@@ -2063,6 +2063,9 @@ impl OptimizationPipeline {
         let origins = std::mem::take(origins);
         let verified = Self::verified_threaded_borrow_positions(graph, &origins.snapshots);
         let mut targets = FxHashMap::default();
+        if verified.is_empty() {
+            return targets;
+        }
         let mut instruction_index = 0;
         for position in graph.item_positions() {
             let Item::Instruction(instruction) = graph.item(position) else {
@@ -2091,6 +2094,9 @@ impl OptimizationPipeline {
         let origins = std::mem::take(origins);
         let verified = Self::verified_threaded_borrow_positions(graph, &origins.snapshots);
         let mut entries = AuthoredFinallyBreakEntries::default();
+        if verified.is_empty() {
+            return entries;
+        }
         let mut nearest_label = None;
         let mut original_source = None;
         for position in graph.item_positions() {
