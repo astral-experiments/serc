@@ -4957,125 +4957,6 @@ impl OptimizationPipeline {
             .iter()
             .map(|(start, _)| *start)
             .collect::<FxHashSet<_>>();
-        let mut setup_nop_predecessors = FxHashMap::default();
-        let mut converted_pop_boundaries = FxHashMap::default();
-        let mut discontinuous_instructions = FxHashSet::default();
-        let mut preceding_labels = Vec::new();
-        let mut setup_nops = FxHashSet::default();
-        let mut last_instruction: Option<(ItemPosition, Instruction)> = None;
-        let mut history_blocks = Vec::new();
-        let mut history_block = 0_usize;
-        for block in graph
-            .order()
-            .iter()
-            .copied()
-            .filter(|_| track_exception_owners)
-        {
-            for (offset, item) in graph[block].items().iter().enumerate() {
-                match item {
-                    Item::Label(label) => {
-                        if track_pop_block_boundaries {
-                            preceding_labels.push(*label);
-                        }
-                        if let Some(location) = setup_locations.get(label)
-                            && let Some((position, instruction)) = last_instruction
-                            && instruction.opcode == NOP
-                            && instruction.location == *location
-                        {
-                            setup_nops.insert(position);
-                        }
-                        if self
-                            .exception_owner_provenance
-                            .block_boundaries
-                            .contains(label)
-                        {
-                            history_block += 1;
-                        }
-                    }
-                    Item::Instruction(instruction) => {
-                        let position = ItemPosition::new(block, offset);
-                        if track_pop_block_boundaries {
-                            // A SETUP's exclusion label need not start an original array.
-                            // Retain the exact fallthrough predecessor across only that label;
-                            // independent entries cannot donate their preceding line.
-                            if !with_exits_only
-                                && instruction.opcode == NOP
-                                && let [setup_start] = preceding_labels.as_slice()
-                                && setup_nop_starts.contains(setup_start)
-                                && !nonlinear_labels.contains(setup_start)
-                                && !self
-                                    .exception_owner_provenance
-                                    .source_boundaries
-                                    .contains(setup_start)
-                                && !self.original_nop_targets.contains(setup_start)
-                                && !self.original_jump_head_targets.contains(setup_start)
-                                && let Some((previous_position, previous)) = last_instruction
-                                // NEXT_LOCATION is resolved after NOP removal and cannot
-                                // supply an authored predecessor line during this pass.
-                                && !previous.fusion_policy.location_from_next()
-                                && previous.location.line == instruction.location.line
-                                && previous.opcode != NOT_TAKEN
-                                && !ends_scope(previous.opcode)
-                                && !is_unconditional_jump(previous.opcode)
-                                && matches!(previous.operand(), Operand::Value(_))
-                            {
-                                setup_nop_predecessors.insert(position, previous_position);
-                            }
-                            if preceding_labels
-                                .iter()
-                                .any(|label| nonlinear_labels.contains(label))
-                            {
-                                discontinuous_instructions.insert(position);
-                            }
-                            // A source join starts a fresh native instruction array. Its first
-                            // erased POP_BLOCK belongs to that new epoch; the linear case below
-                            // separately requires that no join interrupts the transfer.
-                            let starts_source_array = preceding_labels.iter().any(|label| {
-                                self.exception_owner_provenance
-                                    .source_boundaries
-                                    .contains(label)
-                            }) && preceding_labels.iter().all(|label| {
-                                !nonlinear_labels.contains(label)
-                                    || self
-                                        .exception_owner_provenance
-                                        .source_boundaries
-                                        .contains(label)
-                            });
-                            if instruction.opcode == NOP
-                                && instruction.fusion_policy.is_converted_pop_block()
-                                && (starts_source_array
-                                    || (preceding_labels
-                                        .iter()
-                                        .all(|label| !nonlinear_labels.contains(label))
-                                        && last_instruction.is_some_and(|(_, previous)| {
-                                            previous.opcode != NOT_TAKEN
-                                                && !is_unconditional_jump(previous.opcode)
-                                                && !ends_scope(previous.opcode)
-                                        })))
-                            {
-                                let ends: Vec<_> = preceding_labels
-                                    .iter()
-                                    .copied()
-                                    .filter(|label| region_ends.contains(label))
-                                    .collect();
-                                if !ends.is_empty() {
-                                    converted_pop_boundaries.insert(position, ends);
-                                }
-                            }
-                            preceding_labels.clear();
-                        }
-                        last_instruction = Some((position, *instruction));
-                        history_blocks.push(history_block);
-                        if instruction.opcode == NOT_TAKEN
-                            || is_unconditional_jump(instruction.opcode)
-                            || ends_scope(instruction.opcode)
-                        {
-                            history_block += 1;
-                        }
-                    }
-                }
-            }
-        }
         let constant_pass_predecessors = if with_exits_only {
             FxHashMap::default()
         } else {
@@ -5231,21 +5112,18 @@ impl OptimizationPipeline {
                 }
             }
         }
-        let instructions = graph.order().iter().copied().flat_map(|block| {
+        let items = graph.order().iter().copied().flat_map(|block| {
             graph[block]
                 .items()
                 .iter()
                 .enumerate()
-                .filter_map(move |(offset, item)| {
-                    let Item::Instruction(instruction) = item else {
-                        return None;
-                    };
-                    Some((block, ItemPosition::new(block, offset), instruction))
-                })
+                .map(move |(offset, item)| (block, ItemPosition::new(block, offset), item))
         });
-        let mut instructions = instructions.peekable();
-        // The history above visits every instruction in this same, unchanged graph order.
-        let mut history_blocks = history_blocks.into_iter();
+        let mut items = items.peekable();
+        let mut preceding_labels = Vec::new();
+        let mut following_labels = Vec::new();
+        let mut history_block = 0_usize;
+        let mut previous_original: Option<(ItemPosition, &Instruction)> = None;
         let mut previous = None;
         let mut previous_graph_block = None;
         let mut previous_position = None;
@@ -5259,12 +5137,66 @@ impl OptimizationPipeline {
         let mut certified_pop_boundaries = Vec::new();
         let mut certified_pop_widths = Vec::new();
         let mut pending_block = None;
-        while let Some((graph_block, position, instruction)) = instructions.next() {
-            let block = if track_exception_owners {
-                history_blocks.next().expect("NOP instruction history")
-            } else {
-                0
+        while let Some((graph_block, position, item)) = items.next() {
+            let instruction = match item {
+                Item::Instruction(instruction) => instruction,
+                // Only leading labels reach this arm. Once there is an original instruction,
+                // its lookahead consumes all labels before the next one.
+                Item::Label(label) => {
+                    if track_exception_owners {
+                        if track_pop_block_boundaries {
+                            preceding_labels.push(*label);
+                        }
+                        if self
+                            .exception_owner_provenance
+                            .block_boundaries
+                            .contains(label)
+                        {
+                            history_block += 1;
+                        }
+                    }
+                    continue;
+                }
             };
+            let block = history_block;
+            if track_exception_owners
+                && (instruction.opcode == NOT_TAKEN
+                    || is_unconditional_jump(instruction.opcode)
+                    || ends_scope(instruction.opcode))
+            {
+                history_block += 1;
+            }
+            // A setup certifies the instruction before its label, even when that instruction
+            // will be removed. The next instruction also remains the next original instruction,
+            // whereas `previous` below advances only when an instruction survives.
+            let mut setup_nop = false;
+            while let Some((_, _, Item::Label(label))) = items.peek().copied() {
+                let _ = items.next();
+                if track_exception_owners {
+                    if track_pop_block_boundaries {
+                        following_labels.push(*label);
+                        if instruction.opcode == NOP
+                            && setup_locations.get(label) == Some(&instruction.location)
+                        {
+                            setup_nop = true;
+                        }
+                    }
+                    if self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(label)
+                    {
+                        history_block += 1;
+                    }
+                }
+            }
+            let next_original = items.peek().copied().map(|(next_block, _, next)| {
+                let Item::Instruction(next) = next else {
+                    unreachable!("lookahead consumes all intervening labels");
+                };
+                (next_block, next)
+            });
+            let next = next_original.map(|(_, instruction)| instruction);
             if pending_block != Some(block) {
                 pending_slots = 0;
                 pending_pop_slots = Some(0);
@@ -5273,11 +5205,37 @@ impl OptimizationPipeline {
                 }
                 pending_block = Some(block);
             }
-            if track_pop_block_boundaries && discontinuous_instructions.contains(&position) {
+            let discontinuous = track_pop_block_boundaries
+                && preceding_labels
+                    .iter()
+                    .any(|label| nonlinear_labels.contains(label));
+            if discontinuous {
                 pending_pop_boundaries.clear();
                 pending_pop_slots = None;
             }
-            let next = instructions.peek().map(|(_, _, instruction)| *instruction);
+            // A SETUP's exclusion label need not start an original array. Only the exact
+            // surviving fallthrough predecessor can donate across that sole label.
+            let setup_nop_predecessor = setup_nop
+                && !with_exits_only
+                && matches!(preceding_labels.as_slice(), [setup_start]
+                if setup_nop_starts.contains(setup_start)
+                    && !nonlinear_labels.contains(setup_start)
+                    && !self
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .contains(setup_start)
+                    && !self.original_nop_targets.contains(setup_start)
+                    && !self.original_jump_head_targets.contains(setup_start)
+                    && previous_original.is_some_and(|(original_position, original)| {
+                        previous_position == Some(original_position)
+                            // NEXT_LOCATION is resolved after NOP removal and cannot supply a donor.
+                            && !original.fusion_policy.location_from_next()
+                            && original.location.line == instruction.location.line
+                            && original.opcode != NOT_TAKEN
+                            && !ends_scope(original.opcode)
+                            && !is_unconditional_jump(original.opcode)
+                            && matches!(original.operand(), Operand::Value(_))
+                    }));
             // A canceled rotation can leave both the unpack line and a later capture line.
             // Record removal of the first so the legacy store rule keeps the latter.
             let removes_unpack_line_nop = instruction.opcode == NOP
@@ -5288,8 +5246,8 @@ impl OptimizationPipeline {
                         && previous_graph_block == Some(graph_block)
                         && previous.location.line == instruction.location.line
                 })
-                && instructions.peek().is_some_and(|(next_block, _, next)| {
-                    *next_block == graph_block
+                && next_original.is_some_and(|(next_block, next)| {
+                    next_block == graph_block
                         && next.opcode == NOP
                         && next.location.line >= 0
                         && next.location.line != instruction.location.line
@@ -5322,10 +5280,7 @@ impl OptimizationPipeline {
                                 && !(ends_scope(previous.opcode)
                                     || is_unconditional_jump(previous.opcode))
                         }))
-                    || (setup_nops.contains(&position)
-                        && setup_nop_predecessors.get(&position).is_some_and(|expected| {
-                            previous_position == Some(*expected)
-                        }))
+                    || setup_nop_predecessor
                     || (constant_pass_predecessors.get(&position).is_some_and(|expected| {
                         previous_position == Some(*expected)
                     }) && previous.is_some_and(|previous: &Instruction| {
@@ -5365,9 +5320,9 @@ impl OptimizationPipeline {
                 pending_pop_slots = pending_pop_slots.and_then(|count| {
                     (instruction.fusion_policy.is_converted_pop_block()
                         && instruction.local_policy.hidden_exception_owner_slots() == 0
-                        && !setup_nops.contains(&position))
-                    .then(|| count.checked_add(1))
-                    .flatten()
+                        && !setup_nop)
+                        .then(|| count.checked_add(1))
+                        .flatten()
                 });
                 if matches!(
                     instruction.no_location_policy.borrow_fallthrough(),
@@ -5381,11 +5336,38 @@ impl OptimizationPipeline {
                 } else {
                     redundant.push(position);
                 }
-                if track_exception_owners && !setup_nops.contains(&position) {
+                if track_exception_owners && !setup_nop {
                     if track_pop_block_boundaries
-                        && let Some(labels) = converted_pop_boundaries.get(&position)
+                        && instruction.fusion_policy.is_converted_pop_block()
                     {
-                        pending_pop_boundaries.extend(labels.iter().copied());
+                        // A source join begins a fresh native instruction array. Otherwise,
+                        // the preceding original instruction must fall through without a join.
+                        let starts_source_array = preceding_labels.iter().any(|label| {
+                            self.exception_owner_provenance
+                                .source_boundaries
+                                .contains(label)
+                        }) && preceding_labels.iter().all(|label| {
+                            !nonlinear_labels.contains(label)
+                                || self
+                                    .exception_owner_provenance
+                                    .source_boundaries
+                                    .contains(label)
+                        });
+                        if starts_source_array
+                            || (!discontinuous
+                                && previous_original.is_some_and(|(_, original)| {
+                                    original.opcode != NOT_TAKEN
+                                        && !is_unconditional_jump(original.opcode)
+                                        && !ends_scope(original.opcode)
+                                }))
+                        {
+                            pending_pop_boundaries.extend(
+                                preceding_labels
+                                    .iter()
+                                    .copied()
+                                    .filter(|label| region_ends.contains(label)),
+                            );
+                        }
                     }
                     pending_slots = pending_slots
                         .saturating_add(1)
@@ -5422,8 +5404,12 @@ impl OptimizationPipeline {
                 previous_position = Some(position);
                 removed_unpack_line_block = None;
             }
+            if track_pop_block_boundaries {
+                previous_original = Some((position, instruction));
+                preceding_labels.clear();
+                std::mem::swap(&mut preceding_labels, &mut following_labels);
+            }
         }
-        debug_assert!(history_blocks.as_slice().is_empty());
 
         if track_pop_block_boundaries {
             self.exception_owner_provenance
@@ -5445,5 +5431,87 @@ impl OptimizationPipeline {
                 .add_hidden_exception_owner_slots(slots);
         }
         graph.remove_ordered_instructions(&redundant);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::assembler::{Assembler, ExceptionRegion, ExceptionRegionPriority};
+
+    #[test]
+    fn setup_nop_requires_its_original_predecessor_to_survive() {
+        let start = Label(0);
+        let exclusion = Label(1);
+        let setup = Label(2);
+        let handler = Label(3);
+        let location = SourceLocation::new(7, 7, 20, 21);
+        let instruction = |opcode, line, column| {
+            Item::Instruction(Instruction::new(
+                opcode,
+                Operand::Value(0),
+                SourceLocation::new(line, line, column, column + 1),
+                None,
+            ))
+        };
+
+        for removed_original in [false, true] {
+            for trailing_setup in [false, true] {
+                let mut items = vec![Item::Label(start), instruction(LOAD_CONST, 7, 0)];
+                if removed_original {
+                    // The next original instruction represents this line, so this NOP is
+                    // removed even though its own physical successor is in another block.
+                    items.push(instruction(NOP, 7, 10));
+                }
+                items.extend([Item::Label(exclusion), instruction(NOP, 7, 20)]);
+                items.push(Item::Label(setup));
+                if !trailing_setup {
+                    items.push(instruction(LOAD_CONST, 8, 0));
+                }
+                items.push(Item::Label(handler));
+                if !trailing_setup {
+                    items.push(instruction(RETURN_VALUE, 8, 1));
+                }
+
+                let mut assembler = Assembler::from_linear_items(items);
+                assembler.next_label = 4;
+                let mut pipeline = assembler.into_optimization_pipeline();
+                pipeline.exception_regions.push(ExceptionRegion {
+                    is_scope_fallback: false,
+                    priority: ExceptionRegionPriority::OriginalRange(start, exclusion),
+                    start,
+                    end: exclusion,
+                    target: handler,
+                    depth: 0,
+                    preserve_lasti: false,
+                });
+                pipeline
+                    .exception_owner_provenance
+                    .setups
+                    .push((setup, Some(location)));
+                pipeline
+                    .exception_owner_provenance
+                    .setup_nop_ranges
+                    .push((exclusion, setup));
+
+                pipeline.remove_redundant_nops();
+
+                let remaining_nop_columns = pipeline
+                    .graph
+                    .iter_items()
+                    .filter_map(|item| match item {
+                        Item::Instruction(instruction) if instruction.opcode == NOP => {
+                            Some(instruction.location.column)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    remaining_nop_columns,
+                    if removed_original { vec![20] } else { vec![] },
+                    "removed original={removed_original}, trailing setup={trailing_setup}",
+                );
+            }
+        }
     }
 }
