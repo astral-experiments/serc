@@ -50,6 +50,114 @@ fn compile_writes_a_timestamp_pyc() {
 }
 
 #[test]
+fn compile_keeps_python_versions_in_separate_caches() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("module.py");
+    fs_err::write(&source_path, "answer = 42\n").unwrap();
+
+    for version in [serc::PythonVersion::Py314, serc::PythonVersion::Py315] {
+        let output = serc()
+            .args([
+                "compile",
+                "--quiet",
+                "--python-version",
+                &version.to_string(),
+            ])
+            .arg(&source_path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty());
+        let (_, minor, _) = version.target().version;
+        let pyc_path = directory
+            .path()
+            .join(format!("__pycache__/module.cpython-3{minor}.pyc"));
+        let pyc = fs_err::read(pyc_path).unwrap();
+        assert_eq!(&pyc[..4], &version.target().magic_number);
+    }
+
+    let legacy_path = directory.path().join("__pycache__/module.cpython-314.pyc");
+    let legacy = fs_err::read(&legacy_path).unwrap();
+    let output = serc()
+        .args(["compile", "--quiet"])
+        .arg(&source_path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(fs_err::read(legacy_path).unwrap(), legacy);
+}
+
+#[test]
+fn compile_rejects_unsupported_python_version() {
+    let output = serc()
+        .args(["compile", "--python-version", "3.13", "--check"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unsupported Python version"));
+    assert!(stderr.contains("3.14 or 3.15"));
+}
+
+#[test]
+fn compile_matches_cpython_for_version_specific_marshal_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("module.py");
+    for version in [serc::PythonVersion::Py314, serc::PythonVersion::Py315] {
+        let (_, minor, _) = version.target().version;
+        let pyc_path = directory
+            .path()
+            .join(format!("__pycache__/module.cpython-3{minor}.pyc"));
+        for source in [
+            "def answer():\n    return 42\n",
+            "café = 'café'\n",
+            "s = 'café'\nt = ('café',)\ndef f():\n    return café\n",
+            "def f(a):\n    return a[257:1024:1000], 1025, -6, -5\n",
+            "café = 'café' in {'café', 'autre'}\n",
+        ] {
+            fs_err::write(&source_path, source).unwrap();
+            let mut oracle = match version {
+                serc::PythonVersion::Py314 => common::python_3145_command(),
+                serc::PythonVersion::Py315 => common::python_315_command(),
+            };
+            let output = oracle
+                .args([
+                    "-m",
+                    "compileall",
+                    "-q",
+                    "-f",
+                    "-o",
+                    "0",
+                    "--invalidation-mode",
+                    "timestamp",
+                ])
+                .arg(&source_path)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let expected = fs_err::read(&pyc_path).unwrap();
+
+            let output = serc()
+                .args([
+                    "compile",
+                    "--quiet",
+                    "--python-version",
+                    &version.to_string(),
+                ])
+                .arg(&source_path)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(
+                fs_err::read(&pyc_path).unwrap(),
+                expected,
+                "Python {version}: {source}"
+            );
+        }
+    }
+}
+
+#[test]
 fn check_compiles_a_directory_without_writing() {
     let directory = tempfile::tempdir().unwrap();
     let nested = directory.path().join("package");
@@ -226,10 +334,32 @@ fn compile_matches_cpython_for_utf8_encoding_cookies() {
 }
 
 #[test]
+fn compile_accepts_ascii_cookies_and_rejects_non_ascii_source_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("module.py");
+    fs_err::write(&source_path, b"# coding: ascii\nvalue = 'ascii'\n").unwrap();
+    let output = serc()
+        .args(["compile", "--quiet"])
+        .arg(&source_path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    fs_err::write(&source_path, b"# coding: ascii\nvalue = '\xff'\n").unwrap();
+    let output = serc()
+        .args(["compile", "--quiet"])
+        .arg(&source_path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("failed to decode"));
+}
+
+#[test]
 fn compile_rejects_unsupported_encoding_cookies() {
     let directory = tempfile::tempdir().unwrap();
 
-    for encoding in ["ascii", "cp932", "gbk", "big5"] {
+    for encoding in ["cp932", "gbk", "big5"] {
         let source_path = directory.path().join(format!("{encoding}.py"));
         fs_err::write(
             &source_path,

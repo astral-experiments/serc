@@ -193,7 +193,10 @@ impl Assembler {
     ) -> Result<AssembledCode, CompileError> {
         self.resolve_operand_patches()?;
         self.resolve_folded_condition_borrow_entries();
-        if self.has_only_linear_assertion_side_exits() || self.has_only_linear_constant_return() {
+        if self.python_version == crate::PythonVersion::Py314
+            && (self.has_only_linear_assertion_side_exits()
+                || self.has_only_linear_constant_return())
+        {
             return self
                 .optimize_linear_assertion_side_exits(
                     local_count,
@@ -478,6 +481,7 @@ impl Assembler {
                 .capture_uncompacted_conditional_arrays(&graph.copy_items());
         }
         OptimizationPipeline {
+            python_version: self.python_version,
             graph,
             folded_original_predecessor_targets: self
                 .folded_away_condition_targets
@@ -825,11 +829,15 @@ impl OptimizationPipeline {
             }
             original_owners.retain_pipeline(&self);
         }
-        if let Some(constants) = constants
-            && !copied_entry_labels.is_empty()
-        {
-            self.fold_copied_constants(constants, &copied_entry_labels)?;
-            original_owners.retain_pipeline(&self);
+        if let Some(constants) = constants {
+            if !copied_entry_labels.is_empty() {
+                self.fold_copied_constants(constants, &copied_entry_labels)?;
+                original_owners.retain_pipeline(&self);
+            }
+            if self.python_version == crate::PythonVersion::Py315 {
+                self.lower_common_constants(constants);
+                original_owners.retain_pipeline(&self);
+            }
         }
         if let Some(depth) = self.remove_redundant_copy_pop_pairs() {
             removed_max_depth = Some(removed_max_depth.map_or(depth, |current| current.max(depth)));
@@ -1019,6 +1027,7 @@ impl OptimizationPipeline {
                 }
             }
             Self::optimize_load_fast_with_retained_entries(
+                self.python_version,
                 &mut items,
                 &self.exception_regions,
                 locals::BorrowEntryLabels {
@@ -1099,6 +1108,7 @@ impl OptimizationPipeline {
             &self.preserved_block_boundaries,
         );
         Ok(LayoutAssembler {
+            python_version: self.python_version,
             items,
             exception_regions: self.exception_regions,
             exception_owner_provenance: self.exception_owner_provenance,
@@ -1111,6 +1121,53 @@ impl OptimizationPipeline {
 }
 
 impl LayoutAssembler {
+    /// Computes wire operands without changing semantic instruction provenance.
+    pub(in crate::assembler) fn encoded_operand(
+        &self,
+        instruction: &Instruction,
+    ) -> Result<Operand, CompileError> {
+        let operand = instruction.operand();
+        if self.python_version == crate::PythonVersion::Py314 {
+            return Ok(operand);
+        }
+        use crate::target::GENEXPR_RESUME_ARGUMENT;
+        use crate::target::opcodes::{GET_YIELD_FROM_ITER, RESUME};
+        use crate::target::operands::ResumeLocation;
+        use crate::target::operands315::{IteratorMode, ResumeLocation as ResumeLocation315};
+
+        let Operand::Value(argument) = operand else {
+            return Ok(operand);
+        };
+        let encoded = match instruction.opcode {
+            GET_YIELD_FROM_ITER => IteratorMode::YIELD_FROM_CORO_CHECK.argument(),
+            RESUME if argument == GENEXPR_RESUME_ARGUMENT => {
+                ResumeLocation315::AT_GEN_EXPR_START.argument()
+            }
+            RESUME => {
+                let depth_flag = ResumeLocation::AT_FUNC_START.at_depth(true);
+                let location = argument & !depth_flag;
+                let target = [
+                    (
+                        ResumeLocation::AT_FUNC_START,
+                        ResumeLocation315::AT_FUNC_START,
+                    ),
+                    (ResumeLocation::AFTER_YIELD, ResumeLocation315::AFTER_YIELD),
+                    (
+                        ResumeLocation::AFTER_YIELD_FROM,
+                        ResumeLocation315::AFTER_YIELD_FROM,
+                    ),
+                    (ResumeLocation::AFTER_AWAIT, ResumeLocation315::AFTER_AWAIT),
+                ]
+                .into_iter()
+                .find_map(|(semantic, target)| (semantic.argument() == location).then_some(target))
+                .ok_or_else(|| CompileError::Internal("unknown semantic RESUME location".into()))?;
+                target.at_depth(argument & depth_flag != 0)
+            }
+            _ => return Ok(operand),
+        };
+        Ok(Operand::Value(encoded))
+    }
+
     /// Resolves CPython-style `NEXT_LOCATION` markers after CFG optimization.
     fn resolve_next_locations(&mut self) {
         let mut next_location = None;
@@ -1138,8 +1195,8 @@ impl LayoutAssembler {
             match *item {
                 Item::Instruction(instruction) => {
                     instruction_count += 1;
-                    code_units += 1 + u32::from(instruction.opcode.caches());
-                    can_be_unextended &= match instruction.operand() {
+                    code_units += 1 + u32::from(instruction.opcode.caches_for(self.python_version));
+                    can_be_unextended &= match self.encoded_operand(&instruction)? {
                         Operand::Value(argument) => u8::try_from(argument).is_ok(),
                         Operand::Forward(_) | Operand::Backward(_) => true,
                         Operand::Deferred(_) => false,
@@ -1197,25 +1254,21 @@ impl LayoutAssembler {
             });
         }
 
-        let mut extended_args = self
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction) => {
-                    Some(extended_arg_count(match instruction.operand() {
-                        Operand::Value(argument) => argument,
-                        Operand::Forward(label) | Operand::Backward(label) => {
-                            initial_jump_arguments
-                                .as_ref()
-                                .and_then(|indices| label_position(indices, label))
-                                .unwrap_or(0)
-                        }
-                        Operand::Deferred(_) => 0,
-                    }))
-                }
-                Item::Label(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let mut extended_args = Vec::with_capacity(instruction_count);
+        for item in &self.items {
+            let Item::Instruction(instruction) = item else {
+                continue;
+            };
+            let argument = match self.encoded_operand(instruction)? {
+                Operand::Value(argument) => argument,
+                Operand::Forward(label) | Operand::Backward(label) => initial_jump_arguments
+                    .as_ref()
+                    .and_then(|indices| label_position(indices, label))
+                    .unwrap_or(0),
+                Operand::Deferred(_) => 0,
+            };
+            extended_args.push(extended_arg_count(argument));
+        }
         let mut resolved_arguments = vec![0_u32; instruction_count];
 
         for _ in 0..8 {
@@ -1229,9 +1282,11 @@ impl LayoutAssembler {
                     continue;
                 };
                 let opcode_position = position + u32::from(extended_args[instruction_index]);
-                let jump_base = opcode_position + 1 + u32::from(instruction.opcode.caches());
+                let jump_base = opcode_position
+                    + 1
+                    + u32::from(instruction.opcode.caches_for(self.python_version));
                 position = jump_base;
-                let argument = match instruction.operand() {
+                let argument = match self.encoded_operand(instruction)? {
                     Operand::Value(argument) => argument,
                     Operand::Deferred(id) => {
                         return Err(CompileError::Internal(format!(
@@ -1251,7 +1306,7 @@ impl LayoutAssembler {
                         let target = label_position(&labels, label).ok_or_else(|| {
                             CompileError::Internal("unbound backward jump label".to_string())
                         })?;
-                        backward_argument(instruction, jump_base, target)?
+                        backward_argument(self.python_version, instruction, jump_base, target)?
                     }
                 };
                 resolved_arguments[instruction_index] = argument;

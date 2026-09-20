@@ -22,7 +22,7 @@ use crate::target::operands::{
     BinaryIntrinsic, BinaryOperation, CommonConstant, ComparisonOperation, Conversion,
     FunctionAttribute, ResumeLocation, SpecialMethod, UnaryIntrinsic,
 };
-use crate::target::stack_counts as opcode_stack_counts;
+use crate::target::stack_counts_for as opcode_stack_counts;
 use crate::target::{Opcode, is_unconditional_jump};
 
 use super::RETURN_VALUE;
@@ -1656,7 +1656,8 @@ impl Compiler<'_> {
         opcode: Opcode,
         argument: u32,
     ) -> Result<EmittedInstruction, CompileError> {
-        let effect = required_compiler_stack_effect(opcode, argument)?;
+        let effect =
+            required_compiler_stack_effect(self.assembler.python_version(), opcode, argument)?;
         self.apply_stack_effect(effect)?;
         Ok(self.assembler.emit_with_depth(
             opcode,
@@ -1664,6 +1665,15 @@ impl Compiler<'_> {
             self.control.stack.depth.cast_unsigned(),
             ExceptionPolicy::default(),
         ))
+    }
+
+    /// Emits an async-iteration branch marker before exception ownership is assigned.
+    pub(super) fn emit_authored_not_taken(&mut self) -> Result<(), CompileError> {
+        let emitted = self.emit_instruction(crate::target::opcodes::NOT_TAKEN, 0)?;
+        if self.assembler.python_version() == crate::PythonVersion::Py315 {
+            self.assembler.mark_authored_branch_marker(emitted);
+        }
+        Ok(())
     }
 
     pub(super) fn emit_yield_value(
@@ -1795,7 +1805,8 @@ impl Compiler<'_> {
         &mut self,
         argument: u32,
     ) -> Result<EmittedInstruction, CompileError> {
-        let effect = required_compiler_stack_effect(LOAD_FAST, argument)?;
+        let effect =
+            required_compiler_stack_effect(self.assembler.python_version(), LOAD_FAST, argument)?;
         self.apply_stack_effect(effect)?;
         Ok(self
             .assembler
@@ -1880,7 +1891,7 @@ impl Compiler<'_> {
         if !preserve_location && let Some((location, _)) = removed_nop {
             self.assembler.set_location(location);
         }
-        let effect = required_compiler_stack_effect(opcode, 0)?;
+        let effect = required_compiler_stack_effect(self.assembler.python_version(), opcode, 0)?;
         self.apply_stack_effect(effect)?;
         let jump = self.assembler.emit_forward_with_depth(
             opcode,
@@ -1946,7 +1957,7 @@ impl Compiler<'_> {
         if let Some((location, _)) = removed_nop {
             self.assembler.set_location(location);
         }
-        let effect = required_compiler_stack_effect(opcode, 0)?;
+        let effect = required_compiler_stack_effect(self.assembler.python_version(), opcode, 0)?;
         self.apply_stack_effect(effect)?;
         let jump = self
             .assembler
@@ -2021,7 +2032,12 @@ impl Compiler<'_> {
         // Lowering supplies a statically known effect at every call site. Keep the generated
         // metadata cross-check on every test/debug emission without paying for it in production.
         #[cfg(any(test, debug_assertions))]
-        let effect = validate_compiler_stack_effect(opcode, argument, declared)?;
+        let effect = validate_compiler_stack_effect_for(
+            self.assembler.python_version(),
+            opcode,
+            argument,
+            declared,
+        )?;
         #[cfg(not(any(test, debug_assertions)))]
         let effect = {
             let _ = (opcode, argument);
@@ -2059,7 +2075,16 @@ pub(super) enum CompilerStackEffect {
 }
 
 /// Returns the effect on the compiler's logical value stack when it is fixed.
+#[cfg(test)]
 pub(super) fn compiler_stack_effect(opcode: Opcode, argument: u32) -> CompilerStackEffect {
+    compiler_stack_effect_for(crate::PythonVersion::Py314, opcode, argument)
+}
+
+fn compiler_stack_effect_for(
+    python_version: crate::PythonVersion,
+    opcode: Opcode,
+    argument: u32,
+) -> CompilerStackEffect {
     match opcode {
         // CPython's physical interpreter stack retains the return value for frame teardown, but
         // the compiler has finished consuming its logical value stack.
@@ -2068,7 +2093,7 @@ pub(super) fn compiler_stack_effect(opcode: Opcode, argument: u32) -> CompilerSt
         // surrounding lowering path. Its effect is supplied by that path explicitly.
         RERAISE => CompilerStackEffect::ContextDependent,
         _ => {
-            let (popped, pushed) = opcode_stack_counts(opcode, argument);
+            let (popped, pushed) = opcode_stack_counts(python_version, opcode, argument);
             CompilerStackEffect::Fixed(
                 i32::try_from(pushed).expect("opcode push count fits in i32")
                     - i32::try_from(popped).expect("opcode pop count fits in i32"),
@@ -2077,8 +2102,12 @@ pub(super) fn compiler_stack_effect(opcode: Opcode, argument: u32) -> CompilerSt
     }
 }
 
-fn required_compiler_stack_effect(opcode: Opcode, argument: u32) -> Result<i32, CompileError> {
-    match compiler_stack_effect(opcode, argument) {
+fn required_compiler_stack_effect(
+    python_version: crate::PythonVersion,
+    opcode: Opcode,
+    argument: u32,
+) -> Result<i32, CompileError> {
+    match compiler_stack_effect_for(python_version, opcode, argument) {
         CompilerStackEffect::Fixed(effect) => Ok(effect),
         CompilerStackEffect::ContextDependent => Err(CompileError::Internal(format!(
             "opcode {} with argument {argument} has a context-dependent stack effect; use its typed emitter",
@@ -2087,13 +2116,23 @@ fn required_compiler_stack_effect(opcode: Opcode, argument: u32) -> Result<i32, 
     }
 }
 
-#[cfg(any(test, debug_assertions))]
+#[cfg(test)]
 pub(super) fn validate_compiler_stack_effect(
     opcode: Opcode,
     argument: u32,
     declared: i32,
 ) -> Result<i32, CompileError> {
-    match compiler_stack_effect(opcode, argument) {
+    validate_compiler_stack_effect_for(crate::PythonVersion::Py314, opcode, argument, declared)
+}
+
+#[cfg(any(test, debug_assertions))]
+fn validate_compiler_stack_effect_for(
+    python_version: crate::PythonVersion,
+    opcode: Opcode,
+    argument: u32,
+    declared: i32,
+) -> Result<i32, CompileError> {
+    match compiler_stack_effect_for(python_version, opcode, argument) {
         CompilerStackEffect::Fixed(expected) if declared != expected => {
             Err(CompileError::Internal(format!(
                 "compiler declared stack effect {declared} for opcode {} with argument {argument}, expected {expected}",

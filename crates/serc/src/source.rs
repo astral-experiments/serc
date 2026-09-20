@@ -59,6 +59,7 @@ impl Error for SourceDecodeError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceEncoding {
     Utf8(Utf8Encoding),
+    Ascii,
     Latin1,
     Iso885915,
     EucJp,
@@ -75,7 +76,7 @@ enum Utf8Encoding {
 /// Decode Python source bytes and normalize them for parsing.
 ///
 /// Serc accepts UTF-8 source, including a single UTF-8 BOM and CPython-compatible UTF-8
-/// encoding cookies on the first or second physical line. Latin-1, Latin-9, EUC-JP, KOI8-R, and
+/// encoding cookies on the first or second physical line. ASCII, Latin-1, Latin-9, EUC-JP, KOI8-R, and
 /// Windows 1251 cookies are also decoded with CPython-compatible aliases and strict mappings.
 /// Newlines are normalized to `\n`. The returned value borrows `bytes` for unchanged UTF-8 source.
 pub fn decode_source(bytes: &[u8]) -> Result<Cow<'_, str>, SourceDecodeError> {
@@ -103,6 +104,16 @@ pub fn decode_source(bytes: &[u8]) -> Result<Cow<'_, str>, SourceDecodeError> {
     };
 
     let source = match encoding {
+        SourceEncoding::Ascii => {
+            if !bytes.is_ascii() {
+                return Err(SourceDecodeError::InvalidEncoding(
+                    declared
+                        .expect("ASCII source encoding has a cookie")
+                        .to_string(),
+                ));
+            }
+            Cow::Borrowed(std::str::from_utf8(bytes).expect("ASCII is valid UTF-8"))
+        }
         SourceEncoding::Utf8(_) => {
             Cow::Borrowed(std::str::from_utf8(bytes).map_err(SourceDecodeError::InvalidUtf8)?)
         }
@@ -130,7 +141,7 @@ fn decode_legacy(encoding: SourceEncoding, bytes: &[u8]) -> Option<Cow<'_, str>>
             WINDOWS_1251.decode_without_bom_handling_and_without_replacement(bytes)
         }
         SourceEncoding::Windows1251 => None,
-        SourceEncoding::Utf8(_) | SourceEncoding::Latin1 => unreachable!(),
+        SourceEncoding::Utf8(_) | SourceEncoding::Ascii | SourceEncoding::Latin1 => unreachable!(),
     }
 }
 
@@ -231,6 +242,9 @@ fn classify_source_encoding(name: &str) -> Option<SourceEncoding> {
     }
     let normalized = normalize_codec_name(name);
     let encoding = match normalized.as_str() {
+        "ascii" | "646" | "ansi_x3.4_1968" | "ansi_x3_4_1968" | "ansi_x3.4_1986" | "cp367"
+        | "csascii" | "ibm367" | "iso646_us" | "iso_646.irv_1991" | "iso_ir_6" | "us"
+        | "us_ascii" => Some(SourceEncoding::Ascii),
         "8859" | "cp819" | "csisolatin1" | "ibm819" | "iso8859" | "iso8859_1" | "iso_8859_1"
         | "iso_8859_1_1987" | "iso_ir_100" | "l1" | "latin" | "latin1" | "latin_1" => {
             Some(SourceEncoding::Latin1)
@@ -247,6 +261,7 @@ fn classify_source_encoding(name: &str) -> Option<SourceEncoding> {
 fn classify_dotted_codec_alias(name: &str) -> Option<SourceEncoding> {
     let alias = name.contains('.').then(|| name.replace('.', "_"))?;
     match alias.as_str() {
+        "ansi_x3_4_1968" | "iso_ir_6" | "us_ascii" | "iso646_us" => Some(SourceEncoding::Ascii),
         "iso8859_1" | "iso_8859_1" | "iso_8859_1_1987" | "iso_ir_100" => {
             Some(SourceEncoding::Latin1)
         }
@@ -442,6 +457,41 @@ mod tests {
         assert_eq!(
             decode_source(b"first\r\nsecond\rthird\n").unwrap(),
             "first\nsecond\nthird\n"
+        );
+    }
+
+    #[test]
+    fn ascii_source_cookies_are_strict_and_preserve_borrowing() {
+        for alias in [
+            "ascii",
+            "US-ASCII",
+            "646",
+            "ANSI_X3.4-1968",
+            "iso_646.irv_1991",
+        ] {
+            let source = format!("# coding: {alias}\nvalue = 'text'\n");
+            assert!(matches!(
+                decode_source(source.as_bytes()),
+                Ok(Cow::Borrowed(_))
+            ));
+            assert_eq!(decode_source(source.as_bytes()).unwrap(), source);
+        }
+        assert_eq!(
+            decode_source(b"# coding: ascii\r\nvalue = 1\r").unwrap(),
+            "# coding: ascii\nvalue = 1\n"
+        );
+        for bytes in [
+            b"# coding: ascii\nvalue = '\xff'\n".as_slice(),
+            b"# coding: ascii\nvalue = '\xc3\xa9'\n".as_slice(),
+        ] {
+            assert_eq!(
+                decode_source(bytes),
+                Err(SourceDecodeError::InvalidEncoding("ascii".to_string()))
+            );
+        }
+        assert_eq!(
+            decode_source(b"\xef\xbb\xbf# coding: ascii\npass\n"),
+            Err(SourceDecodeError::Utf8BomConflict("ascii".to_string()))
         );
     }
 

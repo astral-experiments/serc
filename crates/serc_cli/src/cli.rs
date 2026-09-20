@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::builder::Styles;
 use clap::builder::styling::{AnsiColor, Effects};
 use clap::{Parser, Subcommand, ValueHint};
-use serc::{CPYTHON_TARGET, CompileError, compile_bytes};
+use serc::{CompileError, CompileOptions, PythonVersion, compile_bytes_with_options};
 use walkdir::WalkDir;
 
 const STYLES: Styles = Styles::styled()
@@ -43,6 +43,10 @@ struct CompileCommand {
     #[arg(value_hint = ValueHint::AnyPath)]
     paths: Vec<PathBuf>,
 
+    /// Python language and bytecode version to target (3.14 or 3.15).
+    #[arg(long, default_value_t = PythonVersion::default())]
+    python_version: PythonVersion,
+
     /// Compile the sources without writing .pyc files.
     #[arg(long)]
     check: bool,
@@ -76,9 +80,13 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
     };
     let paths = discover(&roots)?;
     let mut failures = 0_usize;
+    let options = CompileOptions {
+        python_version: command.python_version,
+        ..CompileOptions::default()
+    };
 
     for path in &paths {
-        if let Err(message) = compile_path(path, command.check) {
+        if let Err(message) = compile_path(path, command.check, &options) {
             failures += 1;
             write_error(&message);
         }
@@ -148,8 +156,8 @@ fn has_python_suffix(path: &Path) -> bool {
         .is_some_and(|name| name.as_encoded_bytes().ends_with(b".py"))
 }
 
-fn compile_path(path: &Path, check: bool) -> Result<(), String> {
-    compile_path_with_metadata(path, check, |path| fs_err::metadata(path))
+fn compile_path(path: &Path, check: bool, options: &CompileOptions) -> Result<(), String> {
+    compile_path_with_metadata(path, check, options, |path| fs_err::metadata(path))
 }
 
 /// Compiles a source file, optionally replacing its timestamp-invalidated cache.
@@ -158,6 +166,7 @@ fn compile_path(path: &Path, check: bool) -> Result<(), String> {
 fn compile_path_with_metadata(
     path: &Path,
     check: bool,
+    options: &CompileOptions,
     load_metadata: impl FnOnce(&Path) -> io::Result<std::fs::Metadata>,
 ) -> Result<(), String> {
     // Snapshot timestamp-cache metadata before reading. If the path changes during compilation,
@@ -173,12 +182,15 @@ fn compile_path_with_metadata(
     let filename = path
         .to_str()
         .ok_or_else(|| format!("path is not UTF-8: {}", path.display()))?;
-    let module = compile_bytes(&source_bytes, filename).map_err(|error| match &error {
-        CompileError::Decode(error) => {
-            format!("failed to decode {}: {error}", path.display())
-        }
-        _ => format!("failed to compile {}: {error}", path.display()),
-    })?;
+    let module =
+        compile_bytes_with_options(&source_bytes, filename, options).map_err(
+            |error| match &error {
+                CompileError::Decode(error) => {
+                    format!("failed to decode {}: {error}", path.display())
+                }
+                _ => format!("failed to compile {}: {error}", path.display()),
+            },
+        )?;
 
     let Some(metadata) = metadata else {
         black_box(module);
@@ -191,7 +203,7 @@ fn compile_path_with_metadata(
         .map_err(|error| format!("failed to read the mtime for {}: {error}", path.display()))?;
     let source_mtime = encode_mtime(modified);
     let pyc = module.to_timestamp_pyc(source_mtime, low_u32(source_size));
-    let output = cache_path(path)?;
+    let output = cache_path(path, options.python_version)?;
 
     let parent = output.parent().ok_or_else(|| {
         format!(
@@ -248,7 +260,7 @@ fn temporary_cache_file(
     tempfile::NamedTempFile::new_in(parent)
 }
 
-fn cache_path(path: &Path) -> Result<PathBuf, String> {
+fn cache_path(path: &Path, python_version: PythonVersion) -> Result<PathBuf, String> {
     let filename = path
         .file_name()
         .ok_or_else(|| format!("{} has no file name", path.display()))?;
@@ -259,16 +271,17 @@ fn cache_path(path: &Path) -> Result<PathBuf, String> {
             .ok_or_else(|| format!("{} has no file stem", path.display()))?
     };
     let mut filename = OsString::from(stem);
-    filename.push(format!(".{}.pyc", cache_tag()));
+    filename.push(format!(".{}.pyc", cache_tag(python_version)));
     let parent = path
         .parent()
         .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
     Ok(parent.join("__pycache__").join(filename))
 }
 
-fn cache_tag() -> String {
-    let (major, minor, _) = CPYTHON_TARGET.version;
-    format!("{}-{major}{minor}", CPYTHON_TARGET.implementation)
+fn cache_tag(python_version: PythonVersion) -> String {
+    let target = python_version.target();
+    let (major, minor, _) = target.version;
+    format!("{}-{major}{minor}", target.implementation)
 }
 
 fn write_error(message: &str) {
@@ -282,23 +295,29 @@ mod tests {
         cache_path, cache_tag, compile_path_with_metadata, discover, encode_mtime,
         has_python_suffix,
     };
+    use serc::{CompileOptions, PythonVersion};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
     fn target_cache_tag() {
-        assert_eq!(cache_tag(), "cpython-314");
+        assert_eq!(cache_tag(PythonVersion::Py314), "cpython-314");
+        assert_eq!(cache_tag(PythonVersion::Py315), "cpython-315");
     }
 
     #[test]
     fn builds_cache_path() {
         assert_eq!(
-            cache_path(Path::new("package/module.py")).unwrap(),
+            cache_path(Path::new("package/module.py"), PythonVersion::Py314).unwrap(),
             PathBuf::from("package/__pycache__/module.cpython-314.pyc")
         );
         assert_eq!(
-            cache_path(Path::new("package/.py")).unwrap(),
+            cache_path(Path::new("package/.py"), PythonVersion::Py314).unwrap(),
             PathBuf::from("package/__pycache__/py.cpython-314.pyc")
+        );
+        assert_eq!(
+            cache_path(Path::new("package/module.py"), PythonVersion::Py315).unwrap(),
+            PathBuf::from("package/__pycache__/module.cpython-315.pyc")
         );
         assert!(has_python_suffix(Path::new("package/.py")));
     }
@@ -325,7 +344,7 @@ mod tests {
         let replacement_mtime = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         fs_err::write(&source_path, source).unwrap();
 
-        compile_path_with_metadata(&source_path, false, |path| {
+        compile_path_with_metadata(&source_path, false, &CompileOptions::default(), |path| {
             fs_err::write(path, replacement)?;
             let file = std::fs::OpenOptions::new().write(true).open(path)?;
             file.set_times(std::fs::FileTimes::new().set_modified(replacement_mtime))?;
@@ -338,7 +357,7 @@ mod tests {
                 .unwrap()
                 .to_timestamp_pyc(1_700_000_000, u32::try_from(replacement.len()).unwrap());
         assert_eq!(
-            fs_err::read(cache_path(&source_path).unwrap()).unwrap(),
+            fs_err::read(cache_path(&source_path, PythonVersion::Py314).unwrap()).unwrap(),
             expected
         );
     }

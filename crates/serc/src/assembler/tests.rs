@@ -1266,6 +1266,122 @@ fn emits_extended_arguments() {
 }
 
 #[test]
+fn target_caches_and_extended_arguments_share_the_same_layout() {
+    use crate::PythonVersion::{Py314, Py315};
+
+    for version in [Py314, Py315] {
+        let mut assembler = Assembler::with_python_version(version);
+        assembler.emit(RESUME, ResumeLocation::AT_FUNC_START.argument());
+        assembler.emit(IMPORT_NAME, if version == Py314 { 64 } else { 256 });
+        assembler.emit(RETURN_VALUE, 0);
+        let expected = if version == Py314 {
+            vec![
+                RESUME.code(),
+                0,
+                IMPORT_NAME.code(),
+                64,
+                RETURN_VALUE.code(),
+                0,
+            ]
+        } else {
+            vec![
+                RESUME.code_for(Py315),
+                0,
+                0,
+                0,
+                EXTENDED_ARG.code_for(Py315),
+                1,
+                IMPORT_NAME.code_for(Py315),
+                0,
+                RETURN_VALUE.code_for(Py315),
+                0,
+            ]
+        };
+        assert_eq!(assembler.finish().unwrap(), expected);
+    }
+}
+
+#[test]
+fn python315_resume_entry_and_depth_have_distinct_encodings() {
+    use crate::PythonVersion::Py315;
+    use crate::target::GENEXPR_RESUME_ARGUMENT;
+
+    for (argument, expected) in [
+        (ResumeLocation::AFTER_YIELD.at_depth(true), 9),
+        (ResumeLocation::AFTER_AWAIT.at_depth(true), 11),
+        (GENEXPR_RESUME_ARGUMENT, 4),
+    ] {
+        let mut assembler = Assembler::with_python_version(Py315);
+        assembler.emit(RESUME, argument);
+        assert_eq!(
+            assembler.finish().unwrap(),
+            [RESUME.code_for(Py315), expected, 0, 0]
+        );
+    }
+}
+
+#[test]
+fn python315_yield_from_uses_quickened_get_iter_and_cache() {
+    use crate::PythonVersion::Py315;
+
+    let mut assembler = Assembler::with_python_version(Py315);
+    assembler.emit(GET_YIELD_FROM_ITER, 0);
+    assert_eq!(
+        assembler.finish().unwrap(),
+        [GET_ITER.code_for(Py315), 3, 0, 0]
+    );
+}
+
+#[test]
+fn python315_borrow_traversal_crosses_removed_constant_branches() {
+    use crate::PythonVersion::{Py314, Py315};
+    use crate::code_object::Constant;
+    use crate::{CompileOptions, compile_with_options};
+
+    for source in [
+        "def f(x):\n    if False:\n        pass\n    return x\n",
+        "def f(x):\n    while False:\n        pass\n    return x\n",
+        "def f(x):\n    if flag:\n        return\n    assert False, x.value\n",
+        "def f(x):\n    if flag:\n        pass\n    else:\n        assert False, f'bad: {x}'\n",
+    ] {
+        for version in [Py314, Py315] {
+            let module = compile_with_options(
+                source,
+                "borrow.py",
+                &CompileOptions {
+                    python_version: version,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap();
+            let code = module
+                .code
+                .constants
+                .iter()
+                .find_map(|constant| {
+                    if let Constant::Code(code) = constant {
+                        Some(code)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            let expected = if version == Py314 {
+                LOAD_FAST
+            } else {
+                LOAD_FAST_BORROW
+            };
+            assert!(
+                code.bytecode
+                    .chunks_exact(2)
+                    .any(|word| word == [expected.code_for(version), 0]),
+                "{version:?}: {source}"
+            );
+        }
+    }
+}
+
+#[test]
 fn emits_full_width_extended_arguments_and_zeroed_inline_caches() {
     let mut assembler = Assembler::default();
     assembler.emit(LOAD_GLOBAL, 0x1234_5678);
@@ -1297,6 +1413,7 @@ fn fused_final_artifacts_preserve_cache_extended_argument_location_and_depth_sem
     let first_location = SourceLocation::new(7, 7, 0, 1);
     let second_location = SourceLocation::new(8, 8, 2, 4);
     let assembler = super::LayoutAssembler {
+        python_version: crate::PythonVersion::Py314,
         items: vec![
             Item::Instruction(Instruction::new(
                 LOAD_GLOBAL,
@@ -1374,6 +1491,7 @@ fn unextended_final_artifacts_preserve_jump_cache_location_and_depth_semantics()
     let second_location = SourceLocation::new(8, 8, 2, 4);
     let target = super::Label(0);
     let assembler = super::LayoutAssembler {
+        python_version: crate::PythonVersion::Py314,
         items: vec![
             Item::Instruction(Instruction::new(
                 LOAD_GLOBAL,
@@ -3847,6 +3965,7 @@ fn retained_setup_nop_identity_survives_consecutive_labels_without_aliasing_remo
             }
         }
         let assembler = super::LayoutAssembler {
+            python_version: crate::PythonVersion::Py314,
             items,
             exception_regions: Vec::new(),
             exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance {

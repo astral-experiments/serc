@@ -15,15 +15,14 @@ use super::{
     CONTAINS_OP, COPY, DELETE_ATTR, DELETE_SUBSCR, DICT_MERGE, DICT_UPDATE, END_ASYNC_FOR, END_FOR,
     END_SEND, FOR_ITER, FORMAT_SIMPLE, FORMAT_WITH_SPEC, GET_AITER, GET_ANEXT, GET_AWAITABLE,
     GET_ITER, GET_LEN, GET_YIELD_FROM_ITER, IS_OP, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT,
-    JUMP_FORWARD, LIST_APPEND, LIST_EXTEND, LOAD_ATTR, LOAD_CONST, LOAD_DEREF, LOAD_FAST,
-    LOAD_FAST_AND_CLEAR, LOAD_GLOBAL, LOAD_SMALL_INT, LOAD_SUPER_ATTR, MAKE_CELL, MAKE_FUNCTION,
-    MAP_ADD, MATCH_CLASS, MATCH_KEYS, MATCH_MAPPING, MATCH_SEQUENCE, NOP, NOT_TAKEN, POP_ITER,
-    POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP,
-    PUSH_NULL, RETURN_VALUE, SEND, SET_ADD, SET_UPDATE, STORE_ATTR, STORE_FAST, STORE_SLICE,
-    STORE_SUBSCR, SWAP, TO_BOOL, UNARY_INVERT, UNARY_NEGATIVE, UNARY_NOT, UNPACK_EX,
-    UNPACK_SEQUENCE,
+    JUMP_FORWARD, LIST_APPEND, LIST_EXTEND, LOAD_ATTR, LOAD_COMMON_CONSTANT, LOAD_CONST,
+    LOAD_DEREF, LOAD_FAST, LOAD_FAST_AND_CLEAR, LOAD_GLOBAL, LOAD_SMALL_INT, LOAD_SUPER_ATTR,
+    MAKE_CELL, MAKE_FUNCTION, MAP_ADD, MATCH_CLASS, MATCH_KEYS, MATCH_MAPPING, MATCH_SEQUENCE, NOP,
+    NOT_TAKEN, POP_ITER, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE,
+    POP_JUMP_IF_TRUE, POP_TOP, PUSH_NULL, RETURN_VALUE, SEND, SET_ADD, SET_UPDATE, STORE_ATTR,
+    STORE_FAST, STORE_SLICE, STORE_SUBSCR, SWAP, TO_BOOL, UNARY_INVERT, UNARY_NEGATIVE, UNARY_NOT,
+    UNPACK_EX, UNPACK_SEQUENCE,
 };
-use crate::CompileError;
 use crate::assembler::{ExceptionPolicy, Label, SourceLocation};
 use crate::code_object::Constant;
 use crate::target::code_flags::{
@@ -35,6 +34,7 @@ use crate::target::operands::{
     ResumeLocation, UnaryIntrinsic,
 };
 use crate::target::{Opcode, is_scope_exit};
+use crate::{CompileError, PythonVersion};
 
 use super::constant::{
     PercentFormatPart, big_integer_digits, constant_slice, explicit_surrogate_string,
@@ -2018,7 +2018,7 @@ impl Compiler<'_> {
                         == Operator::Add
                         && matches!(binary.left.as_ref(), Expr::Name(_))
                         && matches!(binary.right.as_ref(), Expr::Call(call)
-                                if optimized_generator_callable(call) == Some("tuple"));
+                                if matches!(optimized_generator_callable_for_target(call, self.context.python_version), Some("tuple" | "list" | "set")));
                     self.with_control_override(
                         |control| {
                             &mut control
@@ -2168,8 +2168,12 @@ impl Compiler<'_> {
                     };
                     return Err(CompileError::invalid_syntax(message, expression.range));
                 }
-                self.compile_expression(&expression.value)?;
-                self.emit(GET_YIELD_FROM_ITER, 0, 0)?;
+                if self.context.python_version == PythonVersion::Py315 {
+                    self.compile_iterable_expression(&expression.value)?;
+                } else {
+                    self.compile_expression(&expression.value)?;
+                }
+                self.emit(GET_YIELD_FROM_ITER, 0, self.iterator_extra_slots())?;
                 let none = self.add_constant(Constant::None)?;
                 self.emit(LOAD_CONST, none, 1)?;
                 let send = self.assembler.label();
@@ -2195,16 +2199,16 @@ impl Compiler<'_> {
                     yielded,
                     yielded_end,
                     cleanup,
-                    (starting_depth + 2).cast_unsigned(),
+                    (starting_depth + 2 + self.iterator_extra_slots()).cast_unsigned(),
                     false,
                 );
                 self.assembler
                     .set_location(self.source_location(expression.range));
-                self.set_depth(starting_depth + 3);
+                self.set_depth(starting_depth + 3 + self.iterator_extra_slots());
                 self.emit(CLEANUP_THROW, 0, -1)?;
                 self.assembler.mark(end);
-                self.set_depth(starting_depth + 2);
-                self.emit(END_SEND, 0, -1)?;
+                self.set_depth(starting_depth + 2 + self.iterator_extra_slots());
+                self.emit(END_SEND, 0, -self.iterator_slots())?;
             }
             Expr::Await(expression) => self.compile_await(expression)?,
             Expr::TString(tstring) => self.compile_tstring(tstring)?,
@@ -2571,6 +2575,9 @@ impl Compiler<'_> {
         let base_depth = self.control.stack.depth - 1;
         let cleanup_location = self.assembler.location();
         self.emit(GET_AWAITABLE, get_awaitable_argument, 0)?;
+        if self.context.python_version == PythonVersion::Py315 {
+            self.emit(PUSH_NULL, 0, 1)?;
+        }
         let none = self.add_constant(Constant::None)?;
         self.emit(LOAD_CONST, none, 1)?;
 
@@ -2593,16 +2600,16 @@ impl Compiler<'_> {
             yielded,
             yielded_end,
             cleanup,
-            (base_depth + 2).cast_unsigned(),
+            (base_depth + 2 + self.iterator_extra_slots()).cast_unsigned(),
             false,
         );
         self.assembler.set_location(cleanup_location);
-        self.set_depth(base_depth + 3);
+        self.set_depth(base_depth + 3 + self.iterator_extra_slots());
         self.emit(CLEANUP_THROW, 0, -1)?;
         self.assembler.record_exception_owner_block_boundary(end);
         self.assembler.mark(end);
-        self.set_depth(base_depth + 2);
-        self.emit(END_SEND, 0, -1)?;
+        self.set_depth(base_depth + 2 + self.iterator_extra_slots());
+        self.emit(END_SEND, 0, -self.iterator_slots())?;
         if get_awaitable_argument == 0 {
             self.assembler
                 .record_ordinary_await_cleanup(yielded, cleanup);
@@ -2616,7 +2623,9 @@ impl Compiler<'_> {
     }
 
     fn compile_call(&mut self, call: &ruff_python_ast::ExprCall) -> Result<(), CompileError> {
-        if let Some(callable) = optimized_generator_callable(call) {
+        if let Some(callable) =
+            optimized_generator_callable_for_target(call, self.context.python_version)
+        {
             return self.compile_optimized_generator_call(call, callable);
         }
 
@@ -2783,16 +2792,26 @@ impl Compiler<'_> {
         call: &ruff_python_ast::ExprCall,
         callable: &str,
     ) -> Result<(), CompileError> {
-        let (common_constant, initial_result, collect_tuple) = match callable {
-            "all" => (CommonConstant::BUILTIN_ALL, true, false),
-            "any" => (CommonConstant::BUILTIN_ANY, false, false),
-            "tuple" => (CommonConstant::BUILTIN_TUPLE, false, true),
-            _ => unreachable!("optimized generator call must use all, any, or tuple"),
+        let (common_constant, initial_result, collect_collection) = match callable {
+            "all" => (CommonConstant::BUILTIN_ALL.argument(), true, false),
+            "any" => (CommonConstant::BUILTIN_ANY.argument(), false, false),
+            "tuple" => (CommonConstant::BUILTIN_TUPLE.argument(), false, true),
+            "list" => (
+                crate::target::operands315::CommonConstant::BUILTIN_LIST.argument(),
+                false,
+                true,
+            ),
+            "set" => (
+                crate::target::operands315::CommonConstant::BUILTIN_SET.argument(),
+                false,
+                true,
+            ),
+            _ => unreachable!("optimized generator call must use a supported builtin"),
         };
         let generator_expression_boolean_dispatch_eligible = (self
             .context
             .target_specific_rules_enabled()
-            && !collect_tuple
+            && !collect_collection
             && matches!(call.arguments.args.as_ref(), [Expr::Generator(generator)]
                 if generator
                     .generators
@@ -2807,7 +2826,7 @@ impl Compiler<'_> {
 
         // CPython appends the optimized Boolean loop's artificial control-flow instructions
         // after exception-handler regions are labeled, so they do not inherit handler cleanup.
-        let handler_boolean_loop_policy = (!collect_tuple
+        let handler_boolean_loop_policy = (!collect_collection
             && self.control.in_exception_handler()
             && (self
                 .control
@@ -2829,7 +2848,7 @@ impl Compiler<'_> {
                                 })
                     ))))
         .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
-        let coroutine_boolean_loop_policy = (!collect_tuple
+        let coroutine_boolean_loop_policy = (!collect_collection
             && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) != 0
             && self.context.target_specific_rules_enabled()
             && self.control.generators.generator_region_start.is_some()
@@ -2902,7 +2921,7 @@ impl Compiler<'_> {
                     || self.control.stack.depth == 0
                     || !initial_iterator_dispatch)
         });
-        let coroutine_tuple_dispatch_policy = (collect_tuple
+        let coroutine_tuple_dispatch_policy = (collect_collection
             && self.unit.flags & CO_COROUTINE != 0
             && self.context.target_specific_rules_enabled()
             && !self.control.in_iterator_loop()
@@ -2977,7 +2996,7 @@ impl Compiler<'_> {
                             })
                 ))
             .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
-        let plain_try_boolean_loop_policy = (!collect_tuple
+        let plain_try_boolean_loop_policy = (!collect_collection
             && self.context.target_specific_rules_enabled()
             && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
             && !self
@@ -3012,7 +3031,7 @@ impl Compiler<'_> {
         .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
         // Keep prior manager-owner holes and terminal handler returns out of scope: adding the
         // correct loop-owner split there worsens the table while earlier gaps remain unmatched.
-        let preserve_synchronous_with_boolean_loop_owner = !collect_tuple
+        let preserve_synchronous_with_boolean_loop_owner = !collect_collection
             && self.context.target_specific_rules_enabled()
             && self.control.in_synchronous_with()
             && (!self
@@ -3054,7 +3073,7 @@ impl Compiler<'_> {
                         .generators
                         .generator_region_exclusions
                         .is_empty()));
-        let synchronous_with_boolean_loop_policy = (!collect_tuple
+        let synchronous_with_boolean_loop_policy = (!collect_collection
             && self.context.target_specific_rules_enabled()
             && self.control.in_synchronous_with()
             && !preserve_synchronous_with_boolean_loop_owner
@@ -3183,7 +3202,7 @@ impl Compiler<'_> {
         self.compile_expression(&call.func)?;
         self.assembler.set_location(callable_location);
         self.emit(COPY, 1, 1)?;
-        self.emit_common_constant(common_constant)?;
+        self.emit(LOAD_COMMON_CONSTANT, common_constant, 1)?;
         self.emit(IS_OP, 0, -1)?;
         self.emit_jump_forward(POP_JUMP_IF_FALSE, fallback, -1)?;
         let in_inlined_comprehension = !self
@@ -3191,7 +3210,7 @@ impl Compiler<'_> {
             .comprehensions
             .active_comprehension_region_exclusions
             .is_empty();
-        let exclude_not_taken_from_comprehension = collect_tuple
+        let exclude_not_taken_from_comprehension = collect_collection
             && self
                 .control
                 .comprehensions
@@ -3199,7 +3218,7 @@ impl Compiler<'_> {
             && in_inlined_comprehension;
         // Exact-target guards resolve the reused slot at normalization. An early
         // region exclusion would hide a concrete owner found by that proof.
-        let exclude_not_taken_from_exception = collect_tuple
+        let exclude_not_taken_from_exception = collect_collection
             && !self.context.target_specific_rules_enabled()
             && self.control.statements.current_statement_has_following
             && self
@@ -3291,7 +3310,7 @@ impl Compiler<'_> {
                         && !self.control.statements.current_statement_has_following
                     {
                         ExceptionPolicy::normalized_owner(false)
-                    } else if !collect_tuple && in_inlined_comprehension {
+                    } else if !collect_collection && in_inlined_comprehension {
                         // CPython adds the optimized all()/any() dispatch guard's
                         // NOT_TAKEN after exception owners are labeled. It keeps an
                         // owner only when an earlier optimization in this exact CFG
@@ -3307,7 +3326,7 @@ impl Compiler<'_> {
                     // after labeling exception targets. In an inlined comprehension
                     // or one ordinary try region, it keeps an owner only when
                     // compaction leaves a concrete protected fallthrough slot.
-                    } else if collect_tuple
+                    } else if collect_collection
                         && ((in_inlined_comprehension
                             && !exclude_not_taken_from_comprehension
                             && !exclude_not_taken_from_exception)
@@ -3366,8 +3385,16 @@ impl Compiler<'_> {
         }
         self.emit(POP_TOP, 0, -1)?;
 
-        if collect_tuple {
-            self.emit(BUILD_LIST, 0, 1)?;
+        if collect_collection {
+            self.emit(
+                if callable == "set" {
+                    BUILD_SET
+                } else {
+                    BUILD_LIST
+                },
+                0,
+                1,
+            )?;
         }
         if generator_expression_boolean_dispatch_eligible.is_some()
             || self
@@ -3389,14 +3416,26 @@ impl Compiler<'_> {
             self.compile_expression(&call.arguments.args[0])?;
         }
 
+        if self.context.python_version == PythonVersion::Py315 {
+            self.assembler.set_location(callable_location);
+            self.emit(PUSH_NULL, 0, 1)?;
+        }
         let loop_start = self.assembler.label();
         let exhausted = self.assembler.label();
         let iterator_depth = self.control.stack.depth;
         self.assembler.mark(loop_start);
         self.assembler.set_location(callable_location);
         self.emit_jump_forward(FOR_ITER, exhausted, 1)?;
-        if collect_tuple {
-            self.emit(LIST_APPEND, 2, -1)?;
+        if collect_collection {
+            self.emit(
+                if callable == "set" {
+                    SET_ADD
+                } else {
+                    LIST_APPEND
+                },
+                1 + self.iterator_slots().cast_unsigned(),
+                -1,
+            )?;
             self.emit_jump_backward(JUMP_BACKWARD, loop_start, 0)?;
         } else {
             self.emit(TO_BOOL, 0, 0)?;
@@ -3421,7 +3460,7 @@ impl Compiler<'_> {
                 ExceptionPolicy::EXCLUDE_ALWAYS,
             )?;
             self.assembler.mark(matched);
-            self.emit(POP_ITER, 0, -1)?;
+            self.emit(POP_ITER, 0, -self.iterator_slots())?;
             let result = self.add_constant(Constant::Bool(!initial_result))?;
             self.emit(LOAD_CONST, result, 1)?;
             self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
@@ -3431,16 +3470,16 @@ impl Compiler<'_> {
         self.set_depth(iterator_depth + 1);
         self.assembler.set_location(callable_location);
         self.emit(END_FOR, 0, -1)?;
-        self.emit(POP_ITER, 0, -1)?;
+        self.emit(POP_ITER, 0, -self.iterator_slots())?;
         self.assembler.set_location(callable_location);
-        if collect_tuple {
+        if callable == "tuple" {
             self.emit_unary_intrinsic(UnaryIntrinsic::LIST_TO_TUPLE)?;
-        } else {
+        } else if !collect_collection {
             let result = self.add_constant(Constant::Bool(initial_result))?;
             self.emit(LOAD_CONST, result, 1)?;
         }
         let exhausted_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
-        if collect_tuple && self.control.generators.copy_optimized_tuple_branch_exit {
+        if collect_collection && self.control.generators.copy_optimized_tuple_branch_exit {
             self.assembler
                 .allow_transitive_small_exit_inlining(exhausted_exit);
         }
@@ -3918,22 +3957,16 @@ impl Compiler<'_> {
         let comprehension_cell_names = comprehension_cell_names(generators, key, value);
         let base_depth = self.control.stack.depth;
         let comprehension_location = self.assembler.location();
-        if generators[0].is_async {
+        if generators[0].is_async || self.context.python_version == PythonVersion::Py315 {
             self.compile_expression(&generators[0].iter)?;
         } else {
             self.compile_iterable_expression(&generators[0].iter)?;
         }
-        self.assembler
-            .set_location(self.source_location(generators[0].iter.range()));
-        self.emit(
-            if generators[0].is_async {
-                GET_AITER
-            } else {
-                GET_ITER
-            },
-            0,
-            0,
-        )?;
+        if self.context.python_version == PythonVersion::Py314 {
+            self.assembler
+                .set_location(self.source_location(generators[0].iter.range()));
+            self.emit_comprehension_iterator(generators[0].is_async)?;
+        }
         self.assembler.set_location(comprehension_location);
 
         let mut temporary_names = comprehension_temporary_names(generators, key, value);
@@ -4558,10 +4591,18 @@ impl Compiler<'_> {
             .clone_from(&self.symbols.imported_scope_names);
         // CPython only inserts `.<locals>` for function, async-function, and lambda parents.
         child.unit.child_qualified_name_parent = Some(child.unit.qualified_name.clone());
-        child.emit_function_prologue()?;
         let generator_location = child.source_location(generator_range);
+        if child.context.python_version == PythonVersion::Py315 {
+            child.emit_generator_expression_prologue(
+                generator.generators[0].is_async,
+                child.source_location(generator.generators[0].iter.range()),
+            )?;
+        } else {
+            child.emit_function_prologue()?;
+            child.assembler.set_location(generator_location);
+            child.emit_owned_fast(0, 1)?;
+        }
         child.assembler.set_location(generator_location);
-        child.emit_owned_fast(0, 1)?;
         child.compile_generator_expression_loop(
             &generator.generators,
             0,
@@ -4595,29 +4636,27 @@ impl Compiler<'_> {
                 },
                 None,
                 |compiler| {
-                    if generator.generators[0].is_async {
+                    if generator.generators[0].is_async
+                        || compiler.context.python_version == PythonVersion::Py315
+                    {
                         compiler.compile_expression(&generator.generators[0].iter)
                     } else {
                         compiler.compile_iterable_expression(&generator.generators[0].iter)
                     }
                 },
             )?;
-        } else if generator.generators[0].is_async {
+        } else if generator.generators[0].is_async
+            || self.context.python_version == PythonVersion::Py315
+        {
             self.compile_expression(&generator.generators[0].iter)?;
         } else {
             self.compile_iterable_expression(&generator.generators[0].iter)?;
         }
-        self.assembler
-            .set_location(self.source_location(generator.generators[0].iter.range()));
-        self.emit(
-            if generator.generators[0].is_async {
-                GET_AITER
-            } else {
-                GET_ITER
-            },
-            0,
-            0,
-        )?;
+        if self.context.python_version == PythonVersion::Py314 {
+            self.assembler
+                .set_location(self.source_location(generator.generators[0].iter.range()));
+            self.emit_comprehension_iterator(generator.generators[0].is_async)?;
+        }
         self.assembler
             .set_location(self.source_location(generator_range));
         self.emit(CALL, 0, -1)
@@ -4665,7 +4704,7 @@ impl Compiler<'_> {
         self.assembler
             .set_location(self.source_location(generator.iter.range()));
         self.emit(END_FOR, 0, -1)?;
-        self.emit(POP_ITER, 0, -1)?;
+        self.emit(POP_ITER, 0, -self.iterator_slots())?;
         Ok(())
     }
 
@@ -4695,6 +4734,9 @@ impl Compiler<'_> {
             .record_exception_setup(protected_start, false);
         self.assembler.mark(protected_start);
         self.emit(GET_ANEXT, 0, 1)?;
+        if self.context.python_version == PythonVersion::Py315 {
+            self.emit(PUSH_NULL, 0, 1)?;
+        }
         let none = self.add_constant(Constant::None)?;
         self.emit(LOAD_CONST, none, 1)?;
         self.assembler.mark(send);
@@ -4706,7 +4748,7 @@ impl Compiler<'_> {
         self.emit_resume(ResumeLocation::AFTER_AWAIT, ResumeDepth::Zero)?;
         self.emit_jump_backward(JUMP_BACKWARD_NO_INTERRUPT, send, 0)?;
         self.assembler.mark(cleanup_throw);
-        self.set_depth(loop_depth + 3);
+        self.set_depth(loop_depth + 3 + self.iterator_extra_slots());
         self.emit(CLEANUP_THROW, 0, -1)?;
         let cleanup_throw_end = self.assembler.label();
         self.assembler.mark(cleanup_throw_end);
@@ -4715,8 +4757,8 @@ impl Compiler<'_> {
             .generator_region_exclusions
             .push((cleanup_throw, cleanup_throw_end));
         self.assembler.mark(send_end);
-        self.set_depth(loop_depth + 2);
-        self.emit(END_SEND, 0, -1)?;
+        self.set_depth(loop_depth + 2 + self.iterator_extra_slots());
+        self.emit(END_SEND, 0, -self.iterator_slots())?;
         self.assembler.mark(protected_end);
         self.compile_store_target(&generator.target)?;
 
@@ -4739,7 +4781,7 @@ impl Compiler<'_> {
             yielded,
             yielded_end,
             cleanup_throw,
-            (loop_depth + 2).cast_unsigned(),
+            (loop_depth + 2 + self.iterator_extra_slots()).cast_unsigned(),
             false,
         );
         self.assembler.mark(async_cleanup);
@@ -4871,7 +4913,7 @@ impl Compiler<'_> {
                 }
                 self.assembler
                     .set_location(self.source_location(nested.iter.range()));
-                self.emit(if nested.is_async { GET_AITER } else { GET_ITER }, 0, 0)?;
+                self.emit_comprehension_iterator(nested.is_async)?;
                 self.compile_generator_expression_loop(
                     generators,
                     index + 1,
@@ -4879,6 +4921,29 @@ impl Compiler<'_> {
                     generator_location,
                 )?;
             }
+        } else if self.context.python_version == PythonVersion::Py315
+            && let Expr::Starred(starred) = element
+        {
+            self.compile_iterable_expression(&starred.value)?;
+            self.assembler
+                .set_location(self.source_location(element.range()));
+            self.emit_comprehension_iterator(false)?;
+            let loop_depth = self.control.stack.depth;
+            let start = self.assembler.label();
+            let end = self.assembler.label();
+            self.assembler.mark(start);
+            self.emit_jump_forward(FOR_ITER, end, 1)?;
+            if self.unit.flags & CO_ASYNC_GENERATOR != 0 {
+                self.emit_unary_intrinsic(UnaryIntrinsic::ASYNC_GEN_WRAP)?;
+            }
+            self.emit_yield_value(0, 0)?;
+            self.emit_resume(ResumeLocation::AFTER_YIELD, ResumeDepth::One)?;
+            self.emit(POP_TOP, 0, -1)?;
+            self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
+            self.assembler.mark(end);
+            self.set_depth(loop_depth + 1);
+            self.emit(END_FOR, 0, -1)?;
+            self.emit(POP_ITER, 0, -self.iterator_slots())?;
         } else {
             self.compile_expression(element)?;
             self.assembler
@@ -5768,6 +5833,19 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    /// Initializes an iterator and the target's optional synchronous index slot.
+    fn emit_comprehension_iterator(&mut self, is_async: bool) -> Result<(), CompileError> {
+        self.emit(
+            if is_async { GET_AITER } else { GET_ITER },
+            0,
+            if is_async {
+                0
+            } else {
+                self.iterator_extra_slots()
+            },
+        )
+    }
+
     fn compile_comprehension_generator(
         &mut self,
         generators: &[ruff_python_ast::Comprehension],
@@ -5788,8 +5866,14 @@ impl Compiler<'_> {
                 iterator_depth,
             );
         }
-        let loop_depth = self.control.stack.depth;
         let comprehension_location = self.assembler.location();
+        if index == 0 && self.context.python_version == PythonVersion::Py315 {
+            self.assembler
+                .set_location(self.source_location(generator.iter.range()));
+            self.emit_comprehension_iterator(false)?;
+            self.assembler.set_location(comprehension_location);
+        }
+        let loop_depth = self.control.stack.depth;
         let start = self.assembler.label();
         let cleanup = self.assembler.label();
         self.assembler.mark(start);
@@ -5829,7 +5913,7 @@ impl Compiler<'_> {
             add_opcode,
             ComprehensionLoop {
                 restart: start,
-                iterator_depth: iterator_depth + 1,
+                iterator_depth: iterator_depth + usize::try_from(self.iterator_slots()).unwrap(),
                 comprehension_location,
             },
         )?;
@@ -5839,7 +5923,7 @@ impl Compiler<'_> {
         self.assembler
             .set_location(self.source_location(generator.iter.range()));
         self.emit(END_FOR, 0, -1)?;
-        self.emit(POP_ITER, 0, -1)?;
+        self.emit(POP_ITER, 0, -self.iterator_slots())?;
         Ok(())
     }
 
@@ -5899,7 +5983,7 @@ impl Compiler<'_> {
                 }
                 self.assembler
                     .set_location(self.source_location(nested.iter.range()));
-                self.emit(if nested.is_async { GET_AITER } else { GET_ITER }, 0, 0)?;
+                self.emit_comprehension_iterator(nested.is_async)?;
                 self.assembler
                     .set_location(loop_context.comprehension_location);
                 self.compile_comprehension_generator(
@@ -5914,7 +5998,17 @@ impl Compiler<'_> {
             self.assembler
                 .set_location(self.source_location(key.unwrap_or(value).range()));
         } else {
-            self.compile_comprehension_element(key, value)?;
+            let (element, add_opcode) = if self.context.python_version == PythonVersion::Py315 {
+                match (add_opcode, value) {
+                    (LIST_APPEND, Expr::Starred(starred)) => (starred.value.as_ref(), LIST_EXTEND),
+                    (SET_ADD, Expr::Starred(starred)) => (starred.value.as_ref(), SET_UPDATE),
+                    (MAP_ADD, _) if key.is_none() => (value, DICT_UPDATE),
+                    _ => (value, add_opcode),
+                }
+            } else {
+                (value, add_opcode)
+            };
+            self.compile_comprehension_element(key, element)?;
             let add_range = key.map_or_else(
                 || value.range(),
                 |key| ruff_text_size::TextRange::new(key.range().start(), value.range().end()),
@@ -5975,8 +6069,14 @@ impl Compiler<'_> {
         iterator_depth: usize,
     ) -> Result<(), CompileError> {
         let generator = &generators[index];
-        let loop_depth = self.control.stack.depth;
         let cleanup_location = self.assembler.location();
+        if index == 0 && self.context.python_version == PythonVersion::Py315 {
+            self.assembler
+                .set_location(self.source_location(generator.iter.range()));
+            self.emit_comprehension_iterator(true)?;
+            self.assembler.set_location(cleanup_location);
+        }
+        let loop_depth = self.control.stack.depth;
         let start = self.assembler.label();
         let protected_start = self.assembler.label();
         let yielded = self.assembler.label();
@@ -5995,6 +6095,9 @@ impl Compiler<'_> {
             .record_exception_setup(protected_start, false);
         self.assembler.mark(protected_start);
         self.emit(GET_ANEXT, 0, 1)?;
+        if self.context.python_version == PythonVersion::Py315 {
+            self.emit(PUSH_NULL, 0, 1)?;
+        }
         let none = self.add_constant(Constant::None)?;
         self.emit(LOAD_CONST, none, 1)?;
         self.assembler.mark(send);
@@ -6008,13 +6111,13 @@ impl Compiler<'_> {
         self.assembler.mark(protected_before_cleanup_end);
         self.assembler.set_location(cleanup_location);
         self.assembler.mark(cleanup_throw);
-        self.set_depth(loop_depth + 3);
+        self.set_depth(loop_depth + 3 + self.iterator_extra_slots());
         self.emit(CLEANUP_THROW, 0, -1)?;
         self.assembler.mark(cleanup_throw_end);
         self.assembler.mark(protected_after_cleanup_start);
         self.assembler.mark(send_end);
-        self.set_depth(loop_depth + 2);
-        self.emit(END_SEND, 0, -1)?;
+        self.set_depth(loop_depth + 2 + self.iterator_extra_slots());
+        self.emit(END_SEND, 0, -self.iterator_slots())?;
         self.assembler.mark(protected_end);
         self.compile_store_target(&generator.target)?;
 
@@ -6071,7 +6174,7 @@ impl Compiler<'_> {
             yielded,
             yielded_end,
             cleanup_throw,
-            (loop_depth + 2).cast_unsigned(),
+            (loop_depth + 2 + self.iterator_extra_slots()).cast_unsigned(),
             false,
         );
         self.assembler.mark(async_cleanup);
@@ -6831,7 +6934,7 @@ impl Compiler<'_> {
             false
         };
         let optimized_tuple_join = matches!(expression.body.as_ref(), Expr::Call(call)
-            if optimized_generator_callable(call) == Some("tuple"))
+            if matches!(optimized_generator_callable_for_target(call, self.context.python_version), Some("tuple" | "list" | "set")))
             && self.assembler.at_jump_target();
         let body_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
         if let Expr::If(nested) = expression.body.as_ref()
@@ -8843,10 +8946,18 @@ fn generator_is_async(generator: &ruff_python_ast::ExprGenerator) -> bool {
 }
 
 pub(super) fn optimized_generator_callable(call: &ruff_python_ast::ExprCall) -> Option<&str> {
+    optimized_generator_callable_for_target(call, PythonVersion::Py314)
+}
+
+pub(super) fn optimized_generator_callable_for_target(
+    call: &ruff_python_ast::ExprCall,
+    python_version: PythonVersion,
+) -> Option<&str> {
     let Expr::Name(name) = call.func.as_ref() else {
         return None;
     };
-    if !matches!(name.id.as_str(), "all" | "any" | "tuple")
+    if !(matches!(name.id.as_str(), "all" | "any" | "tuple")
+        || (python_version == PythonVersion::Py315 && matches!(name.id.as_str(), "list" | "set")))
         || !matches!(call.arguments.args.as_ref(), [Expr::Generator(generator)]
             if !generator_is_async(generator))
         || !call.arguments.keywords.is_empty()

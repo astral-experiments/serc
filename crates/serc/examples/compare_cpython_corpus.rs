@@ -8,8 +8,8 @@ use std::process::{Command, ExitCode};
 use std::time::Instant;
 
 use serc::{
-    CPYTHON_TARGET, CompileError, CompiledModule, InitialInternState, compile, compile_bytes,
-    compile_bytes_with_intern_state, compile_with_intern_state,
+    CompileError, CompileOptions, CompiledModule, PythonVersion, compile_bytes_with_options,
+    compile_with_options,
 };
 
 #[path = "support/initial_intern_profile.rs"]
@@ -129,6 +129,7 @@ enum CompilerOutcome {
 #[derive(Debug)]
 struct Options {
     python: String,
+    python_version: PythonVersion,
     roots: Vec<PathBuf>,
     extensions: Vec<String>,
     limit: Option<usize>,
@@ -163,7 +164,7 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    if let Err(message) = verify_python(&options.python) {
+    if let Err(message) = verify_python(&options.python, options.python_version) {
         eprintln!("{message}");
         return ExitCode::from(2);
     }
@@ -171,7 +172,13 @@ fn main() -> ExitCode {
         .initial_intern_state
         .as_deref()
         .map(|path| {
-            initial_intern_profile::load(path, &options.python, options.source_bytes, ORACLE)
+            initial_intern_profile::load(
+                path,
+                &options.python,
+                options.python_version,
+                options.source_bytes,
+                ORACLE,
+            )
         })
         .transpose()
     {
@@ -181,13 +188,16 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let initial_intern_state = profile.as_ref().map(|profile| &profile.state);
     if let Some(profile) = &profile {
         println!(
             "Initial intern-state snapshot: {} ({} entries; captured process state)",
             profile.snapshot_sha256, profile.entries
         );
     }
+    let compile_options = CompileOptions {
+        python_version: options.python_version,
+        initial_intern_state: profile.map(|profile| profile.state).unwrap_or_default(),
+    };
     let mut paths = match discover(&options.roots, &options.extensions) {
         Ok(paths) => paths,
         Err(message) => {
@@ -250,6 +260,7 @@ fn main() -> ExitCode {
                 .expect("reader profile checked"),
             &options.python,
             ORACLE,
+            options.python_version,
             &paths,
         ) {
             Ok(reader) => {
@@ -284,14 +295,14 @@ fn main() -> ExitCode {
             .enumerate()
             .map(|(index, path)| {
                 if let Some(reader) = &reader {
-                    return reader.compare(index, path, initial_intern_state);
+                    return reader.compare(index, path, &compile_options);
                 }
                 let mut observation = cache.as_ref().map(|writer| writer.begin(index, path));
                 let outcome = compare(
                     path,
                     &options.python,
                     options.source_bytes,
-                    initial_intern_state,
+                    &compile_options,
                     observation.as_mut(),
                 );
                 if let Some(observation) = observation {
@@ -365,7 +376,7 @@ fn main() -> ExitCode {
             &options.python,
             directory,
             options.source_bytes,
-            initial_intern_state,
+            &compile_options,
         ) {
             eprintln!("failed to dump mismatches: {error}");
             return ExitCode::FAILURE;
@@ -481,34 +492,63 @@ fn validate_outcome_counts(
     failures
 }
 
-fn verify_python(python: &str) -> Result<(), String> {
-    let version = CPYTHON_TARGET.version_string();
-    let magic = CPYTHON_TARGET.magic_hex();
+#[derive(Debug, serde::Deserialize)]
+struct PythonIdentity {
+    implementation: String,
+    version: String,
+    release_level: String,
+    release_serial: u8,
+    magic: String,
+}
+
+impl PythonIdentity {
+    fn matches(&self, version: PythonVersion) -> bool {
+        let target = version.target();
+        let (release_level, release_serial) = match version {
+            PythonVersion::Py314 => ("final", 0),
+            PythonVersion::Py315 => ("candidate", 2),
+        };
+        self.implementation == target.implementation
+            && self.version == target.version_string()
+            && self.release_level == release_level
+            && self.release_serial == release_serial
+            && self.magic == target.magic_hex()
+    }
+}
+
+fn verify_python(python: &str, python_version: PythonVersion) -> Result<(), String> {
+    let target = python_version.target();
     let output = Command::new(python)
         .args([
+            "-B",
             "-I",
             "-S",
             "-c",
-            "import importlib.util, sys; actual = sys.version_info[:3]; magic = importlib.util.MAGIC_NUMBER.hex(); print(f'{sys.implementation.name} {'.'.join(map(str, actual))} magic {magic}'); expected = tuple(map(int, sys.argv[2].split('.'))); raise SystemExit(sys.implementation.name != sys.argv[1] or actual != expected or magic != sys.argv[3])",
-            CPYTHON_TARGET.implementation,
-            version.as_str(),
-            magic.as_str(),
+            "import importlib.util, json, sys; print(json.dumps(dict(implementation=sys.implementation.name, version='.'.join(map(str, sys.version_info[:3])), release_level=sys.version_info.releaselevel, release_serial=sys.version_info.serial, magic=importlib.util.MAGIC_NUMBER.hex())))",
         ])
         .output()
         .map_err(|error| format!("failed to run {python}: {error}"))?;
-    let identity = one_line(&output.stdout);
-    if output.status.success() {
+    let identity: PythonIdentity = serde_json::from_slice(&output.stdout).map_err(|error| {
+        format!(
+            "failed to read {python} identity: {error}; {}",
+            one_line(&output.stderr)
+        )
+    })?;
+    if output.status.success() && identity.matches(python_version) {
         Ok(())
     } else {
         Err(format!(
-            "{python} is {identity}; the compiler and oracle require {} {} with magic {}",
-            CPYTHON_TARGET.implementation, version, magic
+            "{python} is {identity:?}; the compiler and oracle require {} {} with magic {}",
+            target.implementation,
+            target.tag,
+            target.magic_hex()
         ))
     }
 }
 
 fn parse_options() -> Result<Options, String> {
     let mut python = "python3".to_string();
+    let mut python_version = PythonVersion::default();
     let mut roots = Vec::new();
     let mut extensions = vec!["py".to_string()];
     let mut limit = None;
@@ -529,6 +569,13 @@ fn parse_options() -> Result<Options, String> {
                 python = arguments
                     .next()
                     .ok_or_else(|| "--python requires an executable".to_string())?;
+            }
+            "--python-version" => {
+                python_version = arguments
+                    .next()
+                    .ok_or_else(|| "--python-version requires 3.14 or 3.15".to_string())?
+                    .parse::<PythonVersion>()
+                    .map_err(|error| error.to_string())?;
             }
             "--limit" => {
                 limit = Some(
@@ -613,7 +660,7 @@ fn parse_options() -> Result<Options, String> {
             "--source-bytes" => source_bytes = true,
             "--help" | "-h" => {
                 return Err(
-                    "usage: compare_cpython_corpus [--python PATH] [--extension EXT] [--source-bytes] [--initial-intern-state PROFILE.json] [--limit N] [--expected-files N] [--expected-exact N] [--expected-cpython-rejected N] [--examples N] [--require-all] [--require-rejection-parity] [--dump-mismatches DIR] [ROOT ...]"
+                    "usage: compare_cpython_corpus [--python PATH] [--python-version 3.14|3.15] [--extension EXT] [--source-bytes] [--initial-intern-state PROFILE.json] [--limit N] [--expected-files N] [--expected-exact N] [--expected-cpython-rejected N] [--examples N] [--require-all] [--require-rejection-parity] [--dump-mismatches DIR] [ROOT ...]"
                         .to_string(),
                 );
             }
@@ -640,6 +687,7 @@ fn parse_options() -> Result<Options, String> {
 
     Ok(Options {
         python,
+        python_version,
         roots,
         extensions,
         limit,
@@ -697,7 +745,7 @@ fn dump_mismatches(
     python: &str,
     directory: &Path,
     source_bytes: bool,
-    initial_intern_state: Option<&InitialInternState>,
+    options: &CompileOptions,
 ) -> Result<(), std::io::Error> {
     fs_err::create_dir_all(directory)?;
     outcomes
@@ -711,7 +759,7 @@ fn dump_mismatches(
                 CompilerInput::Text(fs_err::read_to_string(&outcome.path)?)
             };
             let filename = outcome.path.to_string_lossy();
-            let ours = compile_module_input(&source, &filename, initial_intern_state)
+            let ours = compile_module_input(&source, &filename, options)
                 .expect("a mismatch compiled successfully in the first pass")
                 .marshal();
             let oracle = Command::new(python)
@@ -753,7 +801,7 @@ fn compare(
     path: &Path,
     python: &str,
     source_bytes: bool,
-    initial_intern_state: Option<&InitialInternState>,
+    options: &CompileOptions,
     mut observation: Option<&mut native_output_cache::Observation<'_>>,
 ) -> Outcome {
     let output = Command::new(python)
@@ -817,7 +865,7 @@ fn compare(
     };
 
     let filename = path.to_string_lossy();
-    let compiled = compile_input(&source, &filename, initial_intern_state);
+    let compiled = compile_input(&source, &filename, options);
     if let Some(observation) = observation {
         observation.compiled(&source, &compiled);
     }
@@ -828,27 +876,21 @@ fn compare(
 fn compile_module_input(
     source: &CompilerInput,
     filename: &str,
-    initial_intern_state: Option<&InitialInternState>,
+    options: &CompileOptions,
 ) -> Result<CompiledModule, CompileError> {
-    match (source, initial_intern_state) {
-        (CompilerInput::Bytes(source), Some(state)) => {
-            compile_bytes_with_intern_state(source, filename, state)
-        }
-        (CompilerInput::Text(source), Some(state)) => {
-            compile_with_intern_state(source, filename, state)
-        }
-        (CompilerInput::Bytes(source), None) => compile_bytes(source, filename),
-        (CompilerInput::Text(source), None) => compile(source, filename),
+    match source {
+        CompilerInput::Bytes(source) => compile_bytes_with_options(source, filename, options),
+        CompilerInput::Text(source) => compile_with_options(source, filename, options),
     }
 }
 
 fn compile_input(
     source: &CompilerInput,
     filename: &str,
-    initial_intern_state: Option<&InitialInternState>,
+    options: &CompileOptions,
 ) -> CompilerOutcome {
     capture_compiler(|| {
-        compile_module_input(source, filename, initial_intern_state).map(|module| module.marshal())
+        compile_module_input(source, filename, options).map(|module| module.marshal())
     })
 }
 
@@ -951,12 +993,73 @@ fn one_line(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompilerInput, CompilerOutcome, ORACLE, OracleOutcome, OutcomeKind, capture_compiler,
-        classify, compile_input, compile_module_input, discover, validate_outcome_counts,
+        CompileOptions, CompilerInput, CompilerOutcome, ORACLE, OracleOutcome, OutcomeKind,
+        PythonIdentity, PythonVersion, capture_compiler, classify, compile_input,
+        compile_module_input, discover, validate_outcome_counts,
     };
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
+
+    #[test]
+    fn oracle_identity_rejects_other_targets_and_release_candidates() {
+        for python_version in [PythonVersion::Py314, PythonVersion::Py315] {
+            let target = python_version.target();
+            let (release_level, release_serial) = match python_version {
+                PythonVersion::Py314 => ("final", 0),
+                PythonVersion::Py315 => ("candidate", 2),
+            };
+            let mut identity = PythonIdentity {
+                implementation: target.implementation.to_string(),
+                version: target.version_string(),
+                release_level: release_level.to_string(),
+                release_serial,
+                magic: target.magic_hex(),
+            };
+            assert!(identity.matches(python_version));
+            let other = match python_version {
+                PythonVersion::Py314 => PythonVersion::Py315,
+                PythonVersion::Py315 => PythonVersion::Py314,
+            };
+            assert!(!identity.matches(other));
+            identity.release_serial += 1;
+            assert!(!identity.matches(python_version));
+            identity.release_serial = release_serial;
+            identity.release_level = "alpha".to_string();
+            assert!(!identity.matches(python_version));
+            identity.release_level = release_level.to_string();
+            identity.magic = "wrong magic".to_string();
+            assert!(!identity.matches(python_version));
+        }
+    }
+
+    #[test]
+    fn frozen_native_oracle_script_remains_unchanged() {
+        use sha2::{Digest, Sha256};
+
+        assert_eq!(
+            format!("{:x}", Sha256::digest(ORACLE.as_bytes())),
+            "6812e016e7e871700001ad9f8f832c5998d553bc33c84afb1745dbd664a965fb"
+        );
+    }
+
+    #[test]
+    fn selected_target_reaches_both_input_modes() {
+        for python_version in [PythonVersion::Py314, PythonVersion::Py315] {
+            let options = CompileOptions {
+                python_version,
+                ..CompileOptions::default()
+            };
+            for input in [
+                CompilerInput::Text("value = 1\n".to_string()),
+                CompilerInput::Bytes(b"value = 1\n".to_vec()),
+            ] {
+                let module = compile_module_input(&input, "target.py", &options).unwrap();
+                assert_eq!(module.python_version(), python_version);
+                assert_eq!(module.target(), python_version.target());
+            }
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -989,7 +1092,10 @@ mod tests {
                 oracle.to_str().unwrap(),
                 &dump,
                 source_bytes,
-                Some(&state),
+                &CompileOptions {
+                    initial_intern_state: state.clone(),
+                    ..CompileOptions::default()
+                },
             )
             .unwrap();
             assert_eq!(fs::read(dump.join("0000.ours.marshal")).unwrap(), expected);
@@ -1008,12 +1114,19 @@ mod tests {
             CompilerInput::Text(source.to_string()),
             CompilerInput::Bytes(source.as_bytes().to_vec()),
         ] {
-            let default = compile_module_input(&input, "profile.py", None)
+            let default = compile_module_input(&input, "profile.py", &CompileOptions::default())
                 .unwrap()
                 .marshal();
-            let supplied = compile_module_input(&input, "profile.py", Some(&state))
-                .unwrap()
-                .marshal();
+            let supplied = compile_module_input(
+                &input,
+                "profile.py",
+                &CompileOptions {
+                    initial_intern_state: state.clone(),
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .marshal();
             assert_eq!(
                 default,
                 serc::compile(source, "profile.py").unwrap().marshal()
@@ -1062,7 +1175,7 @@ mod tests {
             CompilerInput::Text("if:\n".to_string()),
             CompilerInput::Bytes(b"if:\n".to_vec()),
         ] {
-            let compiled = compile_input(&source, "invalid.py", None);
+            let compiled = compile_input(&source, "invalid.py", &CompileOptions::default());
             let outcome = classify(
                 Path::new("invalid.py"),
                 OracleOutcome::Rejected("SyntaxError: invalid syntax".to_string()),
@@ -1080,7 +1193,7 @@ mod tests {
         let compiled = compile_input(
             &CompilerInput::Text("return\n".to_string()),
             "invalid.py",
-            None,
+            &CompileOptions::default(),
         );
         let outcome = classify(
             Path::new("invalid.py"),
@@ -1099,7 +1212,7 @@ mod tests {
             CompilerInput::Text("pass\n".to_string()),
             CompilerInput::Bytes(b"pass\n".to_vec()),
         ] {
-            let compiled = compile_input(&source, "valid.py", None);
+            let compiled = compile_input(&source, "valid.py", &CompileOptions::default());
             let outcome = classify(
                 Path::new("valid.py"),
                 OracleOutcome::Rejected("SyntaxError: invalid syntax".to_string()),

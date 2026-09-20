@@ -1,9 +1,9 @@
-use crate::InitialInternState;
 use crate::code_object::{CodeObject, Constant};
+use crate::{InitialInternState, PythonVersion};
 
 use super::graph::{ObjectGraph, OccurrenceCursor, OccurrenceKind};
 use super::key::FrozenSetMembers;
-use super::plan::{MarshalVisitor, ObjectId, ReferenceMode, traverse_code};
+use super::plan::{MarshalVisitor, ObjectId, ReferenceMode, traverse_code_with_mode};
 use super::v5::{
     FLAG_REF, TYPE_ASCII, TYPE_ASCII_INTERNED, TYPE_BINARY_COMPLEX, TYPE_BINARY_FLOAT, TYPE_CODE,
     TYPE_ELLIPSIS, TYPE_FALSE, TYPE_FROZENSET, TYPE_INT, TYPE_INTERNED, TYPE_LONG, TYPE_NONE,
@@ -11,28 +11,90 @@ use super::v5::{
     TYPE_STRING, TYPE_TRUE, TYPE_TUPLE, TYPE_UNICODE,
 };
 
+// CPython 3.15 adds marshal v6's frozendict tag. The scalar, tuple, frozenset, slice,
+// and code-object tags emitted here retain their v5 wire representation. Verify this
+// against both generated release tables so a target regeneration cannot silently
+// change the shared encoder's assumptions.
+const _: () = {
+    assert!(super::v5::MARSHAL_VERSION == 5);
+    assert!(super::v6::MARSHAL_VERSION == 6);
+    assert!(super::v5::FLAG_REF == super::v6::FLAG_REF);
+    assert!(super::v5::TYPE_ASCII == super::v6::TYPE_ASCII);
+    assert!(super::v5::TYPE_ASCII_INTERNED == super::v6::TYPE_ASCII_INTERNED);
+    assert!(super::v5::TYPE_BINARY_COMPLEX == super::v6::TYPE_BINARY_COMPLEX);
+    assert!(super::v5::TYPE_BINARY_FLOAT == super::v6::TYPE_BINARY_FLOAT);
+    assert!(super::v5::TYPE_CODE == super::v6::TYPE_CODE);
+    assert!(super::v5::TYPE_ELLIPSIS == super::v6::TYPE_ELLIPSIS);
+    assert!(super::v5::TYPE_FALSE == super::v6::TYPE_FALSE);
+    assert!(super::v5::TYPE_FROZENSET == super::v6::TYPE_FROZENSET);
+    assert!(super::v5::TYPE_INT == super::v6::TYPE_INT);
+    assert!(super::v5::TYPE_INTERNED == super::v6::TYPE_INTERNED);
+    assert!(super::v5::TYPE_LONG == super::v6::TYPE_LONG);
+    assert!(super::v5::TYPE_NONE == super::v6::TYPE_NONE);
+    assert!(super::v5::TYPE_REF == super::v6::TYPE_REF);
+    assert!(super::v5::TYPE_SHORT_ASCII == super::v6::TYPE_SHORT_ASCII);
+    assert!(super::v5::TYPE_SHORT_ASCII_INTERNED == super::v6::TYPE_SHORT_ASCII_INTERNED);
+    assert!(super::v5::TYPE_SLICE == super::v6::TYPE_SLICE);
+    assert!(super::v5::TYPE_SMALL_TUPLE == super::v6::TYPE_SMALL_TUPLE);
+    assert!(super::v5::TYPE_STRING == super::v6::TYPE_STRING);
+    assert!(super::v5::TYPE_TRUE == super::v6::TYPE_TRUE);
+    assert!(super::v5::TYPE_TUPLE == super::v6::TYPE_TUPLE);
+    assert!(super::v5::TYPE_UNICODE == super::v6::TYPE_UNICODE);
+};
+
 const UNSEEN_REFERENCE: u32 = u32::MAX;
 
 #[cfg(test)]
 pub(crate) fn encode_code(code: &CodeObject) -> Vec<u8> {
-    encode_code_with_intern_state(code, &InitialInternState::default())
+    encode_code_with_options(code, PythonVersion::Py314, &InitialInternState::default())
 }
 
-pub(crate) fn encode_code_with_intern_state(
+pub(crate) fn encode_code_with_options(
     code: &CodeObject,
+    python_version: PythonVersion,
     initial_intern_state: &InitialInternState,
 ) -> Vec<u8> {
     let mut output = Vec::new();
-    encode_code_into_with_intern_state(code, initial_intern_state, &mut output);
+    encode_code_into_with_mode(
+        code,
+        python_version,
+        initial_intern_state,
+        &mut output,
+        ReferenceMode::Forced,
+    );
     output
 }
 
-pub(crate) fn encode_code_into_with_intern_state(
+pub(crate) fn encode_pyc_code_into_with_options(
     code: &CodeObject,
+    python_version: PythonVersion,
     initial_intern_state: &InitialInternState,
     output: &mut Vec<u8>,
 ) {
-    let graph = ObjectGraph::for_code_with_intern_state(code, initial_intern_state);
+    // CPython 3.15's borrowed local loads leave py_compile's root code object
+    // uniquely owned at marshal.dumps. A retained-code marshal call still has
+    // an external owner, which encode_code_with_options models separately.
+    let root_reference = match python_version {
+        PythonVersion::Py314 => ReferenceMode::Forced,
+        PythonVersion::Py315 => ReferenceMode::IfShared,
+    };
+    encode_code_into_with_mode(
+        code,
+        python_version,
+        initial_intern_state,
+        output,
+        root_reference,
+    );
+}
+
+fn encode_code_into_with_mode(
+    code: &CodeObject,
+    python_version: PythonVersion,
+    initial_intern_state: &InitialInternState,
+    output: &mut Vec<u8>,
+    root_reference: ReferenceMode,
+) {
+    let graph = ObjectGraph::for_code_with_options(code, python_version, initial_intern_state);
     let mut writer = Writer {
         graph: &graph,
         output,
@@ -40,7 +102,7 @@ pub(crate) fn encode_code_into_with_intern_state(
         reference_count: 0,
         occurrences: graph.occurrence_cursor(),
     };
-    traverse_code(code, &mut writer);
+    traverse_code_with_mode(code, root_reference, &mut writer);
     writer.finish();
 }
 
@@ -464,6 +526,10 @@ impl Writer<'_, '_, '_> {
 
 impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
     const USES_METADATA_IDS: bool = false;
+
+    fn python_version(&self) -> PythonVersion {
+        self.graph.python_version()
+    }
 
     fn frozen_set_members(&self, values: &'code [Constant]) -> FrozenSetMembers<'code> {
         self.graph.frozen_set_members(values)

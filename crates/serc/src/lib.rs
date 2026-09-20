@@ -1,12 +1,13 @@
 //! Compile Python source to CPython bytecode without starting a Python interpreter.
 //!
-//! This crate currently targets CPython 3.14.5 exclusively. The bytecode, code object,
-//! marshal, and `.pyc` formats are all implementation details that can change between
-//! Python releases, so future targets should be implemented as separate backends.
+//! Select the Python target with [`CompileOptions`]. The default targets CPython 3.14.5;
+//! Python 3.15 targets CPython 3.15.0rc2. Bytecode, code objects, marshal, and `.pyc`
+//! formats are implementation details tied to these exact CPython releases.
 
 mod assembler;
 mod code_object;
 mod compiler;
+mod config;
 mod initial_intern_state;
 mod marshal;
 mod source;
@@ -17,6 +18,7 @@ use std::fmt;
 
 use code_object::{CodeObject, CodeObjectValidationError};
 use compiler::Compiler;
+pub use config::{CompileOptions, ParsePythonVersionError, PythonVersion};
 pub use initial_intern_state::InitialInternState;
 use ruff_text_size::TextRange;
 pub use source::{SourceDecodeError, decode_source};
@@ -56,7 +58,7 @@ impl CpythonTarget {
     }
 }
 
-/// The sole CPython target currently implemented by this crate.
+/// The default CPython target. See [`PythonVersion::target`] for other supported versions.
 pub const CPYTHON_TARGET: CpythonTarget = CpythonTarget {
     implementation: target::TARGET_IMPLEMENTATION,
     version: target::TARGET_VERSION,
@@ -65,37 +67,54 @@ pub const CPYTHON_TARGET: CpythonTarget = CpythonTarget {
     commit: target::TARGET_COMMIT,
 };
 
-/// A compiled CPython 3.14.5 module code object.
+/// A compiled module code object and its selected CPython target.
 #[derive(Clone, Debug)]
 pub struct CompiledModule {
     code: CodeObject,
+    python_version: PythonVersion,
     initial_intern_state: InitialInternState,
 }
 
 impl CompiledModule {
+    /// Return the Python version used to compile and serialize this module.
+    pub fn python_version(&self) -> PythonVersion {
+        self.python_version
+    }
+
+    /// Return the exact CPython target for this module.
+    pub fn target(&self) -> CpythonTarget {
+        self.python_version.target()
+    }
+
     /// Return the module's raw CPython instruction stream.
     pub fn bytecode(&self) -> &[u8] {
         &self.code.bytecode
     }
 
-    /// Marshal the module code object using CPython 3.14.5's format.
+    /// Marshal the module code object using its selected CPython target's format.
     pub fn marshal(&self) -> Vec<u8> {
-        marshal::encode_code_with_intern_state(&self.code, &self.initial_intern_state)
+        marshal::encode_code_with_options(
+            &self.code,
+            self.python_version,
+            &self.initial_intern_state,
+        )
     }
 
-    /// Build a timestamp-invalidated CPython 3.14.5 `.pyc` file.
+    /// Build a timestamp-invalidated `.pyc` file for the selected CPython target.
     ///
     /// `source_mtime` is the source file's modification time in whole seconds since the
     /// Unix epoch. `source_size` is the source file's byte length, truncated to 32 bits as
-    /// required by CPython's cache format.
+    /// required by CPython's cache format. Root-object references follow `py_compile`,
+    /// which can differ from serializing a retained code object with [`Self::marshal`].
     pub fn to_timestamp_pyc(&self, source_mtime: u32, source_size: u32) -> Vec<u8> {
         let mut output = Vec::with_capacity(16 + self.code.bytecode.len());
-        output.extend_from_slice(&CPYTHON_TARGET.magic_number);
+        output.extend_from_slice(&self.target().magic_number);
         output.extend_from_slice(&0_u32.to_le_bytes());
         output.extend_from_slice(&source_mtime.to_le_bytes());
         output.extend_from_slice(&source_size.to_le_bytes());
-        marshal::encode_code_into_with_intern_state(
+        marshal::encode_pyc_code_into_with_options(
             &self.code,
+            self.python_version,
             &self.initial_intern_state,
             &mut output,
         );
@@ -184,7 +203,7 @@ impl From<CodeObjectValidationError> for CompileError {
 
 /// Compile a Python module for CPython 3.14.5.
 pub fn compile(source: &str, filename: &str) -> Result<CompiledModule, CompileError> {
-    compile_with_intern_state(source, filename, &InitialInternState::default())
+    compile_with_options(source, filename, &CompileOptions::default())
 }
 
 /// Compile a Python module with a fixed initial CPython string intern state.
@@ -196,8 +215,24 @@ pub fn compile_with_intern_state(
     filename: &str,
     initial_intern_state: &InitialInternState,
 ) -> Result<CompiledModule, CompileError> {
+    compile_with_options(
+        source,
+        filename,
+        &CompileOptions {
+            initial_intern_state: initial_intern_state.clone(),
+            ..CompileOptions::default()
+        },
+    )
+}
+
+/// Compile a Python module using the selected target and initial string intern state.
+pub fn compile_with_options(
+    source: &str,
+    filename: &str,
+    options: &CompileOptions,
+) -> Result<CompiledModule, CompileError> {
     let source = source::normalize_source(source);
-    compile_normalized(&source, filename, initial_intern_state)
+    compile_normalized(&source, filename, options)
 }
 
 /// Decode and compile Python source bytes for CPython 3.14.5.
@@ -205,7 +240,7 @@ pub fn compile_with_intern_state(
 /// This function performs no filesystem I/O. See [`decode_source`] for the accepted source
 /// encoding and normalization behavior.
 pub fn compile_bytes(source: &[u8], filename: &str) -> Result<CompiledModule, CompileError> {
-    compile_bytes_with_intern_state(source, filename, &InitialInternState::default())
+    compile_bytes_with_options(source, filename, &CompileOptions::default())
 }
 
 /// Decode and compile source bytes with a fixed initial CPython string intern state.
@@ -217,26 +252,56 @@ pub fn compile_bytes_with_intern_state(
     filename: &str,
     initial_intern_state: &InitialInternState,
 ) -> Result<CompiledModule, CompileError> {
+    compile_bytes_with_options(
+        source,
+        filename,
+        &CompileOptions {
+            initial_intern_state: initial_intern_state.clone(),
+            ..CompileOptions::default()
+        },
+    )
+}
+
+/// Decode and compile source bytes using the selected target and initial string intern state.
+///
+/// This function performs no filesystem I/O. See [`decode_source`] for source encoding behavior.
+pub fn compile_bytes_with_options(
+    source: &[u8],
+    filename: &str,
+    options: &CompileOptions,
+) -> Result<CompiledModule, CompileError> {
     let source = decode_source(source).map_err(CompileError::Decode)?;
-    compile_normalized(&source, filename, initial_intern_state)
+    compile_normalized(&source, filename, options)
 }
 
 fn compile_normalized(
     source: &str,
     filename: &str,
-    initial_intern_state: &InitialInternState,
+    options: &CompileOptions,
 ) -> Result<CompiledModule, CompileError> {
-    let options = ruff_python_parser::ParseOptions::from(ruff_python_parser::Mode::Module)
-        .with_target_version(ruff_python_ast::PythonVersion::PY314);
-    let parsed = ruff_python_parser::parse(source, options)
+    let target_version = match options.python_version {
+        PythonVersion::Py314 => ruff_python_ast::PythonVersion::PY314,
+        PythonVersion::Py315 => ruff_python_ast::PythonVersion::PY315,
+    };
+    let parse_options = ruff_python_parser::ParseOptions::from(ruff_python_parser::Mode::Module)
+        .with_target_version(target_version);
+    let parsed = ruff_python_parser::parse(source, parse_options)
         .map_err(CompileError::Parse)?
         .try_into_module()
         .ok_or_else(|| CompileError::Internal("parser did not return a module".to_string()))?;
-    let code = Compiler::module(filename, source, parsed.tokens(), parsed.suite())
-        .compile_module(parsed.suite())?;
+    Compiler::validate_lazy_imports(parsed.suite(), options.python_version)?;
+    let code = Compiler::module_with_python_version(
+        filename,
+        source,
+        parsed.tokens(),
+        parsed.suite(),
+        options.python_version,
+    )
+    .compile_module(parsed.suite())?;
     Ok(CompiledModule {
         code,
-        initial_intern_state: initial_intern_state.clone(),
+        python_version: options.python_version,
+        initial_intern_state: options.initial_intern_state.clone(),
     })
 }
 

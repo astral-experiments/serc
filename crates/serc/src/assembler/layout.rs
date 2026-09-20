@@ -157,8 +157,18 @@ impl LayoutAssembler {
                     let end = position
                         + u32::from(extended_args[instruction_index])
                         + 1
-                        + u32::from(instruction.opcode.caches());
-                    let dynamic_owner = dynamic_exception_owners.get(&instruction_index);
+                        + u32::from(instruction.opcode.caches_for(self.python_version));
+                    if self.python_version == crate::PythonVersion::Py315
+                        && instruction.opcode == NOT_TAKEN
+                        && !instruction.jump_policy.is_authored_branch_marker()
+                    {
+                        // Python 3.15 clears removed CFG slots before jump normalization.
+                        // Newly appended markers therefore never inherit an exception owner.
+                        late_exception_exclusions.push((position, end));
+                    }
+                    let dynamic_owner = (!instruction.jump_policy.is_authored_branch_marker())
+                        .then(|| dynamic_exception_owners.get(&instruction_index))
+                        .flatten();
                     if let Some(region) = dynamic_owner.and_then(|owner| owner.source_region) {
                         late_source_exception_owners.push((position, end, region));
                     } else {
@@ -417,15 +427,17 @@ impl LayoutAssembler {
             let extended_arg_count = extended_args[instruction_index];
 
             for index in (1..=extended_arg_count).rev() {
-                bytecode[byte_offset] = EXTENDED_ARG.code();
+                bytecode[byte_offset] = EXTENDED_ARG.code_for(self.python_version);
                 bytecode[byte_offset + 1] = ((argument >> (u32::from(index) * 8)) & 0xff) as u8;
                 byte_offset += 2;
             }
-            bytecode[byte_offset] = instruction.opcode.code();
+            bytecode[byte_offset] = instruction.opcode.code_for(self.python_version);
             bytecode[byte_offset + 1] = (argument & 0xff) as u8;
-            byte_offset += 2 + usize::from(instruction.opcode.caches()) * 2;
+            byte_offset += 2 + usize::from(instruction.opcode.caches_for(self.python_version)) * 2;
 
-            let size = u32::from(extended_arg_count) + 1 + u32::from(instruction.opcode.caches());
+            let size = u32::from(extended_arg_count)
+                + 1
+                + u32::from(instruction.opcode.caches_for(self.python_version));
             if let Some((location, length)) = &mut run
                 && *location == instruction.location
             {
@@ -466,8 +478,9 @@ impl LayoutAssembler {
             let Item::Instruction(instruction) = *item else {
                 continue;
             };
-            let jump_base = position + 1 + u32::from(instruction.opcode.caches());
-            let argument = match instruction.operand() {
+            let jump_base =
+                position + 1 + u32::from(instruction.opcode.caches_for(self.python_version));
+            let argument = match self.encoded_operand(&instruction)? {
                 Operand::Value(argument) => argument,
                 Operand::Deferred(id) => {
                     return Err(CompileError::Internal(format!(
@@ -487,16 +500,16 @@ impl LayoutAssembler {
                     let target = label_position(labels, label).ok_or_else(|| {
                         CompileError::Internal("unbound backward jump label".to_string())
                     })?;
-                    backward_argument(&instruction, jump_base, target)?
+                    backward_argument(self.python_version, &instruction, jump_base, target)?
                 }
             };
             let Ok(argument) = u8::try_from(argument) else {
                 return Ok(None);
             };
 
-            bytecode[byte_offset] = instruction.opcode.code();
+            bytecode[byte_offset] = instruction.opcode.code_for(self.python_version);
             bytecode[byte_offset + 1] = argument;
-            let size = 1 + u32::from(instruction.opcode.caches());
+            let size = 1 + u32::from(instruction.opcode.caches_for(self.python_version));
             byte_offset += usize::try_from(size).unwrap() * 2;
             position = jump_base;
 
@@ -534,7 +547,7 @@ impl LayoutAssembler {
                 Item::Instruction(instruction) => {
                     position += u32::from(extended_args[instruction_index])
                         + 1
-                        + u32::from(instruction.opcode.caches());
+                        + u32::from(instruction.opcode.caches_for(self.python_version));
                     instruction_index += 1;
                 }
                 Item::Label(label) => {
@@ -549,13 +562,16 @@ impl LayoutAssembler {
 
 /// Resolves CPython's SEND-relative monitoring offset for an async iterator exit.
 pub(super) fn backward_argument(
+    python_version: crate::PythonVersion,
     instruction: &Instruction,
     jump_base: u32,
     target: u32,
 ) -> Result<u32, CompileError> {
-    // CPython's assembler uses the matching SEND plus five code units, even when
-    // cold-block collection leaves CLEANUP_THROW in that position instead of END_SEND.
-    let target = target + u32::from(instruction.opcode == END_ASYNC_FOR) * 5;
+    // The matching SEND's monitoring offset includes target-specific inline caches,
+    // even when cold-block collection places CLEANUP_THROW there instead of END_SEND.
+    let target = target
+        + u32::from(instruction.opcode == END_ASYNC_FOR)
+            * crate::target::end_send_offset_for(python_version);
     jump_base
         .checked_sub(target)
         .ok_or_else(|| CompileError::Internal("backward jump points forward".to_string()))
@@ -704,6 +720,7 @@ mod tests {
 
     fn layout(items: Vec<Item>, exception_regions: Vec<ExceptionRegion>) -> LayoutAssembler {
         LayoutAssembler {
+            python_version: crate::PythonVersion::Py314,
             items,
             exception_regions,
             exception_owner_provenance:
@@ -766,6 +783,71 @@ mod tests {
             ));
         }
         entries
+    }
+
+    #[test]
+    fn python315_normalized_markers_do_not_reuse_cleared_exception_owners() {
+        use crate::PythonVersion::{Py314, Py315};
+
+        for (version, authored) in [(Py314, false), (Py315, false), (Py315, true)] {
+            let mut marker =
+                Instruction::new(NOT_TAKEN, Operand::Value(0), SourceLocation::NONE, None);
+            marker.set_exception_policy(ExceptionPolicy::NonePresent);
+            if authored {
+                marker.jump_policy.mark_authored_branch_marker();
+            }
+            let mut assembler = layout(
+                vec![
+                    instruction(ExceptionPolicy::default()),
+                    Item::Instruction(marker),
+                    instruction(ExceptionPolicy::default()),
+                ],
+                vec![region(0, 1, 2, 0, false)],
+            );
+            assembler.python_version = version;
+            let table = assembler
+                .exception_table(&[0; 3], &[Some(0), Some(3), Some(4)])
+                .unwrap();
+            let expected = if version == Py314 || authored {
+                vec![(0, 3, 4, 0, false)]
+            } else {
+                vec![(0, 1, 4, 0, false), (2, 3, 4, 0, false)]
+            };
+            assert_eq!(entries(&table), expected);
+        }
+    }
+
+    #[test]
+    fn python315_inline_caches_extend_exception_ranges() {
+        use crate::PythonVersion::Py315;
+        use crate::target::opcodes::{GET_ITER, RESUME};
+
+        let mut assembler = layout(
+            vec![
+                Item::Label(Label(0)),
+                Item::Instruction(Instruction::new(
+                    RESUME,
+                    Operand::Value(0),
+                    SourceLocation::NONE,
+                    None,
+                )),
+                Item::Label(Label(1)),
+                Item::Instruction(Instruction::new(
+                    GET_ITER,
+                    Operand::Value(0),
+                    SourceLocation::NONE,
+                    None,
+                )),
+                Item::Label(Label(2)),
+            ],
+            vec![region(0, 2, 2, 0, false)],
+        );
+        assembler.python_version = Py315;
+        let mut labels = [None; 3];
+        assert_eq!(assembler.label_positions(&[0, 0], &mut labels), 4);
+        assert_eq!(labels, [Some(0), Some(2), Some(4)]);
+        let table = assembler.exception_table(&[0, 0], &labels).unwrap();
+        assert_eq!(entries(&table), [(0, 4, 4, 0, false)]);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use super::{
     GET_ANEXT, GET_ITER, IMPORT_FROM, IMPORT_NAME, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT,
     JUMP_FORWARD, LIST_APPEND, LOAD_ATTR, LOAD_CONST, LOAD_DEREF, LOAD_FAST_AND_CLEAR, LOAD_GLOBAL,
     LOAD_SMALL_INT, MAP_ADD, NOP, NOT_TAKEN, POP_EXCEPT, POP_ITER, POP_JUMP_IF_FALSE,
-    POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP, PUSH_EXC_INFO,
+    POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP, PUSH_EXC_INFO, PUSH_NULL,
     RAISE_VARARGS, RETURN_VALUE, SEND, SET_ADD, STORE_ATTR, STORE_SLICE, STORE_SUBSCR, SWAP,
     TO_BOOL, WITH_EXCEPT_START, YIELD_VALUE,
 };
@@ -34,6 +34,7 @@ use super::constant::{
 use super::expression::{
     binary_operator, comparison_operator, early_condition_truthiness,
     expression_suspends_current_scope, jump_constant_truthiness, optimized_generator_callable,
+    optimized_generator_callable_for_target,
 };
 use super::scope::{NameId, NameSet, ReferenceCollector, collect_target_names};
 use super::source::{
@@ -578,6 +579,7 @@ pub(super) struct GeneratorState {
     // Avoid rescanning a large code unit for post-suspension comprehension filters.
     pub(super) emitted_yield_value: bool,
     pub(super) generator_expression: bool,
+    pub(super) generator_region_depth: u32,
     // Whether an active generator expression uses only simple-name iteration targets.
     pub(super) generator_expression_has_simple_targets: bool,
     // Whether an expression is being evaluated as a generator-expression filter. CPython lowers
@@ -3042,7 +3044,7 @@ impl Compiler<'_> {
         self.compile_expression(&statement.iter)?;
         self.assembler
             .set_location(self.source_location(statement.iter.range()));
-        self.emit(GET_ITER, 0, 0)?;
+        self.emit(GET_ITER, 0, self.iterator_extra_slots())?;
         self.emit_jump_forward(FOR_ITER, cleanup, 1)?;
         // CPython emits a target-line NOP before assigning the loop item. Its early
         // removal leaves a used instruction slot for later branch normalization.
@@ -3052,15 +3054,15 @@ impl Compiler<'_> {
         self.compile_store_target(&statement.target)?;
         self.assembler
             .set_location(self.source_location(statement.body[0].range()));
-        self.emit(POP_TOP, 0, -1)?;
+        self.emit_iterator_cleanup(IteratorCleanup::Sync, false)?;
         self.emit_implicit_return()?;
 
         self.assembler.mark(cleanup);
-        self.set_depth(base_depth + 2);
+        self.set_depth(base_depth + self.iterator_slots() + 1);
         self.assembler
             .set_location(self.source_location(statement.iter.range()));
         self.emit(END_FOR, 0, -1)?;
-        self.emit(POP_ITER, 0, -1)?;
+        self.emit(POP_ITER, 0, -self.iterator_slots())?;
         self.emit_implicit_return()?;
         self.set_depth(base_depth);
         Ok(())
@@ -4009,7 +4011,7 @@ impl Compiler<'_> {
                         self.assignment_defers_async_comprehension_restore(assignment);
                     let direct_optimized_generator_assignment = matches!(
                         assignment.value.as_ref(),
-                        Expr::Call(call) if optimized_generator_callable(call).is_some()
+                        Expr::Call(call) if optimized_generator_callable_for_target(call, self.context.python_version).is_some()
                     ) && self
                         .control
                         .exceptions
@@ -4156,7 +4158,7 @@ impl Compiler<'_> {
                 ) || matches!(expression.value.as_ref(), Expr::Compare(compare) if compare.ops.len() > 1);
                 let optimized_generator_call = matches!(
                     expression.value.as_ref(),
-                    Expr::Call(call) if optimized_generator_callable(call).is_some()
+                    Expr::Call(call) if optimized_generator_callable_for_target(call, self.context.python_version).is_some()
                 );
                 if let Expr::If(conditional) = expression.value.as_ref()
                     && early_condition_truthiness(&conditional.test) == Some(false)
@@ -4464,11 +4466,7 @@ impl Compiler<'_> {
                 let copied_finally_try_iterator_entry = (copied_finally_try_iterator_join
                     && self.assembler.at_original_shared_finally_iterator_join())
                 .then(|| self.assembler.item_count());
-                match context.iterator_cleanup {
-                    IteratorCleanup::None => {}
-                    IteratorCleanup::Sync => self.emit(POP_TOP, 0, -1)?,
-                    IteratorCleanup::Async => self.emit(POP_TOP, 0, -1)?,
-                }
+                self.emit_iterator_cleanup(context.iterator_cleanup, false)?;
                 if context.break_policy.returns() {
                     if self.unit.flags & CO_GENERATOR != 0 {
                         self.output.has_deferred_break_none = true;
@@ -12711,6 +12709,26 @@ impl Compiler<'_> {
         Ok(unwind_starts)
     }
 
+    /// Drop an iterator's target-specific stack slots while preserving a return value.
+    fn emit_iterator_cleanup(
+        &mut self,
+        cleanup: IteratorCleanup,
+        preserve_tos: bool,
+    ) -> Result<(), CompileError> {
+        let slots = match cleanup {
+            IteratorCleanup::None => 0,
+            IteratorCleanup::Sync => self.iterator_slots(),
+            IteratorCleanup::Async => 1,
+        };
+        if slots > 0 && preserve_tos {
+            self.emit(SWAP, (slots + 1).cast_unsigned(), 0)?;
+        }
+        for _ in 0..slots {
+            self.emit(POP_TOP, 0, -1)?;
+        }
+        Ok(())
+    }
+
     fn emit_loop_iterator_cleanup(
         &mut self,
         from_depth: usize,
@@ -12718,15 +12736,10 @@ impl Compiler<'_> {
         preserve_tos: bool,
     ) -> Result<(), CompileError> {
         for index in (from_depth..to_depth).rev() {
-            match self.control.loops.contexts[index].iterator_cleanup {
-                IteratorCleanup::None => {}
-                IteratorCleanup::Sync | IteratorCleanup::Async => {
-                    if preserve_tos {
-                        self.emit(SWAP, 2, 0)?;
-                    }
-                    self.emit(POP_TOP, 0, -1)?;
-                }
-            }
+            self.emit_iterator_cleanup(
+                self.control.loops.contexts[index].iterator_cleanup,
+                preserve_tos,
+            )?;
         }
         Ok(())
     }
@@ -16167,7 +16180,7 @@ impl Compiler<'_> {
         self.compile_iterable_expression(&statement.iter)?;
         self.assembler
             .set_location(self.source_location(statement.iter.range()));
-        self.emit(GET_ITER, 0, 0)?;
+        self.emit(GET_ITER, 0, self.iterator_extra_slots())?;
         self.assembler.mark(start);
         self.emit_jump_forward(FOR_ITER, cleanup, 1)?;
         // FOR_ITER ends CPython's original iterator block. Its fallthrough array
@@ -16304,11 +16317,11 @@ impl Compiler<'_> {
         self.assembler
             .record_exception_owner_block_boundary(cleanup);
         self.assembler.mark(cleanup);
-        self.set_depth(base_depth + 2);
+        self.set_depth(base_depth + self.iterator_slots() + 1);
         self.assembler
             .set_location(self.source_location(statement.iter.range()));
         self.emit(END_FOR, 0, -1)?;
-        self.emit(POP_ITER, 0, -1)?;
+        self.emit(POP_ITER, 0, -self.iterator_slots())?;
         for name in &newly_initialized_targets {
             let name = self.required_name_id(name);
             self.symbols.initialized_locals.remove(name);
@@ -16388,6 +16401,9 @@ impl Compiler<'_> {
             .record_exception_setup(protected_start, false);
         self.assembler.mark(protected_start);
         self.emit(GET_ANEXT, 0, 1)?;
+        if self.context.python_version == crate::PythonVersion::Py315 {
+            self.emit(PUSH_NULL, 0, 1)?;
+        }
         let none = self.add_constant(Constant::None)?;
         self.emit(LOAD_CONST, none, 1)?;
         self.assembler.mark(send);
@@ -16399,7 +16415,7 @@ impl Compiler<'_> {
         self.emit_resume(ResumeLocation::AFTER_AWAIT, ResumeDepth::Zero)?;
         self.emit_jump_backward(JUMP_BACKWARD_NO_INTERRUPT, send, 0)?;
         self.assembler.mark(cleanup_throw);
-        self.set_depth(base_depth + 4);
+        self.set_depth(base_depth + 4 + self.iterator_extra_slots());
         self.emit(CLEANUP_THROW, 0, -1)?;
         let cleanup_throw_end = self.assembler.label();
         self.assembler.mark(cleanup_throw_end);
@@ -16416,10 +16432,10 @@ impl Compiler<'_> {
                 .push((cleanup_throw, cleanup_throw_end));
         }
         self.assembler.mark(send_end);
-        self.set_depth(base_depth + 3);
-        self.emit(END_SEND, 0, -1)?;
+        self.set_depth(base_depth + 3 + self.iterator_extra_slots());
+        self.emit(END_SEND, 0, -self.iterator_slots())?;
         self.assembler.mark(protected_end);
-        self.emit(NOT_TAKEN, 0, 0)?;
+        self.emit_authored_not_taken()?;
         // The removed POP_BLOCK leaves a slot across this authored success marker.
         let target_start = self.assembler.item_count();
         self.compile_store_target(&statement.target)?;
@@ -16466,7 +16482,7 @@ impl Compiler<'_> {
             yielded,
             yielded_end,
             cleanup_throw,
-            (base_depth + 3).cast_unsigned(),
+            (base_depth + 3 + self.iterator_extra_slots()).cast_unsigned(),
             false,
         );
 
@@ -20463,12 +20479,7 @@ impl Compiler<'_> {
                 let context = self.control.loops.contexts.last().copied().ok_or_else(|| {
                     CompileError::invalid_syntax("'break' outside loop", handler.body[0].range())
                 })?;
-                match context.iterator_cleanup {
-                    IteratorCleanup::None => {}
-                    IteratorCleanup::Sync | IteratorCleanup::Async => {
-                        self.emit(POP_TOP, 0, -1)?;
-                    }
-                }
+                self.emit_iterator_cleanup(context.iterator_cleanup, false)?;
                 if context.break_policy.returns() {
                     self.emit_implicit_return()?;
                 } else {
@@ -26310,10 +26321,7 @@ impl Compiler<'_> {
         self.emit(NOP, 0, 0)?;
         self.assembler
             .set_location(self.source_location(break_statement.range()));
-        match context.iterator_cleanup {
-            IteratorCleanup::None => {}
-            IteratorCleanup::Sync | IteratorCleanup::Async => self.emit(POP_TOP, 0, -1)?,
-        }
+        self.emit_iterator_cleanup(context.iterator_cleanup, false)?;
         if context.break_policy.returns() {
             self.emit_implicit_return()?;
         } else {
@@ -26332,10 +26340,7 @@ impl Compiler<'_> {
         self.emit(POP_TOP, 0, -1)?;
         self.assembler.mark(handler_end);
         self.emit(POP_EXCEPT, 0, -1)?;
-        match context.iterator_cleanup {
-            IteratorCleanup::None => {}
-            IteratorCleanup::Sync | IteratorCleanup::Async => self.emit(POP_TOP, 0, -1)?,
-        }
+        self.emit_iterator_cleanup(context.iterator_cleanup, false)?;
         if context.break_policy.returns() {
             self.emit_implicit_return()?;
         } else {
@@ -27689,7 +27694,7 @@ impl Compiler<'_> {
             self.emit(LOAD_CONST, none, 1)?;
             let module = alias.name.as_str();
             let module_index = self.name_index(module)?;
-            self.emit(IMPORT_NAME, module_index, -1)?;
+            self.emit_import_name(module_index, statement.is_lazy, false, statement.range)?;
 
             if let Some(as_name) = &alias.asname {
                 self.compile_import_as(module, as_name.as_str())?;
@@ -27745,7 +27750,12 @@ impl Compiler<'_> {
         self.emit(LOAD_CONST, names, 1)?;
         let module = statement.module.as_ref().map_or("", |name| name.as_str());
         let module_index = self.name_index(module)?;
-        self.emit(IMPORT_NAME, module_index, -1)?;
+        self.emit_import_name(
+            module_index,
+            statement.is_lazy,
+            star_import,
+            statement.range,
+        )?;
 
         if star_import {
             self.emit_unary_intrinsic(UnaryIntrinsic::IMPORT_STAR)?;
@@ -27763,6 +27773,51 @@ impl Compiler<'_> {
             self.store_name(bound_name)?;
         }
         self.emit(POP_TOP, 0, -1)
+    }
+
+    /// Encode the import mode required by the selected target and lexical scope.
+    fn emit_import_name(
+        &mut self,
+        name_index: u32,
+        is_lazy: bool,
+        star_import: bool,
+        range: TextRange,
+    ) -> Result<(), CompileError> {
+        let argument = if self.context.python_version == crate::PythonVersion::Py315 {
+            use crate::target::operands315::ImportMode;
+
+            let mode = if is_lazy {
+                if star_import {
+                    return Err(CompileError::invalid_syntax("cannot lazy import *", range));
+                }
+                if !matches!(self.unit.scope, Scope::Module) {
+                    return Err(CompileError::invalid_syntax(
+                        "lazy imports only allowed in module scope",
+                        range,
+                    ));
+                }
+                ImportMode::LAZY
+            } else if star_import
+                || !matches!(self.unit.scope, Scope::Module)
+                || !self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                || !self.control.exceptions.active_exception_handlers.is_empty()
+                || self.control.exceptions.active_exception_group_handlers > 0
+                || self.control.finally.active_finally_try_bodies > 0
+                || self.control.finally.active_finally_end_blocks > 0
+            {
+                ImportMode::EAGER
+            } else {
+                ImportMode::DEFAULT
+            };
+            mode.encode_name(name_index)
+        } else {
+            name_index
+        };
+        self.emit(IMPORT_NAME, argument, -1)
     }
 }
 

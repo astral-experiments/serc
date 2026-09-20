@@ -482,7 +482,7 @@ impl Assembler {
             None,
             AssemblerStage::RemoveRedundantNops,
         )?;
-        optimize_linear_assertion_load_fast(&mut items);
+        optimize_linear_assertion_load_fast(self.python_version, &mut items);
         #[cfg(any(test, debug_assertions))]
         super::validate_structure(
             &items,
@@ -491,6 +491,7 @@ impl Assembler {
             AssemblerStage::OptimizeLoadFast,
         )?;
         Ok(LayoutAssembler {
+            python_version: self.python_version,
             items,
             exception_regions: self.exception_regions,
             exception_owner_provenance: self.exception_owner_provenance,

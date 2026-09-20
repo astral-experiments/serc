@@ -4,27 +4,47 @@
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 A Rust compiler for Python source that targets byte-for-byte compatibility with CPython 3.14.5 on
-pinned corpora.
+pinned corpora, with experimental CPython 3.15.0rc2 support.
 
 **Experimental:** This project was authored by GPT and is not intended for
 public consumption. Use at your own risk.
 
 Serc compiles Python without embedding or starting a Python runtime. The
-[`serc`](crates/serc) compiler library currently targets CPython 3.14.5, and the
+[`serc`](crates/serc) compiler library defaults to CPython 3.14.5, and the
 [`serc-cli`](crates/serc_cli) package provides the `serc` executable.
+
+## Python version
+
+Choose a target for each compilation with `--python-version`:
+
+```console
+serc compile --python-version 3.14 path/to/package
+serc compile --python-version 3.15 path/to/package
+```
+
+The default is `3.14`, pinned to CPython 3.14.5. The experimental `3.15` target is pinned to
+CPython 3.15.0rc2. Each target writes its own cache tag and bytecode magic number, so the two
+versions can coexist under `__pycache__`. Python 3.15 compatibility validation is in progress;
+the corpus results below describe Python 3.14 only.
+
+Library callers select `PythonVersion::Py314` or `PythonVersion::Py315` through
+`CompileOptions`, then call `compile_with_options` or `compile_bytes_with_options`. See the
+[library API example](crates/serc/README.md#library-source-api).
 
 ## Development
 
 ```console
 cargo fmt --all --check
 ./scripts/check-python-style
-SERC_TEST_PYTHON=/path/to/python3.14 \
+SERC_TEST_PYTHON=/path/to/python3.14.5 \
+SERC_TEST_PYTHON_315=/path/to/python3.15.0rc2 \
   cargo test --workspace --all-targets --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
-Oracle-dependent tests fail unless `SERC_TEST_PYTHON` names the exact
-CPython 3.14.5 target, including its expected bytecode magic number.
+Oracle-dependent tests require `SERC_TEST_PYTHON` to name CPython 3.14.5 and
+`SERC_TEST_PYTHON_315` to name CPython 3.15.0rc2. Both targets are checked against their exact
+release and bytecode magic number. CI provisions both interpreters on Linux, macOS, and Windows.
 The Python style gate requires exactly Ruff 0.15.15; install it with
 `python3 -m pip install ruff==0.15.15`.
 
@@ -44,12 +64,13 @@ runs per compiler; all 505 generated `.pyc` files matched byte for byte.
 
 ## CPython compatibility
 
-Clone the repository with submodules, then provide an exact CPython 3.14.5 executable:
+Clone the repository with submodules, then provide the exact executable for each target:
 
 ```console
 git clone --recurse-submodules https://github.com/astral-sh/serc
 cd serc
-./scripts/check-cpython-compatibility /path/to/python3.14
+./scripts/check-cpython-compatibility /path/to/python3.14.5
+./scripts/check-cpython-compatibility /path/to/python3.15.0rc2 3.15
 ```
 
 The script requires the pinned submodule corpus and runs the exact CPython
@@ -59,6 +80,12 @@ exactly. The frozen baseline separately records 221 CPython-rejected inputs: 128
 rejections, 75 inputs accepted by Serc, and 18 internal compiler failures. CI freezes each
 outcome category against the exact supported CPython release on every pull request and every push
 to `main`.
+
+The optional second argument selects the target and defaults to `3.14`. The Python 3.15 gate
+uses the same 2,451 files and passes source bytes to both compilers. It requires all 2,249
+CPython-accepted files to match exactly, and freezes the 202 CPython-rejected inputs as
+131 matched rejections, 57 rejection mismatches, and 14 compiler failures. Compiler failures
+on accepted inputs always fail either gate.
 
 For broader diagnostics, Serc also has a separately pinned corpus derived
 from [`mypy_primer`](https://github.com/hauntsaninja/mypy_primer). The frozen
@@ -117,8 +144,9 @@ compiler internals and target-generation details.
 
 ## Status
 
-Serc is experimental. It currently targets exactly CPython 3.14.5; Python
-bytecode and marshal formats are not stable across Python releases. Changes to
+Serc is experimental. Python 3.14 defaults to the exact CPython 3.14.5 target; experimental
+Python 3.15 support targets CPython 3.15.0rc2. Python bytecode and marshal formats are not stable
+across Python releases. Full Python 3.15 corpus compatibility has not yet been established. Changes to
 the compiler are accepted only when every CPython-accepted input in the
 required pinned corpus remains byte-identical and the frozen outcome counts
 remain unchanged unless intentionally advanced. Serc was authored entirely

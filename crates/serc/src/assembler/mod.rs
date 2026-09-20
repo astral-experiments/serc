@@ -29,7 +29,7 @@ use crate::target::opcodes::{
 use crate::target::operands::ResumeLocation;
 use crate::target::{
     Opcode, is_conditional_jump, is_scope_exit as ends_scope, is_unconditional_jump,
-    stack_counts as opcode_stack_counts,
+    stack_counts_for as opcode_stack_counts,
 };
 
 #[cfg(any(test, debug_assertions))]
@@ -466,6 +466,26 @@ fn assertion_constant_indices(
 }
 
 impl Assembler {
+    /// Creates an emitter whose stack analysis and final layout use the selected target.
+    pub(crate) fn with_python_version(python_version: crate::PythonVersion) -> Self {
+        Self {
+            python_version,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) const fn python_version(&self) -> crate::PythonVersion {
+        self.python_version
+    }
+
+    /// Records a branch marker emitted before exception targets were assigned.
+    pub(crate) fn mark_authored_branch_marker(&mut self, emitted: EmittedInstruction) {
+        let instruction =
+            self.emitted_instruction_mut(emitted, "marking an authored branch marker");
+        assert_eq!(instruction.opcode, NOT_TAKEN);
+        instruction.jump_policy.mark_authored_branch_marker();
+    }
+
     fn linear_items(&self) -> &[Item] {
         let UnoptimizedCode::Linear(items) = &self.code else {
             panic!("linear instructions are unavailable after constant reachability analysis");
@@ -13235,12 +13255,13 @@ impl Assembler {
         });
     }
 
-    /// Adds the outermost handler that converts escaping `StopIteration` exceptions.
-    pub(crate) fn add_stopiteration_exception_region(
+    /// Retains iterator slots below a generator expression's outer exception handler.
+    pub(crate) fn add_stopiteration_exception_region_with_depth(
         &mut self,
         start: Label,
         end: Label,
         target: Label,
+        depth: u32,
     ) {
         self.exception_regions.push(ExceptionRegion {
             is_scope_fallback: true,
@@ -13248,7 +13269,7 @@ impl Assembler {
             start,
             end,
             target,
-            depth: 0,
+            depth,
             preserve_lasti: true,
         });
     }
@@ -13855,7 +13876,12 @@ impl Assembler {
         explicitly_owned: bool,
         exception_policy: ExceptionPolicy,
     ) -> EmittedInstruction {
-        let strict_owned_load = self.strict_owned_loads && opcode == LOAD_FAST;
+        // These guards model Python 3.14's borrowed-load traversal stopping at
+        // eliminated CFG blocks. Python 3.15 visits their normal successors;
+        // its final stack analysis decides whether each load can be borrowed.
+        let strict_owned_load = self.python_version == PythonVersion::Py314
+            && self.strict_owned_loads
+            && opcode == LOAD_FAST;
         let force_owned_load = explicitly_owned
             || strict_owned_load
             || (opcode == LOAD_FAST && !self.load_fast_borrowing_enabled);
@@ -13885,8 +13911,8 @@ impl Assembler {
     }
 }
 
-fn opcode_stack_effect(opcode: Opcode, argument: u32) -> i64 {
-    let (popped, pushed) = opcode_stack_counts(opcode, argument);
+fn opcode_stack_effect(python_version: crate::PythonVersion, opcode: Opcode, argument: u32) -> i64 {
+    let (popped, pushed) = opcode_stack_counts(python_version, opcode, argument);
     i64::try_from(pushed).unwrap() - i64::try_from(popped).unwrap()
 }
 

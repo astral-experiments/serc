@@ -52,3 +52,33 @@ pub(crate) fn python_3145_command() -> Command {
     command.args(["-I", "-S"]);
     command
 }
+
+static PYTHON_315: OnceLock<Result<String, String>> = OnceLock::new();
+
+pub(crate) fn python_315_command() -> Command {
+    let executable = PYTHON_315.get_or_init(|| {
+        let target = serc::PythonVersion::Py315.target();
+        let executable = std::env::var("SERC_TEST_PYTHON_315")
+            .unwrap_or_else(|_| "python3.15".to_string());
+        let output = Command::new(&executable)
+            .args([
+                "-B", "-I", "-S", "-c",
+                "import importlib.util, sys; ok = sys.implementation.name == 'cpython' and sys.version_info == (3, 15, 0, 'candidate', 2) and sys.version.split()[0] == sys.argv[1] and importlib.util.MAGIC_NUMBER.hex() == sys.argv[2]; print(sys.version, file=sys.stderr); raise SystemExit(not ok)",
+                target.tag.strip_prefix('v').expect("CPython release tag"),
+                &target.magic_hex(),
+            ])
+            .output()
+            .map_err(|error| format!("failed to run pinned CPython {} at {executable}: {error}; set SERC_TEST_PYTHON_315", target.tag))?;
+        if !output.status.success() {
+            return Err(format!("SERC_TEST_PYTHON_315 must name CPython {} with magic {}: {}", target.tag, target.magic_hex(), String::from_utf8_lossy(&output.stderr).trim()));
+        }
+        Ok(executable)
+    });
+    let mut command = Command::new(
+        executable
+            .as_ref()
+            .unwrap_or_else(|error| panic!("{error}")),
+    );
+    command.args(["-B", "-I", "-S"]);
+    command
+}

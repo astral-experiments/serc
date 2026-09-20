@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::block_graph::BlockGraph;
+use crate::PythonVersion;
 use crate::target::Opcode;
 
 pub(crate) struct AssembledCode {
@@ -548,6 +549,15 @@ impl JumpPolicy {
     const ORIGINAL_UNIFORM_FOLD: u16 = 1 << 12;
     const RETAIN_NOP_AFTER_RETARGETING: u16 = 1 << 13;
     const ORIGINAL_MATCH_SUCCESS: u16 = 1 << 14;
+    const AUTHORED_BRANCH_MARKER: u16 = 1 << 15;
+
+    pub(super) const fn is_authored_branch_marker(self) -> bool {
+        self.0 & Self::AUTHORED_BRANCH_MARKER != 0
+    }
+
+    pub(super) fn mark_authored_branch_marker(&mut self) {
+        self.0 |= Self::AUTHORED_BRANCH_MARKER;
+    }
 
     const SYNTHETIC: Self = Self(Self::PREVENT_SMALL_EXIT_INLINING);
     const DEFAULT: Self = Self(0);
@@ -566,7 +576,8 @@ impl JumpPolicy {
             | JumpPolicy::PRESERVE_EXPLICIT_NOP
             | JumpPolicy::NORMALIZED_CONDITIONAL_BACKEDGE
             | JumpPolicy::ORIGINAL_EMPTY_JOIN
-            | JumpPolicy::ORIGINAL_SHARED_EMPTY_JOIN;
+            | JumpPolicy::ORIGINAL_SHARED_EMPTY_JOIN
+            | JumpPolicy::AUTHORED_BRANCH_MARKER;
         Self((first.0 | second.0) & PRESERVED)
     }
 
@@ -1424,6 +1435,7 @@ pub(super) struct DeferredBorrowEntry {
 
 #[derive(Debug)]
 pub(crate) struct Assembler {
+    pub(super) python_version: PythonVersion,
     pub(super) code: UnoptimizedCode,
     /// Number of instructions in the linear item stream; labels do not consume offsets.
     pub(super) instruction_count: usize,
@@ -1541,6 +1553,7 @@ pub(super) type AuthoredFinallyBreakEntries = FxHashMap<Label, AuthoredFinallyBr
 /// pass before instruction emission is complete.
 #[derive(Debug)]
 pub(super) struct OptimizationPipeline {
+    pub(super) python_version: PythonVersion,
     pub(super) graph: BlockGraph,
     /// Original incoming edges removed before CPython resolves cleanup locations.
     pub(super) folded_original_predecessor_targets: FxHashSet<Label>,
@@ -1611,6 +1624,7 @@ pub(super) struct OptimizationPipeline {
 /// The linear assembler state used after CFG optimization is complete.
 #[derive(Debug)]
 pub(super) struct LayoutAssembler {
+    pub(super) python_version: PythonVersion,
     pub(super) items: Vec<Item>,
     pub(super) exception_regions: Vec<ExceptionRegion>,
     pub(super) exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance,
@@ -1669,6 +1683,7 @@ impl SourceLocation {
 impl Default for Assembler {
     fn default() -> Self {
         Self {
+            python_version: PythonVersion::default(),
             code: UnoptimizedCode::Linear(Vec::new()),
             instruction_count: 0,
             emission_stream: EmissionStreamId::next(),

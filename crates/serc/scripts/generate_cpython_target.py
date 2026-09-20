@@ -7,6 +7,7 @@ import argparse
 import ast
 import difflib
 import hashlib
+import json
 import re
 import subprocess
 import sys
@@ -14,6 +15,17 @@ from pathlib import Path
 
 TARGET_TAG = "v3.14.5"
 TARGET_COMMIT = "5607950ef232dad16d75c0cf53101d9649d89115"
+TARGET_VERSION = (3, 14, 5)
+TARGET_MINOR = "3.14"
+TARGETS = {
+    "3.14": (TARGET_TAG, TARGET_COMMIT, TARGET_VERSION, 5),
+    "3.15": (
+        "v3.15.0rc2",
+        "435c9e5a798c99653e3ab64ce29baed0e4f3dfee",
+        (3, 15, 0),
+        6,
+    ),
+}
 TARGET_INPUTS = (
     "Include/opcode_ids.h",
     "Include/opcode.h",
@@ -86,6 +98,49 @@ UNIX_STARTUP_INTERNED_STRINGS = ("pause",)
 CRATE_ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = CRATE_ROOT / "src" / "target" / "cpython_3_14_5.rs"
 MARSHAL_OUTPUT = CRATE_ROOT / "src" / "marshal" / "v5.rs"
+STARTUP_315_INPUT = "scripts/target_metadata/cpython_3_15_0rc2_startup.json"
+STARTUP_315_SHA256 = "bec0bd2dedbe3b38ca68e446c67abf0f8d0f4793b551d9c7036acb0517765d63"
+
+
+def read_startup_strings() -> tuple[str, ...]:
+    """Read the verified neutral Linux startup supplement for the selected target."""
+    data = (CRATE_ROOT / STARTUP_315_INPUT).read_bytes()
+    if hashlib.sha256(data).hexdigest() != STARTUP_315_SHA256:
+        raise ValueError("pinned Python 3.15 startup profile checksum mismatch")
+    profile = json.loads(data)
+    if profile["target_tag"] != TARGET_TAG or profile["target_commit"] != TARGET_COMMIT:
+        raise ValueError("startup profile does not match the selected CPython target")
+    values = profile["strings"]
+    if values != sorted(set(values)) or len(values) != profile["supplemental_entries"]:
+        raise ValueError("startup profile strings are not unique, sorted and complete")
+    if any(not isinstance(value, str) or value.startswith("/") for value in values):
+        raise ValueError("startup profile contains an environment-specific path")
+    return tuple(values)
+
+
+def select_target_version(version: str) -> None:
+    """Select an exact, supported release without changing the default target."""
+    global TARGET_MINOR, TARGET_TAG, TARGET_COMMIT, TARGET_VERSION
+    global TARGET_INPUTS, MARSHAL_INPUTS, OUTPUT, MARSHAL_OUTPUT
+    TARGET_MINOR = version
+    TARGET_TAG, TARGET_COMMIT, TARGET_VERSION, marshal_version = TARGETS[version]
+    TARGET_INPUTS = tuple(
+        p
+        for p in TARGET_INPUTS
+        if p not in {"Python/assemble.c", "Include/internal/pycore_runtime_structs.h"}
+    )
+    if version == "3.15":
+        TARGET_INPUTS += (
+            "Python/assemble.c",
+            "Include/internal/pycore_runtime_structs.h",
+        )
+    marshal_header = (
+        "Include/marshal.h" if version == "3.14" else "Include/cpython/marshal.h"
+    )
+    MARSHAL_INPUTS = (marshal_header, "Python/marshal.c")
+    module = TARGET_TAG.removeprefix("v").replace(".", "_")
+    OUTPUT = CRATE_ROOT / "src" / "target" / f"cpython_{module}.rs"
+    MARSHAL_OUTPUT = CRATE_ROOT / "src" / "marshal" / f"v{marshal_version}.rs"
 
 
 def parse_args() -> argparse.Namespace:
@@ -95,6 +150,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         required=True,
         help="path to a CPython checkout at the pinned commit",
+    )
+    parser.add_argument(
+        "--target-version",
+        choices=TARGETS,
+        default="3.14",
+        help="Python minor version; each choice resolves to an exact pinned release",
     )
     parser.add_argument(
         "--check",
@@ -299,19 +360,26 @@ def render_preinterned_lookup(
 def parse_opcodes(source: str) -> list[tuple[str, int]]:
     section = source.split("/* Instruction opcodes for compiled code */", 1)[1]
     section = section.split("#define HAVE_ARGUMENT", 1)[0]
+    minimum_specialized = int(
+        require_match(
+            r"^#define\s+MIN_SPECIALIZED_OPCODE\s+(\d+)\s*$",
+            source,
+            "first specialized opcode",
+        ).group(1)
+    )
     opcodes = []
     ids = set()
     for name, value in re.findall(
         r"^#define\s+([A-Z][A-Z0-9_]*)\s+(\d+)\s*$", section, re.MULTILINE
     ):
         code = int(value)
-        if code > 128:
+        if code >= minimum_specialized:
             continue
         if code in ids:
             raise ValueError(f"duplicate physical opcode ID {code}")
         ids.add(code)
         opcodes.append((name, code))
-    if not opcodes or ("RESUME", 128) not in opcodes:
+    if not opcodes or "RESUME" not in dict(opcodes):
         raise ValueError(
             "opcode table does not contain the expected RESUME instruction"
         )
@@ -332,10 +400,11 @@ def parse_caches(source: str) -> dict[str, int]:
 
 
 def parse_opcode_flags(source: str) -> dict[str, set[str]]:
-    section = source.split(
-        "const struct opcode_metadata _PyOpcode_opcode_metadata[267] = {", 1
-    )[1]
-    section = section.split("};", 1)[0]
+    section = require_match(
+        r"const struct opcode_metadata _PyOpcode_opcode_metadata\[\d+\] = \{([\s\S]*?)\};",
+        source,
+        "opcode metadata table",
+    ).group(1)
     flags = {}
     for name, expression in re.findall(
         r"^\s*\[([A-Z][A-Z0-9_]*)\]\s*=\s*"
@@ -448,6 +517,31 @@ def render_operand_type(
             "",
         ]
     )
+
+
+def parse_import_modes(source: str) -> tuple[int, list[tuple[str, int]]]:
+    """Extract ordinary, explicit lazy and forced eager import operands."""
+    call = r"ADDOP_NAME_CUSTOM\([^;\n]*IMPORT_NAME,[^;\n]*, names, (\d+), (\d+)\);"
+    patterns = (
+        ("LAZY", r"if \(s->v.Import.is_lazy\) \{[\s\S]*?"),
+        ("EAGER", r"// force eager import in try/except block\s*"),
+        ("DEFAULT", r"\} else \{\s*"),
+    )
+    definitions = []
+    shifts = set()
+    for name, prefix in patterns:
+        match = require_match(prefix + call, source, f"{name.lower()} import operand")
+        shift, value = map(int, match.groups())
+        shifts.add(shift)
+        definitions.append((name, value))
+    if len(shifts) != 1:
+        raise ValueError("import modes disagree on the name index shift")
+    shift = shifts.pop()
+    if not 0 < shift < 32 or any(value >= 1 << shift for _, value in definitions):
+        raise ValueError("invalid import operand layout")
+    if len({value for _, value in definitions}) != len(definitions):
+        raise ValueError("import modes do not have distinct operands")
+    return shift, definitions
 
 
 def opcode_match_expression(opcodes: list[tuple[str, int]], names: set[str]) -> str:
@@ -712,7 +806,7 @@ def render(sources: dict[str, str]) -> str:
         )
         for part in ("MAJOR", "MINOR", "MICRO")
     )
-    if version != (3, 14, 5):
+    if version != TARGET_VERSION:
         raise ValueError(f"unexpected CPython version {version}")
     magic = int(
         require_match(
@@ -741,10 +835,14 @@ def render(sources: dict[str, str]) -> str:
     for relative in TARGET_INPUTS:
         digest = hashlib.sha256(sources[relative].encode()).hexdigest()
         lines.append(f"// {relative}: sha256:{digest}")
+    if TARGET_MINOR == "3.15":
+        lines.append(f"// {STARTUP_315_INPUT}: sha256:{STARTUP_315_SHA256}")
     lines.extend(
         [
             "",
-            "use super::Opcode;",
+            "use super::Opcode;"
+            if TARGET_MINOR == "3.14"
+            else "use super::{Opcode, opcodes};",
             "",
             f'pub(crate) const TARGET_TAG: &str = "{TARGET_TAG}";',
             f'pub(crate) const TARGET_COMMIT: &str = "{TARGET_COMMIT}";',
@@ -753,36 +851,81 @@ def render(sources: dict[str, str]) -> str:
             "pub(crate) const TARGET_MAGIC_NUMBER: [u8; 4] = "
             f"[0x{magic_bytes[0]:02x}, 0x{magic_bytes[1]:02x}, 0x{magic_bytes[2]:02x}, 0x{magic_bytes[3]:02x}];",
             "",
-            "pub(crate) mod opcodes {",
-            "    use super::Opcode;",
-            "",
         ]
     )
-    for name, code in opcodes:
-        lines.append(f"    pub(crate) const {name}: Opcode = Opcode::new({code});")
-    lines.extend(
-        [
-            "}",
-            "",
-            "impl Opcode {",
-            "    /// Returns the inline-cache width generated from the pinned opcode metadata.",
-            "    pub(crate) const fn caches(self) -> u8 {",
-            "        match self {",
-        ]
-    )
+    if TARGET_MINOR == "3.14":
+        lines.extend(["pub(crate) mod opcodes {", "    use super::Opcode;", ""])
+        for name, code in opcodes:
+            lines.append(f"    pub(crate) const {name}: Opcode = Opcode::new({code});")
+        lines.extend(
+            [
+                "}",
+                "",
+                "impl Opcode {",
+                "    /// Returns the inline-cache width generated from the pinned opcode metadata.",
+                "    pub(crate) const fn caches(self) -> u8 {",
+                "        match self {",
+            ]
+        )
+    else:
+        # The IR keeps semantic identities from the original target. Only the
+        # encoding boundary translates them to the selected target's IDs.
+        semantic_names = parse_opcodes_from_generated_names(
+            CRATE_ROOT / "src" / "target" / "cpython_3_14_5.rs"
+        )
+        missing = opcode_names - semantic_names
+        if missing:
+            raise ValueError(f"target requires new semantic opcodes: {sorted(missing)}")
+        lines.extend(
+            ["pub(crate) const fn code(opcode: Opcode) -> u8 {", "    match opcode {"]
+        )
+        for name, code in opcodes:
+            lines.append(f"        opcodes::{name} => {code},")
+        lines.append(
+            f"        opcodes::GET_YIELD_FROM_ITER => {dict(opcodes)['GET_ITER']},"
+        )
+        lines.extend(
+            [
+                '        _ => panic!("unsupported opcode for CPython 3.15"),',
+                "    }",
+                "}",
+                "",
+            ]
+        )
+        lines.extend(
+            ["pub(crate) const fn caches(opcode: Opcode) -> u8 {", "    match opcode {"]
+        )
     for name, _ in opcodes:
         if width := caches.get(name, 0):
             lines.append(f"            opcodes::{name} => {width},")
-    lines.extend(
-        [
-            "            _ => 0,",
-            "        }",
-            "    }",
-            "}",
-            "",
-            "pub(crate) static PREINTERNED_STRINGS: &[&str] = &[",
-        ]
-    )
+    if TARGET_MINOR == "3.14":
+        lines.extend(["            _ => 0,", "        }", "    }", "}", ""])
+    else:
+        lines.append(f"        opcodes::GET_YIELD_FROM_ITER => {caches['GET_ITER']},")
+        lines.extend(["        _ => 0,", "    }", "}", ""])
+        end_send_offset = int(
+            require_match(
+                r"^#define\s+END_SEND_OFFSET\s+(\d+)\s*$",
+                sources["Python/assemble.c"],
+                "END_SEND offset",
+            ).group(1)
+        )
+        lines.append(f"pub(crate) const END_SEND_OFFSET: u32 = {end_send_offset};")
+        small_ints = require_definitions(
+            parse_numeric_defines(
+                sources["Include/internal/pycore_runtime_structs.h"], "_PY_NSMALL"
+            ),
+            {"_PY_NSMALLNEGINTS", "_PY_NSMALLPOSINTS"},
+            "small integer singleton bounds",
+        )
+        lines.append(
+            f"pub(crate) const SMALL_INT_MIN: i64 = -{small_ints['_PY_NSMALLNEGINTS']};"
+        )
+        lines.append(
+            f"pub(crate) const SMALL_INT_MAX: i64 = {small_ints['_PY_NSMALLPOSINTS'] - 1};"
+        )
+        lines.append("")
+    lines.append("pub(crate) static PREINTERNED_STRINGS: &[&str] = &[")
     lines.extend(f"    {rust_string_literal(value)}," for value in preinterned_strings)
     lines.extend(["];", ""])
     lines.extend(
@@ -796,35 +939,64 @@ def render(sources: dict[str, str]) -> str:
         f"    {rust_string_literal(value)}," for value in compiler_interned_strings
     )
     lines.extend(["];", ""])
-    lines.extend(
-        render_preinterned_lookup(
-            preinterned_strings,
-            STARTUP_INTERNED_STRINGS + UNIX_STARTUP_INTERNED_STRINGS,
-            tuple(compiler_interned_strings),
+    if TARGET_MINOR == "3.14":
+        lines.extend(
+            render_preinterned_lookup(
+                preinterned_strings,
+                STARTUP_INTERNED_STRINGS + UNIX_STARTUP_INTERNED_STRINGS,
+                tuple(compiler_interned_strings),
+            )
         )
-    )
-    lines.extend(["", "#[allow(dead_code)]", "impl Opcode {"])
-    for method, flag in (
-        ("has_argument", "HAS_ARG_FLAG"),
-        ("has_constant", "HAS_CONST_FLAG"),
-        ("has_name", "HAS_NAME_FLAG"),
-        ("has_jump", "HAS_JUMP_FLAG"),
-        ("has_free", "HAS_FREE_FLAG"),
-        ("has_local", "HAS_LOCAL_FLAG"),
-    ):
-        names = {name for name in opcode_names if flag in opcode_flags[name]}
-        expression = opcode_match_expression(opcodes, names).replace(
-            "opcode", "self", 1
-        )
+    else:
         lines.extend(
             [
-                f"    pub(crate) const fn {method}(self) -> bool {{",
-                f"        {expression}",
-                "    }",
+                "// Captured before the isolated compile() oracle parses any source.",
+                "// Installation paths are supplied only through an explicit InitialInternState.",
+                "pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[",
+            ]
+        )
+        lines.extend(
+            f"    {rust_string_literal(value)}," for value in read_startup_strings()
+        )
+        lines.extend(["];", ""])
+        lines.extend(
+            [
+                "pub(crate) fn is_preinterned_string(value: &str) -> bool {",
+                "    is_preinterned_static_string(value)",
+                '        || (cfg!(target_os = "linux")',
+                "            && STARTUP_INTERNED_STRINGS.binary_search(&value).is_ok())",
+                "}",
                 "",
             ]
         )
-    lines.extend(["}", ""])
+        lookup = render_preinterned_lookup(
+            preinterned_strings, (), tuple(compiler_interned_strings)
+        )
+        lookup[0] = "fn is_preinterned_static_string(value: &str) -> bool {"
+        lines.extend(lookup)
+    if TARGET_MINOR == "3.14":
+        lines.extend(["", "#[allow(dead_code)]", "impl Opcode {"])
+        for method, flag in (
+            ("has_argument", "HAS_ARG_FLAG"),
+            ("has_constant", "HAS_CONST_FLAG"),
+            ("has_name", "HAS_NAME_FLAG"),
+            ("has_jump", "HAS_JUMP_FLAG"),
+            ("has_free", "HAS_FREE_FLAG"),
+            ("has_local", "HAS_LOCAL_FLAG"),
+        ):
+            names = {name for name in opcode_names if flag in opcode_flags[name]}
+            expression = opcode_match_expression(opcodes, names).replace(
+                "opcode", "self", 1
+            )
+            lines.extend(
+                [
+                    f"    pub(crate) const fn {method}(self) -> bool {{",
+                    f"        {expression}",
+                    "    }",
+                    "",
+                ]
+            )
+        lines.extend(["}", ""])
     for name, names in predicates.items():
         lines.extend(
             [
@@ -901,12 +1073,36 @@ def render(sources: dict[str, str]) -> str:
             "",
         ]
     )
+    if TARGET_MINOR == "3.15":
+        import_shift, import_modes = parse_import_modes(codegen)
+        render_operand_type(lines, "ImportMode", import_modes, "")
+        lines.extend(
+            [
+                "    impl ImportMode {",
+                "        /// Encode a name-table index with the selected import behavior.",
+                "        pub(crate) const fn encode_name(self, index: u32) -> u32 {",
+                f"            (index << {import_shift}) | self.0",
+                "        }",
+                "    }",
+                "",
+            ]
+        )
+        iterator_modes = parse_numeric_defines(opcode_utils, "GET_ITER_")
+        require_definitions(
+            iterator_modes, {"GET_ITER_YIELD_FROM"}, "iterator mode table"
+        )
+        render_operand_type(lines, "IteratorMode", iterator_modes, "GET_ITER_")
     render_operand_type(lines, "Conversion", conversions, "FVC_")
     render_operand_type(lines, "SpecialMethod", special_methods, "SPECIAL_")
     lines.extend(["}", "", "#[allow(dead_code)]", "pub(crate) mod code_flags {"])
     for name, value in code_flags:
         lines.append(f"    pub(crate) const {name}: u32 = {rust_hex(value, 8)};")
-    lines.extend(["}", "", "pub(crate) mod local_kinds {"])
+    lines.extend(["}", ""])
+    if TARGET_MINOR == "3.15":
+        # Both targets currently share the local layout, but retain the selected
+        # release's authoritative definitions for verification and future changes.
+        lines.append("#[allow(dead_code)]")
+    lines.append("pub(crate) mod local_kinds {")
     for name, value in local_kinds:
         lines.append(f"    pub(crate) const {name}: u8 = {rust_hex(value, 2)};")
     lines.extend(["}", ""])
@@ -924,6 +1120,12 @@ def render(sources: dict[str, str]) -> str:
         lines.append(
             f"        opcodes::{name} => ({popped_expression}, {pushed_expression}),"
         )
+    if TARGET_MINOR == "3.15":
+        popped_expression = rust_stack_expression(popped["GET_ITER"])
+        pushed_expression = rust_stack_expression(pushed["GET_ITER"])
+        lines.append(
+            f"        opcodes::GET_YIELD_FROM_ITER => ({popped_expression}, {pushed_expression}),"
+        )
     lines.extend(
         [
             '        _ => unreachable!("missing generated stack metadata for opcode {}", opcode.code()),',
@@ -940,7 +1142,7 @@ def render(sources: dict[str, str]) -> str:
 
 
 def render_marshal(sources: dict[str, str]) -> str:
-    marshal_header = sources["Include/marshal.h"]
+    marshal_header = sources[MARSHAL_INPUTS[0]]
     marshal_source = sources["Python/marshal.c"]
     version = int(
         require_match(
@@ -949,7 +1151,7 @@ def render_marshal(sources: dict[str, str]) -> str:
             "marshal version",
         ).group(1)
     )
-    if version != 5:
+    if version != TARGETS[TARGET_MINOR][3]:
         raise ValueError(f"unexpected marshal version {version}")
 
     required_tags = {
@@ -975,6 +1177,8 @@ def render_marshal(sources: dict[str, str]) -> str:
         "TYPE_SMALL_TUPLE",
         "TYPE_REF",
     }
+    if version >= 6:
+        required_tags.add("TYPE_FROZENDICT")
     all_tags = parse_character_defines(marshal_source, "TYPE_")
     tags = [definition for definition in all_tags if definition[0] in required_tags]
     require_definitions(tags, required_tags, "marshal type-tag table")
@@ -1043,7 +1247,7 @@ def check_numeric_authority() -> None:
                 raise ValueError(f"{relative} duplicates numeric opcode {name}")
 
     for path in sorted((CRATE_ROOT / "src" / "marshal").rglob("*.rs")):
-        if path == MARSHAL_OUTPUT:
+        if path.name in {"v5.rs", "v6.rs"}:
             continue
         relative = path.relative_to(CRATE_ROOT)
         if re.search(
@@ -1056,13 +1260,15 @@ def check_numeric_authority() -> None:
             )
 
 
-def parse_opcodes_from_generated_names() -> set[str]:
-    if not OUTPUT.exists():
+def parse_opcodes_from_generated_names(
+    output: Path = CRATE_ROOT / "src" / "target" / "cpython_3_14_5.rs",
+) -> set[str]:
+    if not output.exists():
         return set()
     return set(
         re.findall(
             r"^\s*pub\(crate\) const ([A-Z][A-Z0-9_]*): Opcode",
-            OUTPUT.read_text(),
+            output.read_text(),
             re.MULTILINE,
         )
     )
@@ -1070,6 +1276,7 @@ def parse_opcodes_from_generated_names() -> set[str]:
 
 def main() -> int:
     options = parse_args()
+    select_target_version(options.target_version)
     try:
         verify_checkout(options.cpython)
         sources = read_inputs(options.cpython)

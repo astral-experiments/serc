@@ -1289,7 +1289,10 @@ fn assertion_borrow_block_ranges(items: &[Item]) -> Vec<Range<usize>> {
     ranges
 }
 
-pub(in crate::assembler) fn optimize_linear_assertion_load_fast(items: &mut [Item]) {
+pub(in crate::assembler) fn optimize_linear_assertion_load_fast(
+    python_version: crate::PythonVersion,
+    items: &mut [Item],
+) {
     #[derive(Clone, Copy)]
     struct Reference {
         producer: u32,
@@ -1509,7 +1512,7 @@ pub(in crate::assembler) fn optimize_linear_assertion_load_fast(items: &mut [Ite
                     unreachable!("operand patches are resolved before assembler passes")
                 }
             };
-            cumulative_effect += opcode_stack_effect(instruction.opcode, argument);
+            cumulative_effect += opcode_stack_effect(python_version, instruction.opcode, argument);
             if let Some(depth_after) = instruction.depth_after() {
                 start_depth = Some(i64::from(depth_after) - cumulative_effect);
                 break;
@@ -1565,29 +1568,53 @@ pub(in crate::assembler) fn optimize_linear_assertion_load_fast(items: &mut [Ite
                 }
                 COPY => stack.push(stack.copy_from_top(argument)),
                 SWAP => unreachable!("linear assertion borrowing requires a SWAP-free stream"),
-                FORMAT_SIMPLE | GET_ANEXT | GET_LEN | GET_YIELD_FROM_ITER | MATCH_KEYS
-                | MATCH_MAPPING | MATCH_SEQUENCE | WITH_EXCEPT_START | IMPORT_FROM => {
-                    let (popped, pushed) = opcode_stack_counts(instruction.opcode, argument);
-                    for (producer, _) in items[range.clone()]
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, item)| matches!(item, Item::Instruction(_)))
-                        .take(pushed.saturating_sub(popped))
-                    {
-                        stack.push(Reference::new(
-                            candidates.binary_search(&producer).ok(),
-                            None,
-                        ));
+                opcode
+                    if matches!(
+                        opcode,
+                        FORMAT_SIMPLE
+                            | GET_ANEXT
+                            | GET_LEN
+                            | GET_YIELD_FROM_ITER
+                            | MATCH_KEYS
+                            | MATCH_MAPPING
+                            | MATCH_SEQUENCE
+                            | WITH_EXCEPT_START
+                            | IMPORT_FROM
+                    ) || (python_version == crate::PythonVersion::Py315
+                        && opcode == crate::target::opcodes::GET_ITER) =>
+                {
+                    let (popped, pushed) =
+                        opcode_stack_counts(python_version, instruction.opcode, argument);
+                    if python_version == crate::PythonVersion::Py315 {
+                        for _ in 0..pushed.saturating_sub(popped) {
+                            stack
+                                .push(Reference::new(candidates.binary_search(&offset).ok(), None));
+                        }
+                    } else {
+                        for (producer, _) in items[range.clone()]
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, item)| matches!(item, Item::Instruction(_)))
+                            .take(pushed.saturating_sub(popped))
+                        {
+                            stack.push(Reference::new(
+                                candidates.binary_search(&producer).ok(),
+                                None,
+                            ));
+                        }
                     }
                 }
                 DICT_MERGE | DICT_UPDATE | LIST_APPEND | LIST_EXTEND | MAP_ADD | RERAISE
                 | SET_ADD | SET_UPDATE => {
-                    let (popped, pushed) = opcode_stack_counts(instruction.opcode, argument);
+                    let (popped, pushed) =
+                        opcode_stack_counts(python_version, instruction.opcode, argument);
                     stack.pop_many(popped.saturating_sub(pushed));
                 }
                 END_SEND | SET_FUNCTION_ATTRIBUTE => {
                     let top = stack.pop();
-                    stack.pop();
+                    let (popped, pushed) =
+                        opcode_stack_counts(python_version, instruction.opcode, argument);
+                    stack.pop_many(popped.saturating_sub(pushed));
                     stack.push(top);
                 }
                 CHECK_EXC_MATCH => {
@@ -1615,7 +1642,8 @@ pub(in crate::assembler) fn optimize_linear_assertion_load_fast(items: &mut [Ite
                     stack.push_unknown(1);
                 }
                 _ => {
-                    let (popped, pushed) = opcode_stack_counts(instruction.opcode, argument);
+                    let (popped, pushed) =
+                        opcode_stack_counts(python_version, instruction.opcode, argument);
                     stack.pop_many(popped);
                     stack.push_unknown(pushed);
                 }
@@ -3075,6 +3103,7 @@ impl OptimizationPipeline {
         assertion_side_exits: bool,
     ) {
         Self::optimize_load_fast_with_retained_entries(
+            crate::PythonVersion::Py314,
             items,
             exception_regions,
             entries,
@@ -3087,6 +3116,7 @@ impl OptimizationPipeline {
 
     /// Admits retained direct NOP edges using separately verified original arrays.
     pub(in crate::assembler) fn optimize_load_fast_with_retained_entries(
+        python_version: crate::PythonVersion,
         items: &mut [Item],
         exception_regions: &[ExceptionRegion],
         entries: BorrowEntryLabels<'_>,
@@ -3284,7 +3314,58 @@ impl OptimizationPipeline {
             return;
         }
 
-        let (blocks, reachable) = if assertion_side_exits {
+        let (blocks, reachable) = if python_version == crate::PythonVersion::Py315 {
+            let mut boundaries = preserved_block_boundaries.clone();
+            boundaries.extend(borrow_unreachable_labels.iter().copied());
+            boundaries.extend(exception_regions.iter().map(|region| region.target));
+            for item in items.iter() {
+                if let Item::Instruction(instruction) = item
+                    && let Operand::Forward(target) | Operand::Backward(target) =
+                        instruction.operand()
+                {
+                    boundaries.insert(target);
+                }
+            }
+            let (blocks, label_blocks, _) = borrow_block_ranges(
+                items,
+                &boundaries,
+                &FxHashSet::default(),
+                preserved_block_boundaries,
+            );
+            let mut reachable = vec![false; blocks.len()];
+            let mut pending = if blocks.is_empty() {
+                Vec::new()
+            } else {
+                vec![0]
+            };
+            while let Some(block) = pending.pop() {
+                if std::mem::replace(&mut reachable[block], true) {
+                    continue;
+                }
+                let last = items[blocks[block].clone()].iter().rev().find_map(|item| {
+                    if let Item::Instruction(instruction) = item {
+                        Some(instruction)
+                    } else {
+                        None
+                    }
+                });
+                // Python 3.15 follows empty CFG blocks and retained NOPs. Python 3.14's
+                // removed-jump barriers below reproduce its earlier traversal semantics.
+                if block + 1 < blocks.len()
+                    && last.is_none_or(|last| block_has_fallthrough(&[Item::Instruction(*last)]))
+                {
+                    pending.push(block + 1);
+                }
+                if let Some(last) = last
+                    && let Operand::Forward(label) | Operand::Backward(label) = last.operand()
+                    && let Some(target) = label_blocks.get(label.0 as usize).copied()
+                    && target < blocks.len()
+                {
+                    pending.push(target);
+                }
+            }
+            (blocks, Some(reachable))
+        } else if assertion_side_exits {
             (assertion_borrow_block_ranges(items), None)
         } else {
             let mut block_labels = FxHashSet::default();
@@ -3962,14 +4043,15 @@ impl OptimizationPipeline {
                     continue;
                 };
                 let Operand::Value(argument) = instruction.operand() else {
-                    cumulative_effect += opcode_stack_effect(instruction.opcode, 0);
+                    cumulative_effect += opcode_stack_effect(python_version, instruction.opcode, 0);
                     if let Some(depth_after) = instruction.depth_after() {
                         start_depth = Some(i64::from(depth_after) - cumulative_effect);
                         break;
                     }
                     continue;
                 };
-                cumulative_effect += opcode_stack_effect(instruction.opcode, argument);
+                cumulative_effect +=
+                    opcode_stack_effect(python_version, instruction.opcode, argument);
                 if let Some(depth_after) = instruction.depth_after() {
                     start_depth = Some(i64::from(depth_after) - cumulative_effect);
                     break;
@@ -4019,31 +4101,53 @@ impl OptimizationPipeline {
                     COPY => stack.push(stack.copy_from_top(argument)),
                     SWAP => stack.swap_from_top(argument),
                     // These instructions retain all their existing inputs.
-                    FORMAT_SIMPLE | GET_ANEXT | GET_LEN | GET_YIELD_FROM_ITER | MATCH_KEYS
-                    | MATCH_MAPPING | MATCH_SEQUENCE | WITH_EXCEPT_START | IMPORT_FROM => {
-                        let (popped, pushed) = opcode_stack_counts(instruction.opcode, argument);
-                        // CPython's inner loop shadows the instruction index,
-                        // attributing these references to the first
-                        // instructions in the block.
-                        for (producer, _) in items[range.clone()]
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, item)| matches!(item, Item::Instruction(_)))
-                            .take(pushed.saturating_sub(popped))
-                        {
-                            stack.push(Reference::new(producer, None));
+                    opcode
+                        if matches!(
+                            opcode,
+                            FORMAT_SIMPLE
+                                | GET_ANEXT
+                                | GET_LEN
+                                | GET_YIELD_FROM_ITER
+                                | MATCH_KEYS
+                                | MATCH_MAPPING
+                                | MATCH_SEQUENCE
+                                | WITH_EXCEPT_START
+                                | IMPORT_FROM
+                        ) || (python_version == crate::PythonVersion::Py315
+                            && opcode == crate::target::opcodes::GET_ITER) =>
+                    {
+                        let (popped, pushed) =
+                            opcode_stack_counts(python_version, instruction.opcode, argument);
+                        if python_version == crate::PythonVersion::Py315 {
+                            for _ in 0..pushed.saturating_sub(popped) {
+                                stack.push(Reference::new(offset, None));
+                            }
+                        } else {
+                            // CPython 3.14's inner loop shadows the instruction index,
+                            // attributing these references to the first instructions in the block.
+                            for (producer, _) in items[range.clone()]
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, item)| matches!(item, Item::Instruction(_)))
+                                .take(pushed.saturating_sub(popped))
+                            {
+                                stack.push(Reference::new(producer, None));
+                            }
                         }
                     }
                     // These consume only their top inputs and retain the
                     // container deeper on the stack.
                     DICT_MERGE | DICT_UPDATE | LIST_APPEND | LIST_EXTEND | MAP_ADD | RERAISE
                     | SET_ADD | SET_UPDATE => {
-                        let (popped, pushed) = opcode_stack_counts(instruction.opcode, argument);
+                        let (popped, pushed) =
+                            opcode_stack_counts(python_version, instruction.opcode, argument);
                         stack.pop_many(popped.saturating_sub(pushed));
                     }
                     END_SEND | SET_FUNCTION_ATTRIBUTE => {
                         let top = stack.pop();
-                        stack.pop();
+                        let (popped, pushed) =
+                            opcode_stack_counts(python_version, instruction.opcode, argument);
+                        stack.pop_many(popped.saturating_sub(pushed));
                         stack.push(top);
                     }
                     CHECK_EXC_MATCH => {
@@ -4071,7 +4175,8 @@ impl OptimizationPipeline {
                         stack.push_unknown(1);
                     }
                     _ => {
-                        let (popped, pushed) = opcode_stack_counts(instruction.opcode, argument);
+                        let (popped, pushed) =
+                            opcode_stack_counts(python_version, instruction.opcode, argument);
                         stack.pop_many(popped);
                         stack.push_unknown(pushed);
                     }
@@ -6091,6 +6196,7 @@ mod retained_finally_origin_tests {
                 pipeline.borrow_jump_entry_labels.insert(Label(4));
             }
             OptimizationPipeline::optimize_load_fast_with_retained_entries(
+                pipeline.python_version,
                 &mut items,
                 &[],
                 BorrowEntryLabels {

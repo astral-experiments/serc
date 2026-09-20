@@ -2,12 +2,72 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::block_graph::ItemPosition;
 use super::super::{ConstantTable, Item, Label, Operand, OptimizationPipeline, SourceLocation};
-use crate::CompileError;
 use crate::code_object::Constant;
 use crate::target::Opcode;
-use crate::target::opcodes::{BUILD_TUPLE, LOAD_CONST, LOAD_SMALL_INT, NOP, UNARY_NEGATIVE};
+use crate::target::opcodes::{
+    BUILD_TUPLE, LOAD_COMMON_CONSTANT, LOAD_CONST, LOAD_SMALL_INT, NOP, UNARY_NEGATIVE,
+};
+use crate::target::operands315::CommonConstant;
+use crate::{CompileError, PythonVersion};
 
 impl OptimizationPipeline {
+    /// Lowers 3.15's immortal constants after value-based graph optimizations.
+    pub(super) fn lower_common_constants(&mut self, constants: &mut dyn ConstantTable) {
+        if self.python_version != PythonVersion::Py315 {
+            return;
+        }
+        let mut changed = false;
+        self.graph.for_each_instruction_mut(|instruction| {
+            if instruction.opcode != LOAD_CONST {
+                return;
+            }
+            let Operand::Value(index) = instruction.operand() else {
+                return;
+            };
+            let common = match constants.get(index) {
+                Constant::None => CommonConstant::NONE,
+                Constant::Bool(true) => CommonConstant::TRUE,
+                Constant::Bool(false) => CommonConstant::FALSE,
+                Constant::String(value) if value.is_empty() => CommonConstant::EMPTY_STR,
+                Constant::SignedInt(-1) => CommonConstant::MINUS_ONE,
+                _ => return,
+            };
+            instruction.opcode = LOAD_COMMON_CONSTANT;
+            instruction.set_operand(Operand::Value(common.argument()));
+            changed = true;
+        });
+        if !changed {
+            return;
+        }
+
+        // Code generation still admits these constants in source order. Only the
+        // final constant table drops their unused slots; slot zero remains reserved.
+        let mut used = vec![false; constants.len()];
+        for item in self.graph.iter_items() {
+            if let Item::Instruction(instruction) = item
+                && instruction.opcode == LOAD_CONST
+                && let Operand::Value(index) = instruction.operand()
+            {
+                used[index as usize] = true;
+            }
+        }
+        // Earlier folding already established admission order, including values
+        // first constructed by expressions whose loads were subsequently discarded.
+        let order = used
+            .iter()
+            .enumerate()
+            .filter_map(|(index, used)| used.then_some(u32::try_from(index).unwrap()))
+            .collect::<Vec<_>>();
+        let indices = constants.retain_used(&used, &order);
+        self.graph.for_each_instruction_mut(|instruction| {
+            if instruction.opcode == LOAD_CONST
+                && let Operand::Value(index) = instruction.operand()
+            {
+                instruction.set_operand(Operand::Value(indices[index as usize].unwrap()));
+            }
+        });
+    }
+
     /// Folds constant operations exposed by exit copying, preserving basic-block boundaries.
     pub(super) fn fold_copied_constants(
         &mut self,
@@ -198,5 +258,64 @@ impl OptimizationPipeline {
             }
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::code_object::Constant;
+    use crate::target::opcodes::LOAD_COMMON_CONSTANT;
+    use crate::{CompileOptions, PythonVersion, compile_with_options};
+
+    #[test]
+    fn python315_common_constants_preserve_first_slot_and_folded_containers() {
+        let source =
+            "a = None\nb = True\nc = False\nd = ''\ne = -1\nf = 1000\ng = (None, False, '', -1)\n";
+        for python_version in [PythonVersion::Py314, PythonVersion::Py315] {
+            let module = compile_with_options(
+                source,
+                "constants.py",
+                &CompileOptions {
+                    python_version,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap();
+            let arguments = module
+                .bytecode()
+                .chunks_exact(2)
+                .filter(|word| word[0] == LOAD_COMMON_CONSTANT.code_for(python_version))
+                .map(|word| word[1])
+                .collect::<Vec<_>>();
+            if python_version == PythonVersion::Py315 {
+                assert_eq!(arguments, [7, 9, 10, 8, 11, 7]);
+                assert!(matches!(
+                    module.code.constants.as_slice(),
+                    [Constant::None, Constant::Int(1000), Constant::Tuple(values)]
+                        if matches!(values.as_slice(), [Constant::None, Constant::Bool(false), Constant::String(empty), Constant::SignedInt(-1)] if empty.is_empty())
+                ));
+            } else {
+                assert!(arguments.is_empty());
+                assert_eq!(module.code.constants.len(), 7);
+            }
+        }
+    }
+
+    #[test]
+    fn python315_common_constant_pruning_preserves_discarded_fold_admission() {
+        let module = compile_with_options(
+            "()\nx = (1, 2)\nf(**kw)\n",
+            "discarded_constant.py",
+            &CompileOptions {
+                python_version: PythonVersion::Py315,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            module.code.constants.as_slice(),
+            [Constant::Int(1), Constant::Tuple(empty), Constant::Tuple(pair)]
+                if empty.is_empty() && matches!(pair.as_slice(), [Constant::Int(1), Constant::Int(2)])
+        ));
     }
 }

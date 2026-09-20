@@ -386,6 +386,11 @@ impl crate::assembler::ConstantTable for OutputState {
         self.qualified_name_constant_index = self
             .qualified_name_constant_index
             .and_then(|index| index_map[index as usize]);
+        self.first_flowgraph_constant = index_map
+            .iter()
+            .take(self.first_flowgraph_constant)
+            .flatten()
+            .count();
         index_map
     }
 }

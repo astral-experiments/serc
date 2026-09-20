@@ -13,7 +13,8 @@ use super::native_output_cache::{
     Artifact, artifact, digest, native_key, os_hex, regular_bytes, write_new,
 };
 use super::{
-    CompilerInput, CompilerOutcome, InitialInternState, OracleOutcome, Outcome, OutcomeKind,
+    CompileOptions, CompilerInput, CompilerOutcome, OracleOutcome, Outcome, OutcomeKind,
+    PythonVersion,
 };
 
 #[derive(Deserialize)]
@@ -85,18 +86,45 @@ fn value_artifact(value: &Value) -> io::Result<Artifact> {
     Ok(serde_json::from_value(value.clone())?)
 }
 
+fn admitted_counts_match(admission: &Admission, config: &Config) -> bool {
+    // Bind the admitted corpus to the caller's explicitly expected inventory.
+    admission.files > 0
+        && admission.eligible > 0
+        && admission.files == config.expected_files
+        && admission.eligible == config.expected_eligible
+        && admission.cpython_rejected == config.expected_cpython_rejected
+        && admission.eligible.checked_add(admission.cpython_rejected) == Some(admission.files)
+}
+
+fn admitted_target_matches(identity: &Value, python_version: PythonVersion) -> bool {
+    let target = python_version.target();
+    identity["profile"]["target"]
+        == json!({
+            "implementation": target.implementation,
+            "version": target.version_string(),
+            "tag": target.tag,
+            "commit": target.commit,
+            "magic_hex": target.magic_hex(),
+        })
+}
+
 impl Reader {
     pub(super) fn new(
         config_path: &Path,
         profile_path: &Path,
         python: &str,
         oracle: &str,
+        python_version: PythonVersion,
         paths: &[PathBuf],
     ) -> io::Result<Self> {
         let config_bytes = regular_bytes(config_path)?;
         let config: Config = serde_json::from_slice(&config_bytes)?;
         let admission_bytes = config.admission.read()?;
         let admission: Admission = serde_json::from_slice(&admission_bytes)?;
+        require(
+            admitted_target_matches(&admission.native_identity, python_version),
+            "admitted native cache CPython target differs from the selected target",
+        )?;
         let actual: Value = serde_json::from_slice(&config.admission_actual.read()?)?;
         require(
             actual["actual_exit_code"] == 0
@@ -106,18 +134,7 @@ impl Reader {
         require(
             admission.schema == 1
                 && admission.status == "ADMITTED_NATIVE_OUTPUT_CACHE"
-                && (
-                    admission.files,
-                    admission.eligible,
-                    admission.cpython_rejected,
-                ) == (
-                    config.expected_files,
-                    config.expected_eligible,
-                    config.expected_cpython_rejected,
-                )
-                && admission.files > 0
-                && admission.eligible > 0
-                && admission.eligible.checked_add(admission.cpython_rejected) == Some(admission.files)
+                && admitted_counts_match(&admission, &config)
                 && [
                     "capture",
                     "capture_actual",
@@ -371,14 +388,9 @@ impl Reader {
         Ok(artifact(&path, bytes))
     }
 
-    pub(super) fn compare(
-        &self,
-        index: usize,
-        path: &Path,
-        state: Option<&InitialInternState>,
-    ) -> Outcome {
+    pub(super) fn compare(&self, index: usize, path: &Path, options: &CompileOptions) -> Outcome {
         self.compare_with(index, path, |input, filename| {
-            super::compile_input(input, filename, state)
+            super::compile_input(input, filename, options)
         })
     }
 
@@ -499,6 +511,28 @@ impl Reader {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn admitted_cache_identity_is_bound_to_its_python_target() {
+        for python_version in [PythonVersion::Py314, PythonVersion::Py315] {
+            let target = python_version.target();
+            let mut identity = json!({"profile": {"target": {
+                "implementation": target.implementation,
+                "version": target.version_string(),
+                "tag": target.tag,
+                "commit": target.commit,
+                "magic_hex": target.magic_hex(),
+            }}});
+            assert!(admitted_target_matches(&identity, python_version));
+            let other = match python_version {
+                PythonVersion::Py314 => PythonVersion::Py315,
+                PythonVersion::Py315 => PythonVersion::Py314,
+            };
+            assert!(!admitted_target_matches(&identity, other));
+            identity["profile"]["target"]["commit"] = json!("other interpreter build");
+            assert!(!admitted_target_matches(&identity, python_version));
+        }
+    }
 
     // Internal synthetic vectors only. This does not mint or load an admission.
     fn fixture(rejected: bool) -> (tempfile::TempDir, Reader, PathBuf) {

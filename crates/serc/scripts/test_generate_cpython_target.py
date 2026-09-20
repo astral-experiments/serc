@@ -143,5 +143,90 @@ class RenderPreinternedLookupTest(unittest.TestCase):
         )
 
 
+class TargetSelectionTest(unittest.TestCase):
+    def tearDown(self) -> None:
+        generator.select_target_version("3.14")
+
+    def test_selects_exact_release_and_protocol_inputs(self) -> None:
+        generator.select_target_version("3.15")
+        self.assertEqual(generator.TARGET_TAG, "v3.15.0rc2")
+        self.assertEqual(
+            generator.TARGET_COMMIT, "435c9e5a798c99653e3ab64ce29baed0e4f3dfee"
+        )
+        self.assertEqual(generator.TARGET_VERSION, (3, 15, 0))
+        self.assertEqual(generator.OUTPUT.name, "cpython_3_15_0rc2.rs")
+        self.assertEqual(generator.MARSHAL_OUTPUT.name, "v6.rs")
+        self.assertIn("Include/cpython/marshal.h", generator.MARSHAL_INPUTS)
+        self.assertIn("Python/assemble.c", generator.TARGET_INPUTS)
+        generator.select_target_version("3.14")
+        self.assertEqual(generator.TARGET_TAG, "v3.14.5")
+        self.assertEqual(generator.TARGET_VERSION, (3, 14, 5))
+        self.assertEqual(generator.OUTPUT.name, "cpython_3_14_5.rs")
+        self.assertEqual(generator.MARSHAL_OUTPUT.name, "v5.rs")
+        self.assertNotIn("Python/assemble.c", generator.TARGET_INPUTS)
+        self.assertEqual(generator.MARSHAL_INPUTS[0], "Include/marshal.h")
+
+    def test_startup_fixture_matches_target_and_pinned_digest(self) -> None:
+        generator.select_target_version("3.15")
+        strings = generator.read_startup_strings()
+        self.assertEqual(len(strings), 2790)
+        self.assertEqual(strings, tuple(sorted(set(strings))))
+        self.assertFalse(any(value.startswith("/") for value in strings))
+        with mock.patch.object(generator, "STARTUP_315_SHA256", "0" * 64):
+            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                generator.read_startup_strings()
+        with mock.patch.object(generator, "TARGET_COMMIT", "0" * 40):
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                generator.read_startup_strings()
+
+    def test_opcode_boundary_comes_from_pinned_source(self) -> None:
+        source = """
+        /* Instruction opcodes for compiled code */
+#define CACHE 0
+#define RESUME 129
+#define SPECIALIZED 130
+#define HAVE_ARGUMENT 42
+#define MIN_SPECIALIZED_OPCODE 130
+        """
+        self.assertEqual(
+            generator.parse_opcodes(source), [("CACHE", 0), ("RESUME", 129)]
+        )
+        with self.assertRaisesRegex(ValueError, "first specialized opcode"):
+            generator.parse_opcodes(source.replace("MIN_SPECIALIZED_OPCODE", "MISSING"))
+
+    def test_import_modes_come_from_each_codegen_branch(self) -> None:
+        source = """
+        if (s->v.Import.is_lazy) {
+            ADDOP_NAME_CUSTOM(c, loc, IMPORT_NAME, alias->name, names, 3, 1);
+        } else {
+            if (force_eager) {
+                // force eager import in try/except block
+                ADDOP_NAME_CUSTOM(c, loc, IMPORT_NAME, alias->name, names, 3, 2);
+            } else {
+                ADDOP_NAME_CUSTOM(c, loc, IMPORT_NAME, alias->name, names, 3, 0);
+            }
+        }
+        """
+        self.assertEqual(
+            generator.parse_import_modes(source),
+            (3, [("LAZY", 1), ("EAGER", 2), ("DEFAULT", 0)]),
+        )
+        with self.assertRaisesRegex(ValueError, "disagree"):
+            generator.parse_import_modes(source.replace("names, 3, 0", "names, 2, 0"))
+        with self.assertRaisesRegex(ValueError, "distinct"):
+            generator.parse_import_modes(source.replace("names, 3, 0", "names, 3, 2"))
+
+    def test_metadata_array_length_comes_from_pinned_source(self) -> None:
+        source = """
+const struct opcode_metadata _PyOpcode_opcode_metadata[271] = {
+    [RESUME] = { true, INSTR_FMT_IBC, HAS_ARG_FLAG | HAS_EVAL_BREAK_FLAG },
+};
+        """
+        self.assertEqual(
+            generator.parse_opcode_flags(source),
+            {"RESUME": {"HAS_ARG_FLAG", "HAS_EVAL_BREAK_FLAG"}},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

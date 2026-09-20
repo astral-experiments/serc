@@ -9,8 +9,9 @@ use ruff_text_size::TextRange;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
-    BUILD_SET, COPY, COPY_FREE_VARS, LOAD_CONST, LOAD_FAST, LOAD_LOCALS, LOAD_SMALL_INT, MAKE_CELL,
-    MAKE_FUNCTION, NOP, POP_TOP, RETURN_GENERATOR, RETURN_VALUE, SETUP_ANNOTATIONS, STORE_DEREF,
+    BUILD_SET, COPY, COPY_FREE_VARS, GET_AITER, GET_ITER, LOAD_CONST, LOAD_FAST, LOAD_LOCALS,
+    LOAD_SMALL_INT, MAKE_CELL, MAKE_FUNCTION, NOP, POP_TOP, RESUME, RETURN_GENERATOR, RETURN_VALUE,
+    SETUP_ANNOTATIONS, STORE_DEREF,
 };
 use crate::CompileError;
 use crate::assembler::{AssembledCode, Assembler, ConstantTable, SourceLocation};
@@ -110,6 +111,7 @@ impl<'source> Compiler<'source> {
         unit: CodeUnit,
         symbols: SymbolState,
     ) -> Self {
+        let assembler = Assembler::with_python_version(context.python_version);
         Self {
             context,
             cached_source_line: Cell::new(None),
@@ -117,7 +119,7 @@ impl<'source> Compiler<'source> {
             output: OutputState::default(),
             symbols,
             control: ControlFlowState::default(),
-            assembler: Assembler::default(),
+            assembler,
         }
     }
 
@@ -130,13 +132,36 @@ impl<'source> Compiler<'source> {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn module(
         filename: &str,
         source: &'source str,
         tokens: &'source Tokens,
         body: &Suite,
     ) -> Self {
-        let context = Arc::new(CompilationContext::new(filename, source, tokens, body));
+        Self::module_with_python_version(
+            filename,
+            source,
+            tokens,
+            body,
+            crate::PythonVersion::Py314,
+        )
+    }
+
+    pub(crate) fn module_with_python_version(
+        filename: &str,
+        source: &'source str,
+        tokens: &'source Tokens,
+        body: &Suite,
+        python_version: crate::PythonVersion,
+    ) -> Self {
+        let context = Arc::new(CompilationContext::with_python_version(
+            filename,
+            source,
+            tokens,
+            body,
+            python_version,
+        ));
         let future_flags = context.module_plan().future_flags;
         let unit = CodeUnit::from_spec(CodeUnitSpec {
             scope: Scope::Module,
@@ -759,15 +784,22 @@ impl<'source> Compiler<'source> {
             for (exclusion_start, exclusion_end) in
                 &self.control.generators.generator_region_exclusions
             {
-                self.assembler.add_stopiteration_exception_region(
-                    region_start,
-                    *exclusion_start,
-                    handler,
-                );
+                self.assembler
+                    .add_stopiteration_exception_region_with_depth(
+                        region_start,
+                        *exclusion_start,
+                        handler,
+                        self.control.generators.generator_region_depth,
+                    );
                 region_start = *exclusion_end;
             }
             self.assembler
-                .add_stopiteration_exception_region(region_start, handler, handler);
+                .add_stopiteration_exception_region_with_depth(
+                    region_start,
+                    handler,
+                    handler,
+                    self.control.generators.generator_region_depth,
+                );
             self.assembler.set_location(SourceLocation::NONE);
             self.set_depth(1);
             self.emit_unary_intrinsic(UnaryIntrinsic::STOPITERATION_ERROR)?;
@@ -911,7 +943,7 @@ impl<'source> Compiler<'source> {
             != 0
             && self.control.generators.generator_region_start.is_some()
         {
-            max_depth.max(2)
+            max_depth.max(self.control.generators.generator_region_depth + 2)
         } else {
             max_depth.max(1)
         };
@@ -968,6 +1000,22 @@ impl<'source> Compiler<'source> {
     }
 
     pub(super) fn emit_function_prologue(&mut self) -> Result<(), CompileError> {
+        self.emit_prologue(None)
+    }
+
+    /// Acquire a generator expression's outer iterator before returning its generator.
+    pub(super) fn emit_generator_expression_prologue(
+        &mut self,
+        is_async: bool,
+        iterator_location: SourceLocation,
+    ) -> Result<(), CompileError> {
+        self.emit_prologue(Some((is_async, iterator_location)))
+    }
+
+    fn emit_prologue(
+        &mut self,
+        generator_iterator: Option<(bool, SourceLocation)>,
+    ) -> Result<(), CompileError> {
         self.assembler.set_location(SourceLocation::NONE);
         if !self.symbols.free_names.is_empty() {
             self.emit(
@@ -987,6 +1035,20 @@ impl<'source> Compiler<'source> {
             .collect();
         for index in cells {
             self.emit(MAKE_CELL, to_u32(index, "cell variable index")?, 0)?;
+        }
+        if let Some((is_async, iterator_location)) = generator_iterator {
+            // This semantic marker becomes RESUME_AT_GEN_EXPR_START during layout.
+            // Keeping it distinct from the 3.14 depth bit avoids an ambiguous operand.
+            self.emit(RESUME, crate::target::GENEXPR_RESUME_ARGUMENT, 0)?;
+            self.assembler.set_location(iterator_location);
+            self.emit(LOAD_FAST, 0, 1)?;
+            if is_async {
+                self.emit(GET_AITER, 0, 0)?;
+            } else {
+                self.emit(GET_ITER, 0, self.iterator_extra_slots())?;
+            }
+            self.control.generators.generator_region_depth =
+                self.control.stack.depth.cast_unsigned();
         }
         if self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0 {
             let line = i32::try_from(self.unit.first_line_number).unwrap_or(i32::MAX);
