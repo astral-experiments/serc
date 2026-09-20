@@ -35,10 +35,12 @@ Serc has both focused Criterion/CodSpeed benchmarks and an
 with `serc compile` on a pinned NumPy source tree. See [`BENCHMARKS.md`](BENCHMARKS.md) for
 published results.
 
-The latest published end-to-end measurement (July 7, 2026, Serc `bd51c6d`)
-compiled NumPy's 505 Python files in **1.471 s ± 0.079 s**, compared with
-**2.056 s ± 0.451 s** for CPython 3.14.5 `compileall`: **1.40 ± 0.32 times
-faster** on that machine and workload.
+The latest published end-to-end measurement (September 20, 2026, Serc
+[`1b57c9c`](https://github.com/astral-sh/serc/commit/1b57c9c33f7586a85d8a7ae2a5f3dd3b9e6a5cec))
+compiled NumPy's 505 Python files in **1.194 s ± 0.023 s**, compared with
+**1.739 s ± 0.060 s** for CPython 3.14.5 `compileall`: **1.46× faster** on
+that machine and workload. These are means and standard deviations across 50
+runs per compiler; all 505 generated `.pyc` files matched byte for byte.
 
 ## CPython compatibility
 
