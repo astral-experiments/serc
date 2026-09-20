@@ -6,8 +6,9 @@ use crate::code_object::{CodeObject, Constant};
 use crate::target::is_preinterned_string;
 
 use super::key::{
-    HashedObjectKey, ObjectKey, code_bytes_key, code_key, constant_key, constants_tuple_key,
-    is_cached_character, local_kinds_key, locals_tuple_key, should_intern, strings_tuple_key,
+    FrozenSetMembers, HashedObjectKey, ObjectKey, code_bytes_key, code_key, constant_key,
+    constants_tuple_key, frozen_set_members_with_properties, is_cached_character, local_kinds_key,
+    locals_tuple_key, should_intern, strings_tuple_key,
 };
 use super::plan::{MarshalVisitor, ObjectId, ReferenceMode, traverse_code};
 
@@ -134,7 +135,6 @@ impl CachedObject {
         }
     }
 
-    #[cfg(test)]
     fn for_key(key: &ObjectKey<'_>) -> Option<Self> {
         match key {
             ObjectKey::Bytes([]) => Some(Self::EmptyBytes),
@@ -163,6 +163,7 @@ pub(super) struct ObjectGraph<'a> {
     cache_scalars: bool,
     objects_by_id: Vec<Object>,
     occurrences: Vec<Occurrence>,
+    has_frozenset: bool,
     #[cfg(debug_assertions)]
     unique_objects: FxHashSet<HashedObjectKey<'a>>,
 }
@@ -176,28 +177,72 @@ impl<'a> ObjectGraph<'a> {
         let explicitly_interned = (!explicitly_interned.is_empty()).then_some(&explicitly_interned);
         let recreated_frozensets =
             (!recreated_frozensets.is_empty()).then_some(&recreated_frozensets);
-        let metadata_slots = code
-            .marshal_provenance
-            .metadata_ids
-            .as_ref()
-            .and_then(|ids| usize::try_from(ids.domain_len).ok())
-            .filter(|len| *len <= MAX_DENSE_METADATA_SLOTS)
-            .map(|len| vec![None; len].into_boxed_slice())
-            .unwrap_or_default();
-        let mut graph = Self {
-            cache_scalars: code.constants.len() >= MIN_CACHED_SCALAR_CONSTANTS,
-            metadata_slots,
-            ..Self::default()
+        let build_graph = |sort_properties| {
+            let metadata_slots = code
+                .marshal_provenance
+                .metadata_ids
+                .as_ref()
+                .and_then(|ids| usize::try_from(ids.domain_len).ok())
+                .filter(|len| *len <= MAX_DENSE_METADATA_SLOTS)
+                .map(|len| vec![None; len].into_boxed_slice())
+                .unwrap_or_default();
+            let mut graph = Self {
+                cache_scalars: code.constants.len() >= MIN_CACHED_SCALAR_CONSTANTS,
+                metadata_slots,
+                ..Self::default()
+            };
+            traverse_code(
+                code,
+                &mut GraphVisitor {
+                    graph: &mut graph,
+                    explicitly_interned,
+                    recreated_frozensets,
+                    sort_properties,
+                },
+            );
+            graph
         };
-        traverse_code(
-            code,
-            &mut GraphVisitor {
-                graph: &mut graph,
-                explicitly_interned,
-                recreated_frozensets,
-            },
-        );
-        graph
+        let graph = build_graph(None);
+        // Frozenset sorting serializes each member independently. Reference flags within tuple
+        // members depend on sharing elsewhere in the complete code tree, so finalize wire order
+        // only after collecting that information. Other code trees retain the single graph pass.
+        if graph.has_frozenset {
+            build_graph(Some(&graph))
+        } else {
+            graph
+        }
+    }
+
+    pub(super) fn frozen_set_members(&self, values: &'a [Constant]) -> FrozenSetMembers<'a> {
+        frozen_set_members_with_properties(values, &|value| self.constant_properties(value))
+    }
+
+    fn constant_properties(&self, value: &'a Constant) -> (bool, bool) {
+        let key = constant_key(value);
+        let cached = CachedObject::for_key(&key).and_then(|cached| match cached {
+            CachedObject::EmptyBytes => self.cached_empty_bytes,
+            CachedObject::EmptyTuple => self.cached_empty_tuple,
+            _ => self.cached_scalar_ids.as_ref().and_then(|slots| {
+                let index = slots[cached.scalar_index()];
+                (index != UNSEEN_CACHED_OBJECT).then(|| ObjectId::from_index(index as usize))
+            }),
+        });
+        let object = cached.or_else(|| {
+            if let Constant::String(value) = value {
+                self.objects
+                    .get(&ObjectKey::ConstantString(value).into())
+                    .or_else(|| self.interned_strings.get(value.as_str()))
+                    .copied()
+            } else {
+                self.objects.get(&key.into()).copied()
+            }
+        });
+        object.map_or((false, false), |object| {
+            (
+                self.is_shared_object(object),
+                self.is_interned_object(object),
+            )
+        })
     }
 
     fn reserve_for_code(&mut self, code: &CodeObject) {
@@ -1123,6 +1168,7 @@ struct GraphVisitor<'graph, 'code> {
     graph: &'graph mut ObjectGraph<'code>,
     explicitly_interned: Option<&'graph FxHashSet<&'code str>>,
     recreated_frozensets: Option<&'graph FxHashSet<usize>>,
+    sort_properties: Option<&'graph ObjectGraph<'code>>,
 }
 
 impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
@@ -1233,6 +1279,7 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
 
     #[inline]
     fn constant(&mut self, value: &'code Constant, _reference_mode: ReferenceMode) -> bool {
+        self.graph.has_frozenset |= matches!(value, Constant::FrozenSet(_));
         match value {
             Constant::None | Constant::Bool(_) | Constant::Ellipsis => true,
             Constant::Tuple(_) | Constant::Code(_) => {
@@ -1303,6 +1350,13 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     }
 
     #[inline]
+    fn frozen_set_members(&self, values: &'code [Constant]) -> FrozenSetMembers<'code> {
+        self.sort_properties.map_or_else(
+            || super::key::frozen_set_members_in_wire_order(values),
+            |graph| graph.frozen_set_members(values),
+        )
+    }
+
     fn slice_member(&mut self, value: &'code Constant) {
         let address = std::ptr::from_ref(value).addr();
         self.graph

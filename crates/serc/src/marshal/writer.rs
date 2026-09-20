@@ -514,6 +514,10 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
     }
 
     #[inline]
+    fn frozen_set_members(&self, values: &'code [Constant]) -> super::key::FrozenSetMembers<'code> {
+        self.graph.frozen_set_members(values)
+    }
+
     fn slice_member(&mut self, value: &'code Constant) {
         let object = self.next_object(OccurrenceKind::SliceMember);
         self.write_slice_member(object, value);

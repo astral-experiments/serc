@@ -200,6 +200,12 @@ Marshal encoding is deliberately split into four responsibilities:
 - `marshal/writer.rs` runs the same traversal, consumes the recorded occurrence IDs, assigns
     reference indices, and encodes every value in CPython's order.
 
+When a code tree contains frozen sets, graph analysis first collects sharing and interning facts
+before rebuilding the occurrence order. CPython orders frozen-set members by independent marshal
+streams; tuple children in those streams need their actual reference flags and stream-local
+reference indices. The final graph and writer use the same resulting member order. Code trees
+without frozen sets require only one graph traversal.
+
 Graph analysis must precede writing because whether an object's first occurrence receives
 `FLAG_REF` depends on later occurrences. Replacing that analysis with opportunistic single-pass
 serialization changes bytes even when decoded values are equal. Both passes use the same pruned

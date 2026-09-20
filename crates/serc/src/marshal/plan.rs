@@ -1,6 +1,6 @@
 use crate::code_object::{CodeObject, Constant};
 
-use super::key::{frozen_set_members_in_wire_order, slice_member_uses_identity};
+use super::key::{FrozenSetMembers, frozen_set_members_in_wire_order, slice_member_uses_identity};
 
 // Equal value keys share an ID; identity-based keys remain distinct exactly as `ObjectKey` does.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,6 +36,9 @@ pub(super) trait MarshalVisitor<'a> {
     fn bytes(&mut self, value: &'a [u8]);
     fn constant(&mut self, value: &'a Constant, reference_mode: ReferenceMode) -> bool;
     fn slice_member(&mut self, value: &'a Constant);
+    fn frozen_set_members(&self, values: &'a [Constant]) -> FrozenSetMembers<'a> {
+        frozen_set_members_in_wire_order(values)
+    }
 }
 
 /// Traverses marshal values in their exact wire order.
@@ -146,7 +149,7 @@ where
         }
         Constant::FrozenSet(values) => {
             if visitor.constant(value, reference_mode) {
-                for (_, value) in frozen_set_members_in_wire_order(values) {
+                for (_, value) in visitor.frozen_set_members(values) {
                     traverse_constant(value, ReferenceMode::Forced, visitor);
                 }
             }
