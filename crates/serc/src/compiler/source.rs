@@ -213,6 +213,10 @@ impl<'source> CompilationContext<'source> {
         let mut identifiers = FxHashSet::default();
         identifiers.reserve(origins.len());
         let mut canonical = FxHashSet::default();
+        #[expect(
+            clippy::iter_over_hash_type,
+            reason = "Both provenance sets are only queried for membership."
+        )]
         for (value, origin) in origins {
             let generated = context.generated_mangled_strings.contains(&value);
             if origin.into_inner() == 2 {
