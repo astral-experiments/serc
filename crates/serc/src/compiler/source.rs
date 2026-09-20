@@ -1221,6 +1221,13 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
         return unparse_annotation_tstring(string, source);
     }
 
+    if annotation_needs_no_unparse_corrections(expression) {
+        let indentation = Indentation::default();
+        return Generator::new(&indentation, LineEnding::Lf)
+            .with_mode(CodegenMode::AstUnparse)
+            .expr(expression);
+    }
+
     let mut original_strings = AnnotationStrings::default();
     original_strings.visit_expr(expression);
     let normalized = original_strings.needs_normalization.then(|| {
@@ -1354,6 +1361,19 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
         annotation.push(')');
     }
     annotation
+}
+
+/// These expressions cannot contain any of the constructs corrected after Ruff generates them.
+fn annotation_needs_no_unparse_corrections(expression: &Expr) -> bool {
+    match expression {
+        Expr::Name(_) | Expr::NoneLiteral(_) => true,
+        Expr::Attribute(attribute) => annotation_needs_no_unparse_corrections(&attribute.value),
+        Expr::BinOp(binary) if binary.op == Operator::BitOr => {
+            annotation_needs_no_unparse_corrections(&binary.left)
+                && annotation_needs_no_unparse_corrections(&binary.right)
+        }
+        _ => false,
+    }
 }
 
 /// CPython builds a complete `JoinedStr` body before applying string repr to it.

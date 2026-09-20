@@ -199,11 +199,11 @@ impl<'a> View<'a> {
         boundaries.extend(preserved);
         let mut previous = None;
         let mut n = 0;
-        for (i, item) in items.iter().copied().enumerate() {
+        for (i, item) in items.iter().enumerate() {
             instruction_positions.push(n);
             match item {
                 Item::Label(l) => {
-                    if labels.insert(l, (i, n)).is_some() {
+                    if labels.insert(*l, (i, n)).is_some() {
                         return None;
                     }
                 }
@@ -211,12 +211,14 @@ impl<'a> View<'a> {
                     if let Operand::Forward(l) | Operand::Backward(l) = ins.operand() {
                         boundaries.insert(l);
                     }
-                    if let Some((p, prior)) = previous {
-                        if let Some(k) = key(prior, ins) {
-                            markers.entry(k).or_default().push((p, i));
-                        }
+                    if ins.opcode == NOT_TAKEN
+                        && let Some(p) = previous
+                        && let Item::Instruction(prior) = &items[p]
+                        && let Some(k) = key(*prior, *ins)
+                    {
+                        markers.entry(k).or_default().push((p, i));
                     }
-                    previous = Some((i, ins));
+                    previous = Some(i);
                     n += 1;
                 }
             }
@@ -2750,6 +2752,39 @@ mod tests {
             0
         );
     }
+
+    #[test]
+    fn marker_candidates_preserve_instruction_order_across_labels() {
+        let provenance = ExceptionOwnerProvenance::default();
+        let preserved = FxHashSet::default();
+        let condition = instruction(POP_JUMP_IF_TRUE, Operand::Forward(Label(99)));
+        let marker = instruction(NOT_TAKEN, Operand::Value(0));
+        let items = [
+            Item::Instruction(marker),
+            Item::Instruction(condition),
+            Item::Label(Label(1)),
+            Item::Label(Label(2)),
+            Item::Instruction(marker),
+            Item::Instruction(marker),
+            Item::Instruction(condition),
+            Item::Instruction(instruction(NOP, Operand::Value(0))),
+            Item::Instruction(marker),
+            Item::Instruction(condition),
+            Item::Label(Label(3)),
+            Item::Instruction(marker),
+            Item::Label(Label(99)),
+        ];
+        let view = View::new(&items[..9], &[], &provenance, &preserved).unwrap();
+        assert_eq!(view.endpoint(condition, marker), Some((1, 4)));
+
+        let view = View::new(&items, &[], &provenance, &preserved).unwrap();
+        assert_eq!(
+            view.markers[&key(condition, marker).unwrap()].as_slice(),
+            &[(1, 4), (9, 11)]
+        );
+        assert_eq!(view.endpoint(condition, marker), None);
+    }
+
     #[test]
     fn label_positions_keep_dense_and_sparse_memberships_exact() {
         let mut labels = LabelPositions::default();

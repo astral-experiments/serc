@@ -1,6 +1,36 @@
 use crate::common;
 
 #[test]
+fn matches_cpython_postponed_name_union_annotation_strings() {
+    let source = r#"from __future__ import annotations
+
+ordinary: ((alpha.Type))
+none: None
+left_nested: ((A | B) | C)
+right_nested: A | (B | (C | None))
+attribute: ((A | B)).Nested | None
+normalized: NORMALIZED_NAMES
+unicode: α.β | None
+mixed_subscript: A | tuple[(B, C)]
+mixed_tuple: ((A, B)) | None
+mixed_string: A | "Forward"
+mixed_lambda: A | (lambda *args: B)
+mixed_call: A | factory(**(B | C))
+
+class Example:
+    field: A | (B | None)
+
+    def method(self, value: (A | B).Nested) -> (α.β | None).More:
+        pass
+
+def function(value: NORMALIZED_NAMES) -> A | tuple[(B, C)]:
+    pass
+"#;
+    let source = source.replace("NORMALIZED_NAMES", "\u{212A}.\u{FB03} | \u{1D4AF}");
+    common::assert_matches_cpython_marshal(&source, "postponed_name_union_annotations.py");
+}
+
+#[test]
 fn matches_cpython_tuple_annotation_strings() {
     for annotation in ["(A, B)", "(A,)", "()", "((A, B), C)", "tuple[(A, B)]"] {
         let source = format!(
