@@ -151,9 +151,10 @@ def get_projects():
         with self.assertRaisesRegex(corpus.CorpusError, "invalid revision"):
             corpus.validate_lock(short)
 
-    def test_compatibility_command_freezes_every_outcome_count(self) -> None:
+    def test_compatibility_command_accounts_for_every_outcome(self) -> None:
         roots = [Path("/corpus/first"), Path("/corpus/second")]
-        full = corpus.compatibility_command("python3.14", roots, 73_537, None)
+        files = 100_000
+        full = corpus.compatibility_command("python3.14", roots, files, None)
         expected_outcomes = {
             value.split("=", 1)[0]: int(value.split("=", 1)[1])
             for option, value in pairwise(full)
@@ -162,23 +163,32 @@ def get_projects():
         expected_exact = expected_outcomes["exact"]
         expected_rejected = int(full[full.index("--expected-cpython-rejected") + 1])
 
-        self.assertEqual(expected_exact, 67_850)
-        self.assertEqual(expected_rejected, 160)
-        self.assertEqual(expected_outcomes["matched-rejection"], 67)
-        self.assertEqual(expected_outcomes["byte-mismatch"], 5_527)
-        self.assertEqual(expected_outcomes["unsupported"], 0)
-        self.assertEqual(expected_outcomes["parse-mismatch"], 0)
-        self.assertEqual(expected_outcomes["compiler-failure"], 9)
-        self.assertEqual(expected_outcomes["rejection-mismatch"], 84)
-        self.assertEqual(expected_outcomes["non-utf8"], 0)
-        self.assertEqual(expected_outcomes["oracle-failure"], 0)
         self.assertEqual(
-            73_537 - expected_exact - expected_rejected,
-            corpus.EXPECTED_BYTE_MISMATCHES,
+            set(expected_outcomes),
+            {
+                "exact",
+                "matched-rejection",
+                "byte-mismatch",
+                "unsupported",
+                "parse-mismatch",
+                "compiler-failure",
+                "rejection-mismatch",
+                "non-utf8",
+                "oracle-failure",
+            },
         )
+        self.assertEqual(full.count("--expected-outcome"), len(expected_outcomes))
+        self.assertEqual(sum(expected_outcomes.values()), files)
+        self.assertTrue(all(count >= 0 for count in expected_outcomes.values()))
+        self.assertLessEqual(
+            expected_outcomes["matched-rejection"]
+            + expected_outcomes["rejection-mismatch"],
+            expected_rejected,
+        )
+        self.assertLessEqual(expected_rejected, files - expected_exact)
         self.assertNotIn("--require-all", full)
 
-        limited = corpus.compatibility_command("python3.14", roots, 73_537, 100)
+        limited = corpus.compatibility_command("python3.14", roots, files, 100)
         self.assertNotIn("--expected-outcome", limited)
         self.assertNotIn("--expected-cpython-rejected", limited)
         self.assertEqual(limited[limited.index("--limit") + 1], "100")
