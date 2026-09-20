@@ -32,7 +32,6 @@ pub(super) struct CompilationContext<'source> {
     pub(super) tokens: &'source Tokens,
     line_index: LineIndex,
     pub(super) scopes: ScopeArena,
-    lowering_profile: LoweringProfile,
     constant_string_origins: FxHashMap<String, AtomicU8>,
     static_attribute_names: FxHashSet<String>,
     cached_static_attribute_tuples: Mutex<FxHashSet<Vec<String>>>,
@@ -42,31 +41,6 @@ pub(super) struct CompilationContext<'source> {
     pub(super) requires_interning_trace: bool,
     next_interning_order: AtomicUsize,
     interning_events: Mutex<Vec<CompilationInterningEvent>>,
-}
-
-/// Selects which target-specific layout rules may run while lowering a parsed module.
-///
-/// Ruff accepts some forward syntax that the pinned CPython target rejects. Keeping that case as
-/// an explicit profile prevents a source feature from acting as an undocumented global switch
-/// throughout the compiler.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LoweringProfile {
-    ExactTarget,
-    ForwardSyntax,
-}
-
-impl LoweringProfile {
-    fn for_suite(body: &Suite, python_version: crate::PythonVersion) -> Self {
-        if python_version == crate::PythonVersion::Py314 && suite_has_lazy_imports(body) {
-            Self::ForwardSyntax
-        } else {
-            Self::ExactTarget
-        }
-    }
-
-    const fn target_specific_rules_enabled(self) -> bool {
-        matches!(self, Self::ExactTarget)
-    }
 }
 
 pub(super) struct CallShape<'a> {
@@ -113,7 +87,6 @@ impl<'source> CompilationContext<'source> {
             tokens,
             line_index: LineIndex::from_source_text(source),
             scopes,
-            lowering_profile: LoweringProfile::for_suite(body, python_version),
             constant_string_origins,
             static_attribute_names,
             cached_static_attribute_tuples: Mutex::new(FxHashSet::default()),
@@ -122,10 +95,6 @@ impl<'source> CompilationContext<'source> {
             next_interning_order: AtomicUsize::new(0),
             interning_events: Mutex::new(Vec::new()),
         }
-    }
-
-    pub(super) const fn target_specific_rules_enabled(&self) -> bool {
-        self.lowering_profile.target_specific_rules_enabled()
     }
 
     pub(super) const fn module_plan(&self) -> &ModulePlan {
@@ -568,32 +537,6 @@ fn parser_interned_strings(
     *generated_mangled_strings = visitor.generated_mangled_strings;
     *static_attribute_names = visitor.static_attribute_names;
     visitor.origins
-}
-
-fn suite_has_lazy_imports(body: &Suite) -> bool {
-    body.iter().any(|statement| match statement {
-        Stmt::Import(import) => import.is_lazy,
-        Stmt::ImportFrom(import) => import.is_lazy,
-        Stmt::If(statement) => {
-            suite_has_lazy_imports(&statement.body)
-                || statement
-                    .elif_else_clauses
-                    .iter()
-                    .any(|clause| suite_has_lazy_imports(&clause.body))
-        }
-        Stmt::For(statement) => {
-            suite_has_lazy_imports(&statement.body) || suite_has_lazy_imports(&statement.orelse)
-        }
-        Stmt::While(statement) => {
-            suite_has_lazy_imports(&statement.body) || suite_has_lazy_imports(&statement.orelse)
-        }
-        Stmt::With(statement) => suite_has_lazy_imports(&statement.body),
-        Stmt::Match(statement) => statement
-            .cases
-            .iter()
-            .any(|case| suite_has_lazy_imports(&case.body)),
-        _ => false,
-    })
 }
 
 impl Compiler<'_> {

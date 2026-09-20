@@ -273,15 +273,7 @@ fn classify_dotted_codec_alias(name: &str) -> Option<SourceEncoding> {
 }
 
 fn classify_latin1_encoding(name: &str) -> bool {
-    let normalized_prefix: String = name
-        .bytes()
-        .take(12)
-        .map(|byte| match byte {
-            b'A'..=b'Z' => char::from(byte.to_ascii_lowercase()),
-            b'_' => '-',
-            _ => char::from(byte),
-        })
-        .collect();
+    let normalized_prefix = normalize_encoding_prefix(name);
     ["latin-1", "iso-8859-1", "iso-latin-1"]
         .iter()
         .any(|prefix| {
@@ -387,15 +379,7 @@ fn is_blank_or_comment(line: &[u8]) -> bool {
 }
 
 fn classify_utf8_encoding(name: &str) -> Option<Utf8Encoding> {
-    let normalized_prefix: String = name
-        .bytes()
-        .take(12)
-        .map(|byte| match byte {
-            b'A'..=b'Z' => char::from(byte.to_ascii_lowercase()),
-            b'_' => '-',
-            _ => char::from(byte),
-        })
-        .collect();
+    let normalized_prefix = normalize_encoding_prefix(name);
     if normalized_prefix == "utf-8" || normalized_prefix.starts_with("utf-8-") {
         return Some(Utf8Encoding::BomCompatible);
     }
@@ -412,6 +396,21 @@ fn classify_utf8_encoding(name: &str) -> Option<Utf8Encoding> {
         .then(|| normalized.replace('.', "_"))
         .is_some_and(|alias| matches!(alias.as_str(), "utf8_ucs2" | "utf8_ucs4"))
         .then_some(Utf8Encoding::Alias)
+}
+
+/// Normalize the first 12 bytes for CPython's tokenizer encoding-prefix checks.
+///
+/// These checks map underscores to hyphens and preserve other punctuation, unlike
+/// the full codec-name normalization used when looking up aliases.
+fn normalize_encoding_prefix(name: &str) -> String {
+    name.bytes()
+        .take(12)
+        .map(|byte| match byte {
+            b'A'..=b'Z' => char::from(byte.to_ascii_lowercase()),
+            b'_' => '-',
+            _ => char::from(byte),
+        })
+        .collect()
 }
 
 fn normalize_codec_name(name: &str) -> String {

@@ -264,14 +264,31 @@ fn cache_path(path: &Path, python_version: PythonVersion) -> Result<PathBuf, Str
     let filename = path
         .file_name()
         .ok_or_else(|| format!("{} has no file name", path.display()))?;
-    let stem = if filename == ".py" {
-        std::ffi::OsStr::new("py")
+    let separator = filename
+        .as_encoded_bytes()
+        .iter()
+        .rposition(|&byte| byte == b'.');
+    let mut filename = if separator == Some(0) {
+        // CPython treats a lone leading dot as an extension separator. Give it a
+        // nonempty stem so `Path::extension` can extract the suffix without losing
+        // platform-specific filename bytes.
+        let mut prefixed = OsString::from("_");
+        prefixed.push(filename);
+        Path::new(&prefixed)
+            .extension()
+            .expect("the prefixed filename has an extension")
+            .to_os_string()
     } else {
         path.file_stem()
             .ok_or_else(|| format!("{} has no file stem", path.display()))?
+            .to_os_string()
     };
-    let mut filename = OsString::from(stem);
-    filename.push(format!(".{}.pyc", cache_tag(python_version)));
+    // Match CPython's `base + sep + tag`: extensionless names have no separator.
+    if separator.is_some() {
+        filename.push(".");
+    }
+    filename.push(cache_tag(python_version));
+    filename.push(".pyc");
     let parent = path
         .parent()
         .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
@@ -319,7 +336,29 @@ mod tests {
             cache_path(Path::new("package/module.py"), PythonVersion::Py315).unwrap(),
             PathBuf::from("package/__pycache__/module.cpython-315.pyc")
         );
+        assert_eq!(
+            cache_path(Path::new("package/module"), PythonVersion::Py315).unwrap(),
+            PathBuf::from("package/__pycache__/modulecpython-315.pyc")
+        );
         assert!(has_python_suffix(Path::new("package/.py")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_paths_preserve_non_utf8_names() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        for (name, expected) in [
+            (b"\xff.py".as_slice(), b"\xff.cpython-314.pyc".as_slice()),
+            (b".\xff", b"\xff.cpython-314.pyc"),
+            (b"\xff", b"\xffcpython-314.pyc"),
+        ] {
+            assert_eq!(
+                cache_path(Path::new(OsStr::from_bytes(name)), PythonVersion::Py314).unwrap(),
+                Path::new("__pycache__").join(OsStr::from_bytes(expected))
+            );
+        }
     }
 
     #[test]

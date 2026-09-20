@@ -7,7 +7,8 @@ use crate::assembler::SourceLocation;
 use crate::code_object::{CodeObject, Constant};
 use crate::target::code_flags::{CO_FUTURE_ANNOTATIONS, CO_FUTURE_BARRY_AS_BDFL};
 use crate::target::opcodes::{
-    BUILD_TUPLE, LOAD_CONST, NOP, NOT_TAKEN, RAISE_VARARGS, RERAISE, RETURN_VALUE,
+    BUILD_TUPLE, GET_LEN, LOAD_CONST, LOAD_SMALL_INT, NOP, NOT_TAKEN, RAISE_VARARGS, RERAISE,
+    RETURN_VALUE,
 };
 
 use super::definition::clean_doc;
@@ -211,68 +212,6 @@ fn opcode_locations_preserve_multiline_attribute_and_call_ranges() {
         compiler.attribute_opcode_location(split_attribute),
         compiler.source_location(split_attribute.attr.range())
     );
-}
-
-#[test]
-fn lazy_import_modules_do_not_retain_dynamic_while_condition_owners() {
-    let functions = r"def named_name(next_value, first, second):
-    while value := next_value(first, second):
-        yield value
-
-def named_attr(reader, first, second):
-    while value := reader.read(first, second):
-        yield value
-
-def direct_name(check, item):
-    while check(item):
-        yield item
-";
-    for prefix in [
-        "lazy import foo",
-        "if ready:\n    lazy import foo",
-        "if ready:\n    pass\nelif other:\n    lazy from sys import path",
-        "if ready:\n    pass\nelse:\n    lazy import foo",
-        "for item in items:\n    lazy import foo",
-        "for item in items:\n    pass\nelse:\n    lazy from sys import path",
-        "while ready:\n    lazy import foo",
-        "while ready:\n    pass\nelse:\n    lazy from sys import path",
-        "with manager:\n    lazy import foo\nwith other:\n    lazy from sys import path",
-        "match value:\n    case _:\n        lazy import foo",
-    ] {
-        let source = format!("{prefix}\n\n{functions}");
-        let parsed = parse_module(&source).unwrap();
-        let module = module_compiler(&source, &parsed)
-            .compile_module(parsed.suite())
-            .unwrap();
-
-        for (name, expected) in [
-            (
-                "named_name",
-                &[0x82, 0x10, 0x1b, 0x01, 0x93, 0x08, 0x1b, 0x01][..],
-            ),
-            (
-                "named_attr",
-                &[0x82, 0x19, 0x24, 0x01, 0x9c, 0x08, 0x24, 0x01][..],
-            ),
-            (
-                "direct_name",
-                &[0x82, 0x0e, 0x19, 0x01, 0x91, 0x08, 0x19, 0x01][..],
-            ),
-        ] {
-            let function = module
-                .constants
-                .iter()
-                .find_map(|constant| match constant {
-                    Constant::Code(code) if code.name == name => Some(code),
-                    _ => None,
-                })
-                .unwrap_or_else(|| panic!("module should contain {name}"));
-            assert_eq!(
-                function.exception_table, expected,
-                "unexpected owner for {name} with:\n{prefix}"
-            );
-        }
-    }
 }
 
 #[test]
@@ -3251,6 +3190,32 @@ mod iterator_width_return_cleanup {
                 3,
                 "{version:?}"
             );
+        }
+    }
+}
+
+#[test]
+fn mapping_pattern_lengths_use_the_full_integer_value() {
+    for size in [255_u32, 256] {
+        let keys = (0..size)
+            .map(|key| format!("{key}: _"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let source = format!("match subject:\n    case {{{keys}}}:\n        pass\n");
+        let module = crate::compile(&source, "mapping_pattern_length.py").unwrap();
+        let mut instructions = module.code.bytecode.as_chunks::<2>().0.iter();
+        instructions
+            .find(|instruction| instruction[0] == GET_LEN.code())
+            .unwrap();
+        let load = instructions.next().unwrap();
+        if size == 255 {
+            assert_eq!(*load, [LOAD_SMALL_INT.code(), 255]);
+        } else {
+            assert_eq!(load[0], LOAD_CONST.code());
+            assert!(matches!(
+                module.code.constants[usize::from(load[1])],
+                Constant::Int(value) if value == u64::from(size)
+            ));
         }
     }
 }

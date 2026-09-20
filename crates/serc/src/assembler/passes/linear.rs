@@ -427,13 +427,6 @@ impl Assembler {
             None,
             AssemblerStage::OptimizeBooleanConversions,
         )?;
-        #[cfg(any(test, debug_assertions))]
-        super::validate_structure(
-            &items,
-            &self.exception_regions,
-            None,
-            AssemblerStage::OptimizeRedundantStoreFast,
-        )?;
         propagate_assertion_exit_locations(&mut items);
         #[cfg(any(test, debug_assertions))]
         super::validate_structure(
@@ -474,13 +467,6 @@ impl Assembler {
             &self.exception_regions,
             None,
             AssemblerStage::PropagateLocationsWithinBlocks,
-        )?;
-        #[cfg(any(test, debug_assertions))]
-        super::validate_structure(
-            &items,
-            &self.exception_regions,
-            None,
-            AssemblerStage::RemoveRedundantNops,
         )?;
         optimize_linear_assertion_load_fast(self.python_version, &mut items);
         #[cfg(any(test, debug_assertions))]

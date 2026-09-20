@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Instant;
 
+use clap::Parser;
 use serc::{
     CompileError, CompileOptions, CompiledModule, PythonVersion, compile_bytes_with_options,
     compile_with_options,
@@ -126,27 +127,66 @@ enum CompilerOutcome {
     Failed(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Parser)]
+#[command(about = "Compare a Python corpus against the pinned CPython target")]
 struct Options {
+    #[arg(long, default_value = "python3", value_name = "PATH")]
     python: String,
+    #[arg(long, default_value_t = PythonVersion::default(), value_name = "3.14|3.15")]
     python_version: PythonVersion,
+    #[arg(value_name = "ROOT", default_values_os_t = default_roots())]
     roots: Vec<PathBuf>,
+    /// Additional file extensions to include alongside .py.
+    #[arg(long = "extension", value_parser = parse_extension, value_name = "EXT")]
     extensions: Vec<String>,
+    #[arg(long)]
     limit: Option<usize>,
+    #[arg(long)]
     expected_files: Option<usize>,
-    expected_outcomes: BTreeMap<OutcomeKind, usize>,
+    #[arg(long = "expected-outcome", value_parser = parse_expected_outcome, value_name = "KIND=COUNT")]
+    expected_outcomes: Vec<(OutcomeKind, usize)>,
+    #[arg(long)]
+    expected_exact: Option<usize>,
+    #[arg(long)]
     expected_cpython_rejected: Option<usize>,
+    #[arg(long)]
     require_all: bool,
+    #[arg(long)]
     require_rejection_parity: bool,
+    #[arg(long, default_value_t = 10)]
     examples: usize,
+    #[arg(long, value_name = "DIR")]
     dump_mismatches: Option<PathBuf>,
+    #[arg(long)]
     source_bytes: bool,
+    #[arg(long, value_name = "PROFILE.json")]
     initial_intern_state: Option<PathBuf>,
 }
 
+impl Options {
+    fn expected_outcome_counts(&self) -> Result<BTreeMap<OutcomeKind, usize>, String> {
+        let mut outcomes = BTreeMap::new();
+        for (kind, count) in self
+            .expected_outcomes
+            .iter()
+            .copied()
+            .chain(self.expected_exact.map(|count| (OutcomeKind::Exact, count)))
+        {
+            if outcomes.insert(kind, count).is_some() {
+                return Err(format!(
+                    "expected outcome `{}` may only be specified once",
+                    kind.name()
+                ));
+            }
+        }
+        Ok(outcomes)
+    }
+}
+
 fn main() -> ExitCode {
-    let options = match parse_options() {
-        Ok(options) => options,
+    let options = Options::parse();
+    let expected_outcomes = match options.expected_outcome_counts() {
+        Ok(outcomes) => outcomes,
         Err(message) => {
             eprintln!("{message}");
             return ExitCode::from(2);
@@ -410,7 +450,7 @@ fn main() -> ExitCode {
             .iter()
             .filter(|outcome| outcome.oracle_rejected && outcome.kind.is_failure())
             .count(),
-        &options.expected_outcomes,
+        &expected_outcomes,
         options.expected_cpython_rejected,
         options.require_all,
         options.require_rejection_parity,
@@ -546,172 +586,28 @@ fn verify_python(python: &str, python_version: PythonVersion) -> Result<(), Stri
     }
 }
 
-fn parse_options() -> Result<Options, String> {
-    let mut python = "python3".to_string();
-    let mut python_version = PythonVersion::default();
-    let mut roots = Vec::new();
-    let mut extensions = vec!["py".to_string()];
-    let mut limit = None;
-    let mut expected_files = None;
-    let mut expected_outcomes = BTreeMap::new();
-    let mut expected_cpython_rejected = None;
-    let mut require_all = false;
-    let mut require_rejection_parity = false;
-    let mut examples = 10;
-    let mut dump_mismatches = None;
-    let mut source_bytes = false;
-    let mut initial_intern_state = None;
-    let mut arguments = env::args().skip(1);
-
-    while let Some(argument) = arguments.next() {
-        match argument.as_str() {
-            "--python" => {
-                python = arguments
-                    .next()
-                    .ok_or_else(|| "--python requires an executable".to_string())?;
-            }
-            "--python-version" => {
-                python_version = arguments
-                    .next()
-                    .ok_or_else(|| "--python-version requires 3.14 or 3.15".to_string())?
-                    .parse::<PythonVersion>()
-                    .map_err(|error| error.to_string())?;
-            }
-            "--limit" => {
-                limit = Some(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--limit requires a number".to_string())?
-                        .parse()
-                        .map_err(|_| "--limit requires a number".to_string())?,
-                );
-            }
-            "--examples" => {
-                examples = arguments
-                    .next()
-                    .ok_or_else(|| "--examples requires a number".to_string())?
-                    .parse()
-                    .map_err(|_| "--examples requires a number".to_string())?;
-            }
-            "--extension" => {
-                let extension = arguments
-                    .next()
-                    .ok_or_else(|| "--extension requires a value".to_string())?;
-                if extension.is_empty()
-                    || extension.starts_with('.')
-                    || extension.contains(std::path::is_separator)
-                {
-                    return Err(
-                        "--extension requires a non-empty bare extension such as `pyi`".to_string(),
-                    );
-                }
-                if !extensions.contains(&extension) {
-                    extensions.push(extension);
-                }
-            }
-            "--expected-files" => {
-                expected_files = Some(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--expected-files requires a number".to_string())?
-                        .parse()
-                        .map_err(|_| "--expected-files requires a number".to_string())?,
-                );
-            }
-            "--expected-exact" => {
-                insert_expected_outcome(
-                    &mut expected_outcomes,
-                    OutcomeKind::Exact,
-                    parse_count(&mut arguments, "--expected-exact")?,
-                    "--expected-exact",
-                )?;
-            }
-            "--expected-cpython-rejected" => {
-                let count = parse_count(&mut arguments, "--expected-cpython-rejected")?;
-                if expected_cpython_rejected.replace(count).is_some() {
-                    return Err(
-                        "--expected-cpython-rejected may only be specified once".to_string()
-                    );
-                }
-            }
-            "--expected-outcome" => {
-                let expected = arguments
-                    .next()
-                    .ok_or_else(|| "--expected-outcome requires a KIND=COUNT value".to_string())?;
-                let (kind, count) = parse_expected_outcome(&expected)?;
-                insert_expected_outcome(&mut expected_outcomes, kind, count, "--expected-outcome")?;
-            }
-            "--dump-mismatches" => {
-                dump_mismatches =
-                    Some(PathBuf::from(arguments.next().ok_or_else(|| {
-                        "--dump-mismatches requires a directory".to_string()
-                    })?));
-            }
-            "--initial-intern-state" => {
-                let path = arguments
-                    .next()
-                    .ok_or_else(|| "--initial-intern-state requires a profile file".to_string())?;
-                if initial_intern_state.replace(PathBuf::from(path)).is_some() {
-                    return Err("--initial-intern-state may only be specified once".to_string());
-                }
-            }
-            "--require-all" => require_all = true,
-            "--require-rejection-parity" => require_rejection_parity = true,
-            "--source-bytes" => source_bytes = true,
-            "--help" | "-h" => {
-                return Err(
-                    "usage: compare_cpython_corpus [--python PATH] [--python-version 3.14|3.15] [--extension EXT] [--source-bytes] [--initial-intern-state PROFILE.json] [--limit N] [--expected-files N] [--expected-exact N] [--expected-cpython-rejected N] [--examples N] [--require-all] [--require-rejection-parity] [--dump-mismatches DIR] [ROOT ...]"
-                        .to_string(),
-                );
-            }
-            _ if argument.starts_with('-') => {
-                return Err(format!("unknown option: {argument}"));
-            }
-            _ => roots.push(PathBuf::from(argument)),
-        }
-    }
-
-    if roots.is_empty() {
-        let ruff = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/ruff");
-        roots = [
-            "crates/ty_python_semantic/resources/corpus",
-            "crates/ruff_python_parser/resources/valid",
-            "crates/ruff_python_parser/resources/inline/ok",
-            "crates/ruff_linter/resources/test/fixtures",
-            "crates/ruff_python_formatter/resources/test/fixtures",
-        ]
-        .into_iter()
-        .map(|root| ruff.join(root))
-        .collect();
-    }
-
-    Ok(Options {
-        python,
-        python_version,
-        roots,
-        extensions,
-        limit,
-        expected_files,
-        expected_outcomes,
-        expected_cpython_rejected,
-        require_all,
-        require_rejection_parity,
-        examples,
-        dump_mismatches,
-        source_bytes,
-        initial_intern_state,
-    })
+fn default_roots() -> Vec<PathBuf> {
+    let ruff = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/ruff");
+    [
+        "crates/ty_python_semantic/resources/corpus",
+        "crates/ruff_python_parser/resources/valid",
+        "crates/ruff_python_parser/resources/inline/ok",
+        "crates/ruff_linter/resources/test/fixtures",
+        "crates/ruff_python_formatter/resources/test/fixtures",
+    ]
+    .into_iter()
+    .map(|root| ruff.join(root))
+    .collect()
 }
 
-fn parse_count(
-    arguments: &mut impl Iterator<Item = String>,
-    option: &str,
-) -> Result<usize, String> {
-    arguments
-        .next()
-        .ok_or_else(|| format!("{option} requires a number"))?
-        .parse()
-        .map_err(|_| format!("{option} requires a number"))
+fn parse_extension(extension: &str) -> Result<String, String> {
+    if extension.is_empty()
+        || extension.starts_with('.')
+        || extension.contains(std::path::is_separator)
+    {
+        return Err("expected a non-empty bare extension such as `pyi`".to_string());
+    }
+    Ok(extension.to_string())
 }
 
 fn parse_expected_outcome(value: &str) -> Result<(OutcomeKind, usize), String> {
@@ -726,18 +622,6 @@ fn parse_expected_outcome(value: &str) -> Result<(OutcomeKind, usize), String> {
         .parse()
         .map_err(|_| "--expected-outcome count must be a number".to_string())?;
     Ok((kind, count))
-}
-
-fn insert_expected_outcome(
-    outcomes: &mut BTreeMap<OutcomeKind, usize>,
-    kind: OutcomeKind,
-    count: usize,
-    option: &str,
-) -> Result<(), String> {
-    if outcomes.insert(kind, count).is_some() {
-        return Err(format!("{option} may only be specified once"));
-    }
-    Ok(())
 }
 
 fn dump_mismatches(
@@ -783,9 +667,10 @@ fn discover(roots: &[PathBuf], extensions: &[String]) -> Result<Vec<PathBuf>, St
             })?;
             if entry.file_type().is_file()
                 && entry.path().extension().is_some_and(|extension| {
-                    extensions
-                        .iter()
-                        .any(|expected| extension == expected.as_str())
+                    extension == "py"
+                        || extensions
+                            .iter()
+                            .any(|expected| extension == expected.as_str())
                 })
             {
                 paths.push(entry.into_path());
@@ -993,13 +878,116 @@ fn one_line(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompileOptions, CompilerInput, CompilerOutcome, ORACLE, OracleOutcome, OutcomeKind,
-        PythonIdentity, PythonVersion, capture_compiler, classify, compile_input,
-        compile_module_input, discover, validate_outcome_counts,
+        CompileOptions, CompilerInput, CompilerOutcome, ORACLE, Options, OracleOutcome,
+        OutcomeKind, PythonIdentity, PythonVersion, capture_compiler, classify, compile_input,
+        compile_module_input, discover, validate_outcome_counts, verify_python,
     };
+    use clap::{Parser, error::ErrorKind};
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
+    use std::process::Command;
+
+    #[test]
+    fn default_corpus_and_explicit_roots() {
+        let options = Options::try_parse_from(["compare_cpython_corpus"]).unwrap();
+        assert_eq!(options.roots, super::default_roots());
+        assert_eq!(options.python, "python3");
+        assert_eq!(options.python_version, PythonVersion::Py314);
+        assert_eq!(options.examples, 10);
+        let options = Options::try_parse_from(["compare_cpython_corpus", "corpus"]).unwrap();
+        assert_eq!(options.roots, [Path::new("corpus")]);
+    }
+
+    #[test]
+    fn selected_python_version_is_parsed_and_validated() {
+        let options =
+            Options::try_parse_from(["compare_cpython_corpus", "--python-version", "3.15"])
+                .unwrap();
+        assert_eq!(options.python_version, PythonVersion::Py315);
+        let error = Options::try_parse_from(["compare_cpython_corpus", "--python-version", "3.13"])
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn rejects_non_bare_extensions() {
+        for extension in ["", ".pyi", "nested/pyi"] {
+            let error =
+                Options::try_parse_from(["compare_cpython_corpus", "--extension", extension])
+                    .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::ValueValidation);
+        }
+    }
+
+    #[test]
+    fn expected_counts_reject_duplicate_kinds_and_exact_alias() {
+        for args in [
+            [
+                "--expected-outcome",
+                "exact=2",
+                "--expected-outcome",
+                "exact=2",
+            ],
+            ["--expected-outcome", "exact=2", "--expected-exact", "2"],
+            ["--expected-exact", "2", "--expected-outcome", "exact=2"],
+        ] {
+            let options =
+                Options::try_parse_from(std::iter::once("compare_cpython_corpus").chain(args))
+                    .unwrap();
+            assert!(
+                options
+                    .expected_outcome_counts()
+                    .unwrap_err()
+                    .contains("may only be specified once")
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_profile_and_frozen_counts_are_preserved() {
+        let options = Options::try_parse_from([
+            "compare_cpython_corpus",
+            "--python",
+            "/cpython-3.14.5",
+            "--source-bytes",
+            "--initial-intern-state",
+            "profile.json",
+            "--expected-files",
+            "3",
+            "--expected-exact",
+            "2",
+            "--expected-cpython-rejected",
+            "1",
+            "--expected-outcome",
+            "matched-rejection=1",
+            "--expected-outcome",
+            "byte-mismatch=0",
+            "--require-all",
+            "--require-rejection-parity",
+            "--examples",
+            "0",
+            "corpus",
+        ])
+        .unwrap();
+        assert_eq!(options.python, "/cpython-3.14.5");
+        assert!(options.source_bytes && options.require_all && options.require_rejection_parity);
+        assert_eq!(
+            options.initial_intern_state.as_deref(),
+            Some(Path::new("profile.json"))
+        );
+        assert_eq!(options.expected_files, Some(3));
+        assert_eq!(options.expected_cpython_rejected, Some(1));
+        assert_eq!(options.examples, 0);
+        assert_eq!(
+            options.expected_outcome_counts().unwrap(),
+            BTreeMap::from([
+                (OutcomeKind::Exact, 2),
+                (OutcomeKind::MatchedRejection, 1),
+                (OutcomeKind::ByteMismatch, 0),
+            ])
+        );
+    }
 
     #[test]
     fn oracle_identity_rejects_other_targets_and_release_candidates() {
@@ -1156,17 +1144,39 @@ mod tests {
     }
 
     #[test]
-    fn oracle_classifies_only_compile_exceptions_as_rejected() {
-        let read = ORACLE.find("source = path.read_bytes()").unwrap();
-        let try_compile = ORACLE.find("try:\n    code = compile(source").unwrap();
-        let compile_exception = ORACLE.find("except Exception as error:").unwrap();
-        let marshal = ORACLE
-            .find("sys.stdout.buffer.write(marshal.dumps(code))")
-            .unwrap();
+    fn oracle_distinguishes_compilation_rejections_and_io_failures() {
+        let python =
+            std::env::var("SERC_TEST_PYTHON").unwrap_or_else(|_| "python3.14".to_string());
+        verify_python(&python, PythonVersion::Py314).unwrap();
+        let directory = tempfile::tempdir().unwrap();
 
-        assert!(read < try_compile);
-        assert!(try_compile < compile_exception);
-        assert!(compile_exception < marshal);
+        for (filename, source, expected_status) in [
+            ("valid.py", Some("pass\n"), 0),
+            ("syntax.py", Some("if:\n"), 2),
+            ("semantic.py", Some("return\n"), 2),
+            ("missing.py", None, 1),
+        ] {
+            let path = directory.path().join(filename);
+            if let Some(source) = source {
+                fs::write(&path, source).unwrap();
+            }
+            let output = Command::new(&python)
+                .args(["-I", "-S", "-c", ORACLE])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(expected_status), "{output:?}");
+            if expected_status == 0 {
+                let expected = serc::compile(source.unwrap(), path.to_str().unwrap())
+                    .unwrap()
+                    .marshal();
+                assert_eq!(output.stdout, expected);
+                assert!(output.stderr.is_empty(), "{output:?}");
+            } else {
+                assert!(output.stdout.is_empty(), "{output:?}");
+                assert!(!output.stderr.is_empty(), "{output:?}");
+            }
+        }
     }
 
     #[test]
@@ -1278,10 +1288,13 @@ mod tests {
         fs::write(directory.path().join("notes.txt"), "not Python\n").unwrap();
         let roots = [directory.path().to_path_buf()];
 
-        let default = discover(&roots, &["py".to_string()]).unwrap();
+        let options = Options::try_parse_from(["compare_cpython_corpus"]).unwrap();
+        let default = discover(&roots, &options.extensions).unwrap();
         assert_eq!(default, vec![directory.path().join("module.py")]);
 
-        let with_stubs = discover(&roots, &["py".to_string(), "pyi".to_string()]).unwrap();
+        let options =
+            Options::try_parse_from(["compare_cpython_corpus", "--extension", "pyi"]).unwrap();
+        let with_stubs = discover(&roots, &options.extensions).unwrap();
         assert_eq!(
             with_stubs,
             vec![

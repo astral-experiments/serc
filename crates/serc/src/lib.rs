@@ -137,7 +137,7 @@ pub enum CompileError {
         /// The byte range of the invalid pattern in the normalized source.
         range: TextRange,
     },
-    /// The parsed source violates a context-dependent Python syntax restriction.
+    /// The parsed source violates a syntax restriction of the targeted Python version.
     InvalidSyntax {
         /// The syntax restriction violated by the source.
         message: String,
@@ -289,6 +289,9 @@ fn compile_normalized(
         .map_err(CompileError::Parse)?
         .try_into_module()
         .ok_or_else(|| CompileError::Internal("parser did not return a module".to_string()))?;
+    if let Some(error) = parsed.unsupported_syntax_errors().first() {
+        return Err(CompileError::invalid_syntax(error.to_string(), error.range));
+    }
     Compiler::validate_lazy_imports(parsed.suite(), options.python_version)?;
     let code = Compiler::module_with_python_version(
         filename,

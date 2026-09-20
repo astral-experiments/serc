@@ -76,15 +76,15 @@ cd serc
 The script requires the pinned submodule corpus and runs the exact CPython
 oracle over 2,451 Python fixtures. For the 2,230 inputs accepted by CPython, it
 requires Serc's marshal output to match `marshal.dumps(compile(...))`
-exactly. The frozen baseline separately records 221 CPython-rejected inputs: 128 matched Serc
-rejections, 75 inputs accepted by Serc, and 18 internal compiler failures. CI freezes each
+exactly. The frozen baseline separately records 221 CPython-rejected inputs: 151 matched Serc
+rejections, 56 inputs accepted by Serc, and 14 internal compiler failures. CI freezes each
 outcome category against the exact supported CPython release on every pull request and every push
 to `main`.
 
 The optional second argument selects the target and defaults to `3.14`. The Python 3.15 gate
 uses the same 2,451 files and passes source bytes to both compilers. It requires all 2,249
 CPython-accepted files to match exactly, and freezes the 202 CPython-rejected inputs as
-132 matched rejections, 56 rejection mismatches, and 14 compiler failures. Compiler failures
+133 matched rejections, 55 rejection mismatches, and 14 compiler failures. Compiler failures
 on accepted inputs always fail either gate.
 
 For broader diagnostics, Serc also has a separately pinned corpus derived

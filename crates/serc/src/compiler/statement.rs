@@ -342,8 +342,6 @@ pub(super) struct ComprehensionState {
     pub(super) in_comprehension_element: bool,
     // Root conditional filters and multi-generator comprehensions use a distinct owner layout.
     pub(super) filtered_comprehension_has_root_if_expression: bool,
-    // Generic truthiness markers in a direct filtered element normalize against dynamic owner slots.
-    pub(super) force_filtered_comprehension_truth_ownerless: bool,
     direct_comprehension_assignment_results: NameSet,
     // Whether an optimized tuple call is the right operand of a name addition in an inlined
     // comprehension. CPython excludes its dispatch marker from the comprehension's restore range.
@@ -356,9 +354,6 @@ pub(super) struct WithState {
     // Only direct None-condition siblings in the innermost synchronous-with body can reuse a
     // preceding conditional owner. Nested suites and earlier returns use a different layout.
     shifted_sync_with_none_owner_statements: Vec<TextRange>,
-    // Direct optimized Boolean assertions after a prior assertion or branch in the innermost
-    // synchronous-with body. Their dispatch marker is appended outside the manager's owner.
-    pub(super) shifted_sync_with_boolean_dispatch_calls: Vec<TextRange>,
     // Direct terminal-condition siblings in the innermost async-with body can leave the first
     // marker of a later terminal branch outside the manager's exception region.
     shifted_async_with_terminal_owner_statements: Vec<TextRange>,
@@ -410,9 +405,6 @@ pub(super) struct ExceptionState {
     // Whether each active ordinary try has a tuple-typed handler whose CFG can leave stale
     // fallthrough exception-owner slots for a top-level Boolean value marker.
     pub(super) active_tuple_handler_try_bodies: Vec<bool>,
-    // Whether the current try follows two call-valued assignments in its recent prefix.
-    // Their retained exception-owner slot keeps a pre-suspension Boolean marker protected.
-    pub(super) active_call_assignment_preceded_try_body: bool,
     // Linear item offset and suspension epoch of the innermost ordinary try body.
     active_try_body_start: Option<(usize, usize)>,
     active_try_marker_slots: Vec<Option<TryMarkerSlotContext>>,
@@ -580,25 +572,13 @@ pub(super) struct GeneratorState {
     pub(super) emitted_yield_value: bool,
     pub(super) generator_expression: bool,
     pub(super) generator_region_depth: u32,
-    // Whether an active generator expression uses only simple-name iteration targets.
-    pub(super) generator_expression_has_simple_targets: bool,
     // Whether an expression is being evaluated as a generator-expression filter. CPython lowers
     // filter conditions before the generator element, so their internal markers do not use the
     // element expression's post-compaction stop-iteration owner rule.
     pub(super) generator_filter_expression: bool,
-    // Whether the current generator expression is the direct argument of an optimized all/any
-    // call with only simple-name targets and no root `not` element.
-    pub(super) generator_expression_boolean_dispatch_eligible: Option<TextRange>,
-    // Whether the current expression is the complete value of an ordinary assignment and is an
-    // optimized all/any/tuple generator call.
-    pub(super) direct_optimized_generator_assignment: bool,
     // Whether an optimized tuple call is the assignment in the first branch of an `if` whose
     // join is immediately followed by a local return.
     pub(super) copy_optimized_tuple_branch_exit: bool,
-    // Whether the current expression is being lowered as one atom of a Boolean condition.
-    pub(super) optimized_generator_boolean_condition: bool,
-    // Whether the current expression is a later operand of a short-circuit Boolean expression.
-    pub(super) optimized_generator_later_boolean_operand: bool,
     // The direct `all(genexpr)` or `any(genexpr)` test of a message-free coroutine assertion,
     // or the `any(genexpr)` test in a direct `assert not any(...)` with or without a message,
     // before suspension.
@@ -633,8 +613,6 @@ pub(super) struct StatementState {
     pub(super) current_statement_preceded_by_try: bool,
     // Whether that try retains a synchronous suffix or cleanup after its suspension.
     current_statement_preceded_by_suffixed_try: bool,
-    // Whether two of this statement's three immediately preceding siblings assign a call.
-    current_statement_preceded_by_call_assignments: bool,
     // Whether this statement directly follows a conditional whose body terminates in a return.
     pub(super) current_statement_preceded_by_terminating_if: bool,
     // Whether a synchronous-with value expression follows a returning conditional, including
@@ -759,13 +737,6 @@ impl ControlFlowState {
             .is_some_and(|context| !context.is_async)
     }
 
-    pub(super) fn current_with_body_start_item(&self) -> Option<usize> {
-        self.withs
-            .active_with_exits
-            .last()
-            .map(|context| context.body_start_item)
-    }
-
     pub(super) fn current_synchronous_with_body_start_item(&self) -> Option<usize> {
         self.withs
             .active_with_exits
@@ -776,13 +747,6 @@ impl ControlFlowState {
 
     pub(super) fn active_with_count(&self) -> usize {
         self.withs.active_with_exits.len()
-    }
-
-    pub(super) fn current_with_suspension_epoch(&self) -> Option<usize> {
-        self.withs
-            .active_with_exits
-            .last()
-            .map(|context| context.suspension_epoch)
     }
 
     pub(super) fn has_with_suspension_epoch(&self, epoch: usize) -> bool {
@@ -849,12 +813,6 @@ impl ControlFlowState {
             .is_some_and(|context| context.iterator_cleanup != IteratorCleanup::None)
     }
 
-    pub(super) fn current_iterator_body_start_item(&self) -> Option<usize> {
-        self.loops.contexts.last().and_then(|context| {
-            (context.iterator_cleanup != IteratorCleanup::None).then_some(context.body_start_item)
-        })
-    }
-
     /// Whether the loop backedge is reached without crossing a nested cleanup.
     fn in_loop_tail_without_nested_cleanup(&self) -> bool {
         self.loops.contexts.last().is_some_and(|context| {
@@ -864,13 +822,6 @@ impl ControlFlowState {
                 && context.exception_region_depth
                     == self.exceptions.active_exception_region_exclusions.len()
         })
-    }
-
-    pub(super) fn in_while_loop(&self) -> bool {
-        self.loops
-            .contexts
-            .last()
-            .is_some_and(|context| context.iterator_cleanup == IteratorCleanup::None)
     }
 
     pub(super) fn current_try_marker_is_shifted_to_ownerless_slot(
@@ -1045,8 +996,7 @@ impl Compiler<'_> {
         });
         let direct_final_sync_with_try_body =
             ((self.control.statements.current_statement_has_following
-                || (self.context.target_specific_rules_enabled()
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     && !statement.handlers.is_empty()
                     && statement.finalbody.is_empty()
                     && self.control.loops.contexts.last().is_some_and(|context| {
@@ -1618,8 +1568,7 @@ impl Compiler<'_> {
                 .control
                 .statements
                 .current_statement_propagates_following_to_suites;
-        let track_sync_with_return_joins =
-            self.context.target_specific_rules_enabled() && self.control.in_synchronous_with();
+        let track_sync_with_return_joins = self.control.in_synchronous_with();
         let mut pending_sync_with_return_join = false;
         let mut pending_sync_with_return_join_after_gap = false;
         let mut pending_sync_with_nonterminal_join = false;
@@ -2110,7 +2059,6 @@ impl Compiler<'_> {
                 let preceded_by_try = matches!(previous_statement, Some(Stmt::Try(_)));
                 let preceded_by_suffixed_try = preceded_by_try
                     && matches!(statement, Stmt::If(_))
-                    && self.context.target_specific_rules_enabled()
                     && self.unit.flags & CO_COROUTINE != 0
                     && self.control.generators.generator_region_start.is_some()
                     && previous_statement.is_some_and(|previous| {
@@ -2148,25 +2096,6 @@ impl Compiler<'_> {
                                     || free_indices.contains_key(&name))
                         )
                     });
-                let preceded_by_call_assignments = self.context.target_specific_rules_enabled()
-                    && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) != 0
-                    && matches!(statement, Stmt::Try(_))
-                    && body[..index]
-                        .iter()
-                        .rev()
-                        .take(3)
-                        .filter(|statement| match statement {
-                            Stmt::Assign(statement) => {
-                                matches!(statement.value.as_ref(), Expr::Call(_))
-                            }
-                            Stmt::AnnAssign(statement) => statement
-                                .value
-                                .as_deref()
-                                .is_some_and(|value| matches!(value, Expr::Call(_))),
-                            _ => false,
-                        })
-                        .count()
-                        >= 2;
                 let preceded_by_terminating_if = matches!(
                     previous_statement,
                     Some(Stmt::If(previous))
@@ -2190,13 +2119,6 @@ impl Compiler<'_> {
                         .statements
                         .current_statement_preceded_by_suffixed_try,
                     preceded_by_suffixed_try,
-                );
-                let previous_statement_preceded_by_call_assignments = std::mem::replace(
-                    &mut self
-                        .control
-                        .statements
-                        .current_statement_preceded_by_call_assignments,
-                    preceded_by_call_assignments,
                 );
                 let previous_statement_preceded_by_terminating_if = std::mem::replace(
                     &mut self
@@ -2237,7 +2159,6 @@ impl Compiler<'_> {
                         previous_statement,
                         Some(Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_))
                     ))
-                    && self.context.target_specific_rules_enabled()
                     && self.control.generators.generator_region_start.is_some()
                     && self.control.loops.contexts.is_empty()
                     && self
@@ -2472,10 +2393,6 @@ impl Compiler<'_> {
                     previous_statement_preceded_by_suffixed_try;
                 self.control
                     .statements
-                    .current_statement_preceded_by_call_assignments =
-                    previous_statement_preceded_by_call_assignments;
-                self.control
-                    .statements
                     .current_statement_preceded_by_terminating_if =
                     previous_statement_preceded_by_terminating_if;
                 self.control
@@ -2618,8 +2535,7 @@ impl Compiler<'_> {
         let finally = &self.control.finally;
         let handlers = &exceptions.active_exception_handlers;
         let try_depth = exceptions.active_try_marker_slots.len();
-        self.context.target_specific_rules_enabled()
-            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+        self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
             && !handlers.is_empty()
             && matches!(try_depth, 1 | 2)
             && exceptions.active_exception_region_exclusions.len() == handlers.len() + try_depth
@@ -2649,11 +2565,10 @@ impl Compiler<'_> {
         // Terminal handler lowering can distribute this cleanup into an original
         // nested-try join. Retain the same unconditional-copy permission as the
         // handler's own unlocated cleanup, even after only one predecessor remains.
-        let copy_unlocated_handler_join = self.context.target_specific_rules_enabled()
-            && self
-                .control
-                .exceptions
-                .unwind_exception_handlers_for_implicit_return
+        let copy_unlocated_handler_join = self
+            .control
+            .exceptions
+            .unwind_exception_handlers_for_implicit_return
             && self.assembler.location() == SourceLocation::NONE
             && self.assembler.at_original_unconditional_join()
             && self.control.exceptions.active_exception_group_handlers == 0
@@ -4023,50 +3938,32 @@ impl Compiler<'_> {
                 } else {
                     let defer_restore =
                         self.assignment_defers_async_comprehension_restore(assignment);
-                    let direct_optimized_generator_assignment = matches!(
-                        assignment.value.as_ref(),
-                        Expr::Call(call) if optimized_generator_callable_for_target(call, self.context.python_version).is_some()
-                    ) && self
-                        .control
-                        .exceptions
-                        .direct_try_body_statements
-                        .contains(&statement.range());
                     self.with_control_override(
                         |control| &mut control.comprehensions.defer_async_comprehension_restore,
                         defer_restore,
                         |compiler| {
-                            compiler.with_control_override(
-                                |control| {
-                                    &mut control.generators.direct_optimized_generator_assignment
-                                },
-                                direct_optimized_generator_assignment,
-                                |compiler| {
-                                    let newly_owned = if assignment
-                                        .targets
-                                        .iter()
-                                        // Cell stores consume the value without transferring it to
-                                        // another fast local, including through a chained COPY.
-                                        .any(|target| {
-                                            matches!(target, Expr::Name(name)
-                                                if !compiler.is_cell(name.id.as_str()))
-                                        })
-                                        && let Expr::Name(name) = assignment.value.as_ref()
-                                    {
-                                        let name = compiler.required_name_id(name.id.as_str());
-                                        compiler.symbols.owned_load_locals.insert(name)
-                                    } else {
-                                        false
-                                    };
-                                    compiler.compile_expression(&assignment.value)?;
-                                    if newly_owned
-                                        && let Expr::Name(name) = assignment.value.as_ref()
-                                    {
-                                        let name = compiler.required_name_id(name.id.as_str());
-                                        compiler.symbols.owned_load_locals.remove(name);
-                                    }
-                                    Ok(())
-                                },
-                            )
+                            let newly_owned = if assignment
+                                .targets
+                                .iter()
+                                // Cell stores consume the value without transferring it to
+                                // another fast local, including through a chained COPY.
+                                .any(|target| {
+                                    matches!(target, Expr::Name(name)
+                                        if !compiler.is_cell(name.id.as_str()))
+                                })
+                                && let Expr::Name(name) = assignment.value.as_ref()
+                            {
+                                let name = compiler.required_name_id(name.id.as_str());
+                                compiler.symbols.owned_load_locals.insert(name)
+                            } else {
+                                false
+                            };
+                            compiler.compile_expression(&assignment.value)?;
+                            if newly_owned && let Expr::Name(name) = assignment.value.as_ref() {
+                                let name = compiler.required_name_id(name.id.as_str());
+                                compiler.symbols.owned_load_locals.remove(name);
+                            }
+                            Ok(())
                         },
                     )?;
                     for (index, target) in assignment.targets.iter().enumerate() {
@@ -4083,7 +3980,6 @@ impl Compiler<'_> {
                         assignment.value.as_ref(),
                         Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)
                     ) && matches!(assignment.targets.as_slice(), [Expr::Name(_)])
-                        && self.context.target_specific_rules_enabled()
                         && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) != 0
                         && self.control.generators.coroutine_suspension_epoch == 0
                         && !self.control.generators.emitted_yield_value
@@ -4248,8 +4144,7 @@ impl Compiler<'_> {
                     .then_some(copied_break_item);
                 // Direct named handlers in ordinary functions and coroutines have
                 // the same two omitted POP_BLOCKs and four cleanup records.
-                let copied_break_handler_origin = (self.context.target_specific_rules_enabled()
-                    && matches!(
+                let copied_break_handler_origin = (matches!(
                         self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
                         0 | CO_COROUTINE
                     )
@@ -4348,8 +4243,9 @@ impl Compiler<'_> {
                                 if guard.elif_else_clauses.is_empty()));
                 // This finalizer's normal and handler exits share the original iterator
                 // discard. The join is checked again after every unwind has been emitted.
-                let copied_finally_try_iterator_join = self.context.target_specific_rules_enabled()
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                let copied_finally_try_iterator_join = self.unit.flags
+                    & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    == 0
                     && context.iterator_cleanup == IteratorCleanup::Sync
                     && !context.prevent_break_exit_inlining
                     && context.break_policy == LoopBreakPolicy::Jump
@@ -4402,8 +4298,7 @@ impl Compiler<'_> {
                     },
                 )?;
                 let marker_end = self.assembler.instruction_count();
-                if self.context.target_specific_rules_enabled()
-                    && self.control.withs.active_with_exits.len() > context.with_depth
+                if self.control.withs.active_with_exits.len() > context.with_depth
                     && self
                         .control
                         .withs
@@ -4641,8 +4536,7 @@ impl Compiler<'_> {
                 })?;
                 // This direct named handler contributes two original POP_BLOCKs before
                 // its four name-cleanup records. No other unwind may add hidden records.
-                let continued_handler_origin = (self.context.target_specific_rules_enabled()
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+                let continued_handler_origin = (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
                     && self.control.withs.active_with_exits.is_empty()
                     && self.control.exceptions.active_try_marker_slots.is_empty()
                     && self.control.exceptions.active_exception_group_handlers == 0
@@ -4669,8 +4563,7 @@ impl Compiler<'_> {
                     .then(|| self.assembler.item_count());
                 // A direct unnamed handler pops its handler block, then its finalizer.
                 // Keep both original NULL slots when the copy starts with a local None test.
-                let continued_unnamed_handler_origin = (self.context.target_specific_rules_enabled()
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                let continued_unnamed_handler_origin = (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     && context.iterator_cleanup == IteratorCleanup::Sync
                     && context.with_depth == 0
                     && self.control.exceptions.active_try_marker_slots.is_empty()
@@ -4709,9 +4602,9 @@ impl Compiler<'_> {
                     .then(|| self.assembler.item_count());
                 // A copied None guard follows the authored continue NOP and one
                 // finally POP. Capture both original cells before NOP compaction.
-                let continued_none_cleanup_target = (self.context.target_specific_rules_enabled()
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                        == CO_COROUTINE
+                let continued_none_cleanup_target = (self.unit.flags
+                    & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    == CO_COROUTINE
                     && context.iterator_cleanup == IteratorCleanup::Sync)
                     .then(|| {
                         let [finally] =
@@ -4733,8 +4626,7 @@ impl Compiler<'_> {
                     .map(|target| (self.assembler.item_count(), target));
                 // A manager-free unnamed handler and its finally each pop one
                 // original block before a nested try starts the copied finalizer.
-                let continued_handler_try_origin = (self.context.target_specific_rules_enabled()
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                let continued_handler_try_origin = (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     && context.iterator_cleanup == IteratorCleanup::Sync
                     && context.with_depth == 0
                     && context.exception_region_depth == 0
@@ -4819,8 +4711,7 @@ impl Compiler<'_> {
                 if let Some((origin, target)) = continued_none_cleanup_origin {
                     self.assembler.record_early_return_nop_pair(origin, target);
                 }
-                if self.context.target_specific_rules_enabled()
-                    && self.control.withs.active_with_exits.len() > context.with_depth
+                if self.control.withs.active_with_exits.len() > context.with_depth
                     && self
                         .control
                         .withs
@@ -4850,12 +4741,10 @@ impl Compiler<'_> {
                 }
                 // This named handler was entered inside the exceptional finalizer.
                 // Restore its exception state before popping that finalizer's state.
-                let handler_before_finally_end = self.context.target_specific_rules_enabled()
-                    && matches!(
-                        self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
-                        CO_GENERATOR | CO_ASYNC_GENERATOR
-                    )
-                    && self.control.loops.contexts.len() == 1
+                let handler_before_finally_end = matches!(
+                    self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
+                    CO_GENERATOR | CO_ASYNC_GENERATOR
+                ) && self.control.loops.contexts.len() == 1
                     && context.iterator_cleanup == IteratorCleanup::None
                     && !context.has_orelse
                     && context.finally_end_depth == 0
@@ -4916,8 +4805,7 @@ impl Compiler<'_> {
                     self.assembler.mark(start);
                     Some(start)
                 };
-                let original_finally_continue_test = (self.context.target_specific_rules_enabled()
-                    && matches!(context.iterator_cleanup, IteratorCleanup::None | IteratorCleanup::Sync)
+                let original_finally_continue_test = (matches!(context.iterator_cleanup, IteratorCleanup::None | IteratorCleanup::Sync)
                     && !context.has_orelse
                     && self.control.withs.active_with_exits.len() == context.with_depth
                     && self.control.finally.active_finally_end_blocks == context.finally_end_depth
@@ -4986,9 +4874,8 @@ impl Compiler<'_> {
                 let copied_finally_continue_test = (context.iterator_cleanup
                     == IteratorCleanup::Async)
                     .then(|| {
-                        if !self.context.target_specific_rules_enabled()
-                            || self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                                != CO_COROUTINE
+                        if self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            != CO_COROUTINE
                             || context.has_orelse
                             || self.control.loops.contexts.len() != 1
                             || !self.control.withs.active_with_exits.is_empty()
@@ -5179,13 +5066,11 @@ impl Compiler<'_> {
                         statement.range,
                     ));
                 }
-                if self.context.target_specific_rules_enabled()
-                    && matches!(
-                        statement.value.as_deref(),
-                        Some(Expr::If(conditional))
-                            if matches!(conditional.orelse.as_ref(), Expr::If(_))
-                    )
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                if matches!(
+                    statement.value.as_deref(),
+                    Some(Expr::If(conditional))
+                        if matches!(conditional.orelse.as_ref(), Expr::If(_))
+                ) && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     && self.control.loops.contexts.is_empty()
                     && !self.control.loops.suite_fallthrough_to_loop_backedge
                     && self.control.withs.active_with_exits.is_empty()
@@ -5273,8 +5158,7 @@ impl Compiler<'_> {
                         .len()
                         > self.control.finally.active_return_finally_contexts.len()
                         || !self.control.exceptions.active_exception_handlers.is_empty());
-                let bare_call_finally_return = self.context.target_specific_rules_enabled()
-                    && overriding_unwind_start.is_none()
+                let bare_call_finally_return = overriding_unwind_start.is_none()
                     && statement.value.is_none()
                     && self.control.loops.contexts.is_empty()
                     && self.control.withs.active_with_exits.is_empty()
@@ -5312,9 +5196,9 @@ impl Compiler<'_> {
                 // This inner ordinary try exits before the sole manager, whose outer
                 // finally starts with a local None comparison. Retain its original NULL
                 // POP next to the authored return before the manager changes location.
-                let retained_inner_try_manager_pop = self.context.target_specific_rules_enabled()
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                        == CO_COROUTINE
+                let retained_inner_try_manager_pop = self.unit.flags
+                    & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    == CO_COROUTINE
                     && !preserve_tos
                     && !return_is_overridden
                     && self.control.loops.contexts.is_empty()
@@ -5374,20 +5258,19 @@ impl Compiler<'_> {
                             .set_location(self.source_location(statement.range));
                         self.emit(NOP, 0, 0)?;
                     }
-                    if self.context.target_specific_rules_enabled()
-                        && self
-                            .control
-                            .withs
-                            .active_with_exits
-                            .last()
-                            .is_some_and(|context| {
-                                context.exception_region_depth
-                                    < self
-                                        .control
-                                        .exceptions
-                                        .active_exception_region_exclusions
-                                        .len()
-                            })
+                    if self
+                        .control
+                        .withs
+                        .active_with_exits
+                        .last()
+                        .is_some_and(|context| {
+                            context.exception_region_depth
+                                < self
+                                    .control
+                                    .exceptions
+                                    .active_exception_region_exclusions
+                                    .len()
+                        })
                         && self.control.exceptions.active_exception_handlers.is_empty()
                         && (self
                             .control
@@ -5471,8 +5354,7 @@ impl Compiler<'_> {
                         self.assembler.set_location(location);
                         self.emit(NOP, 0, 0)?;
                     }
-                    if self.context.target_specific_rules_enabled()
-                        && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                    if self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                         && !return_is_overridden
                         && self.control.exceptions.active_exception_handlers.is_empty()
                         && self.control.exceptions.active_exception_group_handlers == 0
@@ -5543,7 +5425,6 @@ impl Compiler<'_> {
                 // exceptional finally body in which that handler was entered. The saved
                 // depth distinguishes this from a finally entered inside a handler.
                 let handler_before_finally_end = !return_is_overridden
-                    && self.context.target_specific_rules_enabled()
                     && self.control.finally.active_finally_end_blocks == 1
                     && self.control.exceptions.active_exception_handlers.len() == 1
                     && self.control.exceptions.active_exception_handlers[0].finally_end_depth == 1
@@ -5601,7 +5482,6 @@ impl Compiler<'_> {
                 let protected_sync_iterator_below_while =
                     !return_is_overridden
                         && preserve_tos
-                        && self.context.target_specific_rules_enabled()
                         && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                             == 0
                         && self.control.exceptions.active_exception_handlers.is_empty()
@@ -5658,11 +5538,9 @@ impl Compiler<'_> {
                 // loading the returned constant; other returned values are already on the stack.
                 let protected_return_iterator = self.control.in_exception_protected_iterator_loop()
                     || protected_sync_iterator_below_while
-                    || (self.context.target_specific_rules_enabled()
-                        && (!preserve_tos
-                            || self.unit.flags
-                                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                                == CO_COROUTINE)
+                    || ((!preserve_tos
+                        || self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_COROUTINE)
                         && self
                             .control
                             .loops
@@ -5696,7 +5574,7 @@ impl Compiler<'_> {
                         .is_empty()
                     && (delay_literal_iterator_exception_unwind_start
                         || ((matches!(statement.value.as_deref(), Some(Expr::Call(_)))
-                            || (self.context.target_specific_rules_enabled() && preserve_tos))
+                            || (preserve_tos))
                             && protected_return_iterator));
                 let delay_exception_unwind_start = delay_iterator_exception_unwind_start
                     || (overriding_unwind_start.is_none()
@@ -5735,8 +5613,7 @@ impl Compiler<'_> {
                     .finally
                     .active_return_finally_contexts
                     .is_empty()
-                    && exception_unwind_start.is_some()
-                    && self.context.target_specific_rules_enabled())
+                    && exception_unwind_start.is_some())
                 .then(|| {
                     self.control
                         .exceptions
@@ -5756,7 +5633,6 @@ impl Compiler<'_> {
                 // Saved scope depths certify that no manager, loop, ordinary try, or finally
                 // must be interleaved between those handler cleanups.
                 let unwinds_plain_nested_handlers = !return_is_overridden
-                    && self.context.target_specific_rules_enabled()
                     && handler_count > 1
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     && self.control.exceptions.active_exception_group_handlers == 0
@@ -5818,7 +5694,6 @@ impl Compiler<'_> {
                 // the first handler's value-preserving SWAP. Inside the second handler,
                 // its POP_EXCEPT and the first handler's SWAP share the first cleanup.
                 let unwinds_named_outer_unnamed_handlers = !return_is_overridden
-                    && self.context.target_specific_rules_enabled()
                     && preserve_tos
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     && self.control.exceptions.active_exception_group_handlers == 0
@@ -5874,7 +5749,6 @@ impl Compiler<'_> {
                 // iterator created inside the outer handler. That outer handler still
                 // owns the inner pop, iterator cleanup, and its own value-preserving swap.
                 let iterator_between_unnamed_handlers = !return_is_overridden
-                    && self.context.target_specific_rules_enabled()
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     && self.control.exceptions.active_exception_group_handlers == 0
                     && self.control.exceptions.active_try_marker_slots.is_empty()
@@ -5941,7 +5815,6 @@ impl Compiler<'_> {
                 // unwind, so any enclosing ordinary try must retain their cleanup.
                 let nested_handlers_inside_older_iterator = !return_is_overridden
                     && preserve_tos
-                    && self.context.target_specific_rules_enabled()
                     && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                     && self.control.exceptions.active_exception_group_handlers == 0
                     && self.control.withs.active_with_exits.is_empty()
@@ -5998,7 +5871,6 @@ impl Compiler<'_> {
                 // try surrounding them. Each name is cleared after its own handler exits,
                 // while the enclosing handler or try still owns the cleanup.
                 let tracks_two_handlers_inside_ordinary_try = !return_is_overridden
-                    && self.context.target_specific_rules_enabled()
                     && handler_count == 2
                     && self.control.exceptions.active_try_marker_slots.len() == 1
                     && self
@@ -6065,7 +5937,6 @@ impl Compiler<'_> {
                 // before the outer POP_EXCEPT, instead of assigning both pops to one owner.
                 let tracks_interleaved_unnamed_handler_unwind = !return_is_overridden
                     && !preserve_tos
-                    && self.context.target_specific_rules_enabled()
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     && self.control.exceptions.active_exception_group_handlers == 0
                     && self.control.exceptions.active_try_marker_slots.len() == 1
@@ -6119,31 +5990,29 @@ impl Compiler<'_> {
                 // CPython keeps a nested handler's return cleanup protected by its enclosing
                 // try body. A return compiled in a newer try body under an outer handler has a
                 // deeper marker stack and must keep the existing ownerless unwind instead.
-                let preserve_nested_handler_return_owner =
-                    self.context.target_specific_rules_enabled()
-                        && handler_count == 1
-                        && self
-                            .control
-                            .exceptions
-                            .active_exception_region_exclusions
-                            .len()
-                            == 2
-                        && self
-                            .control
-                            .exceptions
-                            .active_exception_handlers
-                            .last()
-                            .is_some_and(|handler| {
-                                handler.try_body_depth
-                                    == self.control.exceptions.active_try_marker_slots.len()
-                            })
-                        && self.control.withs.active_with_exits.is_empty()
-                        && self
-                            .control
-                            .finally
-                            .active_return_finally_contexts
-                            .is_empty()
-                        && self.control.finally.active_finally_end_blocks == 0;
+                let preserve_nested_handler_return_owner = handler_count == 1
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+                        == 2
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_handlers
+                        .last()
+                        .is_some_and(|handler| {
+                            handler.try_body_depth
+                                == self.control.exceptions.active_try_marker_slots.len()
+                        })
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self
+                        .control
+                        .finally
+                        .active_return_finally_contexts
+                        .is_empty()
+                    && self.control.finally.active_finally_end_blocks == 0;
                 // A newer try inside the handler ends first. The older ordinary try
                 // still owns the complete handler cleanup, including deeper handler chains.
                 let preserve_outer_handler_try_owner = !return_is_overridden
@@ -6161,7 +6030,6 @@ impl Compiler<'_> {
                 // inside the handler before POP_EXCEPT clears its exception state.
                 let preserves_enclosing_try_return_owner =
                     !return_is_overridden
-                        && self.context.target_specific_rules_enabled()
                         && handler_count == 1
                         && self.control.finally.active_return_finally_contexts.len() == 1
                         && self.control.loops.contexts.iter().enumerate().all(
@@ -6199,10 +6067,7 @@ impl Compiler<'_> {
                 // pending finalizer under an older synchronous manager. Each try
                 // keeps its own collector after the handler has restored the exception
                 // state. The while adds no cleanup record before either finalizer.
-                let preserves_manager_handler_try_owner = self
-                    .context
-                    .target_specific_rules_enabled()
-                    && statement.value.is_none()
+                let preserves_manager_handler_try_owner = statement.value.is_none()
                     && !preserve_tos
                     && !return_is_overridden
                     && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
@@ -6265,9 +6130,10 @@ impl Compiler<'_> {
                 // try entered before every discarded iterator also retains its owner
                 // until those iterators have been removed.
                 let tracks_handler_finally_iterator_unwinds = self
-                    .context
-                    .target_specific_rules_enabled()
-                    && self.control.withs.active_with_exits.is_empty()
+                    .control
+                    .withs
+                    .active_with_exits
+                    .is_empty()
                     && self
                         .control
                         .finally
@@ -6350,9 +6216,10 @@ impl Compiler<'_> {
                 // the copied finalizer after the handler and finally collectors unwind.
                 // Track those boundaries separately without changing handler POP slots.
                 let tracks_outer_try_handler_finally_unwinds = self
-                    .context
-                    .target_specific_rules_enabled()
-                    && self.control.withs.active_with_exits.is_empty()
+                    .control
+                    .withs
+                    .active_with_exits
+                    .is_empty()
                     && self.control.exceptions.active_exception_group_handlers == 0
                     && self.control.finally.active_finally_end_blocks == 0
                     && self.control.finally.active_normal_finally_bodies == 0
@@ -6409,10 +6276,7 @@ impl Compiler<'_> {
                 // Two named handlers can return through an ordinary try nested inside a
                 // pending finally. The outer handler's name cleanup still belongs to that
                 // try; retire each handler collector before retiring the ordinary try.
-                let tracks_two_named_handlers_before_finally = self
-                    .context
-                    .target_specific_rules_enabled()
-                    && !return_is_overridden
+                let tracks_two_named_handlers_before_finally = !return_is_overridden
                     && self.control.withs.active_with_exits.is_empty()
                     && self.control.loops.contexts.is_empty()
                     && self.control.exceptions.active_exception_group_handlers == 0
@@ -6454,10 +6318,7 @@ impl Compiler<'_> {
                 // entered in that try remains live until after the inner copy; its POP
                 // still belongs to the ordinary try. Retire each collector at its own
                 // unwind boundary so that try owns the copy and the iterator cleanup.
-                let tracks_try_between_finally_unwinds = self
-                    .context
-                    .target_specific_rules_enabled()
-                    && !return_is_overridden
+                let tracks_try_between_finally_unwinds = !return_is_overridden
                     && statement.value.is_none()
                     && !preserve_tos
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
@@ -6576,7 +6437,6 @@ impl Compiler<'_> {
                 // A return pops inner try blocks before discarding an iterator from an
                 // enclosing handler. Preserve each loop's exception depth during that unwind.
                 let tracks_handler_iterator_region_unwinds = !return_is_overridden
-                    && self.context.target_specific_rules_enabled()
                     && handler_count == 1
                     && self.control.withs.active_with_exits.is_empty()
                     && self
@@ -6676,7 +6536,6 @@ impl Compiler<'_> {
                 let tracks_handler_enclosing_try_unwinds = !return_is_overridden
                     && (preserve_tos || bare_handler_return_inside_two_tries)
                     && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
-                    && self.context.target_specific_rules_enabled()
                     && (handler_count == 1 || nested_handlers_inside_older_iterator)
                     && self.control.exceptions.active_exception_group_handlers == 0
                     && (self.control.withs.active_with_exits.is_empty()
@@ -6811,7 +6670,6 @@ impl Compiler<'_> {
                 // Its asynchronous exit runs afterwards, outside this original POP array.
                 let retains_async_manager_handler_iterator_pops = preserve_tos
                     && !return_is_overridden
-                    && self.context.target_specific_rules_enabled()
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                         == CO_COROUTINE
                     && handler_count == 1
@@ -6861,7 +6719,6 @@ impl Compiler<'_> {
                 // Its one async manager remains active until after the copied finalizer.
                 let captures_async_manager_handler_return = preserve_tos
                     && !return_is_overridden
-                    && self.context.target_specific_rules_enabled()
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                         == CO_COROUTINE
                     && handler_count == 1
@@ -7026,45 +6883,43 @@ impl Compiler<'_> {
                         // A constant return from an ordinary try inside a handler's
                         // iterator discards that iterator before clearing the handler name.
                         // Keep that exact prefix separate from the direct-handler captures.
-                        let copied_inner_iterator_handler =
-                            self.context.target_specific_rules_enabled()
-                                && !preserve_tos
-                                && !return_is_overridden
-                                && handler_count == 1
-                                && handler_index == 0
-                                && name.is_some()
-                                && next_finally == 1
-                                && return_finally_contexts.len() == 1
-                                && next_with == 0
-                                && with_depth == 0
-                                && loop_depth == 0
-                                && next_loop == 1
-                                && try_body_depth == 0
-                                && region_depth == 1
-                                && self.control.exceptions.active_try_marker_slots.len() == 1
-                                && self
-                                    .control
-                                    .exceptions
-                                    .active_exception_region_exclusions
-                                    .len()
-                                    == 3
-                                && self.control.exceptions.active_exception_group_handlers == 0
-                                && self.control.withs.active_with_exits.is_empty()
-                                && self.control.finally.active_finally_end_blocks == 0
-                                && self.control.finally.active_normal_finally_bodies == 0
-                                && self.control.finally.active_copied_finally_bodies == 0
-                                && self
-                                    .control
-                                    .finally
-                                    .preserved_return_value_contexts
-                                    .is_empty()
-                                && matches!(return_finally_contexts.as_slice(), [finally]
+                        let copied_inner_iterator_handler = !preserve_tos
+                            && !return_is_overridden
+                            && handler_count == 1
+                            && handler_index == 0
+                            && name.is_some()
+                            && next_finally == 1
+                            && return_finally_contexts.len() == 1
+                            && next_with == 0
+                            && with_depth == 0
+                            && loop_depth == 0
+                            && next_loop == 1
+                            && try_body_depth == 0
+                            && region_depth == 1
+                            && self.control.exceptions.active_try_marker_slots.len() == 1
+                            && self
+                                .control
+                                .exceptions
+                                .active_exception_region_exclusions
+                                .len()
+                                == 3
+                            && self.control.exceptions.active_exception_group_handlers == 0
+                            && self.control.withs.active_with_exits.is_empty()
+                            && self.control.finally.active_finally_end_blocks == 0
+                            && self.control.finally.active_normal_finally_bodies == 0
+                            && self.control.finally.active_copied_finally_bodies == 0
+                            && self
+                                .control
+                                .finally
+                                .preserved_return_value_contexts
+                                .is_empty()
+                            && matches!(return_finally_contexts.as_slice(), [finally]
                                 if finally.handler_depth == 0
                                     && finally.with_depth == 0
                                     && finally.loop_depth == 0
                                     && finally.try_body_depth == 0
                                     && finally.exception_region_depth == 0)
-                                && matches!(self.control.loops.contexts.as_slice(), [iterator]
+                            && matches!(self.control.loops.contexts.as_slice(), [iterator]
                                 if iterator.iterator_cleanup == IteratorCleanup::Sync
                                     && iterator.with_depth == 0
                                     && iterator.finally_end_depth == 0
@@ -7305,31 +7160,29 @@ impl Compiler<'_> {
                         // POP_EXCEPT and any exception-name clearing. The manager unwind
                         // tracks that collector until the finally starts; a synthetic
                         // finally owner would replace it early.
-                        let enclosing_try_owns_pop_except =
-                            self.context.target_specific_rules_enabled()
-                                && handler_count == 1
-                                && next_finally == 1
-                                && return_finally_contexts.len() == 1
-                                && with_depth > 0
-                                && next_with == with_depth
-                                && with_depth == self.control.withs.active_with_exits.len()
-                                && self.control.loops.contexts.is_empty()
-                                && self.control.finally.active_finally_end_blocks == 0
-                                && self.control.finally.active_normal_finally_bodies == 0
-                                && return_finally_contexts[0].handler_depth == 0
-                                && return_finally_contexts[0].with_depth == with_depth
-                                && return_finally_contexts[0].exception_region_depth + 2
-                                    == region_depth
-                                && self
-                                    .control
-                                    .exceptions
-                                    .active_exception_region_exclusions
-                                    .len()
-                                    == region_depth + 1
-                                && handler_region_unwind_starts
-                                    .as_ref()
-                                    .and_then(|starts| starts.get(region_depth - 1))
-                                    .is_some_and(Option::is_none);
+                        let enclosing_try_owns_pop_except = handler_count == 1
+                            && next_finally == 1
+                            && return_finally_contexts.len() == 1
+                            && with_depth > 0
+                            && next_with == with_depth
+                            && with_depth == self.control.withs.active_with_exits.len()
+                            && self.control.loops.contexts.is_empty()
+                            && self.control.finally.active_finally_end_blocks == 0
+                            && self.control.finally.active_normal_finally_bodies == 0
+                            && return_finally_contexts[0].handler_depth == 0
+                            && return_finally_contexts[0].with_depth == with_depth
+                            && return_finally_contexts[0].exception_region_depth + 2
+                                == region_depth
+                            && self
+                                .control
+                                .exceptions
+                                .active_exception_region_exclusions
+                                .len()
+                                == region_depth + 1
+                            && handler_region_unwind_starts
+                                .as_ref()
+                                .and_then(|starts| starts.get(region_depth - 1))
+                                .is_some_and(Option::is_none);
                         let live_manager_handler_try_owner = preserves_manager_handler_try_owner
                             && next_finally == return_finally_contexts.len()
                             && next_with == with_depth
@@ -7429,8 +7282,7 @@ impl Compiler<'_> {
                                         copied_handler_return_item,
                                     );
                                 }
-                                if self.context.target_specific_rules_enabled()
-                                    && !preserve_tos
+                                if !preserve_tos
                                     && handler_count == 1
                                     && (next_finally == 1
                                         || (tracks_try_between_finally_unwinds && next_finally == 2))
@@ -7479,8 +7331,7 @@ impl Compiler<'_> {
                                 }
                                 // Preserve the exact handler span until the copied inner
                                 // assignment has acquired its enclosing finally owner.
-                                if self.context.target_specific_rules_enabled()
-                                    && !preserve_tos
+                                if !preserve_tos
                                     && !return_is_overridden
                                     && handler_count == 1
                                     && name.is_none()
@@ -7586,10 +7437,7 @@ impl Compiler<'_> {
                     // One synchronous manager separates an inner iterator from outer
                     // iterators. Its saved depths certify the lexical cleanup order and
                     // any ordinary try that must retire before the outer iterator pops.
-                    let interleaved_sync_manager_return = self
-                        .context
-                        .target_specific_rules_enabled()
-                        && statement.value.is_none()
+                    let interleaved_sync_manager_return = statement.value.is_none()
                         && !preserve_tos
                         && !return_is_overridden
                         && !nested_call_finally_return
@@ -7704,26 +7552,24 @@ impl Compiler<'_> {
                     // These managers were all entered after the remaining loops. Their
                     // exit callables must be removed before the surrounding iterators.
                     // Keep the separate handler and copied-finally unwind paths unchanged.
-                    let can_unwind_inner_managers_first =
-                        self.context.target_specific_rules_enabled()
-                            && (preserve_tos
-                                || none_return_unwinds_inner_managers
-                                || interleaved_sync_manager_return)
-                            && handler_count == 0
-                            && !nested_call_finally_return
-                            && self.control.finally.active_finally_end_blocks == 0
-                            && self.control.finally.active_normal_finally_bodies == 0
-                            && self.control.finally.active_copied_finally_bodies == 0
-                            && self
-                                .control
-                                .finally
-                                .preserved_return_value_contexts
-                                .is_empty()
-                            && next_with > finally_context.with_depth
-                            && finally_context.loop_depth < next_loop
-                            && self.control.loops.contexts[finally_context.loop_depth..next_loop]
-                                .iter()
-                                .any(|context| context.iterator_cleanup != IteratorCleanup::None);
+                    let can_unwind_inner_managers_first = (preserve_tos
+                        || none_return_unwinds_inner_managers
+                        || interleaved_sync_manager_return)
+                        && handler_count == 0
+                        && !nested_call_finally_return
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self
+                            .control
+                            .finally
+                            .preserved_return_value_contexts
+                            .is_empty()
+                        && next_with > finally_context.with_depth
+                        && finally_context.loop_depth < next_loop
+                        && self.control.loops.contexts[finally_context.loop_depth..next_loop]
+                            .iter()
+                            .any(|context| context.iterator_cleanup != IteratorCleanup::None);
                     let unwind_inner_managers_first = can_unwind_inner_managers_first
                         && self.control.withs.active_with_exits
                             [finally_context.with_depth..next_with]
@@ -7852,63 +7698,61 @@ impl Compiler<'_> {
                     // This shared inner-cleanup join has no unique line donor. The
                     // iterator discard precedes the outer try's located SETUP, so it
                     // must remain artificial when later cleanup blocks are compacted.
-                    let preserve_shared_iterator_location =
-                        self.context.target_specific_rules_enabled()
-                            && !preserve_tos
-                            && !return_is_overridden
-                            && matches!(
-                                statement.value.as_deref(),
-                                None | Some(Expr::NoneLiteral(_))
-                            )
-                            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                                == 0
-                            && handler_count == 0
-                            && context_index == 0
-                            && return_finally_contexts.len() == 2
-                            && self.control.withs.active_with_exits.is_empty()
-                            && self.control.exceptions.active_try_marker_slots.is_empty()
-                            && self.control.exceptions.active_exception_group_handlers == 0
-                            && self.control.finally.active_finally_end_blocks == 0
-                            && self.control.finally.active_normal_finally_bodies == 0
-                            && self.control.finally.active_copied_finally_bodies == 0
-                            && self
-                                .control
-                                .finally
-                                .preserved_return_value_contexts
-                                .is_empty()
-                            && next_loop == finally_context.loop_depth + 1
-                            && self
-                                .control
-                                .loops
-                                .contexts
-                                .get(finally_context.loop_depth)
-                                .is_some_and(|iterator| {
-                                    iterator.iterator_cleanup == IteratorCleanup::Sync
-                                        && iterator.with_depth == 0
-                                        && iterator.finally_end_depth == 0
-                                        && iterator.exception_region_depth
-                                            == finally_context.exception_region_depth + 1
-                                })
-                            && return_finally_contexts.get(1).is_some_and(|inner| {
-                                inner.handler_depth == 0
-                                    && inner.with_depth == 0
-                                    && inner.loop_depth == next_loop
-                                    && inner.exception_region_depth
+                    let preserve_shared_iterator_location = !preserve_tos
+                        && !return_is_overridden
+                        && matches!(
+                            statement.value.as_deref(),
+                            None | Some(Expr::NoneLiteral(_))
+                        )
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == 0
+                        && handler_count == 0
+                        && context_index == 0
+                        && return_finally_contexts.len() == 2
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.exceptions.active_try_marker_slots.is_empty()
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self
+                            .control
+                            .finally
+                            .preserved_return_value_contexts
+                            .is_empty()
+                        && next_loop == finally_context.loop_depth + 1
+                        && self
+                            .control
+                            .loops
+                            .contexts
+                            .get(finally_context.loop_depth)
+                            .is_some_and(|iterator| {
+                                iterator.iterator_cleanup == IteratorCleanup::Sync
+                                    && iterator.with_depth == 0
+                                    && iterator.finally_end_depth == 0
+                                    && iterator.exception_region_depth
                                         == finally_context.exception_region_depth + 1
-                                    && copied_finally_has_guarded_pass_cleanup(&inner.body)
                             })
-                            && matches!(finally_context.body.as_slice(), [Stmt::Try(cleanup)]
+                        && return_finally_contexts.get(1).is_some_and(|inner| {
+                            inner.handler_depth == 0
+                                && inner.with_depth == 0
+                                && inner.loop_depth == next_loop
+                                && inner.exception_region_depth
+                                    == finally_context.exception_region_depth + 1
+                                && copied_finally_has_guarded_pass_cleanup(&inner.body)
+                        })
+                        && matches!(finally_context.body.as_slice(), [Stmt::Try(cleanup)]
                             if !cleanup.is_star
                                 && cleanup.finalbody.is_empty()
                                 && !cleanup.handlers.is_empty())
-                            && self.assembler.location() == SourceLocation::NONE
-                            && self.assembler.at_original_unconditional_join();
+                        && self.assembler.location() == SourceLocation::NONE
+                        && self.assembler.at_original_unconditional_join();
                     // This ordinary try was entered inside the synchronous iterator.
                     // CPython unwinds its POP_BLOCK before SWAP/POP_TOP disposes of the
                     // iterator, then emits the outer finally's separate POP_BLOCK.
-                    let copied_iterator_try_pop = if self.context.target_specific_rules_enabled()
-                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                            == CO_COROUTINE
+                    let copied_iterator_try_pop = if self.unit.flags
+                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_COROUTINE
                         && preserve_tos
                         && !return_is_overridden
                         && matches!(statement.value.as_deref(), Some(Expr::Name(_)))
@@ -8074,8 +7918,7 @@ impl Compiler<'_> {
                     // sole false edge enters this outer POP_BLOCK before any cleanup call
                     // supplies a different line. Require the original records, not just
                     // the physical adjacency of an arbitrary conditional and finalizer.
-                    let copied_guard_exit_location = if self.context.target_specific_rules_enabled()
-                        && preserve_tos
+                    let copied_guard_exit_location = if preserve_tos
                         && !return_is_overridden
                         && handler_count == 0
                         && self.control.exceptions.active_exception_group_handlers == 0
@@ -8137,11 +7980,9 @@ impl Compiler<'_> {
                     // This surrounding loop stays live until after the copied finally.
                     // A while and a retained iterator both contribute no unwind record
                     // between this value return and the ordinary-try/finally POP pair.
-                    let copied_return_keeps_outer_loop = self
-                        .context
-                        .target_specific_rules_enabled()
-                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                            == CO_COROUTINE
+                    let copied_return_keeps_outer_loop = self.unit.flags
+                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_COROUTINE
                         && preserve_tos
                         && !return_is_overridden
                         && context_index == 0
@@ -8158,22 +7999,21 @@ impl Compiler<'_> {
                     // This manager surrounds the entire try/finally and remains live
                     // during the copied finalizer. Only the ordinary try and finally
                     // contribute POP_BLOCK records before the copied condition.
-                    let copied_return_keeps_outer_async_manager =
-                        self.context.target_specific_rules_enabled()
-                            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                                == CO_COROUTINE
-                            && preserve_tos
-                            && !return_is_overridden
-                            && context_index == 0
-                            && return_finally_contexts.len() == 1
-                            && handler_count == 0
-                            && self.control.loops.contexts.is_empty()
-                            && finally_context.with_depth == 1
-                            && next_with == 1
-                            && with_unwind_starts.is_empty()
-                            && finally_context.exception_region_depth == 0
-                            && self.control.finally.active_copied_finally_bodies == 0
-                            && matches!(self.control.withs.active_with_exits.as_slice(), [manager]
+                    let copied_return_keeps_outer_async_manager = self.unit.flags
+                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_COROUTINE
+                        && preserve_tos
+                        && !return_is_overridden
+                        && context_index == 0
+                        && return_finally_contexts.len() == 1
+                        && handler_count == 0
+                        && self.control.loops.contexts.is_empty()
+                        && finally_context.with_depth == 1
+                        && next_with == 1
+                        && with_unwind_starts.is_empty()
+                        && finally_context.exception_region_depth == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && matches!(self.control.withs.active_with_exits.as_slice(), [manager]
                             if manager.is_async
                                 && manager.exception_region_depth == 0
                                 && manager.loop_depth == 0
@@ -8181,11 +8021,9 @@ impl Compiler<'_> {
                     // These synchronous managers surround the entire try/finally.
                     // They contribute no unwind cells before the ordinary-try/finally
                     // POP pair, just as a retained outer async manager does.
-                    let copied_return_keeps_outer_sync_managers = self
-                        .context
-                        .target_specific_rules_enabled()
-                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                            == 0
+                    let copied_return_keeps_outer_sync_managers = self.unit.flags
+                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == 0
                         && preserve_tos
                         && matches!(statement.value.as_deref(), Some(Expr::Call(_)))
                         && !return_is_overridden
@@ -8230,11 +8068,9 @@ impl Compiler<'_> {
                     // This manager was entered inside every ordinary try still active
                     // at the return. Its completed await cleanup comes first; those
                     // surrounding tries then contribute their own original NULL POPs.
-                    let copied_return_unwinds_inner_async_manager = self
-                        .context
-                        .target_specific_rules_enabled()
-                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                            == CO_COROUTINE
+                    let copied_return_unwinds_inner_async_manager = self.unit.flags
+                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_COROUTINE
                         && preserve_tos
                         && !return_is_overridden
                         && context_index == 0
@@ -8253,11 +8089,9 @@ impl Compiler<'_> {
                     // ordinary try POP and the finalizer POP. A value return carries
                     // its result across the same POP pair without iterator cleanup.
                     // Keep both records for the existing None-prefix slot certificate.
-                    let copied_return_unwinds_while_only = self
-                        .context
-                        .target_specific_rules_enabled()
-                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                            == CO_COROUTINE
+                    let copied_return_unwinds_while_only = self.unit.flags
+                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_COROUTINE
                         && !return_is_overridden
                         && context_index == 0
                         && finally_context.loop_depth == 0
@@ -8279,11 +8113,9 @@ impl Compiler<'_> {
                     // POP_TOP (and SWAP for a value return). The surrounding ordinary
                     // try still contributes a NULL POP before the copied finalizer.
                     // An outer while contributes no iterator cell to that prefix.
-                    let copied_return_unwinds_inner_async_iterator = self
-                        .context
-                        .target_specific_rules_enabled()
-                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                            == CO_COROUTINE
+                    let copied_return_unwinds_inner_async_iterator = self.unit.flags
+                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_COROUTINE
                         && !return_is_overridden
                         && context_index == 0
                         && finally_context.loop_depth <= 1
@@ -8327,25 +8159,24 @@ impl Compiler<'_> {
                     // A value return through a while needs no iterator stack cleanup.
                     // Ordinary tries entered inside that while still contribute their
                     // own NULL POP_BLOCK records before the finalizer POP.
-                    let copied_return_unwinds_value_while_tries =
-                        self.context.target_specific_rules_enabled()
-                            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                                == CO_COROUTINE
-                            && preserve_tos
-                            && !return_is_overridden
-                            && context_index == 0
-                            && finally_context.loop_depth == 0
-                            && finally_context.with_depth == 0
-                            && next_loop == 1
-                            && next_with == 0
-                            && self.control.withs.active_with_exits.is_empty()
-                            && self.control.finally.active_copied_finally_bodies == 0
-                            && self
-                                .control
-                                .finally
-                                .preserved_return_value_contexts
-                                .is_empty()
-                            && matches!(self.control.loops.contexts.as_slice(), [loop_context]
+                    let copied_return_unwinds_value_while_tries = self.unit.flags
+                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_COROUTINE
+                        && preserve_tos
+                        && !return_is_overridden
+                        && context_index == 0
+                        && finally_context.loop_depth == 0
+                        && finally_context.with_depth == 0
+                        && next_loop == 1
+                        && next_with == 0
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self
+                            .control
+                            .finally
+                            .preserved_return_value_contexts
+                            .is_empty()
+                        && matches!(self.control.loops.contexts.as_slice(), [loop_context]
                             if loop_context.iterator_cleanup == IteratorCleanup::None
                                 && loop_context.with_depth == 0
                                 && loop_context.finally_end_depth == 0
@@ -8379,8 +8210,7 @@ impl Compiler<'_> {
                                 && (1..=2).contains(&ordinary_try_count))
                             || (copied_return_unwinds_inner_async_iterator
                                 && ordinary_try_count == 1)
-                            || (self.context.target_specific_rules_enabled()
-                                && self.unit.flags & CO_ASYNC_GENERATOR != 0
+                            || (self.unit.flags & CO_ASYNC_GENERATOR != 0
                                 && !preserve_tos
                                 && !return_is_overridden
                                 && context_index == 0
@@ -8416,7 +8246,6 @@ impl Compiler<'_> {
                         // POP_TOP, and SWAP for values, precede both captured NULL cells.
                         if (ordinary_try_count == 1
                             || (ordinary_try_count == 2
-                                && self.context.target_specific_rules_enabled()
                                 && !preserve_tos
                                 && !return_is_overridden
                                 && context_index == 0
@@ -8473,10 +8302,7 @@ impl Compiler<'_> {
                     }
                     // Capture constant returns through one synchronous manager without
                     // changing the omitted POP records or the emitted instruction stream.
-                    let copied_constant_manager_pop = if self
-                        .context
-                        .target_specific_rules_enabled()
-                        && !preserve_tos
+                    let copied_constant_manager_pop = if !preserve_tos
                         && !return_is_overridden
                         && context_index == 0
                         && return_finally_contexts.len() == 1
@@ -8627,8 +8453,7 @@ impl Compiler<'_> {
                     // A bare return through a sync manager can leave an ordinary try
                     // between the manager and finally. Capture the exact cleanup before
                     // its primitive test, including an optional unnamed-handler unwind.
-                    let copied_try_manager_pop = (self.context.target_specific_rules_enabled()
-                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    let copied_try_manager_pop = (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                         && !preserve_tos
                         && !return_is_overridden
                         && context_index == 0
@@ -8679,8 +8504,7 @@ impl Compiler<'_> {
                         });
                     // An unnamed handler restores its exception state before one or
                     // two enclosing sync managers and the sole outer finally unwind.
-                    let copied_unnamed_handler_manager_pop = (self.context.target_specific_rules_enabled()
-                        && matches!(self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR), 0 | CO_COROUTINE)
+                    let copied_unnamed_handler_manager_pop = (matches!(self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR), 0 | CO_COROUTINE)
                         && !preserve_tos
                         && !return_is_overridden
                         && context_index == 0
@@ -8722,8 +8546,7 @@ impl Compiler<'_> {
                         && self.control.finally.active_copied_finally_bodies == 0
                         && self.control.finally.preserved_return_value_contexts.is_empty())
                         .then(|| (self.assembler.item_count(), self.control.withs.active_with_exits.len()));
-                    let copied_manager_return_pop = (self.context.target_specific_rules_enabled()
-                        && matches!(
+                    let copied_manager_return_pop = (matches!(
                             self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
                             0 | CO_COROUTINE
                         )
@@ -8810,9 +8633,9 @@ impl Compiler<'_> {
                                         == self.source_location(statement.range).line)
                         })
                         .map(|(pop_item, _, _)| pop_item);
-                    let copied_bare_handler_none = self.context.target_specific_rules_enabled()
-                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                            == CO_GENERATOR
+                    let copied_bare_handler_none = self.unit.flags
+                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_GENERATOR
                         && !preserve_tos
                         && !return_is_overridden
                         && !starts_jump_target
@@ -8851,8 +8674,7 @@ impl Compiler<'_> {
                                     && handler.try_body_depth == 0
                                     && handler.exception_region_depth == index + 1
                             });
-                    let copied_handler_none_pop = (self.context.target_specific_rules_enabled()
-                        && preserve_tos
+                    let copied_handler_none_pop = (preserve_tos
                         && !return_is_overridden
                         && context_index == 0
                         && handler_count == 1
@@ -8884,10 +8706,9 @@ impl Compiler<'_> {
                     // The inner manager and any ordinary try unwind before this finalizer;
                     // the outer manager still protects the copied body. Keep its exact
                     // handler identity with the original return and cleanup records.
-                    let retained_manager_return_none_pop = if self
-                        .context
-                        .target_specific_rules_enabled()
-                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    let retained_manager_return_none_pop = if self.unit.flags
+                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == 0
                         && (!preserve_tos
                             || matches!(statement.value.as_deref(), Some(Expr::Call(_))))
                         && !return_is_overridden
@@ -8950,10 +8771,9 @@ impl Compiler<'_> {
                     // A named handler and one inner manager finish before this copied
                     // finalizer; the outer managers remain live. Capture their actual
                     // twelve cleanup records with the two omitted handler POP cells.
-                    let retained_manager_named_return_none_pop = if self
-                        .context
-                        .target_specific_rules_enabled()
-                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    let retained_manager_named_return_none_pop = if self.unit.flags
+                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == 0
                         && preserve_tos
                         && matches!(statement.value.as_deref(), Some(Expr::Call(_)))
                         && !return_is_overridden
@@ -9027,8 +8847,7 @@ impl Compiler<'_> {
                     // These coroutine returns have already emitted their exact iterator
                     // or synchronous-manager cleanup. Capture its original cells without
                     // changing the omitted POPs or any emitted instruction.
-                    let copied_cleanup_none_pop = (self.context.target_specific_rules_enabled()
-                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    let copied_cleanup_none_pop = (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                             == CO_COROUTINE
                         && !preserve_tos
                         && !return_is_overridden
@@ -9099,8 +8918,7 @@ impl Compiler<'_> {
                         }).flatten();
                     // A named handler's saved value remains live while this first try
                     // in the copied finalizer emits its own SETUP and truth condition.
-                    let named_handler_try_pop = (self.context.target_specific_rules_enabled()
-                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    let named_handler_try_pop = (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                             == CO_COROUTINE
                         && preserve_tos
                         && !return_is_overridden
@@ -9130,11 +8948,9 @@ impl Compiler<'_> {
                         .then(|| self.assembler.item_count());
                     // Both outer managers remain live; this async iterator alone unwinds
                     // before the finalizer, preserving its original owned disposal cell.
-                    let copied_outer_manager_iterator_none = self
-                        .context
-                        .target_specific_rules_enabled()
-                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                            == CO_ASYNC_GENERATOR
+                    let copied_outer_manager_iterator_none = self.unit.flags
+                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_ASYNC_GENERATOR
                         && !preserve_tos
                         && !return_is_overridden
                         && !starts_jump_target
@@ -9205,8 +9021,7 @@ impl Compiler<'_> {
                     {
                         self.assembler.mark_last_as_converted_pop_block();
                     }
-                    if self.context.target_specific_rules_enabled()
-                        && !preserve_tos
+                    if !preserve_tos
                         && !return_is_overridden
                         && handler_count == 0
                         && context_index == 0
@@ -9586,9 +9401,9 @@ impl Compiler<'_> {
                         self.assembler.mark(copied_finally_end);
                         // An explicit raise dispatches to the still-live owner. Unlike
                         // return or loop control, it does not emit an owner unwind first.
-                        let guarded_raise_cleanup = self.context.target_specific_rules_enabled()
-                            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                                == 0
+                        let guarded_raise_cleanup = self.unit.flags
+                            & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == 0
                             && !return_is_overridden
                             && (preserve_tos
                                 || statement.value.as_deref().is_some_and(is_literal_constant))
@@ -9634,10 +9449,7 @@ impl Compiler<'_> {
                         // Two ordinary tries can surround a live iterator between the
                         // finalizers. The inner try still owns this copy; the iterator is
                         // discarded only after the copied body has completed.
-                        let retained_iterator_try_owns_copy = self
-                            .context
-                            .target_specific_rules_enabled()
-                            && statement.value.is_none()
+                        let retained_iterator_try_owns_copy = statement.value.is_none()
                             && !preserve_tos
                             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                                 == CO_ASYNC_GENERATOR
@@ -9678,11 +9490,10 @@ impl Compiler<'_> {
                             && !suite_contains_yield(&finally_context.body);
                         let retained_try_owns_copy = retained_iterator_try_owns_copy
                             || (tracks_try_between_finally_unwinds && context_index == 1)
-                            || (self.context.target_specific_rules_enabled()
-                                && (handler_count == 0
-                                    || (preserves_manager_handler_try_owner
-                                        && next_handler == 0
-                                        && context_index == 1))
+                            || ((handler_count == 0
+                                || (preserves_manager_handler_try_owner
+                                    && next_handler == 0
+                                    && context_index == 1))
                                 && finally_context.with_depth == outer_context.with_depth
                                 && (finally_context.loop_depth == outer_context.loop_depth
                                     || (outer_context.loop_depth < finally_context.loop_depth
@@ -9715,11 +9526,9 @@ impl Compiler<'_> {
                         // POP_EXCEPT and name clearing. Its existing body-cleanup region
                         // must keep ownership until those records execute; an outer-finally
                         // region over just this copy would incorrectly take precedence.
-                        let retained_named_handler_owns_copy = self
-                            .context
-                            .target_specific_rules_enabled()
-                            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                                == 0
+                        let retained_named_handler_owns_copy = self.unit.flags
+                            & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == 0
                             && (preserve_tos || guarded_raise_cleanup)
                             && !return_is_overridden
                             && context_index == 1
@@ -9784,8 +9593,7 @@ impl Compiler<'_> {
                             }
                         }
                     }
-                    if self.context.target_specific_rules_enabled()
-                        && preserve_tos
+                    if preserve_tos
                         && handler_count == 0
                         && return_finally_contexts.len() == 1
                         && self.control.withs.active_with_exits.is_empty()
@@ -9849,8 +9657,7 @@ impl Compiler<'_> {
                     // Preserve the original shared join before handler unwinding adds only
                     // artificial cleanup instructions and range-end aliases. These saved
                     // lexical depths identify the pending owner seams, including outer tries.
-                    if self.context.target_specific_rules_enabled()
-                        && preserve_tos
+                    if preserve_tos
                         && !return_is_overridden
                         && context_index == 0
                         && return_finally_contexts.len() == 1
@@ -9926,15 +9733,9 @@ impl Compiler<'_> {
                         self.assembler.mark(end);
                         end
                     });
-                let mut deferred_outer_iterator_depth = self
-                    .context
-                    .target_specific_rules_enabled()
-                    .then(|| {
-                        self.control.withs.active_with_exits[..next_with]
-                            .last()
-                            .copied()
-                    })
-                    .flatten()
+                let mut deferred_outer_iterator_depth = self.control.withs.active_with_exits
+                    [..next_with]
+                    .last()
                     .map_or(0, |inner| inner.loop_depth.min(protected_iterator_start));
                 self.emit_return_loop_iterator_cleanup(
                     deferred_outer_iterator_depth,
@@ -10010,10 +9811,7 @@ impl Compiler<'_> {
                         // A named handler has already restored its exception state. After
                         // the inner async exit, retire the try inside the retry iterator
                         // before discarding that iterator; its outer manager remains active.
-                        let named_handler_between_async_managers = self
-                            .context
-                            .target_specific_rules_enabled()
-                            && !preserve_tos
+                        let named_handler_between_async_managers = !preserve_tos
                             && !return_is_overridden
                             && matches!(statement.value.as_deref(), Some(Expr::NoneLiteral(_)))
                             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
@@ -10522,8 +10320,7 @@ impl Compiler<'_> {
                     let end = self.assembler.label();
                     let exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
                     self.assembler.mark_folded_condition_exit(exit);
-                    if self.context.target_specific_rules_enabled()
-                        && let Some(Stmt::If(nested)) = statement.body.last()
+                    if let Some(Stmt::If(nested)) = statement.body.last()
                         && nested.elif_else_clauses.last().is_some_and(|clause| {
                             clause.test.is_none()
                                 && suite_has_linear_borrow_fallthrough(&clause.body)
@@ -10595,31 +10392,31 @@ impl Compiler<'_> {
         let base_depth = self.control.stack.depth;
         // A final multi-branch chain leaves each surviving branch jump outside the handler's
         // protected range. Try-else and nested control-flow regions keep a different owner.
-        let direct_try_chain_exit = self.context.target_specific_rules_enabled()
-            && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
-            && self.control.loops.contexts.is_empty()
-            && self.control.withs.active_with_region_exclusions.is_empty()
-            && self
-                .control
-                .exceptions
-                .active_exception_region_exclusions
-                .len()
-                == 1
-            && self.control.finally.active_finally_try_bodies == 0
-            && !self.control.in_exception_handler()
-            && !self.control.exceptions.direct_try_body_has_else
-            && !self.control.statements.current_statement_has_following
-            && self
-                .control
-                .exceptions
-                .direct_try_body_statements
-                .last()
-                .is_some_and(|direct| *direct == statement.range)
-            && statement.elif_else_clauses.len() >= 2
-            && statement
-                .elif_else_clauses
-                .last()
-                .is_some_and(|clause| clause.test.is_none());
+        let direct_try_chain_exit =
+            self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
+                && self.control.loops.contexts.is_empty()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .len()
+                    == 1
+                && self.control.finally.active_finally_try_bodies == 0
+                && !self.control.in_exception_handler()
+                && !self.control.exceptions.direct_try_body_has_else
+                && !self.control.statements.current_statement_has_following
+                && self
+                    .control
+                    .exceptions
+                    .direct_try_body_statements
+                    .last()
+                    .is_some_and(|direct| *direct == statement.range)
+                && statement.elif_else_clauses.len() >= 2
+                && statement
+                    .elif_else_clauses
+                    .last()
+                    .is_some_and(|clause| clause.test.is_none());
         let direct_try_body_exit = direct_try_if_exit
             || self.control.exceptions.direct_try_assignment_branch_exit == Some(statement.range)
             || direct_try_chain_exit;
@@ -10699,14 +10496,12 @@ impl Compiler<'_> {
                                         context.body_start_item,
                                     )
                                 }))
-                                || (self.context.target_specific_rules_enabled()
-                                    && matches!(
-                                        self.unit.scope,
-                                        Scope::Function { .. } | Scope::Module
-                                    )
-                                    && self.unit.flags
-                                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                                        == 0
+                                || (matches!(
+                                    self.unit.scope,
+                                    Scope::Function { .. } | Scope::Module
+                                ) && self.unit.flags
+                                    & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                    == 0
                                     && self
                                         .control
                                         .exceptions
@@ -10746,7 +10541,6 @@ impl Compiler<'_> {
                             == Some(statement.range))
                     && self.control.in_iterator_loop()
                     && direct_sync_with_iterator
-                    && self.context.target_specific_rules_enabled()
                     && matches!(self.unit.scope, Scope::Function { .. } | Scope::Module)
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     && self.control.exceptions.active_exception_handlers.is_empty()
@@ -10766,7 +10560,6 @@ impl Compiler<'_> {
                                 .contains_terminal_with_barrier_since_item(context.body_start_item)
                     });
                 let preserve_first_sync_iterator_condition_owner = branch_index == 0
-                    && self.context.target_specific_rules_enabled()
                     && self.control.loops.contexts.len() == 1
                     && self.control.loops.contexts.last().is_some_and(|context| {
                         context.iterator_cleanup != IteratorCleanup::None
@@ -10817,7 +10610,6 @@ impl Compiler<'_> {
                         .preserve_coroutine_try_else_condition
                         == Some(test.range());
                 let preserve_first_async_generator_iterator_condition_owner = branch_index == 0
-                    && self.context.target_specific_rules_enabled()
                     && self.unit.flags & CO_ASYNC_GENERATOR != 0
                     && self.control.generators.generator_region_start.is_some()
                     && self.control.statements.current_statement_has_following
@@ -10835,7 +10627,6 @@ impl Compiler<'_> {
                     && !expression_suspends_current_scope(test)
                     && !expression_contains_generator(test);
                 let preserve_generator_iterator_branch_condition_owner = branch_index == 0
-                    && self.context.target_specific_rules_enabled()
                     && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
                     && self.control.generators.generator_region_start.is_some()
                     && self.control.in_iterator_loop()
@@ -10878,7 +10669,6 @@ impl Compiler<'_> {
                         .last()
                         .is_some_and(|context| !context.is_async);
                 let preserve_shifted_sync_with_none_owner = branch_index == 0
-                    && self.context.target_specific_rules_enabled()
                     && self.control.in_synchronous_with()
                     && matches!(test, Expr::Compare(comparison)
                         if comparison.ops.len() == 1
@@ -10975,11 +10765,6 @@ impl Compiler<'_> {
                                         LOAD_FAST_AND_CLEAR,
                                         context.body_start_item,
                                     )
-                                } else if !self.context.target_specific_rules_enabled() {
-                                    !self.assembler.contains_opcode_since_item(
-                                        LOAD_FAST_AND_CLEAR,
-                                        context.body_start_item,
-                                    ) && !self.assembler.contains_opcode(NOT_TAKEN)
                                 } else {
                                     !self
                                         .assembler
@@ -11094,7 +10879,6 @@ impl Compiler<'_> {
                         )
                         .is_ok();
                 let exclude_sync_with_condition_after_return = branch_index == 0
-                    && self.context.target_specific_rules_enabled()
                     && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
                     && self.control.loops.contexts.is_empty()
                     && self.control.in_synchronous_with()
@@ -11164,7 +10948,6 @@ impl Compiler<'_> {
                             && matches!(boolean.values.as_slice(),
                                 [Expr::Named(_), Expr::Named(_)]));
                 let exclude_direct_post_try_coroutine_return_condition = branch_index == 0
-                    && self.context.target_specific_rules_enabled()
                     && self
                         .control
                         .statements
@@ -11195,7 +10978,6 @@ impl Compiler<'_> {
                 // CPython appends the first simple condition marker after the protected body
                 // of a generator or coroutine while-loop try has been labeled.
                 let exclude_generator_while_try_condition = branch_index == 0
-                    && self.context.target_specific_rules_enabled()
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
                     && self.control.generators.generator_region_start.is_some()
                     && !self
@@ -11299,8 +11081,7 @@ impl Compiler<'_> {
                                         .assembler
                                         .contains_opcode_since(SEND, context.body_start))
                         }))
-                        || (self.context.target_specific_rules_enabled()
-                            && self.unit.flags
+                        || (self.unit.flags
                                 & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                                 != 0
                             && self.control.loops.contexts.len() == 1
@@ -11336,8 +11117,7 @@ impl Compiler<'_> {
                                             .exceptions.active_exception_region_exclusions
                                             .len()
                             }))
-                        || (self.context.target_specific_rules_enabled()
-                            && self.control.loops.contexts.len() == 1
+                        || (self.control.loops.contexts.len() == 1
                             && matches!(test, Expr::BoolOp(boolean)
                                 if boolean.values.first().is_some_and(|first| {
                                     !expression_contains_inline_branch(first)
@@ -11499,7 +11279,6 @@ impl Compiler<'_> {
                                         && matches!(comparison.comparators[0], Expr::NoneLiteral(_))))));
                 let exclude_handler_condition_after_return = branch_index == 0
                     && self.control.in_exception_handler()
-                    && self.context.target_specific_rules_enabled()
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     && self
                         .control
@@ -12282,15 +12061,14 @@ impl Compiler<'_> {
                 .expect("retained try-body if exit requires an active try")
                 .push((exit_start, exit_end));
         }
-        if self.context.target_specific_rules_enabled()
-            && self
-                .control
-                .exceptions
-                .active_exception_handlers
-                .last()
-                .is_some_and(|handler| {
-                    handler.name.is_none() && handler.trailing_statement == Some(statement.range)
-                })
+        if self
+            .control
+            .exceptions
+            .active_exception_handlers
+            .last()
+            .is_some_and(|handler| {
+                handler.name.is_none() && handler.trailing_statement == Some(statement.range)
+            })
         {
             // The final comprehension falls through to the handler's source-less cleanup.
             // Preserve its result-store donor before static SWAP elimination moves it.
@@ -12664,8 +12442,7 @@ impl Compiler<'_> {
 
     /// Limits cleanup-guard donation to an empty original exit outside outer cleanup.
     fn can_locate_guarded_cleanup_exit(&self) -> bool {
-        self.context.target_specific_rules_enabled()
-            && matches!(self.unit.scope, Scope::Function { .. })
+        matches!(self.unit.scope, Scope::Function { .. })
             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
             && self.control.loops.contexts.is_empty()
             && self.control.withs.active_with_exits.is_empty()
@@ -12905,11 +12682,9 @@ impl Compiler<'_> {
         // Each ordinary try and the single finalizer contribute one original record.
         // An exited manager, handler, or pending exit would interleave other cleanup.
         // Continue stops at its loop, leaving outer finalizers and regions active.
-        if !self.context.target_specific_rules_enabled()
-            || !(self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                == CO_COROUTINE
-                || (!retained_manager_break
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0))
+        if !(self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            || (!retained_manager_break
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0))
             || !matches!(
                 context.iterator_cleanup,
                 IteratorCleanup::None | IteratorCleanup::Sync
@@ -13132,12 +12907,10 @@ impl Compiler<'_> {
                     self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
                     self.assembler.mark_last_as_converted_pop_block();
                 }
-                if self.context.target_specific_rules_enabled()
-                    && matches!(
-                        self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
-                        CO_GENERATOR | CO_ASYNC_GENERATOR
-                    )
-                    && continue_target.is_none()
+                if matches!(
+                    self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
+                    CO_GENERATOR | CO_ASYNC_GENERATOR
+                ) && continue_target.is_none()
                     && copied_break_item.is_none()
                     && copied_continue_item.is_none()
                     && finally_contexts.len() == 1
@@ -13242,8 +13015,7 @@ impl Compiler<'_> {
                 }
                 // The enclosing ordinary try still owns a copied linear finalizer.
                 // A while break pops that try only after the cleanup call completes.
-                let retained_try_break_exit = (self.context.target_specific_rules_enabled()
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                let retained_try_break_exit = (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     && continue_target.is_none()
                     && copied_break_item.is_none()
                     && copied_continue_item.is_none()
@@ -13295,32 +13067,33 @@ impl Compiler<'_> {
                 });
                 // Only the last copied finalizer can jump directly to the pending continue.
                 // Its remaining handler, manager, and preserved-value cleanup must be empty.
-                let continue_tail = continue_target.filter(|_| {
-                    index == 0
-                        && self
-                            .control
-                            .loops
-                            .contexts
-                            .last()
-                            .is_some_and(|loop_context| {
-                                self.control.finally.active_finally_end_blocks
+                let continue_tail =
+                    continue_target.filter(|_| {
+                        index == 0
+                            && self
+                                .control
+                                .loops
+                                .contexts
+                                .last()
+                                .is_some_and(|loop_context| {
+                                    self.control.finally.active_finally_end_blocks
                                     == loop_context.finally_end_depth
                                     // A still-pending outer POP_BLOCK becomes a NOP until
                                     // after jump threading, so it blocks this inversion.
                                     && context.exception_region_depth
                                         == loop_context.exception_region_depth
-                            })
-                        && self.control.exceptions.active_exception_handlers.len() == first_handler
-                        && next_with == with_depth
-                        && self
-                            .control
-                            .finally
-                            .preserved_return_value_contexts
-                            .is_empty()
-                        && self.control.finally.copied_return_finally_preserved_values == 0
-                        && (copied_finally_tail_can_inline_continue(&context.body)
-                            || (self.context.target_specific_rules_enabled()
-                                && self.control.loops.contexts.last().is_some_and(
+                                })
+                            && self.control.exceptions.active_exception_handlers.len()
+                                == first_handler
+                            && next_with == with_depth
+                            && self
+                                .control
+                                .finally
+                                .preserved_return_value_contexts
+                                .is_empty()
+                            && self.control.finally.copied_return_finally_preserved_values == 0
+                            && (copied_finally_tail_can_inline_continue(&context.body)
+                                || (self.control.loops.contexts.last().is_some_and(
                                     |loop_context| {
                                         copied_finally_has_closed_none_continue(
                                             &context.body,
@@ -13329,39 +13102,37 @@ impl Compiler<'_> {
                                         )
                                     },
                                 ))
-                            || (self.context.target_specific_rules_enabled()
-                                && self.unit.flags
+                                || (self.unit.flags
                                     & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                                     == CO_COROUTINE
-                                && self.control.loops.contexts.last().is_some_and(
-                                    |loop_context| {
-                                        loop_context.iterator_cleanup == IteratorCleanup::Sync
-                                    },
-                                )
-                                && copied_finally_has_guarded_linear_cleanup(
-                                    &context.body,
-                                    captured_none_prefix
-                                        && self.copied_finally_starts_local_none_cleanup(
-                                            &context.body,
-                                        ),
-                                ))
-                            || (self.context.target_specific_rules_enabled()
-                                && self.unit.flags
+                                    && self.control.loops.contexts.last().is_some_and(
+                                        |loop_context| {
+                                            loop_context.iterator_cleanup == IteratorCleanup::Sync
+                                        },
+                                    )
+                                    && copied_finally_has_guarded_linear_cleanup(
+                                        &context.body,
+                                        captured_none_prefix
+                                            && self.copied_finally_starts_local_none_cleanup(
+                                                &context.body,
+                                            ),
+                                    ))
+                                || (self.unit.flags
                                     & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                                     == 0
-                                && self.control.loops.contexts.last().is_some_and(
-                                    |loop_context| {
-                                        matches!(
-                                            loop_context.iterator_cleanup,
-                                            IteratorCleanup::None | IteratorCleanup::Sync
-                                        )
-                                    },
-                                )
-                                && copied_finally_has_guarded_pass_cleanup(&context.body)))
-                        && matches!(context.body.last(), Some(Stmt::If(tail))
+                                    && self.control.loops.contexts.last().is_some_and(
+                                        |loop_context| {
+                                            matches!(
+                                                loop_context.iterator_cleanup,
+                                                IteratorCleanup::None | IteratorCleanup::Sync
+                                            )
+                                        },
+                                    )
+                                    && copied_finally_has_guarded_pass_cleanup(&context.body)))
+                            && matches!(context.body.last(), Some(Stmt::If(tail))
                             if tail.elif_else_clauses.is_empty()
                                 && !suite_contains_loop_break(&tail.body))
-                });
+                    });
                 // A loop-exit copy has left every protected finalizer inside it,
                 // including terminal finalizers without a registered exit context.
                 let outer_overriding_returns = context
@@ -13370,9 +13141,9 @@ impl Compiler<'_> {
                 // This terminal break has no cleanup after its last copied finalizer.
                 // Its ordinary pass handler can copy the same implicit None tail as
                 // a direct return; the enclosing protected-body barrier is stale here.
-                let inline_terminal_break_cleanup = self.context.target_specific_rules_enabled()
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                        == CO_COROUTINE
+                let inline_terminal_break_cleanup = self.unit.flags
+                    & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    == CO_COROUTINE
                     && continue_target.is_none()
                     && index == 0
                     && context.loop_depth == loop_depth
@@ -13681,8 +13452,7 @@ impl Compiler<'_> {
             .exceptions
             .active_exception_region_exclusions
             .len();
-        self.context.target_specific_rules_enabled()
-            && matches!(self.unit.scope, Scope::Function { .. })
+        matches!(self.unit.scope, Scope::Function { .. })
             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
             && self.control.exceptions.normal_try_loop_tail_owner
                 == Some((restart, exception_depth))
@@ -14362,7 +14132,6 @@ impl Compiler<'_> {
                 let body = statement.body.as_slice();
                 let body_label = self.assembler.label();
                 let preserve_first_yielding_iterator_boolean_owner = leading.is_empty()
-                    && self.context.target_specific_rules_enabled()
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
                     && self
                         .control
@@ -14637,7 +14406,6 @@ impl Compiler<'_> {
                     && !try_body_normal_exit
                     && !non_final_branch
                     && !self.control.withs.active_with_region_exclusions.is_empty()
-                    && self.context.target_specific_rules_enabled()
                     && self.control.loops.contexts.len() == 1
                     && self.control.loops.contexts.last().is_some_and(|context| {
                         context.iterator_cleanup == IteratorCleanup::Sync
@@ -14669,7 +14437,6 @@ impl Compiler<'_> {
                     && leading.is_empty()
                     && !try_body_normal_exit
                     && !non_final_branch
-                    && self.context.target_specific_rules_enabled()
                     && matches!(test, Expr::Name(_) | Expr::Attribute(_) | Expr::Call(_))
                     && !expression_contains_generator(test)
                     && self.control.loops.contexts.last().is_some_and(|context| {
@@ -14697,7 +14464,6 @@ impl Compiler<'_> {
                     && has_else
                     && !try_body_normal_exit
                     && !non_final_branch
-                    && self.context.target_specific_rules_enabled()
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
                     && self.control.generators.generator_region_start.is_some()
                     && matches!(test, Expr::Name(_) | Expr::Attribute(_) | Expr::Call(_))
@@ -14743,7 +14509,6 @@ impl Compiler<'_> {
                     && leading.is_empty()
                     && !try_body_normal_exit
                     && !non_final_branch
-                    && self.context.target_specific_rules_enabled()
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
                     && self
                         .control
@@ -15731,9 +15496,8 @@ impl Compiler<'_> {
                 // A conditional arm can finish at this loop while its generator body
                 // still has a source successor before nested finally cleanup. The exact
                 // same-region range excludes a continuation across another cleanup.
-                if self.context.target_specific_rules_enabled()
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                        == CO_GENERATOR
+                if self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    == CO_GENERATOR
                     && !self.control.statements.current_statement_has_following
                     && self.control.statements.same_region_continuation == Some(statement.range)
                     && self.control.loops.contexts.is_empty()
@@ -15920,7 +15684,6 @@ impl Compiler<'_> {
             !self.control.withs.active_with_region_exclusions.is_empty()
                 && statement.body.len() <= 8
                 && is_specialized_none_condition(&statement.test)
-                && self.context.target_specific_rules_enabled()
                 && matches!(self.unit.scope, Scope::Function { .. })
                 && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                 && self
@@ -15965,7 +15728,6 @@ impl Compiler<'_> {
             original_condition = &unary.operand;
         }
         let retain_dynamic_while_condition_owner = exclude_not_taken
-            && self.context.target_specific_rules_enabled()
             && !condition_fallthrough_to_loop_backedge
             && (matches!(
                 original_condition,
@@ -15992,7 +15754,6 @@ impl Compiler<'_> {
         // specialization removes a protected record, so its marker reuses the
         // condition's owner even when an outer finally already covers the marker.
         let override_initial_comparison_owner = exclude_not_taken
-            && self.context.target_specific_rules_enabled()
             && !condition_fallthrough_to_loop_backedge
             && matches!(
                 original_condition,
@@ -16021,7 +15782,6 @@ impl Compiler<'_> {
                         let allow_compacted_owner =
                             compiler.control.conditions.allow_compacted_condition_owner
                                 || (matches!(original_condition, Expr::BoolOp(_))
-                                    && compiler.context.target_specific_rules_enabled()
                                     && !condition_fallthrough_to_loop_backedge
                                     && !expression_suspends_current_scope(&statement.test));
                         compiler.with_control_override(
@@ -16172,7 +15932,7 @@ impl Compiler<'_> {
             }
         }
         self.compile_suite(&statement.orelse)?;
-        if statement.orelse.is_empty() && self.context.target_specific_rules_enabled() {
+        if statement.orelse.is_empty() {
             self.assembler
                 .record_empty_while_break_anchor(else_label, end);
         }
@@ -16243,29 +16003,28 @@ impl Compiler<'_> {
         context.has_orelse = !statement.orelse.is_empty();
         let body_start = self.assembler.instruction_count();
         let first_iterator_loop_assertion = first_iterator_loop_assertion(&statement.body);
-        let first_iterator_assignment_condition = (self.context.target_specific_rules_enabled()
-            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
-            && self.control.loops.contexts.is_empty())
-        .then(|| {
-            first_iterator_assignment_condition(
-                &statement.body,
-                self.control.statements.current_statement_has_following
-                    || self.control.statements.inherited_statement_has_following,
-            )
-        })
-        .flatten()
-        .or_else(|| {
-            (self.context.target_specific_rules_enabled()
-                && self.unit.flags & CO_COROUTINE != 0
-                && self
-                    .control
-                    .exceptions
-                    .active_exception_region_exclusions
-                    .is_empty()
-                && self.control.withs.active_with_region_exclusions.is_empty())
-            .then(|| first_coroutine_iterator_assignment_condition(&statement.body))
+        let first_iterator_assignment_condition =
+            (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+                && self.control.loops.contexts.is_empty())
+            .then(|| {
+                first_iterator_assignment_condition(
+                    &statement.body,
+                    self.control.statements.current_statement_has_following
+                        || self.control.statements.inherited_statement_has_following,
+                )
+            })
             .flatten()
-        });
+            .or_else(|| {
+                (self.unit.flags & CO_COROUTINE != 0
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty()
+                    && self.control.withs.active_with_region_exclusions.is_empty())
+                .then(|| first_coroutine_iterator_assignment_condition(&statement.body))
+                .flatten()
+            });
         let tail_jumps = self.with_loop_context(context, |compiler| {
             compiler.with_control_override(
                 |control| &mut control.loops.first_iterator_assignment_condition,
@@ -16326,9 +16085,7 @@ impl Compiler<'_> {
                 self.assembler.mark_as_artificial_eval_break(backedge);
             }
             self.assembler.record_last_original_loop_backedge();
-        } else if self.context.target_specific_rules_enabled()
-            && tail_jumps != LoopBackedge::EmittedWithOriginalFallthrough
-        {
+        } else if tail_jumps != LoopBackedge::EmittedWithOriginalFallthrough {
             self.assembler.record_omitted_for_backedge(cleanup);
         }
 
@@ -16437,12 +16194,11 @@ impl Compiler<'_> {
         self.emit(CLEANUP_THROW, 0, -1)?;
         let cleanup_throw_end = self.assembler.label();
         self.assembler.mark(cleanup_throw_end);
-        let preserve_outer_exception_owner = self.context.target_specific_rules_enabled()
-            && !self
-                .control
-                .exceptions
-                .active_exception_region_exclusions
-                .is_empty();
+        let preserve_outer_exception_owner = !self
+            .control
+            .exceptions
+            .active_exception_region_exclusions
+            .is_empty();
         if !preserve_outer_exception_owner {
             self.control
                 .generators
@@ -16754,7 +16510,7 @@ impl Compiler<'_> {
                     .set_location(self.source_location(assignment.range));
                 let cell = self.closure_index("__conditional_annotations__")?;
                 self.emit(LOAD_DEREF, cell, 1)?;
-                self.emit_annotation_index(index)?;
+                self.emit_unsigned_constant(index)?;
                 self.emit(SET_ADD, 1, -1)?;
                 self.emit(POP_TOP, 0, -1)?;
             }
@@ -16800,7 +16556,7 @@ impl Compiler<'_> {
                 self.assembler
                     .set_location(self.source_location(assignment.range));
                 self.load_name("__conditional_annotations__")?;
-                self.emit_annotation_index(index)?;
+                self.emit_unsigned_constant(index)?;
                 self.emit(SET_ADD, 1, -1)?;
                 self.emit(POP_TOP, 0, -1)?;
             }
@@ -16996,7 +16752,6 @@ impl Compiler<'_> {
             _ => None,
         };
         let preserve_coroutine_folded_subscript_owner = self.unit.flags & CO_COROUTINE != 0
-            && self.context.target_specific_rules_enabled()
             && self.control.generators.coroutine_suspension_epoch > 0
             && self.control.generators.generator_region_start.is_some()
             && self
@@ -17044,7 +16799,6 @@ impl Compiler<'_> {
             _ => None,
         };
         let exclude_post_suspension_coroutine_assertion_owner = self.unit.flags & CO_COROUTINE != 0
-            && self.context.target_specific_rules_enabled()
             && self.control.generators.coroutine_suspension_epoch > 0
             && self.control.withs.active_with_region_exclusions.is_empty()
             && (self.control.statements.in_terminal_if_branch_suite
@@ -17562,8 +17316,7 @@ impl Compiler<'_> {
         // A runtime while in a bare-name cleanup joins its false edge with
         // authored breaks. Copying that cleanup leaves its original cold exit
         // empty; relocating the handler must not reconnect normal borrowing.
-        let handler_has_runtime_while_break_cleanup = self.context.target_specific_rules_enabled()
-            && !statement.is_star
+        let handler_has_runtime_while_break_cleanup = !statement.is_star
             && !terminal
             && loop_tail.is_none()
             && statement.orelse.is_empty()
@@ -17814,15 +17567,6 @@ impl Compiler<'_> {
             .exceptions
             .active_tuple_handler_try_bodies
             .push(has_tuple_handler);
-        let previous_call_assignment_preceded_try_body = std::mem::replace(
-            &mut self
-                .control
-                .exceptions
-                .active_call_assignment_preceded_try_body,
-            self.control
-                .statements
-                .current_statement_preceded_by_call_assignments,
-        );
         self.control
             .exceptions
             .active_pass_only_try_bodies
@@ -18351,9 +18095,6 @@ impl Compiler<'_> {
             .active_tuple_handler_try_bodies
             .pop()
             .expect("active try region has tuple-handler context");
-        self.control
-            .exceptions
-            .active_call_assignment_preceded_try_body = previous_call_assignment_preceded_try_body;
         let mut try_exclusions = self
             .control
             .exceptions
@@ -18401,8 +18142,7 @@ impl Compiler<'_> {
         }
         let orelse_start_item = self.assembler.item_count();
         let orelse_instruction_count = self.assembler.instruction_count();
-        let preserve_coroutine_try_else_condition = (self.context.target_specific_rules_enabled()
-            && self.unit.flags & CO_COROUTINE != 0
+        let preserve_coroutine_try_else_condition = (self.unit.flags & CO_COROUTINE != 0
             && (try_body_suspended || deferred_try_pop_block)
             && self.control.generators.generator_region_start.is_some()
             && !statement.is_star
@@ -18622,9 +18362,9 @@ impl Compiler<'_> {
             // The discarded yield still falls through when CPython resolves lines,
             // before the False test is folded. Its two original predecessors keep
             // the empty normal-exit array unlocated, leaving the protected test NOP.
-            let unlocated_false_yield_exit = self.context.target_specific_rules_enabled()
-                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                    == CO_ASYNC_GENERATOR
+            let unlocated_false_yield_exit = self.unit.flags
+                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                == CO_ASYNC_GENERATOR
                 && self.control.loops.contexts.is_empty()
                 && self.control.withs.active_with_exits.is_empty()
                 && self.control.withs.active_with_region_exclusions.is_empty()
@@ -19086,8 +18826,7 @@ impl Compiler<'_> {
             // A final class failure falls through to its own original try exit.
             // Successful cases thread past it to the manager cleanup. The failure
             // POP_TOP's location cannot absorb this separate protected jump slot.
-            let retained_manager_match_failure = self.context.target_specific_rules_enabled()
-                && !statement.is_star
+            let retained_manager_match_failure = !statement.is_star
                 && statement.orelse.is_empty()
                 && statement.finalbody.is_empty()
                 && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
@@ -19650,7 +19389,6 @@ impl Compiler<'_> {
                 || copied_finally_leaves_handler_orphan
                 || has_bare_handler
                 || (!statement.is_star
-                    && self.context.target_specific_rules_enabled()
                     && !self
                         .control
                         .statements
@@ -20322,10 +20060,7 @@ impl Compiler<'_> {
                 )?;
                 // An eagerly folded expression branch can erase an original array entry.
                 // Record only authored linear dispatches; compaction is proved by the passes.
-                if handler_index > 0
-                    && self.context.target_specific_rules_enabled()
-                    && !expression_contains_inline_branch(exception_type)
-                {
+                if handler_index > 0 && !expression_contains_inline_branch(exception_type) {
                     self.assembler.record_handler_dispatch_array(
                         exception_type_start,
                         common_cleanup,
@@ -20504,8 +20239,7 @@ impl Compiler<'_> {
                     // The handler has restored its exception state. A while break
                     // now leaves only the ordinary tries entered inside that loop,
                     // just as the direct continue path above does after POP_EXCEPT.
-                    let exclusion_start = (self.context.target_specific_rules_enabled()
-                        && context.iterator_cleanup == IteratorCleanup::None
+                    let exclusion_start = (context.iterator_cleanup == IteratorCleanup::None
                         && context.exception_region_depth
                             < self
                                 .control
@@ -20684,55 +20418,53 @@ impl Compiler<'_> {
                 // An unnamed return nested directly inside two named handlers exposes
                 // the nearer handler's name cleanup. Saved depths exclude another scope
                 // between these collectors; only the innermost POP_EXCEPT needs ownership.
-                let returns_through_two_named_handlers = self
-                    .context
-                    .target_specific_rules_enabled()
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-                    && handler_name.is_none()
-                    && matches!(handler.body.as_slice(), [Stmt::Return(statement)]
+                let returns_through_two_named_handlers =
+                    self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                        && handler_name.is_none()
+                        && matches!(handler.body.as_slice(), [Stmt::Return(statement)]
                             if matches!(statement.value.as_deref(), Some(Expr::Tuple(_))))
-                    && self.control.exceptions.active_exception_group_handlers == 0
-                    && self.control.exceptions.active_try_marker_slots.is_empty()
-                    && self.control.withs.active_with_exits.is_empty()
-                    && self.control.loops.contexts.is_empty()
-                    && self
-                        .control
-                        .finally
-                        .active_return_finally_contexts
-                        .is_empty()
-                    && self.control.finally.active_loop_finally_contexts.is_empty()
-                    && self
-                        .control
-                        .finally
-                        .active_pass_finally_locations
-                        .is_empty()
-                    && self
-                        .control
-                        .finally
-                        .preserved_return_value_contexts
-                        .is_empty()
-                    && self.control.finally.copied_return_finally_preserved_values == 0
-                    && self.control.finally.active_finally_try_bodies == 0
-                    && self.control.finally.active_normal_finally_bodies == 0
-                    && self.control.finally.active_copied_finally_bodies == 0
-                    && self.control.finally.active_finally_end_blocks == 0
-                    && self.control.finally.active_overriding_finally_returns == 0
-                    && matches!(
-                        self.control.exceptions.active_exception_handlers.as_slice(),
-                        [outer, middle]
-                            if outer.name.is_some()
-                                && middle.name.is_some()
-                                && outer.try_body_depth == 0
-                                && middle.try_body_depth == 0
-                                && outer.exception_region_depth == 0
-                                && middle.exception_region_depth == 1
-                                && outer.with_depth == 0
-                                && middle.with_depth == 0
-                                && outer.loop_depth == 0
-                                && middle.loop_depth == 0
-                                && outer.finally_end_depth == 0
-                                && middle.finally_end_depth == 0
-                    );
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && self.control.exceptions.active_try_marker_slots.is_empty()
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.loops.contexts.is_empty()
+                        && self
+                            .control
+                            .finally
+                            .active_return_finally_contexts
+                            .is_empty()
+                        && self.control.finally.active_loop_finally_contexts.is_empty()
+                        && self
+                            .control
+                            .finally
+                            .active_pass_finally_locations
+                            .is_empty()
+                        && self
+                            .control
+                            .finally
+                            .preserved_return_value_contexts
+                            .is_empty()
+                        && self.control.finally.copied_return_finally_preserved_values == 0
+                        && self.control.finally.active_finally_try_bodies == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_overriding_finally_returns == 0
+                        && matches!(
+                            self.control.exceptions.active_exception_handlers.as_slice(),
+                            [outer, middle]
+                                if outer.name.is_some()
+                                    && middle.name.is_some()
+                                    && outer.try_body_depth == 0
+                                    && middle.try_body_depth == 0
+                                    && outer.exception_region_depth == 0
+                                    && middle.exception_region_depth == 1
+                                    && outer.with_depth == 0
+                                    && middle.with_depth == 0
+                                    && outer.loop_depth == 0
+                                    && middle.loop_depth == 0
+                                    && outer.finally_end_depth == 0
+                                    && middle.finally_end_depth == 0
+                        );
                 let context = ExceptionHandlerContext {
                     name: handler_name,
                     first: handler_index == 0,
@@ -20878,8 +20610,7 @@ impl Compiler<'_> {
                     && suite_has_normal_fallthrough(&handler.body)
                     && matches!(handler.body.last(), Some(Stmt::If(tail))
                         if (tail.elif_else_clauses.last().is_some_and(|clause| clause.test.is_some())
-                            || (self.context.target_specific_rules_enabled()
-                                && tail.elif_else_clauses.is_empty()
+                            || (tail.elif_else_clauses.is_empty()
                                 && !terminal
                                 && loop_tail.is_none()
                                 && self.control.finally.active_copied_finally_bodies == 0))
@@ -20908,22 +20639,20 @@ impl Compiler<'_> {
             // Generic loop lowering keeps the same original conditional join as
             // the specialized loop-tail path. Its cleanup must remain unlocated
             // until each normal predecessor receives its own copy.
-            let handler_has_original_conditional_loop_join =
-                self.context.target_specific_rules_enabled()
-                    && handler.name.is_none()
-                    && !terminal
-                    && loop_tail.is_none()
-                    && !cleanup_has_small_return_successor
-                    && self.control.in_loop()
-                    && self.control.finally.active_normal_finally_bodies == 0
-                    && self.control.finally.active_finally_end_blocks == 0
-                    && self.control.finally.active_copied_finally_bodies == 0
-                    && matches!(handler.body.last(), Some(Stmt::If(tail))
+            let handler_has_original_conditional_loop_join = handler.name.is_none()
+                && !terminal
+                && loop_tail.is_none()
+                && !cleanup_has_small_return_successor
+                && self.control.in_loop()
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && matches!(handler.body.last(), Some(Stmt::If(tail))
                     if tail.elif_else_clauses.is_empty()
                         && condition_has_only_runtime_tests(&tail.test)
                         && if_has_multiple_normal_exit_targets(tail)
                         && matches!(tail.body.as_slice(), [Stmt::Break(_) | Stmt::Assign(_)]))
-                    && self.assembler.at_original_shared_conditional_join();
+                && self.assembler.at_original_shared_conditional_join();
             let handler_ends_with_runtime_while_break_cleanup =
                 handler_has_runtime_while_break_cleanup
                     && handler.name.is_none()
@@ -20933,8 +20662,7 @@ impl Compiler<'_> {
             }
             // Earlier raising arms can leave a complete conditional in the final else.
             // Its original jump and fallthrough both enter the name-cleanup array.
-            let handler_has_nested_else_loop_cleanup = self.context.target_specific_rules_enabled()
-                && handler.name.is_some()
+            let handler_has_nested_else_loop_cleanup = handler.name.is_some()
                 && !terminal
                 && !cleanup_has_small_return_successor
                 && self.control.in_loop()
@@ -20952,8 +20680,7 @@ impl Compiler<'_> {
                 && self.assembler.at_original_shared_handler_join();
             // A guarded complete conditional in a finalizer has three original
             // predecessors to its named cleanup: both arms and the guard's false edge.
-            let handler_has_guarded_finally_cleanup = self.context.target_specific_rules_enabled()
-                && handler.name.is_some()
+            let handler_has_guarded_finally_cleanup = handler.name.is_some()
                 && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                 && self.control.in_loop()
                 && (self.control.finally.active_copied_finally_bodies > 0
@@ -20970,8 +20697,7 @@ impl Compiler<'_> {
                 || handler_ends_with_runtime_while_break_cleanup
                 // A named handler's five-record cleanup can be copied onto original
                 // break edges even when a loop's exhaustion arm also falls through.
-                || (self.context.target_specific_rules_enabled()
-                    && handler.name.is_some()
+                || (handler.name.is_some()
                     && !terminal
                     && !cleanup_has_small_return_successor
                     && self.assembler.at_original_authored_break_join())
@@ -20986,8 +20712,7 @@ impl Compiler<'_> {
                         if handler_cleanup_has_runtime_jump_exit(tail)
                             && (handler_cleanup_has_stable_fallthrough_location(tail)
                                 || self.assembler.at_comprehension_assignment_exit()
-                                || (self.context.target_specific_rules_enabled()
-                                    && !terminal
+                                || (!terminal
                                     && !cleanup_has_small_return_successor
                                     && loop_tail.is_none()
                                     && self.control.loops.contexts.is_empty()
@@ -21078,8 +20803,7 @@ impl Compiler<'_> {
                                         if ret.value.as_deref().is_some_and(is_literal_constant)))
                                 // A fallthrough exhaustion assignment does not locate the
                                 // artificial cleanup at the separate authored-break join.
-                                || (self.context.target_specific_rules_enabled()
-                                    && handler.name.is_none()
+                                || (handler.name.is_none()
                                     && !terminal
                                     && !cleanup_has_small_return_successor
                                     && matches!(tail.orelse.as_slice(), [Stmt::Assign(_)])
@@ -21190,8 +20914,7 @@ impl Compiler<'_> {
             // handler's artificial POP_BLOCK/POP_EXCEPT/jump cleanup. CPython copies that
             // wholly unlocated array before propagating locations, including joins after
             // nested finalizers and manager suppression. Existing cleanup routes stay intact.
-            let handler_cleanup_from_original_join = self.context.target_specific_rules_enabled()
-                && !handler_ends_with_inlineable_cleanup
+            let handler_cleanup_from_original_join = !handler_ends_with_inlineable_cleanup
                 && cold_with_cleanup_location.is_none()
                 // A terminating nested try can leave unreachable jumps into this join.
                 // The surviving sole condition edge locates POP_EXCEPT after folding.
@@ -21200,8 +20923,7 @@ impl Compiler<'_> {
                         .is_some_and(|test| jump_constant_truthiness(test).is_none())
                 })
                 && self.assembler.at_original_unconditional_join();
-            let handler_match_failure_location = (self.context.target_specific_rules_enabled()
-                && handler.name.is_some()
+            let handler_match_failure_location = (handler.name.is_some()
                 && matches!(handler.body.last(), Some(Stmt::Match(_))))
             .then(|| self.assembler.original_match_failure_location())
             .flatten();
@@ -21758,30 +21480,29 @@ impl Compiler<'_> {
                     self.assembler.mark(start);
                     start
                 });
-                let original_cleanup_slots =
-                    if self.context.target_specific_rules_enabled() && handler.name.is_none() {
-                        if cold_with_cleanup_location.is_some_and(|range| {
-                            self.assembler.location() == self.source_location(range)
-                        }) {
-                            // The located suppression-only cleanup still contains POP_BLOCK
-                            // when CPython appends its following short return.
-                            1
-                        } else if terminal
-                            && let Some(Stmt::Pass(pass)) = handler.body.last()
-                            && self.assembler.has_single_omitted_nop_before_label(
-                                body_end,
-                                self.source_location(pass.range),
-                            )
-                        {
-                            // The omitted Pass, POP_BLOCK, and replaced cleanup jump all
-                            // remain in the original array before small-exit copying.
-                            3
-                        } else {
-                            0
-                        }
+                let original_cleanup_slots = if handler.name.is_none() {
+                    if cold_with_cleanup_location.is_some_and(|range| {
+                        self.assembler.location() == self.source_location(range)
+                    }) {
+                        // The located suppression-only cleanup still contains POP_BLOCK
+                        // when CPython appends its following short return.
+                        1
+                    } else if terminal
+                        && let Some(Stmt::Pass(pass)) = handler.body.last()
+                        && self.assembler.has_single_omitted_nop_before_label(
+                            body_end,
+                            self.source_location(pass.range),
+                        )
+                    {
+                        // The omitted Pass, POP_BLOCK, and replaced cleanup jump all
+                        // remain in the original array before small-exit copying.
+                        3
                     } else {
                         0
-                    };
+                    }
+                } else {
+                    0
+                };
                 self.emit(POP_EXCEPT, 0, -1)?;
                 if original_cleanup_slots != 0 {
                     self.assembler
@@ -22547,28 +22268,27 @@ impl Compiler<'_> {
             // A final manager or ordinary try can leave two original normal exits
             // into the artificial named-handler cleanup. Copy it while unlocated,
             // even when clearing the name makes the exit larger than a small return.
-            let inline_join_cleanup = self.context.target_specific_rules_enabled()
-                && (matches!(body.last(), Some(Stmt::With(statement))
+            let inline_join_cleanup = (matches!(body.last(), Some(Stmt::With(statement))
                     if !statement.is_async && !suite_terminates(&statement.body))
-                    || matches!(body.last(), Some(Stmt::Try(nested))
-                    if !nested.is_star
-                        && nested.orelse.is_empty()
-                        && nested.finalbody.is_empty()
-                        && !suite_terminates(&nested.body)
-                        && matches!(nested.handlers.as_slice(), [handler]
-                            if handler.as_except_handler().is_some_and(|handler| {
-                                (handler.name.is_some()
-                                    || matches!(handler.body.as_slice(), [Stmt::Pass(_)]))
-                                    && !suite_terminates(&handler.body)
-                            }))))
+                || matches!(body.last(), Some(Stmt::Try(nested))
+                if !nested.is_star
+                    && nested.orelse.is_empty()
+                    && nested.finalbody.is_empty()
+                    && !suite_terminates(&nested.body)
+                    && matches!(nested.handlers.as_slice(), [handler]
+                        if handler.as_except_handler().is_some_and(|handler| {
+                            (handler.name.is_some()
+                                || matches!(handler.body.as_slice(), [Stmt::Pass(_)]))
+                                && !suite_terminates(&handler.body)
+                        }))))
                 && self.assembler.at_original_unconditional_join();
             // A complete nested conditional has an authored jump and fallthrough into
             // the same cleanup. Keep that original array unlocated for early copying.
-            let complete_conditional_cleanup = self.context.target_specific_rules_enabled()
-                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-                && matches!(body.last(), Some(Stmt::If(tail))
+            let complete_conditional_cleanup =
+                self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && matches!(body.last(), Some(Stmt::If(tail))
                     if handler_cleanup_has_complete_runtime_join(tail))
-                && self.assembler.at_original_shared_handler_join();
+                    && self.assembler.at_original_shared_handler_join();
             let inline_join_cleanup = inline_join_cleanup || complete_conditional_cleanup;
             // A nested runtime conditional's normal edges also reach one original
             // artificial cleanup. Assign each copied exit its own predecessor's location.
@@ -24027,32 +23747,32 @@ impl Compiler<'_> {
                     && !suite_contains_yield(&manager.body));
         // The false edge of a terminal handler break retains its populated name
         // cleanup. That original jump still reaches a nonempty guarded recovery.
-        let named_iterator_break_reaches_finally = self.context.target_specific_rules_enabled()
-            && matches!(self.unit.scope, Scope::Function { .. })
-            && synchronous_recovery
-            && matches!(self.control.loops.contexts.as_slice(), [context]
+        let named_iterator_break_reaches_finally =
+            matches!(self.unit.scope, Scope::Function { .. })
+                && synchronous_recovery
+                && matches!(self.control.loops.contexts.as_slice(), [context]
                 if context.iterator_cleanup == IteratorCleanup::Sync
                     && !context.has_orelse
                     && context.with_depth == 0
                     && context.finally_end_depth == 0
                     && context.exception_region_depth == 0)
-            && self.control.withs.active_with_exits.is_empty()
-            && self.control.withs.active_with_region_exclusions.is_empty()
-            && self
-                .control
-                .exceptions
-                .active_exception_region_exclusions
-                .is_empty()
-            && self.control.exceptions.active_try_marker_slots.is_empty()
-            && self.control.exceptions.active_exception_group_handlers == 0
-            && !self.control.in_exception_handler()
-            && self.control.finally.active_finally_try_bodies == 0
-            && self.control.finally.active_normal_finally_bodies == 0
-            && self.control.finally.active_finally_end_blocks == 0
-            && self.control.finally.active_copied_finally_bodies == 0
-            && self.control.finally.active_overriding_finally_returns == 0
-            && named_handler_break_has_guarded_linear_cleanup(statement)
-            && matches!(statement.finalbody.as_slice(), [Stmt::If(cleanup)]
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self.control.exceptions.active_try_marker_slots.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && !self.control.in_exception_handler()
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_overriding_finally_returns == 0
+                && named_handler_break_has_guarded_linear_cleanup(statement)
+                && matches!(statement.finalbody.as_slice(), [Stmt::If(cleanup)]
                 if self.suite_has_nonempty_borrow_entry(&cleanup.body));
         let conditional_handler_reaches_finally = !statement.is_star
             && (statement.orelse.is_empty()
@@ -25446,9 +25166,9 @@ impl Compiler<'_> {
             // A nested normal finalizer in a generator can leave the same empty
             // guard/cleanup join inside its synchronous manager. Exceptional and
             // return copies keep their existing locations and ownership.
-            let nested_generator_manager_exit = self.context.target_specific_rules_enabled()
-                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                    == CO_GENERATOR
+            let nested_generator_manager_exit = self.unit.flags
+                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                == CO_GENERATOR
                 && self.control.loops.contexts.is_empty()
                 && self.control.exceptions.active_exception_handlers.is_empty()
                 && self.control.exceptions.active_exception_group_handlers == 0
@@ -26476,10 +26196,10 @@ impl Compiler<'_> {
                 .withs
                 .direct_final_sync_with_protected_handler_try_body
                 == Some(statement.range)
-            || (self.context.target_specific_rules_enabled()
+            || (
                 // A sibling reached through a conditional arm remains inside the
                 // same try. Suppression must retain that continuation's owner.
-                && self.control.statements.same_region_continuation != Some(statement.range)
+                self.control.statements.same_region_continuation != Some(statement.range)
                 // A following break begins its own try unwind. The manager's
                 // suppression jump reaches that unwind while still inside the try.
                 && !self.control.statements.current_statement_followed_by_break
@@ -26506,7 +26226,8 @@ impl Compiler<'_> {
                 && self.control.finally.active_finally_try_bodies == 0
                 && self.control.finally.active_normal_finally_bodies == 0
                 && self.control.finally.active_finally_end_blocks == 0
-                && suite_terminates(&statement.body));
+                && suite_terminates(&statement.body)
+            );
         self.compile_with_items(
             &statement.items,
             &statement.body,
@@ -26882,12 +26603,6 @@ impl Compiler<'_> {
         } else {
             Vec::new()
         };
-        let shifted_boolean_dispatch_calls =
-            if remaining.is_empty() && self.context.target_specific_rules_enabled() {
-                shifted_sync_with_boolean_dispatch_calls(body)
-            } else {
-                Vec::new()
-            };
         let with_body_start_item = context.body_start_item;
         let (body_noop, region_exclusions) = self.with_region_exclusion_collector(
             |control| &mut control.withs.active_with_region_exclusions,
@@ -26899,25 +26614,11 @@ impl Compiler<'_> {
                         |compiler| {
                             compiler.with_control_override(
                                 |control| {
-                                    &mut control.withs.shifted_sync_with_boolean_dispatch_calls
+                                    &mut control.withs.current_sync_with_boolean_value_marker_scan
                                 },
-                                shifted_boolean_dispatch_calls,
+                                Some(BooleanValueMarkerScan::new(with_body_start_item)),
                                 |compiler| {
-                                    compiler.with_control_override(
-                                        |control| {
-                                            &mut control
-                                                .withs
-                                                .current_sync_with_boolean_value_marker_scan
-                                        },
-                                        Some(BooleanValueMarkerScan::new(with_body_start_item)),
-                                        |compiler| {
-                                            compiler.compile_with_body(
-                                                remaining,
-                                                body,
-                                                following_return,
-                                            )
-                                        },
-                                    )
+                                    compiler.compile_with_body(remaining, body, following_return)
                                 },
                             )
                         },
@@ -26962,10 +26663,7 @@ impl Compiler<'_> {
                         .map(WithBodyExitNoop::RetainedConvertedPopBlock)
                 })
                 .or_else(|| {
-                    if !remaining.is_empty()
-                        || self.control.loops.contexts.is_empty()
-                        || !self.context.target_specific_rules_enabled()
-                    {
+                    if !remaining.is_empty() || self.control.loops.contexts.is_empty() {
                         return None;
                     }
                     let (range, removed_slots) = with_body_continue_exit_donor(body)?;
@@ -26980,7 +26678,6 @@ impl Compiler<'_> {
                 .or_else(|| {
                     let context = self.control.loops.contexts.last()?;
                     if !remaining.is_empty()
-                        || !self.context.target_specific_rules_enabled()
                         || self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
                         || context.iterator_cleanup != IteratorCleanup::Sync
                         || context.has_orelse
@@ -27023,42 +26720,37 @@ impl Compiler<'_> {
         // This original handler cleanup reaches the separate manager POP_BLOCK.
         // Its end identity excludes finally joins already represented upstream.
         let body_noop = match body_noop {
-            None | Some(WithBodyExitNoop::ConvertedPopBlock)
-                if self.context.target_specific_rules_enabled() =>
-            {
-                self.assembler
-                    .original_manager_cleanup_join(
-                        protected_end,
-                        remaining.is_empty() && with_body_has_cold_normal_donor(body),
-                    )
-                    .map(|entry| {
-                        WithBodyExitNoop::RetainedManagerPopBlock(SourceLocation::NONE, entry)
-                    })
-                    .or_else(|| {
-                        (remaining.is_empty()
-                            && matches!(body_noop, Some(WithBodyExitNoop::ConvertedPopBlock))
-                            && matches!(body.last(), Some(Stmt::For(statement))
+            None | Some(WithBodyExitNoop::ConvertedPopBlock) => self
+                .assembler
+                .original_manager_cleanup_join(
+                    protected_end,
+                    remaining.is_empty() && with_body_has_cold_normal_donor(body),
+                )
+                .map(|entry| WithBodyExitNoop::RetainedManagerPopBlock(SourceLocation::NONE, entry))
+                .or_else(|| {
+                    (remaining.is_empty()
+                        && matches!(body_noop, Some(WithBodyExitNoop::ConvertedPopBlock))
+                        && matches!(body.last(), Some(Stmt::For(statement))
                                 if !statement.is_async))
-                        .then(|| {
-                            self.assembler
-                                .original_manager_copied_finally_break_join(protected_end)
-                        })
+                    .then(|| {
+                        self.assembler
+                            .original_manager_copied_finally_break_join(protected_end)
+                    })
+                    .flatten()
+                    .map(|(entry, location)| {
+                        WithBodyExitNoop::RetainedManagerPopBlock(location, entry)
+                    })
+                })
+                .or_else(|| {
+                    remaining
+                        .is_empty()
+                        .then(|| self.assembler.original_manager_match_join(protected_end))
                         .flatten()
                         .map(|(entry, location)| {
                             WithBodyExitNoop::RetainedManagerPopBlock(location, entry)
                         })
-                    })
-                    .or_else(|| {
-                        remaining
-                            .is_empty()
-                            .then(|| self.assembler.original_manager_match_join(protected_end))
-                            .flatten()
-                            .map(|(entry, location)| {
-                                WithBodyExitNoop::RetainedManagerPopBlock(location, entry)
-                            })
-                    })
-                    .or(body_noop)
-            }
+                })
+                .or(body_noop),
             _ => body_noop,
         };
         let mut unlocated_body_pop = None;
@@ -27133,7 +26825,6 @@ impl Compiler<'_> {
             } else {
                 let outer_exception_exit_start =
                     (exclude_handler_exit
-                        && self.context.target_specific_rules_enabled()
                         && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                             == 0
                         && self.control.loops.contexts.last().is_some_and(|context| {
@@ -27221,22 +26912,22 @@ impl Compiler<'_> {
         if terminal {
             self.emit_implicit_return()?;
         } else {
-            let inline_following_return = self.context.target_specific_rules_enabled()
-                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-                && following_return.is_some()
-                && self.control.loops.contexts.is_empty()
-                && self.control.withs.active_with_exits.is_empty()
-                && self.control.exceptions.active_exception_handlers.is_empty()
-                && self
-                    .control
-                    .exceptions
-                    .active_exception_region_exclusions
-                    .len()
-                    == 1
-                && self.control.finally.active_finally_try_bodies == 0
-                && self.control.finally.active_normal_finally_bodies == 0
-                && self.control.finally.active_finally_end_blocks == 0
-                && self.control.exceptions.active_exception_group_handlers == 0;
+            let inline_following_return =
+                self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && following_return.is_some()
+                    && self.control.loops.contexts.is_empty()
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+                        == 1
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.exceptions.active_exception_group_handlers == 0;
             if inline_following_return {
                 let statement = following_return
                     .expect("selected synchronous with has a return successor")
@@ -27628,8 +27319,7 @@ impl Compiler<'_> {
             )
             .flatten();
             let exception_exit_depth = finally_depth.or_else(|| {
-                (self.context.target_specific_rules_enabled()
-                    && self.unit.flags & CO_COROUTINE != 0
+                (self.unit.flags & CO_COROUTINE != 0
                     && self.unit.flags & CO_ASYNC_GENERATOR == 0
                     && !self.control.statements.current_statement_has_following
                     && self.control.exceptions.direct_try_body_has_successor
@@ -27751,7 +27441,7 @@ impl Compiler<'_> {
         if self.output.constants.is_empty() {
             self.add_constant(Constant::Int(u64::from(statement.level)))?;
         }
-        self.emit(LOAD_SMALL_INT, statement.level, 1)?;
+        self.emit_unsigned_constant(statement.level)?;
         let imported_names = statement
             .names
             .iter()
@@ -33532,32 +33222,44 @@ fn suite_ends_in_constant_break_loop(body: &[Stmt]) -> bool {
 }
 
 fn suite_contains_loop_break(body: &[Stmt]) -> bool {
+    suite_any_loop_control(body, &mut |statement| matches!(statement, Stmt::Break(_)))
+}
+
+fn suite_contains_loop_continue(body: &[Stmt]) -> bool {
+    suite_any_loop_control(body, &mut |statement| {
+        matches!(statement, Stmt::Continue(_))
+    })
+}
+
+/// Visits control transfers for this loop, including nested loop else suites.
+/// Nested loop bodies and nested scopes have their own control transfers.
+fn suite_any_loop_control(body: &[Stmt], predicate: &mut impl FnMut(&Stmt) -> bool) -> bool {
     body.iter().any(|statement| match statement {
-        Stmt::Break(_) => true,
+        Stmt::Break(_) | Stmt::Continue(_) => predicate(statement),
         Stmt::If(statement) => {
-            suite_contains_loop_break(&statement.body)
+            suite_any_loop_control(&statement.body, predicate)
                 || statement
                     .elif_else_clauses
                     .iter()
-                    .any(|clause| suite_contains_loop_break(&clause.body))
+                    .any(|clause| suite_any_loop_control(&clause.body, predicate))
         }
         Stmt::Try(statement) => {
-            suite_contains_loop_break(&statement.body)
+            suite_any_loop_control(&statement.body, predicate)
                 || statement
                     .handlers
                     .iter()
                     .filter_map(ruff_python_ast::ExceptHandler::as_except_handler)
-                    .any(|handler| suite_contains_loop_break(&handler.body))
-                || suite_contains_loop_break(&statement.orelse)
-                || suite_contains_loop_break(&statement.finalbody)
+                    .any(|handler| suite_any_loop_control(&handler.body, predicate))
+                || suite_any_loop_control(&statement.orelse, predicate)
+                || suite_any_loop_control(&statement.finalbody, predicate)
         }
-        Stmt::With(statement) => suite_contains_loop_break(&statement.body),
+        Stmt::With(statement) => suite_any_loop_control(&statement.body, predicate),
         Stmt::Match(statement) => statement
             .cases
             .iter()
-            .any(|case| suite_contains_loop_break(&case.body)),
-        Stmt::For(statement) => suite_contains_loop_break(&statement.orelse),
-        Stmt::While(statement) => suite_contains_loop_break(&statement.orelse),
+            .any(|case| suite_any_loop_control(&case.body, predicate)),
+        Stmt::For(statement) => suite_any_loop_control(&statement.orelse, predicate),
+        Stmt::While(statement) => suite_any_loop_control(&statement.orelse, predicate),
         Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
         _ => false,
     })
@@ -33622,39 +33324,10 @@ fn is_unfolded_nested_else_return(expression: &Expr) -> bool {
 }
 
 fn suite_contains_multiple_loop_breaks(body: &[Stmt]) -> bool {
-    fn contains(body: &[Stmt], seen_break: &mut bool) -> bool {
-        body.iter().any(|statement| match statement {
-            Stmt::Break(_) => std::mem::replace(seen_break, true),
-            Stmt::If(statement) => {
-                contains(&statement.body, seen_break)
-                    || statement
-                        .elif_else_clauses
-                        .iter()
-                        .any(|clause| contains(&clause.body, seen_break))
-            }
-            Stmt::Try(statement) => {
-                contains(&statement.body, seen_break)
-                    || statement
-                        .handlers
-                        .iter()
-                        .filter_map(ruff_python_ast::ExceptHandler::as_except_handler)
-                        .any(|handler| contains(&handler.body, seen_break))
-                    || contains(&statement.orelse, seen_break)
-                    || contains(&statement.finalbody, seen_break)
-            }
-            Stmt::With(statement) => contains(&statement.body, seen_break),
-            Stmt::Match(statement) => statement
-                .cases
-                .iter()
-                .any(|case| contains(&case.body, seen_break)),
-            Stmt::For(statement) => contains(&statement.orelse, seen_break),
-            Stmt::While(statement) => contains(&statement.orelse, seen_break),
-            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
-            _ => false,
-        })
-    }
-
-    contains(body, &mut false)
+    let mut seen_break = false;
+    suite_any_loop_control(body, &mut |statement| {
+        matches!(statement, Stmt::Break(_)) && std::mem::replace(&mut seen_break, true)
+    })
 }
 
 fn try_handler_starts_with_optimized_boolean_generator(
@@ -33677,37 +33350,6 @@ fn handler_ownerless_optimized_boolean_generator_test(body: &[Stmt]) -> Option<T
     (matches!(optimized_generator_callable(call), Some("all" | "any"))
         && suite_contains_nested_handler_cold_join(&statement.body))
     .then(|| statement.test.range())
-}
-fn suite_contains_loop_continue(body: &[Stmt]) -> bool {
-    body.iter().any(|statement| match statement {
-        Stmt::Continue(_) => true,
-        Stmt::If(statement) => {
-            suite_contains_loop_continue(&statement.body)
-                || statement
-                    .elif_else_clauses
-                    .iter()
-                    .any(|clause| suite_contains_loop_continue(&clause.body))
-        }
-        Stmt::Try(statement) => {
-            suite_contains_loop_continue(&statement.body)
-                || statement
-                    .handlers
-                    .iter()
-                    .filter_map(ruff_python_ast::ExceptHandler::as_except_handler)
-                    .any(|handler| suite_contains_loop_continue(&handler.body))
-                || suite_contains_loop_continue(&statement.orelse)
-                || suite_contains_loop_continue(&statement.finalbody)
-        }
-        Stmt::With(statement) => suite_contains_loop_continue(&statement.body),
-        Stmt::Match(statement) => statement
-            .cases
-            .iter()
-            .any(|case| suite_contains_loop_continue(&case.body)),
-        Stmt::For(statement) => suite_contains_loop_continue(&statement.orelse),
-        Stmt::While(statement) => suite_contains_loop_continue(&statement.orelse),
-        Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
-        _ => false,
-    })
 }
 
 // This coroutine path has the same local blocks as a synchronous terminal-if exit.
@@ -34856,56 +34498,6 @@ fn shifted_sync_with_none_owner_statements(body: &[Stmt]) -> Vec<TextRange> {
             .then_some(statement.range)
         })
         .collect()
-}
-
-fn shifted_sync_with_boolean_dispatch_calls(body: &[Stmt]) -> Vec<TextRange> {
-    fn assertion_call(statement: &ruff_python_ast::StmtAssert) -> Option<TextRange> {
-        let (test, negated) = match statement.test.as_ref() {
-            Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => (unary.operand.as_ref(), true),
-            test => (test, false),
-        };
-        let Expr::Call(call) = test else {
-            return None;
-        };
-        matches!(
-            (optimized_generator_callable(call), negated),
-            (Some("all"), false) | (Some("any"), _)
-        )
-        .then_some(call.range)
-    }
-
-    fn collect(body: &[Stmt], shifted: bool, calls: &mut Vec<TextRange>) {
-        let mut shifted = shifted;
-        for statement in body {
-            match statement {
-                Stmt::Assert(statement) => {
-                    if shifted && let Some(call) = assertion_call(statement) {
-                        calls.push(call);
-                    }
-                    shifted = true;
-                }
-                Stmt::If(statement) => {
-                    collect(&statement.body, true, calls);
-                    for clause in &statement.elif_else_clauses {
-                        collect(&clause.body, true, calls);
-                    }
-                    shifted = true;
-                }
-                Stmt::While(statement) => {
-                    collect(&statement.body, true, calls);
-                    collect(&statement.orelse, true, calls);
-                    shifted = true;
-                }
-                Stmt::Match(_) | Stmt::With(_) => shifted = true,
-                Stmt::Try(_) | Stmt::For(_) | Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
-                _ => {}
-            }
-        }
-    }
-
-    let mut calls = Vec::new();
-    collect(body, false, &mut calls);
-    calls
 }
 
 fn shifted_async_with_terminal_owner_statements(body: &[Stmt]) -> Vec<TextRange> {

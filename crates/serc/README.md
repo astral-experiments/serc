@@ -118,18 +118,18 @@ current result is:
 ```text
 exact:               2,230
 CPython rejected:      221
-matched rejection:      128
-rejection mismatch:     75
+matched rejection:      151
+rejection mismatch:     56
 byte mismatch:           0
 unsupported:             0
 parse/decode mismatch:   0
-compiler failure:       18
+compiler failure:       14
 non-UTF-8:               0
 oracle failure:          0
 ```
 
 The CPython 3.15.0rc2 gate uses the same 2,451 pinned files and requires 2,249 exact matches.
-Its 202 CPython-rejected files are frozen as 132 matched rejections, 56 rejection mismatches,
+Its 202 CPython-rejected files are frozen as 133 matched rejections, 55 rejection mismatches,
 and 14 compiler failures. Every other failure category must remain zero, and `--require-all`
 independently rejects any failure on a CPython-accepted input. Both gates run in CI.
 

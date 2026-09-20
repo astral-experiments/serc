@@ -10,6 +10,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, ExitCode, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use clap::{Parser, ValueEnum};
 use cpu_time::ProcessTime;
 use serc::{CPYTHON_TARGET, CompiledModule, compile};
 use walkdir::WalkDir;
@@ -157,19 +158,29 @@ while True:
         raise RuntimeError(f"unknown command: {fields!r}")
 "#;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Parser)]
+#[command(about = "Benchmark Serc against the pinned CPython target")]
 struct Options {
+    #[arg(long, value_name = "PATH")]
     python: String,
+    #[arg(long, value_enum)]
     phase: Phase,
+    #[arg(long, value_parser = parse_positive)]
     warmups: usize,
+    #[arg(long, value_parser = parse_positive)]
     samples: usize,
+    #[arg(long = "cooldown-ms", value_parser = parse_duration, value_name = "N")]
     cooldown: Duration,
+    #[arg(long, value_name = "PATH")]
     output: PathBuf,
+    #[arg(required = true, value_name = "ROOT")]
     roots: Vec<PathBuf>,
+    #[arg(long, value_parser = parse_positive)]
     limit: Option<usize>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "snake_case")]
 enum Phase {
     CompilerCore,
     CompileMarshal,
@@ -182,17 +193,6 @@ impl Phase {
             Self::CompilerCore => "compiler_core",
             Self::CompileMarshal => "compile_marshal",
             Self::MarshalOnly => "marshal_only",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "compiler_core" => Ok(Self::CompilerCore),
-            "compile_marshal" => Ok(Self::CompileMarshal),
-            "marshal_only" => Ok(Self::MarshalOnly),
-            _ => Err(format!(
-                "--phase must be one of compiler_core, compile_marshal, or marshal_only; got {value}"
-            )),
         }
     }
 }
@@ -358,7 +358,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let options = parse_options_from(env::args().skip(1))?;
+    let options = Options::parse();
     let paths = discover(&options.roots, options.limit)?;
     if paths.is_empty() {
         return Err("no Python files discovered".to_string());
@@ -461,99 +461,6 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn parse_options_from<I, S>(arguments: I) -> Result<Options, String>
-where
-    I: IntoIterator<Item = S>,
-    S: Into<String>,
-{
-    let mut python = None;
-    let mut phase = None;
-    let mut warmups = None;
-    let mut samples = None;
-    let mut cooldown = None;
-    let mut output = None;
-    let mut limit = None;
-    let mut roots = Vec::new();
-    let mut arguments = arguments.into_iter().map(Into::into);
-
-    while let Some(argument) = arguments.next() {
-        match argument.as_str() {
-            "--python" => {
-                python = Some(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--python requires an executable".to_string())?,
-                );
-            }
-            "--phase" => {
-                phase = Some(Phase::parse(
-                    &arguments
-                        .next()
-                        .ok_or_else(|| "--phase requires a value".to_string())?,
-                )?);
-            }
-            "--warmups" => {
-                warmups = Some(parse_positive(
-                    &arguments
-                        .next()
-                        .ok_or_else(|| "--warmups requires a number".to_string())?,
-                    "--warmups",
-                )?);
-            }
-            "--samples" => {
-                samples = Some(parse_positive(
-                    &arguments
-                        .next()
-                        .ok_or_else(|| "--samples requires a number".to_string())?,
-                    "--samples",
-                )?);
-            }
-            "--cooldown-ms" => {
-                cooldown =
-                    Some(parse_duration(&arguments.next().ok_or_else(|| {
-                        "--cooldown-ms requires a number".to_string()
-                    })?)?);
-            }
-            "--output" => {
-                output = Some(PathBuf::from(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--output requires a path".to_string())?,
-                ));
-            }
-            "--limit" => {
-                limit = Some(parse_positive(
-                    &arguments
-                        .next()
-                        .ok_or_else(|| "--limit requires a number".to_string())?,
-                    "--limit",
-                )?);
-            }
-            "--help" | "-h" => return Err(usage()),
-            _ if argument.starts_with('-') => return Err(format!("unknown option: {argument}")),
-            _ => roots.push(PathBuf::from(argument)),
-        }
-    }
-
-    if roots.is_empty() {
-        return Err(format!("at least one ROOT is required\n{}", usage()));
-    }
-    Ok(Options {
-        python: python.ok_or_else(|| "--python is required".to_string())?,
-        phase: phase.ok_or_else(|| "--phase is required".to_string())?,
-        warmups: warmups.ok_or_else(|| "--warmups is required".to_string())?,
-        samples: samples.ok_or_else(|| "--samples is required".to_string())?,
-        cooldown: cooldown.ok_or_else(|| "--cooldown-ms is required".to_string())?,
-        output: output.ok_or_else(|| "--output is required".to_string())?,
-        roots,
-        limit,
-    })
-}
-
-fn usage() -> String {
-    "usage: benchmark_cpython_corpus --python PATH --phase {compiler_core|compile_marshal|marshal_only} --warmups N --samples N --cooldown-ms N --output PATH [--limit N] ROOT ...".to_string()
-}
-
 fn expected_row_count(options: &Options) -> Result<usize, String> {
     options
         .warmups
@@ -562,12 +469,12 @@ fn expected_row_count(options: &Options) -> Result<usize, String> {
         .ok_or_else(|| "warmup and sample counts produce too many observations".to_string())
 }
 
-fn parse_positive(value: &str, option: &str) -> Result<usize, String> {
+fn parse_positive(value: &str) -> Result<usize, String> {
     let value = value
         .parse::<usize>()
-        .map_err(|_| format!("{option} requires a positive number"))?;
+        .map_err(|_| "expected a positive number".to_string())?;
     if value == 0 {
-        return Err(format!("{option} requires a positive number"));
+        return Err("expected a positive number".to_string());
     }
     Ok(value)
 }
@@ -1597,23 +1504,66 @@ fn bootstrap_median_ci(
 
 #[cfg(test)]
 mod tests {
+    use clap::{Parser, error::ErrorKind};
     use std::io;
     use std::path::PathBuf;
     use std::time::Duration;
 
     use super::{
-        BOOTSTRAP_SEED, BlockSample, Engine, Metric, Options, PYTHON_HELPER, Phase, RawRow,
+        BOOTSTRAP_SEED, BlockSample, Engine, Metric, Options, Phase, PythonRunner, RawRow,
         SourceFile, Timings, block_order, block_order_label, block_samples, bootstrap_median_ci,
-        cooldown_metadata, discover, expected_row_count, parse_options_from, parse_sample_response,
+        cooldown_metadata, discover, expected_row_count, parse_sample_response,
         process_timer_result, profile_from_executable, ratio_statistics, summarize,
         verify_exact_marshal, write_raw,
     };
 
     #[test]
-    fn python_helper_classifies_compile_exceptions_as_rejected() {
-        assert!(
-            PYTHON_HELPER.contains("            except Exception:\n                rejected += 1")
+    fn python_helper_benchmarks_only_accepted_sources() {
+        let python =
+            std::env::var("SERC_TEST_PYTHON").unwrap_or_else(|_| "python3.14".to_string());
+        let sources = [
+            ("accepted.py", "answer = 'caf\u{e9}'\n"),
+            ("syntax.py", "if:\n"),
+            ("semantic.py", "return\n"),
+            (
+                "after_rejections.py",
+                "raise RuntimeError('compiled, never executed')\n",
+            ),
+        ]
+        .map(|(filename, source)| SourceFile {
+            path: PathBuf::from(filename),
+            filename: filename.to_string(),
+            source: source.to_string(),
+        });
+        let mut runner = PythonRunner::start(&python).unwrap();
+        let manifest = runner.initialize(&sources).unwrap();
+        let samples = [
+            Phase::CompilerCore,
+            Phase::CompileMarshal,
+            Phase::MarshalOnly,
+        ]
+        .map(|phase| runner.run_phase(phase).unwrap());
+        runner.finish().unwrap();
+
+        assert_eq!(manifest.accepted_indices, [0, 3]);
+        assert_eq!(manifest.rejected, 2);
+        assert_eq!(
+            manifest.source_bytes,
+            sources[0].source.len() + sources[3].source.len()
         );
+        let expected_marshal = [0, 3].map(|index| {
+            serc::compile(&sources[index].source, &sources[index].filename)
+                .unwrap()
+                .marshal()
+        });
+        assert_eq!(manifest.marshaled, expected_marshal);
+        for sample in samples {
+            assert_eq!(sample.count, 2);
+            assert!(sample.observed > 0);
+        }
+        let marshaled_bytes = expected_marshal.iter().map(Vec::len).sum::<usize>();
+        assert_eq!(samples[1].observed, marshaled_bytes);
+        assert_eq!(samples[2].observed, marshaled_bytes);
     }
 
     fn raw_row(
@@ -1642,7 +1592,8 @@ mod tests {
 
     #[test]
     fn parses_required_options_and_limit() {
-        let options = parse_options_from([
+        let options = Options::try_parse_from([
+            "benchmark_cpython_corpus",
             "--python",
             "/opt/homebrew/bin/python3",
             "--phase",
@@ -1727,7 +1678,8 @@ mod tests {
             ("compile_marshal", Phase::CompileMarshal),
             ("marshal_only", Phase::MarshalOnly),
         ] {
-            let options = parse_options_from([
+            let options = Options::try_parse_from([
+                "benchmark_cpython_corpus",
                 "--python",
                 "python3",
                 "--phase",
@@ -1749,7 +1701,8 @@ mod tests {
 
     #[test]
     fn requires_a_supported_phase() {
-        let missing = parse_options_from([
+        let missing = Options::try_parse_from([
+            "benchmark_cpython_corpus",
             "--python",
             "python3",
             "--warmups",
@@ -1763,9 +1716,11 @@ mod tests {
             "corpus",
         ])
         .expect_err("phase is required");
-        assert_eq!(missing, "--phase is required");
+        assert_eq!(missing.kind(), ErrorKind::MissingRequiredArgument);
+        assert!(missing.to_string().contains("--phase"));
 
-        let unsupported = parse_options_from([
+        let unsupported = Options::try_parse_from([
+            "benchmark_cpython_corpus",
             "--python",
             "python3",
             "--phase",
@@ -1781,33 +1736,39 @@ mod tests {
             "corpus",
         ])
         .expect_err("unsupported phase must fail");
-        assert!(unsupported.contains("compiler_core, compile_marshal, or marshal_only"));
+        assert_eq!(unsupported.kind(), ErrorKind::InvalidValue);
     }
 
     #[test]
-    fn rejects_zero_samples() {
-        let error = parse_options_from([
-            "--python",
-            "python3",
-            "--phase",
-            "compiler_core",
-            "--warmups",
-            "1",
-            "--samples",
-            "0",
-            "--cooldown-ms",
-            "0",
-            "--output",
-            "samples.tsv",
-            "corpus",
-        ])
-        .expect_err("zero samples must fail");
-        assert!(error.contains("positive number"));
+    fn rejects_zero_iteration_counts() {
+        for (warmups, samples, limit) in [("0", "1", "1"), ("1", "0", "1"), ("1", "1", "0")] {
+            let error = Options::try_parse_from([
+                "benchmark_cpython_corpus",
+                "--python",
+                "python3",
+                "--phase",
+                "compiler_core",
+                "--warmups",
+                warmups,
+                "--samples",
+                samples,
+                "--limit",
+                limit,
+                "--cooldown-ms",
+                "0",
+                "--output",
+                "samples.tsv",
+                "corpus",
+            ])
+            .expect_err("zero iteration counts must fail");
+            assert_eq!(error.kind(), ErrorKind::ValueValidation);
+        }
     }
 
     #[test]
     fn requires_cooldown() {
-        let error = parse_options_from([
+        let error = Options::try_parse_from([
+            "benchmark_cpython_corpus",
             "--python",
             "python3",
             "--phase",
@@ -1821,7 +1782,8 @@ mod tests {
             "corpus",
         ])
         .expect_err("cooldown is required");
-        assert!(error.contains("--cooldown-ms is required"));
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        assert!(error.to_string().contains("--cooldown-ms"));
     }
 
     #[test]

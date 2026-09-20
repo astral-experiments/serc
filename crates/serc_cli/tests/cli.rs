@@ -251,37 +251,45 @@ fn compile_rejects_repeated_utf8_boms() {
 }
 
 #[test]
-fn compile_matches_cpython_pyc() {
-    let directory = tempfile::tempdir().unwrap();
-    let source_path = directory.path().join("module.py");
-    let pyc_path = directory.path().join("__pycache__/module.cpython-314.pyc");
-    fs_err::write(&source_path, "def answer():\n    return 42\n").unwrap();
+fn compile_matches_cpython_cache_paths_and_pyc() {
+    for name in [
+        "module.py",
+        "module",
+        ".module",
+        ".py",
+        "some.module.py",
+        ".module.py",
+        "module.",
+        "unicode_é.py",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join(name);
+        fs_err::write(&source_path, "def answer():\n    return 42\n").unwrap();
 
-    let cpython = common::python_3145_command()
-        .args([
-            "-m",
-            "compileall",
-            "-q",
-            "-f",
-            "-o",
-            "0",
-            "--invalidation-mode",
-            "timestamp",
-        ])
-        .arg(&source_path)
-        .output()
-        .unwrap();
-    assert!(cpython.status.success(), "{cpython:?}");
-    let expected = fs_err::read(&pyc_path).unwrap();
+        let cpython = common::python_3145_command()
+            .args([
+                "-X",
+                "utf8",
+                "-c",
+                "import py_compile, sys; print(py_compile.compile(sys.argv[1], doraise=True, optimize=0, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP))",
+            ])
+            .arg(&source_path)
+            .output()
+            .unwrap();
+        assert!(cpython.status.success(), "{name}: {cpython:?}");
+        let pyc_path = std::path::PathBuf::from(String::from_utf8(cpython.stdout).unwrap().trim());
+        let expected = fs_err::read(&pyc_path).unwrap();
+        fs_err::remove_file(&pyc_path).unwrap();
 
-    let output = serc()
-        .args(["compile", "--quiet"])
-        .arg(&source_path)
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{output:?}");
+        let output = serc()
+            .args(["compile", "--quiet"])
+            .arg(&source_path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{name}: {output:?}");
 
-    assert_eq!(fs_err::read(pyc_path).unwrap(), expected);
+        assert_eq!(fs_err::read(pyc_path).unwrap(), expected, "{name}");
+    }
 }
 
 #[test]

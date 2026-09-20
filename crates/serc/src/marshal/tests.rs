@@ -158,11 +158,32 @@ fn cached_scalar_graph_routes_constants_metadata_and_structural_bytes() {
     code.exception_table.push(0);
     let graph = ObjectGraph::for_code(&code);
 
-    assert!(graph.is_interned("é"));
-    assert!(graph.is_shared(&ObjectKey::Int(256), false));
-    assert!(graph.is_shared(&ObjectKey::SignedInt(-5), false));
-    assert!(graph.is_shared(&ObjectKey::Bytes(&[0]), false));
-    assert!(graph.is_shared(&ObjectKey::String("é"), false));
+    let mut occurrences = graph.occurrence_cursor();
+    occurrences.consume(OccurrenceKind::Code);
+    occurrences.consume(OccurrenceKind::CodeBytes);
+    occurrences.consume(OccurrenceKind::Constants);
+    let integer = occurrences.consume(OccurrenceKind::Constant);
+    let signed_integer = occurrences.consume(OccurrenceKind::Constant);
+    let byte = occurrences.consume(OccurrenceKind::Constant);
+    let character = occurrences.consume(OccurrenceKind::Constant);
+    for object in [integer, signed_integer, byte, character] {
+        assert!(graph.is_shared_object(object));
+    }
+    assert!(graph.is_interned_object(character));
+
+    occurrences.consume(OccurrenceKind::Strings);
+    assert_eq!(
+        occurrences.consume(OccurrenceKind::MetadataString),
+        character
+    );
+    occurrences.consume(OccurrenceKind::Locals);
+    occurrences.consume(OccurrenceKind::LocalKinds);
+    for _ in 0..3 {
+        occurrences.consume(OccurrenceKind::MetadataString);
+    }
+    assert_eq!(occurrences.consume(OccurrenceKind::Bytes), byte);
+    assert_eq!(occurrences.consume(OccurrenceKind::Bytes), byte);
+    occurrences.finish();
 }
 
 #[test]
