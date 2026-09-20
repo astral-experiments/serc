@@ -149,13 +149,12 @@ fn has_python_suffix(path: &Path) -> bool {
 }
 
 fn compile_path(path: &Path, check: bool) -> Result<(), String> {
-    compile_path_with_metadata(path, check, source_metadata)
+    compile_path_with_metadata(path, check, |path| fs_err::metadata(path))
 }
 
-fn source_metadata(path: &Path) -> io::Result<std::fs::Metadata> {
-    fs_err::metadata(path)
-}
-
+/// Compiles a source file, optionally replacing its timestamp-invalidated cache.
+///
+/// Check mode skips both the metadata loader and cache output.
 fn compile_path_with_metadata(
     path: &Path,
     check: bool,
@@ -181,12 +180,11 @@ fn compile_path_with_metadata(
         _ => format!("failed to compile {}: {error}", path.display()),
     })?;
 
-    if check {
+    let Some(metadata) = metadata else {
         black_box(module);
         return Ok(());
-    }
+    };
 
-    let metadata = metadata.expect("source metadata is loaded when writing bytecode");
     let source_size = metadata.len();
     let modified = metadata
         .modified()
@@ -214,6 +212,9 @@ fn compile_path_with_metadata(
         .map_err(|error| format!("failed to replace {}: {error}", output.display()))
 }
 
+/// Encodes signed Unix seconds for a CPython timestamp cache header.
+///
+/// Fractional seconds are truncated toward zero, then the value wraps modulo 2^32.
 fn encode_mtime(modified: SystemTime) -> u32 {
     match modified.duration_since(UNIX_EPOCH) {
         Ok(duration) => low_u32(duration.as_secs()),
