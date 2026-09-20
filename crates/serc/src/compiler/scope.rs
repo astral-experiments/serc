@@ -2972,38 +2972,45 @@ impl<'ast> Visitor<'ast> for ReferenceCollector {
     }
 }
 
-pub(super) fn definitely_evaluated_references(expression: &Expr) -> Option<FxHashSet<String>> {
+/// Returns the names loaded by an expression only if it has no conditional evaluation.
+pub(super) fn definitely_evaluated_references(expression: &Expr) -> Option<FxHashSet<&str>> {
     #[derive(Default)]
-    struct ConditionalEvaluationDetector(bool);
+    struct Collector<'ast> {
+        conditional: bool,
+        references: FxHashSet<&'ast str>,
+    }
 
-    impl<'ast> Visitor<'ast> for ConditionalEvaluationDetector {
+    impl<'ast> Visitor<'ast> for Collector<'ast> {
         fn visit_expr(&mut self, expression: &'ast Expr) {
-            if matches!(
-                expression,
-                Expr::BoolOp(_)
-                    | Expr::If(_)
-                    | Expr::Lambda(_)
-                    | Expr::Generator(_)
-                    | Expr::ListComp(_)
-                    | Expr::SetComp(_)
-                    | Expr::DictComp(_)
-            ) || matches!(expression, Expr::Compare(comparison) if comparison.ops.len() > 1)
-            {
-                self.0 = true;
+            if self.conditional {
                 return;
             }
-            walk_expr(self, expression);
+            match expression {
+                Expr::BoolOp(_)
+                | Expr::If(_)
+                | Expr::Lambda(_)
+                | Expr::Generator(_)
+                | Expr::ListComp(_)
+                | Expr::SetComp(_)
+                | Expr::DictComp(_) => self.conditional = true,
+                Expr::Compare(comparison) if comparison.ops.len() > 1 => self.conditional = true,
+                Expr::Name(name) => {
+                    if name.ctx == ExprContext::Load {
+                        let name = name.id.as_str();
+                        self.references.insert(name);
+                        if name == "super" {
+                            self.references.insert("__class__");
+                        }
+                    }
+                }
+                _ => walk_expr(self, expression),
+            }
         }
     }
 
-    let mut detector = ConditionalEvaluationDetector::default();
-    detector.visit_expr(expression);
-    if detector.0 {
-        return None;
-    }
-    let mut references = ReferenceCollector::default();
-    references.visit_expr(expression);
-    Some(references.references)
+    let mut collector = Collector::default();
+    collector.visit_expr(expression);
+    (!collector.conditional).then_some(collector.references)
 }
 
 pub(super) struct LambdaScopeAnalysis {
@@ -3591,8 +3598,11 @@ pub(super) fn collect_self_iterated_nested_comprehension_targets(
                     };
                     let mut targets = Vec::new();
                     collect_target_names(&generator.target, &mut targets);
-                    self.names
-                        .extend(targets.into_iter().filter(|name| references.contains(name)));
+                    self.names.extend(
+                        targets
+                            .into_iter()
+                            .filter(|name| references.contains(name.as_str())),
+                    );
                 }
             }
             walk_expr(self, expression);
@@ -3974,7 +3984,7 @@ mod tests {
 
     use super::{
         FlatFunctionInputs, LocalCollector, ModuleNameCollector, NameId, NameInterner,
-        SCOPE_SEED_NAMES, ScopeDefinition, ScopeId,
+        SCOPE_SEED_NAMES, ScopeDefinition, ScopeId, definitely_evaluated_references,
     };
 
     #[test]
@@ -3983,6 +3993,57 @@ mod tests {
             SCOPE_SEED_NAMES.into_iter().collect::<FxHashSet<_>>().len(),
             SCOPE_SEED_NAMES.len()
         );
+    }
+
+    #[test]
+    fn definitely_evaluated_references_collects_loads_and_super() {
+        let cases: &[(&str, &[&str])] = &[
+            ("(target := call(value, value))", &["call", "value"]),
+            ("left < right", &["left", "right"]),
+            ("super()", &["super", "__class__"]),
+            ("(__class__, super, __class__)", &["__class__", "super"]),
+            ("object.super", &["object"]),
+            ("[first, *rest]", &["first", "rest"]),
+            ("42", &[]),
+        ];
+
+        for (source, expected) in cases {
+            let parsed = parse_module(source).unwrap();
+            let [ruff_python_ast::Stmt::Expr(statement)] = parsed.suite().as_slice() else {
+                panic!("expected one expression statement");
+            };
+            assert_eq!(
+                definitely_evaluated_references(&statement.value),
+                Some(expected.iter().copied().collect()),
+                "source:\n{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn definitely_evaluated_references_discards_loads_before_conditional_evaluation() {
+        let cases = [
+            "before(first, left and right, after)",
+            "before(first, left if condition else right, after)",
+            "before(first, lambda item=default: item, after)",
+            "before(first, (item for item in values), after)",
+            "before(first, [item for item in values], after)",
+            "before(first, {item for item in values}, after)",
+            "before(first, {item: value for item in values}, after)",
+            "before(first, left < middle < right, after)",
+        ];
+
+        for source in cases {
+            let parsed = parse_module(source).unwrap();
+            let [ruff_python_ast::Stmt::Expr(statement)] = parsed.suite().as_slice() else {
+                panic!("expected one expression statement");
+            };
+            assert_eq!(
+                definitely_evaluated_references(&statement.value),
+                None,
+                "source:\n{source}"
+            );
+        }
     }
 
     #[test]
