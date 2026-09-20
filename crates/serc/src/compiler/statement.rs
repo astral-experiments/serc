@@ -572,6 +572,8 @@ pub(super) struct LoopState {
     suite_fallthrough_to_loop_backedge: bool,
     // The final statement emitted by generic loop-tail lowering before one shared backedge.
     uncopied_loop_tail_statement: Option<TextRange>,
+    // Terminal-while lowering also leaves one shared backedge after its final statement.
+    terminal_while_tail_statement: Option<TextRange>,
     // Retain the original enclosing loop-tail context for this guarded-match try only.
     guarded_match_try_loop_tail: Option<TextRange>,
     // This match's failure reaches the forward join of a non-final loop branch.
@@ -3113,7 +3115,13 @@ impl Compiler<'_> {
                 compiler.with_control_override(
                     |control| &mut control.loops.suite_fallthrough_to_loop_backedge,
                     true,
-                    |compiler| compiler.compile_suite(&statement.body),
+                    |compiler| {
+                        compiler.with_control_override(
+                            |control| &mut control.loops.terminal_while_tail_statement,
+                            statement.body.last().map(Ranged::range),
+                            |compiler| compiler.compile_suite(&statement.body),
+                        )
+                    },
                 )
             })?;
             if !suite_terminates(&statement.body) {
@@ -28309,6 +28317,17 @@ impl Compiler<'_> {
                 // The normal cleanup exit inherits its unique assertion-success operand,
                 // independently of the failure RAISE's full test location.
                 self.assembler.set_location(self.source_location(range));
+            } else if (self.control.loops.uncopied_loop_tail_statement == Some(statement.range)
+                || self.control.loops.terminal_while_tail_statement == Some(statement.range))
+                && self.assembler.current_original_block_location().is_none()
+                && self
+                    .assembler
+                    .current_original_block_pre_fusion_instruction_count()
+                    == 0
+            {
+                // The shared loop backedge is copied onto each incoming edge of this
+                // empty original join. Keep it unlocated until each copy gets its donor.
+                self.assembler.set_location(SourceLocation::NONE);
             } else if let Some(location) = self.assembler.last_instruction_location() {
                 self.assembler.set_location(location);
             }

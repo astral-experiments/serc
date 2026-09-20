@@ -102,6 +102,7 @@ mod discarded_suspension_constants;
 mod dynamic_while_call_attribute_condition_owner_compatibility;
 mod dynamic_while_condition_owner_compatibility;
 mod earlier_exception_owner_slots;
+mod empty_finally_join_locations;
 mod empty_try_else_donors;
 mod empty_try_setup;
 mod entry_and_cleanup_owner_slots;
