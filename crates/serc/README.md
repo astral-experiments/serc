@@ -85,12 +85,12 @@ current result is:
 ```text
 exact:               2,230
 CPython rejected:      221
-matched rejection:      128
-rejection mismatch:     75
+matched rejection:      151
+rejection mismatch:     56
 byte mismatch:           0
 unsupported:             0
 parse/decode mismatch:   0
-compiler failure:       18
+compiler failure:       14
 non-UTF-8:               0
 oracle failure:          0
 ```

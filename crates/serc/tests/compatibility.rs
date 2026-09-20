@@ -12,7 +12,8 @@ mod tests {
         assert_matches_cpython_pop_except_positions,
     };
     use serc::{
-        CPYTHON_TARGET, CompileError, compile, compile_bytes_to_pyc, compile_to_pyc, decode_source,
+        CPYTHON_TARGET, CompileError, compile, compile_bytes, compile_bytes_to_pyc, compile_to_pyc,
+        decode_source,
     };
     use serc_workloads as benchmark_workloads;
 
@@ -124,6 +125,40 @@ mod tests {
             error.to_string(),
             format!("failed to parse Python source: {parse_error}")
         );
+    }
+
+    #[test]
+    fn rejects_lazy_imports_for_the_pinned_python_target() {
+        for source in [
+            "lazy import module\n",
+            "lazy from module import value\n",
+            "if False:\n    if ready:\n        lazy import module\n",
+            "def function():\n    lazy import module\n",
+            "class Class:\n    lazy from module import value\n",
+            "try:\n    lazy import module\nexcept ImportError:\n    pass\n",
+        ] {
+            for result in [
+                compile(source, "lazy_import.py"),
+                compile_bytes(source.as_bytes(), "lazy_import.py"),
+            ] {
+                let error = result.unwrap_err();
+                let CompileError::InvalidSyntax { message, range } = &error else {
+                    panic!("expected invalid syntax error for {source:?}, got {error:?}");
+                };
+                assert_eq!(
+                    message,
+                    "Cannot use `lazy` import statement on Python 3.14 (syntax was added in Python 3.15)"
+                );
+                assert_eq!(error.range(), Some(*range));
+                assert_eq!(&source[*range], "lazy");
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_remains_valid_as_an_identifier_and_module_name() {
+        let source = "lazy = 1\nimport lazy\nfrom lazy import value\nfrom module import lazy\n";
+        assert_matches_cpython_marshal(source, "lazy_identifier.py");
     }
 
     #[test]
