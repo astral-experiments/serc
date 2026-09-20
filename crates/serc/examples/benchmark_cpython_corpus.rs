@@ -69,6 +69,7 @@ while True:
     if fields[0] == "INIT":
         count = int(fields[1])
         accepted = []
+        responses = []
         rejected = 0
         accepted_bytes = 0
         for index in range(count):
@@ -91,10 +92,16 @@ while True:
             accepted.append((filename, source))
             precompiled.append(code)
             accepted_bytes += len(source.encode("utf-8"))
+            # Serialize before compiling the next file, preserving marshal identity.
             serialized = marshal.dumps(code)
+            responses.append((index, serialized))
+        # The parent sends every source before reading responses. Drain its input
+        # first so neither pipe can block the other side's writes.
+        for index, serialized in responses:
             print(f"ACCEPT\t{index}\t{len(serialized)}", flush=True)
             sys.stdout.buffer.write(serialized)
             sys.stdout.buffer.flush()
+        del responses
         sources = accepted
         print(
             f"MANIFEST\t{len(accepted)}\t{rejected}\t{accepted_bytes}",
@@ -1505,9 +1512,12 @@ fn bootstrap_median_ci(
 #[cfg(test)]
 mod tests {
     use clap::{Parser, error::ErrorKind};
+    use std::env;
     use std::io;
     use std::path::PathBuf;
-    use std::time::Duration;
+    use std::process::Command;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use super::{
         BOOTSTRAP_SEED, BlockSample, Engine, Metric, Options, Phase, PythonRunner, RawRow,
@@ -1564,6 +1574,67 @@ mod tests {
         let marshaled_bytes = expected_marshal.iter().map(Vec::len).sum::<usize>();
         assert_eq!(samples[1].observed, marshaled_bytes);
         assert_eq!(samples[2].observed, marshaled_bytes);
+    }
+
+    #[test]
+    fn python_initializer_drains_large_sources_before_responses() {
+        const WORKER: &str = "SERC_BENCHMARK_PIPE_TEST_WORKER";
+        if env::var_os(WORKER).is_some() {
+            let python =
+                env::var("SERC_TEST_PYTHON").unwrap_or_else(|_| "python3.14".to_string());
+            let mut runner = PythonRunner::start(&python).expect("pinned CPython helper");
+            let sources = (0..2)
+                .map(|index| SourceFile {
+                    path: PathBuf::from(format!("large_{index}.py")),
+                    filename: format!("large_{index}.py"),
+                    source: format!("value = '{}'\n", "a".repeat(128 * 1024)),
+                })
+                .collect::<Vec<_>>();
+            let manifest = runner
+                .initialize(&sources)
+                .expect("initialize large sources");
+            assert_eq!(manifest.accepted_indices, [0, 1]);
+            assert_eq!(manifest.rejected, 0);
+            let modules = sources
+                .iter()
+                .map(|source| serc::compile(&source.source, &source.filename).unwrap())
+                .collect::<Vec<_>>();
+            verify_exact_marshal(
+                &sources.iter().collect::<Vec<_>>(),
+                &modules,
+                &manifest.marshaled,
+            )
+            .expect("large-source marshal preflight");
+            runner.finish().expect("stop helper");
+            return;
+        }
+
+        // Isolate the blocking protocol so a regression fails within a deadline.
+        // Killing this worker closes both helper pipes, allowing CPython to exit too.
+        let mut child = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::python_initializer_drains_large_sources_before_responses",
+                "--nocapture",
+            ])
+            .env(WORKER, "1")
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let completed = loop {
+            if child.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("stop blocked protocol worker");
+                break false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        // Inherit output so a surviving helper cannot hold a captured pipe open.
+        let status = child.wait().unwrap();
+        assert!(completed, "CPython initialization timed out");
+        assert!(status.success(), "protocol worker exited with {status}");
     }
 
     fn raw_row(

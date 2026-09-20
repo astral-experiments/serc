@@ -153,9 +153,11 @@ cargo run --locked --profile profiling -p serc --example benchmark_cpython_corpu
 
 Repeat with `compile_marshal` and `marshal_only` to measure the other boundaries. Before any
 warmup or measured block, the harness compiles the accepted corpus with both engines and compares
-every marshal payload byte-for-byte. That preflight adds startup work and temporarily retains the
-CPython payloads, but it is outside all timed samples; the existing `compiler_core`,
-`compile_marshal`, and `marshal_only` timing boundaries are unchanged. The TSV records the actual
+every marshal payload byte-for-byte. The CPython helper buffers the serialized preflight responses
+until it has consumed all source inputs, then releases that buffer before timing. This temporarily
+adds up to one corpus of marshal payloads to the helper's memory use and avoids blocking the input
+and output pipes against each other. That preflight is outside all timed samples; the existing
+`compiler_core`, `compile_marshal`, and `marshal_only` timing boundaries are unchanged. The TSV records the actual
 Cargo profile, full Serc commit and dirty-diff hash, lockfile and source/filename corpus hashes,
 and the resolved benchmark and Python executable identities.
 
