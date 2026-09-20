@@ -355,9 +355,6 @@ pub(super) struct WithState {
     // Only direct None-condition siblings in the innermost synchronous-with body can reuse a
     // preceding conditional owner. Nested suites and earlier returns use a different layout.
     shifted_sync_with_none_owner_statements: Vec<TextRange>,
-    // Direct optimized Boolean assertions after a prior assertion or branch in the innermost
-    // synchronous-with body. Their dispatch marker is appended outside the manager's owner.
-    pub(super) shifted_sync_with_boolean_dispatch_calls: Vec<TextRange>,
     // Direct terminal-condition siblings in the innermost async-with body can leave the first
     // marker of a later terminal branch outside the manager's exception region.
     shifted_async_with_terminal_owner_statements: Vec<TextRange>,
@@ -578,15 +575,10 @@ pub(super) struct GeneratorState {
     // Avoid rescanning a large code unit for post-suspension comprehension filters.
     pub(super) emitted_yield_value: bool,
     pub(super) generator_expression: bool,
-    // Whether an active generator expression uses only simple-name iteration targets.
-    pub(super) generator_expression_has_simple_targets: bool,
     // Whether an expression is being evaluated as a generator-expression filter. CPython lowers
     // filter conditions before the generator element, so their internal markers do not use the
     // element expression's post-compaction stop-iteration owner rule.
     pub(super) generator_filter_expression: bool,
-    // Whether the current generator expression is the direct argument of an optimized all/any
-    // call with only simple-name targets and no root `not` element.
-    pub(super) generator_expression_boolean_dispatch_eligible: Option<TextRange>,
     // Whether the current expression is the complete value of an ordinary assignment and is an
     // optimized all/any/tuple generator call.
     pub(super) direct_optimized_generator_assignment: bool,
@@ -595,8 +587,6 @@ pub(super) struct GeneratorState {
     pub(super) copy_optimized_tuple_branch_exit: bool,
     // Whether the current expression is being lowered as one atom of a Boolean condition.
     pub(super) optimized_generator_boolean_condition: bool,
-    // Whether the current expression is a later operand of a short-circuit Boolean expression.
-    pub(super) optimized_generator_later_boolean_operand: bool,
     // The direct `all(genexpr)` or `any(genexpr)` test of a message-free coroutine assertion,
     // or the `any(genexpr)` test in a direct `assert not any(...)` with or without a message,
     // before suspension.
@@ -757,13 +747,6 @@ impl ControlFlowState {
             .is_some_and(|context| !context.is_async)
     }
 
-    pub(super) fn current_with_body_start_item(&self) -> Option<usize> {
-        self.withs
-            .active_with_exits
-            .last()
-            .map(|context| context.body_start_item)
-    }
-
     pub(super) fn current_synchronous_with_body_start_item(&self) -> Option<usize> {
         self.withs
             .active_with_exits
@@ -774,13 +757,6 @@ impl ControlFlowState {
 
     pub(super) fn active_with_count(&self) -> usize {
         self.withs.active_with_exits.len()
-    }
-
-    pub(super) fn current_with_suspension_epoch(&self) -> Option<usize> {
-        self.withs
-            .active_with_exits
-            .last()
-            .map(|context| context.suspension_epoch)
     }
 
     pub(super) fn has_with_suspension_epoch(&self, epoch: usize) -> bool {
@@ -26859,12 +26835,6 @@ impl Compiler<'_> {
         } else {
             Vec::new()
         };
-        let shifted_boolean_dispatch_calls =
-            if remaining.is_empty() && self.context.target_specific_rules_enabled() {
-                shifted_sync_with_boolean_dispatch_calls(body)
-            } else {
-                Vec::new()
-            };
         let with_body_start_item = context.body_start_item;
         let (body_noop, region_exclusions) = self.with_region_exclusion_collector(
             |control| &mut control.withs.active_with_region_exclusions,
@@ -26876,25 +26846,11 @@ impl Compiler<'_> {
                         |compiler| {
                             compiler.with_control_override(
                                 |control| {
-                                    &mut control.withs.shifted_sync_with_boolean_dispatch_calls
+                                    &mut control.withs.current_sync_with_boolean_value_marker_scan
                                 },
-                                shifted_boolean_dispatch_calls,
+                                Some(BooleanValueMarkerScan::new(with_body_start_item)),
                                 |compiler| {
-                                    compiler.with_control_override(
-                                        |control| {
-                                            &mut control
-                                                .withs
-                                                .current_sync_with_boolean_value_marker_scan
-                                        },
-                                        Some(BooleanValueMarkerScan::new(with_body_start_item)),
-                                        |compiler| {
-                                            compiler.compile_with_body(
-                                                remaining,
-                                                body,
-                                                following_return,
-                                            )
-                                        },
-                                    )
+                                    compiler.compile_with_body(remaining, body, following_return)
                                 },
                             )
                         },
@@ -34783,56 +34739,6 @@ fn shifted_sync_with_none_owner_statements(body: &[Stmt]) -> Vec<TextRange> {
             .then_some(statement.range)
         })
         .collect()
-}
-
-fn shifted_sync_with_boolean_dispatch_calls(body: &[Stmt]) -> Vec<TextRange> {
-    fn assertion_call(statement: &ruff_python_ast::StmtAssert) -> Option<TextRange> {
-        let (test, negated) = match statement.test.as_ref() {
-            Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => (unary.operand.as_ref(), true),
-            test => (test, false),
-        };
-        let Expr::Call(call) = test else {
-            return None;
-        };
-        matches!(
-            (optimized_generator_callable(call), negated),
-            (Some("all"), false) | (Some("any"), _)
-        )
-        .then_some(call.range)
-    }
-
-    fn collect(body: &[Stmt], shifted: bool, calls: &mut Vec<TextRange>) {
-        let mut shifted = shifted;
-        for statement in body {
-            match statement {
-                Stmt::Assert(statement) => {
-                    if shifted && let Some(call) = assertion_call(statement) {
-                        calls.push(call);
-                    }
-                    shifted = true;
-                }
-                Stmt::If(statement) => {
-                    collect(&statement.body, true, calls);
-                    for clause in &statement.elif_else_clauses {
-                        collect(&clause.body, true, calls);
-                    }
-                    shifted = true;
-                }
-                Stmt::While(statement) => {
-                    collect(&statement.body, true, calls);
-                    collect(&statement.orelse, true, calls);
-                    shifted = true;
-                }
-                Stmt::Match(_) | Stmt::With(_) => shifted = true,
-                Stmt::Try(_) | Stmt::For(_) | Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
-                _ => {}
-            }
-        }
-    }
-
-    let mut calls = Vec::new();
-    collect(body, false, &mut calls);
-    calls
 }
 
 fn shifted_async_with_terminal_owner_statements(body: &[Stmt]) -> Vec<TextRange> {
