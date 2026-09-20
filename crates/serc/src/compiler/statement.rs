@@ -33459,32 +33459,44 @@ fn suite_ends_in_constant_break_loop(body: &[Stmt]) -> bool {
 }
 
 fn suite_contains_loop_break(body: &[Stmt]) -> bool {
+    suite_any_loop_control(body, &mut |statement| matches!(statement, Stmt::Break(_)))
+}
+
+fn suite_contains_loop_continue(body: &[Stmt]) -> bool {
+    suite_any_loop_control(body, &mut |statement| {
+        matches!(statement, Stmt::Continue(_))
+    })
+}
+
+/// Visits control transfers for this loop, including nested loop else suites.
+/// Nested loop bodies and nested scopes have their own control transfers.
+fn suite_any_loop_control(body: &[Stmt], predicate: &mut impl FnMut(&Stmt) -> bool) -> bool {
     body.iter().any(|statement| match statement {
-        Stmt::Break(_) => true,
+        Stmt::Break(_) | Stmt::Continue(_) => predicate(statement),
         Stmt::If(statement) => {
-            suite_contains_loop_break(&statement.body)
+            suite_any_loop_control(&statement.body, predicate)
                 || statement
                     .elif_else_clauses
                     .iter()
-                    .any(|clause| suite_contains_loop_break(&clause.body))
+                    .any(|clause| suite_any_loop_control(&clause.body, predicate))
         }
         Stmt::Try(statement) => {
-            suite_contains_loop_break(&statement.body)
+            suite_any_loop_control(&statement.body, predicate)
                 || statement
                     .handlers
                     .iter()
                     .filter_map(ruff_python_ast::ExceptHandler::as_except_handler)
-                    .any(|handler| suite_contains_loop_break(&handler.body))
-                || suite_contains_loop_break(&statement.orelse)
-                || suite_contains_loop_break(&statement.finalbody)
+                    .any(|handler| suite_any_loop_control(&handler.body, predicate))
+                || suite_any_loop_control(&statement.orelse, predicate)
+                || suite_any_loop_control(&statement.finalbody, predicate)
         }
-        Stmt::With(statement) => suite_contains_loop_break(&statement.body),
+        Stmt::With(statement) => suite_any_loop_control(&statement.body, predicate),
         Stmt::Match(statement) => statement
             .cases
             .iter()
-            .any(|case| suite_contains_loop_break(&case.body)),
-        Stmt::For(statement) => suite_contains_loop_break(&statement.orelse),
-        Stmt::While(statement) => suite_contains_loop_break(&statement.orelse),
+            .any(|case| suite_any_loop_control(&case.body, predicate)),
+        Stmt::For(statement) => suite_any_loop_control(&statement.orelse, predicate),
+        Stmt::While(statement) => suite_any_loop_control(&statement.orelse, predicate),
         Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
         _ => false,
     })
@@ -33549,39 +33561,10 @@ fn is_unfolded_nested_else_return(expression: &Expr) -> bool {
 }
 
 fn suite_contains_multiple_loop_breaks(body: &[Stmt]) -> bool {
-    fn contains(body: &[Stmt], seen_break: &mut bool) -> bool {
-        body.iter().any(|statement| match statement {
-            Stmt::Break(_) => std::mem::replace(seen_break, true),
-            Stmt::If(statement) => {
-                contains(&statement.body, seen_break)
-                    || statement
-                        .elif_else_clauses
-                        .iter()
-                        .any(|clause| contains(&clause.body, seen_break))
-            }
-            Stmt::Try(statement) => {
-                contains(&statement.body, seen_break)
-                    || statement
-                        .handlers
-                        .iter()
-                        .filter_map(ruff_python_ast::ExceptHandler::as_except_handler)
-                        .any(|handler| contains(&handler.body, seen_break))
-                    || contains(&statement.orelse, seen_break)
-                    || contains(&statement.finalbody, seen_break)
-            }
-            Stmt::With(statement) => contains(&statement.body, seen_break),
-            Stmt::Match(statement) => statement
-                .cases
-                .iter()
-                .any(|case| contains(&case.body, seen_break)),
-            Stmt::For(statement) => contains(&statement.orelse, seen_break),
-            Stmt::While(statement) => contains(&statement.orelse, seen_break),
-            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
-            _ => false,
-        })
-    }
-
-    contains(body, &mut false)
+    let mut seen_break = false;
+    suite_any_loop_control(body, &mut |statement| {
+        matches!(statement, Stmt::Break(_)) && std::mem::replace(&mut seen_break, true)
+    })
 }
 
 fn try_handler_starts_with_optimized_boolean_generator(
@@ -33604,37 +33587,6 @@ fn handler_ownerless_optimized_boolean_generator_test(body: &[Stmt]) -> Option<T
     (matches!(optimized_generator_callable(call), Some("all" | "any"))
         && suite_contains_nested_handler_cold_join(&statement.body))
     .then(|| statement.test.range())
-}
-fn suite_contains_loop_continue(body: &[Stmt]) -> bool {
-    body.iter().any(|statement| match statement {
-        Stmt::Continue(_) => true,
-        Stmt::If(statement) => {
-            suite_contains_loop_continue(&statement.body)
-                || statement
-                    .elif_else_clauses
-                    .iter()
-                    .any(|clause| suite_contains_loop_continue(&clause.body))
-        }
-        Stmt::Try(statement) => {
-            suite_contains_loop_continue(&statement.body)
-                || statement
-                    .handlers
-                    .iter()
-                    .filter_map(ruff_python_ast::ExceptHandler::as_except_handler)
-                    .any(|handler| suite_contains_loop_continue(&handler.body))
-                || suite_contains_loop_continue(&statement.orelse)
-                || suite_contains_loop_continue(&statement.finalbody)
-        }
-        Stmt::With(statement) => suite_contains_loop_continue(&statement.body),
-        Stmt::Match(statement) => statement
-            .cases
-            .iter()
-            .any(|case| suite_contains_loop_continue(&case.body)),
-        Stmt::For(statement) => suite_contains_loop_continue(&statement.orelse),
-        Stmt::While(statement) => suite_contains_loop_continue(&statement.orelse),
-        Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
-        _ => false,
-    })
 }
 
 // This coroutine path has the same local blocks as a synchronous terminal-if exit.
