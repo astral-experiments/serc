@@ -341,8 +341,6 @@ pub(super) struct ComprehensionState {
     pub(super) in_comprehension_element: bool,
     // Root conditional filters and multi-generator comprehensions use a distinct owner layout.
     pub(super) filtered_comprehension_has_root_if_expression: bool,
-    // Generic truthiness markers in a direct filtered element normalize against dynamic owner slots.
-    pub(super) force_filtered_comprehension_truth_ownerless: bool,
     direct_comprehension_assignment_results: NameSet,
     // Whether an optimized tuple call is the right operand of a name addition in an inlined
     // comprehension. CPython excludes its dispatch marker from the comprehension's restore range.
