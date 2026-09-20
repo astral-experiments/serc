@@ -390,6 +390,23 @@ def paired_classes(value):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_reordered_or_pattern_captures() {
+        for pattern in [
+            "[left, right] | [right, left]",
+            "[left, right] | [\n            right,\n            left\n        ]",
+            "[left, middle, right] | [right, left, middle] | [middle, right, left]",
+            "{'left': left, 'right': right} | {'left': right, 'right': left}",
+            "Point(left, right) | Point(right, left)",
+            "[left, right] | (left, right)",
+        ] {
+            let source = format!(
+                "def capture(subject):\n    match subject:\n        case {pattern}:\n            return left, right\n"
+            );
+            assert_matches_cpython_marshal(&source, "or_pattern_captures.py");
+        }
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_match_success_next_locations() {
         let source = r"def tuple_result(subject):
     match subject:
