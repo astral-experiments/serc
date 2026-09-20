@@ -22,6 +22,8 @@ pub(super) enum ReferenceMode {
     Forced,
 }
 
+/// Callbacks returning `bool` control whether traversal visits an object's children.
+/// Returning `false` skips children when the object has already been handled as a reference.
 pub(super) trait MarshalVisitor<'a> {
     const USES_METADATA_IDS: bool;
 
@@ -72,12 +74,20 @@ fn traverse_code_with_mode<'a, V>(
     } else {
         None
     };
-    traverse_strings(
-        &code.names,
-        metadata_ids.map(|ids| ids.names.as_slice()),
-        visitor,
-    );
-    traverse_locals(code, metadata_ids.map(|ids| ids.locals.as_slice()), visitor);
+    if visitor.strings(&code.names) {
+        traverse_metadata_strings(
+            &code.names,
+            metadata_ids.map(|ids| ids.names.as_slice()),
+            visitor,
+        );
+    }
+    if visitor.locals(code) {
+        traverse_metadata_strings(
+            &code.locals,
+            metadata_ids.map(|ids| ids.locals.as_slice()),
+            visitor,
+        );
+    }
     visitor.local_kinds(code);
     visitor.metadata_string(&code.filename, metadata_ids.map(|ids| ids.filename));
     visitor.metadata_string(&code.name, metadata_ids.and_then(|ids| ids.name));
@@ -102,38 +112,24 @@ where
     }
 }
 
+/// Visits metadata tuple members in order.
+///
+/// A mismatched hint length disables ID hints for the entire tuple.
 #[inline]
-fn traverse_strings<'a, V>(values: &'a [String], metadata_ids: Option<&[u32]>, visitor: &mut V)
-where
+fn traverse_metadata_strings<'a, V>(
+    values: &'a [String],
+    metadata_ids: Option<&[u32]>,
+    visitor: &mut V,
+) where
     V: MarshalVisitor<'a>,
 {
-    if visitor.strings(values) {
-        if let Some(metadata_ids) = metadata_ids.filter(|ids| ids.len() == values.len()) {
-            for (value, metadata_id) in values.iter().zip(metadata_ids) {
-                visitor.metadata_string(value, Some(*metadata_id));
-            }
-        } else {
-            for value in values {
-                visitor.metadata_string(value, None);
-            }
+    if let Some(metadata_ids) = metadata_ids.filter(|ids| ids.len() == values.len()) {
+        for (value, metadata_id) in values.iter().zip(metadata_ids) {
+            visitor.metadata_string(value, Some(*metadata_id));
         }
-    }
-}
-
-#[inline]
-fn traverse_locals<'a, V>(code: &'a CodeObject, metadata_ids: Option<&[u32]>, visitor: &mut V)
-where
-    V: MarshalVisitor<'a>,
-{
-    if visitor.locals(code) {
-        if let Some(metadata_ids) = metadata_ids.filter(|ids| ids.len() == code.locals.len()) {
-            for (value, metadata_id) in code.locals.iter().zip(metadata_ids) {
-                visitor.metadata_string(value, Some(*metadata_id));
-            }
-        } else {
-            for value in &code.locals {
-                visitor.metadata_string(value, None);
-            }
+    } else {
+        for value in values {
+            visitor.metadata_string(value, None);
         }
     }
 }
