@@ -98,7 +98,7 @@ impl OptimizationPipeline {
                         instruction.opcode = NOP;
                         instruction.set_operand(Operand::Value(0));
                         instruction.location = SourceLocation::NONE;
-                        instruction.no_location_policy.preserve_location();
+                        instruction.no_location_policy.clear_preserved_location();
                     }
                 }
                 let target = self
