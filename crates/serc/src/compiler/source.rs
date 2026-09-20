@@ -250,6 +250,11 @@ impl<'source> CompilationContext<'source> {
     }
 }
 
+/// Tests for the ASCII dunder substring without constructing a generic string searcher.
+fn has_double_underscore(name: &str) -> bool {
+    name.as_bytes().windows(2).any(|pair| pair == b"__")
+}
+
 fn parser_interned_strings(
     body: &Suite,
     generated_mangled_strings: &mut FxHashSet<String>,
@@ -292,7 +297,7 @@ fn parser_interned_strings(
             if !self.origins.contains_key(name) {
                 self.origins.insert(name.to_string(), AtomicU8::default());
             }
-            if name.contains("__") {
+            if has_double_underscore(name) {
                 self.restricted_private_identifier |= self.mangled_names.is_some();
                 self.raw_private_identifiers.insert(name.to_string());
                 let mangled = self.mangled_name(name);
@@ -1530,6 +1535,73 @@ fn python_string_repr(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_identifier_dunder_matches_adjacent_ascii_underscores() {
+        for (name, expected) in [
+            ("", false),
+            ("_", false),
+            ("plain", false),
+            ("under_score", false),
+            ("_on_both_sides_", false),
+            ("__", true),
+            ("___", true),
+            ("__private", true),
+            ("_Café__already", true),
+            ("trailing__", true),
+            ("_é_", false),
+            ("名__字", true),
+            ("＿_", false),
+            ("_＿", false),
+            ("＿＿", false),
+        ] {
+            assert_eq!(has_double_underscore(name), expected, "{name:?}");
+        }
+
+        let alphabet = ["", "_", "a", "é", "名", "＿"];
+        for first in alphabet {
+            for second in alphabet {
+                for third in alphabet {
+                    for fourth in alphabet {
+                        let name = [first, second, third, fourth].concat();
+                        assert_eq!(
+                            has_double_underscore(&name),
+                            name.contains("__"),
+                            "{name:?}"
+                        );
+                    }
+                }
+            }
+        }
+        let mut name = "letters_and_é".repeat(64);
+        assert!(!has_double_underscore(&name));
+        name.push_str("__end");
+        assert!(has_double_underscore(&name));
+    }
+
+    #[test]
+    fn parser_dunders_preserve_raw_and_generated_mangled_identities() {
+        let parsed = ruff_python_parser::parse_module(
+            "class Café:\n    def f(self):\n        self.__secret\n        self.__already\n        self._Café__already\n        self.élan\n        self.ends_\n",
+        )
+        .unwrap();
+        let mut generated = FxHashSet::default();
+        let mut requires_trace = false;
+        let origins = parser_interned_strings(parsed.suite(), &mut generated, &mut requires_trace);
+        for raw in [
+            "Café",
+            "__secret",
+            "__already",
+            "_Café__already",
+            "élan",
+            "ends_",
+        ] {
+            assert!(origins.contains_key(raw), "{raw:?}");
+        }
+        assert!(generated.contains("_Café__secret"));
+        assert!(!generated.contains("_Café__already"));
+        assert!(requires_trace);
+    }
 
     #[test]
     fn finishing_module_string_provenance_moves_exclusive_keys_and_preserves_shared_context() {
