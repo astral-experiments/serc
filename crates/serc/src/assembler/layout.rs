@@ -568,18 +568,17 @@ pub(super) fn label_position(labels: &[Option<u32>], label: Label) -> Option<u32
         .flatten()
 }
 
+/// Writes a source span as location entries covering at most eight code units each.
 fn write_location_run(
     output: &mut Vec<u8>,
     location: SourceLocation,
     mut length: u32,
     current_line: &mut i32,
 ) {
-    while length > 8 {
-        write_location(output, location, 8, current_line);
-        length -= 8;
-    }
-    if length > 0 {
-        write_location(output, location, length, current_line);
+    while length > 0 {
+        let run_length = length.min(8);
+        write_location(output, location, run_length, current_line);
+        length -= run_length;
     }
 }
 
@@ -642,12 +641,9 @@ fn location_start(code: i32, length: u32) -> u8 {
     0x80 | (code << 3) | (length - 1)
 }
 
+/// Encodes a location-table line delta with a low sign bit and a shifted unsigned magnitude.
 fn write_signed_varint(output: &mut Vec<u8>, value: i32) {
-    let value = if value < 0 {
-        ((0_u32.wrapping_sub(value.cast_unsigned())) << 1) | 1
-    } else {
-        value.cast_unsigned() << 1
-    };
+    let value = (value.unsigned_abs() << 1) | u32::from(value < 0);
     write_varint(output, value);
 }
 
