@@ -508,6 +508,32 @@ struct UncompactedPrefixIndexes {
     targets: FxHashSet<Label>,
 }
 
+/// Item and instruction positions for labels that occur exactly once.
+struct UniqueLabelPositions(FxHashMap<Label, Option<(usize, usize)>>);
+
+impl UniqueLabelPositions {
+    fn new(items: &[Item]) -> Self {
+        let mut positions = FxHashMap::default();
+        let mut instruction_index = 0;
+        for (item_index, item) in items.iter().enumerate() {
+            match item {
+                Item::Label(label) => {
+                    positions
+                        .entry(*label)
+                        .and_modify(|position| *position = None)
+                        .or_insert(Some((item_index, instruction_index)));
+                }
+                Item::Instruction(_) => instruction_index += 1,
+            }
+        }
+        Self(positions)
+    }
+
+    fn get(&self, label: Label) -> Option<(usize, usize)> {
+        self.0.get(&label).copied().flatten()
+    }
+}
+
 impl ExceptionOwnerProvenance {
     /// Retires an async entry before erased labels can migrate to another live array.
     pub(super) fn retire_async_with_setup(&mut self, label: Label) {
@@ -525,7 +551,11 @@ impl ExceptionOwnerProvenance {
     }
 
     /// Finds unchanged For target stores with exactly their original tracing NOP removed.
-    fn original_for_target_prefix_positions(&self, items: &[Item]) -> FxHashMap<usize, usize> {
+    fn original_for_target_prefix_positions(
+        &self,
+        items: &[Item],
+        unique_labels: &OnceCell<UniqueLabelPositions>,
+    ) -> FxHashMap<usize, usize> {
         self.for_target_owner_prefixes
             .iter()
             .filter_map(|(entry, store)| {
@@ -537,26 +567,25 @@ impl ExceptionOwnerProvenance {
                 {
                     return None;
                 }
-                let mut entries = items.iter().enumerate().filter_map(|(index, item)| {
-                    (*item == Item::Label(*entry)).then_some(index)
-                });
-                let index = entries.next()?;
-                if entries.next().is_some() {
-                    return None;
-                }
+                let (index, position) = unique_labels
+                    .get_or_init(|| UniqueLabelPositions::new(items))
+                    .get(*entry)?;
                 let mut expected = *store;
                 expected.local_policy.add_hidden_exception_owner_slots(1);
                 if !matches!(items.get(index + 1), Some(Item::Instruction(actual)) if *actual == expected) {
                     return None;
                 }
-                let position = items[..index].iter().filter(|item| matches!(item, Item::Instruction(_))).count();
                 Some((position, position))
             })
             .collect()
     }
 
     /// Locates complete unchanged Boolean expansions at their unique original labels.
-    fn original_value_jump_positions(&self, items: &[Item]) -> FxHashMap<Label, usize> {
+    fn original_value_jump_positions(
+        &self,
+        items: &[Item],
+        unique_labels: &OnceCell<UniqueLabelPositions>,
+    ) -> FxHashMap<Label, usize> {
         self.original_value_jump_prefixes
             .iter()
             .filter_map(|(entry, prefix)| {
@@ -583,14 +612,10 @@ impl ExceptionOwnerProvenance {
                 {
                     return None;
                 }
-                let mut entries = items
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, item)| (*item == Item::Label(*entry)).then_some(index));
-                let start = entries.next()?;
-                if entries.next().is_some()
-                    || items.get(start..start.checked_add(prefix.len())?)? != prefix.as_slice()
-                {
+                let (start, position) = unique_labels
+                    .get_or_init(|| UniqueLabelPositions::new(items))
+                    .get(*entry)?;
+                if items.get(start..start.checked_add(prefix.len())?)? != prefix.as_slice() {
                     return None;
                 }
                 let records = prefix
@@ -610,13 +635,7 @@ impl ExceptionOwnerProvenance {
                     && matches!(condition.operand(), Operand::Forward(_))
                     && marker.opcode == NOT_TAKEN
                     && marker.exception_policy() == super::ExceptionPolicy::NoneDynamic)
-                    .then(|| {
-                        let position = items[..start]
-                            .iter()
-                            .filter(|item| matches!(item, Item::Instruction(_)))
-                            .count();
-                        (*entry, position + 3)
-                    })
+                    .then(|| (*entry, position + 3))
             })
             .collect()
     }
@@ -1965,6 +1984,13 @@ impl LayoutAssembler {
         label_positions: &FxHashMap<Label, usize>,
     ) -> FxHashMap<usize, Option<usize>> {
         let mut result = FxHashMap::default();
+        if self
+            .exception_owner_provenance
+            .retained_normal_pop_blocks
+            .is_empty()
+        {
+            return result;
+        }
         for (entry, origin) in self.items.iter().filter_map(|item| {
             let Item::Label(entry) = item else {
                 return None;
@@ -2550,17 +2576,11 @@ impl LayoutAssembler {
         result
     }
 
-    /// Identifies SETUP records that still occupy their authored one-instruction ranges.
+    #[cfg(test)]
     pub(super) fn retained_setup_nops(
         &self,
         label_positions: &FxHashMap<Label, usize>,
     ) -> FxHashSet<usize> {
-        let setup_locations: Vec<_> = self
-            .exception_owner_provenance
-            .setups
-            .iter()
-            .filter_map(|(label, location)| Some((*label_positions.get(label)?, (*location)?)))
-            .collect();
         let instructions: Vec<_> = self
             .items
             .iter()
@@ -2568,6 +2588,24 @@ impl LayoutAssembler {
                 Item::Instruction(instruction) => Some(instruction),
                 Item::Label(_) => None,
             })
+            .collect();
+        self.retained_setup_nops_with_instructions(label_positions, &instructions)
+    }
+
+    /// Identifies SETUP records that still occupy their authored one-instruction ranges.
+    fn retained_setup_nops_with_instructions(
+        &self,
+        label_positions: &FxHashMap<Label, usize>,
+        instructions: &[&Instruction],
+    ) -> FxHashSet<usize> {
+        if self.exception_owner_provenance.setup_nop_ranges.is_empty() {
+            return FxHashSet::default();
+        }
+        let setup_locations: Vec<_> = self
+            .exception_owner_provenance
+            .setups
+            .iter()
+            .filter_map(|(label, location)| Some((*label_positions.get(label)?, (*location)?)))
             .collect();
         self.exception_owner_provenance
             .setup_nop_ranges
@@ -4058,10 +4096,10 @@ impl LayoutAssembler {
         {
             return FxHashMap::default();
         }
-        let threaded_conditions = self.threaded_condition_positions();
+        let unique_labels = OnceCell::new();
         let original_value_jump_positions = self
             .exception_owner_provenance
-            .original_value_jump_positions(&self.items);
+            .original_value_jump_positions(&self.items, &unique_labels);
         let original_async_with_setups = self.original_async_with_setups();
         let setups: FxHashMap<_, _> = self
             .exception_owner_provenance
@@ -4089,6 +4127,7 @@ impl LayoutAssembler {
                 }
             }
         }
+        let threaded_conditions = self.threaded_condition_positions(&indexed_instructions);
         let original_uniform_folds = self
             .exception_owner_provenance
             .original_uniform_fold_positions(&indexed_instructions);
@@ -4104,12 +4143,10 @@ impl LayoutAssembler {
                     || restore.exception_policy() != super::ExceptionPolicy::NoneUnchanged
                     || restore.local_policy.hidden_exception_owner_slots() != 0
                     || restore.pre_fold_extra_instructions() != 0
-                    || self
-                        .items
-                        .iter()
-                        .filter(|item| **item == Item::Label(*entry))
-                        .count()
-                        != 1
+                    || unique_labels
+                        .get_or_init(|| UniqueLabelPositions::new(&self.items))
+                        .get(*entry)
+                        .is_none()
                 {
                     return None;
                 }
@@ -4124,8 +4161,9 @@ impl LayoutAssembler {
             .collect::<FxHashMap<_, _>>();
         let for_target_prefixes = self
             .exception_owner_provenance
-            .original_for_target_prefix_positions(&self.items);
-        let retained_setup_nops = self.retained_setup_nops(&label_positions);
+            .original_for_target_prefix_positions(&self.items, &unique_labels);
+        let retained_setup_nops =
+            self.retained_setup_nops_with_instructions(&label_positions, &indexed_instructions);
         // An original entry prefix with no SETUP, region, or policy owner can
         // supply only NULL records, including its certified early-folded slots.
         let null_original_entry_prefix =
@@ -4816,12 +4854,10 @@ impl LayoutAssembler {
                                 .normal_try_copy_pop_ranges
                                 .iter()
                                 .any(|(start, end)| start == label || end == label)
-                            && self
-                                .items
-                                .iter()
-                                .filter(|item| **item == Item::Label(*label))
-                                .count()
-                                == 1
+                            && unique_labels
+                                .get_or_init(|| UniqueLabelPositions::new(&self.items))
+                                .get(*label)
+                                .is_some()
                             && ((indexed_instructions
                                 .get(instruction_index + 2)
                                 .is_some_and(|marker| marker.opcode == NOT_TAKEN)
@@ -5439,12 +5475,10 @@ impl LayoutAssembler {
                             if *instruction == expected
                                 && label_positions.get(&origin.entry) == Some(&original_array_start)
                                 && provenance.block_boundaries.contains(&origin.entry)
-                                && self
-                                    .items
-                                    .iter()
-                                    .filter(|item| **item == Item::Label(origin.entry))
-                                    .count()
-                                    == 1
+                                && unique_labels
+                                    .get_or_init(|| UniqueLabelPositions::new(&self.items))
+                                    .get(origin.entry)
+                                    .is_some()
                                 && indexed_instructions
                                     .iter()
                                     .filter(|candidate| ***candidate == expected)
@@ -8545,19 +8579,21 @@ impl LayoutAssembler {
             }
         }
         let certified = self.uncompacted_conditional_null_markers(&jump_targets);
-        for marker in 0..instruction_index {
-            if !certified.contains(&marker) {
-                continue;
+        if !certified.is_empty() {
+            for marker in 0..instruction_index {
+                if !certified.contains(&marker) {
+                    continue;
+                }
+                owners.insert(
+                    marker,
+                    ExceptionOwnerDecision {
+                        has_owner: false,
+                        source_region: None,
+                        definitive: true,
+                        override_existing: true,
+                    },
+                );
             }
-            owners.insert(
-                marker,
-                ExceptionOwnerDecision {
-                    has_owner: false,
-                    source_region: None,
-                    definitive: true,
-                    override_existing: true,
-                },
-            );
         }
         owners.extend(self.normal_try_break_pop_owners(&label_positions, &jump_targets));
         // The generic fresh-array rule cannot see this pair of omitted POPs.
@@ -10523,19 +10559,14 @@ impl LayoutAssembler {
     }
 
     /// Finds unchanged, unambiguous terminal pairs from the actual threading pass.
-    fn threaded_condition_positions(&self) -> FxHashMap<usize, NormalizedExceptionOwner> {
+    fn threaded_condition_positions(
+        &self,
+        instructions: &[&Instruction],
+    ) -> FxHashMap<usize, NormalizedExceptionOwner> {
         let origins = &self.exception_owner_provenance.threaded_condition_origins;
         if origins.is_empty() {
             return FxHashMap::default();
         }
-        let instructions = self
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction) => Some(*instruction),
-                Item::Label(_) => None,
-            })
-            .collect::<Vec<_>>();
         origins
             .iter()
             .filter_map(|origin| {
@@ -10558,7 +10589,7 @@ impl LayoutAssembler {
                 let mut matches = instructions
                     .windows(2)
                     .enumerate()
-                    .filter(|(_, pair)| pair[0] == origin.0 && pair[1] == origin.1);
+                    .filter(|(_, pair)| *pair[0] == origin.0 && *pair[1] == origin.1);
                 let (position, _) = matches.next()?;
                 if matches.next().is_some() {
                     return None;
@@ -10648,6 +10679,8 @@ mod tests {
 
     #[test]
     fn for_target_owner_prefix_requires_the_exact_surviving_entry() {
+        use std::cell::OnceCell;
+
         use super::ExceptionOwnerProvenance;
         use crate::assembler::{
             ExceptionPolicy, Instruction, Item, Label, Operand, SourceLocation,
@@ -10722,7 +10755,8 @@ mod tests {
                 _ => {}
             }
 
-            let positions = provenance.original_for_target_prefix_positions(&items);
+            let positions =
+                provenance.original_for_target_prefix_positions(&items, &OnceCell::new());
             let expected = if case == "valid" {
                 [(2, 2)].into_iter().collect()
             } else {

@@ -504,6 +504,66 @@ impl Assembler {
             && assertion_constant_indices(items, LOAD_CONST, &mut []).unwrap_or(false)
     }
 
+    /// Recognizes a constant return with no CFG or instruction-policy metadata to replay.
+    pub(in crate::assembler) fn has_only_linear_constant_return(&self) -> bool {
+        let UnoptimizedCode::Linear(items) = &self.code else {
+            return false;
+        };
+        let (resume, nop, load, ret) = match items.as_slice() {
+            [
+                Item::Instruction(resume),
+                Item::Instruction(load),
+                Item::Instruction(ret),
+            ] => (resume, None, load, ret),
+            [
+                Item::Instruction(resume),
+                Item::Instruction(nop),
+                Item::Instruction(load),
+                Item::Instruction(ret),
+            ] => (resume, Some(nop), load, ret),
+            _ => return false,
+        };
+        let ordinary = |instruction: &Instruction, opcode, operand| {
+            *instruction
+                == Instruction::new(
+                    opcode,
+                    operand,
+                    instruction.location,
+                    instruction.depth_after(),
+                )
+        };
+        let Operand::Value(argument) = load.operand() else {
+            return false;
+        };
+        if !matches!(load.opcode, LOAD_CONST | LOAD_SMALL_INT)
+            || !ordinary(resume, RESUME, Operand::Value(0))
+            || !ordinary(load, load.opcode, Operand::Value(argument))
+            || !ordinary(ret, RETURN_VALUE, Operand::Value(0))
+            || nop
+                .is_some_and(|nop| nop.location.line < 0 || !ordinary(nop, NOP, Operand::Value(0)))
+        {
+            return false;
+        }
+
+        // Zero allocated labels rules out emitted, removed, and metadata-only CFG entries.
+        // The remaining provenance below can identify instruction locations without a label.
+        let provenance = &self.exception_owner_provenance;
+        self.next_label == 0
+            && self.exception_regions.is_empty()
+            && self.preserved_block_boundaries.is_empty()
+            && self.borrow_unreachable_blocks.is_empty()
+            && self.borrow_omitted_for_backedges.is_empty()
+            && self.folded_loop_exit_anchors.is_empty()
+            && !self.has_synthesized_percent_target_locations
+            && !self.has_next_location
+            && provenance.omitted_nop_tail.is_none()
+            && provenance.noop_finally_locations.is_empty()
+            && provenance.with_context_locations.is_empty()
+            && provenance.uniform_fold_owner_slots.is_empty()
+            && provenance.original_uniform_folds.is_empty()
+            && provenance.copied_finally_iterator_returns.is_empty()
+    }
+
     fn push_linear_item(&mut self, item: Item) {
         let UnoptimizedCode::Linear(items) = &mut self.code else {
             panic!("linear instructions are unavailable after constant reachability analysis");

@@ -665,26 +665,33 @@ impl OptimizationPipeline {
                 let Some((_, copy)) = following.next() else {
                     continue;
                 };
+                if copy.opcode != COPY || !matches!(copy.operand(), Operand::Value(1)) {
+                    continue;
+                }
                 let Some((_, to_bool)) = following.next() else {
                     continue;
                 };
+                if to_bool.opcode != TO_BOOL {
+                    continue;
+                }
                 let Some((_, jump)) = following.next() else {
                     continue;
                 };
+                if !matches!(jump.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+                    || !matches!(jump.operand(), Operand::Forward(_))
+                {
+                    continue;
+                }
                 let Some((_, not_taken)) = following.next() else {
                     continue;
                 };
+                if not_taken.opcode != NOT_TAKEN {
+                    continue;
+                }
                 let Some((fallthrough_index, pop)) = following.next() else {
                     continue;
                 };
-                if copy.opcode != COPY
-                    || !matches!(copy.operand(), Operand::Value(1))
-                    || to_bool.opcode != TO_BOOL
-                    || !matches!(jump.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
-                    || !matches!(jump.operand(), Operand::Forward(_))
-                    || not_taken.opcode != NOT_TAKEN
-                    || pop.opcode != POP_TOP
-                {
+                if pop.opcode != POP_TOP {
                     continue;
                 }
                 let target = &mut conditional_targets
