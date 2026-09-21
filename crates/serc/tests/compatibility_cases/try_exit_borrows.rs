@@ -5092,3 +5092,45 @@ fn loop_try_continue_break_live_tail_control() {
     );
     common::assert_matches_cpython_marshal(&source, "loop_try_continue_break_live_tail_control.py");
 }
+
+#[test]
+fn matches_cpython_terminal_assertion_handler_borrow_entries() {
+    for handler in ["except Exception:", "except Exception as error:", "except:"] {
+        for assertion in [
+            "assert False",
+            "assert False, 'unreachable'",
+            "assert 0",
+            "assert ()",
+            "assert flag",
+            "raise RuntimeError",
+        ] {
+            let source = format!(
+                "def f(value, flag):
+    try:
+        result = work(value)
+    {handler}
+        report(value)
+        {assertion}
+    assert valid(result)
+    report(value)
+    return result
+"
+            );
+            common::assert_matches_cpython_marshal(&source, "terminal_assert_handler_entry.py");
+        }
+    }
+    for following in ["return result", "raise RuntimeError"] {
+        let source = format!(
+            "def f(value, flag):
+    try:
+        result = work(value)
+    except Exception:
+        if flag:
+            report(value)
+        assert False
+    {following}
+"
+        );
+        common::assert_matches_cpython_marshal(&source, "terminal_assert_handler_small_exit.py");
+    }
+}

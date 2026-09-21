@@ -20421,7 +20421,9 @@ impl Compiler<'_> {
                         .current_statement_followed_by_return_or_raise
                     && statement.handlers.iter().any(|handler| {
                         handler.as_except_handler().is_some_and(|handler| {
-                            matches!(handler.body.as_slice(), [Stmt::Assert(assertion)]
+                            // A preceding handler statement cannot make the folded
+                            // assertion's success/cleanup array reachable.
+                            matches!(handler.body.last(), Some(Stmt::Assert(assertion))
                                 if early_condition_truthiness(&assertion.test) == Some(false))
                         })
                     }))
