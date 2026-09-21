@@ -5169,3 +5169,52 @@ fn matches_cpython_partial_terminal_match_handler_borrow_entries() {
         }
     }
 }
+
+#[test]
+fn preserves_copied_pass_recovery_borrow_fallthrough_and_independent_jumps() {
+    let source = r"def f(flag, value):
+    try:
+        current = lookup(value)
+    except LookupError:
+        try:
+            current = lookup(value)
+        except LookupError:
+            pass
+    else:
+        if flag:
+            try:
+                try:
+                    change(value)
+                except ValueError:
+                    try:
+                        fallback(value)
+                    except ValueError:
+                        raise
+                reset(value)
+            except AttributeError as error:
+                report(error)
+    consume(value)
+    return value
+";
+    for terminal in ["raise", "pass", "report(value)"] {
+        common::assert_matches_cpython_marshal(
+            &source.replace(
+                "                        raise",
+                &format!("                        {terminal}"),
+            ),
+            "copied_pass_recovery_entry.py",
+        );
+    }
+    let live_bypass = source.replace(
+        "                try:
+                    change(value)
+                except ValueError:
+                    try:
+                        fallback(value)
+                    except ValueError:
+                        raise
+",
+        "                change(value)\n",
+    );
+    common::assert_matches_cpython_marshal(&live_bypass, "copied_pass_recovery_live_bypass.py");
+}

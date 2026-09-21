@@ -18266,6 +18266,54 @@ impl Compiler<'_> {
                 .as_except_handler()
                 .is_some_and(|handler| suite_contains_orphan_cold_cleanup(&handler.body))
         });
+        // Copying a nested pass-only recovery empties the enclosing unnamed
+        // handler's original cleanup. Cold ordering leaves that orphan after the
+        // normal else-exit NOP. Only independent live jumps can bypass it.
+        let handler_has_copied_pass_recovery = borrow_exit_has_source_successor
+            && !statement.is_star
+            && statement.finalbody.is_empty()
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && !self
+                .control
+                .statements
+                .current_statement_followed_by_return_or_raise
+            && suite_has_linear_borrow_fallthrough(&statement.body)
+            && matches!(statement.orelse.as_slice(), [Stmt::If(guard)]
+                if guard.elif_else_clauses.is_empty()
+                    && condition_has_only_runtime_tests(&guard.test)
+                    && !expression_contains_inline_branch(&guard.test)
+                    && !expression_suspends_current_scope(&guard.test))
+            && matches!(statement.handlers.as_slice(), [handler]
+            if handler.as_except_handler().is_some_and(|handler| {
+                handler.name.is_none()
+                    && handler.type_.as_ref().is_some_and(|type_| {
+                        !expression_contains_inline_branch(type_)
+                            && !expression_suspends_current_scope(type_)
+                    })
+                    && matches!(handler.body.as_slice(), [Stmt::Try(recovery)]
+                        if !recovery.is_star
+                            && recovery.orelse.is_empty()
+                            && recovery.finalbody.is_empty()
+                            && suite_has_linear_borrow_fallthrough(&recovery.body)
+                            && matches!(recovery.handlers.as_slice(), [handler]
+                                if handler.as_except_handler().is_some_and(|handler| {
+                                    handler.name.is_none()
+                                        && handler.type_.as_ref().is_some_and(|type_| {
+                                            !expression_contains_inline_branch(type_)
+                                                && !expression_suspends_current_scope(type_)
+                                        })
+                                        && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+                                })))
+            }));
         // A runtime while in a bare-name cleanup joins its false edge with
         // authored breaks. Copying that cleanup leaves its original cold exit
         // empty; relocating the handler must not reconnect normal borrowing.
@@ -20452,6 +20500,7 @@ impl Compiler<'_> {
                     && self.control.withs.active_with_exits.is_empty()
                     && !following_name_return_has_noncopyable_cleanup))
                 || handler_has_orphan_cold_cleanup
+                || handler_has_copied_pass_recovery
                 || handler_has_runtime_while_break_cleanup
                 || recovery_value_match_loop
                 || named_handler_cleanup_suffix
