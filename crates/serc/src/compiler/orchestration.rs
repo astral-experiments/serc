@@ -132,6 +132,7 @@ impl<'source> Compiler<'source> {
             symbols,
             control: ControlFlowState::default(),
             assembler,
+            native_label_plan: None,
         }
     }
 
@@ -486,15 +487,20 @@ impl<'source> Compiler<'source> {
             if expression.value.is_string_literal_expr());
         let body = if let Some(Stmt::Expr(expression)) = body.first() {
             if let Expr::StringLiteral(string) = expression.value.as_ref() {
-                let constant = self.add_constant(Constant::String(
-                    if self.context.python_version == PythonVersion::Py312 {
-                        string.value.to_str().to_string()
+                let constant =
+                    self.add_constant(if self.context.python_version == PythonVersion::Py312 {
+                        self.string_literal_constant(string)
                     } else {
-                        clean_doc(string.value.to_str())
-                    },
-                ))?;
-                self.assembler
-                    .set_location(self.source_location(expression.range));
+                        Constant::String(clean_doc(string.value.to_str()))
+                    })?;
+                let location = if self.context.python_version <= PythonVersion::Py313 {
+                    // Native docstring loads use the literal expression, excluding
+                    // parentheses belonging to the enclosing expression statement.
+                    self.source_location(string.range)
+                } else {
+                    self.source_location(expression.range)
+                };
+                self.assembler.set_location(location);
                 self.emit(LOAD_CONST, constant, 1)?;
                 if self.context.python_version == PythonVersion::Py312 {
                     self.assembler.set_location(SourceLocation::NONE);
@@ -557,12 +563,22 @@ impl<'source> Compiler<'source> {
         body: &Suite,
     ) -> Result<CodeObject, CompileError> {
         self.assembler.reserve_items(body.len().saturating_mul(16));
+        if self.context.python_version == PythonVersion::Py312 {
+            self.native_label_plan = super::legacy_native_labels::NativeLabelPlan::function(
+                body,
+                self.unit.flags & CO_COROUTINE != 0,
+            );
+        }
         self.emit_function_prologue()?;
         if self.context.python_version == PythonVersion::Py312 {
             // CPython 3.12 starts a separate body block even for ordinary functions.
             // A same-line `pass` must not inherit RESUME's synthetic 0:0 span.
             let body_entry = self.assembler.label();
             self.assembler.mark(body_entry);
+            self.bind_native_source_label(
+                super::legacy_native_labels::NativeRole::FunctionStart,
+                body_entry,
+            );
             self.assembler
                 .record_exception_owner_block_boundary(body_entry);
         }
@@ -576,13 +592,11 @@ impl<'source> Compiler<'source> {
             if expression.value.is_string_literal_expr());
         let body = if let Some(Stmt::Expr(expression)) = body.first() {
             if let Expr::StringLiteral(string) = expression.value.as_ref() {
-                self.add_constant(Constant::String(
-                    if self.context.python_version == PythonVersion::Py312 {
-                        string.value.to_str().to_string()
-                    } else {
-                        clean_doc(string.value.to_str())
-                    },
-                ))?;
+                self.add_constant(if self.context.python_version == PythonVersion::Py312 {
+                    self.string_literal_constant(string)
+                } else {
+                    Constant::String(clean_doc(string.value.to_str()))
+                })?;
                 if self.has_deferred_annotations() {
                     self.unit.flags |= CO_HAS_DOCSTRING;
                 }
@@ -718,15 +732,20 @@ impl<'source> Compiler<'source> {
             if expression.value.is_string_literal_expr());
         let body = if let Some(Stmt::Expr(expression)) = body.first() {
             if let Expr::StringLiteral(string) = expression.value.as_ref() {
-                let docstring = self.add_constant(Constant::String(
-                    if self.context.python_version == PythonVersion::Py312 {
-                        string.value.to_str().to_string()
+                let docstring =
+                    self.add_constant(if self.context.python_version == PythonVersion::Py312 {
+                        self.string_literal_constant(string)
                     } else {
-                        clean_doc(string.value.to_str())
-                    },
-                ))?;
-                self.assembler
-                    .set_location(self.source_location(expression.range));
+                        Constant::String(clean_doc(string.value.to_str()))
+                    })?;
+                let location = if self.context.python_version <= PythonVersion::Py313 {
+                    // Native docstring loads use the literal expression, excluding
+                    // parentheses belonging to the enclosing expression statement.
+                    self.source_location(string.range)
+                } else {
+                    self.source_location(expression.range)
+                };
+                self.assembler.set_location(location);
                 self.emit(LOAD_CONST, docstring, 1)?;
                 if self.context.python_version == PythonVersion::Py312 {
                     // Native leaves the artificial docstring store unlocated until
@@ -890,6 +909,10 @@ impl<'source> Compiler<'source> {
         if let Some(start) = self.control.generators.generator_region_start {
             self.assembler.record_exception_setup(start, false);
             let handler = self.assembler.label();
+            self.bind_native_source_label(
+                super::legacy_native_labels::NativeRole::StopIterationHandler,
+                handler,
+            );
             self.assembler.mark(handler);
             let mut region_start = start;
             for (exclusion_start, exclusion_end) in
@@ -941,6 +964,7 @@ impl<'source> Compiler<'source> {
             let index = self.name_index(&name)?;
             self.assembler.patch_argument(instruction, index)?;
         }
+        self.certify_native_source_labels();
         self.assembler.resolve_operand_patches()?;
         self.assembler.optimize_constant_pops();
         if self.has_deferred_annotations() {

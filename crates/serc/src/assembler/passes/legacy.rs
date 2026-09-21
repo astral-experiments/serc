@@ -11,8 +11,8 @@ use super::super::{
 use crate::target::opcodes::{
     COMPARE_OP, CONTAINS_OP, COPY, IS_OP, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD,
     LOAD_CLOSURE, LOAD_CONST, LOAD_FAST, LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, NOP, POP_TOP, PUSH_NULL,
-    RETURN_GENERATOR, STORE_FAST, STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST, TO_BOOL, UNARY_NOT,
-    YIELD_VALUE,
+    RETURN_GENERATOR, RETURN_VALUE, STORE_FAST, STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST,
+    TO_BOOL, UNARY_NOT, YIELD_VALUE,
 };
 use crate::target::{is_conditional_jump_for, is_unconditional_jump};
 use crate::{CompileError, PythonVersion};
@@ -74,9 +74,18 @@ impl Assembler {
                 Item::Instruction(_) => None,
             })
             .collect::<FxHashMap<_, _>>();
+        // CPython installs one outer SETUP_CLEANUP for the entire generator or
+        // coroutine before labeling YIELD_VALUE. Later owner exclusions can split,
+        // overlap, or omit that fallback range without changing its stack slot.
+        let scope_depth = usize::from(
+            self.exception_regions
+                .iter()
+                .any(|region| region.is_scope_fallback),
+        );
         let regions = self
             .exception_regions
             .iter()
+            .filter(|region| !region.is_scope_fallback)
             .filter_map(|region| {
                 let start = *labels.get(&region.start)?;
                 let end = *labels.get(&region.end)?;
@@ -96,10 +105,13 @@ impl Assembler {
                 let owners = regions
                     .iter()
                     .filter(|(start, end, _)| *start <= index && index < *end)
-                    .map(|(_, _, owner)| *owner)
+                    // Copied finalizers can add overlapping ranges with distinct
+                    // origins for the same handler. They represent one active SETUP.
+                    .map(|(_, _, (_, target))| *target)
                     .collect::<FxHashSet<_>>();
                 instruction.set_operand(Operand::Value(
-                    u32::try_from(owners.len()).expect("exception nesting fits in an operand"),
+                    u32::try_from(owners.len() + scope_depth)
+                        .expect("exception nesting fits in an operand"),
                 ));
             }
         }
@@ -110,26 +122,38 @@ impl OptimizationPipeline {
     /// Runs the pre-3.14 CFG schedule before preparing target-specific instruction layout.
     pub(super) fn optimize_legacy(
         mut self,
+        first_line_number: u32,
         local_count: usize,
         parameter_count: usize,
         mut constants: Option<&mut dyn ConstantTable>,
     ) -> Result<LayoutAssembler, CompileError> {
         let original_arrays = self.legacy_instruction_arrays();
+        self.initialize_legacy_native_jump_seeds();
+        self.reject_unmodeled_empty_native_jump_targets();
         self.preserve_legacy_setup_nops();
+        if self.python_version == PythonVersion::Py313 {
+            // Capture folded paths through original manager cleanup and dead tails
+            // before pruning erases their successor jumps. Native resolves the
+            // shared POP_BLOCK before folding those constant-loop predecessors.
+            self.preserve_folded_pop_block_locations();
+        }
         self.inline_legacy_exit_blocks(&original_arrays, true);
         if self.python_version == PythonVersion::Py313 {
             self.remove_unreachable_instructions();
-            self.resolve_legacy_locations(self.legacy_predecessors());
+            let predecessors = self.legacy_predecessors_before_folding(&original_arrays);
+            self.resolve_legacy_locations(predecessors);
         }
         if let Some(constants) = constants.as_mut() {
             self.optimize_legacy_load_constants(&mut **constants)?;
             self.optimize_legacy_constant_tuples(&mut **constants)?;
         }
         self.optimize_legacy_adjacent_instructions();
+        self.reject_unmodeled_empty_native_jump_targets();
         self.thread_legacy_jumps();
         let (swap_blocks, capture_cleanup_swaps, _) = self.optimize_swap_runs();
         self.apply_static_swaps((swap_blocks, capture_cleanup_swaps));
         self.remove_legacy_nops_and_pairs(&original_arrays);
+        self.reject_unmodeled_empty_native_jump_targets();
         if self.python_version == PythonVersion::Py312 {
             self.inline_legacy_exit_blocks(&original_arrays, false);
         }
@@ -171,10 +195,11 @@ impl OptimizationPipeline {
                 )
             })
             .collect::<Vec<_>>();
-        // Native cold relocation leaves newly inserted bridge blocks with zero
-        // predecessors. Preserve that provenance across physical graph cleanup.
+        // Native 3.12 cold relocation leaves new bridges with zero predecessors;
+        // 3.13 explicitly assigns one so the preceding cold block donates its span.
         let blocks_before_cold_relocation =
             self.graph.order().iter().copied().collect::<FxHashSet<_>>();
+        self.reject_unmodeled_empty_native_jump_targets();
         self.push_cold_blocks_to_end(None);
         if !copied_owners.is_empty() {
             self.exception_regions.retain(|region| {
@@ -201,11 +226,16 @@ impl OptimizationPipeline {
             self.remove_legacy_nops_and_jumps(&original_arrays, false);
         }
         // Relocation also drops unreachable physical blocks. Recount surviving
-        // edges so their stale predecessors cannot trigger extra exit copies,
-        // while retaining native zero counts for the newly inserted bridges.
+        // edges so stale predecessors cannot trigger extra exit copies, retaining
+        // zero counts on newly inserted bridges only for the native 3.12 phase.
         let mut predecessors = self.legacy_predecessors();
-        predecessors.retain(|block, _| blocks_before_cold_relocation.contains(block));
+        if self.python_version == PythonVersion::Py312 {
+            predecessors.retain(|block, _| blocks_before_cold_relocation.contains(block));
+        }
         self.resolve_legacy_locations(predecessors);
+        if self.python_version == PythonVersion::Py312 {
+            self.guarantee_legacy_exit_line_numbers(first_line_number);
+        }
         // LOAD_CLOSURE remains a distinct pseudo-op until after the owned-local
         // fusion pass in 3.13; 3.12 still has a physical LOAD_CLOSURE instruction.
         if self.python_version == PythonVersion::Py313 {
@@ -219,8 +249,42 @@ impl OptimizationPipeline {
             // 3.12 converts POP_BLOCK only after CFG optimization and line resolution.
             self.remove_legacy_nops(&original_arrays, true);
         }
+        self.reject_unmodeled_empty_native_jump_targets();
         self.normalize_legacy_jump_directions();
         self.normalize_backward_conditionals()?;
+        if !self
+            .legacy_native_labels
+            .as_ref()
+            .is_some_and(|native| native.is_certified())
+        {
+            self.graph
+                .for_each_instruction_mut(Instruction::clear_legacy_initial_jump_argument);
+            for origin in &mut self.exception_owner_provenance.ordinary_await_ends {
+                origin.send.clear_legacy_initial_jump_argument();
+                if let Some((_, bridge)) = &mut origin.bridge {
+                    bridge.clear_legacy_initial_jump_argument();
+                }
+            }
+            for origin in &mut self.exception_owner_provenance.async_with_setups {
+                origin.send.clear_legacy_initial_jump_argument();
+                if let Some((_, bridge)) = &mut origin.bridge {
+                    bridge.clear_legacy_initial_jump_argument();
+                }
+            }
+            for instruction in self
+                .exception_owner_provenance
+                .original_primitive_condition_boundaries
+                .iter_mut()
+                .chain(
+                    self.exception_owner_provenance
+                        .source_none_conditions
+                        .iter_mut()
+                        .map(|origin| &mut origin.instruction),
+                )
+            {
+                instruction.clear_legacy_initial_jump_argument();
+            }
+        }
         Ok(LayoutAssembler {
             python_version: self.python_version,
             items: self.graph.into_items(),
@@ -231,6 +295,142 @@ impl OptimizationPipeline {
             next_label: self.next_label,
             has_next_location: self.has_next_location,
         })
+    }
+
+    /// Freezes native jump operands before any pointer-only CFG retargeting.
+    fn initialize_legacy_native_jump_seeds(&mut self) {
+        let Some(native) = self.legacy_native_labels.as_mut() else {
+            return;
+        };
+        native.initialize_blocks(&self.graph);
+        if !native.is_certified() {
+            return;
+        }
+        let mut seeds = Vec::new();
+        for block in self.graph.order().iter().copied() {
+            for (offset, item) in self.graph[block].items().iter().enumerate() {
+                let Item::Instruction(instruction) = item else {
+                    continue;
+                };
+                let (Operand::Forward(target) | Operand::Backward(target)) = instruction.operand()
+                else {
+                    continue;
+                };
+                let Some(seed) = native.target_label(&self.graph, target) else {
+                    native.invalidate();
+                    return;
+                };
+                seeds.push((ItemPosition::new(block, offset), seed));
+            }
+        }
+        let mut await_seeds = Vec::new();
+        for send in self
+            .exception_owner_provenance
+            .ordinary_await_ends
+            .iter()
+            .map(|origin| &origin.send)
+            .chain(
+                self.exception_owner_provenance
+                    .async_with_setups
+                    .iter()
+                    .map(|origin| &origin.send),
+            )
+        {
+            let Operand::Forward(target) = send.operand() else {
+                native.invalidate();
+                return;
+            };
+            let Some(seed) = native.target_label(&self.graph, target) else {
+                native.invalidate();
+                return;
+            };
+            await_seeds.push(seed);
+        }
+        let mut condition_seeds = Vec::new();
+        for instruction in self
+            .exception_owner_provenance
+            .original_primitive_condition_boundaries
+            .iter()
+            .chain(
+                self.exception_owner_provenance
+                    .source_none_conditions
+                    .iter()
+                    .map(|origin| &origin.instruction),
+            )
+        {
+            let (Operand::Forward(target) | Operand::Backward(target)) = instruction.operand()
+            else {
+                native.invalidate();
+                return;
+            };
+            let Some(seed) = native.target_label(&self.graph, target) else {
+                native.invalidate();
+                return;
+            };
+            condition_seeds.push(seed);
+        }
+        for (instruction, seed) in self
+            .exception_owner_provenance
+            .original_primitive_condition_boundaries
+            .iter_mut()
+            .chain(
+                self.exception_owner_provenance
+                    .source_none_conditions
+                    .iter_mut()
+                    .map(|origin| &mut origin.instruction),
+            )
+            .zip(condition_seeds)
+        {
+            // These pre-CFG certificates authenticate complete original conditions.
+            // Mirror layout provenance into them instead of masking Instruction Eq.
+            instruction.set_legacy_initial_jump_argument(seed);
+        }
+        for (send, seed) in self
+            .exception_owner_provenance
+            .ordinary_await_ends
+            .iter_mut()
+            .map(|origin| &mut origin.send)
+            .chain(
+                self.exception_owner_provenance
+                    .async_with_setups
+                    .iter_mut()
+                    .map(|origin| &mut origin.send),
+            )
+            .zip(await_seeds)
+        {
+            // Ordinary awaits and manager entries both authenticate the exact SEND.
+            // Their immutable captures must mirror the live instruction's seed bits.
+            send.set_legacy_initial_jump_argument(seed);
+        }
+        for (position, seed) in seeds {
+            self.graph
+                .instruction_mut(position)
+                .unwrap()
+                .set_legacy_initial_jump_argument(seed);
+        }
+    }
+
+    /// Rejects unsupported native empty-block operand rewrites for the whole scope.
+    fn reject_unmodeled_empty_native_jump_targets(&mut self) {
+        let Some(native) = self.legacy_native_labels.as_mut() else {
+            return;
+        };
+        if native.is_certified()
+            && self.graph.iter_items().any(|item| {
+                let Item::Instruction(instruction) = item else {
+                    return false;
+                };
+                let (Operand::Forward(target) | Operand::Backward(target)) = instruction.operand()
+                else {
+                    return false;
+                };
+                self.graph
+                    .label_block(target)
+                    .is_none_or(|target| self.graph[target].last_instruction().is_none())
+            })
+        {
+            native.invalidate();
+        }
     }
 
     /// Keeps certified SETUP records present until native pseudo-op conversion.
@@ -1088,6 +1288,82 @@ impl OptimizationPipeline {
         changed
     }
 
+    /// Restores original constant-loop false edges for 3.13's first line pass.
+    fn legacy_predecessors_before_folding(
+        &self,
+        original_arrays: &FxHashMap<BasicBlockId, usize>,
+    ) -> FxHashMap<BasicBlockId, usize> {
+        let mut predecessors = self.legacy_predecessors();
+        if self.folded_predecessor_sources.is_empty() {
+            return predecessors;
+        }
+        let order = self.graph.order();
+        let positions = order
+            .iter()
+            .enumerate()
+            .map(|(position, block)| (*block, position))
+            .collect::<FxHashMap<_, _>>();
+        let mut restored = FxHashSet::default();
+        for &(source, target, location) in &self.folded_predecessor_sources {
+            if !self.folded_loop_exit_anchors.contains(&target) {
+                continue;
+            }
+            let (Some(source), Some(mut target)) = (
+                self.graph.label_block(source),
+                self.graph.label_block(target),
+            ) else {
+                continue;
+            };
+            let Some(marker) = self.graph[source]
+                .items()
+                .iter()
+                .find_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction),
+                    Item::Label(_) => None,
+                })
+            else {
+                continue;
+            };
+            if marker.opcode != NOP || marker.location != location {
+                continue;
+            }
+            // Range-only labels can fragment one original target array. Cross
+            // only those aliases: pruning dead source must not create a path
+            // through an unrelated original block or exception handler.
+            while self.graph[target].last_instruction().is_none() {
+                let Some(next) = order.get(positions[&target] + 1) else {
+                    break;
+                };
+                if original_arrays.get(&target).is_none()
+                    || original_arrays.get(&target) != original_arrays.get(next)
+                {
+                    break;
+                }
+                target = *next;
+            }
+            if self.graph[target]
+                .items()
+                .iter()
+                .find_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction),
+                    Item::Label(_) => None,
+                })
+                .is_some_and(|first| {
+                    (first.opcode == NOP && first.fusion_policy.is_converted_pop_block())
+                    // Ordinary try lowering keeps POP_BLOCK as a hidden copy
+                    // slot. Its surviving unlocated exit jump has the same
+                    // original constant-loop predecessor before line resolution.
+                    || (is_unconditional_jump(first.opcode)
+                        && first.location == SourceLocation::NONE)
+                })
+                && restored.insert((source, target))
+            {
+                *predecessors.entry(target).or_default() += 1;
+            }
+        }
+        predecessors
+    }
+
     fn legacy_predecessors(&self) -> FxHashMap<BasicBlockId, usize> {
         let mut predecessors = FxHashMap::default();
         let reachable = self.graph.reachable_blocks(&self.exception_regions);
@@ -1111,7 +1387,41 @@ impl OptimizationPipeline {
         predecessors
     }
 
+    /// Gives wholly unlocated 3.12 return blocks a line after native location propagation.
+    fn guarantee_legacy_exit_line_numbers(&mut self, first_line_number: u32) {
+        let mut line = i32::try_from(first_line_number).unwrap_or(i32::MAX);
+        let arrays = self.legacy_instruction_arrays();
+        let order = self.graph.order().to_vec();
+        for blocks in order.chunk_by(|left, right| arrays[left] == arrays[right]) {
+            let Some(last) = blocks
+                .iter()
+                .rev()
+                .find_map(|block| self.graph[*block].last_instruction().copied())
+            else {
+                continue;
+            };
+            if last.location.line >= 0 {
+                line = last.location.line;
+            } else if last.opcode == RETURN_VALUE {
+                // Exception-range endpoints can split this native return block
+                // into physical fragments. Fill the entire original array, while
+                // preserving CPython's unknown columns and end line.
+                for &block in blocks {
+                    for instruction in self.graph.instructions_mut(block) {
+                        debug_assert!(instruction.location.line < 0);
+                        instruction.location.line = line;
+                    }
+                }
+            }
+        }
+    }
+
     fn resolve_legacy_locations(&mut self, mut predecessors: FxHashMap<BasicBlockId, usize>) {
+        let mut next_native_label = self
+            .legacy_native_labels
+            .as_ref()
+            .filter(|native| native.is_certified())
+            .map(|native| native.next_cfg_label(&self.graph));
         for block in self.graph.order().to_vec() {
             let Some(jump) = self.graph[block].last_instruction().copied() else {
                 continue;
@@ -1165,6 +1475,12 @@ impl OptimizationPipeline {
                 index,
                 std::iter::once(Item::Label(entry)).chain(copied).collect(),
             );
+            if let (Some(native), Some(next)) = (
+                self.legacy_native_labels.as_mut(),
+                next_native_label.as_mut(),
+            ) {
+                native.allocate_for_block(copy, next);
+            }
             self.graph
                 .instructions_mut(block)
                 .next_back()
@@ -1284,6 +1600,143 @@ fn fuse_legacy_fast_pair(first: &Instruction, second: &Instruction) -> Option<In
 
 #[cfg(test)]
 mod tests {
+    // Add inside assembler/passes/legacy.rs tests. No oracle or source-path dependency.
+    #[test]
+    fn native_jump_seeds_preserve_exact_captures_and_reject_partial_updates() {
+        use crate::assembler::exception_owners::{
+            AsyncWithSetup, OrdinaryAwaitEnd, SourceNoneCondition,
+        };
+        use crate::target::opcodes::{END_SEND, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, SEND};
+
+        for unknown_capture in [0, 1, 2] {
+            let start = Label(0);
+            let first_body = Label(1);
+            let second_body = Label(2);
+            let end = Label(3);
+            let location = SourceLocation::new(2, 2, 4, 12);
+            let primitive =
+                Instruction::new(POP_JUMP_IF_FALSE, Operand::Forward(end), location, Some(0));
+            let none = Instruction::new(POP_JUMP_IF_NONE, Operand::Forward(end), location, Some(0));
+            let send = Instruction::new(SEND, Operand::Forward(end), location, Some(1));
+            let end_send = Instruction::new(END_SEND, Operand::Value(0), location, Some(0));
+            let mut assembler = Assembler::from_linear_items(vec![
+                Item::Label(start),
+                Item::Instruction(primitive),
+                Item::Label(first_body),
+                Item::Instruction(none),
+                Item::Label(second_body),
+                Item::Instruction(send),
+                Item::Label(end),
+                Item::Instruction(end_send),
+                Item::Instruction(Instruction::new(
+                    RETURN_CONST,
+                    Operand::Value(0),
+                    location,
+                    Some(0),
+                )),
+            ]);
+            assembler.python_version = PythonVersion::Py312;
+            assembler.next_label = 4;
+            assembler.bind_legacy_native_label(start, 1);
+            assembler.bind_legacy_native_label(end, 300);
+            assembler.certify_legacy_native_labels();
+            assembler
+                .exception_owner_provenance
+                .original_primitive_condition_boundaries
+                .push(primitive);
+            let mut captured_none = none;
+            if unknown_capture == 1 {
+                captured_none.retarget(Operand::Forward(Label(900)));
+            }
+            assembler
+                .exception_owner_provenance
+                .source_none_conditions
+                .push(SourceNoneCondition {
+                    entry: first_body,
+                    labels: vec![first_body],
+                    instruction: captured_none,
+                    entry_prefix: None,
+                });
+            assembler
+                .exception_owner_provenance
+                .ordinary_await_ends
+                .push(OrdinaryAwaitEnd {
+                    send,
+                    entry: end,
+                    end_send,
+                    cleanup: Vec::new(),
+                    bridge: None,
+                });
+            let mut manager_send = send;
+            if unknown_capture == 2 {
+                manager_send.retarget(Operand::Forward(Label(901)));
+            }
+            assembler
+                .exception_owner_provenance
+                .async_with_setups
+                .push(AsyncWithSetup {
+                    setup: end,
+                    send: manager_send,
+                    prefix: vec![Item::Label(end), Item::Instruction(end_send)],
+                    cleanup: Vec::new(),
+                    bridge: None,
+                });
+            let mut pipeline = assembler.into_optimization_pipeline();
+            pipeline.initialize_legacy_native_jump_seeds();
+            let expected = if unknown_capture != 0 { None } else { Some(1) };
+            let live = |opcode| {
+                pipeline
+                    .graph
+                    .iter_items()
+                    .find_map(|item| match item {
+                        Item::Instruction(instruction) if instruction.opcode == opcode => {
+                            Some(*instruction)
+                        }
+                        _ => None,
+                    })
+                    .unwrap()
+            };
+            for opcode in [POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, SEND] {
+                assert_eq!(live(opcode).legacy_initial_jump_width(), expected);
+            }
+            let provenance = &pipeline.exception_owner_provenance;
+            assert_eq!(
+                provenance.original_primitive_condition_boundaries[0],
+                live(POP_JUMP_IF_FALSE)
+            );
+            assert_eq!(provenance.ordinary_await_ends[0].send, live(SEND));
+            assert_eq!(
+                provenance.source_none_conditions[0]
+                    .instruction
+                    .legacy_initial_jump_width(),
+                expected
+            );
+            if unknown_capture != 1 {
+                assert_eq!(
+                    provenance.source_none_conditions[0].instruction,
+                    live(POP_JUMP_IF_NONE)
+                );
+            }
+            assert_eq!(
+                provenance.async_with_setups[0]
+                    .send
+                    .legacy_initial_jump_width(),
+                expected
+            );
+            if unknown_capture != 2 {
+                assert_eq!(provenance.async_with_setups[0].send, live(SEND));
+            }
+            assert_eq!(
+                pipeline
+                    .legacy_native_labels
+                    .as_ref()
+                    .unwrap()
+                    .is_certified(),
+                unknown_capture == 0
+            );
+        }
+    }
+
     use super::*;
     use crate::assembler::{ExceptionPolicy, Label};
     use crate::target::opcodes::{
@@ -2560,5 +3013,55 @@ mod tests {
                 152, 100, 224, 13, 17, 240, 5, 0, 5, 35, 251, 224, 13, 17, 250
             ]
         );
+    }
+
+    #[test]
+    fn legacy_handler_while_keeps_shared_cleanup_unlocated() {
+        use crate::code_object::Constant;
+        use crate::{CompileOptions, compile_with_options};
+
+        // Pinned CPython 3.12.14 and 3.13.15: both the entry test and the
+        // repeated loop test reach the handler cleanup, so neither donates its span.
+        let source = "def f(flag):\n    try:\n        work()\n    except Exception as error:\n        while check():\n            work()\n    finish()\n";
+        for (version, lines) in [
+            (
+                PythonVersion::Py312,
+                &[
+                    128, 0, 240, 2, 4, 5, 19, 220, 8, 12, 140, 6, 244, 8, 0, 5, 11, 133, 72, 248,
+                    244, 7, 0, 12, 21, 242, 0, 2, 5, 19, 220, 14, 19, 140, 103, 220, 12, 16, 140,
+                    70, 244, 3, 0, 15, 20, 141, 103, 251, 228, 4, 10, 133, 72, 251, 240, 7, 2, 5,
+                    19, 250,
+                ][..],
+            ),
+            (
+                PythonVersion::Py313,
+                &[
+                    128, 0, 240, 2, 4, 5, 19, 220, 8, 12, 140, 6, 244, 8, 0, 5, 11, 133, 72, 248,
+                    244, 7, 0, 12, 21, 243, 0, 2, 5, 19, 220, 14, 19, 143, 103, 137, 103, 220, 12,
+                    16, 140, 70, 244, 3, 0, 15, 20, 143, 103, 139, 103, 255, 248, 240, 3, 2, 5, 19,
+                    250,
+                ][..],
+            ),
+        ] {
+            let module = compile_with_options(
+                source,
+                "handler_loop.py",
+                &CompileOptions {
+                    python_version: version,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .code;
+            let function = module
+                .constants
+                .iter()
+                .find_map(|constant| match constant {
+                    Constant::Code(code) if code.name == "f" => Some(code),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(function.line_table, lines, "{version:?}");
+        }
     }
 }

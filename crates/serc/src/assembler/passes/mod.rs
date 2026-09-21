@@ -209,7 +209,7 @@ impl Assembler {
                 .finish(first_line_number);
         }
         self.into_optimization_pipeline()
-            .optimize(local_count, parameter_count, constants)?
+            .optimize(first_line_number, local_count, parameter_count, constants)?
             .finish(first_line_number)
     }
 
@@ -511,6 +511,7 @@ impl Assembler {
             initial_reachable,
             retired_exception_handler_targets: rustc_hash::FxHashSet::default(),
             next_label: self.next_label,
+            legacy_native_labels: self.legacy_native_labels,
             exception_regions: self.exception_regions,
             exception_owner_provenance: self.exception_owner_provenance,
             preserved_block_boundaries: self.preserved_block_boundaries,
@@ -559,12 +560,18 @@ impl OptimizationPipeline {
 
     fn optimize(
         mut self,
+        first_line_number: u32,
         local_count: usize,
         parameter_count: usize,
         constants: Option<&mut dyn ConstantTable>,
     ) -> Result<LayoutAssembler, CompileError> {
         if self.python_version <= crate::PythonVersion::Py313 {
-            return self.optimize_legacy(local_count, parameter_count, constants);
+            return self.optimize_legacy(
+                first_line_number,
+                local_count,
+                parameter_count,
+                constants,
+            );
         }
         let reversed_store_handler_exits = self.capture_reversed_store_handler_exits();
         self.preserve_shared_original_manager_pop_locations();
@@ -1252,9 +1259,29 @@ impl LayoutAssembler {
             }
         }
 
-        // CPython initially stores instruction indices in jump operands. Their widths
-        // seed offset resolution, including self-dependent backward jumps at 255/256.
-        let initial_jump_arguments = if instruction_count > usize::from(u8::MAX) {
+        let native_jump_widths = self.python_version == crate::PythonVersion::Py312
+            && self.items.iter().all(|item| match item {
+                Item::Instruction(instruction) => match instruction.operand() {
+                    Operand::Forward(_) | Operand::Backward(_) => {
+                        instruction.legacy_initial_jump_width().is_some()
+                    }
+                    Operand::Value(_) | Operand::Deferred(_) => true,
+                },
+                Item::Label(_) => true,
+            });
+        if native_jump_widths {
+            can_be_unextended &= self.items.iter().all(|item| match item {
+                Item::Instruction(instruction) => instruction
+                    .legacy_initial_jump_width()
+                    .is_none_or(|width| width == 0),
+                Item::Label(_) => true,
+            });
+        }
+        // 3.12 seeds from native symbolic operands; 3.13+ uses instruction indices.
+        // Uncertified 3.12 code objects retain the existing compatibility path.
+        let initial_jump_arguments = if !native_jump_widths
+            && instruction_count > usize::from(u8::MAX)
+        {
             let mut indices = vec![None; labels.len()];
             let mut index = 0_u32;
             for item in &self.items {
@@ -1311,7 +1338,18 @@ impl LayoutAssembler {
                     .unwrap_or(0),
                 Operand::Deferred(_) => 0,
             };
-            extended_args.push(extended_arg_count(argument));
+            let width = if native_jump_widths
+                && matches!(
+                    instruction.operand(),
+                    Operand::Forward(_) | Operand::Backward(_)
+                ) {
+                instruction
+                    .legacy_initial_jump_width()
+                    .expect("all native jumps are certified")
+            } else {
+                extended_arg_count(argument)
+            };
+            extended_args.push(width);
         }
         let mut resolved_arguments = vec![0_u32; instruction_count];
 

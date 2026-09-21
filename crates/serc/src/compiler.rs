@@ -16,6 +16,7 @@ mod definition;
 mod expression;
 #[cfg(test)]
 mod legacy_annotation_tests;
+mod legacy_native_labels;
 mod orchestration;
 mod scope;
 mod source;
@@ -68,6 +69,7 @@ pub(crate) struct Compiler<'source> {
     symbols: SymbolState,
     control: ControlFlowState,
     assembler: Assembler,
+    native_label_plan: Option<Box<legacy_native_labels::NativeLabelPlan>>,
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -411,13 +411,15 @@ fn main() -> ExitCode {
     }
 
     if let Some(directory) = &options.dump_mismatches {
-        if let Err(error) = dump_mismatches(
-            &outcomes,
-            &options.python,
-            directory,
-            options.source_bytes,
-            &compile_options,
-        ) {
+        if let Err(error) = pool.install(|| {
+            dump_mismatches(
+                &outcomes,
+                &options.python,
+                directory,
+                options.source_bytes,
+                &compile_options,
+            )
+        }) {
             eprintln!("failed to dump mismatches: {error}");
             return ExitCode::FAILURE;
         }
@@ -635,8 +637,10 @@ fn dump_mismatches(
     outcomes
         .iter()
         .filter(|outcome| outcome.kind == OutcomeKind::ByteMismatch)
+        .collect::<Vec<_>>()
+        .into_par_iter()
         .enumerate()
-        .try_for_each(|(index, outcome)| {
+        .map(|(index, outcome)| {
             let source = if source_bytes {
                 CompilerInput::Bytes(fs_err::read(&outcome.path)?)
             } else {
@@ -656,6 +660,9 @@ fn dump_mismatches(
             fs_err::write(directory.join(format!("{stem}.ours.marshal")), ours)?;
             fs_err::write(directory.join(format!("{stem}.cpython.marshal")), oracle)
         })
+        .collect::<Vec<Result<(), std::io::Error>>>()
+        .into_iter()
+        .collect()
 }
 
 fn discover(roots: &[PathBuf], extensions: &[String]) -> Result<Vec<PathBuf>, String> {

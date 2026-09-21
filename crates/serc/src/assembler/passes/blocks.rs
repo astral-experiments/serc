@@ -2232,6 +2232,15 @@ impl OptimizationPipeline {
                 instruction.depth_after(),
             );
             backedge.set_exception_policy(ExceptionPolicy::AlwaysAbsent);
+            if let Some(native) = self.legacy_native_labels.as_mut()
+                && native.is_certified()
+            {
+                if let Some(argument) = native.target_label(&self.graph, target) {
+                    backedge.set_legacy_initial_jump_argument(argument);
+                } else {
+                    native.invalidate();
+                }
+            }
             items.push(Item::Instruction(backedge));
             self.preserved_block_boundaries.insert(fresh_entry);
             self.graph.insert_block(position + 1, items);
@@ -2248,6 +2257,11 @@ impl OptimizationPipeline {
             normalize_unmoved_interruptible_jumps(&mut self.graph);
             return FxHashSet::default();
         }
+        // Range-only labels can split our physical graph without starting a
+        // native 3.13 instruction array. Keep that distinction when the label's
+        // empty block becomes the predecessor of a newly inserted cold bridge.
+        let legacy_arrays = (self.python_version == crate::PythonVersion::Py313)
+            .then(|| self.legacy_instruction_arrays());
         let graph = &mut self.graph;
         if graph.len() < 2 {
             normalize_unmoved_interruptible_jumps(graph);
@@ -2428,6 +2442,14 @@ impl OptimizationPipeline {
                     && temperatures[order[*position + 1].index()] == WARM_BLOCK
             })
             .collect::<Vec<_>>();
+        if let Some(native) = self.legacy_native_labels.as_mut()
+            && native.is_certified()
+        {
+            let mut next_native = native.next_cfg_label(graph);
+            for &position in &explicit_jumps {
+                native.allocate_for_block(order[position + 1], &mut next_native);
+            }
+        }
         for position in explicit_jumps.into_iter().rev() {
             let next = graph.block_at(position + 1);
             let target = if let Some(label) = graph[next].first_label() {
@@ -2456,7 +2478,7 @@ impl OptimizationPipeline {
                     marker.set_operand(Operand::Value(0));
                     graph[current].last_instruction() == Some(&marker)
                 });
-            let (location, exception_exclusion) = graph[current].last_instruction().map_or(
+            let (mut location, exception_exclusion) = graph[current].last_instruction().map_or(
                 (SourceLocation::NONE, ExceptionExclusion::None),
                 |instruction| {
                     let exclusion = if instruction.exception_policy().exclusion()
@@ -2469,6 +2491,22 @@ impl OptimizationPipeline {
                     (instruction.location, exclusion)
                 },
             );
+            if graph[current].last_instruction().is_none()
+                && let Some(arrays) = &legacy_arrays
+                && let Some(array) = arrays.get(&current)
+            {
+                // Native propagation sees the last instruction before an unused
+                // range label in this same array. An actual original empty array
+                // still stops inheritance, as does any intervening jump target.
+                if let Some(previous) = order[..position]
+                    .iter()
+                    .rev()
+                    .take_while(|block| arrays.get(*block) == Some(array))
+                    .find_map(|block| graph[*block].last_instruction())
+                {
+                    location = previous.location;
+                }
+            }
             let label = Label(self.next_label);
             self.next_label += 1;
             let mut bridge = Instruction::synthetic(
@@ -2484,6 +2522,11 @@ impl OptimizationPipeline {
                 bridge.opcode = JUMP_BACKWARD;
                 bridge.location = SourceLocation::NONE;
                 bridge.no_location_policy.preserve_location();
+                if let Some(native) = self.legacy_native_labels.as_ref()
+                    && let Some(argument) = native.block_label(next)
+                {
+                    bridge.set_legacy_initial_jump_argument(argument);
+                }
             }
             if empty_while_anchor {
                 // CPython's empty original anchor separates the authored break NOP

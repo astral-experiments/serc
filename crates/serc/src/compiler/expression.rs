@@ -387,7 +387,12 @@ impl Compiler<'_> {
         &self,
         assignment: &ruff_python_ast::StmtAssign,
     ) -> bool {
-        if !expression_defers_async_comprehension_restore(&assignment.value) {
+        // Legacy CFG passes need the original restore/store order: 3.13 resolves
+        // successor locations before static swaps, and 3.12 counts the SWAP when
+        // deciding which cleanup blocks to inline. Let those passes exchange it.
+        if self.context.python_version <= PythonVersion::Py313
+            || !expression_defers_async_comprehension_restore(&assignment.value)
+        {
             return false;
         }
         let [Expr::Name(target)] = assignment.targets.as_slice() else {
@@ -710,6 +715,16 @@ impl Compiler<'_> {
                     )?;
                     false
                 };
+                if self.context.python_version <= PythonVersion::Py313
+                    && self.assembler.instruction_count() == body_start
+                    && let [Stmt::Pass(pass)] = case.body.as_slice()
+                {
+                    // Protected suites can omit a final Pass in favor of their cleanup.
+                    // Legacy case jumps start unlocated, so retain its original donor NOP.
+                    self.assembler
+                        .set_location(self.source_location(pass.range));
+                    self.emit(NOP, 0, 0)?;
+                }
                 if !context.empty_failure_jumps.is_empty()
                     && self
                         .assembler
@@ -816,7 +831,9 @@ impl Compiler<'_> {
                             .emit_jump_forward_instruction_with_exception_policy(
                                 JUMP_FORWARD,
                                 end,
-                                if final_async_exhaustion {
+                                if final_async_exhaustion
+                                    && self.context.python_version != PythonVersion::Py312
+                                {
                                     // Cold ordering materializes the original fallthrough as a
                                     // new bridge; it has no original exception-owner slot.
                                     ExceptionPolicy::EXCLUDE_ALWAYS
@@ -1083,7 +1100,7 @@ impl Compiler<'_> {
                 self.assembler
                     .mark_borrow_empty_block_if_unretained_at(success_offset);
             }
-            if !terminal
+            if (!terminal || self.context.python_version <= PythonVersion::Py313)
                 && self.assembler.instruction_count() == body_start
                 && let [Stmt::Pass(pass)] = case.body.as_slice()
                 && case
@@ -1348,10 +1365,12 @@ impl Compiler<'_> {
                     // consuming None jump. Register the constant before the specialization so
                     // its pool ordering follows the same source traversal. The removed
                     // LOAD_CONST and IS_OP leave a protected slot for the late NOT_TAKEN marker.
-                    // Swap optimization reconstructs rotations into those folded instruction
-                    // slots, retaining the None pattern's location on the surviving swaps.
-                    let preserve_swap_slots =
-                        self.assembler.current_block_ends_with_multiple_swaps();
+                    // From 3.13, the constant pass folds these slots before swap optimization,
+                    // which can reconstruct rotations into them with the None pattern's span.
+                    // In 3.12, swaps run first in the same left-to-right pass, so the still-real
+                    // identity test bounds the run and the capture's swap locations survive.
+                    let preserve_swap_slots = self.context.python_version >= PythonVersion::Py313
+                        && self.assembler.current_block_ends_with_multiple_swaps();
                     if preserve_swap_slots {
                         self.emit(NOP, 0, 0)?;
                         self.emit(NOP, 0, 0)?;
@@ -1731,8 +1750,10 @@ impl Compiler<'_> {
                 ExceptionPolicy::NoneDynamicConditionStrict,
             )?;
         }
-        // CPython's flowgraph only folds tuples with up to 30 stack operands.
-        if pattern.keys.len() <= 30
+        // Legacy CFG folding retains each key's source line as a NOP before
+        // building the tuple. Keep those loads until the target's folding pass.
+        if self.context.python_version >= crate::PythonVersion::Py314
+            && pattern.keys.len() <= 30
             && let Some(keys) = pattern
                 .keys
                 .iter()
@@ -2642,12 +2663,27 @@ impl Compiler<'_> {
         }
 
         self.compile_expression(&expression.value)?;
-        self.compile_awaitable_on_stack(0)
+        self.compile_awaitable_on_stack_with_native_roles(
+            0,
+            Some([
+                super::legacy_native_labels::NativeRole::AwaitSend(expression.range),
+                super::legacy_native_labels::NativeRole::AwaitFail(expression.range),
+                super::legacy_native_labels::NativeRole::AwaitExit(expression.range),
+            ]),
+        )
     }
 
     pub(super) fn compile_awaitable_on_stack(
         &mut self,
         get_awaitable_argument: u32,
+    ) -> Result<(), CompileError> {
+        self.compile_awaitable_on_stack_with_native_roles(get_awaitable_argument, None)
+    }
+
+    pub(super) fn compile_awaitable_on_stack_with_native_roles(
+        &mut self,
+        get_awaitable_argument: u32,
+        native_roles: Option<[super::legacy_native_labels::NativeRole; 3]>,
     ) -> Result<(), CompileError> {
         let base_depth = self.control.stack.depth - 1;
         let cleanup_location = self.assembler.location();
@@ -2663,6 +2699,11 @@ impl Compiler<'_> {
         let yielded = self.assembler.label();
         let yielded_end = self.assembler.label();
         let cleanup = self.assembler.label();
+        if let Some([send_role, fail_role, exit_role]) = native_roles {
+            self.bind_native_source_label(send_role, send);
+            self.bind_native_source_label(fail_role, cleanup);
+            self.bind_native_source_label(exit_role, end);
+        }
         self.assembler.mark(send);
         self.emit_jump_forward(SEND, end, 0)?;
         self.assembler.record_exception_setup(yielded, false);
@@ -3656,7 +3697,11 @@ impl Compiler<'_> {
         let comprehension_cell_names = comprehension_cell_names(generators, key, value);
         let base_depth = self.control.stack.depth;
         let comprehension_location = self.assembler.location();
-        if generators[0].is_async || self.context.python_version == PythonVersion::Py315 {
+        // Legacy AST folding applies to every comprehension iterable, including
+        // async clauses; ordinary async-for statements follow a different rule.
+        if (generators[0].is_async && self.context.python_version >= PythonVersion::Py314)
+            || self.context.python_version == PythonVersion::Py315
+        {
             self.compile_expression(&generators[0].iter)?;
         } else {
             self.compile_iterable_expression(&generators[0].iter)?;
@@ -4335,7 +4380,9 @@ impl Compiler<'_> {
         } else {
             FunctionAttribute::CLOSURE.argument()
         })?;
-        if generator.generators[0].is_async || self.context.python_version == PythonVersion::Py315 {
+        if (generator.generators[0].is_async && self.context.python_version >= PythonVersion::Py314)
+            || self.context.python_version == PythonVersion::Py315
+        {
             self.compile_expression(&generator.generators[0].iter)?;
         } else {
             self.compile_iterable_expression(&generator.generators[0].iter)?;
@@ -4607,6 +4654,8 @@ impl Compiler<'_> {
             };
             if !nested.is_async
                 && let Some(singleton) = singleton
+                && (self.context.python_version >= PythonVersion::Py314
+                    || self.source_aware_fold_constant(singleton).is_none())
             {
                 // CPython treats `for value in [expression]` as an assignment. Filters on
                 // that clause continue the enclosing real loop when they reject the value.
@@ -4624,7 +4673,7 @@ impl Compiler<'_> {
                     restart,
                 )?;
             } else {
-                if nested.is_async {
+                if nested.is_async && self.context.python_version >= PythonVersion::Py314 {
                     self.compile_expression(&nested.iter)?;
                 } else {
                     self.compile_iterable_expression(&nested.iter)?;
@@ -5685,6 +5734,8 @@ impl Compiler<'_> {
             };
             if !nested.is_async
                 && let Some(singleton) = singleton
+                && (self.context.python_version >= PythonVersion::Py314
+                    || self.source_aware_fold_constant(singleton).is_none())
             {
                 // A singleton clause is an assignment; rejected filters continue the
                 // enclosing real loop without adding an iterator or a cleanup block.
@@ -5710,7 +5761,7 @@ impl Compiler<'_> {
                     loop_context,
                 )?;
             } else {
-                if nested.is_async {
+                if nested.is_async && self.context.python_version >= PythonVersion::Py314 {
                     self.compile_expression(&nested.iter)?;
                 } else {
                     self.compile_iterable_expression(&nested.iter)?;
@@ -6224,7 +6275,7 @@ impl Compiler<'_> {
                 Ok(())
             }
             Expr::List(list) if !list.elts.iter().any(Expr::is_starred_expr) => {
-                if list.elts.len() <= 30
+                if (self.context.python_version <= PythonVersion::Py313 || list.elts.len() <= 30)
                     && let Some(constants) = list
                         .elts
                         .iter()
@@ -6254,7 +6305,9 @@ impl Compiler<'_> {
                 } else {
                     self.compile_collection(
                         &list.elts,
-                        if list.elts.len() > 30 {
+                        if self.context.python_version >= PythonVersion::Py314
+                            && list.elts.len() > 30
+                        {
                             CollectionKind::List
                         } else {
                             CollectionKind::Tuple
@@ -6263,7 +6316,8 @@ impl Compiler<'_> {
                 }
             }
             Expr::Set(set)
-                if set.elts.len() <= 30
+                if (self.context.python_version <= PythonVersion::Py313
+                    || set.elts.len() <= 30)
                     && !set.elts.iter().any(Expr::is_starred_expr)
                     && set
                         .elts
@@ -6493,6 +6547,14 @@ impl Compiler<'_> {
         let base_depth = self.control.stack.depth;
         let else_label = self.assembler.label();
         let end = self.assembler.label();
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::ValueIfEnd(expression.range),
+            end,
+        );
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::ValueIfElse(expression.range),
+            else_label,
+        );
         // CPython appends this repeated-attribute if-expression marker after
         // compacting an ordinary try inside an iterator loop. A fresh marker slot
         // is ownerless; a concrete protected fallthrough vacancy remains owned.
@@ -6889,6 +6951,16 @@ impl Compiler<'_> {
         let base_depth = self.control.stack.depth;
         let otherwise = self.assembler.label();
         let end = defer_return.then(|| self.assembler.label());
+        if let Some(end) = end {
+            self.bind_native_source_label(
+                super::legacy_native_labels::NativeRole::ValueIfEnd(conditional.range),
+                end,
+            );
+            self.bind_native_source_label(
+                super::legacy_native_labels::NativeRole::ValueIfElse(conditional.range),
+                otherwise,
+            );
+        }
         if defer_return {
             self.compile_if_expression_condition(&conditional.test, otherwise)?;
         } else {
@@ -6930,6 +7002,10 @@ impl Compiler<'_> {
     ) -> Result<(), CompileError> {
         if self.context.python_version <= PythonVersion::Py313 {
             let end = self.assembler.label();
+            self.bind_native_source_label(
+                super::legacy_native_labels::NativeRole::ValueBoolEnd(expression.range),
+                end,
+            );
             let location = self.source_location(expression.range);
             let jump = if expression.op == BoolOp::And {
                 POP_JUMP_IF_FALSE
@@ -7843,6 +7919,16 @@ impl Compiler<'_> {
     ) -> Result<(), CompileError> {
         let otherwise = self.assembler.label();
         let end = self.assembler.label();
+        if body_target == else_target {
+            self.bind_native_source_label(
+                super::legacy_native_labels::NativeRole::ConditionIfEnd(conditional.range),
+                end,
+            );
+            self.bind_native_source_label(
+                super::legacy_native_labels::NativeRole::ConditionIfElse(conditional.range),
+                otherwise,
+            );
+        }
         self.compile_jump_if(&conditional.test, false, otherwise)?;
         self.assembler.record_short_circuit_owner_continuation();
         self.compile_if_expression_arm_jump(&conditional.body, jump_on, body_target)?;
@@ -8105,6 +8191,10 @@ impl Compiler<'_> {
                 return self.compile_jump_if(last, jump_on, label);
             }
             let end = self.assembler.label();
+            self.bind_native_source_label(
+                super::legacy_native_labels::NativeRole::ConditionBoolEnd(boolean.range),
+                end,
+            );
             for (operand_index, value) in leading.iter().enumerate() {
                 if defer_terminal_with_exclusion {
                     self.with_control_override(

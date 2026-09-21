@@ -769,6 +769,7 @@ impl Compiler<'_> {
     pub(super) fn add_constant(&mut self, constant: Constant) -> Result<u32, CompileError> {
         self.context
             .record_constant_string_origins(&constant, false);
+        self.output.has_frozenset_constants |= matches!(constant, Constant::FrozenSet(_));
         if let Constant::Code(code) = &constant {
             self.output.has_frozenset_constants |= code
                 .marshal_provenance
@@ -786,6 +787,7 @@ impl Compiler<'_> {
         if let Some(constant) = discarded.output.constants.values.first() {
             // The child builder already recorded cache admissions. Copy only the parent's
             // retained slot, without replaying those compilation-wide chronology events.
+            self.output.has_frozenset_constants |= matches!(constant, Constant::FrozenSet(_));
             if let Constant::Code(code) = constant {
                 self.output.has_frozenset_constants |= code
                     .marshal_provenance
@@ -2596,8 +2598,13 @@ fn first_constant(
         }
 
         /// Older code generation builds an entire constant display before visiting its items.
-        fn legacy_collection_constant(&self, elements: &[Expr], is_set: bool) -> Option<Constant> {
-            if elements.len() < 3 {
+        fn legacy_collection_constant(
+            &self,
+            elements: &[Expr],
+            is_set: bool,
+            minimum_size: usize,
+        ) -> Option<Constant> {
+            if elements.len() < minimum_size {
                 return None;
             }
             let constants = elements
@@ -2618,6 +2625,26 @@ fn first_constant(
             } else {
                 Some(Constant::Tuple(constants))
             }
+        }
+
+        fn visit_iterable_expression(&mut self, expression: &'ast Expr) {
+            if self.is_complete() {
+                return;
+            }
+            if self.compiler.context.python_version <= PythonVersion::Py313 {
+                let constant = match expression {
+                    Expr::List(list) if list.ctx == ExprContext::Load => {
+                        self.legacy_collection_constant(&list.elts, false, 0)
+                    }
+                    Expr::Set(set) => self.legacy_collection_constant(&set.elts, true, 0),
+                    _ => None,
+                };
+                if constant.is_some() {
+                    self.constant = constant;
+                    return;
+                }
+            }
+            self.visit_expr(expression);
         }
 
         fn visit_legacy_dict(&mut self, items: &'ast [ruff_python_ast::DictItem]) {
@@ -2773,7 +2800,11 @@ fn first_constant(
                         return;
                     }
                     Stmt::For(loop_) => {
-                        self.visit_expr(&loop_.iter);
+                        if loop_.is_async {
+                            self.visit_expr(&loop_.iter);
+                        } else {
+                            self.visit_iterable_expression(&loop_.iter);
+                        }
                         if loop_.is_async && !self.is_complete() {
                             self.constant = Some(Constant::None);
                         }
@@ -2849,6 +2880,16 @@ fn first_constant(
                 }
             }
             match statement {
+                Stmt::For(loop_)
+                    if self.compiler.context.python_version <= PythonVersion::Py313
+                        && !loop_.is_async =>
+                {
+                    self.visit_iterable_expression(&loop_.iter);
+                    self.visit_expr(&loop_.target);
+                    self.visit_body(&loop_.body);
+                    self.visit_body(&loop_.orelse);
+                    return;
+                }
                 Stmt::AnnAssign(assignment) => {
                     if let Some(value) = &assignment.value {
                         self.visit_expr(value);
@@ -2934,22 +2975,74 @@ fn first_constant(
             if self.compiler.context.python_version <= PythonVersion::Py313 {
                 match expression {
                     Expr::List(list) if list.ctx == ExprContext::Load => {
-                        if let Some(constant) = self.legacy_collection_constant(&list.elts, false) {
+                        if let Some(constant) =
+                            self.legacy_collection_constant(&list.elts, false, 3)
+                        {
                             self.constant = Some(constant);
                             return;
                         }
                     }
                     Expr::Set(set) => {
-                        if let Some(constant) = self.legacy_collection_constant(&set.elts, true) {
+                        if let Some(constant) = self.legacy_collection_constant(&set.elts, true, 3)
+                        {
                             self.constant = Some(constant);
                             return;
                         }
+                    }
+                    Expr::Compare(comparison) => {
+                        self.visit_expr(&comparison.left);
+                        for (index, comparator) in comparison.comparators.iter().enumerate() {
+                            if index + 1 == comparison.comparators.len()
+                                && matches!(
+                                    comparison.ops[index],
+                                    ruff_python_ast::CmpOp::In | ruff_python_ast::CmpOp::NotIn
+                                )
+                            {
+                                self.visit_iterable_expression(comparator);
+                            } else {
+                                self.visit_expr(comparator);
+                            }
+                        }
+                        return;
                     }
                     Expr::Dict(dict) => {
                         self.visit_legacy_dict(&dict.items);
                         return;
                     }
                     _ => {}
+                }
+            }
+            if self.compiler.context.python_version <= PythonVersion::Py313 {
+                let comprehension = match expression {
+                    Expr::ListComp(comprehension) => {
+                        Some((&comprehension.generators, None, comprehension.elt.as_ref()))
+                    }
+                    Expr::SetComp(comprehension) => {
+                        Some((&comprehension.generators, None, comprehension.elt.as_ref()))
+                    }
+                    Expr::DictComp(comprehension) => Some((
+                        &comprehension.generators,
+                        comprehension.key.as_deref(),
+                        comprehension.value.as_ref(),
+                    )),
+                    _ => None,
+                };
+                if let Some((generators, key, value)) = comprehension {
+                    for generator in generators {
+                        self.visit_iterable_expression(&generator.iter);
+                        if generator.is_async && !self.is_complete() {
+                            self.constant = Some(Constant::None);
+                        }
+                        self.visit_expr(&generator.target);
+                        for condition in &generator.ifs {
+                            self.visit_expr(condition);
+                        }
+                    }
+                    if let Some(key) = key {
+                        self.visit_expr(key);
+                    }
+                    self.visit_expr(value);
+                    return;
                 }
             }
             if let Expr::Call(call) = expression {
@@ -2963,7 +3056,7 @@ fn first_constant(
                     && expanded
                     && !self.is_complete()
                     && let Some(constant) =
-                        self.legacy_collection_constant(&call.arguments.args, false)
+                        self.legacy_collection_constant(&call.arguments.args, false, 3)
                 {
                     self.constant = Some(constant);
                 } else {

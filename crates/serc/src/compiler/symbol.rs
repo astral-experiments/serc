@@ -27,7 +27,10 @@ use crate::{CompileError, PythonVersion};
 
 use super::RETURN_VALUE;
 
-use super::constant::{DeferredConstantTarget, constant_slice, fold_constant, literal_constant};
+use super::constant::{
+    DeferredConstantTarget, constant_slice, fold_constant, literal_constant,
+    python_constant_values_equal,
+};
 use super::scope::{NameId, NameSet, definitely_evaluated_references};
 use super::source::unparse_annotation;
 use super::{Compiler, Scope};
@@ -905,6 +908,108 @@ impl Compiler<'_> {
                 }
             }
 
+            /// Match legacy whole-display code generation and AST iterable folding.
+            fn legacy_collection_constant(
+                &self,
+                expression: &Expr,
+                iterable: bool,
+            ) -> Option<Constant> {
+                let compiler = self.legacy_compiler?;
+                let (elements, is_set) = match expression {
+                    Expr::List(list) if list.ctx == ExprContext::Load => {
+                        (list.elts.as_slice(), false)
+                    }
+                    Expr::Set(set) => (set.elts.as_slice(), true),
+                    _ => return None,
+                };
+                if !iterable && elements.len() < 3 {
+                    return None;
+                }
+                let values = elements
+                    .iter()
+                    .map(|element| compiler.source_aware_fold_constant(element))
+                    .collect::<Option<Vec<_>>>()?;
+                if is_set {
+                    let mut unique = Vec::with_capacity(values.len());
+                    for value in values {
+                        if !unique
+                            .iter()
+                            .any(|existing| python_constant_values_equal(existing, &value))
+                        {
+                            unique.push(value);
+                        }
+                    }
+                    Some(Constant::FrozenSet(unique))
+                } else {
+                    Some(Constant::Tuple(values))
+                }
+            }
+
+            fn visit_iterable_expression(&mut self, expression: &'ast Expr) {
+                if let Some(constant) = self.legacy_collection_constant(expression, true) {
+                    // Visit the whole container before any later reuse of its members.
+                    self.record_interpolated_constant(constant);
+                } else {
+                    self.visit_expr(expression);
+                }
+            }
+
+            /// Reserve legacy constant-key tuples after their values, at each map flush.
+            fn visit_legacy_dict(&mut self, items: &'ast [ruff_python_ast::DictItem]) {
+                let compiler = self.legacy_compiler.unwrap();
+                let mut index = 0;
+                while index < items.len() {
+                    if items[index].key.is_none() {
+                        self.visit_expr(&items[index].value);
+                        index += 1;
+                        continue;
+                    }
+                    let start = index;
+                    while index < items.len() && items[index].key.is_some() && index - start < 17 {
+                        index += 1;
+                    }
+                    let group = &items[start..index];
+                    if (2..=15).contains(&group.len())
+                        && let Some(keys) = group
+                            .iter()
+                            .map(|item| {
+                                compiler.source_aware_fold_constant(item.key.as_ref().unwrap())
+                            })
+                            .collect::<Option<Vec<_>>>()
+                    {
+                        for item in group {
+                            self.visit_expr(&item.value);
+                        }
+                        self.record_interpolated_constant(Constant::Tuple(keys));
+                    } else {
+                        for item in group {
+                            self.visit_expr(item.key.as_ref().unwrap());
+                            self.visit_expr(&item.value);
+                        }
+                    }
+                }
+            }
+
+            fn visit_annotation_subscript(&mut self, expression: &'ast Expr) {
+                match expression {
+                    Expr::Slice(slice) => {
+                        // Annotation-only targets evaluate bounds without constructing a slice.
+                        for bound in [&slice.lower, &slice.upper, &slice.step]
+                            .into_iter()
+                            .flatten()
+                        {
+                            self.visit_expr(bound);
+                        }
+                    }
+                    Expr::Tuple(tuple) => {
+                        for element in &tuple.elts {
+                            self.visit_annotation_subscript(element);
+                        }
+                    }
+                    _ => self.visit_expr(expression),
+                }
+            }
+
             fn record_interpolated_constant(&mut self, constant: Constant) {
                 if self.record_string_origins {
                     self.string_origin_constants.push((constant.clone(), false));
@@ -983,6 +1088,25 @@ impl Compiler<'_> {
                 }
             }
 
+            /// Retain parent-scope admissions for an eager legacy function annotation.
+            fn visit_legacy_annotation(&mut self, name: &str, annotation: &'ast Expr) {
+                if self.register_literals {
+                    self.constants.push(Constant::String(
+                        mangle_name(name, self.private_name.as_deref()).into_owned(),
+                    ));
+                }
+                if self.future_annotations {
+                    if self.register_literals {
+                        self.constants.push(Constant::String(unparse_annotation(
+                            annotation,
+                            self.source,
+                        )));
+                    }
+                } else {
+                    self.visit_expr(annotation);
+                }
+            }
+
             fn visit_scope_body(&mut self, body: &'ast [Stmt]) {
                 if let Some(Stmt::Expr(statement)) = body.first()
                     && let Some(docstring @ Constant::String(_)) =
@@ -1031,7 +1155,7 @@ impl Compiler<'_> {
                                 Expr::Attribute(attribute) => self.visit_expr(&attribute.value),
                                 Expr::Subscript(subscript) => {
                                     self.visit_expr(&subscript.value);
-                                    self.visit_expr(&subscript.slice);
+                                    self.visit_annotation_subscript(&subscript.slice);
                                 }
                                 _ => {}
                             }
@@ -1060,6 +1184,15 @@ impl Compiler<'_> {
                             self.record_string_origins = true;
                             self.string_origin_constants.clear();
                         }
+                        return;
+                    }
+                    Stmt::For(statement)
+                        if self.legacy_compiler.is_some() && !statement.is_async =>
+                    {
+                        self.visit_iterable_expression(&statement.iter);
+                        self.visit_expr(&statement.target);
+                        self.visit_body(&statement.body);
+                        self.visit_body(&statement.orelse);
                         return;
                     }
                     Stmt::For(statement) if statement.is_async => {
@@ -1099,6 +1232,39 @@ impl Compiler<'_> {
                                 self.record_key_origin(parameter.name().as_str());
                                 self.visit_expr(default);
                             }
+                        }
+                        if self.legacy_compiler.is_some() && definition.type_params.is_none() {
+                            // Legacy non-generic signatures execute in this scope even when
+                            // their surrounding instructions are later removed. Keep their
+                            // names and reusable constants in the original admission order.
+                            let record_string_origins = self.record_string_origins;
+                            self.record_string_origins = false;
+                            let parameters = &definition.parameters;
+                            for parameter in parameters
+                                .args
+                                .iter()
+                                .chain(&parameters.posonlyargs)
+                                .map(|parameter| &parameter.parameter)
+                                .chain(parameters.vararg.as_deref())
+                                .chain(
+                                    parameters
+                                        .kwonlyargs
+                                        .iter()
+                                        .map(|parameter| &parameter.parameter),
+                                )
+                                .chain(parameters.kwarg.as_deref())
+                            {
+                                if let Some(annotation) = &parameter.annotation {
+                                    self.visit_legacy_annotation(
+                                        parameter.name.as_str(),
+                                        annotation,
+                                    );
+                                }
+                            }
+                            if let Some(annotation) = &definition.returns {
+                                self.visit_legacy_annotation("return", annotation);
+                            }
+                            self.record_string_origins = record_string_origins;
                         }
                         if self.record_string_origins {
                             let mut child = self.origin_collector(self.private_name.clone());
@@ -1218,6 +1384,10 @@ impl Compiler<'_> {
                         return;
                     }
                     Stmt::Import(import) => {
+                        if self.legacy_compiler.is_some() && self.register_literals {
+                            self.constants.push(Constant::Int(0));
+                            self.constants.push(Constant::None);
+                        }
                         for alias in &import.names {
                             let imported = alias.name.as_str();
                             self.names.push((imported.to_string(), true));
@@ -1235,17 +1405,23 @@ impl Compiler<'_> {
                         return;
                     }
                     Stmt::ImportFrom(import) => {
-                        if self.record_string_origins {
-                            self.string_origin_constants.push((
-                                Constant::Tuple(
-                                    import
-                                        .names
-                                        .iter()
-                                        .map(|alias| Constant::String(alias.name.to_string()))
-                                        .collect(),
-                                ),
-                                true,
-                            ));
+                        let register_legacy_literals =
+                            self.legacy_compiler.is_some() && self.register_literals;
+                        if self.record_string_origins || register_legacy_literals {
+                            let names = Constant::Tuple(
+                                import
+                                    .names
+                                    .iter()
+                                    .map(|alias| Constant::String(alias.name.to_string()))
+                                    .collect(),
+                            );
+                            if register_legacy_literals {
+                                self.constants.push(Constant::Int(u64::from(import.level)));
+                                self.constants.push(names.clone());
+                            }
+                            if self.record_string_origins {
+                                self.string_origin_constants.push((names, true));
+                            }
                         }
                         if let Some(module) = &import.module {
                             self.names.push((module.as_str().to_string(), true));
@@ -1285,6 +1461,10 @@ impl Compiler<'_> {
             }
 
             fn visit_expr(&mut self, expression: &'ast Expr) {
+                if let Some(constant) = self.legacy_collection_constant(expression, false) {
+                    self.record_interpolated_constant(constant);
+                    return;
+                }
                 if let Some(constant) = self.legacy_folded_constant(expression) {
                     // Legacy AST folding admits only the result, before the next child
                     // is built. Replaying operands or delaying this action changes which
@@ -1316,6 +1496,23 @@ impl Compiler<'_> {
                         .any(|element| fold_constant(element).is_none())
                 }) {
                     self.has_untracked_collection = true;
+                }
+                if let Expr::Slice(slice) = expression
+                    && self.legacy_compiler.is_some()
+                {
+                    // Legacy targets load each bound before building the slice. Reused
+                    // bounds keep this admission even when the surrounding code is removed.
+                    for bound in [&slice.lower, &slice.upper] {
+                        if let Some(bound) = bound {
+                            self.visit_expr(bound);
+                        } else {
+                            self.record_interpolated_constant(Constant::None);
+                        }
+                    }
+                    if let Some(step) = &slice.step {
+                        self.visit_expr(step);
+                    }
+                    return;
                 }
                 if let Expr::Slice(slice) = expression
                     && let Some(constant) = constant_slice(slice)
@@ -1353,6 +1550,26 @@ impl Compiler<'_> {
                     return;
                 }
                 match expression {
+                    Expr::Dict(dictionary) if self.legacy_compiler.is_some() => {
+                        self.visit_legacy_dict(&dictionary.items);
+                        return;
+                    }
+                    Expr::Compare(comparison) if self.legacy_compiler.is_some() => {
+                        self.visit_expr(&comparison.left);
+                        for (index, comparator) in comparison.comparators.iter().enumerate() {
+                            if index + 1 == comparison.comparators.len()
+                                && matches!(
+                                    comparison.ops[index],
+                                    ruff_python_ast::CmpOp::In | ruff_python_ast::CmpOp::NotIn
+                                )
+                            {
+                                self.visit_iterable_expression(comparator);
+                            } else {
+                                self.visit_expr(comparator);
+                            }
+                        }
+                        return;
+                    }
                     Expr::Call(call) if self.record_string_origins || self.register_literals => {
                         self.visit_expr(&call.func);
                         for argument in &call.arguments.args {
@@ -1480,7 +1697,7 @@ impl Compiler<'_> {
                         // Only the outer iterable runs in this scope; the generator body has
                         // its own name table, even when its enclosing branch is eliminated.
                         if let Some(first) = generator.generators.first() {
-                            self.visit_expr(&first.iter);
+                            self.visit_iterable_expression(&first.iter);
                         }
                         if build {
                             self.record_string_origins = true;
@@ -1512,7 +1729,7 @@ impl Compiler<'_> {
                         self.record_string_origins = false;
                     }
                     if let Some(first) = generators.first() {
-                        self.visit_expr(&first.iter);
+                        self.visit_iterable_expression(&first.iter);
                     }
                     // Hidden fast locals apply only inside this comprehension. The same
                     // spelling in a surrounding dead suite still belongs in its name table.
@@ -1522,7 +1739,7 @@ impl Compiler<'_> {
                     }
                     for (index, generator) in generators.iter().enumerate() {
                         if index > 0 {
-                            self.visit_expr(&generator.iter);
+                            self.visit_iterable_expression(&generator.iter);
                         }
                         self.visit_expr(&generator.target);
                         for condition in &generator.ifs {
@@ -2110,7 +2327,7 @@ impl Compiler<'_> {
     ) -> Result<EmittedJump, CompileError> {
         self.control.clear_direct_comprehension_assignment_results();
         let removed_nop = (compact_trailing_nop
-            && self.context.python_version != crate::PythonVersion::Py312
+            && self.context.python_version >= crate::PythonVersion::Py314
             && is_unconditional_jump(opcode))
         .then(|| self.take_trailing_nop_location())
         .flatten();
@@ -2138,7 +2355,7 @@ impl Compiler<'_> {
         exception_policy: ExceptionPolicy,
     ) -> Result<(), CompileError> {
         self.control.clear_direct_comprehension_assignment_results();
-        let removed_nop = (self.context.python_version != crate::PythonVersion::Py312
+        let removed_nop = (self.context.python_version >= crate::PythonVersion::Py314
             && is_unconditional_jump(opcode))
         .then(|| self.take_trailing_nop_location())
         .flatten();
@@ -2178,7 +2395,7 @@ impl Compiler<'_> {
         label: Label,
     ) -> Result<EmittedJump, CompileError> {
         self.control.clear_direct_comprehension_assignment_results();
-        let removed_nop = (self.context.python_version != crate::PythonVersion::Py312
+        let removed_nop = (self.context.python_version >= crate::PythonVersion::Py314
             && is_unconditional_jump(opcode))
         .then(|| self.take_trailing_nop_location())
         .flatten();
@@ -2208,7 +2425,7 @@ impl Compiler<'_> {
         exception_policy: ExceptionPolicy,
     ) -> Result<(), CompileError> {
         self.control.clear_direct_comprehension_assignment_results();
-        let removed_nop = (self.context.python_version != crate::PythonVersion::Py312
+        let removed_nop = (self.context.python_version >= crate::PythonVersion::Py314
             && is_unconditional_jump(opcode))
         .then(|| self.take_trailing_nop_location())
         .flatten();

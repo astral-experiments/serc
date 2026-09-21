@@ -2522,7 +2522,15 @@ impl OptimizationPipeline {
                 {
                     continue;
                 }
-                if let Some(target) = exception_successors[block_starts[block.index()] + offset] {
+                // Legacy exit copies preserve the donor's absent exception owner even
+                // inside a protected destination. Those instructions cannot contribute
+                // uncertainty to the destination's handler.
+                let ownerless_legacy_copy = self.python_version <= crate::PythonVersion::Py313
+                    && instruction.exception_policy().exclusion()
+                        == super::super::ExceptionExclusion::Always;
+                if !ownerless_legacy_copy
+                    && let Some(target) = exception_successors[block_starts[block.index()] + offset]
+                {
                     propagate(target, unsafe_locals);
                 }
                 let Operand::Value(argument) = instruction.operand() else {

@@ -3,6 +3,7 @@ mod exception_owners;
 mod fusion_owner_slots;
 mod ir;
 mod layout;
+mod legacy_native_labels;
 mod passes;
 
 #[cfg(test)]
@@ -487,6 +488,30 @@ impl Assembler {
 
     pub(crate) const fn python_version(&self) -> crate::PythonVersion {
         self.python_version
+    }
+
+    /// Binds a physical entry to its canonical native 3.12 codegen label.
+    pub(crate) fn bind_legacy_native_label(&mut self, physical: Label, native: u32) {
+        debug_assert_eq!(self.python_version, crate::PythonVersion::Py312);
+        self.legacy_native_labels
+            .get_or_insert_with(Default::default)
+            .bind(physical, native);
+    }
+
+    /// Enables exact native operands only after every codegen occurrence is covered.
+    pub(crate) fn certify_legacy_native_labels(&mut self) {
+        debug_assert_eq!(self.python_version, crate::PythonVersion::Py312);
+        self.legacy_native_labels
+            .get_or_insert_with(Default::default)
+            .certify();
+    }
+
+    /// Cancels the complete code object's provenance if any producer is unsupported.
+    pub(crate) fn invalidate_legacy_native_labels(&mut self) {
+        debug_assert_eq!(self.python_version, crate::PythonVersion::Py312);
+        self.legacy_native_labels
+            .get_or_insert_with(Default::default)
+            .invalidate();
     }
 
     /// Records a branch marker emitted before exception targets were assigned.
@@ -4956,6 +4981,34 @@ impl Assembler {
             .add_hidden_exception_owner_slots(slots);
     }
 
+    /// Counts an omitted normal `POP_BLOCK` at its original boundary for 3.13 copying.
+    pub(crate) fn add_legacy_pop_block_copy_slot(&mut self, boundary: Label) {
+        if self.python_version != crate::PythonVersion::Py313 {
+            return;
+        }
+        let index = self
+            .linear_items()
+            .iter()
+            .position(|item| *item == Item::Label(boundary))
+            .expect("normal POP_BLOCK boundary is emitted");
+        let materialized = self.linear_items()[index + 1..]
+            .iter()
+            .find_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction),
+                Item::Label(_) => None,
+            })
+            .is_some_and(|instruction| instruction.fusion_policy.is_converted_pop_block());
+        if !materialized {
+            // Reuse the logical POP boundary. Inserting a label before its last
+            // predecessor can split a fused pair or belong to another original array.
+            *self
+                .exception_owner_provenance
+                .legacy_early_copy_slots
+                .entry(boundary)
+                .or_default() += 1;
+        }
+    }
+
     /// Moves one compiler-removed NULL `POP_BLOCK` to its original linear successor.
     ///
     /// The caller already counted that record on the protected predecessor. Keeping it
@@ -5278,6 +5331,11 @@ impl Assembler {
 
     /// Resolves condition markers whose instructions all precede CFG optimization.
     pub(crate) fn defer_last_original_condition_exception_owner(&mut self) {
+        if self.python_version <= crate::PythonVersion::Py313 {
+            // These targets omit NOT_TAKEN. Their actual condition jump keeps
+            // its enclosing handler; only modern appended markers need lookup.
+            return;
+        }
         let instruction =
             self.required_last_instruction_mut("deferring an original condition owner");
         let mut policy = instruction.exception_policy();
@@ -5938,6 +5996,11 @@ impl Assembler {
 
     /// Allows a condition jump followed by a marker to copy a split return.
     pub(crate) fn allow_last_condition_split_return_copy(&mut self) {
+        if self.python_version <= crate::PythonVersion::Py313 {
+            // Legacy conditions have no NOT_TAKEN marker, and their native CFG
+            // pipeline determines exit copying without this modern policy.
+            return;
+        }
         let mut instructions =
             self.linear_items_mut()
                 .iter_mut()
@@ -8707,9 +8770,14 @@ impl Assembler {
     }
 
     pub(crate) fn mark_last_as_converted_pop_block(&mut self) {
-        self.required_last_instruction_mut("marking a converted POP_BLOCK")
-            .fusion_policy
-            .mark_converted_pop_block();
+        let legacy = self.python_version <= crate::PythonVersion::Py313;
+        let instruction = self.required_last_instruction_mut("marking a converted POP_BLOCK");
+        instruction.fusion_policy.mark_converted_pop_block();
+        if legacy {
+            // Native POP_BLOCK has no owner. Set its original exclusion before
+            // provenance captures the instruction; copied records normalize later.
+            instruction.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+        }
     }
 
     /// Reuses the emitted normal-exhaustion record for its original outer `POP_BLOCK`.
