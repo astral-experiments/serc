@@ -1593,26 +1593,11 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                     | Operator::Div
                     | Operator::Pow),
                     right,
-                ) if matches!(left, Constant::Float(_))
-                    && matches!(
-                        right,
-                        Constant::Bool(_) | Constant::Int(_) | Constant::SignedInt(_)
-                    )
-                    || matches!(right, Constant::Float(_))
-                        && matches!(
-                            left,
-                            Constant::Bool(_) | Constant::Int(_) | Constant::SignedInt(_)
-                        ) =>
+                ) if matches!(left, Constant::Float(_)) && is_integer_constant(&right)
+                    || matches!(right, Constant::Float(_)) && is_integer_constant(&left) =>
                 {
-                    let to_float = |constant: Constant| match constant {
-                        Constant::Bool(value) => Some(f64::from(value)),
-                        Constant::Int(value) => Some(value as f64),
-                        Constant::SignedInt(value) => Some(value as f64),
-                        Constant::Float(value) => Some(value),
-                        _ => None,
-                    };
-                    let left = to_float(left)?;
-                    let right = to_float(right)?;
+                    let left = constant_as_float(&left)?;
+                    let right = constant_as_float(&right)?;
                     match operator {
                         Operator::Add => Some(Constant::Float(left + right)),
                         Operator::Sub => Some(Constant::Float(left - right)),
@@ -1777,8 +1762,15 @@ fn integer_digits(mut value: u64) -> Vec<u16> {
     digits
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "CPython mixed float folding rounds integer operands to binary64"
+)]
 fn constant_as_float(constant: &Constant) -> Option<f64> {
     match constant {
+        Constant::Bool(value) => Some(f64::from(*value)),
+        Constant::Int(value) => Some(*value as f64),
+        Constant::SignedInt(value) => Some(*value as f64),
         Constant::Float(value) => Some(*value),
         // Dividing an integer by one provides PyLong_AsDouble's rounding and overflow checks.
         constant => fold_integer_true_divide(constant, &Constant::Int(1)),

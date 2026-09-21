@@ -35,3 +35,30 @@ fn matches_cpython_float_remainder_integer_conversion() {
         common::assert_matches_cpython_marshal(&source, "float_remainder_conversion.py");
     }
 }
+
+#[test]
+fn matches_cpython_mixed_big_integer_float_folding() {
+    for integer in [
+        "18446744073709551616",
+        "18446744073709553665",
+        "1000000000000000000000",
+    ] {
+        for operator in ["+", "-", "*", "/", "**"] {
+            for sign in ["", "-"] {
+                let float = if operator == "**" { "2.0" } else { "1.5" };
+                for (left, right) in [
+                    (format!("{sign}{integer}"), float.to_owned()),
+                    (float.to_owned(), format!("{sign}{integer}")),
+                ] {
+                    let source = format!("def mixed():\n    return ({left}) {operator} ({right})\n");
+                    common::assert_matches_cpython_marshal(&source, "mixed_big_integer_float.py");
+                }
+            }
+        }
+    }
+    let overflow = format!("0x1{}", "0".repeat(256));
+    common::assert_matches_cpython_marshal(
+        &format!("values = ({overflow} * 0.5, 0.5 / {overflow}, {overflow} ** 0.0)\n"),
+        "mixed_big_integer_float_overflow.py",
+    );
+}
