@@ -346,3 +346,33 @@ fn matches_cpython_protected_final_else_pop_locations() {
         assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn excludes_retained_conditional_pop_blocks_from_suspension_handlers() {
+    for (prefix, action) in [
+        ("", "work()"),
+        ("async ", "await work()"),
+        ("", "yield work()"),
+        ("async ", "yield work()"),
+    ] {
+        let source = format!(
+            "{prefix}def f(condition, work):\n    try:\n        if condition:\n            {action}\n        else:\n            {action}\n    except Error:\n        pass\n    else:\n        return\n"
+        );
+        assert_matches_cpython_marshal(&source, "conditional_pop_block_suspension_owner.py");
+    }
+}
+
+#[test]
+fn excludes_retained_conditional_pop_blocks_from_enclosing_tries() {
+    for (prefix, action) in [
+        ("", "work()"),
+        ("async ", "await work()"),
+        ("", "yield work()"),
+        ("async ", "yield work()"),
+    ] {
+        let source = format!(
+            "{prefix}def f(condition, work):\n    try:\n        try:\n            if condition:\n                {action}\n            else:\n                {action}\n        except Error:\n            pass\n        else:\n            raise Failed\n    except Other:\n        recover()\n"
+        );
+        assert_matches_cpython_marshal(&source, "conditional_pop_block_enclosing_owner.py");
+    }
+}

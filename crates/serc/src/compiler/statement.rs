@@ -12685,7 +12685,10 @@ impl Compiler<'_> {
             if let Some(location) = self.assembler.last_instruction_location() {
                 self.assembler.set_location(location);
             }
-            self.emit(NOP, 0, 0)?;
+            // This retained normal exit is the original POP_BLOCK. Native exception
+            // labeling pops the protected region without assigning this record an
+            // owner, including any enclosing try or coroutine stop handler.
+            self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
             self.assembler.mark_last_as_converted_pop_block();
             self.assembler.preserve_last_nop();
             let exit_end = self.assembler.label();
