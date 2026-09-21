@@ -1608,17 +1608,13 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                         Operator::Sub => Some(Constant::Float(left - right)),
                         Operator::Mult => Some(Constant::Float(left * right)),
                         Operator::Div if right != 0.0 => Some(Constant::Float(left / right)),
-                        Operator::Pow => {
-                            let result = left.powf(right);
-                            result.is_finite().then_some(Constant::Float(result))
-                        }
+                        Operator::Pow => fold_float_power(left, right),
                         Operator::Div => None,
                         _ => unreachable!(),
                     }
                 }
                 (Constant::Float(left), Operator::Pow, Constant::Float(right)) => {
-                    let result = left.powf(right);
-                    result.is_finite().then_some(Constant::Float(result))
+                    fold_float_power(left, right)
                 }
                 (left, operator @ (Operator::Add | Operator::Sub | Operator::Mult), right)
                     if matches!(left, Constant::Complex { .. })
@@ -1780,6 +1776,24 @@ fn constant_as_float(constant: &Constant) -> Option<f64> {
         // Dividing an integer by one provides PyLong_AsDouble's rounding and overflow checks.
         constant => fold_integer_true_divide(constant, &Constant::Int(1)),
     }
+}
+
+#[expect(
+    clippy::float_cmp,
+    reason = "CPython checks real exponents for exact binary64 integrality"
+)]
+fn fold_float_power(base: f64, exponent: f64) -> Option<Constant> {
+    if base.is_finite() && exponent.is_finite() && base < 0.0 && exponent != exponent.floor() {
+        // float_pow delegates negative fractional powers to complex_pow. Follow
+        // _Py_c_pow with positive imaginary zeros for both real operands.
+        let magnitude = base.hypot(0.0).powf(exponent);
+        let phase = 0.0_f64.atan2(base) * exponent;
+        let real = magnitude * phase.cos();
+        let imag = magnitude * phase.sin();
+        return (real.is_finite() && imag.is_finite()).then_some(Constant::Complex { real, imag });
+    }
+    let result = base.powf(exponent);
+    result.is_finite().then_some(Constant::Float(result))
 }
 
 /// Match CPython's `float_rem`: a nonzero remainder and zero both take the divisor's sign.
