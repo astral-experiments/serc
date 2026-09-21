@@ -28,6 +28,10 @@ pub(super) enum NativeRole {
     HandlerCleanupBody(TextRange),
     HandlerCleanupEnd(TextRange),
     ValueBoolEnd(TextRange),
+    ValueCompareCleanup(TextRange),
+    ValueCompareEnd(TextRange),
+    ConditionCompareCleanup(TextRange),
+    ConditionCompareEnd(TextRange),
     ConditionBoolEnd(TextRange),
     ValueIfEnd(TextRange),
     ValueIfElse(TextRange),
@@ -89,7 +93,6 @@ struct Builder {
     manager_depth: usize,
     handler_depth: usize,
     for_manager_depths: Vec<usize>,
-    inside_comprehension: bool,
     inside_comprehension_body: bool,
 }
 
@@ -433,10 +436,9 @@ impl Builder {
         value: &Expr,
     ) -> Option<()> {
         let first = generators.first()?;
-        if self.inside_comprehension
-            || generators
-                .iter()
-                .any(|generator| generator.is_async || !Self::name_unpack_target(&generator.target))
+        if generators
+            .iter()
+            .any(|generator| generator.is_async || !Self::name_unpack_target(&generator.target))
             || generators.iter().skip(1).any(|generator| {
                 // Native's inner singleton shortcut reserves three labels but
                 // leaves Start and Anchor unmarked. Reject the source shape,
@@ -447,9 +449,9 @@ impl Builder {
         {
             return None;
         }
-        self.inside_comprehension = true;
-        // Only the outer iterable executes before the inlined scope. Preserve
-        // its ordinary Await route while excluding nested inline comprehensions.
+        // An inner comprehension's outer iterable still belongs to the enclosing
+        // body. Preserve that suspension restriction across recursive scopes.
+        let previous_body = self.inside_comprehension_body;
         self.expression(&first.iter)?;
         self.instruction(); // GET_ITER / LOAD_FAST_AND_CLEAR / SWAP
         self.inside_comprehension_body = true;
@@ -465,8 +467,7 @@ impl Builder {
         self.instruction(); // exceptional restoration / RERAISE
         self.mark(end);
         self.instruction(); // normal SWAP / STORE_FAST_MAYBE_NULL
-        self.inside_comprehension_body = false;
-        self.inside_comprehension = false;
+        self.inside_comprehension_body = previous_body;
         Some(())
     }
 
@@ -624,6 +625,27 @@ impl Builder {
                 self.instruction(); // original join jump
                 self.mark(otherwise);
                 self.condition(&conditional.orelse, jump_on)?;
+                self.mark(end);
+            }
+            Expr::Compare(comparison) if comparison.ops.len() > 1 => {
+                // compiler_jump_if reserves Cleanup before visiting the left
+                // operand, but delays End until after the final conditional.
+                let cleanup = self.allocate(NativeRole::ConditionCompareCleanup(comparison.range));
+                self.expression(&comparison.left)?;
+                let (last, leading) = comparison.comparators.split_last()?;
+                for comparator in leading {
+                    self.expression(comparator)?;
+                    self.instruction(); // SWAP / COPY / COMPARE / conditional
+                }
+                self.expression(last)?;
+                self.instruction(); // final comparison and conditional jump
+                let end = self.allocate(NativeRole::ConditionCompareEnd(comparison.range));
+                self.instruction(); // jump around failed-comparison cleanup
+                self.mark(cleanup);
+                self.instruction(); // POP_TOP
+                if !jump_on {
+                    self.instruction(); // failed comparison jumps to caller's label
+                }
                 self.mark(end);
             }
             _ => {
@@ -811,6 +833,25 @@ impl Builder {
             Expr::Compare(comparison) if comparison.ops.len() == 1 => {
                 self.expression(&comparison.left)?;
                 self.expression(&comparison.comparators[0])?;
+            }
+            Expr::Compare(comparison) if comparison.ops.len() > 1 => {
+                // Unlike condition lowering, compiler_compare visits the left
+                // operand before reserving its failed-comparison cleanup.
+                self.expression(&comparison.left)?;
+                let cleanup = self.allocate(NativeRole::ValueCompareCleanup(comparison.range));
+                let (last, leading) = comparison.comparators.split_last()?;
+                for comparator in leading {
+                    self.expression(comparator)?;
+                    self.instruction(); // SWAP / COPY / COMPARE / conditional / POP
+                }
+                self.expression(last)?;
+                self.instruction(); // final comparison
+                let end = self.allocate(NativeRole::ValueCompareEnd(comparison.range));
+                self.instruction(); // jump around failed-comparison cleanup
+                self.mark(cleanup);
+                self.instruction(); // SWAP / POP_TOP
+                self.mark(end);
+                return Some(()); // no instruction follows the joined value
             }
             Expr::Call(call) => {
                 self.expression(&call.func)?;
@@ -1515,8 +1556,6 @@ mod manager_tests {
     fn inlined_comprehension_subset_rejects_additional_control_routes() {
         for expression in [
             "[item async for item in xs]",
-            "[[other for other in ys] for item in xs]",
-            "[item for item in [other for other in ys]]",
             "[await action(item) for item in xs]",
             "[item for item in xs for other in await ys()]",
             "[item for item in xs for other in [value]]",
@@ -1603,10 +1642,8 @@ mod manager_tests {
         for filter in [
             "True",
             "__debug__",
-            "lower < item < upper",
             "predicate(await value())",
             "await predicate(item)",
-            "predicate([other for other in ys])",
         ] {
             let source =
                 format!("async def f(xs, ys):\n    values = [item for item in xs if {filter}]\n");
@@ -2074,5 +2111,255 @@ mod comprehension_family_tests {
                 [&NativeRole::ComprehensionIfCleanup(comprehension.generators[0].iter.range())],
             5
         );
+    }
+}
+
+#[cfg(test)]
+mod expression_family_tests {
+    use super::{NativeLabelPlan, NativeRole};
+    use ruff_python_ast::{Expr, Stmt};
+    use ruff_python_parser::parse_module;
+    use ruff_text_size::Ranged;
+
+    #[test]
+    fn value_chain_allocates_cleanup_after_left_and_end_after_comparators() {
+        let parsed =
+            parse_module("def f():\n    value = (a if p else b) < mid < (c if q else d)\n")
+                .unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::Assign(assignment)] = function.body.as_slice() else {
+            panic!()
+        };
+        let Expr::Compare(comparison) = assignment.value.as_ref() else {
+            panic!()
+        };
+        let Expr::If(left) = comparison.left.as_ref() else {
+            panic!()
+        };
+        let Expr::If(right) = &comparison.comparators[1] else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+        for (role, ordinal) in [
+            (NativeRole::ValueIfEnd(left.range), 2),
+            (NativeRole::ValueIfElse(left.range), 3),
+            (NativeRole::ValueCompareCleanup(comparison.range), 4),
+            (NativeRole::ValueIfEnd(right.range), 5),
+            (NativeRole::ValueIfElse(right.range), 6),
+            (NativeRole::ValueCompareEnd(comparison.range), 7),
+        ] {
+            assert_eq!(plan.remaining[&role], ordinal);
+        }
+        assert_eq!(plan.remaining.len(), 7);
+    }
+
+    #[test]
+    fn condition_chain_allocates_cleanup_before_left_and_end_after_comparators() {
+        let parsed = parse_module(
+            "def f():\n    if (a if p else b) < mid < (c if q else d):\n        pass\n",
+        )
+        .unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::If(statement)] = function.body.as_slice() else {
+            panic!()
+        };
+        let Expr::Compare(comparison) = statement.test.as_ref() else {
+            panic!()
+        };
+        let Expr::If(left) = comparison.left.as_ref() else {
+            panic!()
+        };
+        let Expr::If(right) = &comparison.comparators[1] else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+        for (role, ordinal) in [
+            (NativeRole::IfEnd(statement.range), 2),
+            (NativeRole::ConditionCompareCleanup(comparison.range), 3),
+            (NativeRole::ValueIfEnd(left.range), 4),
+            (NativeRole::ValueIfElse(left.range), 5),
+            (NativeRole::ValueIfEnd(right.range), 6),
+            (NativeRole::ValueIfElse(right.range), 7),
+            (NativeRole::ConditionCompareEnd(comparison.range), 8),
+        ] {
+            assert_eq!(plan.remaining[&role], ordinal);
+        }
+        assert_eq!(plan.remaining.len(), 8);
+    }
+
+    #[test]
+    fn chain_end_aliases_enclosing_boolean_join_in_both_contexts() {
+        let parsed = parse_module(
+            "def f():\n    value = p or a < b < c\n    if p or a < b < c:\n        pass\n",
+        )
+        .unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::Assign(assignment), Stmt::If(statement)] = function.body.as_slice() else {
+            panic!()
+        };
+        let Expr::BoolOp(value) = assignment.value.as_ref() else {
+            panic!()
+        };
+        let Expr::Compare(value_chain) = &value.values[1] else {
+            panic!()
+        };
+        let Expr::BoolOp(condition) = statement.test.as_ref() else {
+            panic!()
+        };
+        let Expr::Compare(condition_chain) = &condition.values[1] else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+        assert_eq!(plan.remaining[&NativeRole::ValueBoolEnd(value.range)], 4);
+        assert_eq!(
+            plan.remaining[&NativeRole::ValueCompareEnd(value_chain.range)],
+            4
+        );
+        assert_eq!(
+            plan.remaining[&NativeRole::ValueCompareCleanup(value_chain.range)],
+            3
+        );
+        assert_eq!(
+            plan.remaining[&NativeRole::ConditionBoolEnd(condition.range)],
+            8
+        );
+        assert_eq!(
+            plan.remaining[&NativeRole::ConditionCompareEnd(condition_chain.range)],
+            8
+        );
+        assert_eq!(
+            plan.remaining[&NativeRole::ConditionCompareCleanup(condition_chain.range)],
+            7
+        );
+        assert_eq!(plan.remaining[&NativeRole::IfEnd(statement.range)], 5);
+    }
+
+    #[test]
+    fn nested_comprehension_schedules_interleave_filters_and_keep_restore_boundaries() {
+        let parsed = parse_module(
+            "def f():\n    values = [[z for z in zs if a < b < c] for x in xs if p or q]\n",
+        )
+        .unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::Assign(assignment)] = function.body.as_slice() else {
+            panic!()
+        };
+        let Expr::ListComp(outer) = assignment.value.as_ref() else {
+            panic!()
+        };
+        let Expr::ListComp(inner) = outer.elt.as_ref() else {
+            panic!()
+        };
+        let first = &outer.generators[0];
+        let second = &inner.generators[0];
+        let Expr::Compare(comparison) = &second.ifs[0] else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+        for (role, ordinal) in [
+            (NativeRole::ComprehensionCleanup(first.iter.range()), 2),
+            (NativeRole::ComprehensionEnd(first.iter.range()), 3),
+            (NativeRole::ComprehensionStart(first.iter.range()), 4),
+            (NativeRole::ComprehensionIfCleanup(first.iter.range()), 5),
+            (NativeRole::ComprehensionAnchor(first.iter.range()), 6),
+            (NativeRole::ConditionBoolEnd(first.ifs[0].range()), 7),
+            (NativeRole::ComprehensionCleanup(second.iter.range()), 8),
+            (NativeRole::ComprehensionEnd(second.iter.range()), 9),
+            (NativeRole::ComprehensionStart(second.iter.range()), 10),
+            (NativeRole::ComprehensionIfCleanup(second.iter.range()), 11),
+            (NativeRole::ComprehensionAnchor(second.iter.range()), 12),
+            (NativeRole::ConditionCompareCleanup(comparison.range), 13),
+            (NativeRole::ConditionCompareEnd(comparison.range), 14),
+        ] {
+            assert_eq!(plan.remaining[&role], ordinal);
+        }
+        assert_eq!(plan.remaining.len(), 14);
+    }
+
+    #[test]
+    fn nested_outer_iterable_completes_before_enclosing_save_state() {
+        let parsed = parse_module("def f():\n    values = [x for x in [y for y in ys]]\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::Assign(assignment)] = function.body.as_slice() else {
+            panic!()
+        };
+        let Expr::ListComp(outer) = assignment.value.as_ref() else {
+            panic!()
+        };
+        let Expr::ListComp(inner) = &outer.generators[0].iter else {
+            panic!()
+        };
+        let outer_range = outer.generators[0].iter.range();
+        let inner_range = inner.generators[0].iter.range();
+        let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+        assert_eq!(
+            plan.remaining[&NativeRole::ComprehensionCleanup(inner_range)],
+            2
+        );
+        assert_eq!(
+            plan.remaining[&NativeRole::ComprehensionEnd(inner_range)],
+            3
+        );
+        assert_eq!(
+            plan.remaining[&NativeRole::ComprehensionAnchor(inner_range)],
+            6
+        );
+        assert_eq!(
+            plan.remaining[&NativeRole::ComprehensionCleanup(outer_range)],
+            7
+        );
+        assert_eq!(
+            plan.remaining[&NativeRole::ComprehensionEnd(outer_range)],
+            8
+        );
+        assert_eq!(
+            plan.remaining[&NativeRole::ComprehensionAnchor(outer_range)],
+            11
+        );
+        assert_eq!(plan.remaining.len(), 11);
+    }
+
+    #[test]
+    fn nested_comprehensions_restore_enclosing_suspension_restrictions() {
+        for expression in [
+            "[[y for y in ys] or await action() for x in xs]",
+            "[([y for y in ys], await action()) for x in xs]",
+            "[[y for y in await items()] for x in xs]",
+            "[[y for y in ys for z in [item]] for x in xs]",
+            "[[y async for y in ys] for x in xs]",
+        ] {
+            let source = format!("async def f():\n    values = {expression}\n");
+            let parsed = parse_module(&source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(
+                NativeLabelPlan::function(&function.body, true).is_none(),
+                "{source}"
+            );
+        }
+        for expression in [
+            "[[y for y in ys] for x in await items()]",
+            "[x for x in [y for y in await items()]]",
+        ] {
+            let source = format!("async def f():\n    values = {expression}\n    await done()\n");
+            let parsed = parse_module(&source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+            assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 18);
+            assert_eq!(plan.remaining.len(), 18);
+        }
     }
 }

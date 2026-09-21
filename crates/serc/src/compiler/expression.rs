@@ -7576,6 +7576,10 @@ impl Compiler<'_> {
 
         let base_depth = self.control.stack.depth - 1;
         let cleanup = self.assembler.label();
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::ValueCompareCleanup(expression.range),
+            cleanup,
+        );
         for (operator, comparator) in expression
             .ops
             .iter()
@@ -7624,6 +7628,10 @@ impl Compiler<'_> {
         let (opcode, argument) = comparison_operator(operator, self.context.python_version);
         self.emit(opcode, argument, -1)?;
         let end = self.assembler.label();
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::ValueCompareEnd(expression.range),
+            end,
+        );
         self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
 
         self.assembler.mark(cleanup);
@@ -8268,6 +8276,10 @@ impl Compiler<'_> {
             let base_depth = self.control.stack.depth;
             let cleanup = self.assembler.label();
             let end = self.assembler.label();
+            self.bind_native_source_label(
+                super::legacy_native_labels::NativeRole::ConditionCompareCleanup(comparison.range),
+                cleanup,
+            );
             self.compile_expression(&comparison.left)?;
             for (operator, comparator) in comparison
                 .ops
@@ -8323,6 +8335,12 @@ impl Compiler<'_> {
             if self.context.python_version <= PythonVersion::Py313 {
                 self.assembler.set_location(SourceLocation::NONE);
             }
+            // Native reserves End here, after operand labels. Its source plan
+            // is independent of the earlier physical label allocation above.
+            self.bind_native_source_label(
+                super::legacy_native_labels::NativeRole::ConditionCompareEnd(comparison.range),
+                end,
+            );
             let comparison_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
             if self.control.conditions.retained_chained_comparison_exit == Some(comparison.range) {
                 // CPython retains this final comparison fallthrough jump as a NOP when its

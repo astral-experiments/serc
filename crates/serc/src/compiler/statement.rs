@@ -3347,10 +3347,10 @@ impl Compiler<'_> {
                 let next = self.assembler.label();
                 if self.context.python_version == crate::PythonVersion::Py312
                     && statement.elif_else_clauses.is_empty()
-                    && matches!(body.last(), Some(Stmt::Return(_) | Stmt::Raise(_)))
                 {
-                    // A terminating arm receives no eager implicit return. Its false
-                    // target is the original native IfEnd, before the shared footer.
+                    // Without an else, native compiler_if uses IfEnd as the false
+                    // target. Eager copies of the true arm's footer do not change
+                    // that source boundary or its original native label.
                     self.bind_native_source_label(
                         super::legacy_native_labels::NativeRole::IfEnd(statement.range),
                         next,
