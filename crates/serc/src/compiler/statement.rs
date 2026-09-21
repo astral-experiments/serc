@@ -3862,9 +3862,12 @@ impl Compiler<'_> {
         })?;
         self.compile_expression(&expression.body)?;
         // The discarded expression's POP_TOP is authored without a location.
-        // 3.12 resolves it after static swaps, so it must not inherit this arm yet.
+        // Nested arms keep the shared discard unlocated until exit copying gives
+        // each predecessor its own donor. 3.12 also resolves after static swaps.
         self.assembler.set_location(
-            if self.context.python_version == crate::PythonVersion::Py312 {
+            if self.context.python_version == crate::PythonVersion::Py312
+                || matches!(expression.body.as_ref(), Expr::If(_))
+            {
                 SourceLocation::NONE
             } else {
                 self.source_location(expression.body.range())
@@ -3881,9 +3884,12 @@ impl Compiler<'_> {
         let end = self.assembler.label();
         self.assembler.mark(end);
         // The discarded expression's POP_TOP is authored without a location.
-        // 3.12 resolves it after static swaps, so it must not inherit this arm yet.
+        // Nested arms keep the shared discard unlocated until exit copying gives
+        // each predecessor its own donor. 3.12 also resolves after static swaps.
         self.assembler.set_location(
-            if self.context.python_version == crate::PythonVersion::Py312 {
+            if self.context.python_version == crate::PythonVersion::Py312
+                || matches!(expression.orelse.as_ref(), Expr::If(_))
+            {
                 SourceLocation::NONE
             } else {
                 self.source_location(expression.orelse.range())
