@@ -34102,11 +34102,26 @@ fn conditional_for_else_cleanup_exit(statement: &ruff_python_ast::StmtIf) -> boo
 fn suite_has_unconditional_cleanup_exit(body: &[Stmt]) -> bool {
     match body.last() {
         Some(Stmt::Try(statement)) => {
+            // A direct return makes the normal finalizer exit unreachable. Its copied
+            // cleanup returns separately, leaving only the surrounding condition's
+            // false edge at the original join.
+            let returning_body = statement.handlers.is_empty()
+                && statement.orelse.is_empty()
+                && !suite_contains_yield_with_headers(&statement.body, true, true)
+                && !suite_contains_yield_with_headers(&statement.finalbody, true, true)
+                && statement.body.split_last().is_some_and(|(last, leading)| {
+                    (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
+                        && matches!(last, Stmt::Return(returned)
+                        if returned.value.as_deref().is_none_or(|value| {
+                            !expression_contains_inline_branch(value)
+                                && !expression_suspends_current_scope(value)
+                        }))
+                });
             statement.finalbody.is_empty()
                 // A terminal condition in the protected body can leave an empty
                 // original join before cleanup. Linear finalizer work alone does
                 // not certify the enclosing condition's sole predecessor.
-                || (suite_has_linear_borrow_fallthrough(&statement.body)
+                || ((suite_has_linear_borrow_fallthrough(&statement.body) || returning_body)
                     && suite_has_linear_borrow_fallthrough(&statement.finalbody)
                     && !suite_contains_yield(&statement.finalbody))
         }

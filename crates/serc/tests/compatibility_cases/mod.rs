@@ -705,3 +705,5 @@ mod with_pass_finally_owner;
 
 mod numeric_remainder_folding;
 mod signed_integer_folding;
+
+mod try_finally_return_exit_locations;
