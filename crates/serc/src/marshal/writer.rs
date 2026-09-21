@@ -219,12 +219,6 @@ impl Writer<'_, '_, '_> {
         let Some(flag) = self.begin_object(object, reference_mode) else {
             return;
         };
-        self.string_value(flag, value, interned);
-    }
-
-    /// Writes a UTF-8 string after reference registration.
-    /// `interned` describes this object's identity; fresh slice members pass false.
-    fn string_value(&mut self, flag: u8, value: &str, interned: bool) {
         let bytes = value.as_bytes();
         if value.is_ascii() && bytes.len() < 256 {
             self.output.extend_from_slice(&[
@@ -297,7 +291,12 @@ impl Writer<'_, '_, '_> {
         true
     }
 
-    fn write_constant_value(&mut self, value: &Constant, reference_mode: ReferenceMode) -> bool {
+    fn write_constant_value(
+        &mut self,
+        value: &Constant,
+        reference_mode: ReferenceMode,
+        kind: OccurrenceKind,
+    ) -> bool {
         match value {
             Constant::None => {
                 self.byte(TYPE_NONE);
@@ -316,22 +315,22 @@ impl Writer<'_, '_, '_> {
                 true
             }
             Constant::Int(integer) => {
-                let object = self.next_object(OccurrenceKind::Constant);
+                let object = self.next_object(kind);
                 self.integer(object, *integer, reference_mode);
                 true
             }
             Constant::SignedInt(integer) => {
-                let object = self.next_object(OccurrenceKind::Constant);
+                let object = self.next_object(kind);
                 self.signed_integer(object, *integer, reference_mode);
                 true
             }
             Constant::BigInt { negative, digits } => {
-                let object = self.next_object(OccurrenceKind::Constant);
+                let object = self.next_object(kind);
                 self.big_integer(object, digits, *negative, reference_mode);
                 true
             }
             Constant::Float(float) => {
-                let object = self.next_object(OccurrenceKind::Constant);
+                let object = self.next_object(kind);
                 let Some(flag) = self.begin_object(object, reference_mode) else {
                     return false;
                 };
@@ -339,7 +338,7 @@ impl Writer<'_, '_, '_> {
                 true
             }
             Constant::Complex { real, imag } => {
-                let object = self.next_object(OccurrenceKind::Constant);
+                let object = self.next_object(kind);
                 let Some(flag) = self.begin_object(object, reference_mode) else {
                     return false;
                 };
@@ -347,17 +346,17 @@ impl Writer<'_, '_, '_> {
                 true
             }
             Constant::String(string) => {
-                let object = self.next_object(OccurrenceKind::Constant);
+                let object = self.next_object(kind);
                 self.string_with_object(object, string, reference_mode);
                 true
             }
             Constant::SurrogateString(string) => {
-                let object = self.next_object(OccurrenceKind::Constant);
+                let object = self.next_object(kind);
                 self.surrogate_string_with_object(object, string, reference_mode);
                 true
             }
             Constant::Bytes(bytes) => {
-                let object = self.next_object(OccurrenceKind::Constant);
+                let object = self.next_object(kind);
                 self.bytes_with_object(object, bytes, reference_mode);
                 true
             }
@@ -365,7 +364,7 @@ impl Writer<'_, '_, '_> {
                 unreachable!("tuple and code constants have dedicated traversal methods")
             }
             Constant::FrozenSet(values) => {
-                let object = self.next_object(OccurrenceKind::Constant);
+                let object = self.next_object(kind);
                 let Some(flag) = self.begin_object(object, reference_mode) else {
                     return false;
                 };
@@ -383,77 +382,13 @@ impl Writer<'_, '_, '_> {
                     self.graph.python_version() >= PythonVersion::Py314,
                     "slice constants require marshal v5 or later"
                 );
-                let object = self.next_object(OccurrenceKind::Constant);
+                let object = self.next_object(kind);
                 let Some(flag) = self.begin_object(object, reference_mode) else {
                     return false;
                 };
                 self.byte(TYPE_SLICE | flag);
                 true
             }
-        }
-    }
-
-    fn write_slice_member(&mut self, object: ObjectId, value: &Constant) {
-        let Some(flag) = self.begin_object(object, ReferenceMode::IfShared) else {
-            return;
-        };
-        match value {
-            Constant::Int(value) => {
-                if let Ok(value) = i32::try_from(*value) {
-                    self.byte_and_long(TYPE_INT | flag, value.cast_unsigned());
-                } else {
-                    self.long_integer(flag, *value, false);
-                }
-            }
-            Constant::SignedInt(value) => {
-                if let Ok(value) = i32::try_from(*value) {
-                    self.byte_and_long(TYPE_INT | flag, value.cast_unsigned());
-                } else {
-                    self.long_integer(flag, value.unsigned_abs(), true);
-                }
-            }
-            Constant::BigInt { negative, digits } => {
-                let digit_count =
-                    u32::try_from(digits.len()).expect("marshal integer limit exceeded");
-                self.byte_and_long(
-                    TYPE_LONG | flag,
-                    if *negative {
-                        0_u32.wrapping_sub(digit_count)
-                    } else {
-                        digit_count
-                    },
-                );
-                for digit in digits {
-                    self.output.extend_from_slice(&digit.to_le_bytes());
-                }
-            }
-            Constant::Float(value) => {
-                self.byte_and_float(TYPE_BINARY_FLOAT | flag, *value);
-            }
-            Constant::Complex { real, imag } => {
-                self.byte_and_complex(TYPE_BINARY_COMPLEX | flag, *real, *imag);
-            }
-            Constant::String(value) => {
-                self.string_value(flag, value, false);
-            }
-            Constant::SurrogateString(value) => {
-                self.byte_and_long(
-                    TYPE_UNICODE | flag,
-                    value
-                        .len()
-                        .try_into()
-                        .expect("marshal string exceeds 4 GiB"),
-                );
-                self.output.extend_from_slice(value);
-            }
-            Constant::Bytes(value) => {
-                self.byte_and_long(
-                    TYPE_STRING | flag,
-                    value.len().try_into().expect("marshal value exceeds 4 GiB"),
-                );
-                self.output.extend_from_slice(value);
-            }
-            _ => unreachable!("only non-cached scalar slice members use identity keys"),
         }
     }
 
@@ -606,12 +541,28 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
 
     #[inline]
     fn constant(&mut self, value: &'code Constant, reference_mode: ReferenceMode) -> bool {
-        self.write_constant_value(value, reference_mode)
+        self.write_constant_value(value, reference_mode, OccurrenceKind::Constant)
     }
 
     #[inline]
     fn slice_member(&mut self, value: &'code Constant) {
-        let object = self.next_object(OccurrenceKind::SliceMember);
-        self.write_slice_member(object, value);
+        // The graph gives these occurrences fresh, uninterned object IDs.
+        match value {
+            Constant::Int(_)
+            | Constant::SignedInt(_)
+            | Constant::BigInt { .. }
+            | Constant::Float(_)
+            | Constant::Complex { .. }
+            | Constant::String(_)
+            | Constant::SurrogateString(_)
+            | Constant::Bytes(_) => {
+                self.write_constant_value(
+                    value,
+                    ReferenceMode::IfShared,
+                    OccurrenceKind::SliceMember,
+                );
+            }
+            _ => unreachable!("only non-cached scalar slice members use identity keys"),
+        }
     }
 }

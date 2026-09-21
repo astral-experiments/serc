@@ -108,6 +108,37 @@ fn compile_rejects_unsupported_python_version() {
 fn compile_matches_cpython_for_version_specific_marshal_identity() {
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("module.py");
+    // Equal ordinary and slice constants must keep their distinct ownership and string tags.
+    let scalar_source = [
+        "-2147483649",
+        "-2147483648",
+        "2147483647",
+        "2147483648",
+        "-9223372036854775808",
+        "18446744073709551615",
+        "18446744073709551616",
+        "-18446744073709551616",
+        "-0.0",
+        "2 + 3j",
+        "''",
+        "'x'",
+        "'é'",
+        "'Ā'",
+        "'identifier'",
+        "'not interned'",
+        r"'\ud800'",
+        "b''",
+        "b'x'",
+        r"b'\xff\x00'",
+        &format!("{:?}", "x".repeat(255)),
+        &format!("{:?}", "x".repeat(256)),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, value)| {
+        format!("def scalar_{index}(a):\n    return {value}, a[{value}:{value}:{value}], a[{value}:{value}:{value}]\n")
+    })
+    .collect::<String>();
     for version in [
         serc::PythonVersion::Py312,
         serc::PythonVersion::Py313,
@@ -119,6 +150,7 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
             .path()
             .join(format!("__pycache__/module.cpython-3{minor}.pyc"));
         for source in [
+            scalar_source.as_str(),
             "def answer():\n    return 42\n",
             "café = 'café'\n",
             "s = 'café'\nt = ('café',)\ndef f():\n    return café\n",
