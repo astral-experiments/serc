@@ -305,7 +305,7 @@ jobs:
           PYTHON: ${{ steps.python313.outputs.python-path }}
         run: |
           # Preserve the quotes build.bat requires around MSBuild properties.
-          & .\PCbuild\build.bat --% -p x64 -c Release -E --no-ctypes "/p:IncludeTests=false" "/p:PlatformToolset=v143"
+          & .\PCbuild\build.bat --% -p x64 -c Release -e --no-ctypes "/p:IncludeTests=false" "/p:PlatformToolset=v143"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $python312Path = Join-Path $PWD "PCbuild\amd64\python.exe"
           "python-path=$python312Path" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
