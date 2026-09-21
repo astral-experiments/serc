@@ -700,3 +700,5 @@ mod with_folded_constant_owner;
 mod nested_or_sequence_pop_locations;
 
 mod with_pass_finally_owner;
+
+mod numeric_remainder_folding;

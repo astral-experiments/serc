@@ -1524,6 +1524,12 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                 (Constant::Int(left), Operator::Mod, Constant::Int(right)) if right != 0 => {
                     Some(Constant::Int(left % right))
                 }
+                (left, Operator::Mod, right)
+                    if matches!(left, Constant::Float(_))
+                        || matches!(right, Constant::Float(_)) =>
+                {
+                    fold_float_remainder(&left, &right).map(Constant::Float)
+                }
                 (Constant::Int(left), Operator::Pow, Constant::Int(right)) => {
                     const MAX_INT_SIZE: u64 = 128;
 
@@ -1785,15 +1791,36 @@ fn integer_digits(mut value: u64) -> Vec<u16> {
     digits
 }
 
-/// Match the quotient from CPython's `_float_div_mod`, including rounding and signed zero.
-fn fold_float_floor_divide(left: &Constant, right: &Constant) -> Option<f64> {
-    let to_float = |constant: &Constant| match constant {
+fn constant_as_float(constant: &Constant) -> Option<f64> {
+    match constant {
         Constant::Float(value) => Some(*value),
         // Dividing an integer by one provides PyLong_AsDouble's rounding and overflow checks.
         constant => fold_integer_true_divide(constant, &Constant::Int(1)),
-    };
-    let left = to_float(left)?;
-    let right = to_float(right)?;
+    }
+}
+
+/// Match CPython's `float_rem`: a nonzero remainder and zero both take the divisor's sign.
+fn fold_float_remainder(left: &Constant, right: &Constant) -> Option<f64> {
+    let left = constant_as_float(left)?;
+    let right = constant_as_float(right)?;
+    if right == 0.0 {
+        return None;
+    }
+    let mut remainder = left % right;
+    if remainder != 0.0 {
+        if (right < 0.0) != (remainder < 0.0) {
+            remainder += right;
+        }
+    } else {
+        remainder = 0.0_f64.copysign(right);
+    }
+    Some(remainder)
+}
+
+/// Match the quotient from CPython's `_float_div_mod`, including rounding and signed zero.
+fn fold_float_floor_divide(left: &Constant, right: &Constant) -> Option<f64> {
+    let left = constant_as_float(left)?;
+    let right = constant_as_float(right)?;
     if right == 0.0 {
         return None;
     }
