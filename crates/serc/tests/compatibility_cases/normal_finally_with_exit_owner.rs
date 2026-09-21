@@ -1,4 +1,5 @@
 use crate::common;
+use crate::common::indent;
 
 #[test]
 fn matches_cpython_marshal_for_normal_finally_after_coroutine_with_return() {
@@ -38,16 +39,6 @@ fn preserves_manager_owners_on_complete_finally_branch_joins() {
             }
         }
     }
-}
-
-fn indent(source: &str) -> String {
-    let mut indented = String::new();
-    for line in source.lines() {
-        indented.push_str("    ");
-        indented.push_str(line);
-        indented.push('\n');
-    }
-    indented
 }
 
 #[test]

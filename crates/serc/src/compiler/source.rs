@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use ruff_python_ast::token::{TokenKind, Tokens};
 use ruff_python_ast::visitor::transformer::{Transformer, walk_expr as transform_expr};
@@ -14,10 +14,7 @@ use ruff_text_size::{Ranged, TextLen, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::assembler::SourceLocation;
-use crate::code_object::{
-    CodeInterningSummary, CodeObject, CompilationInterningEvent, CompilationInterningEventKind,
-    Constant,
-};
+use crate::code_object::{CodeInterningSummary, CodeObject, CompilationInterningEvent, Constant};
 
 use super::constant::{explicit_surrogate_string, fold_constant};
 use super::scope::{ModulePlan, ScopeArena, class_static_attributes};
@@ -87,18 +84,17 @@ pub(super) struct CompilationContext<'source> {
     pub(super) tokens: &'source Tokens,
     line_index: LineIndex,
     pub(super) scopes: ScopeArena,
-    constant_string_origins: FxHashMap<String, AtomicU8>,
+    constant_string_origins: FxHashMap<String, Cell<u8>>,
     // Legacy class qualified-name identity depends on the first scalar cache admission,
     // even when that constant or the defining class is later removed as unreachable.
-    legacy_constant_string_origins: Option<Mutex<LegacyConstantOrigins>>,
+    legacy_constant_string_origins: Option<RefCell<LegacyConstantOrigins>>,
     static_attribute_names: FxHashSet<String>,
-    cached_static_attribute_tuples: Mutex<FxHashSet<Vec<String>>>,
+    cached_static_attribute_tuples: RefCell<FxHashSet<Vec<String>>>,
     pub(super) generated_mangled_strings: FxHashSet<String>,
     // Generated names can first become canonical when an otherwise discarded child assembles.
     // Restricted generic-class identifiers also require real child lowering for key origins.
     pub(super) requires_interning_trace: bool,
-    next_interning_order: AtomicUsize,
-    interning_events: Mutex<Vec<CompilationInterningEvent>>,
+    interning_events: RefCell<Vec<CompilationInterningEvent>>,
 }
 
 pub(super) struct CallShape<'a> {
@@ -136,7 +132,7 @@ impl<'source> CompilationContext<'source> {
         let mut generated_mangled_strings = FxHashSet::default();
         let legacy_constant_string_origins = (python_version <= crate::PythonVersion::Py313
             && scopes.has_class_scopes())
-        .then(Mutex::default);
+        .then(RefCell::default);
         let mut requires_interning_trace = false;
         let mut static_attribute_names = FxHashSet::default();
         let constant_string_origins = parser_interned_strings(
@@ -155,11 +151,10 @@ impl<'source> CompilationContext<'source> {
             constant_string_origins,
             legacy_constant_string_origins,
             static_attribute_names,
-            cached_static_attribute_tuples: Mutex::new(FxHashSet::default()),
+            cached_static_attribute_tuples: RefCell::new(FxHashSet::default()),
             generated_mangled_strings,
             requires_interning_trace,
-            next_interning_order: AtomicUsize::new(0),
-            interning_events: Mutex::new(Vec::new()),
+            interning_events: RefCell::new(Vec::new()),
         }
     }
 
@@ -171,13 +166,10 @@ impl<'source> CompilationContext<'source> {
     /// parser-interned name used as a constant. Later equal constants reuse that object's identity,
     /// even when the first load is removed by control-flow optimization.
     pub(super) fn record_constant_string_origin(&self, value: &str, interned: bool) {
-        if let Some(origin) = self.constant_string_origins.get(value) {
-            let _ = origin.compare_exchange(
-                0,
-                if interned { 2 } else { 1 },
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            );
+        if let Some(origin) = self.constant_string_origins.get(value)
+            && origin.get() == 0
+        {
+            origin.set(if interned { 2 } else { 1 });
         }
     }
 
@@ -189,7 +181,7 @@ impl<'source> CompilationContext<'source> {
 
     pub(super) fn record_constant_string_origins(&self, constant: &Constant, interned: bool) {
         if let Some(origins) = &self.legacy_constant_string_origins {
-            origins.lock().unwrap().record_constant(constant);
+            origins.borrow_mut().record_constant(constant);
         }
         self.record_interned_constant_string_origins(constant, interned);
     }
@@ -242,8 +234,7 @@ impl<'source> CompilationContext<'source> {
         };
         !self
             .cached_static_attribute_tuples
-            .lock()
-            .unwrap()
+            .borrow_mut()
             .insert(values)
     }
 
@@ -284,22 +275,20 @@ impl<'source> CompilationContext<'source> {
             .iter()
             .any(|value| self.generated_mangled_strings.contains(value))
         {
-            self.record_interning_event(CompilationInterningEventKind::CachedTuple(values));
+            self.record_interning_event(CompilationInterningEvent::CachedTuple(values));
         }
     }
 
-    fn record_interning_event(&self, kind: CompilationInterningEventKind) -> usize {
-        let order = self.next_interning_order.fetch_add(1, Ordering::Relaxed);
-        self.interning_events
-            .lock()
-            .unwrap()
-            .push(CompilationInterningEvent { order, kind });
+    fn record_interning_event(&self, event: CompilationInterningEvent) -> usize {
+        let mut events = self.interning_events.borrow_mut();
+        let order = events.len();
+        events.push(event);
         order
     }
 
     pub(super) fn record_code_assembly(&self, code: &CodeObject) -> Option<usize> {
         if let Some(origins) = &self.legacy_constant_string_origins {
-            origins.lock().unwrap().record_code_assembly(code);
+            origins.borrow_mut().record_code_assembly(code);
         }
         // Assembly merges these tuples without recursively admitting their members.
         self.record_static_attribute_tuple_cache(
@@ -321,14 +310,14 @@ impl<'source> CompilationContext<'source> {
             return None;
         }
         Some(
-            self.record_interning_event(CompilationInterningEventKind::CodeAssembly(
+            self.record_interning_event(CompilationInterningEvent::CodeAssembly(
                 CodeInterningSummary::from_code(code),
             )),
         )
     }
 
-    pub(super) fn interning_events(&self) -> Vec<CompilationInterningEvent> {
-        self.interning_events.lock().unwrap().clone()
+    pub(super) fn take_interning_events(&self) -> Vec<CompilationInterningEvent> {
+        self.interning_events.take()
     }
 
     pub(super) fn has_tracked_string_origins(&self) -> bool {
@@ -349,7 +338,7 @@ impl<'source> CompilationContext<'source> {
     /// 3.13 interns that winner, so later equal class names can share its identity.
     pub(super) fn record_class_qualified_name(&self, value: &str) -> Option<bool> {
         let origins = self.legacy_constant_string_origins.as_ref()?;
-        let mut origins = origins.lock().unwrap();
+        let mut origins = origins.borrow_mut();
         match origins.strings.entry(value.to_string()) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 // A dotted import interns its complete spelling while parsing. In 3.13,
@@ -366,13 +355,12 @@ impl<'source> CompilationContext<'source> {
         }
     }
 
-    /// Takes the completed module's string keys when no child still shares the context.
+    /// Takes the completed module's string keys after all child compilers have been consumed.
     pub(super) fn finish_constant_string_provenance(
-        context: &mut Arc<Self>,
+        context: &mut Rc<Self>,
     ) -> (FxHashSet<String>, FxHashSet<String>) {
-        let Some(context) = Arc::get_mut(context) else {
-            return context.constant_string_provenance();
-        };
+        let context = Rc::get_mut(context)
+            .expect("completed module should exclusively own its compilation context");
         let origins = std::mem::take(&mut context.constant_string_origins);
         let mut identifiers = FxHashSet::default();
         identifiers.reserve(origins.len());
@@ -396,22 +384,6 @@ impl<'source> CompilationContext<'source> {
         }
         (identifiers, canonical)
     }
-
-    fn constant_string_provenance(&self) -> (FxHashSet<String>, FxHashSet<String>) {
-        let identifiers = self
-            .constant_string_origins
-            .keys()
-            .filter(|value| !self.generated_mangled_strings.contains(*value))
-            .cloned()
-            .collect();
-        let canonical = self
-            .constant_string_origins
-            .iter()
-            .filter(|(_, origin)| origin.load(Ordering::Relaxed) == 2)
-            .map(|(value, _)| value.clone())
-            .collect();
-        (identifiers, canonical)
-    }
 }
 
 /// Tests for the ASCII dunder substring without constructing a generic string searcher.
@@ -424,10 +396,10 @@ fn parser_interned_strings(
     generated_mangled_strings: &mut FxHashSet<String>,
     requires_interning_trace: &mut bool,
     static_attribute_names: &mut FxHashSet<String>,
-) -> FxHashMap<String, AtomicU8> {
+) -> FxHashMap<String, Cell<u8>> {
     #[derive(Default)]
     struct ConstantIdentifiers {
-        origins: FxHashMap<String, AtomicU8>,
+        origins: FxHashMap<String, Cell<u8>>,
         private_name: Option<String>,
         mangled_names: Option<FxHashSet<String>>,
         generated_mangled_strings: FxHashSet<String>,
@@ -461,7 +433,7 @@ fn parser_interned_strings(
 
         fn record_raw_name(&mut self, name: &str) {
             if !self.origins.contains_key(name) {
-                self.origins.insert(name.to_string(), AtomicU8::default());
+                self.origins.insert(name.to_string(), Cell::default());
             }
             if has_double_underscore(name) {
                 self.restricted_private_identifier |= self.mangled_names.is_some();
@@ -1994,7 +1966,7 @@ mod tests {
     }
 
     #[test]
-    fn finishing_module_string_provenance_moves_exclusive_keys_and_preserves_shared_context() {
+    fn finishing_module_string_provenance_moves_exclusive_keys() {
         let tokens = Tokens::new(Vec::new());
         let mut context = CompilationContext::new("example.py", "", &tokens, &Suite::new());
         context.constant_string_origins = [
@@ -2006,7 +1978,7 @@ mod tests {
             ("mangled_canonical", 2),
         ]
         .into_iter()
-        .map(|(name, state)| (name.to_string(), AtomicU8::new(state)))
+        .map(|(name, state)| (name.to_string(), Cell::new(state)))
         .collect();
         context.generated_mangled_strings = [
             "mangled_unused",
@@ -2017,10 +1989,10 @@ mod tests {
         .map(str::to_string)
         .collect();
         context.requires_interning_trace = true;
-        context.record_interning_event(CompilationInterningEventKind::CachedTuple(vec![
+        context.record_interning_event(CompilationInterningEvent::CachedTuple(vec![
             "earlier".to_string(),
         ]));
-        let mut context = Arc::new(context);
+        let mut context = Rc::new(context);
         let input_key_address = |name: &str| {
             context
                 .constant_string_origins
@@ -2043,12 +2015,6 @@ mod tests {
                 .collect(),
         );
 
-        let shared = Arc::clone(&context);
-        let copied = CompilationContext::finish_constant_string_provenance(&mut context);
-        assert_eq!(copied, expected);
-        assert_eq!(shared.constant_string_origins.len(), 6);
-        drop(shared);
-
         let moved = CompilationContext::finish_constant_string_provenance(&mut context);
         assert_eq!(moved, expected);
         assert_eq!(moved.0.get("unused").unwrap().as_ptr(), unused_address);
@@ -2063,9 +2029,9 @@ mod tests {
         assert!(context.constant_string_origins.is_empty());
         assert_eq!(context.generated_mangled_strings.len(), 3);
         assert!(context.requires_interning_trace);
-        assert_eq!(context.interning_events().len(), 1);
+        assert_eq!(context.interning_events.borrow().len(), 1);
         assert_eq!(
-            context.record_interning_event(CompilationInterningEventKind::CachedTuple(Vec::new())),
+            context.record_interning_event(CompilationInterningEvent::CachedTuple(Vec::new())),
             1
         );
     }

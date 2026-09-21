@@ -2,9 +2,7 @@ use std::collections::hash_map::Entry;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::code_object::{
-    CodeInterningSummary, CodeObject, CompilationInterningEventKind, Constant,
-};
+use crate::code_object::{CodeInterningSummary, CodeObject, CompilationInterningEvent, Constant};
 use crate::target::{is_preinterned_string_for, small_int_bounds_for};
 use crate::{InitialInternState, PythonVersion};
 
@@ -172,7 +170,7 @@ pub(super) struct ObjectGraph<'a> {
     objects: FxHashMap<HashedObjectKey<'a>, ObjectId>,
     interned_strings: FxHashMap<&'a str, ObjectId>,
     metadata_aliased_constants: FxHashSet<usize>,
-    metadata_slots: Box<[Option<(&'a str, ObjectId)>]>,
+    metadata_slots: Box<[Option<ObjectId>]>,
     cached_empty_bytes: Option<ObjectId>,
     cached_empty_tuple: Option<ObjectId>,
     cached_scalar_ids: Option<Box<[u32]>>,
@@ -233,11 +231,8 @@ impl<'a> ObjectGraph<'a> {
         let explicitly_interned = (!explicitly_interned.is_empty()).then_some(&explicitly_interned);
         let recreated_frozensets =
             (!recreated_frozensets.is_empty()).then_some(&recreated_frozensets);
-        let metadata_slots = code
-            .marshal_provenance
-            .metadata_ids
-            .as_ref()
-            .and_then(|ids| usize::try_from(ids.domain_len).ok())
+        let metadata_slots = usize::try_from(code.marshal_provenance.metadata_ids.domain_len)
+            .ok()
             .filter(|len| *len <= MAX_DENSE_METADATA_SLOTS)
             .map(|len| vec![None; len].into_boxed_slice())
             .unwrap_or_default();
@@ -345,11 +340,15 @@ impl<'a> ObjectGraph<'a> {
         metadata_id: Option<u32>,
     ) -> bool {
         let slot_index = metadata_id.map(|id| id as usize);
-        if let Some((stored, id)) = slot_index
+        if let Some(id) = slot_index
             .and_then(|index| self.metadata_slots.get(index).copied())
             .flatten()
-            && metadata_values_equal(stored, value)
         {
+            debug_assert_eq!(
+                self.interned_strings.get(value),
+                Some(&id),
+                "metadata ID must identify one string"
+            );
             self.objects_by_id[id.index()].shared = true;
             self.occurrences.push(Occurrence { object: id, kind });
             return false;
@@ -359,7 +358,7 @@ impl<'a> ObjectGraph<'a> {
         // be traversed before or after this metadata and must retain the same object identity.
         let (id, first) = self.interned_string(value);
         if let Some(slot) = slot_index.and_then(|index| self.metadata_slots.get_mut(index)) {
-            *slot = Some((value, id));
+            *slot = Some(id);
         }
         self.occurrences.push(Occurrence { object: id, kind });
         first
@@ -580,45 +579,6 @@ impl<'a> ObjectGraph<'a> {
     }
 }
 
-/// Compares metadata exactly while keeping the overwhelmingly common short-name path inline.
-#[inline]
-pub(super) fn metadata_values_equal(left: &str, right: &str) -> bool {
-    let left = left.as_bytes();
-    let right = right.as_bytes();
-    let length = left.len();
-    if length != right.len() {
-        return false;
-    }
-
-    match length {
-        0 => true,
-        1 => left[0] == right[0],
-        2..=3 => {
-            let left_start = u16::from_ne_bytes(left[..2].try_into().expect("two bytes"));
-            let right_start = u16::from_ne_bytes(right[..2].try_into().expect("two bytes"));
-            let left_end = u16::from_ne_bytes(left[length - 2..].try_into().expect("two bytes"));
-            let right_end = u16::from_ne_bytes(right[length - 2..].try_into().expect("two bytes"));
-            left_start == right_start && left_end == right_end
-        }
-        4..=7 => {
-            let left_start = u32::from_ne_bytes(left[..4].try_into().expect("four bytes"));
-            let right_start = u32::from_ne_bytes(right[..4].try_into().expect("four bytes"));
-            let left_end = u32::from_ne_bytes(left[length - 4..].try_into().expect("four bytes"));
-            let right_end = u32::from_ne_bytes(right[length - 4..].try_into().expect("four bytes"));
-            left_start == right_start && left_end == right_end
-        }
-        8..=16 => {
-            let left_start = u64::from_ne_bytes(left[..8].try_into().expect("eight bytes"));
-            let right_start = u64::from_ne_bytes(right[..8].try_into().expect("eight bytes"));
-            let left_end = u64::from_ne_bytes(left[length - 8..].try_into().expect("eight bytes"));
-            let right_end =
-                u64::from_ne_bytes(right[length - 8..].try_into().expect("eight bytes"));
-            left_start == right_start && left_end == right_end
-        }
-        _ => left == right,
-    }
-}
-
 /// Finds constant tuple elements replaced by metadata-string interning. CPython's
 /// constant cache can share an all-string tuple with `co_names` or `co_varnames` before
 /// interning metadata, including tuples from a different nested code object. Only
@@ -709,7 +669,7 @@ fn collect_explicitly_interned<'a>(
             .map(String::as_str),
     );
     let (has_qualified_name_constant, frozenset_recreation_need) =
-        if code.marshal_provenance.subtree_has_frozenset_constants == Some(false) {
+        if !code.marshal_provenance.subtree_has_frozenset_constants {
             (
                 collect_interning_provenance_without_frozensets(code, values, metadata_tuples),
                 FrozensetRecreationNeed::None,
@@ -1490,19 +1450,17 @@ fn collect_compilation_interning<'a>(
 
     let mut surviving = FxHashMap::default();
     collect_surviving(code, &mut surviving);
-    let mut events: Vec<_> = code.marshal_provenance.interning_events.iter().collect();
-    events.sort_unstable_by_key(|event| event.order);
     let mut tuple_origins = FxHashMap::default();
-    for event in events {
-        match &event.kind {
-            CompilationInterningEventKind::CachedTuple(values) => {
+    for (order, event) in code.marshal_provenance.interning_events.iter().enumerate() {
+        match event {
+            CompilationInterningEvent::CachedTuple(values) => {
                 tuple_origins
                     .entry(values.iter().map(String::as_str).collect())
                     .or_insert(true);
             }
-            CompilationInterningEventKind::CodeAssembly(summary) => {
+            CompilationInterningEvent::CodeAssembly(summary) => {
                 let origins = CodeTupleOrigins::record(summary, &mut tuple_origins);
-                if let Some(current) = surviving.get(&event.order) {
+                if let Some(current) = surviving.get(&order) {
                     intern_code_object(
                         current,
                         origins,

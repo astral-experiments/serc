@@ -2,21 +2,6 @@ use crate::common;
 
 #[test]
 fn matches_cpython_loads_after_direct_manager_try_exits() {
-    // These nested manager exits have a separate existing NOP difference. Compare every
-    // local-load occurrence directly with the pinned oracle, including all cleanup copies.
-    const ORACLE: &str = r#"
-import dis, marshal, pathlib, sys, types
-source = pathlib.Path(sys.argv[1]).read_text()
-ours = marshal.loads(pathlib.Path(sys.argv[2]).read_bytes())
-reference = compile(source, "direct_manager_try_exit.py", "exec", dont_inherit=True, optimize=0)
-def loads(module):
-    code = next(value for value in module.co_consts if isinstance(value, types.CodeType))
-    return [(instruction.opname, instruction.arg, instruction.argrepr, tuple(instruction.positions))
-            for instruction in dis.get_instructions(code) if "LOAD_FAST" in instruction.opname]
-expected = loads(reference)
-assert expected, "oracle must contain local loads"
-assert loads(ours) == expected, "local-load opcode, argument or location differs"
-"#;
     for scope in 0..4 {
         let is_async = scope == 1 || scope == 3;
         let prefix = if is_async { "async " } else { "" };
@@ -34,28 +19,7 @@ assert loads(ours) == expected, "local-load opcode, argument or location differs
                     body.replace('\n', "\n                "),
                     handler.replace('\n', "\n            "),
                 );
-                let directory = tempfile::tempdir().unwrap();
-                let source_path = directory.path().join("source.py");
-                let marshal_path = directory.path().join("ours.marshal");
-                std::fs::write(&source_path, &source).unwrap();
-                std::fs::write(
-                    &marshal_path,
-                    serc::compile(&source, "direct_manager_try_exit.py")
-                        .unwrap()
-                        .marshal(),
-                )
-                .unwrap();
-                let output = common::python_3145_command()
-                    .args(["-c", ORACLE])
-                    .arg(&source_path)
-                    .arg(&marshal_path)
-                    .output()
-                    .unwrap();
-                assert!(
-                    output.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&output.stderr),
-                );
+                common::assert_matches_cpython_marshal(&source, "direct_manager_try_exit.py");
             }
         }
     }

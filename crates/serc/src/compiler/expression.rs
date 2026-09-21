@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use ruff_python_ast::visitor::{Visitor, walk_expr};
 use ruff_python_ast::{
@@ -3671,7 +3671,7 @@ impl Compiler<'_> {
         let qualified_name = self.child_qualified_name("<lambda>");
         let first_line_number = self.line_number(u32::from(lambda.range.start()));
         let mut child = Self::function(
-            Arc::clone(&self.context),
+            Rc::clone(&self.context),
             "<lambda>",
             qualified_name,
             first_line_number,
@@ -4381,7 +4381,7 @@ impl Compiler<'_> {
             0
         } | (self.unit.flags & SUPPORTED_FUTURE_FLAGS);
         let mut child = Self::function(
-            Arc::clone(&self.context),
+            Rc::clone(&self.context),
             "<genexpr>",
             self.child_qualified_name("<genexpr>"),
             self.line_number(u32::from(generator_range.start())),

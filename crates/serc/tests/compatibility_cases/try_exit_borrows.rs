@@ -1,4 +1,5 @@
 use crate::common;
+use crate::common::indent as indent_finally_borrow_case;
 
 #[test]
 fn matches_cpython_completed_handler_for_borrowing() {
@@ -579,24 +580,6 @@ fn matches_cpython_borrows_after_direct_nested_recovery() {
 
 #[test]
 fn matches_cpython_borrows_after_conditional_nested_recovery() {
-    // These conditional joins have existing NOP and table differences. Compare the following
-    // return's instructions and positions to the pinned oracle to protect its bypass edge.
-    const ORACLE: &str = r#"
-import dis, marshal, pathlib, sys, types
-source = pathlib.Path(sys.argv[1]).read_text()
-ours = marshal.loads(pathlib.Path(sys.argv[2]).read_bytes())
-reference = compile(source, "conditional_nested_recovery.py", "exec", dont_inherit=True, optimize=0)
-ours = next(value for value in ours.co_consts if isinstance(value, types.CodeType))
-reference = next(value for value in reference.co_consts if isinstance(value, types.CodeType))
-tail_line = len(source.splitlines())
-def tail(code):
-    return [(instruction.opname, instruction.arg, tuple(instruction.positions))
-            for instruction in dis.get_instructions(code)
-            if instruction.positions.lineno == tail_line]
-expected = tail(reference)
-assert expected, "oracle continuation must contain instructions"
-assert tail(ours) == expected, "continuation instruction or location differs"
-"#;
     for (prefix, leading) in [("", ""), ("async ", ""), ("", "    yield resource\n")] {
         for condition in [
             "flag",
@@ -607,28 +590,7 @@ assert tail(ours) == expected, "continuation instruction or location differs"
                 let source = format!(
                     "{prefix}def guarded(resource, other, value, receive, consume, flag, items):\n{leading}    try:\n        value = receive(resource)\n    except LookupError{name}:\n        if {condition}:\n            try:\n                value = receive(other)\n            except ValueError:\n                value = resource\n    return consume(value)\n",
                 );
-                let directory = tempfile::tempdir().unwrap();
-                let source_path = directory.path().join("source.py");
-                let marshal_path = directory.path().join("ours.marshal");
-                std::fs::write(&source_path, &source).unwrap();
-                std::fs::write(
-                    &marshal_path,
-                    serc::compile(&source, "conditional_nested_recovery.py")
-                        .unwrap()
-                        .marshal(),
-                )
-                .unwrap();
-                let output = common::python_3145_command()
-                    .args(["-c", ORACLE])
-                    .arg(&source_path)
-                    .arg(&marshal_path)
-                    .output()
-                    .unwrap();
-                assert!(
-                    output.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
+                common::assert_matches_cpython_marshal(&source, "conditional_nested_recovery.py");
             }
         }
     }
@@ -816,21 +778,6 @@ fn matches_cpython_nested_normal_finally_empty_exits() {
 
 #[test]
 fn preserves_cpython_nested_normal_finally_located_nops() {
-    // These shapes retain independent exception-table differences. Their located NOPs
-    // must survive the empty-block borrow boundary, including folded-away conditions.
-    const ORACLE: &str = r#"
-import dis, marshal, pathlib, sys, types
-source = pathlib.Path(sys.argv[1]).read_text()
-ours = marshal.loads(pathlib.Path(sys.argv[2]).read_bytes())
-reference = compile(source, "nested_finally_nops.py", "exec", dont_inherit=True, optimize=0)
-def nops(module):
-    code = next(value for value in module.co_consts if isinstance(value, types.CodeType))
-    return [tuple(instruction.positions) for instruction in dis.get_instructions(code)
-            if instruction.opname == "NOP"]
-expected = nops(reference)
-assert expected, "oracle must retain located NOPs"
-assert nops(ours) == expected, "nested-finally located NOPs differ"
-"#;
     for prefix in ["", "async "] {
         for handler in ["", " ValueError"] {
             for body in ["if False:\n    action(y)", "if x:\n    pass"] {
@@ -838,28 +785,7 @@ assert nops(ours) == expected, "nested-finally located NOPs differ"
                     "{prefix}def f(x, y):\n    try:\n        action(y)\n    finally:\n        try:\n            {}\n        except{handler}:\n            pass\n    return consume(y)\n",
                     body.replace('\n', "\n            "),
                 );
-                let directory = tempfile::tempdir().unwrap();
-                let source_path = directory.path().join("source.py");
-                let marshal_path = directory.path().join("ours.marshal");
-                std::fs::write(&source_path, &source).unwrap();
-                std::fs::write(
-                    &marshal_path,
-                    serc::compile(&source, "nested_finally_nops.py")
-                        .unwrap()
-                        .marshal(),
-                )
-                .unwrap();
-                let output = common::python_3145_command()
-                    .args(["-c", ORACLE])
-                    .arg(&source_path)
-                    .arg(&marshal_path)
-                    .output()
-                    .unwrap();
-                assert!(
-                    output.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
+                common::assert_matches_cpython_marshal(&source, "nested_finally_nops.py");
             }
         }
     }
@@ -1163,32 +1089,7 @@ fn preserves_borrows_after_removed_nested_finally_jumps() {
                     pass
     consume(value)
 ";
-    // This shape has a separate jump-layout mismatch. Compare every local-load opcode
-    // against a fresh native compilation so that partial borrowing regressions still fail.
-    let source = format!(
-        r#"{function}
-import dis
-native = compile({function:?}, "native_finally_jump.py", "exec", dont_inherit=True, optimize=0).co_consts[0]
-def loads(code):
-    return [(instruction.opname, instruction.argval) for instruction in dis.get_instructions(code) if instruction.opname.startswith("LOAD_FAST")]
-expected = loads(native)
-actual = loads(f.__code__)
-assert any(opname == "LOAD_FAST" for opname, _ in expected), expected
-assert actual == expected, (actual, expected)
-print("matched")
-"#
-    );
-    common::assert_executes(&source, "matched\n");
-}
-
-fn indent_finally_borrow_case(source: &str) -> String {
-    let mut result = String::new();
-    for line in source.lines() {
-        result.push_str("    ");
-        result.push_str(line);
-        result.push('\n');
-    }
-    result
+    common::assert_matches_cpython_marshal(function, "native_finally_jump.py");
 }
 
 #[test]

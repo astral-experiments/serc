@@ -771,10 +771,8 @@ impl Compiler<'_> {
             .record_constant_string_origins(&constant, false);
         self.output.has_frozenset_constants |= matches!(constant, Constant::FrozenSet(_));
         if let Constant::Code(code) = &constant {
-            self.output.has_frozenset_constants |= code
-                .marshal_provenance
-                .subtree_has_frozenset_constants
-                .unwrap_or(true);
+            self.output.has_frozenset_constants |=
+                code.marshal_provenance.subtree_has_frozenset_constants;
         }
         self.output.constants.intern(constant)
     }
@@ -789,10 +787,8 @@ impl Compiler<'_> {
             // retained slot, without replaying those compilation-wide chronology events.
             self.output.has_frozenset_constants |= matches!(constant, Constant::FrozenSet(_));
             if let Constant::Code(code) = constant {
-                self.output.has_frozenset_constants |= code
-                    .marshal_provenance
-                    .subtree_has_frozenset_constants
-                    .unwrap_or(true);
+                self.output.has_frozenset_constants |=
+                    code.marshal_provenance.subtree_has_frozenset_constants;
             }
             self.output.constants.intern(constant.clone())?;
             self.output
@@ -829,7 +825,7 @@ impl Compiler<'_> {
         }
         let mut used = self
             .assembler
-            .used_constant_indices(LOAD_CONST, self.output.constants.len());
+            .used_constant_indices(self.output.constants.len());
         if let Some(index) = deferred_none {
             used[usize::try_from(index).expect("constant index should fit in usize")] = true;
         }
@@ -842,8 +838,7 @@ impl Compiler<'_> {
             .take(self.output.first_flowgraph_constant)
             .flatten()
             .count();
-        self.assembler
-            .remap_constant_indices(LOAD_CONST, &index_map);
+        self.assembler.remap_constant_indices(&index_map);
         self.output.qualified_name_constant_index =
             self.output.qualified_name_constant_index.and_then(|index| {
                 let index = usize::try_from(index).expect("constant index always fits in usize");
@@ -3229,7 +3224,9 @@ mod tests {
         CONSTANT_INDEX_THRESHOLD, ConstantEquality, ConstantIndices, ConstantPool,
         constant_pool_fingerprint,
     };
-    use crate::code_object::{CodeObject, Constant, LocalsIdentity, MarshalProvenance};
+    use crate::code_object::{
+        CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance,
+    };
 
     fn code_object(constants: Vec<Constant>) -> CodeObject {
         CodeObject {
@@ -3249,7 +3246,16 @@ mod tests {
             first_line_number: 1,
             line_table: Vec::new(),
             exception_table: Vec::new(),
-            marshal_provenance: MarshalProvenance::default(),
+            marshal_provenance: MarshalProvenance {
+                metadata_ids: MarshalMetadataIds {
+                    domain_len: 2,
+                    locals: vec![0],
+                    filename: 1,
+                    ..MarshalMetadataIds::default()
+                },
+                subtree_has_frozenset_constants: true,
+                ..MarshalProvenance::default()
+            },
         }
     }
 
@@ -3425,7 +3431,7 @@ mod tests {
             .qualified_name_constant_index = Some(0);
         with_graph_provenance
             .marshal_provenance
-            .subtree_has_frozenset_constants = Some(true);
+            .subtree_has_frozenset_constants = false;
 
         assert!(ConstantEquality::PoolKey.equal(
             &Constant::Code(Box::new(plain)),

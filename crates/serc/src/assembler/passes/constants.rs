@@ -724,12 +724,11 @@ mod tests {
                 if matches!(values.as_slice(), [Constant::Bool(true), Constant::Float(value)] if value.to_bits() == (-0.0_f64).to_bits())
         ));
         assert_eq!(module.code.stack_size, 2);
-        assert_eq!(
+        assert!(
             module
                 .code
                 .marshal_provenance
-                .subtree_has_frozenset_constants,
-            Some(true)
+                .subtree_has_frozenset_constants
         );
         assert!(
             !module

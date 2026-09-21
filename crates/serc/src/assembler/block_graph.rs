@@ -225,6 +225,53 @@ fn collect_segments<T>(
     segments
 }
 
+/// Fuses non-overlapping adjacent pairs while preserving label barriers and source locations.
+pub(super) fn fuse_adjacent_instructions(
+    items: &mut Vec<Item>,
+    mut fuse: impl FnMut(&Instruction, &Instruction) -> Option<Instruction>,
+) {
+    let original_len = items.len();
+    let mut read = 0;
+    let mut write = 0;
+    while read < original_len {
+        let fused = if read + 1 < original_len {
+            match (&items[read], &items[read + 1]) {
+                (Item::Instruction(first), Item::Instruction(second)) => fuse(first, second),
+                (Item::Label(_), _) | (_, Item::Label(_)) => None,
+            }
+        } else {
+            None
+        };
+        if let Some(instruction) = fused {
+            let second_location = match &items[read + 1] {
+                Item::Instruction(second) => second.location,
+                Item::Label(_) => unreachable!("a fused pair must contain two instructions"),
+            };
+            // CPython resolves missing locations before replacing the second half of a
+            // superinstruction with a removable NOP. For a forward source-order pair,
+            // preserve that location on an immediately following instruction before
+            // compacting the pair. Reversed assignment stores retain the first location.
+            if let Some(Item::Instruction(following)) = items.get_mut(read + 2)
+                && following.location.line < 0
+                && !following.no_location_policy.preserves_location()
+                && second_location.line == instruction.location.line
+                && second_location.column > instruction.location.column
+            {
+                following.location = second_location;
+            }
+            items[write] = Item::Instruction(instruction);
+            read += 2;
+        } else {
+            if write != read {
+                items[write] = items[read];
+            }
+            read += 1;
+        }
+        write += 1;
+    }
+    items.truncate(write);
+}
+
 impl BlockGraph {
     fn partition_items(
         items: Vec<Item>,
@@ -557,85 +604,6 @@ impl BlockGraph {
         physical_lengths.next().is_none()
     }
 
-    /// Repartitions the ordered instruction stream for a pass whose logical
-    /// block boundaries are narrower than the assembler's structural ones.
-    /// Existing block IDs are reused in order; newly split suffixes receive
-    /// fresh IDs from the append-only arena.
-    #[cfg(test)]
-    pub(super) fn repartition(
-        &mut self,
-        boundary_labels: &FxHashSet<Label>,
-        starts_block: impl Fn(&Instruction) -> bool,
-        ends_block: impl Fn(&Instruction) -> bool,
-    ) {
-        let item_count = self
-            .order
-            .iter()
-            .map(|block| self[*block].items.len())
-            .sum();
-        let mut segment_lengths = Vec::with_capacity(item_count);
-        let mut segment_length = 0;
-        let mut has_instruction = false;
-        for (_, block) in self.iter() {
-            for item in block.items() {
-                let starts_here = match item {
-                    Item::Label(label) => boundary_labels.contains(label),
-                    Item::Instruction(instruction) => starts_block(instruction),
-                };
-                if starts_here && has_instruction {
-                    segment_lengths.push(segment_length);
-                    segment_length = 0;
-                    has_instruction = false;
-                }
-                let ends_here = match item {
-                    Item::Instruction(instruction) => ends_block(instruction),
-                    Item::Label(_) => false,
-                };
-                has_instruction |= matches!(item, Item::Instruction(_));
-                segment_length += 1;
-                if ends_here {
-                    segment_lengths.push(segment_length);
-                    segment_length = 0;
-                    has_instruction = false;
-                }
-            }
-        }
-        if segment_length > 0 {
-            segment_lengths.push(segment_length);
-        }
-
-        if segment_lengths.len() == self.order.len()
-            && self
-                .order
-                .iter()
-                .zip(&segment_lengths)
-                .all(|(block, length)| self[*block].items.len() == *length)
-        {
-            return;
-        }
-
-        self.clear_label_index();
-        let original_order = std::mem::take(&mut self.order);
-        let items = original_order
-            .iter()
-            .copied()
-            .flat_map(|block| std::mem::take(&mut self.blocks[block.index()].items));
-        let segments = collect_segments(items, segment_lengths);
-
-        let mut reusable = original_order.into_iter();
-        let mut order = Vec::with_capacity(segments.len());
-        for items in segments {
-            if let Some(block) = reusable.next() {
-                self.blocks[block.index()].items = items;
-                order.push(block);
-            } else {
-                order.push(self.allocate_block(items));
-            }
-        }
-        self.order = order;
-        self.rebuild_label_index();
-    }
-
     pub(super) fn append_to_block(
         &mut self,
         block: BasicBlockId,
@@ -764,77 +732,13 @@ impl BlockGraph {
             })
     }
 
-    /// Replaces block contents while preserving the exact label sequence.
-    #[cfg(test)]
-    pub(super) fn replace_items_preserving_labels(
-        &mut self,
-        block: BasicBlockId,
-        items: impl Iterator<Item = Item> + Clone,
-    ) {
-        let old_labels = self[block].items().iter().filter_map(|item| match item {
-            Item::Label(label) => Some(*label),
-            Item::Instruction(_) => None,
-        });
-        let new_labels = items.clone().filter_map(|item| match item {
-            Item::Label(label) => Some(label),
-            Item::Instruction(_) => None,
-        });
-        assert!(
-            old_labels.eq(new_labels),
-            "label-preserving replacement changed block labels"
-        );
-        let block_items = &mut self.blocks[block.index()].items;
-        block_items.clear();
-        block_items.extend(items);
-    }
-
     /// Fuses non-overlapping adjacent instruction pairs without exposing labels.
     pub(super) fn fuse_adjacent_instructions(
         &mut self,
         block: BasicBlockId,
-        mut fuse: impl FnMut(&Instruction, &Instruction) -> Option<Instruction>,
+        fuse: impl FnMut(&Instruction, &Instruction) -> Option<Instruction>,
     ) {
-        let items = &mut self.blocks[block.index()].items;
-        let original_len = items.len();
-        let mut read = 0;
-        let mut write = 0;
-        while read < original_len {
-            let fused = if read + 1 < original_len {
-                match (&items[read], &items[read + 1]) {
-                    (Item::Instruction(first), Item::Instruction(second)) => fuse(first, second),
-                    (Item::Label(_), _) | (_, Item::Label(_)) => None,
-                }
-            } else {
-                None
-            };
-            if let Some(instruction) = fused {
-                let second_location = match &items[read + 1] {
-                    Item::Instruction(second) => second.location,
-                    Item::Label(_) => unreachable!("a fused pair must contain two instructions"),
-                };
-                // CPython resolves missing locations before replacing the second half of a
-                // superinstruction with a removable NOP. For a forward source-order pair,
-                // preserve that location on an immediately following instruction before
-                // compacting the pair. Reversed assignment stores retain the first location.
-                if let Some(Item::Instruction(following)) = items.get_mut(read + 2)
-                    && following.location.line < 0
-                    && !following.no_location_policy.preserves_location()
-                    && second_location.line == instruction.location.line
-                    && second_location.column > instruction.location.column
-                {
-                    following.location = second_location;
-                }
-                items[write] = Item::Instruction(instruction);
-                read += 2;
-            } else {
-                if write != read {
-                    items[write] = items[read];
-                }
-                read += 1;
-            }
-            write += 1;
-        }
-        items.truncate(write);
+        fuse_adjacent_instructions(&mut self.blocks[block.index()].items, fuse);
     }
 
     fn validate_order(&self, order: &[BasicBlockId]) -> Result<(), String> {
@@ -1584,30 +1488,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "label-preserving replacement changed block labels")]
-    fn replacing_items_preserving_labels_rejects_changed_labels() {
-        let old_label = Label(0);
-        let new_label = Label(1);
-        let mut graph = BlockGraph::from_items(
-            vec![
-                Item::Label(old_label),
-                instruction(RETURN_VALUE, Operand::Value(0)),
-            ],
-            &FxHashSet::default(),
-        );
-        let block = graph.block_at(0);
-
-        graph.replace_items_preserving_labels(
-            block,
-            [
-                Item::Label(new_label),
-                instruction(RETURN_VALUE, Operand::Value(0)),
-            ]
-            .into_iter(),
-        );
-    }
-
-    #[test]
     fn inserting_a_label_adds_it_to_lookup() {
         let old_label = Label(0);
         let new_label = Label(1);
@@ -1642,31 +1522,6 @@ mod tests {
 
         assert_eq!(graph.len(), 2);
         assert_ne!(graph.label_block(first), graph.label_block(boundary));
-        graph.validate().unwrap();
-    }
-
-    #[test]
-    fn repartition_reuses_the_leading_block_id_and_moves_labels() {
-        let first_label = Label(0);
-        let second_label = Label(1);
-        let mut graph = BlockGraph::from_items(
-            vec![
-                Item::Label(first_label),
-                instruction(NOP, Operand::Value(0)),
-                Item::Label(second_label),
-                instruction(RETURN_VALUE, Operand::Value(0)),
-            ],
-            &FxHashSet::default(),
-        );
-        let first = graph.block_at(0);
-        let second = graph.block_at(1);
-
-        graph.repartition(&FxHashSet::default(), |_| false, |_| false);
-
-        assert_eq!(graph.order(), &[first]);
-        assert_ne!(first, second);
-        assert_eq!(graph.label_block(first_label), Some(first));
-        assert_eq!(graph.label_block(second_label), Some(first));
         graph.validate().unwrap();
     }
 

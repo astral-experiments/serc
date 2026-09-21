@@ -491,20 +491,12 @@ class Container:
             .iter()
             .position(|name| name == spelling)
             .expect("metadata name should be present");
-        code.marshal_provenance
-            .metadata_ids
-            .as_ref()
-            .expect("compiled code should carry metadata IDs")
-            .names[index]
+        code.marshal_provenance.metadata_ids.names[index]
     };
     let module_container_id = metadata_name_id(&module, "Container");
     let class_mangled_id = metadata_name_id(class, "_Container__value");
     let method_mangled_id = metadata_name_id(method, "_Container__value");
-    let method_metadata = method
-        .marshal_provenance
-        .metadata_ids
-        .as_ref()
-        .expect("compiled method should carry metadata IDs");
+    let method_metadata = &method.marshal_provenance.metadata_ids;
     let method_local = method
         .locals
         .iter()
@@ -513,14 +505,14 @@ class Container:
     assert_eq!(class_mangled_id, method_mangled_id);
     assert_eq!(method_metadata.locals[method_local], class_mangled_id);
 
-    let module_metadata = module.marshal_provenance.metadata_ids.as_ref().unwrap();
-    let class_metadata = class.marshal_provenance.metadata_ids.as_ref().unwrap();
+    let module_metadata = &module.marshal_provenance.metadata_ids;
+    let class_metadata = &class.marshal_provenance.metadata_ids;
     assert_eq!(class_metadata.name, Some(module_container_id));
     assert_eq!(class_metadata.qualified_name, Some(module_container_id));
     assert_eq!(module_metadata.filename, class_metadata.filename);
     assert_eq!(class_metadata.filename, method_metadata.filename);
     for code in [&module, class, method] {
-        let metadata = code.marshal_provenance.metadata_ids.as_ref().unwrap();
+        let metadata = &code.marshal_provenance.metadata_ids;
         assert_eq!(metadata.names.len(), code.names.len());
         assert_eq!(metadata.locals.len(), code.locals.len());
         assert!(metadata.filename < metadata.domain_len);
@@ -562,10 +554,7 @@ fn marshal_frozenset_presence_hint_is_conservative_across_nested_code() {
     let outer = nested_code(&module, "outer").unwrap();
     let inner = nested_code(&module, "inner").unwrap();
     for code in [&module, outer, inner] {
-        assert_eq!(
-            code.marshal_provenance.subtree_has_frozenset_constants,
-            Some(false)
-        );
+        assert!(!code.marshal_provenance.subtree_has_frozenset_constants);
     }
 
     for body in [
@@ -583,9 +572,8 @@ fn marshal_frozenset_presence_hint_is_conservative_across_nested_code() {
         let outer = nested_code(&module, "outer").unwrap();
         let inner = nested_code(&module, "inner").unwrap();
         for code in [&module, outer, inner] {
-            assert_eq!(
+            assert!(
                 code.marshal_provenance.subtree_has_frozenset_constants,
-                Some(true),
                 "missing frozenset hint for `{body}` in `{}`",
                 code.name
             );

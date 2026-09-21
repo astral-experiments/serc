@@ -1,4 +1,4 @@
-use crate::common::assert_matches_cpython_marshal;
+use crate::common::{assert_matches_cpython_marshal, indent};
 
 #[test]
 fn matches_cpython_retained_setup_original_prefix_owners() {
@@ -52,15 +52,6 @@ fn matches_cpython_retained_setup_original_prefix_owners() {
             }
         }
     }
-}
-
-fn indent(source: &str) -> String {
-    source.lines().fold(String::new(), |mut body, line| {
-        body.push_str("    ");
-        body.push_str(line);
-        body.push('\n');
-        body
-    })
 }
 
 #[test]

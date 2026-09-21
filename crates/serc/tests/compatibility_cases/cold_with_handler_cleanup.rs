@@ -1,4 +1,5 @@
 use crate::common;
+use crate::common::indent;
 
 #[test]
 fn matches_cpython_module_with_discarded_tail_boundaries() {
@@ -62,16 +63,6 @@ fn matches_cpython_terminal_named_with_cleanup_copies() {
             }
         }
     }
-}
-
-fn indent(source: &str) -> String {
-    let mut indented = String::new();
-    for line in source.lines() {
-        indented.push_str("    ");
-        indented.push_str(line);
-        indented.push('\n');
-    }
-    indented
 }
 
 #[test]

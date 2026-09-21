@@ -1,14 +1,5 @@
-use std::fmt::Write as _;
-
 use crate::common;
-
-fn indent(source: &str) -> String {
-    let mut result = String::new();
-    for line in source.lines() {
-        writeln!(result, "    {line}").expect("writing to a String cannot fail");
-    }
-    result
-}
+use crate::common::indent;
 
 #[test]
 fn borrows_through_surviving_breaks_into_manager_cleanup() {

@@ -1056,7 +1056,7 @@ def render(sources: dict[str, str]) -> str:
         lookup[0] = "fn is_preinterned_static_string(value: &str) -> bool {"
         lines.extend(lookup)
     if TARGET_MINOR == "3.14":
-        lines.extend(["", "#[allow(dead_code)]", "impl Opcode {"])
+        lines.extend(["", "impl Opcode {"])
         for method, flag in (
             ("has_argument", "HAS_ARG_FLAG"),
             ("has_constant", "HAS_CONST_FLAG"),

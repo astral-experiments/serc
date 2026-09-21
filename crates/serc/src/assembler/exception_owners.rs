@@ -12290,7 +12290,7 @@ mod tests {
                 load.location = SourceLocation::new(8, 8, 4, 12);
             }
             let retained = change != "removed constant";
-            assembler.remap_constant_indices(LOAD_CONST, &[Some(0), None, retained.then_some(1)]);
+            assembler.remap_constant_indices(&[Some(0), None, retained.then_some(1)]);
             let Item::Instruction(live) = assembler.linear_items()[load_item] else {
                 unreachable!();
             };
@@ -12397,7 +12397,7 @@ mod tests {
                 matches!(assembler.linear_items()[load_item], Item::Instruction(instruction) if instruction.opcode == LOAD_CONST)
             );
             let retained = change != "removed constant";
-            assembler.remap_constant_indices(LOAD_CONST, &[Some(0), None, retained.then_some(1)]);
+            assembler.remap_constant_indices(&[Some(0), None, retained.then_some(1)]);
             assert_eq!(
                 assembler
                     .exception_owner_provenance
@@ -13481,7 +13481,7 @@ mod tests {
             }
             assembler.linear_items_mut()[0] = Item::Instruction(instruction);
             let retained = mutation != "removed constant";
-            assembler.remap_constant_indices(LOAD_CONST, &[Some(0), None, retained.then_some(1)]);
+            assembler.remap_constant_indices(&[Some(0), None, retained.then_some(1)]);
             let instructions = assembler
                 .linear_items()
                 .iter()

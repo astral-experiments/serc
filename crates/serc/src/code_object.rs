@@ -120,9 +120,10 @@ pub(crate) enum LocalsIdentity {
 
 /// Dense, module-wide name IDs that let marshal graph planning bypass repeated string lookups.
 ///
-/// These hints never affect wire order or code-constant equality. Hand-built code objects can
-/// omit them, and graph planning validates every hinted value before reusing its object identity.
+/// Every code object in a module shares the compiler's immutable name domain, with one additional
+/// ID for the filename. IDs never affect wire order or code-constant equality.
 #[derive(Clone, Debug)]
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct MarshalMetadataIds {
     pub(crate) domain_len: u32,
     pub(crate) names: Vec<u32>,
@@ -134,13 +135,7 @@ pub(crate) struct MarshalMetadataIds {
 
 /// A constant-cache admission or real code assembly in compilation order.
 #[derive(Clone, Debug)]
-pub(crate) struct CompilationInterningEvent {
-    pub(crate) order: usize,
-    pub(crate) kind: CompilationInterningEventKind,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) enum CompilationInterningEventKind {
+pub(crate) enum CompilationInterningEvent {
     CachedTuple(Vec<String>),
     CodeAssembly(CodeInterningSummary),
 }
@@ -209,7 +204,8 @@ impl CodeInterningSummary {
 ///
 /// Each nested code object retains its own provenance because marshal graph planning happens after
 /// the compiler has assembled the complete constant tree.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct MarshalProvenance {
     pub(crate) assembly_order: Option<usize>,
     pub(crate) interning_events: Vec<CompilationInterningEvent>,
@@ -225,9 +221,9 @@ pub(crate) struct MarshalProvenance {
     pub(crate) qualified_name_constant_index: Option<u32>,
     /// Legacy qualified-name ownership recorded before discarded constants are pruned.
     pub(crate) qualified_name_is_canonical: Option<bool>,
-    pub(crate) metadata_ids: Option<MarshalMetadataIds>,
-    /// Whether this code tree can contain a frozenset constant; `None` keeps legacy analysis.
-    pub(crate) subtree_has_frozenset_constants: Option<bool>,
+    pub(crate) metadata_ids: MarshalMetadataIds,
+    /// Whether this code tree can contain a frozenset constant.
+    pub(crate) subtree_has_frozenset_constants: bool,
 }
 
 impl MarshalProvenance {
@@ -454,7 +450,13 @@ mod tests {
             first_line_number: 1,
             line_table: Vec::new(),
             exception_table: Vec::new(),
-            marshal_provenance: MarshalProvenance::default(),
+            marshal_provenance: MarshalProvenance {
+                metadata_ids: MarshalMetadataIds {
+                    domain_len: 1,
+                    ..MarshalMetadataIds::default()
+                },
+                ..MarshalProvenance::default()
+            },
         }
     }
 
@@ -467,15 +469,15 @@ mod tests {
     fn marshal_metadata_ids_do_not_participate_in_constant_pool_equality() {
         let first = MarshalProvenance::default();
         let mut second = MarshalProvenance {
-            metadata_ids: Some(MarshalMetadataIds {
+            metadata_ids: MarshalMetadataIds {
                 domain_len: 3,
                 names: vec![0, 1],
                 locals: vec![1],
                 filename: 2,
                 name: Some(0),
                 qualified_name: Some(1),
-            }),
-            subtree_has_frozenset_constants: Some(true),
+            },
+            subtree_has_frozenset_constants: true,
             ..MarshalProvenance::default()
         };
 

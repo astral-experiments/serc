@@ -85,11 +85,7 @@ pub(super) fn traverse_code_with_mode<'a, V>(
     }
     visitor.code_bytes(code);
     traverse_constants(&code.constants, ReferenceMode::IfShared, visitor);
-    let metadata_ids = if V::USES_METADATA_IDS {
-        code.marshal_provenance.metadata_ids.as_ref()
-    } else {
-        None
-    };
+    let metadata_ids = V::USES_METADATA_IDS.then_some(&code.marshal_provenance.metadata_ids);
     if visitor.strings(&code.names) {
         traverse_metadata_strings(
             &code.names,
@@ -127,7 +123,7 @@ where
 
 /// Visits metadata tuple members in order.
 ///
-/// A mismatched hint length disables ID hints for the entire tuple.
+/// Compiler-owned IDs follow the same order and length as the metadata tuple.
 #[inline]
 fn traverse_metadata_strings<'a, V>(
     values: &'a [String],
@@ -136,7 +132,8 @@ fn traverse_metadata_strings<'a, V>(
 ) where
     V: MarshalVisitor<'a>,
 {
-    if let Some(metadata_ids) = metadata_ids.filter(|ids| ids.len() == values.len()) {
+    if let Some(metadata_ids) = metadata_ids {
+        assert_eq!(metadata_ids.len(), values.len(), "metadata ID tuple length");
         for (value, metadata_id) in values.iter().zip(metadata_ids) {
             visitor.metadata_string(value, Some(*metadata_id));
         }

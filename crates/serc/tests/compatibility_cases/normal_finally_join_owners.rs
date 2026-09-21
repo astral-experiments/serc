@@ -1,14 +1,5 @@
 use crate::common;
-
-fn indent(source: &str) -> String {
-    let mut indented = String::new();
-    for line in source.lines() {
-        indented.push_str("    ");
-        indented.push_str(line);
-        indented.push('\n');
-    }
-    indented
-}
+use crate::common::indent;
 
 #[test]
 fn matches_cpython_normal_finally_source_join_owners() {

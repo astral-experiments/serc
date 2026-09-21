@@ -1547,7 +1547,6 @@ pub(crate) fn is_preinterned_string(value: &str) -> bool {
         .is_ok()
 }
 
-#[allow(dead_code)]
 impl Opcode {
     pub(crate) const fn has_argument(self) -> bool {
         matches!(

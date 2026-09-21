@@ -1,4 +1,5 @@
 use crate::common;
+use crate::common::indent;
 
 #[test]
 fn matches_cpython_bare_handler_conditional_cleanup_copies() {
@@ -220,16 +221,6 @@ assert actual == expected, (actual, expected)
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-}
-
-fn indent(source: &str) -> String {
-    let mut indented = String::new();
-    for line in source.lines() {
-        indented.push_str("    ");
-        indented.push_str(line);
-        indented.push('\n');
-    }
-    indented
 }
 
 #[test]
