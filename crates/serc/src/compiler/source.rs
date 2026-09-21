@@ -2064,6 +2064,7 @@ mod tests {
             &mut generated,
             &mut requires_trace,
             &mut FxHashSet::default(),
+            &mut false,
         );
         for raw in [
             "Café",
