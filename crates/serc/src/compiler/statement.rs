@@ -18647,7 +18647,15 @@ impl Compiler<'_> {
             None
         } else {
             let body_instruction_count = self.assembler.instruction_count();
+            // Full suites emit a leading Pass outside a manager. A split
+            // one-statement prefix can still omit it as a terminal statement.
+            let split_pass_prefix = statement.body.len() == 2
+                && matches!(statement.body.last(), Some(Stmt::If(_)))
+                && (exclude_terminal_body_not_taken
+                    || (loop_tail.is_some() && statement.orelse.is_empty())
+                    || nested_handler_tail_if_with_terminal_handlers);
             if statement.body.len() > 1
+                && (!self.control.withs.active_with_exits.is_empty() || split_pass_prefix)
                 && let Some(Stmt::Pass(pass)) = statement.body.first()
             {
                 self.assembler
@@ -25817,7 +25825,10 @@ impl Compiler<'_> {
             |compiler| {
                 if statement.handlers.is_empty() {
                     let instruction_count = compiler.assembler.instruction_count();
+                    // The suite already emits this authored Pass when no manager
+                    // is active; duplicate records would change stale CFG slots.
                     if statement.body.len() > 1
+                        && !compiler.control.withs.active_with_exits.is_empty()
                         && let Some(Stmt::Pass(pass)) = statement.body.first()
                     {
                         compiler

@@ -714,3 +714,5 @@ mod type_parameter_scope_boundaries;
 mod with_pass_finally_owner;
 
 mod nan_allocation_identity;
+
+mod leading_pass_try_owners;
