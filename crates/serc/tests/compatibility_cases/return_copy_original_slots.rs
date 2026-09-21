@@ -597,3 +597,19 @@ fn iterator_breaks_copy_two_literal_tuple_returns() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_final_literal_attribute_assignment_copy_budget() {
+    for marker in ["'attribute documentation'", "42", "None", "True", "pass"] {
+        for constants in [1, 2] {
+            let markers = format!("        {marker}\n").repeat(constants);
+            let source = format!(
+                "class Container:\n    def __init__(self, values=None):\n        self.values = values[:] if values else []\n{markers}"
+            );
+            common::assert_matches_cpython_marshal(
+                &source,
+                "final_literal_attribute_copy_budget.py",
+            );
+        }
+    }
+}

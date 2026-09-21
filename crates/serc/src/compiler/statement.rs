@@ -1998,19 +1998,28 @@ impl Compiler<'_> {
                     statement.range()
                 };
                 self.assembler.set_location(self.source_location(range));
-                // Python 3.13 counts the final literal's NOP before copying small exits.
-                // Keep it until the later NOP cleanup to preserve that original budget.
+                let located_module_manager_marker = matches!(self.unit.scope, Scope::Module)
+                    && self.control.statements.in_terminal_if_branch_suite
+                    && matches!(body.get(index.wrapping_sub(1)), Some(Stmt::With(previous))
+                        if !previous.is_async);
+                // Keep the final literal's authored NOP in its original array until
+                // small-exit copying has counted it, before later NOP cleanup.
+                let retain_final_literal_nop = self.context.python_version
+                    >= crate::PythonVersion::Py314
+                    && is_final
+                    && final_expression_becomes_return
+                    && literal_constant(&expression.value).is_some()
+                    // Existing module markers retain their boundary for manager suppression.
+                    && !located_module_manager_marker;
                 if self.context.python_version == crate::PythonVersion::Py313
+                    || retain_final_literal_nop
                     || index + 1 < body.len()
                     || (!final_expression_becomes_return
                         && (!matches!(self.unit.scope, Scope::Class { .. })
                             // Legacy CFG propagation needs the authored marker before
                             // case exits and loop backedges can inherit its location.
                             || self.context.python_version <= crate::PythonVersion::Py313))
-                    || (matches!(self.unit.scope, Scope::Module)
-                        && self.control.statements.in_terminal_if_branch_suite
-                        && matches!(body.get(index.wrapping_sub(1)), Some(Stmt::With(previous))
-                            if !previous.is_async))
+                    || located_module_manager_marker
                 {
                     // An authored constant NOP donates its line to the ownerless
                     // POP_BLOCK. From 3.14, CFG-folded expressions keep a load/pop pair
@@ -2048,12 +2057,13 @@ impl Compiler<'_> {
                         {
                             exclusions.push((noop_start, noop_end));
                         }
-                    } else if (final_expression_becomes_return
-                        && index + 1 < body.len()
-                        && body[index + 1..].iter().all(|statement| {
-                            matches!(statement, Stmt::Expr(expression)
+                    } else if retain_final_literal_nop
+                        || (final_expression_becomes_return
+                            && index + 1 < body.len()
+                            && body[index + 1..].iter().all(|statement| {
+                                matches!(statement, Stmt::Expr(expression)
                                 if is_literal_constant(&expression.value))
-                        }))
+                            }))
                         || matches!(&body[index + 1..], [Stmt::Return(returned)]
                         if returned.value.as_deref().is_none_or(|value| {
                             matches!(value, Expr::Name(_)) || is_literal_constant(value)
@@ -2062,7 +2072,8 @@ impl Compiler<'_> {
                         // Keep a literal-constant or simple-return footer in one block
                         // so the existing exit-copy budget sees its complete suffix.
                         self.emit(NOP, 0, 0)?;
-                        if final_expression_becomes_return
+                        if self.context.python_version <= crate::PythonVersion::Py313
+                            && final_expression_becomes_return
                             && index + 2 == body.len()
                             && matches!(body.last(), Some(Stmt::Expr(expression))
                                 if is_literal_constant(&expression.value))
