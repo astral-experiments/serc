@@ -295,31 +295,12 @@ impl Builder {
                 Stmt::Pass(_) => self.instruction(),
                 Stmt::Global(_) | Stmt::Nonlocal(_) => {}
                 Stmt::If(statement) => {
-                    // The initial subset excludes flattened elif chains and
-                    // constant pruning. Each accepted AST node is visited once,
-                    // so its range is a unique original codegen occurrence.
-                    if !runtime_condition(&statement.test)
-                        || statement.elif_else_clauses.len() > 1
-                        || statement
-                            .elif_else_clauses
-                            .first()
-                            .is_some_and(|clause| clause.test.is_some())
-                    {
-                        return None;
-                    }
-                    let end = self.allocate(NativeRole::IfEnd(statement.range));
-                    let otherwise = statement
-                        .elif_else_clauses
-                        .first()
-                        .map(|_| self.allocate(NativeRole::IfElse(statement.range)));
-                    self.condition(&statement.test, false)?;
-                    self.suite(&statement.body)?;
-                    if let Some(otherwise) = otherwise {
-                        self.instruction(); // original unconditional join jump
-                        self.mark(otherwise);
-                        self.suite(&statement.elif_else_clauses[0].body)?;
-                    }
-                    self.mark(end);
+                    self.if_statement(
+                        statement.range,
+                        &statement.test,
+                        &statement.body,
+                        &statement.elif_else_clauses,
+                    )?;
                 }
                 _ => return None,
             }
@@ -327,7 +308,45 @@ impl Builder {
         Some(())
     }
 
-    /// Mirrors one inlined, unfiltered synchronous Name-target comprehension.
+    /// Mirrors `compiler_if`, including CPython's nested If nodes for each elif.
+    fn if_statement(
+        &mut self,
+        range: TextRange,
+        test: &Expr,
+        body: &[Stmt],
+        clauses: &[ruff_python_ast::ElifElseClause],
+    ) -> Option<()> {
+        if !runtime_condition(test) {
+            return None;
+        }
+        let end = self.allocate(NativeRole::IfEnd(range));
+        let otherwise = clauses
+            .first()
+            .map(|_| self.allocate(NativeRole::IfElse(range)));
+        self.condition(test, false)?;
+        self.suite(body)?;
+        if let Some(otherwise) = otherwise {
+            // Native emits this original join even after a terminating body.
+            // The next elif allocates its labels only after this boundary.
+            self.instruction();
+            self.mark(otherwise);
+            let (clause, remaining) = clauses.split_first()?;
+            if let Some(test) = &clause.test {
+                self.if_statement(clause.range, test, &clause.body, remaining)?;
+            } else {
+                if !remaining.is_empty() {
+                    return None;
+                }
+                self.suite(&clause.body)?;
+            }
+        }
+        // Every nested elif end marks the same original boundary. A later
+        // body or declaration-only else label may be their canonical alias.
+        self.mark(end);
+        Some(())
+    }
+
+    /// Mirrors one inlined synchronous Name-target comprehension.
     fn comprehension(
         &mut self,
         generators: &[ruff_python_ast::Comprehension],
@@ -340,9 +359,18 @@ impl Builder {
         if self.inside_comprehension
             || generator.is_async
             || !matches!(&generator.target, Expr::Name(_))
-            || !generator.ifs.is_empty()
         {
             return None;
+        }
+        // These filters use compiler_jump_if's ordinary expression branch.
+        // Their subexpressions allocate no labels; rejection reuses IfCleanup.
+        for filter in &generator.ifs {
+            if !matches!(filter, Expr::Name(_) | Expr::Compare(_) | Expr::Call(_))
+                || !runtime_condition(filter)
+            {
+                return None;
+            }
+            Self::label_free_expression(filter)?;
         }
         if let Some(key) = key {
             Self::label_free_expression(key)?;
@@ -365,6 +393,9 @@ impl Builder {
         self.mark(start);
         self.instruction(); // FOR_ITER
         self.store_target(&generator.target)?;
+        for filter in &generator.ifs {
+            self.condition(filter, false)?;
+        }
         if let Some(key) = key {
             self.expression(key)?;
         }
@@ -821,6 +852,85 @@ mod tests {
         assert_eq!(plan.remaining[&NativeRole::AwaitFail(awaited.range)], 5);
         assert_eq!(plan.remaining[&NativeRole::AwaitExit(awaited.range)], 6);
         assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 7);
+    }
+
+    #[test]
+    fn elif_allocations_interleave_with_bodies_and_share_the_nested_end() {
+        let parsed = parse_module("async def f(a, b, c):\n    if a:\n        await first()\n    elif b:\n        await second()\n    else:\n        if c:\n            pass\n    await done()\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::If(outer), Stmt::Expr(after)] = function.body.as_slice() else {
+            panic!()
+        };
+        let [clause, otherwise] = outer.elif_else_clauses.as_slice() else {
+            panic!()
+        };
+        let [Stmt::If(nested)] = otherwise.body.as_slice() else {
+            panic!()
+        };
+        let ruff_python_ast::Expr::Await(after) = after.value.as_ref() else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        assert_eq!(plan.remaining[&NativeRole::IfElse(outer.range)], 3);
+        assert_eq!(plan.remaining[&NativeRole::IfElse(clause.range)], 8);
+        for range in [outer.range, clause.range, nested.range] {
+            assert_eq!(plan.remaining[&NativeRole::IfEnd(range)], 12);
+        }
+        assert_eq!(plan.remaining[&NativeRole::AwaitSend(after.range)], 13);
+        assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 16);
+    }
+
+    #[test]
+    fn elif_without_else_reserves_no_final_false_label() {
+        let parsed = parse_module("def f(a, b, c):\n    if a:\n        pass\n    elif b:\n        pass\n    elif c:\n        pass\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::If(outer)] = function.body.as_slice() else {
+            panic!()
+        };
+        let [first, last] = outer.elif_else_clauses.as_slice() else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+        for range in [outer.range, first.range, last.range] {
+            assert_eq!(plan.remaining[&NativeRole::IfEnd(range)], 6);
+        }
+        assert_eq!(plan.remaining[&NativeRole::IfElse(outer.range)], 3);
+        assert_eq!(plan.remaining[&NativeRole::IfElse(first.range)], 5);
+        assert!(!plan.remaining.contains_key(&NativeRole::IfElse(last.range)));
+    }
+
+    #[test]
+    fn declaration_only_else_can_be_the_canonical_elif_end() {
+        let parsed = parse_module("def f(a, b):\n    if a:\n        return\n    elif b:\n        return\n    else:\n        global shared\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::If(outer)] = function.body.as_slice() else {
+            panic!()
+        };
+        let clause = &outer.elif_else_clauses[0];
+        let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+        assert_eq!(plan.remaining[&NativeRole::IfEnd(outer.range)], 5);
+        assert_eq!(plan.remaining[&NativeRole::IfEnd(clause.range)], 5);
+        assert_eq!(plan.remaining[&NativeRole::IfElse(clause.range)], 5);
+    }
+
+    #[test]
+    fn unsupported_or_constant_elif_invalidates_the_whole_plan() {
+        for source in [
+            "def f(a):\n    if a:\n        pass\n    elif True:\n        pass\n",
+            "def f(a, b):\n    if a:\n        return\n    elif b:\n        return\n        while work():\n            pass\n",
+        ] {
+            let parsed = parse_module(source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(NativeLabelPlan::function(&function.body, false).is_none());
+        }
     }
 
     #[test]
@@ -1304,7 +1414,6 @@ mod manager_tests {
     #[test]
     fn inlined_comprehension_subset_rejects_additional_control_routes() {
         for expression in [
-            "[item for item in xs if item]",
             "[item for item in xs for other in ys]",
             "[item async for item in xs]",
             "[item for item, other in xs]",
@@ -1315,6 +1424,90 @@ mod manager_tests {
             "{(left if flag else right): item for item in xs}",
         ] {
             let source = format!("async def f(xs, ys):\n    values = {expression}\n");
+            let parsed = parse_module(&source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(
+                NativeLabelPlan::function(&function.body, true).is_none(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn comprehension_filters_reuse_the_existing_native_cleanup_label() {
+        let parsed = parse_module(
+            "async def f(flag, allowed):\n    values = [item for item in await items() if flag if item in allowed if predicate(item)]\n    await done()\n",
+        )
+        .unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let Stmt::Assign(assignment) = &function.body[0] else {
+            panic!()
+        };
+        let ruff_python_ast::Expr::ListComp(comprehension) = assignment.value.as_ref() else {
+            panic!()
+        };
+        let range = comprehension.generators[0].iter.range();
+        let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        // Iterable await allocates 2..4, then the same five comprehension labels
+        // as an unfiltered expression. None of the three filters adds a label.
+        assert_eq!(plan.remaining[&NativeRole::ComprehensionCleanup(range)], 5);
+        assert_eq!(plan.remaining[&NativeRole::ComprehensionEnd(range)], 6);
+        assert_eq!(plan.remaining[&NativeRole::ComprehensionStart(range)], 7);
+        assert_eq!(
+            plan.remaining[&NativeRole::ComprehensionIfCleanup(range)],
+            8
+        );
+        assert_eq!(plan.remaining[&NativeRole::ComprehensionAnchor(range)], 9);
+        assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 13);
+        assert_eq!(plan.remaining.len(), 13);
+    }
+
+    #[test]
+    fn comprehension_filters_compose_with_existing_loop_and_manager_roles() {
+        for expression in [
+            "[item for item in xs if item]",
+            "{item for item in xs if item is not None}",
+            "{item: value(item) for item in xs if predicate(item, enabled=flag)}",
+            "[item for item in xs if item in allowed if predicate(item)]",
+        ] {
+            let source = format!(
+                "def f(xs, flag, allowed, cm):\n    with cm:\n        for first, second in xs:\n            values = {expression}\n            if flag:\n                continue\n"
+            );
+            let parsed = parse_module(&source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(
+                NativeLabelPlan::function(&function.body, false).is_some(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn comprehension_filters_decline_other_branch_and_evaluation_routes() {
+        for filter in [
+            "True",
+            "__debug__",
+            "not item",
+            "item.enabled",
+            "item[index]",
+            "item and flag",
+            "item or flag",
+            "(item if flag else other)",
+            "lower < item < upper",
+            "item == (left or right)",
+            "predicate(item, enabled=left or right)",
+            "predicate(await value())",
+            "await predicate(item)",
+            "predicate([other for other in ys])",
+        ] {
+            let source =
+                format!("async def f(xs, ys):\n    values = [item for item in xs if {filter}]\n");
             let parsed = parse_module(&source).unwrap();
             let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
                 panic!()

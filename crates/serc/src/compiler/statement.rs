@@ -3195,6 +3195,19 @@ impl Compiler<'_> {
         &mut self,
         statement: &ruff_python_ast::StmtIf,
     ) -> Result<(), CompileError> {
+        if self.context.python_version == crate::PythonVersion::Py312
+            && statement
+                .elif_else_clauses
+                .iter()
+                .any(|clause| clause.test.is_some())
+        {
+            // Native emits elif as nested If nodes with one original shared end.
+            // Keep that footer until legacy CFG optimization duplicates exits;
+            // eager per-arm returns lose the original end-label aliases.
+            self.compile_if(statement)?;
+            self.assembler.set_location(SourceLocation::NONE);
+            return self.emit_deferred_implicit_return();
+        }
         if self.context.python_version <= crate::PythonVersion::Py313
             && std::iter::once(statement.body.as_slice())
                 .chain(
@@ -3207,6 +3220,8 @@ impl Compiler<'_> {
                     matches!(body.last(), Some(Stmt::While(_)))
                         || (self.context.python_version == crate::PythonVersion::Py312
                             && (matches!(body.last(), Some(Stmt::Try(_) | Stmt::If(_) | Stmt::Match(_)))
+                                || matches!(body.last(), Some(Stmt::Expr(expression))
+                                    if matches!(expression.value.as_ref(), Expr::Await(_)))
                                 || suite_has_cold_only_terminal_if_continuation(body)
                                 || matches!(body.last(), Some(Stmt::For(loop_statement))
                                     if loop_statement.is_async)
@@ -3221,8 +3236,10 @@ impl Compiler<'_> {
             // Keep each compound arm's original jump to the shared footer. 3.12
             // visits exit blocks in source order, so nested recovery exits cannot
             // copy a return that a later arm exit has not acquired yet. Async
-            // comprehension restoration, async-loop exhaustion, and their continuations
-            // also stay cold until relocation inserts a bridge to the shared warm return.
+            // comprehension restoration, async-loop exhaustion, ordinary await cleanup,
+            // and their continuations also stay cold until relocation inserts a bridge
+            // to the shared warm return. Keeping that original footer also preserves the
+            // terminal IfEnd label for native jump sizing.
             // A runtime while's two false edges retain their unlocated shared exit until
             // native exit duplication assigns each predecessor its own return. In 3.13
             // this happens before folding; 3.12 duplicates exits after CFG optimization.
@@ -3512,7 +3529,15 @@ impl Compiler<'_> {
                     },
                 )?;
                 if !suite_terminates(body) && !emitted_fallthrough {
-                    if self.context.python_version == crate::PythonVersion::Py312
+                    if self.context.python_version <= crate::PythonVersion::Py313
+                        && body.iter().all(|statement| {
+                            matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))
+                        })
+                    {
+                        // Declarations emit no native instructions. Keep the footer
+                        // unlocated until its incoming condition supplies the span.
+                        self.assembler.set_location(SourceLocation::NONE);
+                    } else if self.context.python_version == crate::PythonVersion::Py312
                         && matches!(body.last(), Some(Stmt::Assign(_)))
                     {
                         // Native 3.12 resolves the implicit return after static swaps,
@@ -10920,6 +10945,14 @@ impl Compiler<'_> {
             super::legacy_native_labels::NativeRole::IfEnd(statement.range),
             end,
         );
+        for clause in &statement.elif_else_clauses {
+            if clause.test.is_some() {
+                self.bind_native_source_label(
+                    super::legacy_native_labels::NativeRole::IfEnd(clause.range),
+                    end,
+                );
+            }
+        }
         let mut branches: Vec<(Option<&Expr>, &[Stmt])> =
             vec![(Some(&statement.test), statement.body.as_slice())];
         branches.extend(
@@ -10955,9 +10988,14 @@ impl Compiler<'_> {
                 } else {
                     self.assembler.label()
                 };
-                if branch_index == 0 && next != end {
+                if next != end {
+                    let range = if branch_index == 0 {
+                        statement.range
+                    } else {
+                        statement.elif_else_clauses[branch_index - 1].range
+                    };
                     self.bind_native_source_label(
-                        super::legacy_native_labels::NativeRole::IfElse(statement.range),
+                        super::legacy_native_labels::NativeRole::IfElse(range),
                         next,
                     );
                 }

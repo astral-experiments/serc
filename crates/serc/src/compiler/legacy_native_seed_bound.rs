@@ -1,7 +1,9 @@
 //! Conservative proof that all original Python 3.12 jump seeds fit in one byte.
 //!
 //! Count source labels S, true jumps J, and scope exits E before dead-code removal.
-//! There are at most U = J + E + 1 original unlabeled blocks and B = S + U blocks.
+//! K bounds jumps with an unlabeled successor. Usually K = J; explicit suspension
+//! helper backedges and synchronous For backedges already have labeled successors.
+//! There are at most U = K + E + 1 original unlabeled blocks and B = S + U blocks.
 //! Empty-block repair and cold placement label at most U original blocks. Cold
 //! placement adds at most C = min(J, floor(B / 2)) bridges: each cold-to-warm
 //! adjacency needs a distinct incoming warm jump because its cold predecessor
@@ -25,18 +27,37 @@ pub(super) fn certifies(body: &[Stmt]) -> bool {
 struct Counts {
     labels: u32,
     jumps: u32,
+    unlabeled_jump_successors: u32,
     exits: u32,
 }
 
 impl Counts {
     fn add(&mut self, labels: u32, jumps: u32, exits: u32) {
+        self.add_with_unlabeled_successors(labels, jumps, jumps, exits);
+    }
+
+    fn add_with_unlabeled_successors(
+        &mut self,
+        labels: u32,
+        jumps: u32,
+        unlabeled_jump_successors: u32,
+        exits: u32,
+    ) {
+        debug_assert!(unlabeled_jump_successors <= jumps);
         self.labels = self.labels.saturating_add(labels);
         self.jumps = self.jumps.saturating_add(jumps);
+        self.unlabeled_jump_successors = self
+            .unlabeled_jump_successors
+            .saturating_add(unlabeled_jump_successors);
         self.exits = self.exits.saturating_add(exits);
+        debug_assert!(self.unlabeled_jump_successors <= self.jumps);
     }
 
     fn max_label(self) -> u32 {
-        let unlabeled = self.jumps.saturating_add(self.exits).saturating_add(1);
+        let unlabeled = self
+            .unlabeled_jump_successors
+            .saturating_add(self.exits)
+            .saturating_add(1);
         let blocks = self.labels.saturating_add(unlabeled);
         let cold_bridges = self.jumps.min(blocks / 2);
         blocks
@@ -59,6 +80,7 @@ struct Counter<'ast> {
     counts: Counts,
     frames: Vec<Frame<'ast>>,
     has_await: bool,
+    in_annotation: bool,
 }
 
 fn function_counts(body: &[Stmt]) -> Option<Counts> {
@@ -99,7 +121,7 @@ impl<'ast> Counter<'ast> {
                 self.expression(&assignment.target)?;
                 self.optional(assignment.value.as_deref())?;
                 // Local annotations may not execute, but counting them is safe.
-                self.expression(&assignment.annotation)?;
+                self.annotation(Some(&assignment.annotation))?;
             }
             Stmt::AugAssign(assignment) => {
                 self.expression(&assignment.target)?;
@@ -157,8 +179,14 @@ impl<'ast> Counter<'ast> {
                 self.suite(&statement.orelse)?;
             }
             Stmt::For(statement) => {
-                let (labels, jumps) = if statement.is_async { (6, 3) } else { (4, 2) };
-                self.counts.add(labels, jumps, 0);
+                if statement.is_async {
+                    self.counts.add(6, 3, 0);
+                } else {
+                    // Only FOR_ITER can create an unlabeled successor. The
+                    // original backedge is followed by the cleanup label/END_FOR.
+                    // Its target-line NOP prevents discounting FOR_ITER itself.
+                    self.counts.add_with_unlabeled_successors(4, 2, 1, 0);
+                }
                 self.expression(&statement.iter)?;
                 self.expression(&statement.target)?;
                 self.frames.push(Frame::Loop);
@@ -211,7 +239,7 @@ impl<'ast> Counter<'ast> {
                     self.expression(&decorator.expression)?;
                 }
                 self.parameters(&definition.parameters)?;
-                self.optional(definition.returns.as_deref())?;
+                self.annotation(definition.returns.as_deref())?;
                 // The child body has an independent native label counter.
             }
             Stmt::ClassDef(definition) => {
@@ -304,15 +332,30 @@ impl<'ast> Counter<'ast> {
     fn parameters(&mut self, parameters: &Parameters) -> Option<()> {
         for parameter in parameters.iter_non_variadic_params() {
             self.optional(parameter.default.as_deref())?;
-            self.optional(parameter.parameter.annotation.as_deref())?;
+            self.annotation(parameter.parameter.annotation.as_deref())?;
         }
         for parameter in [parameters.vararg.as_deref(), parameters.kwarg.as_deref()]
             .into_iter()
             .flatten()
         {
-            self.optional(parameter.annotation.as_deref())?;
+            self.annotation(parameter.annotation.as_deref())?;
         }
         Some(())
+    }
+
+    /// Retains the full jump-successor charge throughout possibly unevaluated annotations.
+    fn annotation(&mut self, expression: Option<&Expr>) -> Option<()> {
+        let previous = std::mem::replace(&mut self.in_annotation, true);
+        let result = self.optional(expression);
+        self.in_annotation = previous;
+        result
+    }
+
+    /// Native `SEND`'s backedge is immediately followed by fail/`CLEANUP_THROW`.
+    fn explicit_suspension(&mut self) {
+        let unlabeled = if self.in_annotation { 2 } else { 1 };
+        self.counts
+            .add_with_unlabeled_successors(3, 2, unlabeled, 0);
     }
 
     fn optional(&mut self, expression: Option<&Expr>) -> Option<()> {
@@ -413,12 +456,12 @@ impl<'ast> Counter<'ast> {
             | Expr::BytesLiteral(_) => {}
             Expr::Await(awaited) => {
                 self.expression(&awaited.value)?;
-                self.counts.add(3, 2, 0);
+                self.explicit_suspension();
                 self.has_await = true;
             }
             Expr::YieldFrom(yielded) => {
                 self.expression(&yielded.value)?;
-                self.counts.add(3, 2, 0);
+                self.explicit_suspension();
             }
             Expr::Yield(yielded) => self.optional(yielded.value.as_deref())?,
             Expr::If(conditional) => {
@@ -544,6 +587,7 @@ mod tests {
         let below = Counts {
             labels: 1,
             jumps: 99,
+            unlabeled_jump_successors: 99,
             exits: 3,
         };
         let boundary = Counts { labels: 2, ..below };
@@ -552,6 +596,7 @@ mod tests {
         let mut overflow = Counts {
             labels: u32::MAX,
             jumps: u32::MAX,
+            unlabeled_jump_successors: u32::MAX,
             exits: u32::MAX,
         };
         overflow.add(1, 1, 1);
@@ -559,7 +604,7 @@ mod tests {
     }
 
     #[test]
-    fn warm_jump_bound_certifies_sparse_cold_adjacencies() {
+    fn warm_jump_and_labeled_successor_bounds_compose() {
         let source = format!("async def f():\n{}", "    await work()\n".repeat(26));
         let budget = counts(&source).unwrap();
         assert_eq!(
@@ -567,20 +612,21 @@ mod tests {
             Counts {
                 labels: 80,
                 jumps: 52,
+                unlabeled_jump_successors: 26,
                 exits: 3,
             },
         );
-        // The physical-adjacency bound alone gives 256, but only 52 warm
-        // jumps can reach distinct successors of cold blocks, giving 240.
-        assert_eq!(budget.max_label(), 240);
+        // K counts only SEND successors; its helper backedges are followed by
+        // labeled blocks. Cold placement still needs at most 52 warm jumps.
+        assert_eq!(budget.max_label(), 214);
         let parsed = parse_module(&source).unwrap();
         let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
             panic!("expected one function");
         };
         assert!(certifies(&function.body));
 
-        let source = format!("async def f():\n{}", "    await work()\n".repeat(28));
-        assert_eq!(counts(&source).unwrap().max_label(), 258);
+        let source = format!("async def f():\n{}", "    await work()\n".repeat(32));
+        assert_eq!(counts(&source).unwrap().max_label(), 262);
         let parsed = parse_module(&source).unwrap();
         let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
             panic!("expected one function");
@@ -614,6 +660,7 @@ mod tests {
             Some(Counts {
                 labels: 6,
                 jumps: 4,
+                unlabeled_jump_successors: 4,
                 exits: 4
             }),
         );
@@ -622,6 +669,7 @@ mod tests {
             Some(Counts {
                 labels: 12,
                 jumps: 6,
+                unlabeled_jump_successors: 4,
                 exits: 3
             }),
         );
@@ -636,6 +684,7 @@ mod tests {
             Some(Counts {
                 labels: 38,
                 jumps: 22,
+                unlabeled_jump_successors: 22,
                 exits: 9
             }),
         );
@@ -647,6 +696,7 @@ mod tests {
             Some(Counts {
                 labels: 21,
                 jumps: 12,
+                unlabeled_jump_successors: 11,
                 exits: 5
             }),
         );
@@ -661,6 +711,7 @@ mod tests {
             Some(Counts {
                 labels: 11,
                 jumps: 4,
+                unlabeled_jump_successors: 4,
                 exits: 6
             }),
         );
@@ -669,6 +720,7 @@ mod tests {
             Some(Counts {
                 labels: 14,
                 jumps: 8,
+                unlabeled_jump_successors: 8,
                 exits: 5
             }),
         );
@@ -681,6 +733,7 @@ mod tests {
             Some(Counts {
                 labels: 6,
                 jumps: 1,
+                unlabeled_jump_successors: 1,
                 exits: 5,
             }),
         );
@@ -691,6 +744,7 @@ mod tests {
             Some(Counts {
                 labels: 9,
                 jumps: 4,
+                unlabeled_jump_successors: 4,
                 exits: 6,
             }),
         );
@@ -699,6 +753,7 @@ mod tests {
             Some(Counts {
                 labels: 6,
                 jumps: 1,
+                unlabeled_jump_successors: 1,
                 exits: 7,
             }),
         );
@@ -715,6 +770,7 @@ mod tests {
             Some(Counts {
                 labels: 19,
                 jumps: 11,
+                unlabeled_jump_successors: 11,
                 exits: 17,
             }),
         );
@@ -727,6 +783,7 @@ mod tests {
             Some(Counts {
                 labels: 33,
                 jumps: 18,
+                unlabeled_jump_successors: 18,
                 exits: 11,
             }),
         );
@@ -741,6 +798,7 @@ mod tests {
             Some(Counts {
                 labels: 13,
                 jumps: 10,
+                unlabeled_jump_successors: 9,
                 exits: 5,
             }),
         );
@@ -751,6 +809,7 @@ mod tests {
             Some(Counts {
                 labels: 12,
                 jumps: 6,
+                unlabeled_jump_successors: 5,
                 exits: 5,
             }),
         );
@@ -765,6 +824,7 @@ mod tests {
             Some(Counts {
                 labels: 17,
                 jumps: 9,
+                unlabeled_jump_successors: 9,
                 exits: 9,
             }),
         );
@@ -775,6 +835,7 @@ mod tests {
             Some(Counts {
                 labels: 25,
                 jumps: 15,
+                unlabeled_jump_successors: 14,
                 exits: 8,
             }),
         );
@@ -797,6 +858,7 @@ mod tests {
             Some(Counts {
                 labels: 9,
                 jumps: 4,
+                unlabeled_jump_successors: 4,
                 exits: 9,
             }),
         );
@@ -810,6 +872,7 @@ mod tests {
             Counts {
                 labels: 66,
                 jumps: 61,
+                unlabeled_jump_successors: 61,
                 exits: 5,
             },
         );
@@ -844,6 +907,7 @@ mod tests {
             Some(Counts {
                 labels: 13,
                 jumps: 8,
+                unlabeled_jump_successors: 7,
                 exits: 4
             }),
         );
@@ -856,6 +920,7 @@ mod tests {
             Some(Counts {
                 labels: 21,
                 jumps: 11,
+                unlabeled_jump_successors: 11,
                 exits: 5
             }),
         );
@@ -870,6 +935,7 @@ mod tests {
             Some(Counts {
                 labels: 3,
                 jumps: 1,
+                unlabeled_jump_successors: 1,
                 exits: 3
             }),
         );
@@ -878,6 +944,7 @@ mod tests {
             Some(Counts {
                 labels: 5,
                 jumps: 2,
+                unlabeled_jump_successors: 1,
                 exits: 3
             }),
         );
@@ -911,5 +978,133 @@ mod tests {
             panic!()
         };
         assert!(!certifies(&function.body));
+    }
+
+    #[test]
+    fn unlabeled_successor_counts_saturate_monotonically() {
+        let mut budget = Counts {
+            labels: 1,
+            jumps: u32::MAX - 1,
+            unlabeled_jump_successors: u32::MAX - 2,
+            exits: 3,
+        };
+        let previous = budget.max_label();
+        budget.add_with_unlabeled_successors(3, 2, 1, 0);
+        assert_eq!(budget.jumps, u32::MAX);
+        assert_eq!(budget.unlabeled_jump_successors, u32::MAX - 1);
+        assert!(budget.max_label() >= previous);
+        budget.add_with_unlabeled_successors(3, 2, 1, 0);
+        assert_eq!(budget.unlabeled_jump_successors, u32::MAX);
+        budget.add(u32::MAX, u32::MAX, u32::MAX);
+        assert_eq!(budget.max_label(), u32::MAX);
+        assert!(budget.unlabeled_jump_successors <= budget.jumps);
+    }
+
+    #[test]
+    fn labeled_successor_refinement_retains_the_strict_255_boundary() {
+        let source = format!(
+            "async def f():\n{}    raise Error\n",
+            "    await work()\n".repeat(31),
+        );
+        assert_eq!(
+            counts(&source),
+            Some(Counts {
+                labels: 95,
+                jumps: 62,
+                unlabeled_jump_successors: 31,
+                exits: 4,
+            }),
+        );
+        assert_eq!(counts(&source).unwrap().max_label(), 255);
+        let parsed = parse_module(&source).unwrap();
+        let Stmt::FunctionDef(function) = &parsed.suite()[0] else {
+            panic!()
+        };
+        assert!(certifies(&function.body));
+
+        let source = format!("{source}    raise Other\n");
+        assert_eq!(counts(&source).unwrap().max_label(), 256);
+        let parsed = parse_module(&source).unwrap();
+        let Stmt::FunctionDef(function) = &parsed.suite()[0] else {
+            panic!()
+        };
+        assert!(!certifies(&function.body));
+        assert_eq!(counts(&format!("{source}    await discarded()\n")), None);
+    }
+
+    #[test]
+    fn every_finally_copy_charges_its_own_labeled_successors() {
+        // Three inner await copies and six outer For/await copies. Return from
+        // a copied inner finalizer still leaves the original outer unwind visit.
+        assert_eq!(
+            counts(
+                "async def f():\n    try:\n        try:\n            return payload\n        finally:\n            await inner()\n            return inner_result\n    finally:\n        for item in items:\n            await outer(item)\n        return outer_result\n"
+            ),
+            Some(Counts {
+                labels: 61,
+                jumps: 32,
+                unlabeled_jump_successors: 17,
+                exits: 17,
+            }),
+        );
+        // Yield-from has the same explicit SEND helper. A possible implicit
+        // manager await always keeps the full charge, as asserted separately.
+        assert_eq!(
+            counts("def f():\n    yield from items\n"),
+            Some(Counts {
+                labels: 5,
+                jumps: 2,
+                unlabeled_jump_successors: 1,
+                exits: 3,
+            }),
+        );
+        assert_eq!(
+            counts(
+                "async def f():\n    async with manager():\n        await work()\n        return\n"
+            ),
+            Some(Counts {
+                labels: 23,
+                jumps: 13,
+                unlabeled_jump_successors: 12,
+                exits: 6,
+            }),
+        );
+    }
+
+    #[test]
+    fn annotations_retain_full_successor_cost_recursively_and_restore_defaults() {
+        // Six annotation awaits keep K2, including the nested lambda default.
+        // The ordinary child default and the final statement each use K1.
+        assert_eq!(
+            counts(
+                "async def f():\n    local: tuple[(await local_type())]\n    nested: (lambda value=(await nested_type()): value)\n    def child(value=(await default()), other: tuple[(await other_type())]=None, *args: tuple[(await args_type())], **kwargs: tuple[(await kwargs_type())]) -> tuple[(await result_type())]:\n        pass\n    await after()\n"
+            ),
+            Some(Counts {
+                labels: 26,
+                jumps: 16,
+                unlabeled_jump_successors: 14,
+                exits: 3,
+            }),
+        );
+    }
+
+    #[test]
+    fn dead_explicit_suspensions_still_consume_the_source_budget() {
+        let source = format!(
+            "async def f():\n    return\n{}",
+            "    await work()\n".repeat(31),
+        );
+        assert_eq!(counts(&source).unwrap().max_label(), 255);
+        assert_eq!(
+            counts(&format!("{source}    raise Error\n"))
+                .unwrap()
+                .max_label(),
+            256
+        );
+        let source = format!(
+            "async def f():\n    if False:\n{}",
+            "        await work()\n".repeat(300),
+        );
+        assert_eq!(counts(&source), None);
     }
 }
