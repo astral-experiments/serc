@@ -5,7 +5,7 @@ fn matches_cpython_shared_handler_cleanup_join_locations() {
     for (filename, source) in [
         (
             "unnamed_elif.py",
-            r#"def f(work, a, b, after):
+            r"def f(work, a, b, after):
     try:
         work()
     except ValueError:
@@ -14,7 +14,7 @@ fn matches_cpython_shared_handler_cleanup_join_locations() {
         elif b:
             value = work()
     after()
-"#,
+",
         ),
         (
             "guarded_assert_finally.py",
@@ -30,7 +30,7 @@ fn matches_cpython_shared_handler_cleanup_join_locations() {
         ),
         (
             "nested_partial_if_else.py",
-            r#"def f(work, flag, cached, after):
+            r"def f(work, flag, cached, after):
     try:
         return work()
     except NameError:
@@ -42,11 +42,11 @@ fn matches_cpython_shared_handler_cleanup_join_locations() {
                 value = work()
                 work(value)
     after()
-"#,
+",
         ),
         (
             "nested_if_assignment_finally.py",
-            r#"async def f(work, outer, middle, inner, after):
+            r"async def f(work, outer, middle, inner, after):
     try:
         await work()
     except Exception as error:
@@ -61,11 +61,11 @@ fn matches_cpython_shared_handler_cleanup_join_locations() {
             value = False
     finally:
         after()
-"#,
+",
         ),
         (
             "guarded_assert_without_message_control.py",
-            r#"def f(work, flag, after):
+            r"def f(work, flag, after):
     try:
         work()
     except Exception as error:
@@ -73,11 +73,11 @@ fn matches_cpython_shared_handler_cleanup_join_locations() {
             assert work(error)
     finally:
         after()
-"#,
+",
         ),
         (
             "unnamed_elif_loop_tail_control.py",
-            r#"def f(items, strict, silent, call):
+            r"def f(items, strict, silent, call):
     for item in items:
         try:
             call(item)
@@ -86,7 +86,7 @@ fn matches_cpython_shared_handler_cleanup_join_locations() {
                 raise
             elif not silent:
                 call(item)
-"#,
+",
         ),
     ] {
         common::assert_matches_cpython_marshal(source, filename);
@@ -135,7 +135,7 @@ fn matches_cpython_handler_cleanup_donor_locations() {
         ),
         (
             "guarded_false_assert_with_control.py",
-            r#"def f(work, manager, flag):
+            r"def f(work, manager, flag):
     with manager:
         try:
             work()
@@ -143,7 +143,7 @@ fn matches_cpython_handler_cleanup_donor_locations() {
             if not flag:
                 assert False, error
         work()
-"#,
+",
         ),
     ] {
         common::assert_matches_cpython_marshal(source, filename);
