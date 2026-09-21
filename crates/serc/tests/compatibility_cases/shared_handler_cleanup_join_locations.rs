@@ -195,7 +195,7 @@ fn matches_cpython_named_shared_false_cleanup_contexts() {
 
 #[test]
 fn matches_cpython_final_elif_for_exhaustion_cleanup() {
-    const SOURCE: &str = r#"def f(first, second, items):
+    const SOURCE: &str = r"def f(first, second, items):
     try:
         work()
     except Error as error:
@@ -207,7 +207,7 @@ fn matches_cpython_final_elif_for_exhaustion_cleanup() {
                 if value is not None:
                     return value
     raise Error()
-"#;
+";
 
     for (filename, source) in [
         ("named_for_return.py", SOURCE.to_owned()),
@@ -254,10 +254,12 @@ fn matches_cpython_final_elif_for_exhaustion_cleanup() {
 #[test]
 fn matches_cpython_nested_handler_cleanup_prefix_locations() {
     let indent = |source: &str| {
-        source
-            .lines()
-            .map(|line| format!("    {line}\n"))
-            .collect::<String>()
+        source.lines().fold(String::new(), |mut result, line| {
+            result.push_str("    ");
+            result.push_str(line);
+            result.push('\n');
+            result
+        })
     };
     for depth in 1..=4 {
         for named in [false, true] {
