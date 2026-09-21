@@ -1109,10 +1109,6 @@ impl ScopeArena {
             .any(|node| matches!(node.plan, ScopePlan::Class(_)))
     }
 
-    #[expect(
-        clippy::iter_over_hash_type,
-        reason = "The Boolean result does not depend on iteration order."
-    )]
     pub(super) fn has_nested_class_scopes(&self) -> bool {
         self.by_parent_and_origin
             .keys()
