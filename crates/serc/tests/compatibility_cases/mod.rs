@@ -702,3 +702,4 @@ mod nested_or_sequence_pop_locations;
 mod with_pass_finally_owner;
 
 mod numeric_remainder_folding;
+mod signed_integer_folding;

@@ -1512,8 +1512,19 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                 {
                     fold_integer_true_divide(&left, &right).map(Constant::Float)
                 }
-                (Constant::Int(left), Operator::FloorDiv, Constant::Int(right)) if right != 0 => {
-                    Some(Constant::Int(left / right))
+                (
+                    Constant::Int(left),
+                    operator @ (Operator::FloorDiv | Operator::Mod),
+                    Constant::Int(right),
+                ) if right != 0 => Some(Constant::Int(if operator == Operator::FloorDiv {
+                    left / right
+                } else {
+                    left % right
+                })),
+                (left, operator @ (Operator::FloorDiv | Operator::Mod), right)
+                    if is_integer_constant(&left) && is_integer_constant(&right) =>
+                {
+                    fold_integer_divmod(&left, operator, &right)
                 }
                 (left, Operator::FloorDiv, right)
                     if matches!(left, Constant::Float(_))
@@ -1521,43 +1532,21 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                 {
                     fold_float_floor_divide(&left, &right).map(Constant::Float)
                 }
-                (Constant::Int(left), Operator::Mod, Constant::Int(right)) if right != 0 => {
-                    Some(Constant::Int(left % right))
-                }
                 (left, Operator::Mod, right)
                     if matches!(left, Constant::Float(_))
                         || matches!(right, Constant::Float(_)) =>
                 {
                     fold_float_remainder(&left, &right).map(Constant::Float)
                 }
-                (Constant::Int(left), Operator::Pow, Constant::Int(right)) => {
-                    const MAX_INT_SIZE: u64 = 128;
-
-                    if left != 0 && right > 0 {
-                        let left_bits = u64::from(u64::BITS - left.leading_zeros());
-                        if left_bits > MAX_INT_SIZE / right {
-                            return None;
-                        }
-                    }
-                    let right = u32::try_from(right).ok()?;
-                    if let Some(value) = left.checked_pow(right) {
-                        Some(Constant::Int(value))
-                    } else {
-                        u128::from(left)
-                            .checked_pow(right)
-                            .map(|value| Constant::BigInt {
-                                negative: false,
-                                digits: big_integer_digits(&value.to_string()),
-                            })
-                    }
-                }
                 (
-                    Constant::Int(0) | Constant::Bool(false),
+                    left,
                     Operator::Pow,
-                    Constant::BigInt {
+                    right @ (Constant::Bool(_)
+                    | Constant::Int(_)
+                    | Constant::BigInt {
                         negative: false, ..
-                    },
-                ) => Some(Constant::Int(0)),
+                    }),
+                ) if is_integer_constant(&left) => fold_integer_power(&left, &right),
                 (left, operator @ (Operator::LShift | Operator::RShift), right)
                     if is_integer_constant(&left) && is_integer_constant(&right) =>
                 {
@@ -1640,9 +1629,6 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                 (Constant::Float(left), Operator::Pow, Constant::Float(right)) => {
                     let result = left.powf(right);
                     result.is_finite().then_some(Constant::Float(result))
-                }
-                (Constant::Bool(left), Operator::Pow, Constant::Bool(right)) => {
-                    Some(Constant::Int(u64::from(left).pow(u32::from(right))))
                 }
                 (left, operator @ (Operator::Add | Operator::Sub | Operator::Mult), right)
                     if matches!(left, Constant::Complex { .. })
@@ -1968,6 +1954,72 @@ fn fold_integer_arithmetic(
         _ => unreachable!(),
     };
     Some(integer_constant(result.negative, result.digits))
+}
+
+/// Apply CPython's constant-power bit budget to the magnitude, independently of its sign.
+fn fold_integer_power(left: &Constant, right: &Constant) -> Option<Constant> {
+    const MAX_INT_SIZE: usize = 128;
+
+    let left = folded_integer(left)?;
+    let right = folded_integer(right)?;
+    debug_assert!(!right.negative);
+    if right.digits.is_empty() {
+        return Some(Constant::Int(1));
+    }
+    if left.digits.is_empty() {
+        return Some(Constant::Int(0));
+    }
+    let mut exponent = magnitude_to_usize(&right.digits)?;
+    if magnitude_bit_length(&left.digits) > MAX_INT_SIZE / exponent {
+        return None;
+    }
+    let negative = left.negative && exponent & 1 != 0;
+    let mut power = left.digits;
+    let mut result = vec![1];
+    while exponent != 0 {
+        if exponent & 1 != 0 {
+            result = multiply_magnitudes(&result, &power);
+        }
+        exponent >>= 1;
+        if exponent != 0 {
+            power = multiply_magnitudes(&power, &power);
+        }
+    }
+    Some(integer_constant(negative, result))
+}
+
+/// Divide integer magnitudes, then use CPython's floor quotient and divisor-signed remainder.
+fn fold_integer_divmod(left: &Constant, operator: Operator, right: &Constant) -> Option<Constant> {
+    let left = folded_integer(left)?;
+    let right = folded_integer(right)?;
+    if right.digits.is_empty() {
+        return None;
+    }
+    let mut remainder = left.digits;
+    let mut quotient = Vec::new();
+    if let Some(top_bit) =
+        magnitude_bit_length(&remainder).checked_sub(magnitude_bit_length(&right.digits))
+    {
+        quotient.resize(top_bit / 15 + 1, 0);
+        for bit in (0..=top_bit).rev() {
+            let divisor = left_shift_magnitude(&right.digits, bit);
+            if !compare_magnitudes(&remainder, &divisor).is_lt() {
+                remainder = subtract_magnitudes(&remainder, &divisor);
+                quotient[bit / 15] |= 1 << (bit % 15);
+            }
+        }
+        quotient = normalized_digits(quotient);
+    }
+    let negative = left.negative != right.negative;
+    if negative && !remainder.is_empty() {
+        quotient = add_magnitudes(&quotient, &[1]);
+        remainder = subtract_magnitudes(&right.digits, &remainder);
+    }
+    Some(match operator {
+        Operator::FloorDiv => integer_constant(negative, quotient),
+        Operator::Mod => integer_constant(right.negative, remainder),
+        _ => unreachable!(),
+    })
 }
 
 fn add_folded_integers(left: &FoldedInteger, right: &FoldedInteger) -> FoldedInteger {

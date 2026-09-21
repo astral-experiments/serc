@@ -11,7 +11,10 @@ fn matches_cpython_float_remainder_folding() {
                 let source = format!(
                     "def remainder():\n    return {left_sign}{left} % {right_sign}{right}\n"
                 );
-                common::assert_matches_cpython_marshal(&source, &format!("remainder_{left_sign}{left}_{right_sign}{right}.py"));
+                common::assert_matches_cpython_marshal(
+                    &source,
+                    &format!("remainder_{left_sign}{left}_{right_sign}{right}.py"),
+                );
             }
         }
     }
