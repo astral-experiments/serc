@@ -1978,7 +1978,7 @@ impl Compiler<'_> {
                 && if self.context.python_version <= crate::PythonVersion::Py313 {
                     self.return_value_is_constant(&expression.value)
                 } else {
-                    fold_constant(&expression.value).is_some()
+                    self.source_aware_fold_constant(&expression.value).is_some()
                 }
             {
                 if self.context.python_version >= crate::PythonVersion::Py314
@@ -12855,10 +12855,10 @@ impl Compiler<'_> {
         // Early folding can remove the final conditional that supplies CPython's
         // original discard location. Preserve that fallback separately from the
         // discard's unlocated provenance; runtime tails resolve from their final call.
-        let preserve_folded_location = folded_bool_operand(&expression.value).is_some()
+        let preserve_folded_location = folded_bool_operand(&expression.value, self.context.python_version).is_some()
             || boolean.values.last().is_some_and(|last| {
                 matches!(last, Expr::BoolOp(inner)
-                    if inner.op != boolean.op && folded_bool_operand(last).is_some())
+                    if inner.op != boolean.op && folded_bool_operand(last, self.context.python_version).is_some())
             });
         self.assembler
             .prepare_loop_tail_discard(preserve_folded_location);

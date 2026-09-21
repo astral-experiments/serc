@@ -1010,6 +1010,15 @@ impl Compiler<'_> {
             }
         }
         match expression {
+            // BUILD_TUPLE becomes LOAD_CONST after the pass that folds TO_BOOL.
+            // The following UNARY_NOT therefore still consumes a runtime Boolean.
+            Expr::UnaryOp(unary)
+                if self.context.python_version >= crate::PythonVersion::Py314
+                    && unary.op == ruff_python_ast::UnaryOp::Not
+                    && matches!(unary.operand.as_ref(), Expr::Tuple(_)) =>
+            {
+                None
+            }
             Expr::StringLiteral(string) => Some(self.string_literal_constant(string)),
             Expr::Tuple(tuple) if tuple.ctx == ExprContext::Load => tuple
                 .elts

@@ -17,7 +17,7 @@ use crate::target::operands::Conversion;
 use crate::{CompileError, PythonVersion};
 
 use super::Compiler;
-use super::expression::literal_truthiness;
+use super::expression::{jump_constant_truthiness, literal_truthiness};
 use super::scope::NameId;
 use super::symbol::{mangle_name, to_u32};
 use crate::code_object::{CodeObject, Constant};
@@ -1480,7 +1480,12 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                 | Constant::Complex { .. }) => Some(constant),
                 _ => None,
             },
-            UnaryOp::Not => literal_truthiness(&unary.operand).map(|value| Constant::Bool(!value)),
+            UnaryOp::Not => {
+                if matches!(unary.operand.as_ref(), Expr::Tuple(_)) {
+                    fold_constant(&unary.operand)?;
+                }
+                literal_truthiness(&unary.operand).map(|value| Constant::Bool(!value))
+            }
             UnaryOp::USub => fold_constant(&unary.operand)?.negated(),
             UnaryOp::Invert => {
                 let operand = fold_constant(&unary.operand)?;
@@ -2333,7 +2338,10 @@ fn fold_literal_subscript(value: &Expr, index: &Expr) -> Option<Constant> {
     }
 }
 
-pub(super) fn folded_bool_operand(expression: &Expr) -> Option<(&Expr, Constant)> {
+pub(super) fn folded_bool_operand(
+    expression: &Expr,
+    python_version: PythonVersion,
+) -> Option<(&Expr, Constant)> {
     let Expr::BoolOp(boolean) = expression else {
         return fold_constant(expression).map(|constant| (expression, constant));
     };
@@ -2343,7 +2351,13 @@ pub(super) fn folded_bool_operand(expression: &Expr) -> Option<(&Expr, Constant)
             return None;
         }
         let constant = fold_constant(value)?;
-        let truthiness = constant_truthiness(&constant);
+        let truthiness = if python_version <= PythonVersion::Py313 {
+            constant_truthiness(&constant)
+        } else {
+            // The early LOAD_CONST pass precedes arithmetic and tuple folding. Its
+            // Boolean shortcuts cannot consume values produced by those later rewrites.
+            jump_constant_truthiness(value)?
+        };
         if matches!(boolean.op, BoolOp::And) && !truthiness
             || matches!(boolean.op, BoolOp::Or) && truthiness
         {
