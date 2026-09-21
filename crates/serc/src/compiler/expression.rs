@@ -1188,7 +1188,7 @@ impl Compiler<'_> {
                 self.compile_match_case_tail_suite(&statement.body, false_exit)?;
             }
             self.set_branch_end_location(&statement.body, body_start);
-            if !loop_tail && !final_case {
+            if !loop_tail {
                 self.assembler
                     .record_comprehension_assignment_exit(false_exit);
             }
