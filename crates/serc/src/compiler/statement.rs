@@ -456,6 +456,9 @@ pub(super) struct ExceptionState {
 
 #[derive(Debug, Default)]
 pub(super) struct FinallyState {
+    // A complete two-level source certificate uses recursive native return
+    // unwinding even when both finalizers replace the pending return.
+    copies_terminating_finally_returns: bool,
     // The direct tail statement is followed by the copied lexical unwind.
     copied_finally_tail: Option<TextRange>,
     // CPython retains the normal finally exit when it directly ends a synchronous with body.
@@ -23424,6 +23427,47 @@ impl Compiler<'_> {
         statement: &ruff_python_ast::StmtTry,
         terminal: bool,
     ) -> Result<(), CompileError> {
+        let finally = &self.control.finally;
+        if self.context.python_version <= crate::PythonVersion::Py313
+            && !finally.copies_terminating_finally_returns
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.exceptions.active_try_marker_slots.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && finally.active_return_finally_contexts.is_empty()
+            && finally.active_loop_finally_contexts.is_empty()
+            && finally.active_pass_finally_locations.is_empty()
+            && finally.preserved_return_value_contexts.is_empty()
+            && finally.copied_return_finally_preserved_values == 0
+            && finally.active_finally_try_bodies == 0
+            && finally.active_normal_finally_bodies == 0
+            && finally.active_copied_finally_bodies == 0
+            && finally.active_finally_end_blocks == 0
+            && finally.active_overriding_finally_returns == 0
+            && supports_nested_terminating_finally_returns(statement)
+        {
+            return self.with_control_override(
+                |control| &mut control.finally.copies_terminating_finally_returns,
+                true,
+                |compiler| compiler.compile_try_finally_inner(statement, terminal),
+            );
+        }
+        self.compile_try_finally_inner(statement, terminal)
+    }
+
+    fn compile_try_finally_inner(
+        &mut self,
+        statement: &ruff_python_ast::StmtTry,
+        terminal: bool,
+    ) -> Result<(), CompileError> {
         let preserve_exit_nop =
             std::mem::take(&mut self.control.finally.preserve_next_finally_exit_nop);
         let capture_manager_pop =
@@ -25422,7 +25466,11 @@ impl Compiler<'_> {
                 statement.finalbody.as_slice(),
                 [Stmt::Delete(delete)] if matches!(delete.targets.as_slice(), [Expr::Name(_)])
             );
-        let copy_finally_on_exit = !suite_terminates(&statement.finalbody);
+        // Native FINALLY_TRY visits the cleanup before any overriding Return
+        // discards the pending value. The certified chain uses the existing
+        // copied-return contexts for terminating and falling-through cleanup.
+        let copy_finally_on_exit = self.control.finally.copies_terminating_finally_returns
+            || !suite_terminates(&statement.finalbody);
         let noop_finally_body = statement.finalbody.iter().all(|statement| {
             matches!(statement, Stmt::Pass(_))
                 || matches!(statement, Stmt::Expr(expression) if fold_constant(&expression.value).is_some())
@@ -25477,7 +25525,7 @@ impl Compiler<'_> {
             self.control.finally.pending_name_return_borrow_exit.take();
         let protected_result = self.with_finally_protected_context(
             pass_finally_location,
-            overriding_return,
+            overriding_return && !self.control.finally.copies_terminating_finally_returns,
             FinallyProtectedLoopRanges {
                 preserve_break_exit: preserve_break_exit_loop_range,
                 borrow_reachable_exit: inner_try_break_loop_range
@@ -26908,6 +26956,7 @@ impl Compiler<'_> {
             || self.control.finally.active_copied_finally_bodies > 0;
         if let Some((Stmt::Return(return_statement), leading)) = statement.finalbody.split_last()
             && has_enclosing_finally_cleanup
+            && !self.control.finally.copies_terminating_finally_returns
         {
             self.compile_suite(leading)?;
             explicit_handler_end =
@@ -31193,6 +31242,65 @@ fn finalizer_tail_has_matching_linear_copies(body: &[Stmt]) -> bool {
             suspensions.visit_expr(&assignment.value);
             !suspensions.found
         })
+}
+
+/// Certifies the two adjacent finally frames covered by the existing return
+/// owner proof. An exceptional inner return crosses `FINALLY_END`, then the one
+/// outer `FINALLY_TRY`. Cleanup adds no handler, manager, or abrupt loop exit.
+fn supports_nested_terminating_finally_returns(statement: &ruff_python_ast::StmtTry) -> bool {
+    fn supported_return(statement: &ruff_python_ast::StmtReturn) -> bool {
+        statement
+            .value
+            .as_deref()
+            .is_none_or(|value| matches!(value, Expr::Name(_)) || is_literal_constant(value))
+    }
+
+    fn supported_call(expression: &Expr) -> bool {
+        matches!(expression, Expr::Call(_))
+            && !expression_contains_inline_branch(expression)
+            && !expression_suspends_current_scope(expression)
+    }
+
+    fn supported_work(statement: &Stmt) -> bool {
+        match statement {
+            Stmt::Pass(_) => true,
+            Stmt::Expr(expression) => match expression.value.as_ref() {
+                Expr::Await(awaited) => supported_call(&awaited.value),
+                value => supported_call(value),
+            },
+            _ => false,
+        }
+    }
+
+    fn supported_finally(statement: &ruff_python_ast::StmtTry) -> bool {
+        if statement.is_star || !statement.handlers.is_empty() || !statement.orelse.is_empty() {
+            return false;
+        }
+        let Some((Stmt::Return(tail), leading)) = statement.finalbody.split_last() else {
+            return false;
+        };
+        supported_return(tail)
+            && leading.iter().all(|statement| {
+                if let Stmt::For(loop_statement) = statement {
+                    !loop_statement.is_async
+                        && matches!(loop_statement.target.as_ref(), Expr::Name(_))
+                        && (matches!(loop_statement.iter.as_ref(), Expr::Name(_))
+                            || supported_call(&loop_statement.iter))
+                        && loop_statement.orelse.is_empty()
+                        && loop_statement.body.iter().all(supported_work)
+                } else {
+                    supported_work(statement)
+                }
+            })
+    }
+
+    let [Stmt::Try(inner)] = statement.body.as_slice() else {
+        return false;
+    };
+    let [Stmt::Return(return_statement)] = inner.body.as_slice() else {
+        return false;
+    };
+    supported_finally(statement) && supported_finally(inner) && supported_return(return_statement)
 }
 
 // Certify an emitted-work path with no internal branch or cleanup entry. A suite
@@ -35961,10 +36069,46 @@ mod tests {
     use super::{
         first_coroutine_try_else_condition, first_iterator_assignment_condition,
         suite_contains_multiple_loop_breaks, suite_terminates,
-        terminal_assert_splits_success_return,
+        supports_nested_terminating_finally_returns, terminal_assert_splits_success_return,
     };
     use ruff_python_ast::Stmt;
     use ruff_python_parser::parse_module;
+
+    #[test]
+    fn recursive_finally_return_certificate_requires_two_complete_frames() {
+        let prefix = "async def f():\n    try:\n        try:\n            return payload\n        finally:\n            await inner()\n            return inner_result\n    finally:\n";
+        for body in [
+            "        return outer_result\n",
+            "        cleanup()\n        return None\n",
+            "        for item in items:\n            await outer(item)\n        return outer_result\n",
+        ] {
+            let parsed = parse_module(&format!("{prefix}{body}")).unwrap();
+            let Stmt::FunctionDef(function) = &parsed.suite()[0] else {
+                panic!()
+            };
+            let Stmt::Try(statement) = &function.body[0] else {
+                panic!()
+            };
+            assert!(supports_nested_terminating_finally_returns(statement));
+        }
+        for body in [
+            "        return action()\n",
+            "        if flag:\n            cleanup()\n        return outer_result\n",
+            "        for item in items:\n            break\n        return outer_result\n",
+            "        async for item in items:\n            await outer(item)\n        return outer_result\n",
+            "        await (left() if flag else right())\n        return outer_result\n",
+            "        with manager():\n            cleanup()\n        return outer_result\n",
+        ] {
+            let parsed = parse_module(&format!("{prefix}{body}")).unwrap();
+            let Stmt::FunctionDef(function) = &parsed.suite()[0] else {
+                panic!()
+            };
+            let Stmt::Try(statement) = &function.body[0] else {
+                panic!()
+            };
+            assert!(!supports_nested_terminating_finally_returns(statement));
+        }
+    }
 
     fn terminal_assert_splits(expression: &str) -> bool {
         let parsed = parse_module(&format!("assert {expression}"))
