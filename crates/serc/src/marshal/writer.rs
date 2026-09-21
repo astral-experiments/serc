@@ -330,6 +330,9 @@ impl Writer<'_, '_, '_> {
                 self.big_integer(object, digits, *negative, reference_mode);
                 true
             }
+            Constant::NonReflexive(number) => {
+                self.write_constant_value(&number.value(), reference_mode)
+            }
             Constant::Float(float) => {
                 let object = self.next_object(OccurrenceKind::Constant);
                 let Some(flag) = self.begin_object(object, reference_mode) else {
@@ -427,6 +430,13 @@ impl Writer<'_, '_, '_> {
                     self.output.extend_from_slice(&digit.to_le_bytes());
                 }
             }
+            Constant::NonReflexive(number) => match number.value() {
+                Constant::Float(value) => self.byte_and_float(TYPE_BINARY_FLOAT | flag, value),
+                Constant::Complex { real, imag } => {
+                    self.byte_and_complex(TYPE_BINARY_COMPLEX | flag, real, imag);
+                }
+                _ => unreachable!("non-reflexive values are NaN-bearing numbers"),
+            },
             Constant::Float(value) => {
                 self.byte_and_float(TYPE_BINARY_FLOAT | flag, *value);
             }

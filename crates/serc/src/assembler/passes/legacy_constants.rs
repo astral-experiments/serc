@@ -196,6 +196,7 @@ fn legacy_constant_truthiness(constant: &Constant) -> bool {
         Constant::Int(value) => *value != 0,
         Constant::SignedInt(value) => *value != 0,
         Constant::BigInt { digits, .. } => !digits.is_empty(),
+        Constant::NonReflexive(_) => true,
         Constant::Float(value) => *value != 0.0,
         Constant::Complex { real, imag } => *real != 0.0 || *imag != 0.0,
         Constant::String(value) => !value.is_empty(),

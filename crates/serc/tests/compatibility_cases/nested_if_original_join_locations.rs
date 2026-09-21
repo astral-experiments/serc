@@ -158,3 +158,35 @@ fn nested_final_else_exception_group_keeps_exit_location() {
         "nested_cleanup_if_exit_exception_group_boundary.py",
     );
 }
+
+#[test]
+fn folded_populated_predecessors_keep_original_tuple_copy_rounds() {
+    for value in [
+        "1",
+        "-1",
+        "(1, 2, 3)",
+        "values[None, :]",
+        "prepare(values, (0, 1), mode='constant', constant_values=0)",
+    ] {
+        for returned in ["left, right", "left, right, values"] {
+            let source = format!(
+                "def choose(outer, first, second, left, right, values):
+    if outer:
+        if first:
+            left = {value}
+        elif second:
+            if left:
+                right = False
+            else:
+                right = True
+        else:
+            raise ValueError
+    else:
+        left = 4
+    return {returned}
+"
+            );
+            common::assert_matches_cpython_marshal(&source, "folded_predecessor_tuple_copy.py");
+        }
+    }
+}

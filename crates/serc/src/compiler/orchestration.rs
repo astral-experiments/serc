@@ -96,6 +96,14 @@ impl ConstantTable for InterningConstantTable<'_, '_> {
         self.output.intern(constant)
     }
 
+    fn reallocate_non_reflexive_constant(
+        &mut self,
+        index: u32,
+        remap: &mut crate::code_object::NonReflexiveRemap,
+    ) -> Result<u32, CompileError> {
+        self.output.reallocate_non_reflexive_constant(index, remap)
+    }
+
     fn fold_sequence(&mut self, values: Vec<Constant>, is_set: bool) -> Result<u32, CompileError> {
         let index = self.output.fold_sequence(values, is_set)?;
         self.context
@@ -111,8 +119,13 @@ impl ConstantTable for InterningConstantTable<'_, '_> {
         self.output.retain_used_in_order(used)
     }
 
-    fn retain_used(&mut self, used: &[bool], order: &[u32]) -> Vec<Option<u32>> {
-        self.output.retain_used(used, order)
+    fn retain_used(
+        &mut self,
+        used: &[bool],
+        order: &[u32],
+        early_booleans: &[bool],
+    ) -> Vec<Option<u32>> {
+        self.output.retain_used(used, order, early_booleans)
     }
 }
 
@@ -497,13 +510,9 @@ impl<'source> Compiler<'source> {
                     } else {
                         Constant::String(clean_doc(string.value.to_str()))
                     })?;
-                let location = if self.context.python_version <= PythonVersion::Py313 {
-                    // Native docstring loads use the literal expression, excluding
-                    // parentheses belonging to the enclosing expression statement.
-                    self.source_location(string.range)
-                } else {
-                    self.source_location(expression.range)
-                };
+                // Native docstring loads use the literal expression, excluding
+                // parentheses belonging to the enclosing expression statement.
+                let location = self.source_location(string.range);
                 self.assembler.set_location(location);
                 self.emit(LOAD_CONST, constant, 1)?;
                 if self.context.python_version == PythonVersion::Py312 {
@@ -755,13 +764,9 @@ impl<'source> Compiler<'source> {
                     } else {
                         Constant::String(clean_doc(string.value.to_str()))
                     })?;
-                let location = if self.context.python_version <= PythonVersion::Py313 {
-                    // Native docstring loads use the literal expression, excluding
-                    // parentheses belonging to the enclosing expression statement.
-                    self.source_location(string.range)
-                } else {
-                    self.source_location(expression.range)
-                };
+                // Native docstring loads use the literal expression, excluding
+                // parentheses belonging to the enclosing expression statement.
+                let location = self.source_location(string.range);
                 self.assembler.set_location(location);
                 self.emit(LOAD_CONST, docstring, 1)?;
                 if self.context.python_version == PythonVersion::Py312 {
@@ -786,6 +791,10 @@ impl<'source> Compiler<'source> {
         {
             let range = if let Expr::FString(fstring) = expression.value.as_ref() {
                 self.fstring_result_range(fstring)
+            } else if self.context.python_version >= PythonVersion::Py314
+                && matches!(expression.value.as_ref(), Expr::BinOp(_) | Expr::UnaryOp(_))
+            {
+                expression.value.range()
             } else {
                 expression.range
             };

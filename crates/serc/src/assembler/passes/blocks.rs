@@ -1,9 +1,10 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::{
-    ExceptionExclusion, ExceptionPolicy, ExceptionRegion, Instruction, Item, JUMP_BACKWARD,
-    JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, Label, Operand, OptimizationPipeline, SourceLocation,
-    block_has_fallthrough, block_jump_target, cleanup_block_creation_order, ends_scope,
+    ConstantTable, ExceptionExclusion, ExceptionPolicy, ExceptionRegion, Instruction, Item,
+    JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, Label, Operand, OptimizationPipeline,
+    SourceLocation, block_has_fallthrough, block_jump_target, cleanup_block_creation_order,
+    ends_scope,
 };
 use crate::assembler::block_graph::{BasicBlockId, BlockGraph, ItemPosition};
 use crate::assembler::exception_owners::ExceptionOwnerProvenance;
@@ -1816,8 +1817,11 @@ fn propagate_exit_block_locations(
                 .items()
                 .iter()
                 .find(|item| matches!(item, Item::Instruction(_)))
-            && first.opcode == NOP
-            && first.fusion_policy.is_converted_pop_block()
+            && ((first.opcode == POP_EXCEPT
+                && graph[target].items().iter().any(|item| {
+                    matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
+                }))
+                || (first.opcode == NOP && first.fusion_policy.is_converted_pop_block()))
             && first.location.line < 0
             && !first.no_location_policy.preserves_location()
             && let Some(location) = analysis.jump_predecessors[target.index()].and_then(|source| {
@@ -1827,6 +1831,8 @@ fn propagate_exit_block_locations(
             })
             && let Some(first) = graph.instructions_mut(target).next()
         {
+            // A sole jump locates the artificial cleanup entry even when later
+            // instructions in the same block already have authored locations.
             first.location = location;
             continue;
         }
@@ -3750,7 +3756,9 @@ impl OptimizationPipeline {
             &mut Vec::new(),
             &origins,
             &threaded_normal_try_joins,
+            None,
         )
+        .expect("test constant-free copy does not allocate constants")
     }
 
     pub(in crate::assembler) fn duplicate_exit_blocks_with_store_origins(
@@ -3760,10 +3768,11 @@ impl OptimizationPipeline {
         region_retargets: &mut Vec<(ExceptionRegion, ExceptionRegion)>,
         reversed_store_handler_exits: &ReversedStoreHandlerExits,
         threaded_normal_try_joins: &ThreadedNormalTryJoins,
-    ) -> Vec<Label> {
+        mut constants: Option<&mut dyn ConstantTable>,
+    ) -> Result<Vec<Label>, crate::CompileError> {
         let graph = &mut self.graph;
         if graph.is_normalized_jump_free_single_block(&self.preserved_block_boundaries) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         if !graph.is_normalized(&self.preserved_block_boundaries) {
@@ -3800,7 +3809,7 @@ impl OptimizationPipeline {
                 .expect("certified original cleanup array continuations");
         }
         if graph.len() < 2 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let order = graph.order().to_vec();
@@ -3879,7 +3888,7 @@ impl OptimizationPipeline {
                 &self.preserved_block_boundaries,
                 &self.retained_pop_block_origins,
             );
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let ExitBlockAnalysis {
             positions,
@@ -5065,6 +5074,21 @@ impl OptimizationPipeline {
                     Item::Label(_) => item,
                 })
                 .collect::<Vec<_>>();
+            if inline_small_exit && let Some(constants) = constants.as_deref_mut() {
+                // Native small-exit copying precedes arithmetic folding. Other
+                // copies reuse already allocated constants; code objects always do.
+                let mut remap = crate::code_object::NonReflexiveRemap::default();
+                for item in &mut copied {
+                    if let Item::Instruction(instruction) = item
+                        && instruction.opcode == LOAD_CONST
+                        && let Operand::Value(index) = instruction.operand()
+                    {
+                        let index =
+                            constants.reallocate_non_reflexive_constant(index, &mut remap)?;
+                        instruction.set_operand(Operand::Value(index));
+                    }
+                }
+            }
             // A shared jump keeps its original no-location policy through NOP removal.
             // Its copy has a new predecessor and can inherit that predecessor's location.
             // Read the original labels before they are renamed below.
@@ -5259,10 +5283,17 @@ impl OptimizationPipeline {
                     .count()
                     == 2
                 && graph[source].last_instruction().is_some_and(|jump| {
-                    jump.pre_fold_extra_instructions() == 1
+                    // A direct copy keeps the original join policy and has no
+                    // threaded-away jump slot. Retargeting clears that policy
+                    // while recording the one bypassed slot; both retain the same
+                    // pass array followed by the original empty join.
+                    ((jump.pre_fold_extra_instructions() == 1
+                        && !jump.jump_policy.retains_nop_for(jump.operand()))
+                        || (jump.pre_fold_extra_instructions() == 0
+                            && jump.jump_policy.retained_nop()
+                                == super::super::ir::RetainedJumpNop::DirectTarget))
                         && jump.local_policy.hidden_exception_owner_slots() == 0
                         && !jump.fusion_policy.is_authored_break()
-                        && !jump.jump_policy.retains_nop_for(jump.operand())
                         && !jump.jump_policy.borrow_empty_block()
                 });
             // Match-success jumps are originally unlocated. A located replacement
@@ -5681,7 +5712,13 @@ impl OptimizationPipeline {
                 if let Some(location) = original_donor {
                     // Keep every copy round unlocated. The unique copied successor
                     // identifies this original marker after the schedule finishes.
-                    original_join_marker_donors.push((source, copied_label, marker, location));
+                    original_join_marker_donors.push((
+                        source,
+                        copied_label,
+                        marker,
+                        location,
+                        true,
+                    ));
                 }
                 graph.insert_item(
                     ItemPosition::new(source, position),
@@ -5703,7 +5740,7 @@ impl OptimizationPipeline {
                     original.depth_after(),
                 );
                 marker.set_exception_policy(original.exception_policy());
-                original_join_marker_donors.push((source, copied_label, marker, location));
+                original_join_marker_donors.push((source, copied_label, marker, location, false));
                 graph.insert_item(
                     ItemPosition::new(source, position),
                     Item::Instruction(marker),
@@ -6615,7 +6652,12 @@ impl OptimizationPipeline {
         // Location restoration must follow every copy round: locating a join's NOP
         // earlier can change the eligibility of a later original-array copy. Copies
         // receive new labels, so this seam certifies only the original jump marker.
-        for (source, successor, mut expected, location) in original_join_marker_donors {
+        for (source, successor, mut expected, location, store_donor) in original_join_marker_donors
+        {
+            // A surviving shared original cannot inherit this fallthrough store's line.
+            if store_donor && remaining_predecessors[source.index()] != 1 {
+                continue;
+            }
             let items = graph[source].items();
             let Some(successor_position) = items
                 .iter()
@@ -7012,6 +7054,32 @@ impl OptimizationPipeline {
             if !copied_exit_needs_location && !graph[target].items().iter().all(|item| {
                 !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
             }) {
+                if remaining_predecessors[target.index()] == 1
+                    && let Some(Item::Instruction(first)) = graph[target]
+                        .items()
+                        .iter()
+                        .find(|item| matches!(item, Item::Instruction(_)))
+                    && first.opcode == POP_EXCEPT
+                    && first.location.line < 0
+                    && !first.no_location_policy.preserves_location()
+                    && let Some(location) = jump_sources[target.index()]
+                        .iter()
+                        .copied()
+                        .filter(|source| !drop_blocks[source.index()])
+                        .find_map(|source| {
+                            block_jump_target(graph[source].items())
+                                .and_then(|label| graph.label_block(label))
+                                .filter(|block| *block == target)
+                                .and_then(|_| graph[source].last_instruction())
+                                .filter(|instruction| instruction.location.line >= 0)
+                                .map(|instruction| instruction.location)
+                        })
+                    && let Some(first) = graph.instructions_mut(target).next()
+                {
+                    // Only the artificial prefix needs a line from its sole live jump.
+                    // Keep copied arrays on their existing internal-entry propagation path.
+                    first.location = location;
+                }
                 continue;
             }
             if preserve_shared_cleanup {
@@ -7331,7 +7399,7 @@ impl OptimizationPipeline {
                 .collect();
             propagate_normal_try_pop_continuations(graph, &original_pop_ranges, &handler_entries);
         }
-        copied_entry_labels
+        Ok(copied_entry_labels)
     }
 }
 

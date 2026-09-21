@@ -1164,6 +1164,46 @@ impl Default for InstructionMetadata {
     }
 }
 
+/// First occurrences of the two Boolean objects in one original instruction owner.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum EarlyBooleanAdmissions {
+    #[default]
+    None,
+    True,
+    False,
+    TrueFalse,
+    FalseTrue,
+}
+
+impl EarlyBooleanAdmissions {
+    pub(super) const fn values(self) -> &'static [bool] {
+        match self {
+            Self::None => &[],
+            Self::True => &[true],
+            Self::False => &[false],
+            Self::TrueFalse => &[true, false],
+            Self::FalseTrue => &[false, true],
+        }
+    }
+
+    pub(super) fn append(&mut self, value: bool) {
+        *self = match (*self, value) {
+            (Self::None, true) => Self::True,
+            (Self::None, false) => Self::False,
+            (Self::True, false) => Self::TrueFalse,
+            (Self::False, true) => Self::FalseTrue,
+            _ => *self,
+        };
+    }
+
+    fn followed_by(mut self, other: Self) -> Self {
+        for value in other.values() {
+            self.append(*value);
+        }
+        self
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Instruction {
     pub(super) opcode: Opcode,
@@ -1177,6 +1217,7 @@ pub(super) struct Instruction {
     // `NOT_TAKEN` is added after CPython labels exception handlers. The new instruction keeps
     // whatever exception target remains in its reused CFG slot, if there is one.
     metadata: InstructionMetadata,
+    pub(super) early_boolean_admissions: EarlyBooleanAdmissions,
 }
 
 impl Instruction {
@@ -1200,6 +1241,7 @@ impl Instruction {
             fusion_policy,
             jump_policy: JumpPolicy::default(),
             metadata: InstructionMetadata::default(),
+            early_boolean_admissions: EarlyBooleanAdmissions::default(),
         }
     }
 
@@ -1219,6 +1261,7 @@ impl Instruction {
             fusion_policy: FusionPolicy::default(),
             jump_policy: JumpPolicy::default(),
             metadata: InstructionMetadata::default(),
+            early_boolean_admissions: EarlyBooleanAdmissions::default(),
         }
     }
 
@@ -1471,6 +1514,9 @@ impl Instruction {
                     || second.only_allows_unconditional_inlining(),
             )
             .with_flags(first.metadata.flags() | second.metadata.flags()),
+            early_boolean_admissions: first
+                .early_boolean_admissions
+                .followed_by(second.early_boolean_admissions),
         }
     }
 }
@@ -1538,6 +1584,8 @@ pub(crate) struct Assembler {
     pub(super) operand_patches: Vec<OperandPatch>,
     pub(super) deferred_none_constant_index: Option<u32>,
     pub(super) discarded_fold_admissions: FxHashMap<Label, Vec<u32>>,
+    pub(super) early_boolean_admissions_certified: bool,
+    pub(super) has_early_boolean_admissions: bool,
     pub(super) next_label: u32,
     pub(super) legacy_native_labels: Option<Box<super::legacy_native_labels::LegacyNativeLabels>>,
     pub(super) location: SourceLocation,
@@ -1654,6 +1702,8 @@ pub(super) struct OptimizationPipeline {
     pub(super) folded_loop_exit_anchors: FxHashSet<Label>,
     /// First-fold admissions retained before their next surviving source label.
     pub(super) discarded_fold_admissions: FxHashMap<Label, Vec<u32>>,
+    pub(super) early_boolean_admissions_certified: bool,
+    pub(super) has_early_boolean_admissions: bool,
     pub(super) initial_reachable: Option<Vec<bool>>,
     /// Erased handler entries must not mark a later block reached through label aliasing.
     pub(super) retired_exception_handler_targets: FxHashSet<Label>,
@@ -1791,6 +1841,8 @@ impl Default for Assembler {
             operand_patches: Vec::new(),
             deferred_none_constant_index: None,
             discarded_fold_admissions: FxHashMap::default(),
+            early_boolean_admissions_certified: false,
+            has_early_boolean_admissions: false,
             next_label: 0,
             legacy_native_labels: None,
             location: SourceLocation::NONE,

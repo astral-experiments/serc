@@ -124,6 +124,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) original_fallthrough_pop_blocks: FxHashMap<Label, Instruction>,
     // Ordinary handler exits copied from an original unlocated POP_EXCEPT/jump array.
     pub(super) original_handler_cleanup_join_exits: FxHashSet<Label>,
+    // Source-emitted named cleanup arrays, before original POP_BLOCK restoration.
+    pub(super) original_named_handler_cleanup_joins: Vec<(Label, [Instruction; 5])>,
     // Original try/except POP_BLOCK exits inside their own finally, for owner transfer
     // and late redundant-exit removal, but not ordinary-try exit copying.
     pub(super) compound_try_owner_exits: Vec<(Label, Label)>,

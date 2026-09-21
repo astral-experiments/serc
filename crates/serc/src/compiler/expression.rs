@@ -1188,7 +1188,7 @@ impl Compiler<'_> {
                 self.compile_match_case_tail_suite(&statement.body, false_exit)?;
             }
             self.set_branch_end_location(&statement.body, body_start);
-            if !loop_tail && !final_case {
+            if !loop_tail {
                 self.assembler
                     .record_comprehension_assignment_exit(false_exit);
             }
@@ -1998,7 +1998,8 @@ impl Compiler<'_> {
         let starting_depth = self.control.stack.depth;
         if self.context.python_version >= PythonVersion::Py314
             && let Expr::BoolOp(boolean) = expression
-            && let Some((origin, constant)) = folded_bool_operand(expression)
+            && let Some((origin, _)) = folded_bool_operand(expression, self.context.python_version)
+            && let Some(constant) = self.source_aware_fold_constant(origin)
         {
             self.pre_register_expression_names(expression)?;
             let expression_location = self.source_location(expression.range());
@@ -2008,7 +2009,6 @@ impl Compiler<'_> {
                 self.emit(NOP, 0, 0)?;
             }
             self.assembler.set_location(origin_location);
-            let constant = self.source_aware_fold_constant(origin).unwrap_or(constant);
             self.emit_folded_constant(origin, constant)?;
             if boolean.values.len() > 1
                 && boolean
@@ -7204,7 +7204,8 @@ impl Compiler<'_> {
 
         for (operand_index, value) in leading.iter().enumerate() {
             if let Expr::BoolOp(inner) = value
-                && (inner.op == expression.op || folded_bool_operand(value).is_none())
+                && (inner.op == expression.op
+                    || folded_bool_operand(value, self.context.python_version).is_none())
             {
                 self.compile_bool_expression_at(
                     inner,
@@ -7592,7 +7593,8 @@ impl Compiler<'_> {
             self.emit(POP_TOP, 0, -1)?;
         }
         if let Expr::BoolOp(inner) = last
-            && (inner.op == expression.op || folded_bool_operand(last).is_none())
+            && (inner.op == expression.op
+                || folded_bool_operand(last, self.context.python_version).is_none())
         {
             self.compile_bool_expression_at(inner, continuation, false)?;
         } else {

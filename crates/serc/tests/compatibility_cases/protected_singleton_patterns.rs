@@ -204,3 +204,33 @@ fn preserves_fresh_manager_singleton_arrays_and_other_identity_tests() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn preserves_class_singleton_match_break_return_locations() {
+    for pattern in ["Point(field=None)", "Point(field=None) | None"] {
+        for matched_break in [false, true] {
+            let (matched, fallback) = if matched_break {
+                ("break", "consume(item)")
+            } else {
+                ("pass", "break")
+            };
+            for loop_else in ["", "        else:\n            exhausted()\n"] {
+                for outer_else in [false, true] {
+                    let mut source = String::from("def f(items, flag):\n    if flag:\n");
+                    if outer_else {
+                        source.push_str("        alternate()\n    else:\n");
+                    }
+                    write!(
+                        source,
+                        "        for item in items:\n            match item:\n                case {pattern}:\n                    {matched}\n                case _:\n                    {fallback}\n{loop_else}"
+                    )
+                    .unwrap();
+                    if !outer_else {
+                        source.push_str("    else:\n        alternate()\n");
+                    }
+                    common::assert_matches_cpython_marshal(&source, "class_pattern_break.py");
+                }
+            }
+        }
+    }
+}

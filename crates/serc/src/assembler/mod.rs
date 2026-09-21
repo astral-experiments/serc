@@ -322,8 +322,18 @@ pub(crate) trait ConstantTable {
     fn get(&self, index: u32) -> &Constant;
     fn intern(&mut self, constant: Constant) -> Result<u32, CompileError>;
     fn fold_sequence(&mut self, values: Vec<Constant>, is_set: bool) -> Result<u32, CompileError>;
+    fn reallocate_non_reflexive_constant(
+        &mut self,
+        index: u32,
+        remap: &mut crate::code_object::NonReflexiveRemap,
+    ) -> Result<u32, CompileError>;
     fn len(&self) -> usize;
-    fn retain_used(&mut self, used: &[bool], order: &[u32]) -> Vec<Option<u32>>;
+    fn retain_used(
+        &mut self,
+        used: &[bool],
+        order: &[u32],
+        early_booleans: &[bool],
+    ) -> Vec<Option<u32>>;
     fn retain_used_in_order(&mut self, used: &[bool]) -> Vec<Option<u32>>;
 }
 
@@ -1371,10 +1381,10 @@ impl Assembler {
 
     /// Keeps a cleanup-free while break until the shared handler exit can be copied.
     ///
-    /// The caller certifies an unnamed handler ending in a runtime while without else.
+    /// The caller certifies a handler ending in a runtime while without else.
     /// Its single false edge enters a source boundary beside the distinct break target.
     /// Removing the break first would merge those two original cleanup predecessors.
-    pub(crate) fn defer_original_while_break_cleanup_edges(&mut self) {
+    pub(crate) fn defer_original_while_break_cleanup_edges(&mut self) -> bool {
         let items = self.linear_items();
         let labels = items
             .iter()
@@ -1391,7 +1401,7 @@ impl Assembler {
                     || self.folded_away_loop_else_targets.contains(label)
             })
         {
-            return;
+            return false;
         }
         let mut false_edge = None;
         let mut breaks = Vec::new();
@@ -1409,7 +1419,7 @@ impl Assembler {
                 || instruction.local_policy.hidden_exception_owner_slots() != 0
                 || instruction.no_location_policy.preserves_location()
             {
-                return;
+                return false;
             }
             if matches!(
                 instruction.opcode,
@@ -1424,7 +1434,7 @@ impl Assembler {
                     .replace((target, instruction.depth_after()))
                     .is_some()
                 {
-                    return;
+                    return false;
                 }
             } else if instruction.opcode == JUMP_FORWARD
                 && instruction.fusion_policy.is_authored_break()
@@ -1434,18 +1444,18 @@ impl Assembler {
             {
                 breaks.push((index, target, instruction.depth_after()));
             } else {
-                return;
+                return false;
             }
         }
         let Some((false_target, depth)) = false_edge else {
-            return;
+            return false;
         };
         if breaks.is_empty()
             || breaks
                 .iter()
                 .any(|(_, target, break_depth)| *target == false_target || *break_depth != depth)
         {
-            return;
+            return false;
         }
         for (index, _, _) in breaks {
             let Item::Instruction(jump) = &mut self.linear_items_mut()[index] else {
@@ -1453,6 +1463,7 @@ impl Assembler {
             };
             jump.jump_policy.defer_removal();
         }
+        true
     }
 
     /// Certifies a guard-false donor beside a separate normal-finally exit.
@@ -11246,6 +11257,45 @@ impl Assembler {
             .push((start, origin));
     }
 
+    /// Saves a named handler's original cleanup array before exit-copy scheduling.
+    pub(crate) fn record_original_named_handler_cleanup_join(&mut self, entry: Label, end: Label) {
+        let items = self.linear_items();
+        let Some(start) = items.iter().rposition(|item| *item == Item::Label(entry)) else {
+            return;
+        };
+        let array = items[start + 1..]
+            .iter()
+            .skip_while(|item| matches!(item, Item::Label(_)))
+            .map(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction),
+                Item::Label(_) => None,
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(array) = array.and_then(|array| <[Instruction; 5]>::try_from(array).ok()) else {
+            return;
+        };
+        let [pop, load, store, delete, jump] = array;
+        if pop.opcode != POP_EXCEPT
+            || load.opcode != LOAD_CONST
+            || store.opcode != STORE_FAST
+            || delete.opcode != DELETE_FAST
+            || store.operand() != delete.operand()
+            || jump.opcode != JUMP_FORWARD
+            || jump.operand() != Operand::Forward(end)
+            || array.iter().any(|instruction| {
+                instruction.location != SourceLocation::NONE
+                    || instruction.pre_fold_extra_instructions() != 0
+                    || instruction.local_policy.hidden_exception_owner_slots() != 0
+                    || instruction.exception_policy() != ExceptionPolicy::default()
+            })
+        {
+            return;
+        }
+        self.exception_owner_provenance
+            .original_named_handler_cleanup_joins
+            .push((entry, array));
+    }
+
     /// Records an ordinary handler exit copied from an original empty join.
     pub(crate) fn record_original_handler_cleanup_join_exit(
         &mut self,
@@ -14010,6 +14060,28 @@ impl Assembler {
 
     pub(crate) const fn deferred_none_constant_index(&self) -> Option<u32> {
         self.deferred_none_constant_index
+    }
+
+    /// Reports whether lowering can retain every early Boolean owner in this unit.
+    pub(crate) const fn early_boolean_admissions_certified(&self) -> bool {
+        self.early_boolean_admissions_certified
+    }
+
+    /// Enables phase ordering only for code units whose original Boolean owners survive lowering.
+    pub(crate) fn certify_early_boolean_admissions(&mut self, certified: bool) {
+        self.early_boolean_admissions_certified = certified;
+    }
+
+    /// Attaches native early `TO_BOOL` admissions to the instruction copied with their owner.
+    pub(crate) fn record_last_early_boolean_admissions(&mut self, admissions: &[bool]) {
+        if !self.early_boolean_admissions_certified || admissions.is_empty() {
+            return;
+        }
+        self.has_early_boolean_admissions = true;
+        let instruction = self.required_last_instruction_mut("recording early Boolean admissions");
+        for value in admissions {
+            instruction.early_boolean_admissions.append(*value);
+        }
     }
 
     /// Retains a folded value's construction at an omitted expression's source position.
