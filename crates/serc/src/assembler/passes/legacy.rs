@@ -249,11 +249,14 @@ impl OptimizationPipeline {
                 }
             });
             self.remove_legacy_nops_and_jumps(&original_arrays, true);
+            self.reject_unmodeled_empty_native_jump_targets();
         } else {
-            // 3.12 converts POP_BLOCK only after CFG optimization and line resolution.
+            // Native 3.12 does not eliminate empty blocks after ConvertPseudoOps:
+            // their original jump operands survive into ResolveJumps. Reject
+            // preexisting unsupported empty targets before this final conversion.
+            self.reject_unmodeled_empty_native_jump_targets();
             self.remove_legacy_nops(&original_arrays, true);
         }
-        self.reject_unmodeled_empty_native_jump_targets();
         self.normalize_legacy_jump_directions();
         self.normalize_backward_conditionals()?;
         if !self
@@ -284,6 +287,12 @@ impl OptimizationPipeline {
                         .source_none_conditions
                         .iter_mut()
                         .map(|origin| &mut origin.instruction),
+                )
+                .chain(
+                    self.exception_owner_provenance
+                        .original_comprehension_normal_exits
+                        .iter_mut()
+                        .map(|(_, instruction)| instruction),
                 )
             {
                 instruction.clear_legacy_initial_jump_argument();
@@ -362,6 +371,12 @@ impl OptimizationPipeline {
                     .iter()
                     .map(|origin| &origin.instruction),
             )
+            .chain(
+                self.exception_owner_provenance
+                    .original_comprehension_normal_exits
+                    .iter()
+                    .map(|(_, instruction)| instruction),
+            )
         {
             let (Operand::Forward(target) | Operand::Backward(target)) = instruction.operand()
             else {
@@ -384,9 +399,15 @@ impl OptimizationPipeline {
                     .iter_mut()
                     .map(|origin| &mut origin.instruction),
             )
+            .chain(
+                self.exception_owner_provenance
+                    .original_comprehension_normal_exits
+                    .iter_mut()
+                    .map(|(_, instruction)| instruction),
+            )
             .zip(condition_seeds)
         {
-            // These pre-CFG certificates authenticate complete original conditions.
+            // These pre-CFG certificates authenticate complete original jumps.
             // Mirror layout provenance into them instead of masking Instruction Eq.
             instruction.set_legacy_initial_jump_argument(seed);
         }
@@ -1411,9 +1432,19 @@ impl OptimizationPipeline {
                 // Exception-range endpoints can split this native return block
                 // into physical fragments. Fill the entire original array, while
                 // preserving CPython's unknown columns and end line.
+                let mut first_instruction = true;
                 for &block in blocks {
                     for instruction in self.graph.instructions_mut(block) {
-                        debug_assert!(instruction.location.line < 0);
+                        // A later cold predecessor can locate the leading POP_BLOCK
+                        // after this return was visited. The pinned release compiler
+                        // still overwrites its line with the exit fallback below.
+                        debug_assert!(
+                            instruction.location.line < 0
+                                || (first_instruction
+                                    && instruction.opcode == NOP
+                                    && instruction.fusion_policy.is_converted_pop_block())
+                        );
+                        first_instruction = false;
                         instruction.location.line = line;
                     }
                 }
@@ -1549,7 +1580,23 @@ impl OptimizationPipeline {
                 .flatten();
             let target = block_jump_target(self.graph[block].items())
                 .and_then(|label| self.graph.label_block(label));
-            for successor in fallthrough.into_iter().chain(target) {
+            for mut successor in fallthrough.into_iter().chain(target) {
+                // Native 3.12 removes empty blocks before resolving lines. Erased
+                // branches can leave label-only fragments between a donor and
+                // its real successor; they must not swallow that unique edge.
+                while self.python_version == PythonVersion::Py312
+                    && predecessors.get(&successor) == Some(&1)
+                    && self.graph[successor].last_instruction().is_none()
+                {
+                    let Some(next) = order
+                        .iter()
+                        .position(|block| *block == successor)
+                        .and_then(|index| order.get(index + 1))
+                    else {
+                        break;
+                    };
+                    successor = *next;
+                }
                 if predecessors.get(&successor) == Some(&1)
                     && let Some(first) = self.graph.instructions_mut(successor).next()
                     && first.location.line < 0
@@ -1640,17 +1687,25 @@ mod tests {
         };
         use crate::target::opcodes::{END_SEND, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, SEND};
 
-        for unknown_capture in [0, 1, 2] {
+        let cases = [(0, 254), (0, 255), (0, 300), (1, 300), (2, 300), (3, 300)];
+        for (unknown_capture, native_label) in cases {
             let start = Label(0);
             let first_body = Label(1);
             let second_body = Label(2);
             let end = Label(3);
+            let normal_end = Label(4);
             let location = SourceLocation::new(2, 2, 4, 12);
             let primitive =
                 Instruction::new(POP_JUMP_IF_FALSE, Operand::Forward(end), location, Some(0));
             let none = Instruction::new(POP_JUMP_IF_NONE, Operand::Forward(end), location, Some(0));
             let send = Instruction::new(SEND, Operand::Forward(end), location, Some(1));
             let end_send = Instruction::new(END_SEND, Operand::Value(0), location, Some(0));
+            let normal_exit = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(normal_end),
+                location,
+                Some(0),
+            );
             let mut assembler = Assembler::from_linear_items(vec![
                 Item::Label(start),
                 Item::Instruction(primitive),
@@ -1660,6 +1715,8 @@ mod tests {
                 Item::Instruction(send),
                 Item::Label(end),
                 Item::Instruction(end_send),
+                Item::Instruction(normal_exit),
+                Item::Label(normal_end),
                 Item::Instruction(Instruction::new(
                     RETURN_CONST,
                     Operand::Value(0),
@@ -1668,9 +1725,10 @@ mod tests {
                 )),
             ]);
             assembler.python_version = PythonVersion::Py312;
-            assembler.next_label = 4;
+            assembler.next_label = 5;
             assembler.bind_legacy_native_label(start, 1);
-            assembler.bind_legacy_native_label(end, 300);
+            assembler.bind_legacy_native_label(end, native_label);
+            assembler.bind_legacy_native_label(normal_end, native_label + 1);
             assembler.certify_legacy_native_labels();
             assembler
                 .exception_owner_provenance
@@ -1713,9 +1771,19 @@ mod tests {
                     cleanup: Vec::new(),
                     bridge: None,
                 });
+            let mut captured_normal_exit = normal_exit;
+            if unknown_capture == 3 {
+                captured_normal_exit.retarget(Operand::Forward(Label(902)));
+            }
+            assembler
+                .exception_owner_provenance
+                .original_comprehension_normal_exits
+                .push((normal_end, captured_normal_exit));
             let mut pipeline = assembler.into_optimization_pipeline();
             pipeline.initialize_legacy_native_jump_seeds();
-            let expected = if unknown_capture != 0 { None } else { Some(1) };
+            let expected = (unknown_capture == 0).then_some(u8::from(native_label > 255));
+            let normal_expected =
+                (unknown_capture == 0).then_some(u8::from(native_label + 1 > 255));
             let live = |opcode| {
                 pipeline
                     .graph
@@ -1731,7 +1799,23 @@ mod tests {
             for opcode in [POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, SEND] {
                 assert_eq!(live(opcode).legacy_initial_jump_width(), expected);
             }
+            assert_eq!(
+                live(JUMP_FORWARD).legacy_initial_jump_width(),
+                normal_expected
+            );
             let provenance = &pipeline.exception_owner_provenance;
+            assert_eq!(
+                provenance.original_comprehension_normal_exits[0]
+                    .1
+                    .legacy_initial_jump_width(),
+                normal_expected
+            );
+            if unknown_capture != 3 {
+                assert_eq!(
+                    provenance.original_comprehension_normal_exits[0].1,
+                    live(JUMP_FORWARD)
+                );
+            }
             assert_eq!(
                 provenance.original_primitive_condition_boundaries[0],
                 live(POP_JUMP_IF_FALSE)

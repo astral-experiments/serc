@@ -1339,6 +1339,12 @@ impl Compiler<'_> {
             self.assembler.set_location(location);
             self.emit(POP_TOP, 0, -1)?;
         }
+        // Native 3.12 cleanup falls through to a separate zero-pop block.
+        // Keep that original boundary even when no pattern jumps to it directly.
+        if self.context.python_version == crate::PythonVersion::Py312 {
+            self.assembler
+                .record_exception_owner_block_boundary(context.fail_pop[0]);
+        }
         self.assembler.mark(context.fail_pop[0]);
         self.set_depth(failure_depth);
         Ok(())
@@ -3943,6 +3949,12 @@ impl Compiler<'_> {
         let protected_start = self.assembler.label();
         let protected_end = self.assembler.label();
         let cleanup = self.assembler.label();
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::ComprehensionCleanup(
+                generators[0].iter.range(),
+            ),
+            cleanup,
+        );
         let parent_cleanup = self
             .control
             .comprehensions
@@ -4109,6 +4121,10 @@ impl Compiler<'_> {
         }
 
         let normal_cleanup = self.assembler.label();
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::ComprehensionEnd(generators[0].iter.range()),
+            normal_cleanup,
+        );
         let normal_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, normal_cleanup)?;
         if discard_result && generators.iter().any(|generator| generator.is_async) {
             self.assembler.prevent_jump_inlining(normal_exit);
@@ -5665,6 +5681,18 @@ impl Compiler<'_> {
             start
         };
         let cleanup = self.assembler.label();
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::ComprehensionStart(generator.iter.range()),
+            start,
+        );
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::ComprehensionIfCleanup(generator.iter.range()),
+            filter_cleanup,
+        );
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::ComprehensionAnchor(generator.iter.range()),
+            cleanup,
+        );
         self.assembler.mark(start);
         self.assembler
             .set_location(self.source_location(generator.iter.range()));

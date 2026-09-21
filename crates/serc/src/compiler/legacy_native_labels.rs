@@ -30,6 +30,11 @@ pub(super) enum NativeRole {
     ForBody(TextRange),
     ForCleanup(TextRange),
     ForEnd(TextRange),
+    ComprehensionCleanup(TextRange),
+    ComprehensionEnd(TextRange),
+    ComprehensionStart(TextRange),
+    ComprehensionIfCleanup(TextRange),
+    ComprehensionAnchor(TextRange),
     AwaitSend(TextRange),
     AwaitFail(TextRange),
     AwaitExit(TextRange),
@@ -75,6 +80,8 @@ struct Builder {
     boundary: usize,
     labels: Vec<(NativeRole, Option<usize>)>,
     manager_depth: usize,
+    for_manager_depths: Vec<usize>,
+    inside_comprehension: bool,
 }
 
 impl NativeLabelPlan {
@@ -190,8 +197,7 @@ impl Builder {
                     self.instruction();
                 }
                 Stmt::For(statement)
-                    if !statement.is_async
-                        && matches!(statement.target.as_ref(), Expr::Name(_)) =>
+                    if !statement.is_async && Self::name_unpack_target(&statement.target) =>
                 {
                     // compiler_for reserves all four labels before visiting the
                     // iterable. Its body mark follows the original target NOP.
@@ -199,6 +205,9 @@ impl Builder {
                     let body = self.allocate(NativeRole::ForBody(statement.range));
                     let cleanup = self.allocate(NativeRole::ForCleanup(statement.range));
                     let end = self.allocate(NativeRole::ForEnd(statement.range));
+                    // Native pushes FOR_LOOP before evaluating the iterable. A
+                    // continue can reuse its start only without crossing a manager.
+                    self.for_manager_depths.push(self.manager_depth);
                     self.expression(&statement.iter)?;
                     self.instruction(); // GET_ITER
                     self.mark(start);
@@ -210,8 +219,15 @@ impl Builder {
                     self.instruction(); // original backedge, including dead source
                     self.mark(cleanup);
                     self.instruction(); // END_FOR
+                    self.for_manager_depths.pop();
                     self.suite(&statement.orelse)?;
                     self.mark(end);
+                }
+                Stmt::Continue(_)
+                    if self.for_manager_depths.last() == Some(&self.manager_depth) =>
+                {
+                    self.instruction(); // original continue NOP
+                    self.instruction(); // JUMP to the existing nearest ForStart
                 }
                 Stmt::Assert(statement) => {
                     let end = self.allocate(NativeRole::AssertEnd(statement.range));
@@ -308,6 +324,61 @@ impl Builder {
                 _ => return None,
             }
         }
+        Some(())
+    }
+
+    /// Mirrors one inlined, unfiltered synchronous Name-target comprehension.
+    fn comprehension(
+        &mut self,
+        generators: &[ruff_python_ast::Comprehension],
+        key: Option<&Expr>,
+        value: &Expr,
+    ) -> Option<()> {
+        let [generator] = generators else {
+            return None;
+        };
+        if self.inside_comprehension
+            || generator.is_async
+            || !matches!(&generator.target, Expr::Name(_))
+            || !generator.ifs.is_empty()
+        {
+            return None;
+        }
+        if let Some(key) = key {
+            Self::label_free_expression(key)?;
+        }
+        Self::label_free_expression(value)?;
+        self.inside_comprehension = true;
+        // The outer iterable runs before the inlined scope saves its target.
+        // Any ordinary Await here allocates its labels before the five below.
+        self.expression(&generator.iter)?;
+        self.instruction(); // GET_ITER / LOAD_FAST_AND_CLEAR / SWAP
+        let range = generator.iter.range();
+        // A Name target is a local in the native comprehension, even when the
+        // enclosing name is a cell or free variable, so its save set is nonempty.
+        let cleanup = self.allocate(NativeRole::ComprehensionCleanup(range));
+        let end = self.allocate(NativeRole::ComprehensionEnd(range));
+        self.instruction(); // SETUP_FINALLY / BUILD_LIST, SET or MAP / SWAP
+        let start = self.allocate(NativeRole::ComprehensionStart(range));
+        let if_cleanup = self.allocate(NativeRole::ComprehensionIfCleanup(range));
+        let anchor = self.allocate(NativeRole::ComprehensionAnchor(range));
+        self.mark(start);
+        self.instruction(); // FOR_ITER
+        self.store_target(&generator.target)?;
+        if let Some(key) = key {
+            self.expression(key)?;
+        }
+        self.expression(value)?;
+        self.instruction(); // LIST_APPEND / SET_ADD / MAP_ADD
+        self.mark(if_cleanup);
+        self.instruction(); // original backedge
+        self.mark(anchor);
+        self.instruction(); // END_FOR / POP_BLOCK / JUMP to normal restoration
+        self.mark(cleanup);
+        self.instruction(); // exceptional restoration / RERAISE
+        self.mark(end);
+        self.instruction(); // normal SWAP / STORE_FAST_MAYBE_NULL
+        self.inside_comprehension = false;
         Some(())
     }
 
@@ -431,6 +502,20 @@ impl Builder {
         Some(())
     }
 
+    /// Admits Name stores and nonempty unpacking without target-expression labels.
+    fn name_unpack_target(target: &Expr) -> bool {
+        match target {
+            Expr::Name(_) => true,
+            Expr::Tuple(tuple) => {
+                !tuple.elts.is_empty() && tuple.elts.iter().all(Self::name_unpack_target)
+            }
+            Expr::List(list) => {
+                !list.elts.is_empty() && list.elts.iter().all(Self::name_unpack_target)
+            }
+            _ => false,
+        }
+    }
+
     fn store_target(&mut self, target: &Expr) -> Option<()> {
         match target {
             Expr::Name(_) => self.instruction(),
@@ -520,6 +605,19 @@ impl Builder {
                 // Native emits nothing after this label. A nested trailing
                 // Boolean end can therefore alias its parent's end exactly.
                 return Some(());
+            }
+            Expr::ListComp(comprehension) => {
+                return self.comprehension(&comprehension.generators, None, &comprehension.elt);
+            }
+            Expr::SetComp(comprehension) => {
+                return self.comprehension(&comprehension.generators, None, &comprehension.elt);
+            }
+            Expr::DictComp(comprehension) => {
+                return self.comprehension(
+                    &comprehension.generators,
+                    Some(comprehension.key.as_deref()?),
+                    &comprehension.value,
+                );
             }
             Expr::Generator(generator) => {
                 // compiler_comprehension compiles this child in a separate code
@@ -653,7 +751,7 @@ fn runtime_condition(expression: &Expr) -> bool {
 }
 
 impl Compiler<'_> {
-    /// Consumes the exact, unreferenced body label of an admitted Name-target For.
+    /// Consumes the exact, unreferenced body label of an admitted For target.
     pub(super) fn consume_unreferenced_native_for_body(&mut self, range: TextRange) {
         let Some(plan) = self.native_label_plan.as_mut() else {
             return;
@@ -661,7 +759,7 @@ impl Compiler<'_> {
         let body = plan.remaining.remove(&NativeRole::ForBody(range));
         let cleanup = plan.remaining.get(&NativeRole::ForCleanup(range)).copied();
         // compiler_for counts and marks Body, but no jump or SETUP targets it.
-        // Its Name store prevents aliases. The later Cleanup remains live via
+        // Its Name store or initial UNPACK prevents aliases. Cleanup remains live via
         // FOR_ITER and real END_FOR through all native max-label allocation
         // phases, so omitting this smaller physical binding preserves that max.
         // Keep Serc's existing NOP, block boundaries and owner proofs intact.
@@ -872,9 +970,7 @@ mod tests {
     fn unsupported_for_routes_reject_the_whole_scope() {
         for source in [
             "async def f(xs):\n    async for item in xs:\n        pass\n",
-            "def f(xs):\n    for a, b in xs:\n        pass\n",
             "def f(xs):\n    for item in xs:\n        break\n",
-            "def f(xs):\n    for item in xs:\n        continue\n",
         ] {
             let parsed = parse_module(source).unwrap();
             let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
@@ -1096,6 +1192,137 @@ mod manager_tests {
                 panic!()
             };
             assert!(NativeLabelPlan::function(&function.body, false).is_none());
+        }
+    }
+    #[test]
+    fn unpacked_for_continue_reuses_the_existing_native_loop_labels() {
+        let parsed = parse_module("async def f(items, flag):\n    for first, [second, third] in items:\n        if flag:\n            continue\n    await done()\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let Stmt::For(loop_) = &function.body[0] else {
+            panic!()
+        };
+        let Stmt::If(conditional) = &loop_.body[0] else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        assert_eq!(plan.remaining[&NativeRole::ForStart(loop_.range)], 2);
+        assert_eq!(plan.remaining[&NativeRole::ForBody(loop_.range)], 3);
+        assert_eq!(plan.remaining[&NativeRole::ForCleanup(loop_.range)], 4);
+        assert_eq!(plan.remaining[&NativeRole::ForEnd(loop_.range)], 5);
+        assert_eq!(plan.remaining[&NativeRole::IfEnd(conditional.range)], 6);
+        assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 10);
+        assert_eq!(plan.remaining.len(), 10);
+    }
+
+    #[test]
+    fn for_continue_stops_at_the_nearest_loop_before_manager_cleanup() {
+        for source in [
+            "def f(items, cm):\n    with cm:\n        for first, second in items:\n            continue\n",
+            "def f(items, cm):\n    for first, second in items:\n        with cm:\n            for value in items:\n                continue\n",
+            "def f(items):\n    for first, second in items:\n        for value in items:\n            pass\n        else:\n            continue\n",
+        ] {
+            let parsed = parse_module(source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(
+                NativeLabelPlan::function(&function.body, false).is_some(),
+                "{source}"
+            );
+        }
+        for source in [
+            "def f(items, cm):\n    for first, second in items:\n        with cm:\n            continue\n",
+            "def f(items):\n    for first, second in items:\n        pass\n    else:\n        continue\n",
+            "def f(items):\n    for first, second in items:\n        break\n",
+            "def f(items):\n    while items:\n        continue\n",
+        ] {
+            let parsed = parse_module(source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(
+                NativeLabelPlan::function(&function.body, false).is_none(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn for_unpacking_declines_targets_with_other_store_routes() {
+        for target in [
+            "first, *rest",
+            "holder.item",
+            "holder[index]",
+            "()",
+            "first, ()",
+        ] {
+            let source = format!("def f(items):\n    for {target} in items:\n        pass\n");
+            let parsed = parse_module(&source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(
+                NativeLabelPlan::function(&function.body, false).is_none(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn inlined_comprehension_labels_follow_the_outer_iterable_await() {
+        let parsed = parse_module(
+            "async def f():\n    values = [item for item in await items()]\n    await done()\n",
+        )
+        .unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let Stmt::Assign(assignment) = &function.body[0] else {
+            panic!()
+        };
+        let ruff_python_ast::Expr::ListComp(comprehension) = assignment.value.as_ref() else {
+            panic!()
+        };
+        let range = comprehension.generators[0].iter.range();
+        let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        // Native 3.12 reserves the coroutine body first, then the explicit
+        // iterable await's three labels, then the five inlined scope/loop labels.
+        assert_eq!(plan.remaining[&NativeRole::ComprehensionCleanup(range)], 5);
+        assert_eq!(plan.remaining[&NativeRole::ComprehensionEnd(range)], 6);
+        assert_eq!(plan.remaining[&NativeRole::ComprehensionStart(range)], 7);
+        assert_eq!(
+            plan.remaining[&NativeRole::ComprehensionIfCleanup(range)],
+            8
+        );
+        assert_eq!(plan.remaining[&NativeRole::ComprehensionAnchor(range)], 9);
+        assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 13);
+        assert_eq!(plan.remaining.len(), 13);
+    }
+
+    #[test]
+    fn inlined_comprehension_subset_rejects_additional_control_routes() {
+        for expression in [
+            "[item for item in xs if item]",
+            "[item for item in xs for other in ys]",
+            "[item async for item in xs]",
+            "[item for item, other in xs]",
+            "[[other for other in ys] for item in xs]",
+            "[item for item in [other for other in ys]]",
+            "[await action(item) for item in xs]",
+            "[left or right for item in xs]",
+            "{(left if flag else right): item for item in xs}",
+        ] {
+            let source = format!("async def f(xs, ys):\n    values = {expression}\n");
+            let parsed = parse_module(&source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(
+                NativeLabelPlan::function(&function.body, true).is_none(),
+                "{source}"
+            );
         }
     }
 }
