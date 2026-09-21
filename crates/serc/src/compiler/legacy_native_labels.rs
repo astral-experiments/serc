@@ -7,7 +7,7 @@
 
 use ruff_python_ast::{BoolOp, Expr, FStringPart, InterpolatedStringElement, Stmt, UnaryOp};
 use ruff_text_size::{Ranged, TextRange};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::assembler::Label;
 
@@ -24,6 +24,10 @@ pub(super) enum NativeRole {
     TryExcept(TextRange),
     TryEnd(TextRange),
     TryCleanup(TextRange),
+    FinallyBody(TextRange),
+    FinallyHandler(TextRange),
+    FinallyExit(TextRange),
+    FinallyCleanup(TextRange),
     HandlerNext(TextRange),
     HandlerCleanupBody(TextRange),
     HandlerCleanupEnd(TextRange),
@@ -82,9 +86,31 @@ impl WithAwait {
     }
 }
 
+/// Identifies one source-generated visit of an ordinary finalbody.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum FinallyCopy {
+    Normal,
+    Exceptional,
+}
+
+/// A semantic source context, independent of physical compiler visitation order.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+struct EmissionContext(u32);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct FinallyContext {
+    parent: EmissionContext,
+    owner: TextRange,
+    copy: FinallyCopy,
+}
+
 #[derive(Debug)]
 pub(super) struct NativeLabelPlan {
     remaining: FxHashMap<NativeRole, u32>,
+    copied_remaining: FxHashMap<(EmissionContext, NativeRole), u32>,
+    contexts: FxHashMap<FinallyContext, EmissionContext>,
+    remaining_contexts: FxHashSet<EmissionContext>,
+    context: EmissionContext,
     valid: bool,
 }
 
@@ -93,7 +119,11 @@ struct Builder {
     // Only equality matters: advance across original instructions, including
     // instructions that later disappear. This is not a native label ordinal.
     boundary: usize,
-    labels: Vec<(NativeRole, Option<usize>)>,
+    labels: Vec<(NativeRole, EmissionContext, Option<usize>)>,
+    context: EmissionContext,
+    contexts: FxHashMap<FinallyContext, EmissionContext>,
+    finally_depth: usize,
+    loop_finally_depths: Vec<usize>,
     manager_depth: usize,
     handler_depth: usize,
     loop_manager_depths: Vec<usize>,
@@ -123,32 +153,58 @@ impl NativeLabelPlan {
             builder.instruction();
         }
         let mut aliases = FxHashMap::default();
-        for (index, (_, boundary)) in builder.labels.iter().enumerate() {
+        for (index, (_, _, boundary)) in builder.labels.iter().enumerate() {
             let ordinal = u32::try_from(index.checked_add(1)?).ok()?;
             aliases.insert((*boundary)?, ordinal);
         }
         let mut remaining = FxHashMap::default();
-        for (role, boundary) in builder.labels {
-            if remaining.insert(role, aliases[&boundary?]).is_some() {
+        let mut copied_remaining = FxHashMap::default();
+        for (role, context, boundary) in builder.labels {
+            let native = aliases[&boundary?];
+            let previous = if context == EmissionContext::default() {
+                remaining.insert(role, native)
+            } else {
+                copied_remaining.insert((context, role), native)
+            };
+            if previous.is_some() {
                 return None;
             }
         }
         Some(Box::new(Self {
             remaining,
+            copied_remaining,
+            remaining_contexts: builder.contexts.values().copied().collect(),
+            contexts: builder.contexts,
+            context: EmissionContext::default(),
             valid: true,
         }))
+    }
+    fn take(&mut self, role: NativeRole) -> Option<u32> {
+        if self.context == EmissionContext::default() {
+            self.remaining.remove(&role)
+        } else {
+            self.copied_remaining.remove(&(self.context, role))
+        }
+    }
+
+    fn get(&self, role: NativeRole) -> Option<u32> {
+        if self.context == EmissionContext::default() {
+            self.remaining.get(&role).copied()
+        } else {
+            self.copied_remaining.get(&(self.context, role)).copied()
+        }
     }
 }
 
 impl Builder {
     fn allocate(&mut self, role: NativeRole) -> usize {
         let label = self.labels.len();
-        self.labels.push((role, None));
+        self.labels.push((role, self.context, None));
         label
     }
 
     fn mark(&mut self, label: usize) {
-        self.labels[label].1 = Some(self.boundary);
+        self.labels[label].2 = Some(self.boundary);
     }
 
     fn instruction(&mut self) {
@@ -202,7 +258,8 @@ impl Builder {
                     self.instruction(); // POP_TOP, or the constant statement's NOP
                 }
                 Stmt::Return(statement) => {
-                    if self.manager_depth != 0 || self.handler_depth != 0 {
+                    if self.manager_depth != 0 || self.handler_depth != 0 || self.finally_depth != 0
+                    {
                         return None;
                     }
                     if let Some(value) = &statement.value {
@@ -231,6 +288,7 @@ impl Builder {
                     // Native pushes FOR_LOOP before evaluating the iterable. A
                     // continue can reuse its start only without crossing a manager.
                     self.loop_manager_depths.push(self.manager_depth);
+                    self.loop_finally_depths.push(self.finally_depth);
                     self.expression(&statement.iter)?;
                     self.instruction(); // GET_ITER
                     self.mark(start);
@@ -243,15 +301,20 @@ impl Builder {
                     self.mark(cleanup);
                     self.instruction(); // END_FOR
                     self.loop_manager_depths.pop();
+                    self.loop_finally_depths.pop();
                     self.suite(&statement.orelse)?;
                     self.mark(end);
                 }
                 Stmt::While(statement) => self.while_statement(statement)?,
-                Stmt::Break(_) if self.loop_manager_depths.last() == Some(&self.manager_depth) => {
+                Stmt::Break(_)
+                    if self.loop_manager_depths.last() == Some(&self.manager_depth)
+                        && self.loop_finally_depths.last() == Some(&self.finally_depth) =>
+                {
                     self.instruction(); // original NOP, optional iterator cleanup and exit jump
                 }
                 Stmt::Continue(_)
-                    if self.loop_manager_depths.last() == Some(&self.manager_depth) =>
+                    if self.loop_manager_depths.last() == Some(&self.manager_depth)
+                        && self.loop_finally_depths.last() == Some(&self.finally_depth) =>
                 {
                     self.instruction(); // original continue NOP
                     self.instruction(); // JUMP to the existing nearest loop start
@@ -349,6 +412,7 @@ impl Builder {
         let anchor = self.allocate(NativeRole::WhileAnchor(statement.range));
         self.mark(start);
         self.loop_manager_depths.push(self.manager_depth);
+        self.loop_finally_depths.push(self.finally_depth);
         // Native's original LOAD_CONST / conditional also separates the marks
         // for literal True. Constant folding is a later CFG operation.
         self.condition(&statement.test, false)?;
@@ -356,6 +420,7 @@ impl Builder {
         self.suite(&statement.body)?;
         self.condition(&statement.test, true)?;
         self.loop_manager_depths.pop();
+        self.loop_finally_depths.pop();
         self.mark(anchor);
         self.suite(&statement.orelse)?;
         self.mark(end);
@@ -365,9 +430,100 @@ impl Builder {
         Some(())
     }
 
-    /// Mirrors typed `compiler_try_except` handlers with their original shared join.
+    /// Visits a copied cleanup with semantic identity and shared native counters.
+    fn finally_copy(
+        &mut self,
+        statement: &ruff_python_ast::StmtTry,
+        copy: FinallyCopy,
+    ) -> Option<()> {
+        let parent = self.context;
+        let key = FinallyContext {
+            parent,
+            owner: statement.range,
+            copy,
+        };
+        let context = EmissionContext(u32::try_from(self.contexts.len().checked_add(1)?).ok()?);
+        if self.contexts.insert(key, context).is_some() {
+            return None;
+        }
+        self.context = context;
+        let result = self.suite(&statement.finalbody);
+        self.context = parent;
+        result
+    }
+
+    /// Admits straight-line cleanup whose only new labels are ordinary awaits.
+    fn finalbody_value(value: &Expr) -> Option<()> {
+        if let Expr::Await(awaited) = value {
+            Self::label_free_expression(&awaited.value)
+        } else {
+            Self::label_free_expression(value)
+        }
+    }
+
+    fn try_finally(&mut self, statement: &ruff_python_ast::StmtTry) -> Option<()> {
+        if statement.is_star || statement.finalbody.is_empty() {
+            return None;
+        }
+        for final_statement in &statement.finalbody {
+            match final_statement {
+                Stmt::Expr(expression) => Self::finalbody_value(&expression.value)?,
+                Stmt::Assign(assignment) => {
+                    Self::finalbody_value(&assignment.value)?;
+                    for target in &assignment.targets {
+                        if !matches!(
+                            target,
+                            Expr::Name(_) | Expr::Attribute(_) | Expr::Subscript(_)
+                        ) {
+                            return None;
+                        }
+                        Self::label_free_expression(target)?;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        let body = self.allocate(NativeRole::FinallyBody(statement.range));
+        let handler = self.allocate(NativeRole::FinallyHandler(statement.range));
+        let exit = self.allocate(NativeRole::FinallyExit(statement.range));
+        let cleanup = self.allocate(NativeRole::FinallyCleanup(statement.range));
+        self.instruction(); // SETUP_FINALLY separates the protected entry
+        self.mark(body);
+        self.finally_depth += 1;
+        if statement.handlers.is_empty() {
+            if !statement.orelse.is_empty() {
+                return None;
+            }
+            self.suite(&statement.body)?;
+        } else {
+            self.try_except_inner(statement)?;
+        }
+        self.finally_depth -= 1;
+        self.instruction(); // original POP_BLOCK precedes normal cleanup
+        self.finally_copy(statement, FinallyCopy::Normal)?;
+        self.instruction(); // original JUMP Exit, including dead source
+        self.mark(handler);
+        self.instruction(); // SETUP_CLEANUP / PUSH_EXC_INFO
+        self.finally_copy(statement, FinallyCopy::Exceptional)?;
+        self.instruction(); // RERAISE 0
+        self.mark(cleanup);
+        self.instruction(); // POP_EXCEPT_AND_RERAISE
+        self.mark(exit);
+        Some(())
+    }
+
+    /// Mirrors the outer finalizer separately from an ordinary handler generator.
     fn try_except(&mut self, statement: &ruff_python_ast::StmtTry) -> Option<()> {
-        if statement.is_star || statement.handlers.is_empty() || !statement.finalbody.is_empty() {
+        if statement.finalbody.is_empty() {
+            self.try_except_inner(statement)
+        } else {
+            self.try_finally(statement)
+        }
+    }
+
+    /// Mirrors typed `compiler_try_except` handlers with their original shared join.
+    fn try_except_inner(&mut self, statement: &ruff_python_ast::StmtTry) -> Option<()> {
+        if statement.is_star || statement.handlers.is_empty() {
             return None;
         }
         // Native reserves all four before visiting the protected suite. The
@@ -954,13 +1110,42 @@ fn runtime_condition(expression: &Expr) -> bool {
 }
 
 impl Compiler<'_> {
+    /// Scopes one physical source visit without relying on physical emission order.
+    pub(super) fn with_native_finally_copy<T>(
+        &mut self,
+        owner: TextRange,
+        copy: FinallyCopy,
+        compile: impl FnOnce(&mut Self) -> Result<T, crate::CompileError>,
+    ) -> Result<T, crate::CompileError> {
+        let Some(plan) = self.native_label_plan.as_mut() else {
+            return compile(self);
+        };
+        let parent = plan.context;
+        let key = FinallyContext {
+            parent,
+            owner,
+            copy,
+        };
+        if let Some(&context) = plan.contexts.get(&key) {
+            plan.valid &= plan.remaining_contexts.remove(&context);
+            plan.context = context;
+        } else {
+            plan.valid = false;
+        }
+        let result = compile(self);
+        if let Some(plan) = self.native_label_plan.as_mut() {
+            plan.context = parent;
+        }
+        result
+    }
+
     /// Consumes the exact, unreferenced body label of an admitted For target.
     pub(super) fn consume_unreferenced_native_for_body(&mut self, range: TextRange) {
         let Some(plan) = self.native_label_plan.as_mut() else {
             return;
         };
-        let body = plan.remaining.remove(&NativeRole::ForBody(range));
-        let cleanup = plan.remaining.get(&NativeRole::ForCleanup(range)).copied();
+        let body = plan.take(NativeRole::ForBody(range));
+        let cleanup = plan.get(NativeRole::ForCleanup(range));
         // compiler_for counts and marks Body, but no jump or SETUP targets it.
         // Its Name store or initial UNPACK prevents aliases. Cleanup remains live via
         // FOR_ITER and real END_FOR through all native max-label allocation
@@ -975,7 +1160,7 @@ impl Compiler<'_> {
         let Some(plan) = self.native_label_plan.as_mut() else {
             return;
         };
-        if let Some(native) = plan.remaining.remove(&role) {
+        if let Some(native) = plan.take(role) {
             self.assembler.bind_legacy_native_label(physical, native);
         } else {
             plan.valid = false;
@@ -984,7 +1169,12 @@ impl Compiler<'_> {
 
     pub(super) fn certify_native_source_labels(&mut self) {
         if let Some(plan) = self.native_label_plan.take() {
-            if plan.valid && plan.remaining.is_empty() {
+            if plan.valid
+                && plan.context == EmissionContext::default()
+                && plan.remaining.is_empty()
+                && plan.copied_remaining.is_empty()
+                && plan.remaining_contexts.is_empty()
+            {
                 self.assembler.certify_legacy_native_labels();
             } else {
                 self.assembler.invalidate_legacy_native_labels();
@@ -1463,7 +1653,7 @@ mod manager_tests {
             "def f():\n    with manager():\n        return 1\n",
             "def f():\n    with first(), second():\n        return 1\n",
             "def f():\n    with first():\n        with second():\n            return 1\n",
-            "def f():\n    with manager():\n        try:\n            work()\n        finally:\n            finish()\n",
+            "def f():\n    with manager():\n        try:\n            return value\n        finally:\n            finish()\n",
         ] {
             let parsed = parse_module(source).unwrap();
             let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
@@ -1962,7 +2152,7 @@ mod ordinary_except_tests {
     fn unsupported_handlers_reject_the_entire_native_label_plan() {
         for source in [
             "def f():\n    try:\n        action()\n    except:\n        pass\n",
-            "def f():\n    try:\n        action()\n    except Error:\n        pass\n    finally:\n        done()\n",
+            "def f():\n    try:\n        action()\n    except Error:\n        return value\n    finally:\n        done()\n",
             "def f():\n    try:\n        action()\n    except* Error:\n        pass\n",
             "def f():\n    try:\n        action()\n    except Error:\n        if flag:\n            return value\n",
             "def f():\n    try:\n        action()\n    except Error:\n        try:\n            return value\n        except Other:\n            pass\n",
@@ -2571,5 +2761,130 @@ mod while_else_tests {
         assert_eq!(plan.remaining[&NativeRole::AwaitSend(after.range)], 16);
         assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 19);
         assert_eq!(plan.remaining.len(), 19);
+    }
+}
+
+#[cfg(test)]
+mod finally_occurrence_tests {
+    use super::{EmissionContext, FinallyContext, FinallyCopy, NativeLabelPlan, NativeRole};
+    use ruff_python_ast::{Expr, Stmt};
+    use ruff_python_parser::parse_module;
+
+    #[test]
+    fn finalizer_await_occurrences_keep_native_order_and_distinct_identity() {
+        let parsed = parse_module(
+            "async def f():\n    try:\n        work()\n    finally:\n        await cleanup()\n",
+        )
+        .unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::Try(statement)] = function.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::Expr(expression)] = statement.finalbody.as_slice() else {
+            panic!()
+        };
+        let Expr::Await(awaited) = expression.value.as_ref() else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        for (role, expected) in [
+            (NativeRole::FinallyBody(statement.range), 2),
+            (NativeRole::FinallyHandler(statement.range), 3),
+            (NativeRole::FinallyExit(statement.range), 4),
+            (NativeRole::FinallyCleanup(statement.range), 5),
+            (NativeRole::StopIterationHandler, 12),
+        ] {
+            assert_eq!(plan.remaining[&role], expected);
+        }
+        for (copy, first) in [(FinallyCopy::Normal, 6), (FinallyCopy::Exceptional, 9)] {
+            let context = plan.contexts[&FinallyContext {
+                parent: EmissionContext::default(),
+                owner: statement.range,
+                copy,
+            }];
+            for (role, expected) in [
+                (NativeRole::AwaitSend(awaited.range), first),
+                (NativeRole::AwaitFail(awaited.range), first + 1),
+                (NativeRole::AwaitExit(awaited.range), first + 2),
+            ] {
+                assert_eq!(plan.copied_remaining[&(context, role)], expected);
+            }
+        }
+        assert_eq!(plan.remaining_contexts.len(), 2);
+        assert_eq!(plan.copied_remaining.len(), 6);
+    }
+
+    #[test]
+    fn protected_nested_and_sibling_finalizers_keep_separate_contexts() {
+        for source in [
+            "async def f():\n    try:\n        try:\n            work()\n        finally:\n            await inner()\n    finally:\n        await outer()\n",
+            "async def f():\n    try:\n        work()\n    finally:\n        await first()\n    try:\n        work()\n    finally:\n        await second()\n",
+        ] {
+            let parsed = parse_module(source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+            assert_eq!(plan.contexts.len(), 4);
+            assert_eq!(plan.copied_remaining.len(), 12);
+            assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 22);
+        }
+    }
+
+    #[test]
+    fn label_free_finalizers_still_require_both_source_occurrences() {
+        let parsed = parse_module(
+            "def f():\n    try:\n        work()\n    finally:\n        state.value = saved\n",
+        )
+        .unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+        assert_eq!(plan.remaining_contexts.len(), 2);
+        assert!(plan.copied_remaining.is_empty());
+    }
+
+    #[test]
+    fn ordinary_finalizers_inside_managers_and_handlers_keep_both_copies() {
+        for source in [
+            "def f():\n    with manager():\n        try:\n            work()\n        finally:\n            finish()\n",
+            "def f():\n    try:\n        action()\n    except Error:\n        pass\n    finally:\n        done()\n",
+        ] {
+            let parsed = parse_module(source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+            assert_eq!(plan.remaining_contexts.len(), 2);
+            assert!(plan.copied_remaining.is_empty());
+        }
+    }
+
+    #[test]
+    fn finalizers_reject_crossing_exits_but_allow_loop_local_exits() {
+        for source in [
+            "def f():\n    try:\n        return result\n    finally:\n        cleanup()\n",
+            "def f(xs):\n    for x in xs:\n        try:\n            break\n        finally:\n            cleanup()\n",
+            "def f(xs):\n    for x in xs:\n        try:\n            continue\n        finally:\n            cleanup()\n",
+            "def f(flag):\n    try:\n        work()\n    finally:\n        if flag:\n            cleanup()\n",
+            "def f():\n    try:\n        work()\n    finally:\n        return result\n",
+        ] {
+            let parsed = parse_module(source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(
+                NativeLabelPlan::function(&function.body, false).is_none(),
+                "{source}"
+            );
+        }
+        let parsed = parse_module("def f(xs, flag):\n    try:\n        for x in xs:\n            if flag:\n                break\n            continue\n    finally:\n        cleanup()\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        assert!(NativeLabelPlan::function(&function.body, false).is_some());
     }
 }

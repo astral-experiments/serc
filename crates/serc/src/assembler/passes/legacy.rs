@@ -266,37 +266,8 @@ impl OptimizationPipeline {
         {
             self.graph
                 .for_each_instruction_mut(Instruction::clear_legacy_initial_jump_argument);
-            for origin in &mut self.exception_owner_provenance.ordinary_await_ends {
-                origin.send.clear_legacy_initial_jump_argument();
-                if let Some((_, bridge)) = &mut origin.bridge {
-                    bridge.clear_legacy_initial_jump_argument();
-                }
-            }
-            for origin in &mut self.exception_owner_provenance.async_with_setups {
-                origin.send.clear_legacy_initial_jump_argument();
-                if let Some((_, bridge)) = &mut origin.bridge {
-                    bridge.clear_legacy_initial_jump_argument();
-                }
-            }
-            for instruction in self
-                .exception_owner_provenance
-                .original_primitive_condition_boundaries
-                .iter_mut()
-                .chain(
-                    self.exception_owner_provenance
-                        .source_none_conditions
-                        .iter_mut()
-                        .map(|origin| &mut origin.instruction),
-                )
-                .chain(
-                    self.exception_owner_provenance
-                        .original_comprehension_normal_exits
-                        .iter_mut()
-                        .map(|(_, instruction)| instruction),
-                )
-            {
-                instruction.clear_legacy_initial_jump_argument();
-            }
+            self.exception_owner_provenance
+                .visit_legacy_seed_captures_mut(Instruction::clear_legacy_initial_jump_argument);
         }
         Ok(LayoutAssembler {
             python_version: self.python_version,
@@ -340,97 +311,44 @@ impl OptimizationPipeline {
                 seeds.push((ItemPosition::new(block, offset), seed));
             }
         }
-        let mut await_seeds = Vec::new();
-        for send in self
+        // Mixed prefixes contain real non-jumps, but typed jump witnesses must
+        // retain their producer's operand shape before generic seed preflight.
+        if !self
             .exception_owner_provenance
-            .ordinary_await_ends
-            .iter()
-            .map(|origin| &origin.send)
-            .chain(
-                self.exception_owner_provenance
-                    .async_with_setups
-                    .iter()
-                    .map(|origin| &origin.send),
-            )
+            .legacy_seed_capture_shapes_valid()
         {
-            let Operand::Forward(target) = send.operand() else {
-                native.invalidate();
-                return;
-            };
-            let Some(seed) = native.target_label(&self.graph, target) else {
-                native.invalidate();
-                return;
-            };
-            await_seeds.push(seed);
+            native.invalidate();
+            return;
         }
-        let mut condition_seeds = Vec::new();
-        for instruction in self
-            .exception_owner_provenance
-            .original_primitive_condition_boundaries
-            .iter()
-            .chain(
-                self.exception_owner_provenance
-                    .source_none_conditions
-                    .iter()
-                    .map(|origin| &origin.instruction),
-            )
-            .chain(
-                self.exception_owner_provenance
-                    .original_comprehension_normal_exits
-                    .iter()
-                    .map(|(_, instruction)| instruction),
-            )
-        {
-            let (Operand::Forward(target) | Operand::Backward(target)) = instruction.operand()
-            else {
-                native.invalidate();
-                return;
-            };
-            let Some(seed) = native.target_label(&self.graph, target) else {
-                native.invalidate();
-                return;
-            };
-            condition_seeds.push(seed);
+        let mut unresolved_capture = false;
+        self.exception_owner_provenance
+            .visit_legacy_seed_captures_mut(|instruction| {
+                let (Operand::Forward(target) | Operand::Backward(target)) = instruction.operand()
+                else {
+                    return;
+                };
+                if native.target_label(&self.graph, target).is_none() {
+                    unresolved_capture = true;
+                }
+            });
+        if unresolved_capture {
+            native.invalidate();
+            return;
         }
-        for (instruction, seed) in self
-            .exception_owner_provenance
-            .original_primitive_condition_boundaries
-            .iter_mut()
-            .chain(
-                self.exception_owner_provenance
-                    .source_none_conditions
-                    .iter_mut()
-                    .map(|origin| &mut origin.instruction),
-            )
-            .chain(
-                self.exception_owner_provenance
-                    .original_comprehension_normal_exits
-                    .iter_mut()
-                    .map(|(_, instruction)| instruction),
-            )
-            .zip(condition_seeds)
-        {
-            // These pre-CFG certificates authenticate complete original jumps.
-            // Mirror layout provenance into them instead of masking Instruction Eq.
-            instruction.set_legacy_initial_jump_argument(seed);
-        }
-        for (send, seed) in self
-            .exception_owner_provenance
-            .ordinary_await_ends
-            .iter_mut()
-            .map(|origin| &mut origin.send)
-            .chain(
-                self.exception_owner_provenance
-                    .async_with_setups
-                    .iter_mut()
-                    .map(|origin| &mut origin.send),
-            )
-            .zip(await_seeds)
-        {
-            // Ordinary awaits and manager entries both authenticate the exact SEND.
-            // Their immutable captures must mirror the live instruction's seed bits.
-            send.set_legacy_initial_jump_argument(seed);
-        }
+        // Every target is resolved before the first write. Graph targets, native
+        // labels and captured operands stay unchanged between preflight and commit.
+        // Resolve each record directly so hash-map traversal order is immaterial.
+        self.exception_owner_provenance
+            .visit_legacy_seed_captures_mut(|instruction| {
+                let (Operand::Forward(target) | Operand::Backward(target)) = instruction.operand()
+                else {
+                    return;
+                };
+                let seed = native
+                    .target_label(&self.graph, target)
+                    .expect("preflight resolved the unchanged captured jump target");
+                instruction.set_legacy_initial_jump_argument(seed);
+            });
         for (position, seed) in seeds {
             self.graph
                 .instruction_mut(position)
@@ -3219,6 +3137,139 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(function.line_table, lines, "{version:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod finally_capture_seed_tests {
+    use super::*;
+    use crate::assembler::Assembler;
+    use crate::assembler::exception_owners::OriginalNormalFinallyArray;
+    use crate::target::opcodes::{POP_JUMP_IF_FALSE, RETURN_CONST};
+
+    #[test]
+    fn finalizer_prefix_and_incoming_seeds_are_atomic_and_preserve_equality() {
+        for native_entry in [12, 256] {
+            for invalid in 0..4 {
+                let start = Label(0);
+                let entry = Label(1);
+                let end = Label(2);
+                let incoming = Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(entry),
+                    SourceLocation::NONE,
+                    Some(0),
+                );
+                let condition = Instruction::new(
+                    POP_JUMP_IF_FALSE,
+                    Operand::Forward(end),
+                    SourceLocation::NONE,
+                    Some(0),
+                );
+                let mut assembler = Assembler::from_linear_items(vec![
+                    Item::Label(start),
+                    Item::Instruction(incoming),
+                    Item::Label(entry),
+                    Item::Instruction(condition),
+                    Item::Label(end),
+                    Item::Instruction(Instruction::new(
+                        RETURN_CONST,
+                        Operand::Value(0),
+                        SourceLocation::NONE,
+                        Some(0),
+                    )),
+                ]);
+                assembler.python_version = PythonVersion::Py312;
+                assembler.next_label = 3;
+                assembler.bind_legacy_native_label(start, 1);
+                assembler.bind_legacy_native_label(entry, native_entry);
+                assembler.bind_legacy_native_label(end, native_entry + 1);
+                assembler.certify_legacy_native_labels();
+                let mut captured_condition = condition;
+                if invalid == 1 {
+                    captured_condition.retarget(Operand::Forward(Label(900)));
+                }
+                let mut captured_incoming = incoming;
+                if invalid == 2 {
+                    captured_incoming.set_operand(Operand::Value(0));
+                }
+                assembler
+                    .exception_owner_provenance
+                    .original_normal_finally_arrays
+                    .push(OriginalNormalFinallyArray {
+                        entry,
+                        prefix: vec![Item::Label(entry), Item::Instruction(captured_condition)],
+                        incoming: vec![captured_incoming],
+                        retained_setup: None,
+                        borrow_join: None,
+                    });
+                if invalid == 3 {
+                    let mut malformed = condition;
+                    malformed.set_operand(Operand::Value(0));
+                    assembler
+                        .exception_owner_provenance
+                        .original_primitive_condition_boundaries
+                        .push(malformed);
+                }
+                let mut pipeline = assembler.into_optimization_pipeline();
+                let arrays = pipeline.legacy_instruction_arrays();
+                pipeline.initialize_legacy_native_jump_seeds(&arrays);
+                assert_eq!(
+                    pipeline
+                        .legacy_native_labels
+                        .as_ref()
+                        .unwrap()
+                        .is_certified(),
+                    invalid == 0
+                );
+                let live = pipeline
+                    .graph
+                    .iter_items()
+                    .filter_map(|item| {
+                        if let Item::Instruction(instruction) = item {
+                            Some(*instruction)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let expected = (invalid == 0).then_some(u8::from(native_entry > 255));
+                assert_eq!(live[0].legacy_initial_jump_width(), expected);
+                assert_eq!(live[1].legacy_initial_jump_width(), expected);
+                let origin = &pipeline
+                    .exception_owner_provenance
+                    .original_normal_finally_arrays[0];
+                assert_eq!(origin.incoming[0].legacy_initial_jump_width(), expected);
+                let Item::Instruction(captured) = origin.prefix[1] else {
+                    panic!()
+                };
+                assert_eq!(captured.legacy_initial_jump_width(), expected);
+                if invalid == 0 {
+                    assert_eq!(origin.incoming[0], live[0]);
+                    assert_eq!(captured, live[1]);
+                }
+                // A formerly seeded jump can become a non-jump before cancellation.
+                pipeline
+                    .exception_owner_provenance
+                    .visit_legacy_seed_captures_mut(|instruction| {
+                        instruction.set_operand(Operand::Forward(entry));
+                        instruction.set_legacy_initial_jump_argument(native_entry);
+                        instruction.opcode = NOP;
+                        instruction.set_operand(Operand::Value(0));
+                        assert!(instruction.legacy_initial_jump_width().is_some());
+                    });
+                pipeline
+                    .exception_owner_provenance
+                    .visit_legacy_seed_captures_mut(
+                        Instruction::clear_legacy_initial_jump_argument,
+                    );
+                pipeline
+                    .exception_owner_provenance
+                    .visit_legacy_seed_captures_mut(|instruction| {
+                        assert_eq!(instruction.legacy_initial_jump_width(), None);
+                    });
+            }
         }
     }
 }

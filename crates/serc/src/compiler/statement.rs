@@ -1772,38 +1772,30 @@ impl Compiler<'_> {
                         continue;
                     }
                     Stmt::Try(statement)
-                        if self.context.python_version <= crate::PythonVersion::Py313
-                            && !statement.is_star
-                            && statement.orelse.is_empty()
-                            && ((statement.finalbody.is_empty()
-                                && (matches!(statement.body.last(), Some(Stmt::While(_)))
-                                    || (self.context.python_version
-                                        == crate::PythonVersion::Py312
-                                        && (matches!(
-                                            statement.body.last(),
-                                            Some(Stmt::If(_) | Stmt::Try(_) | Stmt::Match(_))
-                                        ) || statement.handlers.iter().any(
-                                            |handler| {
-                                                handler.as_except_handler().is_some_and(|handler| {
-                                                    matches!(
-                                                        handler.body.last(),
-                                                        Some(Stmt::Try(_))
-                                                    )
-                                                })
-                                            },
-                                        )))))
-                                || (self.context.python_version
-                                    == crate::PythonVersion::Py312
-                                    && matches!(
-                                        statement.finalbody.last(),
-                                        Some(Stmt::If(_) | Stmt::Try(_) | Stmt::For(_))
-                                    ))) =>
+                        if !statement.is_star
+                            && match self.context.python_version {
+                                crate::PythonVersion::Py312 => {
+                                    statement.finalbody.is_empty()
+                                        || (statement.orelse.is_empty()
+                                            && matches!(
+                                                statement.finalbody.last(),
+                                                Some(Stmt::If(_) | Stmt::Try(_) | Stmt::For(_))
+                                            ))
+                                }
+                                crate::PythonVersion::Py313 => {
+                                    statement.orelse.is_empty()
+                                        && statement.finalbody.is_empty()
+                                        && matches!(statement.body.last(), Some(Stmt::While(_)))
+                                }
+                                _ => false,
+                            } =>
                     {
-                        // Preserve the original normal try exit and shared footer. The
-                        // loop tests need distinct return paths; 3.12's two single-pass
-                        // copy rounds must visit nested conditional and cleanup exits before
-                        // their enclosing try, handler, or finally exit acquires a copied
-                        // footer. A nested handler recovery also keeps its cleanup jump.
+                        // Native 3.12 emits every ordinary try's normal and handler
+                        // jumps to one shared footer after all cleanup blocks. Preserve
+                        // that original End (and its jump operands) until the two CFG
+                        // copy rounds; eager returns erase its allocation provenance.
+                        // The existing finalizer and 3.13 loop routes need the same
+                        // ordering for their nested exits and cleanup jumps.
                         let previous = self.assembler.location();
                         self.assembler
                             .set_location(self.source_location(statement.range));
@@ -23558,6 +23550,8 @@ impl Compiler<'_> {
         statement: &ruff_python_ast::StmtTry,
         terminal: bool,
     ) -> Result<(), CompileError> {
+        use super::legacy_native_labels::{FinallyCopy, NativeRole};
+
         let preserve_exit_nop =
             std::mem::take(&mut self.control.finally.preserve_next_finally_exit_nop);
         let capture_manager_pop =
@@ -23696,6 +23690,10 @@ impl Compiler<'_> {
         let finally_handler = self.assembler.label();
         let cleanup = self.assembler.label();
         let end = self.assembler.label();
+        self.bind_native_source_label(NativeRole::FinallyBody(statement.range), protected_start);
+        self.bind_native_source_label(NativeRole::FinallyHandler(statement.range), finally_handler);
+        self.bind_native_source_label(NativeRole::FinallyExit(statement.range), end);
+        self.bind_native_source_label(NativeRole::FinallyCleanup(statement.range), cleanup);
         let empty_loop_finally_entry = statement.handlers.is_empty()
             && suite_ends_in_constant_break_loop(&statement.body)
             && matches!(statement.finalbody.first(), Some(Stmt::While(loop_statement))
@@ -25738,6 +25736,11 @@ impl Compiler<'_> {
                             compiler.compile_try_except(
                                 statement,
                                 TryCompileOptions {
+                                    // 3.12 keeps the inner SETUP_FINALLY between the
+                                    // outer finally body and the ordinary try body.
+                                    emit_statement_nop: compiler.context.python_version
+                                        == crate::PythonVersion::Py312
+                                        && !statement.is_star,
                                     retained_else_break_exit:
                                         terminal_else_break_bypasses_empty_exit,
                                     ..TryCompileOptions::NESTED_HANDLER
@@ -26113,7 +26116,10 @@ impl Compiler<'_> {
         }
         let finalbody_block = self.assembler.current_block_token();
         let finalbody_instruction_start = self.assembler.instruction_count();
-        let ((), finalbody_emitted_fallthrough) = self.with_fallthrough_tracking(|compiler| {
+        let ((), finalbody_emitted_fallthrough) = self.with_native_finally_copy(
+            statement.range,
+            FinallyCopy::Normal,
+            |compiler| compiler.with_fallthrough_tracking(|compiler| {
             if let Some(location) = pass_finally_location {
                 compiler.assembler.set_location(location);
                 if compiler
@@ -26207,7 +26213,8 @@ impl Compiler<'_> {
                 )?;
             }
             Ok(())
-        })?;
+            }),
+        )?;
         if let Some(normal_exit) = name_return_borrow_exit {
             self.assembler
                 .mark_noncopyable_finally_borrow_barrier(normal_exit, normal_finally_pop_block);
@@ -27039,100 +27046,107 @@ impl Compiler<'_> {
             .exceptions
             .active_exception_region_exclusions
             .push(Vec::new());
-        let mut explicit_handler_end = None;
-        let has_enclosing_finally_cleanup = self.control.finally.active_finally_try_bodies > 0
-            || self.control.finally.active_normal_finally_bodies > 0
-            || self.control.finally.active_finally_end_blocks > 0
-            || self.control.finally.active_copied_finally_bodies > 0;
-        if let Some((Stmt::Return(return_statement), leading)) = statement.finalbody.split_last()
-            && has_enclosing_finally_cleanup
-            && !self.control.finally.copies_terminating_finally_returns
-        {
-            self.compile_suite(leading)?;
-            explicit_handler_end =
-                Some(self.compile_return_from_exception_handler(return_statement)?);
-        } else if let [Stmt::If(final_if)] = statement.finalbody.as_slice()
-            && final_if.elif_else_clauses.is_empty()
-        {
-            let condition_false = if self.control.in_synchronous_with()
-                && matches!(final_if.body.as_slice(), [Stmt::Expr(_)])
-                && let Expr::BoolOp(boolean) = final_if.test.as_ref()
-                && boolean.op == BoolOp::And
-                && let [first, second] = boolean.values.as_slice()
-                && matches!((first, second), (Expr::Compare(_), Expr::Name(_)))
-            {
-                let first_false = self.assembler.label();
-                let second_false = self.assembler.label();
-                self.with_control_override(
-                    |control| &mut control.finally.exceptional_finally_condition,
-                    true,
-                    |compiler| {
-                        compiler.compile_jump_if(first, false, first_false)?;
-                        compiler.compile_jump_if(second, false, second_false)
-                    },
-                )?;
-                vec![(first_false, first), (second_false, second)]
-            } else {
-                let condition_false = self.assembler.label();
-                self.with_control_override(
-                    |control| &mut control.finally.exceptional_finally_condition,
-                    true,
-                    |compiler| compiler.compile_jump_if(&final_if.test, false, condition_false),
-                )?;
-                vec![(condition_false, final_if.test.as_ref())]
-            };
-            self.assembler.record_short_circuit_owner_continuation();
-            self.compile_exceptional_finally_suite(&final_if.body)?;
-            // Keep an ordinary guard's original end label before RERAISE. Inner joins
-            // still fall through during initial small-exit classification; the assembler
-            // duplicates the shared exceptional exit later while resolving locations.
-            if condition_false.len() > 1 && !suite_terminates(&final_if.body) {
-                self.assembler.set_location(SourceLocation::NONE);
-                self.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
-            }
-            for (condition_false, _test) in condition_false.into_iter().rev() {
-                self.assembler.mark(condition_false);
-                self.set_depth(base_depth + 2);
-                self.assembler.set_location(SourceLocation::NONE);
-                self.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
-            }
-        } else {
-            if let Some(location) = pass_finally_location {
-                self.assembler.set_location(location);
-                self.emit(NOP, 0, 0)?;
-            } else {
-                self.compile_exceptional_finally_suite(&statement.finalbody)?;
-            }
-            if !suite_terminates(&statement.finalbody) {
-                if (self.context.python_version == crate::PythonVersion::Py312
-                    && statement.finalbody.last().is_some_and(|statement| {
-                        matches!(statement, Stmt::Assign(_))
-                            || matches!(statement, Stmt::AnnAssign(assignment) if assignment.value.is_some())
-                    }))
-                    || matches!(
-                        statement.finalbody.last(),
-                        Some(Stmt::If(_) | Stmt::For(_) | Stmt::While(_) | Stmt::Match(_))
-                    )
+        let explicit_handler_end = self.with_native_finally_copy(
+            statement.range,
+            FinallyCopy::Exceptional,
+            |compiler| {
+                let mut explicit_handler_end = None;
+                let has_enclosing_finally_cleanup = compiler.control.finally.active_finally_try_bodies > 0
+                    || compiler.control.finally.active_normal_finally_bodies > 0
+                    || compiler.control.finally.active_finally_end_blocks > 0
+                    || compiler.control.finally.active_copied_finally_bodies > 0;
+                if let Some((Stmt::Return(return_statement), leading)) = statement.finalbody.split_last()
+                    && has_enclosing_finally_cleanup
+                    && !compiler.control.finally.copies_terminating_finally_returns
                 {
-                    // CPython leaves the shared exceptional exit unlocated. Each incoming
-                    // branch, including a loop break, supplies the copied exit's location.
-                    self.assembler.set_location(SourceLocation::NONE);
-                } else if let Some(range) = suite_unary_not_fallthrough_range(&statement.finalbody)
+                    compiler.compile_suite(leading)?;
+                    explicit_handler_end =
+                        Some(compiler.compile_return_from_exception_handler(return_statement)?);
+                } else if let [Stmt::If(final_if)] = statement.finalbody.as_slice()
+                    && final_if.elif_else_clauses.is_empty()
                 {
-                    self.assembler.set_location(self.source_location(range));
-                } else if let Some(statement) = statement
-                    .finalbody
-                    .last()
-                    .filter(|statement| statement_uses_implicit_return_location(statement))
-                {
-                    self.assembler
-                        .set_location(self.source_location(implicit_return_range(self, statement)));
-                } else if let Some(location) = self.assembler.last_instruction_location() {
-                    self.assembler.set_location(location);
+                    let condition_false = if compiler.control.in_synchronous_with()
+                        && matches!(final_if.body.as_slice(), [Stmt::Expr(_)])
+                        && let Expr::BoolOp(boolean) = final_if.test.as_ref()
+                        && boolean.op == BoolOp::And
+                        && let [first, second] = boolean.values.as_slice()
+                        && matches!((first, second), (Expr::Compare(_), Expr::Name(_)))
+                    {
+                        let first_false = compiler.assembler.label();
+                        let second_false = compiler.assembler.label();
+                        compiler.with_control_override(
+                            |control| &mut control.finally.exceptional_finally_condition,
+                            true,
+                            |compiler| {
+                                compiler.compile_jump_if(first, false, first_false)?;
+                                compiler.compile_jump_if(second, false, second_false)
+                            },
+                        )?;
+                        vec![(first_false, first), (second_false, second)]
+                    } else {
+                        let condition_false = compiler.assembler.label();
+                        compiler.with_control_override(
+                            |control| &mut control.finally.exceptional_finally_condition,
+                            true,
+                            |compiler| compiler.compile_jump_if(&final_if.test, false, condition_false),
+                        )?;
+                        vec![(condition_false, final_if.test.as_ref())]
+                    };
+                    compiler.assembler.record_short_circuit_owner_continuation();
+                    compiler.compile_exceptional_finally_suite(&final_if.body)?;
+                    // Keep an ordinary guard's original end label before RERAISE. Inner joins
+                    // still fall through during initial small-exit classification; the assembler
+                    // duplicates the shared exceptional exit later while resolving locations.
+                    if condition_false.len() > 1 && !suite_terminates(&final_if.body) {
+                        compiler.assembler.set_location(SourceLocation::NONE);
+                        compiler.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
+                    }
+                    for (condition_false, _test) in condition_false.into_iter().rev() {
+                        compiler.assembler.mark(condition_false);
+                        compiler.set_depth(base_depth + 2);
+                        compiler.assembler.set_location(SourceLocation::NONE);
+                        compiler.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
+                    }
+                } else {
+                    if let Some(location) = pass_finally_location {
+                        compiler.assembler.set_location(location);
+                        compiler.emit(NOP, 0, 0)?;
+                    } else {
+                        compiler.compile_exceptional_finally_suite(&statement.finalbody)?;
+                    }
+                    if !suite_terminates(&statement.finalbody) {
+                        if (compiler.context.python_version == crate::PythonVersion::Py312
+                            && statement.finalbody.last().is_some_and(|statement| {
+                                matches!(statement, Stmt::Assign(_))
+                                    || matches!(statement, Stmt::AnnAssign(assignment) if assignment.value.is_some())
+                            }))
+                            || matches!(
+                                statement.finalbody.last(),
+                                Some(Stmt::If(_) | Stmt::For(_) | Stmt::While(_) | Stmt::Match(_))
+                            )
+                        {
+                            // CPython leaves the shared exceptional exit unlocated. Each incoming
+                            // branch, including a loop break, supplies the copied exit's location.
+                            compiler.assembler.set_location(SourceLocation::NONE);
+                        } else if let Some(range) = suite_unary_not_fallthrough_range(&statement.finalbody)
+                        {
+                            compiler.assembler.set_location(compiler.source_location(range));
+                        } else if let Some(statement) = statement
+                            .finalbody
+                            .last()
+                            .filter(|statement| statement_uses_implicit_return_location(statement))
+                        {
+                            compiler.assembler
+                                .set_location(compiler.source_location(implicit_return_range(compiler, statement)));
+                        } else if let Some(location) = compiler.assembler.last_instruction_location() {
+                            compiler.assembler.set_location(location);
+                        }
+                        compiler.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
+                    }
                 }
-                self.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
-            }
-        }
+                Ok(explicit_handler_end)
+            },
+        )?;
         let handler_end = if let Some(handler_end) = explicit_handler_end {
             handler_end
         } else {
