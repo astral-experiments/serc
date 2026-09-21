@@ -12271,7 +12271,8 @@ impl Compiler<'_> {
                                     .control
                                     .exceptions
                                     .active_exception_region_exclusions
-                                    .is_empty())
+                                    .is_empty()
+                                || !self.control.withs.active_with_region_exclusions.is_empty())
                             && matches!(body.last(), Some(Stmt::If(nested))
                             if matches!(nested_if_exit_location(nested, true),
                                 Some(NestedIfExitLocation::Unlocated))
@@ -12281,6 +12282,21 @@ impl Compiler<'_> {
                             statement,
                             self.control.statements.current_statement_has_following,
                         ),
+                        // The loop's else can leave its own shared partial-if join.
+                        // Break edges bypass that original join during exit copying.
+                        Stmt::For(loop_statement) if !loop_statement.is_async => {
+                            loop_statement.orelse.last().and_then(|tail| match tail {
+                                Stmt::If(tail)
+                                    if tail.elif_else_clauses.is_empty()
+                                        && condition_has_only_runtime_tests(&tail.test) =>
+                                {
+                                    nested_if_exit_location(tail, false).filter(|location| {
+                                        matches!(location, NestedIfExitLocation::Unlocated)
+                                    })
+                                }
+                                _ => None,
+                            })
+                        }
                         _ => None,
                     });
                     let nested_if_ends_in_break = matches!(
