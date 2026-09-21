@@ -191,3 +191,43 @@ fn matches_cpython_loop_false_edge_join_locations() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_final_else_after_terminating_elif() {
+    for (filename, source) in [
+        (
+            "matches_cpython_final_else_after_terminating_elif_role00.py",
+            r"def f(flag, first, second, last):
+    if flag:
+        if first:
+            raise ValueError()
+        elif second:
+            raise TypeError()
+        else:
+            if not last():
+                raise RuntimeError()
+    else:
+        other()
+    after()
+",
+        ),
+        (
+            "matches_cpython_final_else_after_terminating_elif_role11.py",
+            r"def f(flag, first, second, last):
+    if flag:
+        if first:
+            work()
+        elif second:
+            recover()
+        else:
+            if not last():
+                raise RuntimeError()
+    else:
+        other()
+    after()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

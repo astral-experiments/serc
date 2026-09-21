@@ -87,3 +87,54 @@ fn matches_cpython_named_elif_cleanup_locations() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_named_elif_cleanup_before_return() {
+    for (filename, source) in [
+        (
+            "matches_cpython_named_elif_cleanup_before_return_handler10.py",
+            r"def f(ignore_errors, verbose, data):
+    try:
+        work()
+    except Exception as error:
+        message = 'failed'
+        if not ignore_errors:
+            raise ValueError(message)
+        elif verbose:
+            report(message)
+    return data
+",
+        ),
+        (
+            "matches_cpython_named_elif_cleanup_before_return_handler11.py",
+            r"def f(ignore_errors, verbose, data):
+    try:
+        work()
+    except Exception as error:
+        message = 'failed'
+        if not ignore_errors:
+            raise ValueError(message)
+        elif verbose:
+            report(message)
+    return None
+",
+        ),
+        (
+            "matches_cpython_named_elif_cleanup_before_return_handler12.py",
+            r"def f(ignore_errors, verbose, data):
+    try:
+        work()
+    except Exception as error:
+        message = 'failed'
+        if not ignore_errors:
+            raise ValueError(message)
+        elif verbose:
+            report(message)
+    after()
+    return data
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

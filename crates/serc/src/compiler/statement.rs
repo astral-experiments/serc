@@ -12734,8 +12734,17 @@ impl Compiler<'_> {
             let mut descended_else = false;
             while let Some(Stmt::If(statement)) = final_else_body.last()
                 && condition_has_only_runtime_tests(&statement.test)
-                && let [clause] = statement.elif_else_clauses.as_slice()
+                && let Some((clause, earlier)) = statement.elif_else_clauses.split_last()
                 && clause.test.is_none()
+                && (earlier.is_empty()
+                    || (suite_terminates_before_constant_folding(&statement.body)
+                        && earlier.iter().all(|clause| {
+                            clause
+                                .test
+                                .as_ref()
+                                .is_some_and(condition_has_only_runtime_tests)
+                                && suite_terminates_before_constant_folding(&clause.body)
+                        })))
             {
                 final_else_body = &clause.body;
                 descended_else = true;
@@ -22137,7 +22146,9 @@ impl Compiler<'_> {
                 // Earlier terminating arms leave the last elif's false edge and body
                 // fallthrough sharing the artificial cleanup before a continuation.
                 || (loop_tail.is_none()
-                    && !cleanup_has_small_return_successor
+                    // A named cleanup plus an explicit return exceeds the four-opcode
+                    // small-exit limit, so its two normal predecessors still share it.
+                    && (!cleanup_has_small_return_successor || handler.name.is_some())
                     && (self.control.statements.current_statement_has_following
                         || self.control.statements.inherited_statement_has_following
                         || has_lowered_loop_condition_successor
