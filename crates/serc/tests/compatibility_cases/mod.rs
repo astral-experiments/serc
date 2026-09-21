@@ -209,6 +209,7 @@ mod nested_try_branch_exit_markers;
 mod nested_try_ifexp_handler_compatibility;
 mod nested_while_branch_exits;
 mod nested_while_dispatch_layout;
+mod neutral_bootstrap_owners;
 mod non_final_loop_branch_assert_location_compatibility;
 mod non_final_try_loop_backedges;
 mod normal_finally_join_owners;

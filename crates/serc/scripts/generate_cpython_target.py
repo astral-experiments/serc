@@ -61,6 +61,24 @@ TARGET_INPUTS = (
     "Python/Python-ast.c",
 )
 MODERN_TARGET_INPUTS = TARGET_INPUTS
+BOOTSTRAP_314_INPUT = "scripts/target_metadata/cpython_3_14_5_bootstrap.json"
+BOOTSTRAP_314_SHA256 = (
+    "3a55396a7cd0f658d221fa67528ff3390b29db386dac856640ef90b17ef9ad8a"
+)
+BOOTSTRAP_INPUTS = (
+    "Lib/importlib/_bootstrap.py",
+    "Lib/importlib/_bootstrap_external.py",
+    "Lib/encodings/__init__.py",
+    "Lib/encodings/aliases.py",
+    "Objects/codeobject.c",
+    "Python/import.c",
+    "Python/pylifecycle.c",
+    "Python/codecs.c",
+    "Programs/_freeze_module.c",
+    "Include/internal/pycore_global_strings.h",
+    "Python/Python-ast.c",
+)
+TARGET_INPUTS = tuple(dict.fromkeys((*MODERN_TARGET_INPUTS, *BOOTSTRAP_INPUTS)))
 LEGACY_TARGET_INPUTS = (
     "Include/opcode.h",
     "Include/object.h",
@@ -156,6 +174,35 @@ V4_INPUT_DIGESTS = {
 }
 
 
+def read_bootstrap_strings(sources: dict[str, str]) -> tuple[str, ...]:
+    """Verify the source-derived Linux supplement without compiling on the host."""
+    data = (CRATE_ROOT / BOOTSTRAP_314_INPUT).read_bytes()
+    if hashlib.sha256(data).hexdigest() != BOOTSTRAP_314_SHA256:
+        raise ValueError("pinned Python 3.14 bootstrap checksum mismatch")
+    profile = json.loads(data)
+    if (
+        profile["target_tag"] != TARGET_TAG
+        or profile["target_commit"] != TARGET_COMMIT
+        or profile["platform"] != "linux"
+    ):
+        raise ValueError("bootstrap profile does not match the selected target")
+    helper = CRATE_ROOT / "scripts/generate_cpython_bootstrap.py"
+    if hashlib.sha256(helper.read_bytes()).hexdigest() != profile["generator_sha256"]:
+        raise ValueError("bootstrap generator changed; regenerate its fixture")
+    expected = {
+        relative: hashlib.sha256(sources[relative].encode()).hexdigest()
+        for relative in BOOTSTRAP_INPUTS
+    }
+    if profile["input_sha256"] != expected:
+        raise ValueError("bootstrap profile does not match the pinned source inputs")
+    values = profile["strings"]
+    if values != sorted(set(values)) or len(values) != profile["supplemental_entries"]:
+        raise ValueError("bootstrap strings are not unique, sorted and complete")
+    if any(not isinstance(value, str) or value.startswith("/") for value in values):
+        raise ValueError("bootstrap profile contains an environment-specific path")
+    return tuple(values)
+
+
 def startup_input() -> tuple[str, str]:
     if TARGET_MINOR == "3.15":
         return STARTUP_315_INPUT, STARTUP_315_SHA256
@@ -192,6 +239,8 @@ def select_target_version(version: str) -> None:
     TARGET_MINOR = version
     TARGET_TAG, TARGET_COMMIT, TARGET_VERSION, marshal_version = TARGETS[version]
     TARGET_INPUTS = MODERN_TARGET_INPUTS
+    if version == "3.14":
+        TARGET_INPUTS = tuple(dict.fromkeys((*TARGET_INPUTS, *BOOTSTRAP_INPUTS)))
     if version == "3.12":
         TARGET_INPUTS = (
             *LEGACY_TARGET_INPUTS,
@@ -916,7 +965,9 @@ def render(sources: dict[str, str]) -> str:
     for relative in TARGET_INPUTS:
         digest = hashlib.sha256(sources[relative].encode()).hexdigest()
         lines.append(f"// {relative}: sha256:{digest}")
-    if TARGET_MINOR == "3.15":
+    if TARGET_MINOR == "3.14":
+        lines.append(f"// {BOOTSTRAP_314_INPUT}: sha256:{BOOTSTRAP_314_SHA256}")
+    elif TARGET_MINOR == "3.15":
         lines.append(f"// {STARTUP_315_INPUT}: sha256:{STARTUP_315_SHA256}")
     lines.extend(
         [
@@ -1022,12 +1073,34 @@ def render(sources: dict[str, str]) -> str:
     lines.extend(["];", ""])
     if TARGET_MINOR == "3.14":
         lines.extend(
-            render_preinterned_lookup(
-                preinterned_strings,
-                STARTUP_INTERNED_STRINGS + UNIX_STARTUP_INTERNED_STRINGS,
-                tuple(compiler_interned_strings),
-            )
+            [
+                "// Source-derived identifiers and live owners from neutral Linux bootstrap.",
+                "pub(crate) static BOOTSTRAP_INTERNED_STRINGS: &[&str] = &[",
+            ]
         )
+        lines.extend(
+            f"    {rust_string_literal(value)},"
+            for value in read_bootstrap_strings(sources)
+        )
+        lines.extend(
+            [
+                "];",
+                "",
+                "pub(crate) fn is_preinterned_string(value: &str) -> bool {",
+                "    is_preinterned_static_string(value)",
+                '        || (cfg!(target_os = "linux")',
+                "            && BOOTSTRAP_INTERNED_STRINGS.binary_search(&value).is_ok())",
+                "}",
+                "",
+            ]
+        )
+        lookup = render_preinterned_lookup(
+            preinterned_strings,
+            STARTUP_INTERNED_STRINGS + UNIX_STARTUP_INTERNED_STRINGS,
+            tuple(compiler_interned_strings),
+        )
+        lookup[0] = "fn is_preinterned_static_string(value: &str) -> bool {"
+        lines.extend(lookup)
     else:
         lines.extend(
             [
