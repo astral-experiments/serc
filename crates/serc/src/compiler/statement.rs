@@ -25591,6 +25591,24 @@ impl Compiler<'_> {
                             && nested.finalbody.is_empty()
                             && !nested.handlers.is_empty()
                             && (nested_guarded_recovery_leaves_empty_borrow_exit(nested)
+                                // A linear named recovery remains cold. The terminal
+                                // guard targets POP_BLOCK before the nested normal jump,
+                                // whose removal empties the original hot-path join.
+                                || (nested.body.split_last().is_some_and(|(last, prefix)| {
+                                    (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
+                                        && matches!(last, Stmt::If(condition)
+                                            if condition.elif_else_clauses.is_empty()
+                                                && condition_has_only_runtime_tests(&condition.test)
+                                                && !expression_contains_inline_branch(&condition.test)
+                                                && !expression_suspends_current_scope(&condition.test)
+                                                && suite_has_linear_borrow_fallthrough(&condition.body))
+                                }) && nested.handlers.iter().all(|handler| {
+                                    handler.as_except_handler().is_some_and(|handler| {
+                                        handler.type_.is_some()
+                                            && handler.name.is_some()
+                                            && suite_has_linear_borrow_fallthrough(&handler.body)
+                                    })
+                                }))
                                 || nested.body.split_last().is_some_and(|(last, leading)| {
                                 suite_has_linear_borrow_fallthrough(leading)
                                     && matches!(last, Stmt::If(condition)
@@ -25633,6 +25651,47 @@ impl Compiler<'_> {
             && self.control.finally.active_finally_end_blocks == 0
             && self.control.finally.active_copied_finally_bodies == 0
             && nested_named_recovery_leaves_empty_borrow_entry(statement);
+        // A conditional try-body ends at a separate POP_BLOCK array. A leading
+        // while finalizer starts another array, so removing POP_BLOCK leaves an
+        // empty original entry between the guard and the cleanup loop.
+        let conditional_while_finally_exit = statement.handlers.is_empty()
+            && !statement.is_star
+            && statement.orelse.is_empty()
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && statement.body.split_last().is_some_and(|(last, prefix)| {
+                (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
+                    && matches!(last, Stmt::If(branch)
+                    if condition_has_only_runtime_tests(&branch.test)
+                        && !expression_contains_inline_branch(&branch.test)
+                        && !expression_suspends_current_scope(&branch.test)
+                        && suite_has_linear_borrow_fallthrough(&branch.body)
+                        && branch.elif_else_clauses.iter().all(|clause| {
+                            clause.test.as_ref().is_none_or(|test| {
+                                condition_has_only_runtime_tests(test)
+                                    && !expression_contains_inline_branch(test)
+                                    && !expression_suspends_current_scope(test)
+                            }) && suite_has_linear_borrow_fallthrough(&clause.body)
+                        }))
+            })
+            && matches!(statement.finalbody.first(), Some(Stmt::While(cleanup))
+                if condition_has_only_runtime_tests(&cleanup.test)
+                    && !expression_contains_inline_branch(&cleanup.test)
+                    && !expression_suspends_current_scope(&cleanup.test)
+                    && cleanup.orelse.is_empty()
+                    && suite_has_linear_borrow_fallthrough(&cleanup.body));
         let managed_while_recovery_exit = statement.handlers.is_empty()
             && !normal_finally_is_borrow_reachable
             && statement.orelse.is_empty()
@@ -25647,6 +25706,7 @@ impl Compiler<'_> {
         if (!statement.handlers.is_empty() && !normal_finally_is_borrow_reachable)
             || nested_handler_exit
             || nested_named_recovery_exit
+            || conditional_while_finally_exit
             || managed_while_recovery_exit
         {
             // An abrupt or bare handler leaves an empty CPython CFG block before the normal
