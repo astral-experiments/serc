@@ -23142,7 +23142,11 @@ impl Compiler<'_> {
             let body_has_instructions = self.assembler.instruction_count() > body_instruction_start;
             // Artificial cleanup inherits only the current block's location. A preceding
             // branch or loop body is not the source of a separate normal-exit block.
-            let body_cleanup_location = if body_has_instructions {
+            let body_cleanup_location = if let Some(Stmt::Pass(statement)) = handler.body.last() {
+                // An omitted trailing pass is still the native NOP donor for the
+                // artificial subgroup cleanup, including inside an outer handler.
+                self.source_location(statement.range)
+            } else if body_has_instructions {
                 self.assembler
                     .current_block_last_instruction_location()
                     .unwrap_or(SourceLocation::NONE)
@@ -23341,9 +23345,9 @@ impl Compiler<'_> {
         self.assembler.mark(end);
         self.set_depth(base_depth);
         if terminal {
-            if let Some(location) = self.assembler.last_instruction_location() {
-                self.assembler.set_location(location);
-            }
+            // The footer joins normal else fallthrough and handled exception groups.
+            // CPython emits it unlocated; each copied exit resolves its own donor.
+            self.assembler.set_location(SourceLocation::NONE);
             self.emit_implicit_return()?;
         }
         Ok(())
