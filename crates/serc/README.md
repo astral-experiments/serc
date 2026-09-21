@@ -10,8 +10,8 @@ generated-target workflow, and required correctness gate.
 
 The backend currently implements:
 
-- CPython 3.14.5 code objects, inline caches, extended arguments, jumps, source-location tables,
-  marshal references and interning, and timestamp-invalidated `.pyc` files;
+- code objects, inline caches, extended arguments, jumps, source-location tables, marshal references
+  and interning, and timestamp-invalidated `.pyc` files for the four pinned CPython targets;
 - literals, collections and unpacking, f-strings, names, attributes, subscripts, slices, unary and
   binary operations, comparisons, boolean operations, conditional expressions, calls, and named
   expressions;

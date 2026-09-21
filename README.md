@@ -24,12 +24,6 @@ serc compile --python-version 3.14 path/to/package
 serc compile --python-version 3.15 path/to/package
 ```
 
-The default is `3.14`, pinned to CPython 3.14.5. The experimental `3.12`, `3.13`, and `3.15`
-targets are pinned to CPython 3.12.14, 3.13.15, and 3.15.0rc2 respectively. Each target writes its
-own cache tag and bytecode magic number, so all four versions can coexist under `__pycache__`.
-See the [exact target pins](crates/serc/README.md#updating-the-cpython-target).
-The public corpus tables below describe Python 3.14 only.
-
 Library callers select `PythonVersion::Py312`, `Py313`, `Py314`, or `Py315` through
 `CompileOptions`, then call `compile_with_options` or `compile_bytes_with_options`. See the
 [library API example](crates/serc/README.md#library-source-api).
@@ -96,6 +90,14 @@ uses the same 2,451 files and passes source bytes to both compilers. It requires
 CPython-accepted files to match exactly, and freezes the 202 CPython-rejected inputs as
 133 matched rejections, 55 rejection mismatches, and 14 compiler failures. Compiler failures
 on accepted inputs always fail any gate.
+
+The Python 3.12.14 gate requires 2,174 exact matches and records 277 CPython-rejected inputs;
+Python 3.13.15 requires 2,193 exact matches and records 258 CPython-rejected inputs. Both use
+the same 2,451 fixtures and pass source bytes to both compilers. See the
+[corpus comparator](crates/serc/README.md#cpython-corpus-comparison)
+for the frozen outcome counts and exact oracle requirements.
+
+### Public corpus compatibility
 
 For broader diagnostics, Serc also has a separately pinned corpus derived
 from [`mypy_primer`](https://github.com/hauntsaninja/mypy_primer). The frozen
