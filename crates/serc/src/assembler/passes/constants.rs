@@ -320,11 +320,42 @@ impl OptimizationPipeline {
         });
     }
 
+    /// Captures early Boolean creation from actual copied owners before later CFG rewrites.
+    pub(super) fn capture_early_boolean_admissions(&self) -> Option<Vec<bool>> {
+        if self.python_version != crate::PythonVersion::Py314
+            || !self.early_boolean_admissions_certified
+            || !self.has_early_boolean_admissions
+        {
+            return None;
+        }
+        // Native removes unreachable original arrays after small-exit copying and before
+        // this phase. Certification excludes conditions already erased during lowering.
+        let reachable = self.graph.reachable_blocks(&self.exception_regions);
+        let mut admissions = Vec::with_capacity(2);
+        for block in self.graph.order() {
+            if !reachable[block.index()] {
+                continue;
+            }
+            for item in self.graph[*block].items() {
+                let Item::Instruction(instruction) = item else {
+                    continue;
+                };
+                for value in instruction.early_boolean_admissions.values() {
+                    if !admissions.contains(value) {
+                        admissions.push(*value);
+                    }
+                }
+            }
+        }
+        Some(admissions)
+    }
+
     /// Folds constant operations exposed by exit copying, preserving basic-block boundaries.
     pub(super) fn fold_copied_constants(
         &mut self,
         constants: &mut dyn ConstantTable,
         copied_entry_labels: &[Label],
+        early_booleans: &[bool],
     ) -> Result<(), CompileError> {
         let copied_entry_labels = copied_entry_labels
             .iter()
@@ -498,7 +529,7 @@ impl OptimizationPipeline {
             }
         }
         order.retain(|index| used[*index as usize]);
-        let indices = constants.retain_used(&used, &order);
+        let indices = constants.retain_used(&used, &order, early_booleans);
         self.graph.for_each_instruction_mut(|instruction| {
             if instruction.opcode == LOAD_CONST
                 && let Operand::Value(index) = instruction.operand()

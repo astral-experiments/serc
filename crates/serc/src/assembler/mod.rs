@@ -323,7 +323,12 @@ pub(crate) trait ConstantTable {
     fn intern(&mut self, constant: Constant) -> Result<u32, CompileError>;
     fn fold_sequence(&mut self, values: Vec<Constant>, is_set: bool) -> Result<u32, CompileError>;
     fn len(&self) -> usize;
-    fn retain_used(&mut self, used: &[bool], order: &[u32]) -> Vec<Option<u32>>;
+    fn retain_used(
+        &mut self,
+        used: &[bool],
+        order: &[u32],
+        early_booleans: &[bool],
+    ) -> Vec<Option<u32>>;
     fn retain_used_in_order(&mut self, used: &[bool]) -> Vec<Option<u32>>;
 }
 
@@ -14011,6 +14016,28 @@ impl Assembler {
 
     pub(crate) const fn deferred_none_constant_index(&self) -> Option<u32> {
         self.deferred_none_constant_index
+    }
+
+    /// Reports whether lowering can retain every early Boolean owner in this unit.
+    pub(crate) const fn early_boolean_admissions_certified(&self) -> bool {
+        self.early_boolean_admissions_certified
+    }
+
+    /// Enables phase ordering only for code units whose original Boolean owners survive lowering.
+    pub(crate) fn certify_early_boolean_admissions(&mut self, certified: bool) {
+        self.early_boolean_admissions_certified = certified;
+    }
+
+    /// Attaches native early `TO_BOOL` admissions to the instruction copied with their owner.
+    pub(crate) fn record_last_early_boolean_admissions(&mut self, admissions: &[bool]) {
+        if !self.early_boolean_admissions_certified || admissions.is_empty() {
+            return;
+        }
+        self.has_early_boolean_admissions = true;
+        let instruction = self.required_last_instruction_mut("recording early Boolean admissions");
+        for value in admissions {
+            instruction.early_boolean_admissions.append(*value);
+        }
     }
 
     /// Retains a folded value's construction at an omitted expression's source position.

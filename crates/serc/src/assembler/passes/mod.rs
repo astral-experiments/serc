@@ -197,6 +197,7 @@ impl Assembler {
         self.prepare_legacy_yield_arguments();
         self.resolve_folded_condition_borrow_entries();
         if self.python_version == crate::PythonVersion::Py314
+            && !(self.early_boolean_admissions_certified && self.has_early_boolean_admissions)
             && (self.has_only_linear_assertion_side_exits()
                 || self.has_only_linear_constant_return())
         {
@@ -509,6 +510,8 @@ impl Assembler {
             folded_predecessor_sources: self.folded_predecessor_sources,
             folded_loop_exit_anchors: self.folded_loop_exit_anchors,
             discarded_fold_admissions: self.discarded_fold_admissions,
+            early_boolean_admissions_certified: self.early_boolean_admissions_certified,
+            has_early_boolean_admissions: self.has_early_boolean_admissions,
             initial_reachable,
             retired_exception_handler_targets: rustc_hash::FxHashSet::default(),
             next_label: self.next_label,
@@ -845,6 +848,9 @@ impl OptimizationPipeline {
         }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::DuplicateExitBlocks)?;
+        // Native optimize_load_const walks the copied graph before the later folds and
+        // conditional threading. Freeze instruction-owned admissions at that same boundary.
+        let early_booleans = self.capture_early_boolean_admissions();
         // CPython removes unreachable blocks after its per-block optimizations, including
         // small-exit copying followed by conditional threading, before checking local loads.
         // A terminating match arm can leave its original case jump newly unreachable here.
@@ -868,8 +874,15 @@ impl OptimizationPipeline {
                     Some(removed_max_depth.map_or(depth, |current| current.max(depth)));
                 original_owners.retain_pipeline(&self);
             }
-            if sequence_depth.is_some() || !copied_entry_labels.is_empty() {
-                self.fold_copied_constants(constants, &copied_entry_labels)?;
+            if sequence_depth.is_some()
+                || !copied_entry_labels.is_empty()
+                || early_booleans.is_some()
+            {
+                self.fold_copied_constants(
+                    constants,
+                    &copied_entry_labels,
+                    early_booleans.as_deref().unwrap_or_default(),
+                )?;
                 original_owners.retain_pipeline(&self);
             }
             if self.python_version == crate::PythonVersion::Py315 {

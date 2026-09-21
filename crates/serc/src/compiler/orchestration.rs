@@ -111,8 +111,13 @@ impl ConstantTable for InterningConstantTable<'_, '_> {
         self.output.retain_used_in_order(used)
     }
 
-    fn retain_used(&mut self, used: &[bool], order: &[u32]) -> Vec<Option<u32>> {
-        self.output.retain_used(used, order)
+    fn retain_used(
+        &mut self,
+        used: &[bool],
+        order: &[u32],
+        early_booleans: &[bool],
+    ) -> Vec<Option<u32>> {
+        self.output.retain_used(used, order, early_booleans)
     }
 }
 

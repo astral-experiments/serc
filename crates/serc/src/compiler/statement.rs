@@ -1523,6 +1523,17 @@ impl Compiler<'_> {
         final_expression_becomes_return: bool,
         has_docstring: bool,
     ) -> Result<(), CompileError> {
+        // The token prefilter only avoids an AST proof for units with no value-context
+        // negation. Certification itself depends on syntax and native owner lifetimes.
+        if self.context.python_version == crate::PythonVersion::Py314
+            && let Some((first, last)) = body.first().zip(body.last())
+            && self.context.source[usize::from(first.start())..usize::from(last.end())]
+                .contains("not")
+        {
+            self.assembler.certify_early_boolean_admissions(
+                super::constant::can_order_early_boolean_admissions(body),
+            );
+        }
         if self.context.python_version <= crate::PythonVersion::Py313
             && !has_docstring
             && let Some((statement @ Stmt::Expr(expression), remaining)) = body.split_first()
