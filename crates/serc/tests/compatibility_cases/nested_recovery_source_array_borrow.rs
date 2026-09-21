@@ -323,7 +323,7 @@ fn preserves_terminal_nested_join_return_borrows_without_pass() {
     for (filename, source) in [
         (
             "terminal-no-pass.py",
-            r#"def f(value, outer, first, second):
+            r"def f(value, outer, first, second):
     if outer:
         if first:
             return update(value)
@@ -332,7 +332,7 @@ fn preserves_terminal_nested_join_return_borrows_without_pass() {
     else:
         value = other(value)
     return value
-"#,
+",
         ),
         (
             "nested-assignment-raise.py",
