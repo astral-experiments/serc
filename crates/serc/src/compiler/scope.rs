@@ -3889,41 +3889,8 @@ pub(super) fn collect_conditional_simple_annotations<'a>(
     annotations: &mut Vec<&'a ruff_python_ast::StmtAnnAssign>,
 ) {
     for statement in body {
-        match statement {
-            Stmt::If(statement) => {
-                collect_simple_annotations(&statement.body, annotations);
-                for clause in &statement.elif_else_clauses {
-                    collect_simple_annotations(&clause.body, annotations);
-                }
-            }
-            Stmt::For(statement) => {
-                collect_simple_annotations(&statement.body, annotations);
-                collect_simple_annotations(&statement.orelse, annotations);
-            }
-            Stmt::While(statement) => {
-                collect_simple_annotations(&statement.body, annotations);
-                collect_simple_annotations(&statement.orelse, annotations);
-            }
-            Stmt::Try(statement) => {
-                collect_simple_annotations(&statement.body, annotations);
-                collect_simple_annotations(&statement.orelse, annotations);
-                for handler in &statement.handlers {
-                    if let Some(handler) = handler.as_except_handler() {
-                        collect_simple_annotations(&handler.body, annotations);
-                    }
-                }
-                collect_simple_annotations(&statement.finalbody, annotations);
-                // Try/finally lowers the final body once for the normal path and once for the
-                // exceptional path, so both copies conditionally register their annotations.
-                collect_simple_annotations(&statement.finalbody, annotations);
-            }
-            Stmt::With(statement) => collect_simple_annotations(&statement.body, annotations),
-            Stmt::Match(statement) => {
-                for case in &statement.cases {
-                    collect_simple_annotations(&case.body, annotations);
-                }
-            }
-            _ => {}
+        if !matches!(statement, Stmt::AnnAssign(_)) {
+            collect_simple_annotations(std::slice::from_ref(statement), annotations);
         }
     }
 }

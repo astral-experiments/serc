@@ -134,13 +134,7 @@ pub(crate) struct MarshalMetadataIds {
 
 /// A constant-cache admission or real code assembly in compilation order.
 #[derive(Clone, Debug)]
-pub(crate) struct CompilationInterningEvent {
-    pub(crate) order: usize,
-    pub(crate) kind: CompilationInterningEventKind,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) enum CompilationInterningEventKind {
+pub(crate) enum CompilationInterningEvent {
     CachedTuple(Vec<String>),
     CodeAssembly(CodeInterningSummary),
 }

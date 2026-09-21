@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use ruff_text_size::TextSize;
 use rustc_hash::FxHashMap;
@@ -59,7 +59,7 @@ enum Scope {
 
 #[derive(Debug)]
 pub(crate) struct Compiler<'source> {
-    context: Arc<CompilationContext<'source>>,
+    context: Rc<CompilationContext<'source>>,
     cached_source_line: Cell<Option<CachedSourceLine>>,
     unit: CodeUnit,
     output: OutputState,
