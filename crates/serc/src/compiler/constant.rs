@@ -733,10 +733,8 @@ impl Compiler<'_> {
         self.context
             .record_constant_string_origins(&constant, false);
         if let Constant::Code(code) = &constant {
-            self.output.has_frozenset_constants |= code
-                .marshal_provenance
-                .subtree_has_frozenset_constants
-                .unwrap_or(true);
+            self.output.has_frozenset_constants |=
+                code.marshal_provenance.subtree_has_frozenset_constants;
         }
         self.output.constants.intern(constant)
     }
@@ -750,10 +748,8 @@ impl Compiler<'_> {
             // The child builder already recorded cache admissions. Copy only the parent's
             // retained slot, without replaying those compilation-wide chronology events.
             if let Constant::Code(code) = constant {
-                self.output.has_frozenset_constants |= code
-                    .marshal_provenance
-                    .subtree_has_frozenset_constants
-                    .unwrap_or(true);
+                self.output.has_frozenset_constants |=
+                    code.marshal_provenance.subtree_has_frozenset_constants;
             }
             self.output.constants.intern(constant.clone())?;
             self.output
@@ -2919,7 +2915,9 @@ mod tests {
         CONSTANT_INDEX_THRESHOLD, ConstantEquality, ConstantIndices, ConstantPool,
         constant_pool_fingerprint,
     };
-    use crate::code_object::{CodeObject, Constant, LocalsIdentity, MarshalProvenance};
+    use crate::code_object::{
+        CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance,
+    };
 
     fn code_object(constants: Vec<Constant>) -> CodeObject {
         CodeObject {
@@ -2939,7 +2937,16 @@ mod tests {
             first_line_number: 1,
             line_table: Vec::new(),
             exception_table: Vec::new(),
-            marshal_provenance: MarshalProvenance::default(),
+            marshal_provenance: MarshalProvenance {
+                metadata_ids: MarshalMetadataIds {
+                    domain_len: 2,
+                    locals: vec![0],
+                    filename: 1,
+                    ..MarshalMetadataIds::default()
+                },
+                subtree_has_frozenset_constants: true,
+                ..MarshalProvenance::default()
+            },
         }
     }
 
@@ -3115,7 +3122,7 @@ mod tests {
             .qualified_name_constant_index = Some(0);
         with_graph_provenance
             .marshal_provenance
-            .subtree_has_frozenset_constants = Some(true);
+            .subtree_has_frozenset_constants = false;
 
         assert!(ConstantEquality::PoolKey.equal(
             &Constant::Code(Box::new(plain)),

@@ -998,8 +998,8 @@ impl<'source> Compiler<'source> {
                 },
                 canonical_constant_strings,
                 qualified_name_constant_index: self.output.qualified_name_constant_index,
-                metadata_ids: Some(metadata_ids),
-                subtree_has_frozenset_constants: Some(self.output.has_frozenset_constants),
+                metadata_ids,
+                subtree_has_frozenset_constants: self.output.has_frozenset_constants,
             },
         };
         code.validate()?;

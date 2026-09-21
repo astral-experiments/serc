@@ -3,7 +3,7 @@ use crate::code_object::{
 };
 
 use super::encode_code;
-use super::graph::{ObjectGraph, OccurrenceKind, metadata_values_equal};
+use super::graph::{ObjectGraph, OccurrenceKind};
 use super::key::{
     ObjectKey, code_bytes_key, code_key, constant_key, constant_sort_key, constants_tuple_key,
     local_kinds_key, locals_tuple_key, slice_member_uses_identity, strings_tuple_key,
@@ -28,7 +28,15 @@ fn code_object(constants: Vec<Constant>) -> CodeObject {
         first_line_number: 1,
         line_table: Vec::new(),
         exception_table: Vec::new(),
-        marshal_provenance: MarshalProvenance::default(),
+        marshal_provenance: MarshalProvenance {
+            metadata_ids: MarshalMetadataIds {
+                domain_len: 2,
+                filename: 1,
+                ..MarshalMetadataIds::default()
+            },
+            subtree_has_frozenset_constants: true,
+            ..MarshalProvenance::default()
+        },
     }
 }
 
@@ -154,6 +162,7 @@ fn cached_scalar_graph_routes_constants_metadata_and_structural_bytes() {
     ]);
     code.constants.resize(32, Constant::None);
     code.names.push("é".to_string());
+    code.marshal_provenance.metadata_ids.names.push(0);
     code.line_table.push(0);
     code.exception_table.push(0);
     let graph = ObjectGraph::for_code(&code);
@@ -197,6 +206,7 @@ fn tracks_interned_strings_from_constants_and_metadata() {
         .explicitly_interned_strings
         .insert("méthode".to_string());
     code.names.push("metadata name with spaces".to_string());
+    code.marshal_provenance.metadata_ids.names.push(0);
     let graph = ObjectGraph::for_code(&code);
 
     assert!(graph.is_interned("identifier"));
@@ -219,37 +229,24 @@ fn frozenset_free_provenance_walk_preserves_nested_interns_and_qualified_names()
         .explicitly_interned_strings
         .insert("méthode".to_string());
     nested.marshal_provenance.qualified_name_constant_index = Some(0);
-    nested.marshal_provenance.subtree_has_frozenset_constants = Some(false);
+    nested.marshal_provenance.subtree_has_frozenset_constants = false;
     let mut hinted = code_object(vec![
         Constant::Code(Box::new(nested)),
         Constant::String("méthode".to_string()),
     ]);
-    hinted.marshal_provenance.subtree_has_frozenset_constants = Some(false);
+    hinted.marshal_provenance.subtree_has_frozenset_constants = false;
 
     let mut fallback = hinted.clone();
-    fallback.marshal_provenance.subtree_has_frozenset_constants = None;
+    fallback.marshal_provenance.subtree_has_frozenset_constants = true;
     let Constant::Code(nested) = &mut fallback.constants[0] else {
         unreachable!();
     };
-    nested.marshal_provenance.subtree_has_frozenset_constants = None;
+    nested.marshal_provenance.subtree_has_frozenset_constants = true;
 
     assert_eq!(encode_code(&hinted), encode_code(&fallback));
     let graph = ObjectGraph::for_code(&hinted);
     assert!(graph.is_interned("méthode"));
     assert!(graph.is_interned("Nested"));
-}
-
-#[test]
-fn hand_built_frozenset_without_provenance_keeps_legacy_classification() {
-    let fallback = code_object(vec![Constant::FrozenSet(vec![Constant::String(
-        "identifier".to_string(),
-    )])]);
-    let mut conservative = fallback.clone();
-    conservative
-        .marshal_provenance
-        .subtree_has_frozenset_constants = Some(true);
-
-    assert_eq!(encode_code(&conservative), encode_code(&fallback));
 }
 
 #[test]
@@ -260,14 +257,14 @@ fn dense_metadata_ids_preserve_nested_and_constant_string_identity() {
     nested.local_kinds = vec![1];
     nested.name = "shared_before".to_string();
     nested.qualified_name = "shared_after".to_string();
-    nested.marshal_provenance.metadata_ids = Some(MarshalMetadataIds {
+    nested.marshal_provenance.metadata_ids = MarshalMetadataIds {
         domain_len: 8,
         names: vec![1, 2],
         locals: vec![3],
         filename: 7,
         name: Some(0),
         qualified_name: Some(1),
-    });
+    };
     let mut hinted = code_object(vec![
         Constant::String("shared_before".to_string()),
         Constant::Code(Box::new(nested)),
@@ -279,21 +276,23 @@ fn dense_metadata_ids_preserve_nested_and_constant_string_identity() {
     hinted.local_kinds = vec![1];
     hinted.name = "shared_after".to_string();
     hinted.qualified_name = "shared_before".to_string();
-    hinted.marshal_provenance.metadata_ids = Some(MarshalMetadataIds {
+    hinted.marshal_provenance.metadata_ids = MarshalMetadataIds {
         domain_len: 8,
         names: vec![0, 1],
         locals: vec![3],
         filename: 7,
         name: Some(1),
         qualified_name: Some(0),
-    });
+    };
 
     let mut fallback = hinted.clone();
-    fallback.marshal_provenance.metadata_ids = None;
+    fallback.marshal_provenance.metadata_ids.domain_len = u32::MAX;
+    fallback.marshal_provenance.metadata_ids.filename = u32::MAX - 1;
     let Constant::Code(nested) = &mut fallback.constants[1] else {
         unreachable!();
     };
-    nested.marshal_provenance.metadata_ids = None;
+    nested.marshal_provenance.metadata_ids.domain_len = u32::MAX;
+    nested.marshal_provenance.metadata_ids.filename = u32::MAX - 1;
 
     assert_eq!(encode_code(&hinted), encode_code(&fallback));
     let graph = ObjectGraph::for_code(&hinted);
@@ -312,83 +311,21 @@ fn dense_metadata_ids_preserve_nested_and_constant_string_identity() {
 }
 
 #[test]
-fn malformed_metadata_ids_fall_back_without_aliasing_values() {
-    let mut hinted = code_object(vec![Constant::String("constant_name".to_string())]);
-    hinted.names = vec!["first_name".to_string(), "second_name".to_string()];
-    hinted.locals = vec!["first_local".to_string(), "second_local".to_string()];
-    hinted.local_kinds = vec![1, 1];
-    hinted.name = "constant_name".to_string();
-    hinted.qualified_name = "different_qualified_name".to_string();
-    hinted.marshal_provenance.metadata_ids = Some(MarshalMetadataIds {
-        domain_len: 2,
-        // A mismatched name-vector shape disables those hints; the local and scalar hints then
-        // deliberately collide and exercise per-value validation plus the out-of-range path.
-        names: vec![0],
-        locals: vec![0, 0],
-        filename: 0,
-        name: Some(1),
-        qualified_name: Some(42),
-    });
-    let mut fallback = hinted.clone();
-    fallback.marshal_provenance.metadata_ids = None;
-    assert_eq!(encode_code(&hinted), encode_code(&fallback));
-
-    hinted
-        .marshal_provenance
-        .metadata_ids
-        .as_mut()
-        .unwrap()
-        .domain_len = u32::MAX;
-    assert_eq!(encode_code(&hinted), encode_code(&fallback));
+#[should_panic(expected = "metadata ID tuple length")]
+fn rejects_mismatched_metadata_id_lengths() {
+    let mut code = code_object(Vec::new());
+    code.names.push("untracked".to_string());
+    ObjectGraph::for_code(&code);
 }
 
 #[test]
-fn inline_metadata_equality_is_exact_at_short_string_boundaries() {
-    for length in 0..=40 {
-        let value = "a".repeat(length);
-        assert!(metadata_values_equal(&value, &value));
-        assert!(!metadata_values_equal(&value, &format!("{value}b")));
-        for index in [0, length / 2, length.saturating_sub(1)] {
-            if index >= length {
-                continue;
-            }
-            let mut different = value.clone().into_bytes();
-            different[index] = b'b';
-            let different = String::from_utf8(different).unwrap();
-            assert!(
-                !metadata_values_equal(&value, &different),
-                "accepted byte mismatch at {index} of {length}"
-            );
-        }
-    }
-    for characters in 1..=20 {
-        let first = "é".repeat(characters);
-        let equal = "é".repeat(characters);
-        let different = "à".repeat(characters);
-        assert!(metadata_values_equal(&first, &equal));
-        assert!(!metadata_values_equal(&first, &different));
-    }
-}
-
-#[test]
-fn colliding_short_metadata_ids_never_alias_distinct_values() {
-    let mut hinted = code_object(Vec::new());
-    hinted.names = [2, 3, 4, 7, 8, 15, 16, 17]
-        .into_iter()
-        .map(|length| "a".repeat(length))
-        .collect();
-    hinted.marshal_provenance.metadata_ids = Some(MarshalMetadataIds {
-        domain_len: 1,
-        names: vec![0; hinted.names.len()],
-        locals: Vec::new(),
-        filename: 0,
-        name: Some(0),
-        qualified_name: Some(0),
-    });
-    let mut fallback = hinted.clone();
-    fallback.marshal_provenance.metadata_ids = None;
-
-    assert_eq!(encode_code(&hinted), encode_code(&fallback));
+#[cfg(debug_assertions)]
+#[should_panic(expected = "metadata ID must identify one string")]
+fn rejects_colliding_metadata_ids() {
+    let mut code = code_object(Vec::new());
+    code.names = vec!["first".to_string(), "second".to_string()];
+    code.marshal_provenance.metadata_ids.names = vec![0, 0];
+    ObjectGraph::for_code(&code);
 }
 
 #[test]
@@ -421,6 +358,7 @@ fn bypasses_value_lookup_for_structurally_unique_objects() {
     }]);
     inner.bytecode.push(0);
     inner.locals.push("value".to_string());
+    inner.marshal_provenance.metadata_ids.locals.push(0);
     inner.local_kinds.push(1);
     inner.marshal_provenance.locals_identity = LocalsIdentity::Fresh;
 
@@ -852,6 +790,7 @@ fn metadata_tuple_aliases_intern_only_the_shared_constant_slots() {
     use crate::{InitialInternState, PythonVersion};
     let mut child = code_object(vec![Constant::None]);
     child.names = vec!["café".to_string()];
+    child.marshal_provenance.metadata_ids.names = vec![0];
     let code = code_object(vec![
         Constant::String("café".to_string()),
         Constant::Code(Box::new(child)),
@@ -886,6 +825,7 @@ fn metadata_tuple_aliases_do_not_intern_equal_frozenset_members() {
         "café".to_string(),
     )])]);
     code.names = vec!["café".to_string()];
+    code.marshal_provenance.metadata_ids.names = vec![0];
     for version in [PythonVersion::Py314, PythonVersion::Py315] {
         let bytes = encode_code_with_options(&code, version, &InitialInternState::default());
         let plain_member = [b'u' | 0x80, 5, 0, 0, 0, b'c', b'a', b'f', 0xc3, 0xa9];
