@@ -567,7 +567,7 @@ impl OptimizationPipeline {
         first_line_number: u32,
         local_count: usize,
         parameter_count: usize,
-        constants: Option<&mut dyn ConstantTable>,
+        mut constants: Option<&mut dyn ConstantTable>,
     ) -> Result<LayoutAssembler, CompileError> {
         if self.python_version <= crate::PythonVersion::Py313 {
             return self.optimize_legacy(
@@ -685,7 +685,10 @@ impl OptimizationPipeline {
                 &mut copied_exit_region_retargets,
                 &reversed_store_handler_exits,
                 &threaded_normal_try_joins,
-            )
+                constants
+                    .as_mut()
+                    .map(|constants| &mut **constants as &mut dyn ConstantTable),
+            )?
         };
         self.borrow_threaded_jump_entries.clear();
         self.borrow_authored_finally_break_origins =

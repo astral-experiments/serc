@@ -1,7 +1,8 @@
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::target::code_flags::{CO_VARARGS, CO_VARKEYWORDS};
 use crate::target::local_kinds::CO_FAST_LOCAL;
@@ -239,6 +240,57 @@ impl MarshalProvenance {
     }
 }
 
+/// Identifies one native allocation without changing its serialized numeric value.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) enum NonReflexiveKey {
+    Source(u64),
+    Allocated(usize),
+}
+
+#[derive(Clone, Debug)]
+enum NonReflexiveIdentity {
+    Source(u64),
+    Allocated(Arc<()>),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NonReflexiveValue {
+    Float(f64),
+    Complex { real: f64, imag: f64 },
+}
+
+/// A NaN-bearing number whose identity survives container copies.
+#[derive(Clone, Debug)]
+pub(crate) struct NonReflexiveNumber {
+    value: NonReflexiveValue,
+    identity: NonReflexiveIdentity,
+}
+
+pub(crate) type NonReflexiveRemap = FxHashMap<NonReflexiveKey, Arc<()>>;
+
+impl NonReflexiveNumber {
+    pub(crate) fn key(&self) -> NonReflexiveKey {
+        match &self.identity {
+            NonReflexiveIdentity::Source(origin) => NonReflexiveKey::Source(*origin),
+            NonReflexiveIdentity::Allocated(owner) => {
+                NonReflexiveKey::Allocated(Arc::as_ptr(owner).addr())
+            }
+        }
+    }
+
+    pub(crate) fn value(&self) -> Constant {
+        match self.value {
+            NonReflexiveValue::Float(value) => Constant::Float(value),
+            NonReflexiveValue::Complex { real, imag } => Constant::Complex { real, imag },
+        }
+    }
+
+    fn reallocate(&mut self, remap: &mut NonReflexiveRemap) {
+        let owner = remap.entry(self.key()).or_insert_with(|| Arc::new(()));
+        self.identity = NonReflexiveIdentity::Allocated(Arc::clone(owner));
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum Constant {
     None,
@@ -255,6 +307,7 @@ pub(crate) enum Constant {
         real: f64,
         imag: f64,
     },
+    NonReflexive(Box<NonReflexiveNumber>),
     String(String),
     SurrogateString(Vec<u8>),
     Bytes(Vec<u8>),
@@ -269,6 +322,76 @@ pub(crate) enum Constant {
 }
 
 impl Constant {
+    /// Records the producing AST operation while pure fold analyses recompute its value.
+    pub(crate) fn with_non_reflexive_origin(self, origin: u64) -> Self {
+        let value = match self {
+            Self::Float(value) if value.is_nan() => NonReflexiveValue::Float(value),
+            Self::Complex { real, imag } if real.is_nan() || imag.is_nan() => {
+                NonReflexiveValue::Complex { real, imag }
+            }
+            other => return other,
+        };
+        Self::NonReflexive(Box::new(NonReflexiveNumber {
+            value,
+            identity: NonReflexiveIdentity::Source(origin),
+        }))
+    }
+
+    /// Returns numeric operands without the allocation identity consumed by an operation.
+    pub(crate) fn into_numeric_value(self) -> Self {
+        match self {
+            Self::NonReflexive(number) => number.value(),
+            other => other,
+        }
+    }
+
+    pub(crate) fn has_non_reflexive_number(&self) -> bool {
+        match self {
+            Self::NonReflexive(_) => true,
+            Self::Tuple(values) | Self::FrozenSet(values) => {
+                values.iter().any(Self::has_non_reflexive_number)
+            }
+            Self::Slice { lower, upper, step } => [lower, upper, step]
+                .into_iter()
+                .any(|value| value.has_non_reflexive_number()),
+            // A copied code constant reuses its already compiled numeric objects.
+            _ => false,
+        }
+    }
+
+    pub(crate) fn has_source_non_reflexive_number(&self) -> bool {
+        match self {
+            Self::NonReflexive(number) => {
+                matches!(number.identity, NonReflexiveIdentity::Source(_))
+            }
+            Self::Tuple(values) | Self::FrozenSet(values) => {
+                values.iter().any(Self::has_source_non_reflexive_number)
+            }
+            Self::Slice { lower, upper, step } => [lower, upper, step]
+                .into_iter()
+                .any(|value| value.has_source_non_reflexive_number()),
+            _ => false,
+        }
+    }
+
+    /// Rebinds one native fold event, preserving aliases throughout its result graph.
+    pub(crate) fn reallocate_non_reflexive_numbers(&mut self, remap: &mut NonReflexiveRemap) {
+        match self {
+            Self::NonReflexive(number) => number.reallocate(remap),
+            Self::Tuple(values) | Self::FrozenSet(values) => {
+                for value in values {
+                    value.reallocate_non_reflexive_numbers(remap);
+                }
+            }
+            Self::Slice { lower, upper, step } => {
+                for value in [lower, upper, step] {
+                    value.reallocate_non_reflexive_numbers(remap);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Applies Python numeric negation, leaving nonnumeric operands to raise at runtime.
     pub(crate) fn negated(self) -> Option<Self> {
         match self {
@@ -310,6 +433,11 @@ impl Constant {
                         digits,
                     })
                 }
+            }
+            Self::NonReflexive(number) => {
+                let mut result = number.value().negated()?.with_non_reflexive_origin(0);
+                result.reallocate_non_reflexive_numbers(&mut NonReflexiveRemap::default());
+                Some(result)
             }
             Self::Float(value) => Some(Self::Float(-value)),
             Self::Complex { real, imag } => Some(Self::Complex {

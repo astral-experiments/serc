@@ -1,9 +1,10 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::{
-    ExceptionExclusion, ExceptionPolicy, ExceptionRegion, Instruction, Item, JUMP_BACKWARD,
-    JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, Label, Operand, OptimizationPipeline, SourceLocation,
-    block_has_fallthrough, block_jump_target, cleanup_block_creation_order, ends_scope,
+    ConstantTable, ExceptionExclusion, ExceptionPolicy, ExceptionRegion, Instruction, Item,
+    JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, Label, Operand, OptimizationPipeline,
+    SourceLocation, block_has_fallthrough, block_jump_target, cleanup_block_creation_order,
+    ends_scope,
 };
 use crate::assembler::block_graph::{BasicBlockId, BlockGraph, ItemPosition};
 use crate::assembler::exception_owners::ExceptionOwnerProvenance;
@@ -3755,7 +3756,9 @@ impl OptimizationPipeline {
             &mut Vec::new(),
             &origins,
             &threaded_normal_try_joins,
+            None,
         )
+        .expect("test constant-free copy does not allocate constants")
     }
 
     pub(in crate::assembler) fn duplicate_exit_blocks_with_store_origins(
@@ -3765,10 +3768,11 @@ impl OptimizationPipeline {
         region_retargets: &mut Vec<(ExceptionRegion, ExceptionRegion)>,
         reversed_store_handler_exits: &ReversedStoreHandlerExits,
         threaded_normal_try_joins: &ThreadedNormalTryJoins,
-    ) -> Vec<Label> {
+        mut constants: Option<&mut dyn ConstantTable>,
+    ) -> Result<Vec<Label>, crate::CompileError> {
         let graph = &mut self.graph;
         if graph.is_normalized_jump_free_single_block(&self.preserved_block_boundaries) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         if !graph.is_normalized(&self.preserved_block_boundaries) {
@@ -3805,7 +3809,7 @@ impl OptimizationPipeline {
                 .expect("certified original cleanup array continuations");
         }
         if graph.len() < 2 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let order = graph.order().to_vec();
@@ -3884,7 +3888,7 @@ impl OptimizationPipeline {
                 &self.preserved_block_boundaries,
                 &self.retained_pop_block_origins,
             );
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let ExitBlockAnalysis {
             positions,
@@ -5070,6 +5074,21 @@ impl OptimizationPipeline {
                     Item::Label(_) => item,
                 })
                 .collect::<Vec<_>>();
+            if inline_small_exit && let Some(constants) = constants.as_deref_mut() {
+                // Native small-exit copying precedes arithmetic folding. Other
+                // copies reuse already allocated constants; code objects always do.
+                let mut remap = crate::code_object::NonReflexiveRemap::default();
+                for item in &mut copied {
+                    if let Item::Instruction(instruction) = item
+                        && instruction.opcode == LOAD_CONST
+                        && let Operand::Value(index) = instruction.operand()
+                    {
+                        let index =
+                            constants.reallocate_non_reflexive_constant(index, &mut remap)?;
+                        instruction.set_operand(Operand::Value(index));
+                    }
+                }
+            }
             // A shared jump keeps its original no-location policy through NOP removal.
             // Its copy has a new predecessor and can inherit that predecessor's location.
             // Read the original labels before they are renamed below.
@@ -7373,7 +7392,7 @@ impl OptimizationPipeline {
                 .collect();
             propagate_normal_try_pop_continuations(graph, &original_pop_ranges, &handler_entries);
         }
-        copied_entry_labels
+        Ok(copied_entry_labels)
     }
 }
 

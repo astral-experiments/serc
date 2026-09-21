@@ -711,3 +711,5 @@ mod literal_statement_spans;
 mod late_constant_boolean_folding;
 mod try_finally_return_exit_locations;
 mod terminal_try_else_donor_locations;
+
+mod nan_allocation_identity;

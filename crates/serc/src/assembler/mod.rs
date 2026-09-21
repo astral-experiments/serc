@@ -322,6 +322,11 @@ pub(crate) trait ConstantTable {
     fn get(&self, index: u32) -> &Constant;
     fn intern(&mut self, constant: Constant) -> Result<u32, CompileError>;
     fn fold_sequence(&mut self, values: Vec<Constant>, is_set: bool) -> Result<u32, CompileError>;
+    fn reallocate_non_reflexive_constant(
+        &mut self,
+        index: u32,
+        remap: &mut crate::code_object::NonReflexiveRemap,
+    ) -> Result<u32, CompileError>;
     fn len(&self) -> usize;
     fn retain_used(
         &mut self,

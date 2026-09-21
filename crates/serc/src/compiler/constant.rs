@@ -20,7 +20,7 @@ use super::Compiler;
 use super::expression::{jump_constant_truthiness, literal_truthiness};
 use super::scope::NameId;
 use super::symbol::{mangle_name, to_u32};
-use crate::code_object::{CodeObject, Constant};
+use crate::code_object::{CodeObject, Constant, NonReflexiveRemap};
 
 #[derive(Debug, Default)]
 pub(super) struct ConstantPool {
@@ -165,6 +165,7 @@ fn constant_pool_fingerprint(constant: &Constant) -> Option<u64> {
                 negative.hash(&mut hasher);
                 digits.hash(&mut hasher);
             }
+            Constant::NonReflexive(number) => number.key().hash(&mut hasher),
             Constant::Float(value) => value.to_bits().hash(&mut hasher),
             Constant::Complex { real, imag } => {
                 real.to_bits().hash(&mut hasher);
@@ -266,6 +267,20 @@ impl crate::assembler::ConstantTable for OutputState {
     }
 
     fn intern(&mut self, constant: Constant) -> Result<u32, CompileError> {
+        self.constants.intern(constant)
+    }
+
+    fn reallocate_non_reflexive_constant(
+        &mut self,
+        index: u32,
+        remap: &mut NonReflexiveRemap,
+    ) -> Result<u32, CompileError> {
+        let constant = &self.constants.values[index as usize];
+        if !constant.has_non_reflexive_number() {
+            return Ok(index);
+        }
+        let constant = constant.clone();
+        let constant = self.reallocate_non_reflexive_value(constant, remap);
         self.constants.intern(constant)
     }
 
@@ -715,6 +730,60 @@ impl Compiler<'_> {
 }
 
 impl OutputState {
+    /// Keeps each fold result and its construction dependencies in one allocation event.
+    fn reallocate_non_reflexive_value(
+        &mut self,
+        mut constant: Constant,
+        remap: &mut NonReflexiveRemap,
+    ) -> Constant {
+        fn collect(
+            constant: &Constant,
+            dependencies: &[(Constant, Vec<Constant>)],
+            seen: &mut Vec<Constant>,
+            collected: &mut Vec<(Constant, Vec<Constant>)>,
+        ) {
+            if seen
+                .iter()
+                .any(|value| ConstantEquality::PoolKey.equal(value, constant))
+            {
+                return;
+            }
+            seen.push(constant.clone());
+            if let Some((result, operands)) = dependencies
+                .iter()
+                .find(|(result, _)| ConstantEquality::PoolKey.equal(result, constant))
+            {
+                for operand in operands {
+                    collect(operand, dependencies, seen, collected);
+                }
+                if result.has_non_reflexive_number() {
+                    collected.push((result.clone(), operands.clone()));
+                }
+            }
+            if let Constant::Tuple(values) | Constant::FrozenSet(values) = constant {
+                for value in values {
+                    collect(value, dependencies, seen, collected);
+                }
+            }
+        }
+        let mut dependencies = Vec::new();
+        collect(
+            &constant,
+            &self.folded_constant_dependencies,
+            &mut Vec::new(),
+            &mut dependencies,
+        );
+        constant.reallocate_non_reflexive_numbers(remap);
+        for (result, operands) in &mut dependencies {
+            result.reallocate_non_reflexive_numbers(remap);
+            for operand in operands {
+                operand.reallocate_non_reflexive_numbers(remap);
+            }
+        }
+        self.folded_constant_dependencies.extend(dependencies);
+        constant
+    }
+
     /// Preserves operand admissions for containers created by late graph folding.
     fn record_folded_constant_dependencies(
         &mut self,
@@ -910,6 +979,14 @@ impl Compiler<'_> {
     }
 
     pub(super) fn add_constant(&mut self, constant: Constant) -> Result<u32, CompileError> {
+        let constant = if self.context.python_version >= PythonVersion::Py314
+            && constant.has_source_non_reflexive_number()
+        {
+            self.output
+                .reallocate_non_reflexive_value(constant, &mut NonReflexiveRemap::default())
+        } else {
+            constant
+        };
         self.context
             .record_constant_string_origins(&constant, false);
         self.output.has_frozenset_constants |= matches!(constant, Constant::FrozenSet(_));
@@ -1167,7 +1244,7 @@ pub(super) fn explicit_surrogate_string(value: &str, source: &str) -> Option<Vec
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConstantEquality {
-    /// Equality for CPython's constant table, including type and floating-point bit identity.
+    /// Constant-table equality, including type, signed zeros, and NaN allocation identity.
     PoolKey,
     /// Python value equality used while folding set-like literals and membership tests.
     PythonValue,
@@ -1179,6 +1256,9 @@ impl ConstantEquality {
         reason = "CPython constant deduplication uses exact numeric equality"
     )]
     fn equal(self, left: &Constant, right: &Constant) -> bool {
+        if let (Constant::NonReflexive(left), Constant::NonReflexive(right)) = (left, right) {
+            return left.key() == right.key();
+        }
         if matches!(self, Self::PythonValue)
             && let (Some((left_real, left_imag)), Some((right_real, right_imag))) =
                 (numeric_parts(left), numeric_parts(right))
@@ -1280,6 +1360,7 @@ fn numeric_parts(value: &Constant) -> Option<(NumericReal, f64)> {
             },
             0.0,
         )),
+        Constant::NonReflexive(number) => numeric_parts(&number.value()),
         Constant::Float(value) => Some((NumericReal::Float(*value), 0.0)),
         Constant::Complex { real, imag } => Some((NumericReal::Float(*real), *imag)),
         _ => None,
@@ -1582,7 +1663,7 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
     if let Some(constant) = literal_constant(expression) {
         return Some(constant);
     }
-    match expression {
+    let result = match expression {
         Expr::Name(name) if name.ctx == ExprContext::Load && name.id.as_str() == "__debug__" => {
             Some(Constant::Bool(true))
         }
@@ -1620,7 +1701,8 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                 | Constant::SignedInt(_)
                 | Constant::BigInt { .. }
                 | Constant::Float(_)
-                | Constant::Complex { .. }) => Some(constant),
+                | Constant::Complex { .. }
+                | Constant::NonReflexive(_)) => Some(constant),
                 _ => None,
             },
             UnaryOp::Not => {
@@ -1629,7 +1711,9 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                 }
                 literal_truthiness(&unary.operand).map(|value| Constant::Bool(!value))
             }
-            UnaryOp::USub => fold_constant(&unary.operand)?.negated(),
+            UnaryOp::USub => fold_constant(&unary.operand)?
+                .into_numeric_value()
+                .negated(),
             UnaryOp::Invert => {
                 let operand = fold_constant(&unary.operand)?;
                 // CPython leaves boolean inversion at runtime for its deprecation warning.
@@ -1647,8 +1731,8 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
             }
         },
         Expr::BinOp(binary) => {
-            let left = fold_constant(&binary.left)?;
-            let right = fold_constant(&binary.right)?;
+            let left = fold_constant(&binary.left)?.into_numeric_value();
+            let right = fold_constant(&binary.right)?.into_numeric_value();
             match (left, binary.op, right) {
                 (left, operator @ (Operator::Add | Operator::Sub | Operator::Mult), right)
                     if is_integer_constant(&left) && is_integer_constant(&right) =>
@@ -1820,7 +1904,10 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
             }
         }
         _ => None,
-    }
+    };
+    let origin = (u64::from(expression.range().start().to_u32()) << 32)
+        | u64::from(expression.range().end().to_u32());
+    result.map(|constant| constant.with_non_reflexive_origin(origin))
 }
 
 fn fold_integer_bitwise(left: &Constant, operator: Operator, right: &Constant) -> Option<Constant> {
@@ -1915,6 +2002,7 @@ fn constant_as_float(constant: &Constant) -> Option<f64> {
         Constant::Bool(value) => Some(f64::from(*value)),
         Constant::Int(value) => Some(*value as f64),
         Constant::SignedInt(value) => Some(*value as f64),
+        Constant::NonReflexive(number) => constant_as_float(&number.value()),
         Constant::Float(value) => Some(*value),
         // Dividing an integer by one provides PyLong_AsDouble's rounding and overflow checks.
         constant => fold_integer_true_divide(constant, &Constant::Int(1)),
@@ -2540,6 +2628,7 @@ fn constant_complex_parts(constant: &Constant) -> Option<(f64, f64)> {
         Constant::BigInt { .. } => {
             fold_integer_true_divide(constant, &Constant::Int(1)).map(|real| (real, 0.0))
         }
+        Constant::NonReflexive(number) => constant_complex_parts(&number.value()),
         Constant::Float(value) => Some((*value, 0.0)),
         Constant::Complex { real, imag } => Some((*real, *imag)),
         _ => None,
@@ -2696,6 +2785,7 @@ pub(super) fn constant_truthiness(constant: &Constant) -> bool {
         Constant::Int(value) => *value != 0,
         Constant::SignedInt(value) => *value != 0,
         Constant::BigInt { digits, .. } => !digits.is_empty(),
+        Constant::NonReflexive(_) => true,
         Constant::Float(value) => *value != 0.0,
         Constant::Complex { real, imag } => *real != 0.0 || *imag != 0.0,
         Constant::String(value) => !value.is_empty(),

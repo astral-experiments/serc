@@ -96,6 +96,14 @@ impl ConstantTable for InterningConstantTable<'_, '_> {
         self.output.intern(constant)
     }
 
+    fn reallocate_non_reflexive_constant(
+        &mut self,
+        index: u32,
+        remap: &mut crate::code_object::NonReflexiveRemap,
+    ) -> Result<u32, CompileError> {
+        self.output.reallocate_non_reflexive_constant(index, remap)
+    }
+
     fn fold_sequence(&mut self, values: Vec<Constant>, is_set: bool) -> Result<u32, CompileError> {
         let index = self.output.fold_sequence(values, is_set)?;
         self.context

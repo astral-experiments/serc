@@ -945,6 +945,7 @@ fn collect_qualified_name_origin_from_constant<'a>(
         | Constant::Int(_)
         | Constant::SignedInt(_)
         | Constant::BigInt { .. }
+        | Constant::NonReflexive(_)
         | Constant::Float(_)
         | Constant::Complex { .. }
         | Constant::String(_)
@@ -1127,7 +1128,8 @@ fn frozenset_intern_dependencies(
             Constant::Tuple(members) | Constant::FrozenSet(members) => {
                 members.iter().all(safe_tuple_member)
             }
-            Constant::Float(_)
+            Constant::NonReflexive(_)
+            | Constant::Float(_)
             | Constant::Complex { .. }
             | Constant::Slice { .. }
             | Constant::Code(_) => false,
@@ -1434,6 +1436,7 @@ fn constant_frozenset_recreation_need(
         | Constant::Int(_)
         | Constant::SignedInt(_)
         | Constant::BigInt { .. }
+        | Constant::NonReflexive(_)
         | Constant::Float(_)
         | Constant::Complex { .. }
         | Constant::String(_)
@@ -1476,6 +1479,7 @@ fn constant_string_recreation_need(
         | Constant::Int(_)
         | Constant::SignedInt(_)
         | Constant::BigInt { .. }
+        | Constant::NonReflexive(_)
         | Constant::Float(_)
         | Constant::Complex { .. }
         | Constant::SurrogateString(_)
@@ -1538,6 +1542,7 @@ fn constant_has_identifier_or_explicit_dependent_frozenset(
         | Constant::Int(_)
         | Constant::SignedInt(_)
         | Constant::BigInt { .. }
+        | Constant::NonReflexive(_)
         | Constant::Float(_)
         | Constant::Complex { .. }
         | Constant::String(_)
@@ -1584,6 +1589,7 @@ fn constant_contains_identifier_or_explicit_dependent_string(
         | Constant::Int(_)
         | Constant::SignedInt(_)
         | Constant::BigInt { .. }
+        | Constant::NonReflexive(_)
         | Constant::Float(_)
         | Constant::Complex { .. }
         | Constant::SurrogateString(_)
@@ -1662,6 +1668,7 @@ fn collect_preinterned_recreated_constant(
         | Constant::Int(_)
         | Constant::SignedInt(_)
         | Constant::BigInt { .. }
+        | Constant::NonReflexive(_)
         | Constant::Float(_)
         | Constant::Complex { .. }
         | Constant::SurrogateString(_)
@@ -2002,6 +2009,7 @@ fn intern_code_constant<'a>(
         | Constant::Int(_)
         | Constant::SignedInt(_)
         | Constant::BigInt { .. }
+        | Constant::NonReflexive(_)
         | Constant::Float(_)
         | Constant::Complex { .. }
         | Constant::SurrogateString(_)
