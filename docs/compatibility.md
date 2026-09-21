@@ -95,4 +95,4 @@ Python 3.12, 3.13, and 3.15 support targets CPython 3.12.14, 3.13.15, and 3.15.0
 Python bytecode and marshal formats are not stable across Python releases. Changes to the compiler
 are accepted only when every CPython-accepted input in the required pinned corpus remains
 byte-identical and the frozen outcome counts remain unchanged unless intentionally advanced. Serc was authored entirely
-by GPT in Codex.
+by GPT-6 Astra in Codex.

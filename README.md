@@ -4,7 +4,7 @@ A Python bytecode compiler, written in Rust.
 
 > [!WARNING]
 > Serc is experimental. All code changes, PR summaries, and additional documentation
-> were authored by GPT in Codex.
+> were authored entirely by GPT-6 Astra in Codex.
 > Use at your own risk.
 
 ## Highlights
