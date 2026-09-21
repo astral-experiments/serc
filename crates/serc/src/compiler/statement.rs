@@ -19456,7 +19456,14 @@ impl Compiler<'_> {
                     _ => None,
                 })
                 .flatten()
-                .or_else(|| loop_false_fallthrough_range(normal_exit_suite));
+                .or_else(|| {
+                    // A try's while-else exit retains its existing cleanup donor rules.
+                    // Only a final for-else condition adds a newly certified donor here.
+                    let Some(Stmt::For(_)) = normal_exit_suite.last() else {
+                        return None;
+                    };
+                    loop_false_fallthrough_range(normal_exit_suite)
+                });
             let nested_else_while_exit_location = if !statement.is_star
                 && statement.orelse.is_empty()
                 && let Some(Stmt::If(branch)) = statement.body.last()
