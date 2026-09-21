@@ -25021,7 +25021,8 @@ impl Compiler<'_> {
                 }));
         // A guarded recovery retains a live POP_EXCEPT route into normal cleanup.
         // A plain companion containing work or only pass statements does not remove
-        // that route. Copied loop and nested cleanup exits keep their separate rules.
+        // that route. Named companions retain their own normal name-clearing cleanup.
+        // Copied loop and nested cleanup exits keep their separate rules.
         let plain_handler_shares_guarded_cleanup = synchronous_recovery
             && matches!(self.unit.scope, Scope::Function { .. })
             && statement.orelse.is_empty()
@@ -25037,11 +25038,6 @@ impl Compiler<'_> {
             && self.control.finally.active_finally_try_bodies == 0
             && suite_has_linear_borrow_fallthrough(&statement.body)
             && !suite_contains_abrupt_control_flow(&statement.finalbody)
-            && statement.handlers.iter().all(|handler| {
-                handler
-                    .as_except_handler()
-                    .is_some_and(|handler| handler.name.is_none())
-            })
             && statement.handlers.iter().any(|handler| {
                 handler
                     .as_except_handler()

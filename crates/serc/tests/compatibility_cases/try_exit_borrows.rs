@@ -5218,3 +5218,40 @@ fn preserves_copied_pass_recovery_borrow_fallthrough_and_independent_jumps() {
     );
     common::assert_matches_cpython_marshal(&live_bypass, "copied_pass_recovery_live_bypass.py");
 }
+
+#[test]
+fn borrows_through_named_plain_companions_of_guarded_handlers() {
+    for (name_plain, name_guard) in [(false, false), (true, true), (false, true), (true, false)] {
+        for guard_index in 0..3 {
+            for cleanup in [
+                "owner.state = marker\n",
+                "if owner.ready:\n    finish(owner)\n",
+            ] {
+                let mut recovery = String::from("try:\n    work(value)\n");
+                for index in 0..3 {
+                    let guarded = index == guard_index;
+                    let named = if guarded { name_guard } else { name_plain };
+                    let name = if named { " as error" } else { "" };
+                    let body = if guarded {
+                        "if flag:\n    raise\nrecover(value)\n"
+                    } else {
+                        "consume(value)\n"
+                    };
+                    recovery.push_str(&format!(
+                        "except Error{index}{name}:\n{}",
+                        indent_finally_borrow_case(body),
+                    ));
+                }
+                recovery.push_str(&format!(
+                    "finally:\n{}",
+                    indent_finally_borrow_case(cleanup)
+                ));
+                let source = format!(
+                    "def function(owner, flag, value, marker):\n{}    return value\n",
+                    indent_finally_borrow_case(&recovery),
+                );
+                common::assert_matches_cpython_marshal(&source, "named_companion_finally.py");
+            }
+        }
+    }
+}
