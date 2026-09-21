@@ -16358,10 +16358,11 @@ impl Compiler<'_> {
                 {
                     self.assembler.allow_borrow_surviving_break_entry(end);
                 }
-                // A guarded finalizer inside one outer async manager has a populated
-                // normal entry. Keep the loop barrier, but let surviving authored breaks
-                // reach that entry; empty finalizers and removed breaks stay disconnected.
-                if self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+                // A surviving break enters the populated normal-finally array even
+                // under an outer manager. Keep the removed-break barrier: only the
+                // assembler's surviving authored jump can open this original entry.
+                // Suspension changes the manager exit, not this direct cleanup edge.
+                if matches!(self.unit.scope, Scope::Function { .. })
                     && !self.control.statements.current_statement_has_following
                     && self.control.loops.contexts.is_empty()
                     && self.control.exceptions.active_exception_handlers.is_empty()
@@ -16373,8 +16374,7 @@ impl Compiler<'_> {
                     && self.control.finally.innermost_finally_exception_exclusion_depth
                         == Some(self.control.exceptions.active_exception_region_exclusions.len())
                     && matches!(self.control.withs.active_with_exits.as_slice(), [manager]
-                        if manager.is_async
-                            && manager.loop_depth == 0
+                        if manager.loop_depth == 0
                             && manager.exception_region_depth + 1
                                 == self.control.exceptions.active_exception_region_exclusions.len())
                     && self.control.finally.active_return_finally_contexts.last().is_some_and(|context| {
@@ -16384,77 +16384,40 @@ impl Compiler<'_> {
                             && context.exception_region_depth + 1
                                 == self.control.exceptions.active_exception_region_exclusions.len()
                             && !suite_contains_yield(&context.body)
-                            && context.body.split_first().is_some_and(|(entry, tail)| {
-                                matches!(entry, Stmt::If(cleanup)
-                                    if condition_has_linear_runtime_leaves(&cleanup.test)
-                                        && !expression_suspends_current_scope(&cleanup.test)
-                                        && cleanup.elif_else_clauses.is_empty()
-                                        && (suite_has_linear_borrow_fallthrough(&cleanup.body)
-                                            || matches!(cleanup.body.as_slice(), [Stmt::If(nested)]
-                                                if condition_has_linear_runtime_leaves(&nested.test)
-                                                    && !expression_suspends_current_scope(&nested.test)
-                                                    && nested.elif_else_clauses.is_empty()
-                                                    && suite_has_linear_borrow_fallthrough(&nested.body)))
-                                        && (tail.is_empty() || suite_has_linear_borrow_fallthrough(tail)))
-                            })
+                            && (self.suite_has_nonempty_borrow_entry(&context.body)
+                                // Preserve the existing synchronous recovery entry,
+                                // whose call survives even when its setup NOP shares a line.
+                                || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                                    && !self.control.withs.active_with_exits[0].is_async
+                                    && suite_has_live_conditional_break(&statement.body, true)
+                                    && matches!(context.body.as_slice(), [Stmt::Try(cleanup)]
+                                        if !cleanup.is_star
+                                            && cleanup.orelse.is_empty()
+                                            && cleanup.finalbody.is_empty()
+                                            && matches!(cleanup.body.as_slice(), [Stmt::Expr(call)]
+                                                if matches!(call.value.as_ref(), Expr::Call(_))
+                                                    && !expression_contains_inline_branch(&call.value)
+                                                    && !expression_suspends_current_scope(&call.value))
+                                            && matches!(cleanup.handlers.as_slice(), [handler]
+                                                if handler.as_except_handler().is_some_and(|handler| {
+                                                    handler.type_.is_some()
+                                                        && handler.name.is_none()
+                                                        && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+                                                }))))
+                                || context.body.split_first().is_some_and(|(entry, tail)| {
+                                    matches!(entry, Stmt::If(cleanup)
+                                        if condition_has_linear_runtime_leaves(&cleanup.test)
+                                            && !expression_suspends_current_scope(&cleanup.test)
+                                            && cleanup.elif_else_clauses.is_empty()
+                                            && (suite_has_linear_borrow_fallthrough(&cleanup.body)
+                                                || matches!(cleanup.body.as_slice(), [Stmt::If(nested)]
+                                                    if condition_has_linear_runtime_leaves(&nested.test)
+                                                        && !expression_suspends_current_scope(&nested.test)
+                                                        && nested.elif_else_clauses.is_empty()
+                                                        && suite_has_linear_borrow_fallthrough(&nested.body)))
+                                            && (tail.is_empty() || suite_has_linear_borrow_fallthrough(tail)))
+                                }))
                     })
-                {
-                    self.assembler.allow_borrow_surviving_break_entry(end);
-                }
-                // A call or separate call recovery keeps the normal finally target
-                // populated inside one synchronous manager. Retain the loop barrier
-                // and admit only authored breaks into that original cleanup array.
-                if matches!(self.unit.scope, Scope::Function { .. })
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-                    && !self.control.statements.current_statement_has_following
-                    && statement.orelse.is_empty()
-                    && self.control.loops.contexts.is_empty()
-                    && self.control.exceptions.active_exception_handlers.is_empty()
-                    && self.control.exceptions.active_exception_group_handlers == 0
-                    && self.control.finally.active_normal_finally_bodies == 0
-                    && self.control.finally.active_finally_end_blocks == 0
-                    && self.control.finally.active_copied_finally_bodies == 0
-                    && self.control.withs.active_with_region_exclusions.len() == 1
-                    && self
-                        .control
-                        .finally
-                        .innermost_finally_exception_exclusion_depth
-                        == Some(
-                            self.control
-                                .exceptions
-                                .active_exception_region_exclusions
-                                .len(),
-                        )
-                    && matches!(self.control.withs.active_with_exits.as_slice(), [manager]
-                        if !manager.is_async
-                            && manager.loop_depth == 0
-                            && manager.exception_region_depth + 1
-                                == self.control.exceptions.active_exception_region_exclusions.len())
-                    && suite_has_live_conditional_break(&statement.body, true)
-                    && matches!(self.control.finally.active_return_finally_contexts.as_slice(), [context]
-                    if context.loop_depth == 0
-                        && context.with_depth == 1
-                        && context.handler_depth == 0
-                        && context.exception_region_depth + 1
-                            == self.control.exceptions.active_exception_region_exclusions.len()
-                        && (matches!(context.body.as_slice(), [Stmt::Expr(call)]
-                            if matches!(call.value.as_ref(), Expr::Call(_))
-                                && !expression_contains_inline_branch(&call.value)
-                                && !expression_suspends_current_scope(&call.value))
-                            || matches!(context.body.as_slice(), [Stmt::Try(cleanup)]
-                                if !cleanup.is_star
-                                    && cleanup.orelse.is_empty()
-                                    && cleanup.finalbody.is_empty()
-                                    && matches!(cleanup.body.as_slice(), [Stmt::Expr(call)]
-                                        if matches!(call.value.as_ref(), Expr::Call(_))
-                                            && !expression_contains_inline_branch(&call.value)
-                                            && !expression_suspends_current_scope(&call.value))
-                                    && matches!(cleanup.handlers.as_slice(), [handler]
-                                        if handler.as_except_handler().is_some_and(|handler| {
-                                            handler.type_.is_some()
-                                                && handler.name.is_none()
-                                                && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
-                                        })))))
                 {
                     self.assembler.allow_borrow_surviving_break_entry(end);
                 }

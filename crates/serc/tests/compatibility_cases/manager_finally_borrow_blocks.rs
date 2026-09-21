@@ -240,3 +240,62 @@ fn matches_cpython_sync_conditional_nested_finally_nop_owners() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_manager_finally_surviving_break_entries() {
+    for (prefix, manager, work) in [
+        ("def", "with", "work(value)"),
+        ("def", "with", "yield value"),
+        ("async def", "async with", "await work(value)"),
+        ("async def", "async with", "yield value"),
+    ] {
+        for cleanup in [
+            "manager.value = value",
+            "close(value)",
+            "if value:\n                value.close()",
+        ] {
+            let source = format!(
+                "{prefix} f(manager, flag, other, value):
+    {manager} manager:
+        try:
+            while True:
+                {work}
+                if flag is not None and other:
+                    break
+                if flag:
+                    value = work(value)
+                    if other:
+                        break
+        finally:
+            {cleanup}
+"
+            );
+            common::assert_matches_cpython_marshal(&source, "managed_finally_break_entry.py");
+        }
+    }
+}
+
+#[test]
+fn matches_cpython_manager_finally_removed_break_entry_controls() {
+    for (prefix, manager) in [("def", "with"), ("async def", "async with")] {
+        for cleanup in [
+            "pass",
+            "manager.value = value",
+            "while flag:\n                close(value)",
+            "try: close(value)\n            except Exception: pass",
+        ] {
+            let source = format!(
+                "{prefix} f(manager, flag, value):
+    {manager} manager:
+        try:
+            while True:
+                work(value)
+                break
+        finally:
+            {cleanup}
+"
+            );
+            common::assert_matches_cpython_marshal(&source, "managed_finally_removed_break.py");
+        }
+    }
+}
