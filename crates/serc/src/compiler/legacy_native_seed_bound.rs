@@ -9,8 +9,8 @@
 //! Normalization adds unlabeled bridges only, so S + U + J + C bounds every label.
 //!
 //! This certificate controls initial `EXTENDED_ARG` widths, not final jump distances.
-//! Unsupported syntax declines the complete code object. In particular, finally
-//! copies and pattern failure stacks require additional source-generation proofs.
+//! Unsupported syntax declines the complete code object. Finally copies follow
+//! native frame unwinding; pattern failure stacks remain unsupported.
 
 use ruff_python_ast::{
     Comprehension, Expr, FStringPart, InterpolatedStringElement, Parameters, Stmt, UnaryOp,
@@ -45,10 +45,19 @@ impl Counts {
     }
 }
 
+/// Only these native frame roles affect the source budget or stop an unwind.
+#[derive(Clone, Copy)]
+enum Frame<'ast> {
+    Loop,
+    AsyncManager,
+    Finally(&'ast [Stmt]),
+    ExceptStarBarrier,
+}
+
 #[derive(Default)]
-struct Counter {
+struct Counter<'ast> {
     counts: Counts,
-    async_managers: u32,
+    frames: Vec<Frame<'ast>>,
     has_await: bool,
 }
 
@@ -66,8 +75,8 @@ fn count(length: usize) -> u32 {
     u32::try_from(length).unwrap_or(u32::MAX)
 }
 
-impl Counter {
-    fn suite(&mut self, statements: &[Stmt]) -> Option<()> {
+impl<'ast> Counter<'ast> {
+    fn suite(&mut self, statements: &'ast [Stmt]) -> Option<()> {
         // Native source generation visits discarded suites and post-return tails.
         for statement in statements {
             if self.counts.max_label() >= 256 {
@@ -78,7 +87,7 @@ impl Counter {
         Some(())
     }
 
-    fn statement(&mut self, statement: &Stmt) -> Option<()> {
+    fn statement(&mut self, statement: &'ast Stmt) -> Option<()> {
         match statement {
             Stmt::Assign(assignment) => {
                 self.expression(&assignment.value)?;
@@ -103,14 +112,12 @@ impl Counter {
             }
             Stmt::Expr(expression) => self.expression(&expression.value)?,
             Stmt::Return(statement) => {
-                self.unwind();
-                self.counts.add(0, 0, 1);
                 self.optional(statement.value.as_deref())?;
+                self.unwind(false)?;
+                self.counts.add(0, 0, 1);
             }
             Stmt::Break(_) | Stmt::Continue(_) => {
-                // Some loop exits stop before outer managers; charging all
-                // active managers is conservative and needs no frame-stack copy.
-                self.unwind();
+                self.unwind(true)?;
                 self.counts.add(0, 1, 0);
             }
             Stmt::Raise(statement) => {
@@ -142,9 +149,11 @@ impl Counter {
             }
             Stmt::While(statement) => {
                 self.counts.add(4, 0, 0);
+                self.frames.push(Frame::Loop);
                 self.condition(&statement.test)?;
                 self.suite(&statement.body)?;
                 self.condition(&statement.test)?;
+                self.frames.pop();
                 self.suite(&statement.orelse)?;
             }
             Stmt::For(statement) => {
@@ -152,7 +161,9 @@ impl Counter {
                 self.counts.add(labels, jumps, 0);
                 self.expression(&statement.iter)?;
                 self.expression(&statement.target)?;
+                self.frames.push(Frame::Loop);
                 self.suite(&statement.body)?;
+                self.frames.pop();
                 self.suite(&statement.orelse)?;
             }
             Stmt::With(statement) => {
@@ -162,37 +173,34 @@ impl Counter {
                     self.expression(&item.context_expr)?;
                     self.optional(item.optional_vars.as_deref())?;
                 }
-                let previous = self.async_managers;
+                let previous = self.frames.len();
                 if statement.is_async {
-                    self.async_managers = previous.saturating_add(count(statement.items.len()));
+                    self.frames.extend(std::iter::repeat_n(
+                        Frame::AsyncManager,
+                        statement.items.len(),
+                    ));
                 }
                 self.suite(&statement.body)?;
-                self.async_managers = previous;
+                self.frames.truncate(previous);
             }
             Stmt::Try(statement) => {
-                if !statement.finalbody.is_empty() {
-                    return None;
-                }
-                if statement.is_star {
-                    self.counts.add(7, 4, 2);
+                if statement.finalbody.is_empty() {
+                    self.try_except(statement)?;
                 } else {
+                    // Native reserves body/end/exit/cleanup and emits one normal
+                    // jump plus two reraises around its normal/exceptional copies.
                     self.counts.add(4, 1, 2);
-                }
-                self.suite(&statement.body)?;
-                self.suite(&statement.orelse)?;
-                for handler in &statement.handlers {
-                    let handler = handler.as_except_handler()?;
-                    if statement.is_star {
-                        self.counts.add(5, 4, 0);
+                    self.frames.push(Frame::Finally(&statement.finalbody));
+                    if statement.handlers.is_empty() {
+                        self.suite(&statement.body)?;
                     } else {
-                        self.counts.add(
-                            if handler.name.is_some() { 3 } else { 2 },
-                            1 + u32::from(handler.type_.is_some()),
-                            u32::from(handler.name.is_some()),
-                        );
+                        self.try_except(statement)?;
                     }
-                    self.optional(handler.type_.as_deref())?;
-                    self.suite(&handler.body)?;
+                    self.frames.pop();
+                    self.suite(&statement.finalbody)?;
+                    // FINALLY_END only pops stack values on unwind, so it adds
+                    // no projected frame or label/jump/exit budget.
+                    self.suite(&statement.finalbody)?;
                 }
             }
             Stmt::FunctionDef(definition) => {
@@ -232,12 +240,65 @@ impl Counter {
         Some(())
     }
 
-    fn unwind(&mut self) {
-        self.counts.add(
-            self.async_managers.saturating_mul(3),
-            self.async_managers.saturating_mul(2),
-            0,
-        );
+    /// Mirrors native pop/cleanup/recurse/restore, including unreachable copies.
+    fn unwind(&mut self, stop_at_loop: bool) -> Option<()> {
+        if self.counts.max_label() >= 256 {
+            return None;
+        }
+        let Some(frame) = self.frames.pop() else {
+            return Some(());
+        };
+        let result = match frame {
+            Frame::Loop if stop_at_loop => Some(()),
+            Frame::Loop => self.unwind(stop_at_loop),
+            Frame::AsyncManager => {
+                self.counts.add(3, 2, 0);
+                self.unwind(stop_at_loop)
+            }
+            Frame::Finally(body) => {
+                // Its own frame is already removed. A return in the copied suite
+                // may unwind outer frames, after which this original unwind must
+                // still visit those outer frames again, just as native codegen does.
+                self.suite(body).and_then(|()| self.unwind(stop_at_loop))
+            }
+            Frame::ExceptStarBarrier => None,
+        };
+        self.frames.push(frame);
+        result
+    }
+
+    fn try_except(&mut self, statement: &'ast ruff_python_ast::StmtTry) -> Option<()> {
+        if statement.is_star {
+            self.counts.add(7, 4, 2);
+        } else {
+            self.counts.add(4, 1, 2);
+        }
+        self.suite(&statement.body)?;
+        if !statement.is_star {
+            self.suite(&statement.orelse)?;
+        }
+        for handler in &statement.handlers {
+            let handler = handler.as_except_handler()?;
+            if statement.is_star {
+                self.counts.add(5, 4, 0);
+                self.frames.push(Frame::ExceptStarBarrier);
+            } else {
+                self.counts.add(
+                    if handler.name.is_some() { 3 } else { 2 },
+                    1 + u32::from(handler.type_.is_some()),
+                    u32::from(handler.name.is_some()),
+                );
+            }
+            self.optional(handler.type_.as_deref())?;
+            self.suite(&handler.body)?;
+            if statement.is_star {
+                self.frames.pop();
+            }
+        }
+        if statement.is_star {
+            self.suite(&statement.orelse)?;
+        }
+        Some(())
     }
 
     fn parameters(&mut self, parameters: &Parameters) -> Option<()> {
@@ -578,15 +639,14 @@ mod tests {
                 exits: 9
             }),
         );
-        // The outer manager is not actually unwound by this break; charging it
-        // too is the deliberate upper bound, and its depth is restored after it.
+        // The loop-local break does not unwind its enclosing manager.
         assert_eq!(
             counts(
                 "async def f():\n    async with manager():\n        for item in items:\n            break\n"
             ),
             Some(Counts {
-                labels: 24,
-                jumps: 14,
+                labels: 21,
+                jumps: 12,
                 exits: 5
             }),
         );
@@ -612,6 +672,167 @@ mod tests {
                 exits: 5
             }),
         );
+    }
+
+    #[test]
+    fn finally_counts_normal_exceptional_and_unwinding_copies() {
+        assert_eq!(
+            counts("def f():\n    try:\n        work()\n    finally:\n        cleanup()\n"),
+            Some(Counts {
+                labels: 6,
+                jumps: 1,
+                exits: 5,
+            }),
+        );
+        assert_eq!(
+            counts(
+                "def f(flag):\n    try:\n        return value\n    finally:\n        if flag:\n            cleanup()\n"
+            ),
+            Some(Counts {
+                labels: 9,
+                jumps: 4,
+                exits: 6,
+            }),
+        );
+        assert_eq!(
+            counts("def f():\n    try:\n        work()\n    finally:\n        raise Error\n"),
+            Some(Counts {
+                labels: 6,
+                jumps: 1,
+                exits: 7,
+            }),
+        );
+    }
+
+    #[test]
+    fn nested_finally_returns_restore_frames_before_original_unwind_continues() {
+        // Three inner and six outer copies: a return in the copied inner
+        // finalizer does not suppress the original unwind's outer copy.
+        assert_eq!(
+            counts(
+                "def f(inner, outer):\n    try:\n        try:\n            return payload\n        finally:\n            if inner:\n                return inner_result\n    finally:\n        if outer:\n            return outer_result\n"
+            ),
+            Some(Counts {
+                labels: 19,
+                jumps: 11,
+                exits: 17,
+            }),
+        );
+        // The manager is crossed four times, including after the copied
+        // finalizer's return; normal and exceptional manager awaits are separate.
+        assert_eq!(
+            counts(
+                "async def f():\n    async with manager():\n        try:\n            return value\n        finally:\n            return other\n"
+            ),
+            Some(Counts {
+                labels: 33,
+                jumps: 18,
+                exits: 11,
+            }),
+        );
+    }
+
+    #[test]
+    fn loop_exits_copy_only_finalizers_inside_the_target_loop() {
+        assert_eq!(
+            counts(
+                "def f(items, active):\n    for item in items:\n        try:\n            break\n        finally:\n            if active:\n                continue\n"
+            ),
+            Some(Counts {
+                labels: 13,
+                jumps: 10,
+                exits: 5,
+            }),
+        );
+        assert_eq!(
+            counts(
+                "def f(items, active):\n    try:\n        for item in items:\n            break\n    finally:\n        if active:\n            cleanup()\n"
+            ),
+            Some(Counts {
+                labels: 12,
+                jumps: 6,
+                exits: 5,
+            }),
+        );
+    }
+
+    #[test]
+    fn finally_frames_remain_active_through_handlers_and_else() {
+        assert_eq!(
+            counts(
+                "def f(flag):\n    try:\n        work()\n    except Error:\n        if flag:\n            return value\n    else:\n        return other\n    finally:\n        if flag:\n            cleanup()\n"
+            ),
+            Some(Counts {
+                labels: 17,
+                jumps: 9,
+                exits: 9,
+            }),
+        );
+        assert_eq!(
+            counts(
+                "def f(flag, items):\n    try:\n        work()\n    except* Error:\n        for item in items:\n            break\n    else:\n        return other\n    finally:\n        if flag:\n            cleanup()\n"
+            ),
+            Some(Counts {
+                labels: 25,
+                jumps: 15,
+                exits: 8,
+            }),
+        );
+        // A loop inside except* stops before the handler barrier, as above.
+        // Exits crossing that barrier cannot receive a certificate.
+        for source in [
+            "def f():\n    try:\n        work()\n    except* Error:\n        return\n    finally:\n        cleanup()\n",
+            "def f():\n    while condition:\n        try:\n            work()\n        except* Error:\n            break\n        finally:\n            cleanup()\n",
+        ] {
+            assert_eq!(counts(source), None, "{source}");
+        }
+    }
+
+    #[test]
+    fn finally_dead_tails_and_repeated_copies_keep_the_strict_bound() {
+        assert_eq!(
+            counts(
+                "def f(flag):\n    try:\n        return value\n    finally:\n        return other\n        if flag:\n            cleanup()\n"
+            ),
+            Some(Counts {
+                labels: 9,
+                jumps: 4,
+                exits: 9,
+            }),
+        );
+        let source = format!(
+            "def f(flag):\n    try:\n        pass\n    finally:\n{}",
+            "        if flag:\n            pass\n".repeat(30),
+        );
+        let budget = counts(&source).unwrap();
+        assert_eq!(
+            budget,
+            Counts {
+                labels: 66,
+                jumps: 61,
+                exits: 5,
+            },
+        );
+        assert_eq!(budget.max_label(), 255);
+        let parsed = parse_module(&source).unwrap();
+        let Stmt::FunctionDef(function) = &parsed.suite()[0] else {
+            panic!()
+        };
+        assert!(certifies(&function.body));
+
+        let source = format!("{source}    raise Error\n");
+        assert_eq!(counts(&source).unwrap().max_label(), 256);
+        let parsed = parse_module(&source).unwrap();
+        let Stmt::FunctionDef(function) = &parsed.suite()[0] else {
+            panic!()
+        };
+        assert!(!certifies(&function.body));
+
+        let source = format!(
+            "def f(flag):\n    try:\n        return\n    finally:\n        return\n{}",
+            "        if flag:\n            pass\n".repeat(300),
+        );
+        assert_eq!(counts(&source), None);
     }
 
     #[test]
@@ -665,7 +886,6 @@ mod tests {
     #[test]
     fn unsupported_allocation_routes_decline_the_whole_function() {
         for source in [
-            "def f():\n    try:\n        work()\n    finally:\n        finish()\n",
             "def f(value):\n    match value:\n        case _: pass\n",
             "def f():\n    def generic[T]():\n        pass\n",
             "def f():\n    type Alias = int\n",

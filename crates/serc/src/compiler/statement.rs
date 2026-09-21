@@ -1746,7 +1746,17 @@ impl Compiler<'_> {
                         continue;
                     }
                     Stmt::With(statement) => {
-                        self.compile_async_with(statement, true)?;
+                        if self.context.python_version == crate::PythonVersion::Py312 {
+                            // Native 3.12 emits both manager exits before its shared
+                            // unlocated footer. Keep that original block until CFG
+                            // copying, so the manager end and StopIteration handler
+                            // retain their distinct original label operands.
+                            self.compile_async_with(statement, false)?;
+                            self.assembler.set_location(SourceLocation::NONE);
+                            self.emit_deferred_implicit_return()?;
+                        } else {
+                            self.compile_async_with(statement, true)?;
+                        }
                         self.control.statements.emitted_fallthrough_return = true;
                         continue;
                     }
@@ -1754,16 +1764,25 @@ impl Compiler<'_> {
                         if self.context.python_version <= crate::PythonVersion::Py313
                             && !statement.is_star
                             && statement.orelse.is_empty()
-                            && statement.finalbody.is_empty()
-                            && (matches!(statement.body.last(), Some(Stmt::While(_)))
+                            && ((statement.finalbody.is_empty()
+                                && (matches!(statement.body.last(), Some(Stmt::While(_)))
+                                    || (self.context.python_version
+                                        == crate::PythonVersion::Py312
+                                        && matches!(
+                                            statement.body.last(),
+                                            Some(Stmt::If(_) | Stmt::Try(_))
+                                        ))))
                                 || (self.context.python_version
                                     == crate::PythonVersion::Py312
-                                    && matches!(statement.body.last(), Some(Stmt::If(_))))) =>
+                                    && matches!(
+                                        statement.finalbody.last(),
+                                        Some(Stmt::If(_) | Stmt::Try(_))
+                                    ))) =>
                     {
                         // Preserve the original normal try exit and shared footer. The
                         // loop tests need distinct return paths; 3.12's two single-pass
-                        // copy rounds must also visit nested conditional exits before
-                        // their successors acquire a copied footer.
+                        // copy rounds must visit nested conditional and cleanup exits before
+                        // their enclosing try or finally exit acquires a copied footer.
                         let previous = self.assembler.location();
                         self.assembler
                             .set_location(self.source_location(statement.range));
@@ -1781,6 +1800,18 @@ impl Compiler<'_> {
                         let result = self.compile_try_inner(statement, TryCompileOptions::TERMINAL);
                         self.assembler.set_location(previous);
                         result?;
+                        self.control.statements.emitted_fallthrough_return = true;
+                        continue;
+                    }
+                    Stmt::Match(statement)
+                        if self.context.python_version == crate::PythonVersion::Py312 =>
+                    {
+                        // Keep the original case-success jumps and one shared footer.
+                        // 3.12's two forward copy rounds must visit earlier case exits
+                        // before later compound joins acquire a copied return.
+                        self.compile_match(statement)?;
+                        self.assembler.set_location(SourceLocation::NONE);
+                        self.emit_deferred_implicit_return()?;
                         self.control.statements.emitted_fallthrough_return = true;
                         continue;
                     }
@@ -3157,7 +3188,7 @@ impl Compiler<'_> {
                 .any(|body| {
                     matches!(body.last(), Some(Stmt::While(_)))
                         || (self.context.python_version == crate::PythonVersion::Py312
-                            && (matches!(body.last(), Some(Stmt::Try(_) | Stmt::If(_)))
+                            && (matches!(body.last(), Some(Stmt::Try(_) | Stmt::If(_) | Stmt::Match(_)))
                                 || matches!(body.last(), Some(Stmt::For(loop_statement))
                                     if loop_statement.is_async)
                                 || body.iter().any(|statement| {
@@ -4523,7 +4554,12 @@ impl Compiler<'_> {
                 let marker_end = self.assembler.instruction_count();
                 if self.context.python_version == crate::PythonVersion::Py312
                     && self.control.withs.active_with_exits.len() == context.with_depth
-                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_handlers
+                        .iter()
+                        .all(|handler| handler.loop_depth < self.control.loops.contexts.len())
                     && self.control.exceptions.active_exception_group_handlers == 0
                     && self.control.finally.active_loop_finally_contexts.is_empty()
                     && self.control.finally.active_finally_try_bodies == 0
@@ -4531,7 +4567,8 @@ impl Compiler<'_> {
                     && self.control.finally.active_normal_finally_bodies == 0
                     && self.control.finally.active_copied_finally_bodies == 0
                 {
-                    // Only ordinary try bodies lie between this break and its loop.
+                    // Only ordinary try bodies lie between this break and its loop;
+                    // handlers surrounding the loop remain active after the break.
                     // Native 3.12 keeps their POP_BLOCKs through exit copying and
                     // NOP cleanup, so the last ownerless POP retains the break line.
                     let ordinary_try_pops = self

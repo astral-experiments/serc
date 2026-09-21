@@ -2994,3 +2994,267 @@ fn python_312_nested_terminal_if_retains_shared_footer_order() {
     );
     assert!(function.exception_table.is_empty());
 }
+
+#[test]
+fn python312_terminal_async_manager_keeps_original_footer_jump_seed() {
+    // Captured from CPython 3.12.14. The initial native labels are small, but
+    // this scope exceeds the conservative uniform-seed bound. Its cold await
+    // bridge must converge to 255 without an unnecessary EXTENDED_ARG.
+    let mut source = String::from("async def f(cm, flag, work):\n");
+    source.push_str(&"    if flag:\n        value = 0\n".repeat(60));
+    source.push_str("    await work()\n");
+    source.push_str(&"    value = 0\n".repeat(111));
+    source.push_str("    async with cm:\n        pass\n");
+    let module = compile(&source, PythonVersion::Py312);
+    let function = child(&module, "f");
+    let mut bytecode = vec![75, 0, 1, 0, 151, 0];
+    bytecode.extend([124, 1, 114, 2, 100, 1, 125, 3].repeat(60));
+    bytecode.extend([
+        2, 0, 124, 2, 171, 0, 0, 0, 0, 0, 0, 0, 131, 0, 100, 0, 123, 3, 0, 0, 150, 2, 151, 3, 134,
+        5, 5, 0, 1, 0,
+    ]);
+    bytecode.extend([100, 1, 125, 3].repeat(111));
+    bytecode.extend([
+        124, 0, 52, 0, 131, 1, 100, 0, 123, 3, 0, 0, 150, 2, 151, 3, 134, 5, 5, 0, 1, 0, 9, 0, 100,
+        0, 100, 0, 100, 0, 171, 2, 0, 0, 0, 0, 0, 0, 131, 2, 100, 0, 123, 3, 0, 0, 150, 2, 151, 3,
+        134, 5, 5, 0, 1, 0, 121, 0, 55, 0, 140, 255, 55, 0, 140, 24, 55, 0, 140, 9, 35, 0, 49, 0,
+        131, 2, 100, 0, 123, 4, 0, 0, 150, 3, 151, 3, 134, 5, 55, 0, 5, 0, 115, 1, 119, 2, 1, 0,
+        89, 0, 1, 0, 1, 0, 121, 0, 120, 3, 89, 0, 119, 1, 173, 3, 119, 1,
+    ]);
+    assert_eq!(function.bytecode, bytecode);
+    assert_eq!(
+        function.exception_table,
+        [
+            130, 67, 59, 72, 24, 1, 195, 61, 1, 71, 61, 4, 195, 62, 67, 40, 72, 24, 1, 199, 38, 1,
+            71, 63, 6, 199, 39, 3, 72, 24, 1, 199, 42, 2, 72, 3, 3, 199, 44, 11, 72, 24, 1, 199,
+            55, 1, 72, 1, 4, 199, 56, 6, 72, 24, 1, 199, 63, 1, 72, 24, 1, 200, 1, 1, 72, 24, 1,
+            200, 3, 6, 72, 21, 7, 200, 9, 1, 72, 12, 12, 200, 10, 7, 72, 21, 7, 200, 17, 7, 72, 24,
+            1,
+        ]
+    );
+}
+
+#[test]
+fn python312_finally_bound_preserves_backward_jump_at_one_byte_boundary() {
+    // Captured from CPython 3.12.14. Finally source emission formerly declined
+    // the uniform native seed certificate. Its small label budget must let the
+    // loop converge to 255 instead of preserving a spurious EXTENDED_ARG at 256.
+    let mut source =
+        String::from("def f(flag):\n    try:\n        work()\n    finally:\n        cleanup()\n");
+    source.push_str(&"    padding = 0\n".repeat(150));
+    source.push_str("    while flag:\n");
+    source.push_str(&"        padding = 0\n".repeat(126));
+    let module = compile(&source, PythonVersion::Py312);
+    let function = child(&module, "f");
+    let mut bytecode = vec![
+        151, 0, 9, 0, 116, 1, 0, 0, 0, 0, 0, 0, 0, 0, 171, 0, 0, 0, 0, 0, 0, 0, 1, 0, 116, 3, 0, 0,
+        0, 0, 0, 0, 0, 0, 171, 0, 0, 0, 0, 0, 0, 0, 1, 0,
+    ];
+    bytecode.extend([100, 1, 125, 1].repeat(150));
+    bytecode.extend([124, 0, 144, 1, 114, 0]);
+    bytecode.extend([100, 1, 125, 1].repeat(126));
+    bytecode.extend([
+        124, 0, 114, 1, 140, 255, 121, 0, 121, 0, 35, 0, 116, 3, 0, 0, 0, 0, 0, 0, 0, 0, 171, 0, 0,
+        0, 0, 0, 0, 0, 1, 0, 119, 0, 120, 3, 89, 0, 119, 1,
+    ]);
+    assert_eq!(function.bytecode, bytecode);
+    assert_eq!(
+        function.exception_table,
+        [130, 10, 73, 6, 0, 201, 6, 12, 73, 18, 3,]
+    );
+}
+
+#[test]
+fn python_312_break_keeps_inner_try_pop_inside_an_enclosing_handler() {
+    // Native 3.12.14 unwinds the inner TRY_EXCEPT before the loop break,
+    // retaining the surrounding handler while POP_BLOCK itself stays ownerless.
+    let module = compile(
+        "async def f(flag):\n    try:\n        await work()\n    except Failure as error:\n        if flag:\n            while True:\n                try:\n                    await cleanup()\n                    break\n                except Cancelled:\n                    if ready():\n                        break\n        else:\n            await cleanup()\n        raise\n",
+        PythonVersion::Py312,
+    );
+    let function = child(&module, "f");
+    assert_eq!(
+        function.bytecode,
+        [
+            75, 0, 1, 0, 151, 0, 9, 0, 116, 1, 0, 0, 0, 0, 0, 0, 0, 0, 171, 0, 0, 0, 0, 0, 0, 0,
+            131, 0, 100, 0, 123, 3, 0, 0, 150, 3, 151, 3, 134, 5, 5, 0, 1, 0, 121, 0, 55, 0, 140,
+            5, 35, 0, 116, 2, 0, 0, 0, 0, 0, 0, 0, 0, 36, 0, 114, 78, 125, 1, 124, 0, 114, 51, 9,
+            0, 9, 0, 116, 5, 0, 0, 0, 0, 0, 0, 0, 0, 171, 0, 0, 0, 0, 0, 0, 0, 131, 0, 100, 0, 123,
+            4, 0, 0, 150, 5, 151, 3, 134, 5, 55, 0, 5, 0, 1, 0, 9, 0, 130, 0, 35, 0, 116, 6, 0, 0,
+            0, 0, 0, 0, 0, 0, 36, 0, 114, 15, 1, 0, 116, 9, 0, 0, 0, 0, 0, 0, 0, 0, 171, 0, 0, 0,
+            0, 0, 0, 0, 114, 2, 89, 0, 130, 0, 89, 0, 110, 4, 119, 0, 120, 3, 89, 0, 119, 1, 140,
+            50, 116, 5, 0, 0, 0, 0, 0, 0, 0, 0, 171, 0, 0, 0, 0, 0, 0, 0, 131, 0, 100, 0, 123, 4,
+            0, 0, 150, 4, 151, 3, 134, 5, 55, 0, 5, 0, 1, 0, 130, 0, 100, 0, 125, 1, 126, 1, 119,
+            1, 119, 0, 120, 3, 89, 0, 119, 1, 173, 3, 119, 1
+        ]
+    );
+    assert_eq!(
+        function.line_table,
+        [
+            232, 0, 248, 128, 0, 240, 2, 13, 5, 14, 220, 14, 18, 139, 102, 143, 12, 138, 12, 249,
+            220, 11, 18, 242, 0, 11, 5, 14, 217, 11, 15, 216, 18, 22, 240, 2, 5, 17, 30, 220, 26,
+            33, 155, 41, 151, 79, 145, 79, 216, 20, 25, 240, 12, 0, 9, 14, 248, 244, 11, 0, 24, 33,
+            242, 0, 2, 17, 30, 220, 23, 28, 148, 119, 216, 24, 29, 240, 6, 0, 9, 14, 241, 9, 0, 24,
+            31, 240, 3, 2, 17, 30, 250, 240, 9, 0, 19, 23, 244, 16, 0, 19, 26, 147, 41, 143, 79,
+            137, 79, 216, 8, 13, 251, 240, 23, 11, 5, 14, 252
+        ]
+    );
+    assert_eq!(
+        function.exception_table,
+        [
+            130, 1, 65, 51, 1, 132, 13, 25, 0, 145, 1, 23, 4, 146, 4, 25, 0, 150, 1, 65, 51, 1,
+            151, 1, 25, 0, 153, 9, 65, 48, 3, 162, 3, 65, 43, 3, 166, 13, 59, 2, 179, 1, 54, 6,
+            180, 5, 59, 2, 186, 1, 65, 43, 3, 187, 19, 65, 19, 5, 193, 14, 4, 65, 43, 3, 193, 18,
+            1, 65, 19, 5, 193, 19, 17, 65, 43, 3, 193, 36, 1, 65, 39, 6, 193, 37, 6, 65, 43, 3,
+            193, 43, 5, 65, 48, 3, 193, 48, 3, 65, 51, 1
+        ]
+    );
+}
+
+#[test]
+fn python312_compound_try_exits_keep_the_shared_footer() {
+    // Captured from the pinned CPython 3.12 compiler.
+    for (source, expected_code, expected_lines, expected_exceptions) in [
+        (
+            "def f(flag, guard, action):\n    try:\n        action(0)\n    finally:\n        try:\n            if flag:\n                action(1)\n            else:\n                action(2)\n        except ValueError:\n            action(3)\n",
+            &[
+                151, 0, 9, 0, 2, 0, 124, 2, 100, 1, 171, 1, 0, 0, 0, 0, 0, 0, 1, 0, 9, 0, 124, 0,
+                114, 9, 2, 0, 124, 2, 100, 2, 171, 1, 0, 0, 0, 0, 0, 0, 1, 0, 110, 9, 2, 0, 124, 2,
+                100, 3, 171, 1, 0, 0, 0, 0, 0, 0, 1, 0, 121, 0, 121, 0, 35, 0, 116, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 36, 0, 114, 11, 1, 0, 2, 0, 124, 2, 100, 4, 171, 1, 0, 0, 0, 0, 0, 0,
+                1, 0, 89, 0, 121, 0, 119, 0, 120, 3, 89, 0, 119, 1, 35, 0, 9, 0, 124, 0, 114, 9, 2,
+                0, 124, 2, 100, 2, 171, 1, 0, 0, 0, 0, 0, 0, 1, 0, 119, 0, 2, 0, 124, 2, 100, 3,
+                171, 1, 0, 0, 0, 0, 0, 0, 1, 0, 119, 0, 35, 0, 116, 0, 0, 0, 0, 0, 0, 0, 0, 0, 36,
+                0, 114, 11, 1, 0, 2, 0, 124, 2, 100, 4, 171, 1, 0, 0, 0, 0, 0, 0, 1, 0, 89, 0, 119,
+                0, 119, 0, 120, 3, 89, 0, 119, 1, 120, 3, 89, 0, 119, 1,
+            ][..],
+            &[
+                128, 0, 240, 2, 9, 5, 22, 217, 8, 14, 136, 113, 140, 9, 240, 4, 6, 9, 22, 217, 15,
+                19, 217, 16, 22, 144, 113, 149, 9, 225, 16, 22, 144, 113, 149, 9, 240, 5, 0, 17,
+                26, 248, 244, 6, 0, 16, 26, 242, 0, 1, 9, 22, 217, 12, 18, 144, 49, 142, 73, 240,
+                3, 1, 9, 22, 251, 240, 11, 6, 9, 22, 217, 15, 19, 217, 16, 22, 144, 113, 149, 9,
+                225, 16, 22, 144, 113, 149, 9, 248, 220, 15, 25, 242, 0, 1, 9, 22, 217, 12, 18,
+                144, 49, 142, 73, 240, 3, 1, 9, 22, 253,
+            ][..],
+            &[
+                130, 8, 55, 0, 139, 19, 32, 0, 160, 17, 52, 3, 179, 1, 52, 3, 183, 1, 65, 36, 3,
+                185, 10, 65, 13, 4, 193, 3, 1, 65, 36, 3, 193, 4, 8, 65, 13, 4, 193, 12, 1, 65, 36,
+                3, 193, 13, 17, 65, 33, 7, 193, 30, 2, 65, 36, 3, 193, 32, 1, 65, 33, 7, 193, 33,
+                3, 65, 36, 3,
+            ][..],
+        ),
+        (
+            "def f(flag, guard, action):\n    try:\n        try:\n            if flag:\n                action(1)\n            else:\n                action(2)\n        except ValueError:\n            action(3)\n    except RuntimeError:\n        action(4)\n",
+            &[
+                151, 0, 9, 0, 9, 0, 124, 0, 114, 9, 2, 0, 124, 2, 100, 1, 171, 1, 0, 0, 0, 0, 0, 0,
+                1, 0, 110, 9, 2, 0, 124, 2, 100, 2, 171, 1, 0, 0, 0, 0, 0, 0, 1, 0, 121, 0, 121, 0,
+                35, 0, 116, 0, 0, 0, 0, 0, 0, 0, 0, 0, 36, 0, 114, 11, 1, 0, 2, 0, 124, 2, 100, 3,
+                171, 1, 0, 0, 0, 0, 0, 0, 1, 0, 89, 0, 121, 0, 119, 0, 120, 3, 89, 0, 119, 1, 35,
+                0, 116, 2, 0, 0, 0, 0, 0, 0, 0, 0, 36, 0, 114, 11, 1, 0, 2, 0, 124, 2, 100, 4, 171,
+                1, 0, 0, 0, 0, 0, 0, 1, 0, 89, 0, 121, 0, 119, 0, 120, 3, 89, 0, 119, 1,
+            ][..],
+            &[
+                128, 0, 240, 2, 9, 5, 18, 240, 2, 6, 9, 22, 217, 15, 19, 217, 16, 22, 144, 113,
+                149, 9, 225, 16, 22, 144, 113, 149, 9, 240, 5, 0, 17, 26, 248, 244, 6, 0, 16, 26,
+                242, 0, 1, 9, 22, 217, 12, 18, 144, 49, 142, 73, 240, 3, 1, 9, 22, 251, 228, 11,
+                23, 242, 0, 1, 5, 18, 217, 8, 14, 136, 113, 142, 9, 240, 3, 1, 5, 18, 250,
+            ][..],
+            &[
+                131, 19, 24, 0, 152, 17, 44, 3, 169, 1, 47, 0, 171, 1, 44, 3, 172, 3, 47, 0, 175,
+                17, 65, 3, 3, 193, 2, 1, 65, 3, 3,
+            ][..],
+        ),
+    ] {
+        let module = compile(source, PythonVersion::Py312);
+        let function = child(&module, "f");
+        assert_eq!(function.bytecode, expected_code, "{source}");
+        assert_eq!(function.line_table, expected_lines, "{source}");
+        assert_eq!(function.exception_table, expected_exceptions, "{source}");
+    }
+}
+
+#[test]
+fn python_312_nested_finally_condition_keeps_shared_footer_order() {
+    let module = compile(
+        "def f(a, b):\n    try:\n        work()\n    finally:\n        if a:\n            if b:\n                finish()\n        else:\n            other()\n",
+        PythonVersion::Py312,
+    );
+    let function = child(&module, "f");
+    assert_eq!(
+        function.bytecode,
+        [
+            151, 0, 9, 0, 116, 1, 0, 0, 0, 0, 0, 0, 0, 0, 171, 0, 0, 0, 0, 0, 0, 0, 1, 0, 124, 0,
+            114, 13, 124, 1, 114, 22, 116, 3, 0, 0, 0, 0, 0, 0, 0, 0, 171, 0, 0, 0, 0, 0, 0, 0, 1,
+            0, 121, 0, 116, 5, 0, 0, 0, 0, 0, 0, 0, 0, 171, 0, 0, 0, 0, 0, 0, 0, 1, 0, 121, 0, 121,
+            0, 35, 0, 124, 0, 114, 14, 124, 1, 114, 11, 116, 3, 0, 0, 0, 0, 0, 0, 0, 0, 171, 0, 0,
+            0, 0, 0, 0, 0, 1, 0, 119, 0, 119, 0, 116, 5, 0, 0, 0, 0, 0, 0, 0, 0, 171, 0, 0, 0, 0,
+            0, 0, 0, 1, 0, 119, 0, 120, 3, 89, 0, 119, 1
+        ]
+    );
+    assert_eq!(
+        function.exception_table,
+        [130, 10, 39, 0, 167, 28, 65, 3, 3]
+    );
+    assert_eq!(
+        function.line_table,
+        [
+            128, 0, 240, 2, 7, 5, 20, 220, 8, 12, 140, 6, 225, 11, 12, 217, 15, 16, 220, 16, 22,
+            149, 8, 228, 12, 17, 141, 71, 240, 7, 0, 16, 17, 248, 241, 3, 0, 12, 13, 217, 15, 16,
+            220, 16, 22, 149, 8, 240, 3, 0, 16, 17, 244, 6, 0, 13, 18, 141, 71, 250
+        ]
+    );
+}
+
+#[test]
+fn python312_compound_match_tails_keep_the_original_shared_footer() {
+    // Captured from the pinned CPython 3.12.14 compiler.
+    let module = compile(
+        "def choose(value, mode, ready, action):\n    match value:\n        case 1:\n            match mode:\n                case 3:\n                    if ready:\n                        action()\n                case 4:\n                    action()\n                case _:\n                    raise ValueError\n        case _:\n            action()\n",
+        PythonVersion::Py312,
+    );
+    let function = child(&module, "choose");
+    assert_eq!(
+        function.bytecode.as_slice(),
+        &[
+            151, 0, 124, 0, 100, 1, 107, 40, 0, 0, 114, 37, 124, 1, 120, 1, 100, 2, 107, 40, 0, 0,
+            114, 11, 1, 0, 124, 2, 114, 27, 2, 0, 124, 3, 171, 0, 0, 0, 0, 0, 0, 0, 1, 0, 121, 0,
+            100, 3, 107, 40, 0, 0, 114, 8, 2, 0, 124, 3, 171, 0, 0, 0, 0, 0, 0, 0, 1, 0, 121, 0, 9,
+            0, 116, 0, 0, 0, 0, 0, 0, 0, 0, 0, 130, 1, 121, 0, 9, 0, 2, 0, 124, 3, 171, 0, 0, 0, 0,
+            0, 0, 0, 1, 0, 121, 0,
+        ]
+    );
+    assert_eq!(
+        function.line_table.as_slice(),
+        &[
+            128, 0, 216, 10, 15, 219, 13, 14, 216, 18, 22, 221, 21, 22, 217, 23, 28, 217, 24, 30,
+            157, 8, 219, 21, 22, 217, 20, 26, 149, 72, 216, 21, 22, 220, 26, 36, 208, 20, 36, 240,
+            11, 0, 24, 29, 240, 12, 0, 14, 15, 217, 12, 18, 141, 72,
+        ]
+    );
+    assert_eq!(function.exception_table.as_slice(), &[]);
+
+    let module = compile(
+        "def choose(value, mode, ready, action):\n    if mode:\n        match value:\n            case 1:\n                if ready:\n                    action()\n            case _:\n                action()\n    else:\n        match value:\n            case 2:\n                if ready:\n                    action()\n            case _:\n                action()\n",
+        PythonVersion::Py312,
+    );
+    let function = child(&module, "choose");
+    assert_eq!(
+        function.bytecode.as_slice(),
+        &[
+            151, 0, 124, 1, 114, 25, 124, 0, 100, 1, 107, 40, 0, 0, 114, 10, 124, 2, 114, 17, 2, 0,
+            124, 3, 171, 0, 0, 0, 0, 0, 0, 0, 1, 0, 121, 0, 9, 0, 2, 0, 124, 3, 171, 0, 0, 0, 0, 0,
+            0, 0, 1, 0, 121, 0, 121, 0, 124, 0, 100, 2, 107, 40, 0, 0, 114, 11, 124, 2, 114, 8, 2,
+            0, 124, 3, 171, 0, 0, 0, 0, 0, 0, 0, 1, 0, 121, 0, 121, 0, 9, 0, 2, 0, 124, 3, 171, 0,
+            0, 0, 0, 0, 0, 0, 1, 0, 121, 0,
+        ]
+    );
+    assert_eq!(
+        function.line_table.as_slice(),
+        &[
+            128, 0, 217, 7, 11, 216, 14, 19, 219, 17, 18, 217, 19, 24, 217, 20, 26, 149, 72, 216,
+            17, 18, 217, 16, 22, 149, 8, 240, 7, 0, 20, 25, 240, 10, 0, 15, 20, 219, 17, 18, 217,
+            19, 24, 217, 20, 26, 149, 72, 240, 3, 0, 20, 25, 224, 17, 18, 217, 16, 22, 149, 8,
+        ]
+    );
+    assert_eq!(function.exception_table.as_slice(), &[]);
+}
