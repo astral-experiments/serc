@@ -46,6 +46,7 @@ mod constant_assertion_exit_slots;
 mod constant_condition_admission;
 mod constant_false_comprehension_filters;
 mod constant_negation_ifexp_borrow;
+mod constant_pop_return_owners;
 mod context_manager_return_handler_nesting;
 mod continued_cleanup_locations;
 mod copied_exit_borrow_fusion_compatibility;

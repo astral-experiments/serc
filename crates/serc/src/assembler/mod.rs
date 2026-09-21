@@ -14151,28 +14151,70 @@ impl Assembler {
             let Some(target_position) = label_positions.get(&target).copied() else {
                 continue;
             };
-            let mut target = items[target_position + 1..].iter().filter_map(|item| {
-                if let Item::Instruction(instruction) = item {
-                    Some(*instruction)
-                } else {
-                    None
-                }
-            });
-            let (Some(pop), Some(return_load), Some(return_value)) =
+            let mut target = items
+                .iter()
+                .enumerate()
+                .skip(target_position + 1)
+                .filter_map(|(position, item)| match item {
+                    Item::Instruction(instruction) => Some((position, *instruction)),
+                    Item::Label(_) => None,
+                });
+            let (Some((_, pop)), Some(return_load), Some(return_value)) =
                 (target.next(), target.next(), target.next())
             else {
                 continue;
             };
             if pop.opcode == POP_TOP
-                && is_constant_load(return_load.opcode)
-                && return_value.opcode == RETURN_VALUE
+                && is_constant_load(return_load.1.opcode)
+                && return_value.1.opcode == RETURN_VALUE
             {
                 replacements.push((index, return_load, return_value));
             }
         }
-        for (index, return_load, return_value) in replacements {
+        let mut copied_positions = Vec::with_capacity(replacements.len() * 2);
+        for (index, (load_position, return_load), (value_position, return_value)) in replacements {
             items[index] = Item::Instruction(return_load);
             items[index + 1] = Item::Instruction(return_value);
+            copied_positions.extend([(index, load_position), (index + 1, value_position)]);
+        }
+        if copied_positions.is_empty() || self.exception_regions.is_empty() {
+            return;
+        }
+        // Native exit copying retains each target instruction's already-labeled
+        // i_except. Replacing a constant/jump earlier must transport its target's
+        // exact range coverage too, including an enclosing fallback owner.
+        let mut boundaries = std::collections::BTreeMap::new();
+        for region in std::mem::take(&mut self.exception_regions) {
+            let range = label_positions[&region.start]..label_positions[&region.end];
+            let mut start = region.start;
+            for &(source, target) in &copied_positions {
+                let source_owned = range.contains(&source);
+                let target_owned = range.contains(&target);
+                if source_owned == target_owned {
+                    continue;
+                }
+                let copy_start = *boundaries.entry(source).or_insert_with(|| self.label());
+                let copy_end = *boundaries.entry(source + 1).or_insert_with(|| self.label());
+                if source_owned {
+                    self.exception_regions.push(ExceptionRegion {
+                        start,
+                        end: copy_start,
+                        ..region
+                    });
+                    start = copy_end;
+                } else {
+                    self.exception_regions.push(ExceptionRegion {
+                        start: copy_start,
+                        end: copy_end,
+                        ..region
+                    });
+                }
+            }
+            self.exception_regions
+                .push(ExceptionRegion { start, ..region });
+        }
+        for (position, label) in boundaries.into_iter().rev() {
+            self.insert_label(position, label);
         }
     }
 
