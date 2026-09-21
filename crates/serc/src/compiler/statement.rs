@@ -33831,12 +33831,37 @@ fn suite_ends_in_empty_try_exit_block(body: &[Stmt], loop_tail: bool) -> bool {
             has_terminal_branch && !all_branches_terminate
         }),
         Some(Stmt::If(statement)) => {
-            statement.elif_else_clauses.is_empty()
+            let runtime_test = |test: &Expr| {
+                condition_has_linear_runtime_leaves(test)
+                    && !expression_suspends_current_scope(test)
+            };
+            let returns = |body: &[Stmt]| {
+                body.split_last().is_some_and(|(last, prefix)| {
+                    matches!(last, Stmt::Return(return_)
+                    if return_.value.as_deref().is_none_or(|value| {
+                        !expression_contains_inline_branch(value)
+                            && !expression_suspends_current_scope(value)
+                    })) && (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
+                })
+            };
+            (statement.elif_else_clauses.is_empty()
                 && !suite_terminates(&statement.body)
                 && !statement
                     .body
                     .last()
-                    .is_some_and(statement_threads_through_empty_join)
+                    .is_some_and(statement_threads_through_empty_join))
+                // Returning earlier arms leave no live jump around the final elif's
+                // empty POP_BLOCK join. Its false edge and linear body share that exit.
+                || (runtime_test(&statement.test)
+                    && returns(&statement.body)
+                    && statement.elif_else_clauses.split_last().is_some_and(|(last, earlier)| {
+                        last.test.as_ref().is_some_and(runtime_test)
+                            && suite_has_linear_borrow_fallthrough(&last.body)
+                            && earlier.iter().all(|clause| {
+                                clause.test.as_ref().is_some_and(runtime_test)
+                                    && returns(&clause.body)
+                            })
+                    }))
         }
         Some(Stmt::While(statement)) => {
             // Several condition exits share the loop's empty normal-exit block. Removing

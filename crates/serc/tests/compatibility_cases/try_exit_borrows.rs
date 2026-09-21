@@ -5255,3 +5255,31 @@ fn borrows_through_named_plain_companions_of_guarded_handlers() {
         }
     }
 }
+
+#[test]
+fn preserves_empty_try_exit_after_returning_elif_arms() {
+    for declaration in ["def", "async def"] {
+        for earlier_chain in ["", "elif value:\n    return value\n"] {
+            for continuation in [
+                "finish(value)\nreturn value\n",
+                "return value\n",
+                "return False\n",
+            ] {
+                for handler in ["pass\n", "report(value)\nvalue = work(value)\n"] {
+                    let body = format!(
+                        "try:\n    value = work(value)\n{}except Error:\n{}{continuation}",
+                        indent_finally_borrow_case(&format!(
+                            "if flag:\n    report(value)\n    return False\n{earlier_chain}elif other:\n    report(value)\n    value = work(value)\n",
+                        )),
+                        indent_finally_borrow_case(handler),
+                    );
+                    let source = format!(
+                        "{declaration} function(value, flag, other):\n{}",
+                        indent_finally_borrow_case(&body),
+                    );
+                    common::assert_matches_cpython_marshal(&source, "returning_elif_try_exit.py");
+                }
+            }
+        }
+    }
+}
