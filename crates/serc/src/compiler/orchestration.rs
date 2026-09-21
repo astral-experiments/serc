@@ -578,7 +578,7 @@ impl<'source> Compiler<'source> {
             }
             self.native_label_plan = super::legacy_native_labels::NativeLabelPlan::function(
                 body,
-                self.unit.flags & CO_COROUTINE != 0,
+                self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0,
             );
         }
         self.emit_function_prologue()?;

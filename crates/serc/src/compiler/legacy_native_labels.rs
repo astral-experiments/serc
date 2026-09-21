@@ -5,7 +5,9 @@
 //! pseudo-ops or copies exits. Unsupported source or an unbound lowering role cancels
 //! the complete code object; it never supplies a partial seed to the assembler.
 
-use ruff_python_ast::{BoolOp, Expr, FStringPart, InterpolatedStringElement, Stmt, UnaryOp};
+use ruff_python_ast::{
+    BoolOp, Expr, FStringPart, InterpolatedStringElement, Pattern, Stmt, UnaryOp,
+};
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -20,6 +22,9 @@ pub(super) enum NativeRole {
     IfEnd(TextRange),
     IfElse(TextRange),
     AssertEnd(TextRange),
+    MatchEnd(TextRange),
+    MatchOrEnd(TextRange),
+    MatchFailPop(TextRange, usize),
     TryBody(TextRange),
     TryExcept(TextRange),
     TryEnd(TextRange),
@@ -41,6 +46,12 @@ pub(super) enum NativeRole {
     ValueIfElse(TextRange),
     ConditionIfEnd(TextRange),
     ConditionIfElse(TextRange),
+    AsyncForStart(TextRange),
+    AsyncForExcept(TextRange),
+    AsyncForEnd(TextRange),
+    AsyncForSend(TextRange),
+    AsyncForFail(TextRange),
+    AsyncForExit(TextRange),
     ForStart(TextRange),
     ForBody(TextRange),
     ForCleanup(TextRange),
@@ -68,13 +79,15 @@ pub(super) enum NativeRole {
     WithAwaitExit(TextRange, WithAwait),
 }
 
-/// Distinguishes original async-manager awaits and authored Return cleanup.
+/// Distinguishes original async-manager awaits and authored control-exit cleanup.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum WithAwait {
     Enter,
     NormalExit,
     ExceptionalExit,
     Return(TextRange),
+    Break(TextRange),
+    Continue(TextRange),
 }
 
 impl WithAwait {
@@ -126,7 +139,7 @@ struct Builder {
     finally_depth: usize,
     loop_finally_depths: Vec<usize>,
     manager_depth: usize,
-    async_manager_items: Vec<TextRange>,
+    async_manager_items: Vec<(usize, TextRange)>,
     loop_manager_depths: Vec<usize>,
     inside_comprehension_body: bool,
     // None means local annotations emit no suffix. Modules always store simple
@@ -135,7 +148,7 @@ struct Builder {
 }
 
 impl NativeLabelPlan {
-    pub(super) fn function(body: &[Stmt], coroutine: bool) -> Option<Box<Self>> {
+    pub(super) fn function(body: &[Stmt], has_stop_iteration_handler: bool) -> Option<Box<Self>> {
         let mut builder = Builder::default();
         let start = builder.allocate(NativeRole::FunctionStart);
         builder.mark(start);
@@ -147,7 +160,7 @@ impl NativeLabelPlan {
             body
         };
         builder.suite(body)?;
-        if coroutine {
+        if has_stop_iteration_handler {
             // wrap_in_stopiteration_handler reserves this after the entire body,
             // then inserts SETUP_CLEANUP at offset zero. That insertion shifts all
             // prior marks equally, so it cannot change their alias equivalence.
@@ -306,7 +319,7 @@ impl Builder {
                     // handler/iterator/sync-manager cleanup lies inside the
                     // nonempty gaps of each await and the final RETURN_VALUE.
                     for index in (0..self.async_manager_items.len()).rev() {
-                        let manager = self.async_manager_items[index];
+                        let (_, manager) = self.async_manager_items[index];
                         self.manager_await(manager, WithAwait::Return(statement.range));
                     }
                     self.instruction();
@@ -320,6 +333,7 @@ impl Builder {
                     }
                     self.instruction();
                 }
+                Stmt::For(statement) if statement.is_async => self.async_for(statement)?,
                 Stmt::For(statement)
                     if !statement.is_async && Self::name_unpack_target(&statement.target) =>
                 {
@@ -330,7 +344,7 @@ impl Builder {
                     let cleanup = self.allocate(NativeRole::ForCleanup(statement.range));
                     let end = self.allocate(NativeRole::ForEnd(statement.range));
                     // Native pushes FOR_LOOP before evaluating the iterable. A
-                    // continue can reuse its start only without crossing a manager.
+                    // continue unwinds only managers entered above this loop.
                     self.loop_manager_depths.push(self.manager_depth);
                     self.loop_finally_depths.push(self.finally_depth);
                     self.expression(&statement.iter)?;
@@ -350,18 +364,11 @@ impl Builder {
                     self.mark(end);
                 }
                 Stmt::While(statement) => self.while_statement(statement)?,
-                Stmt::Break(_)
-                    if self.loop_manager_depths.last() == Some(&self.manager_depth)
-                        && self.loop_finally_depths.last() == Some(&self.finally_depth) =>
-                {
-                    self.instruction(); // original NOP, optional iterator cleanup and exit jump
+                Stmt::Break(statement) => {
+                    self.loop_control(WithAwait::Break(statement.range))?;
                 }
-                Stmt::Continue(_)
-                    if self.loop_manager_depths.last() == Some(&self.manager_depth)
-                        && self.loop_finally_depths.last() == Some(&self.finally_depth) =>
-                {
-                    self.instruction(); // original continue NOP
-                    self.instruction(); // JUMP to the existing nearest loop start
+                Stmt::Continue(statement) => {
+                    self.loop_control(WithAwait::Continue(statement.range))?;
                 }
                 Stmt::Assert(statement) => {
                     let end = self.allocate(NativeRole::AssertEnd(statement.range));
@@ -374,6 +381,7 @@ impl Builder {
                     self.instruction(); // RAISE_VARARGS
                     self.mark(end);
                 }
+                Stmt::Match(statement) => self.match_statement(statement)?,
                 Stmt::With(statement) => self.manager(statement)?,
                 Stmt::Try(statement) => self.try_except(statement)?,
                 Stmt::FunctionDef(definition) => {
@@ -443,6 +451,43 @@ impl Builder {
         Some(())
     }
 
+    /// Mirrors `compiler_async_for` and its original `compiler_add_yield_from` labels.
+    fn async_for(&mut self, statement: &ruff_python_ast::StmtFor) -> Option<()> {
+        // Without an else suite, native End is the existing physical exhaustion
+        // continuation (or the explicit break target). A nonempty else needs a
+        // separately proved binding for its otherwise unreferenced final label.
+        if !statement.orelse.is_empty() || !Self::name_unpack_target(&statement.target) {
+            return None;
+        }
+        let start = self.allocate(NativeRole::AsyncForStart(statement.range));
+        let except = self.allocate(NativeRole::AsyncForExcept(statement.range));
+        let end = self.allocate(NativeRole::AsyncForEnd(statement.range));
+        self.expression(&statement.iter)?;
+        self.instruction(); // GET_AITER
+        self.mark(start);
+        self.loop_manager_depths.push(self.manager_depth);
+        self.loop_finally_depths.push(self.finally_depth);
+        self.instruction(); // SETUP_FINALLY / GET_ANEXT / LOAD_CONST
+        let send = self.allocate(NativeRole::AsyncForSend(statement.range));
+        let fail = self.allocate(NativeRole::AsyncForFail(statement.range));
+        let exit = self.allocate(NativeRole::AsyncForExit(statement.range));
+        self.mark(send);
+        self.instruction(); // SEND / SETUP_FINALLY / YIELD / POP_BLOCK / RESUME / JUMP
+        self.mark(fail);
+        self.instruction(); // CLEANUP_THROW
+        self.mark(exit);
+        self.instruction(); // END_SEND / POP_BLOCK
+        self.store_target(&statement.target)?;
+        self.suite(&statement.body)?;
+        self.instruction(); // original backedge, including dead source
+        self.loop_manager_depths.pop();
+        self.loop_finally_depths.pop();
+        self.mark(except);
+        self.instruction(); // END_ASYNC_FOR
+        self.mark(end);
+        Some(())
+    }
+
     /// Mirrors both original tests of `compiler_while`, including dead source.
     fn while_statement(&mut self, statement: &ruff_python_ast::StmtWhile) -> Option<()> {
         let literal_true =
@@ -496,36 +541,41 @@ impl Builder {
         result
     }
 
-    /// Admits straight-line cleanup whose only new labels are ordinary awaits.
-    fn finalbody_value(value: &Expr) -> Option<()> {
-        if let Expr::Await(awaited) = value {
-            Self::label_free_expression(&awaited.value)
-        } else {
-            Self::label_free_expression(value)
+    /// Checks copied cleanup independently of the source grammar's other gates.
+    fn supports_finalbody(body: &[Stmt]) -> bool {
+        use ruff_python_ast::statement_visitor::{StatementVisitor, walk_stmt};
+
+        struct ExitDetector(bool);
+        impl<'ast> StatementVisitor<'ast> for ExitDetector {
+            fn visit_stmt(&mut self, statement: &'ast Stmt) {
+                if self.0 {
+                    return;
+                }
+                match statement {
+                    Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_) => self.0 = true,
+                    Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+                    _ => walk_stmt(self, statement),
+                }
+            }
         }
+
+        // Include eager definition headers, but skip independent child bodies.
+        // Conservatively treat annotations as eager, matching this planner's
+        // existing definition-expression admission.
+        if super::statement::legacy_suite_contains_yield(body, false) {
+            return false;
+        }
+        let mut exits = ExitDetector(false);
+        exits.visit_body(body);
+        !exits.0
     }
 
     fn try_finally(&mut self, statement: &ruff_python_ast::StmtTry) -> Option<()> {
-        if statement.is_star || statement.finalbody.is_empty() {
+        if statement.is_star
+            || statement.finalbody.is_empty()
+            || !Self::supports_finalbody(&statement.finalbody)
+        {
             return None;
-        }
-        for final_statement in &statement.finalbody {
-            match final_statement {
-                Stmt::Expr(expression) => Self::finalbody_value(&expression.value)?,
-                Stmt::Assign(assignment) => {
-                    Self::finalbody_value(&assignment.value)?;
-                    for target in &assignment.targets {
-                        if !matches!(
-                            target,
-                            Expr::Name(_) | Expr::Attribute(_) | Expr::Subscript(_)
-                        ) {
-                            return None;
-                        }
-                        Self::label_free_expression(target)?;
-                    }
-                }
-                _ => return None,
-            }
         }
         let body = self.allocate(NativeRole::FinallyBody(statement.range));
         let handler = self.allocate(NativeRole::FinallyHandler(statement.range));
@@ -656,6 +706,129 @@ impl Builder {
         Some(())
     }
 
+    /// Mirrors strings, flat alternatives and shallow single-capture class patterns.
+    fn match_statement(&mut self, statement: &ruff_python_ast::StmtMatch) -> Option<()> {
+        let wildcard = |pattern: &Pattern| {
+            matches!(pattern, Pattern::MatchAs(pattern)
+                if pattern.pattern.is_none() && pattern.name.is_none())
+        };
+        let capture = |pattern: &Pattern| {
+            matches!(pattern, Pattern::MatchAs(pattern)
+                if pattern.name.is_some() && pattern.pattern.as_deref().is_none_or(wildcard))
+        };
+        if statement.cases.is_empty()
+            || statement.cases.iter().enumerate().any(|(index, case)| {
+                case.guard.is_some()
+                    || (wildcard(&case.pattern) || capture(&case.pattern))
+                        && index + 1 != statement.cases.len()
+            })
+        {
+            return None;
+        }
+        self.expression(&statement.subject)?;
+        let end = self.allocate(NativeRole::MatchEnd(statement.range));
+        let has_default = statement.cases.len() > 1
+            && statement
+                .cases
+                .last()
+                .is_some_and(|case| wildcard(&case.pattern));
+        let matched_cases = statement.cases.len() - usize::from(has_default);
+        for (index, case) in statement.cases[..matched_cases].iter().enumerate() {
+            if index + 1 != matched_cases {
+                self.instruction(); // COPY the subject for a later case
+            }
+            let fail_pop = if wildcard(&case.pattern) {
+                self.instruction(); // a sole wildcard discards the subject
+                None
+            } else if capture(&case.pattern) {
+                // Bare capture stores the subject. Wildcard-as first emits a
+                // redundant COPY/POP pair, then the same case-level STORE.
+                self.instruction();
+                None
+            } else {
+                Some(self.match_pattern_failure(&case.pattern, case.pattern.range())?)
+            };
+            if index + 1 != matched_cases {
+                self.instruction(); // successful pattern discards the subject copy
+            }
+            self.suite(&case.body)?;
+            self.instruction(); // original success JUMP, including dead source
+            if let Some((zero, one)) = fail_pop {
+                if let Some(one) = one {
+                    self.mark(one);
+                    self.instruction(); // discard the failed class result
+                }
+                self.mark(zero);
+            }
+        }
+        if has_default {
+            let case = statement.cases.last()?;
+            self.instruction(); // trailing wildcard NOP before its body
+            self.suite(&case.body)?;
+        }
+        self.mark(end);
+        Some(())
+    }
+
+    /// Returns lazy zero-pop and optional one-pop failures of this context.
+    fn match_pattern_failure(
+        &mut self,
+        pattern: &Pattern,
+        owner: TextRange,
+    ) -> Option<(usize, Option<usize>)> {
+        match pattern {
+            Pattern::MatchValue(value) if value.value.is_string_literal_expr() => {
+                self.expression(&value.value)?;
+                self.instruction(); // COMPARE_OP precedes lazy fail-pop allocation
+                let failure = self.allocate(NativeRole::MatchFailPop(owner, 0));
+                self.instruction(); // conditional pattern failure
+                Some((failure, None))
+            }
+            Pattern::MatchOr(alternatives)
+                if alternatives.patterns.len() > 1
+                    && alternatives.patterns.iter().all(|alternative| {
+                        matches!(alternative, Pattern::MatchValue(value)
+                            if value.value.is_string_literal_expr())
+                    }) =>
+            {
+                let end = self.allocate(NativeRole::MatchOrEnd(alternatives.range));
+                for alternative in &alternatives.patterns {
+                    self.instruction(); // COPY before each alternative's fresh context
+                    let (failure, _) =
+                        self.match_pattern_failure(alternative, alternative.range())?;
+                    self.instruction(); // success JUMP OrEnd before failure marks
+                    self.mark(failure);
+                }
+                self.instruction(); // failed alternatives discard their subject copy
+                // Native restores the outer context before allocating this slot.
+                let failure = self.allocate(NativeRole::MatchFailPop(owner, 0));
+                self.instruction(); // unconditional failure JUMP
+                self.mark(end);
+                self.instruction(); // successful alternatives discard their subject copy
+                Some((failure, None))
+            }
+            Pattern::MatchClass(class)
+                if matches!(class.cls.as_ref(), Expr::Name(_) | Expr::Attribute(_))
+                    && class.arguments.patterns.is_empty()
+                    && matches!(class.arguments.keywords.as_slice(), [keyword]
+                        if matches!(&keyword.pattern, Pattern::MatchAs(capture)
+                            if capture.pattern.is_none() && capture.name.is_some())) =>
+            {
+                Self::label_free_expression(&class.cls)?;
+                self.expression(&class.cls)?;
+                self.instruction(); // MATCH_CLASS/COPY/None/IS_OP, with on_top=1
+                let zero = self.allocate(NativeRole::MatchFailPop(owner, 0));
+                let one = self.allocate(NativeRole::MatchFailPop(owner, 1));
+                self.instruction(); // conditional failure targets the one-pop slot
+                // UNPACK_SEQUENCE(1) and the case-level capture STORE have no
+                // intervening label. The capture itself needs no rotations.
+                self.instruction();
+                Some((zero, Some(one)))
+            }
+            _ => None,
+        }
+    }
+
     /// Mirrors an inlined synchronous comprehension with one shared save/restore.
     fn comprehension(
         &mut self,
@@ -776,7 +949,7 @@ impl Builder {
         }
         self.manager_depth += 1;
         if is_async {
-            self.async_manager_items.push(range);
+            self.async_manager_items.push((self.manager_depth, range));
         }
         if remaining.is_empty() {
             self.suite(body)?;
@@ -809,6 +982,26 @@ impl Builder {
         // compiler_with_except_finish returns with no intervening instruction.
         // offset2lbl therefore gives both exits the later helper-exit ordinal.
         self.mark(exit);
+        Some(())
+    }
+
+    /// Visits manager cleanup above the nearest loop without unwinding that loop.
+    fn loop_control(&mut self, phase: WithAwait) -> Option<()> {
+        let manager_depth = *self.loop_manager_depths.last()?;
+        if self.loop_finally_depths.last() != Some(&self.finally_depth) {
+            return None;
+        }
+        self.instruction(); // authored Break/Continue NOP before any cleanup
+        for index in (0..self.async_manager_items.len()).rev() {
+            let (depth, manager) = self.async_manager_items[index];
+            if depth <= manager_depth {
+                break;
+            }
+            self.manager_await(manager, phase);
+        }
+        // Ordinary handler and synchronous-manager cleanup allocate no labels.
+        // Break also drops its loop iterator; both exits end in an original JUMP.
+        self.instruction();
         Some(())
     }
 
@@ -1120,6 +1313,13 @@ impl Builder {
                     self.expression(&item.value)?;
                 }
             }
+            Expr::Yield(yielded) if !self.inside_comprehension_body => {
+                if let Some(value) = &yielded.value {
+                    self.expression(value)?;
+                }
+                // Plain yield allocates no labels. Optional ASYNC_GEN_WRAP,
+                // YIELD_VALUE and RESUME separate any labels in its value.
+            }
             Expr::Await(awaited) if !self.inside_comprehension_body => {
                 self.expression(&awaited.value)?;
                 self.instruction(); // GET_AWAITABLE / LOAD_CONST before send
@@ -1151,7 +1351,8 @@ fn runtime_condition(expression: &Expr) -> bool {
         | Expr::Await(_)
         | Expr::Compare(_)
         | Expr::BoolOp(_)
-        | Expr::If(_) => true,
+        | Expr::If(_)
+        | Expr::Named(_) => true,
         Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => runtime_condition(&unary.operand),
         _ => false,
     }
@@ -1487,8 +1688,8 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_for_routes_reject_the_whole_scope() {
-        let source = "async def f(xs):\n    async for item in xs:\n        pass\n";
+    fn unsupported_async_for_else_rejects_the_whole_scope() {
+        let source = "async def f(xs):\n    async for item in xs:\n        pass\n    else:\n        finish()\n";
         let parsed = parse_module(source).unwrap();
         let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
             panic!()
@@ -1911,6 +2112,7 @@ mod manager_tests {
     #[test]
     fn for_continue_stops_at_the_nearest_loop_before_manager_cleanup() {
         for source in [
+            "def f(items, cm):\n    for first, second in items:\n        with cm:\n            continue\n",
             "def f(items, cm):\n    with cm:\n        for first, second in items:\n            continue\n",
             "def f(items, cm):\n    for first, second in items:\n        with cm:\n            for value in items:\n                continue\n",
             "def f(items):\n    for first, second in items:\n        for value in items:\n            pass\n        else:\n            continue\n",
@@ -1924,19 +2126,15 @@ mod manager_tests {
                 "{source}"
             );
         }
-        for source in [
-            "def f(items, cm):\n    for first, second in items:\n        with cm:\n            continue\n",
-            "def f(items):\n    for first, second in items:\n        pass\n    else:\n        continue\n",
-        ] {
-            let parsed = parse_module(source).unwrap();
-            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
-                panic!()
-            };
-            assert!(
-                NativeLabelPlan::function(&function.body, false).is_none(),
-                "{source}"
-            );
-        }
+        let source = "def f(items):\n    for first, second in items:\n        pass\n    else:\n        continue\n";
+        let parsed = parse_module(source).unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        assert!(
+            NativeLabelPlan::function(&function.body, false).is_none(),
+            "{source}"
+        );
     }
 
     #[test]
@@ -2199,6 +2397,8 @@ mod manager_tests {
     #[test]
     fn for_break_stops_at_the_nearest_loop_before_manager_cleanup() {
         for source in [
+            "async def f(items):\n    async for item in items:\n        break\n",
+            "def f(items, cm):\n    for item in items:\n        with cm:\n            break\n",
             "def f(items, cm):\n    with cm:\n        for item in items:\n            break\n",
             "def f(items, cm):\n    for item in items:\n        with cm:\n            for other in items:\n                break\n",
             "def f(items):\n    for item in items:\n        for other in items:\n            pass\n        else:\n            break\n",
@@ -2208,14 +2408,13 @@ mod manager_tests {
                 panic!()
             };
             assert!(
-                NativeLabelPlan::function(&function.body, false).is_some(),
+                NativeLabelPlan::function(&function.body, function.is_async).is_some(),
                 "{source}"
             );
         }
         for source in [
-            "def f(items, cm):\n    for item in items:\n        with cm:\n            break\n",
             "def f(items):\n    for item in items:\n        pass\n    else:\n        break\n",
-            "async def f(items):\n    async for item in items:\n        break\n",
+            "async def f(items):\n    async for item in items:\n        pass\n    else:\n        break\n",
         ] {
             let parsed = parse_module(source).unwrap();
             let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
@@ -2369,7 +2568,7 @@ mod ordinary_except_tests {
         let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
             panic!()
         };
-        assert!(NativeLabelPlan::function(&function.body, false).is_none());
+        assert!(NativeLabelPlan::function(&function.body, false).is_some());
     }
 
     #[test]
@@ -2915,6 +3114,8 @@ mod while_else_tests {
     #[test]
     fn while_transfers_use_nearest_loop_and_pop_it_before_else() {
         for source in [
+            "def f():\n    for item in items:\n        with manager():\n            while flag:\n                break\n            else:\n                continue\n",
+            "def f():\n    while flag:\n        with manager():\n            break\n",
             "def f():\n    with manager():\n        while flag:\n            break\n",
             "def f():\n    while flag:\n        for item in items:\n            continue\n        break\n",
             "def f():\n    for item in items:\n        while flag:\n            break\n        else:\n            continue\n",
@@ -2927,19 +3128,6 @@ mod while_else_tests {
             };
             assert!(
                 NativeLabelPlan::function(&function.body, false).is_some(),
-                "{source}"
-            );
-        }
-        for source in [
-            "def f():\n    while flag:\n        with manager():\n            break\n",
-            "def f():\n    for item in items:\n        with manager():\n            while flag:\n                break\n            else:\n                continue\n",
-        ] {
-            let parsed = parse_module(source).unwrap();
-            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
-                panic!()
-            };
-            assert!(
-                NativeLabelPlan::function(&function.body, false).is_none(),
                 "{source}"
             );
         }
@@ -2988,9 +3176,13 @@ mod while_else_tests {
 
 #[cfg(test)]
 mod finally_occurrence_tests {
-    use super::{EmissionContext, FinallyContext, FinallyCopy, NativeLabelPlan, NativeRole};
+    use super::{
+        Builder, EmissionContext, FinallyContext, FinallyCopy, NativeLabelPlan, NativeRole,
+        WithAwait,
+    };
     use ruff_python_ast::{Expr, Stmt};
     use ruff_python_parser::parse_module;
+    use ruff_text_size::Ranged;
 
     #[test]
     fn finalizer_await_occurrences_keep_native_order_and_distinct_identity() {
@@ -3086,12 +3278,225 @@ mod finally_occurrence_tests {
     }
 
     #[test]
+    fn conditional_finalbody_visits_both_copies_with_distinct_ordinals() {
+        let parsed = parse_module("async def f(flag):\n    try:\n        work()\n    finally:\n        before()\n        if flag:\n            await cleanup()\n        after()\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::Try(statement)] = function.body.as_slice() else {
+            panic!()
+        };
+        let Stmt::If(branch) = &statement.finalbody[1] else {
+            panic!()
+        };
+        let [Stmt::Expr(expression)] = branch.body.as_slice() else {
+            panic!()
+        };
+        let Expr::Await(awaited) = expression.value.as_ref() else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        for (copy, first) in [(FinallyCopy::Normal, 6), (FinallyCopy::Exceptional, 10)] {
+            let context = plan.contexts[&FinallyContext {
+                parent: EmissionContext::default(),
+                owner: statement.range,
+                copy,
+            }];
+            for (role, expected) in [
+                (NativeRole::IfEnd(branch.range), first),
+                (NativeRole::AwaitSend(awaited.range), first + 1),
+                (NativeRole::AwaitFail(awaited.range), first + 2),
+                (NativeRole::AwaitExit(awaited.range), first + 3),
+            ] {
+                assert_eq!(plan.copied_remaining[&(context, role)], expected);
+            }
+        }
+        assert_eq!(plan.remaining_contexts.len(), 2);
+        assert_eq!(plan.copied_remaining.len(), 8);
+        assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 14);
+    }
+
+    #[test]
+    fn copied_managers_and_loops_keep_their_existing_native_schedule() {
+        let parsed = parse_module("async def f(items):\n    try:\n        work()\n    finally:\n        async with manager():\n            for item in items:\n                consume(item)\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::Try(statement)] = function.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::With(manager)] = statement.finalbody.as_slice() else {
+            panic!()
+        };
+        let [Stmt::For(loop_statement)] = manager.body.as_slice() else {
+            panic!()
+        };
+        let range = manager.items[0].context_expr.range();
+        let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        for (copy, first) in [(FinallyCopy::Normal, 6), (FinallyCopy::Exceptional, 25)] {
+            let context = plan.contexts[&FinallyContext {
+                parent: EmissionContext::default(),
+                owner: statement.range,
+                copy,
+            }];
+            for (role, expected) in [
+                (NativeRole::WithBlock(range), first),
+                (NativeRole::WithFinal(range), first + 1),
+                (NativeRole::WithCleanup(range), first + 3),
+                (
+                    NativeRole::WithAwaitSend(range, WithAwait::Enter),
+                    first + 4,
+                ),
+                (NativeRole::ForStart(loop_statement.range), first + 7),
+                (NativeRole::ForBody(loop_statement.range), first + 8),
+                (NativeRole::ForCleanup(loop_statement.range), first + 9),
+                (NativeRole::ForEnd(loop_statement.range), first + 10),
+                (
+                    NativeRole::WithAwaitSend(range, WithAwait::NormalExit),
+                    first + 11,
+                ),
+                (
+                    NativeRole::WithAwaitSend(range, WithAwait::ExceptionalExit),
+                    first + 14,
+                ),
+                (NativeRole::WithSuppress(range), first + 17),
+                (NativeRole::WithExit(range), first + 18),
+                (NativeRole::WithHelperExit(range), first + 18),
+            ] {
+                assert_eq!(plan.copied_remaining[&(context, role)], expected);
+            }
+        }
+        assert_eq!(plan.remaining_contexts.len(), 2);
+        assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 44);
+    }
+
+    #[test]
+    fn nested_cleanup_contexts_keep_global_ordinals_and_parent_identity() {
+        let parsed = parse_module("async def f():\n    try:\n        work()\n    finally:\n        try:\n            inner()\n        finally:\n            await cleanup()\n        after()\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::Try(outer)] = function.body.as_slice() else {
+            panic!()
+        };
+        let Stmt::Try(inner) = &outer.finalbody[0] else {
+            panic!()
+        };
+        let [Stmt::Expr(expression)] = inner.finalbody.as_slice() else {
+            panic!()
+        };
+        let Expr::Await(awaited) = expression.value.as_ref() else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        for (outer_copy, first) in [(FinallyCopy::Normal, 6), (FinallyCopy::Exceptional, 16)] {
+            let parent = plan.contexts[&FinallyContext {
+                parent: EmissionContext::default(),
+                owner: outer.range,
+                copy: outer_copy,
+            }];
+            assert_eq!(
+                plan.copied_remaining[&(parent, NativeRole::FinallyBody(inner.range))],
+                first
+            );
+            for (copy, offset) in [(FinallyCopy::Normal, 4), (FinallyCopy::Exceptional, 7)] {
+                let context = plan.contexts[&FinallyContext {
+                    parent,
+                    owner: inner.range,
+                    copy,
+                }];
+                assert_eq!(
+                    plan.copied_remaining[&(context, NativeRole::AwaitSend(awaited.range))],
+                    first + offset
+                );
+            }
+        }
+        assert_eq!(plan.remaining_contexts.len(), 6);
+        assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 26);
+    }
+
+    #[test]
+    fn cleanup_exit_guard_recurses_through_statement_containers() {
+        for cleanup in [
+            "        before()\n        if flag:\n            return value\n",
+            "        for item in items:\n            break\n",
+            "        while flag:\n            continue\n",
+            "        with manager():\n            return value\n",
+            "        try:\n            close()\n        except Error:\n            return value\n",
+            "        match value:\n            case None:\n                return result\n",
+            "        yield item\n",
+            "        yield from items\n",
+            "        def child(value=(yield item)):\n            return value\n",
+        ] {
+            let source = format!("def f():\n    try:\n        work()\n    finally:\n{cleanup}");
+            let parsed = parse_module(&source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            let [Stmt::Try(statement)] = function.body.as_slice() else {
+                panic!()
+            };
+            // Exercise the recursive gate directly, including Match before its
+            // separate grammar extension can make hidden exits admissible.
+            assert!(
+                !Builder::supports_finalbody(&statement.finalbody),
+                "{source}"
+            );
+            assert!(
+                NativeLabelPlan::function(&function.body, false).is_none(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn sole_if_cleanup_has_one_original_end_in_each_copy() {
+        let parsed = parse_module("def f(flag):\n    try:\n        work()\n    finally:\n        if flag:\n            cleanup()\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::Try(statement)] = function.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::If(branch)] = statement.finalbody.as_slice() else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+        for (copy, expected) in [(FinallyCopy::Normal, 6), (FinallyCopy::Exceptional, 7)] {
+            let context = plan.contexts[&FinallyContext {
+                parent: EmissionContext::default(),
+                owner: statement.range,
+                copy,
+            }];
+            assert_eq!(
+                plan.copied_remaining[&(context, NativeRole::IfEnd(branch.range))],
+                expected
+            );
+        }
+        assert_eq!(plan.copied_remaining.len(), 2);
+    }
+
+    #[test]
+    fn cleanup_guard_skips_independent_child_bodies() {
+        let parsed = parse_module("def f():\n    try:\n        work()\n    finally:\n        def child():\n            yield item\n            return\n        class Child:\n            def method(self):\n                return value\n        consume(child, Child)\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::Try(statement)] = function.body.as_slice() else {
+            panic!()
+        };
+        assert!(Builder::supports_finalbody(&statement.finalbody));
+        let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+        assert_eq!(plan.remaining_contexts.len(), 2);
+        assert!(plan.copied_remaining.is_empty());
+    }
+
+    #[test]
     fn finalizers_reject_crossing_exits_but_allow_loop_local_exits() {
         for source in [
             "def f():\n    try:\n        return result\n    finally:\n        cleanup()\n",
             "def f(xs):\n    for x in xs:\n        try:\n            break\n        finally:\n            cleanup()\n",
             "def f(xs):\n    for x in xs:\n        try:\n            continue\n        finally:\n            cleanup()\n",
-            "def f(flag):\n    try:\n        work()\n    finally:\n        if flag:\n            cleanup()\n",
             "def f():\n    try:\n        work()\n    finally:\n        return result\n",
         ] {
             let parsed = parse_module(source).unwrap();
@@ -3208,6 +3613,466 @@ mod module_native_label_tests {
             };
             let plan = NativeLabelPlan::module(parsed.suite(), false).unwrap();
             assert_eq!(plan.remaining[&NativeRole::IfEnd(last.range)], count);
+        }
+    }
+}
+
+#[cfg(test)]
+mod assignment_condition_tests {
+    use super::{NativeLabelPlan, NativeRole};
+    use ruff_python_ast::{Expr, Stmt};
+    use ruff_python_parser::parse_module;
+
+    #[test]
+    fn assignment_condition_keeps_value_labels_before_copy_and_branch() {
+        let parsed = parse_module(
+            "def f():\n    if (item := left if flag else right):\n        action()\n    if (ready := poll()):\n        finish()\n",
+        )
+        .unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::If(first), Stmt::If(second)] = function.body.as_slice() else {
+            panic!()
+        };
+        let Expr::Named(named) = first.test.as_ref() else {
+            panic!()
+        };
+        let Expr::If(value) = named.value.as_ref() else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+        assert_eq!(plan.remaining[&NativeRole::IfEnd(first.range)], 2);
+        assert_eq!(plan.remaining[&NativeRole::ValueIfEnd(value.range)], 3);
+        assert_eq!(plan.remaining[&NativeRole::ValueIfElse(value.range)], 4);
+        assert_eq!(plan.remaining[&NativeRole::IfEnd(second.range)], 5);
+    }
+}
+
+#[cfg(test)]
+mod plain_yield_native_label_tests {
+    use super::{NativeLabelPlan, NativeRole};
+    use ruff_python_ast::{Expr, Stmt};
+    use ruff_python_parser::parse_module;
+
+    #[test]
+    fn yielded_value_labels_precede_the_generator_stop_iteration_handler() {
+        for source in [
+            "def f(flag, a, b):\n    yield (a if flag else b)\n",
+            "async def f(flag, a, b):\n    yield (a if flag else b)\n",
+        ] {
+            let parsed = parse_module(source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            let [Stmt::Expr(expression)] = function.body.as_slice() else {
+                panic!()
+            };
+            let Expr::Yield(yielded) = expression.value.as_ref() else {
+                panic!()
+            };
+            let Some(Expr::If(value)) = yielded.value.as_deref() else {
+                panic!()
+            };
+            let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+            assert_eq!(plan.remaining[&NativeRole::FunctionStart], 1);
+            assert_eq!(plan.remaining[&NativeRole::ValueIfEnd(value.range)], 2);
+            assert_eq!(plan.remaining[&NativeRole::ValueIfElse(value.range)], 3);
+            assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 4);
+            assert_eq!(plan.remaining.len(), 4);
+            assert!(plan.copied_remaining.is_empty());
+            assert!(plan.remaining_contexts.is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod match_native_label_tests {
+    use super::{NativeLabelPlan, NativeRole};
+    use ruff_python_ast::{Expr, Pattern, Stmt};
+    use ruff_python_parser::parse_module;
+    use ruff_text_size::Ranged;
+
+    #[test]
+    fn match_failure_allocations_interleave_with_case_body_labels() {
+        let parsed = parse_module("def f(value, flag):\n    match value:\n        case \"red\":\n            if flag:\n                work()\n        case \"blue\" | \"green\":\n            result = 1\n        case _:\n            result = 2\n    return result\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let Stmt::Match(statement) = &function.body[0] else {
+            panic!()
+        };
+        let first = &statement.cases[0];
+        let [Stmt::If(branch)] = first.body.as_slice() else {
+            panic!()
+        };
+        let Pattern::MatchOr(alternatives) = &statement.cases[1].pattern else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+        assert_eq!(plan.remaining[&NativeRole::FunctionStart], 1);
+        assert_eq!(plan.remaining[&NativeRole::MatchEnd(statement.range)], 2);
+        assert_eq!(
+            plan.remaining[&NativeRole::MatchFailPop(first.pattern.range(), 0)],
+            3
+        );
+        assert_eq!(plan.remaining[&NativeRole::IfEnd(branch.range)], 4);
+        assert_eq!(
+            plan.remaining[&NativeRole::MatchOrEnd(alternatives.range)],
+            5
+        );
+        assert_eq!(
+            plan.remaining[&NativeRole::MatchFailPop(alternatives.patterns[0].range(), 0)],
+            6
+        );
+        assert_eq!(
+            plan.remaining[&NativeRole::MatchFailPop(alternatives.patterns[1].range(), 0)],
+            7
+        );
+        assert_eq!(
+            plan.remaining[&NativeRole::MatchFailPop(alternatives.range, 0)],
+            8
+        );
+        assert_eq!(plan.remaining.len(), 8);
+    }
+
+    #[test]
+    fn match_without_default_aliases_end_to_final_failure() {
+        for patterns in ["\"red\"", "\"red\" | \"blue\""] {
+            let source = format!(
+                "def f(value):\n    match value:\n        case {patterns}:\n            work()\n    finish()\n"
+            );
+            let parsed = parse_module(&source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            let Stmt::Match(statement) = &function.body[0] else {
+                panic!()
+            };
+            let pattern = &statement.cases[0].pattern;
+            let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+            let last_failure = if matches!(pattern, Pattern::MatchOr(_)) {
+                6
+            } else {
+                3
+            };
+            assert_eq!(
+                plan.remaining[&NativeRole::MatchEnd(statement.range)],
+                last_failure
+            );
+            assert_eq!(
+                plan.remaining[&NativeRole::MatchFailPop(pattern.range(), 0)],
+                last_failure
+            );
+        }
+    }
+
+    #[test]
+    fn subject_labels_precede_match_end_allocation() {
+        let parsed = parse_module("def f(flag, first, second):\n    match first if flag else second:\n        case \"red\":\n            work()\n        case _:\n            other()\n    finish()\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let Stmt::Match(statement) = &function.body[0] else {
+            panic!()
+        };
+        let Expr::If(subject) = statement.subject.as_ref() else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+        assert_eq!(plan.remaining[&NativeRole::ValueIfEnd(subject.range)], 2);
+        assert_eq!(plan.remaining[&NativeRole::ValueIfElse(subject.range)], 3);
+        assert_eq!(plan.remaining[&NativeRole::MatchEnd(statement.range)], 4);
+        assert_eq!(
+            plan.remaining[&NativeRole::MatchFailPop(statement.cases[0].pattern.range(), 0)],
+            5
+        );
+    }
+
+    #[test]
+    fn sole_wildcard_allocates_no_failure_context() {
+        let parsed = parse_module(
+            "def f(value):\n    match value:\n        case _:\n            work()\n    finish()\n",
+        )
+        .unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let Stmt::Match(statement) = &function.body[0] else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+        assert_eq!(plan.remaining.len(), 2);
+        assert_eq!(plan.remaining[&NativeRole::MatchEnd(statement.range)], 2);
+    }
+
+    #[test]
+    fn class_failure_slots_interleave_with_body_labels_and_keep_the_footer() {
+        let parsed = parse_module("async def f(value, flag):\n    match value:\n        case kinds.First(field=first):\n            if flag:\n                use(first)\n            finish()\n        case kinds.Second(field=second):\n            use(second)\n        case _ as remaining:\n            finish(remaining)\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let Stmt::Match(statement) = &function.body[0] else {
+            panic!()
+        };
+        let Stmt::If(branch) = &statement.cases[0].body[0] else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        assert_eq!(plan.remaining[&NativeRole::FunctionStart], 1);
+        assert_eq!(plan.remaining[&NativeRole::MatchEnd(statement.range)], 2);
+        for (index, zero, one) in [(0, 3, 4), (1, 6, 7)] {
+            let range = statement.cases[index].pattern.range();
+            assert_eq!(plan.remaining[&NativeRole::MatchFailPop(range, 0)], zero);
+            assert_eq!(plan.remaining[&NativeRole::MatchFailPop(range, 1)], one);
+        }
+        assert_eq!(plan.remaining[&NativeRole::IfEnd(branch.range)], 5);
+        assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 8);
+        assert_eq!(plan.remaining.len(), 8);
+    }
+
+    #[test]
+    fn class_without_default_aliases_only_zero_pop_to_match_end() {
+        let parsed = parse_module("def f(value):\n    match value:\n        case Item(field=captured):\n            use(captured)\n    finish()\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let Stmt::Match(statement) = &function.body[0] else {
+            panic!()
+        };
+        let range = statement.cases[0].pattern.range();
+        let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+        assert_eq!(plan.remaining[&NativeRole::MatchEnd(statement.range)], 3);
+        assert_eq!(plan.remaining[&NativeRole::MatchFailPop(range, 0)], 3);
+        assert_eq!(plan.remaining[&NativeRole::MatchFailPop(range, 1)], 4);
+        assert_eq!(plan.remaining.len(), 4);
+    }
+
+    #[test]
+    fn final_named_captures_need_no_failure_labels() {
+        for pattern in ["captured", "_ as captured"] {
+            let source = format!(
+                "def f(value):\n    match value:\n        case {pattern}:\n            use(captured)\n"
+            );
+            let parsed = parse_module(&source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            let Stmt::Match(statement) = &function.body[0] else {
+                panic!()
+            };
+            let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+            assert_eq!(plan.remaining[&NativeRole::MatchEnd(statement.range)], 2);
+            assert_eq!(plan.remaining.len(), 2);
+        }
+    }
+
+    #[test]
+    fn deeper_class_patterns_reject_the_entire_plan() {
+        for pattern in [
+            "Item(captured)",
+            "Item(field=Other(value=captured))",
+            "Item(field=_)",
+            "Item(field=captured) if flag",
+            "First(field=captured) | Second(field=captured)",
+        ] {
+            let source = format!(
+                "def f(value, flag):\n    match value:\n        case {pattern}:\n            work()\n        case _:\n            other()\n"
+            );
+            let parsed = parse_module(&source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(
+                NativeLabelPlan::function(&function.body, false).is_none(),
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_match_forms_reject_the_entire_plan() {
+        for pattern in [
+            "\"red\" if flag",
+            "\"red\" as captured",
+            "Item(first=captured, second=other)",
+            "{\"item\": captured}",
+            "[first, second]",
+            "Color.RED",
+            "None",
+            "1",
+            "(\"red\" as captured) | (\"blue\" as captured)",
+        ] {
+            let source = format!(
+                "def f(value, flag):\n    match value:\n        case {pattern}:\n            work()\n        case _:\n            other()\n    finish()\n"
+            );
+            let parsed = parse_module(&source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(
+                NativeLabelPlan::function(&function.body, false).is_none(),
+                "{pattern}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod manager_loop_unwind_tests {
+    use ruff_python_ast::Stmt;
+    use ruff_python_parser::parse_module;
+    use ruff_text_size::Ranged;
+
+    use super::{NativeLabelPlan, NativeRole, WithAwait};
+
+    #[test]
+    fn loop_exit_awaits_precede_dead_normal_exits_in_reverse_manager_order() {
+        for transfer in ["break", "continue"] {
+            let source = format!(
+                "async def f(flag, sync, first, second):\n    while flag:\n        with sync:\n            async with first, second:\n                {transfer}\n"
+            );
+            let parsed = parse_module(&source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            let [Stmt::While(loop_)] = function.body.as_slice() else {
+                panic!()
+            };
+            let [Stmt::With(sync)] = loop_.body.as_slice() else {
+                panic!()
+            };
+            let [Stmt::With(manager)] = sync.body.as_slice() else {
+                panic!()
+            };
+            let phase = match &manager.body[0] {
+                Stmt::Break(exit) => WithAwait::Break(exit.range),
+                Stmt::Continue(exit) => WithAwait::Continue(exit.range),
+                _ => panic!(),
+            };
+            let first = manager.items[0].context_expr.range();
+            let second = manager.items[1].context_expr.range();
+            let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+            // Native allocates FunctionStart, four While labels, four sync-manager
+            // labels, then each async manager's four labels and entry-await triple.
+            for (item, phase, ordinal) in [
+                (first, WithAwait::Enter, 14),
+                (second, WithAwait::Enter, 21),
+                (second, phase, 24),
+                (first, phase, 27),
+                (second, WithAwait::NormalExit, 30),
+                (second, WithAwait::ExceptionalExit, 33),
+                (first, WithAwait::NormalExit, 38),
+                (first, WithAwait::ExceptionalExit, 41),
+            ] {
+                for (index, role) in phase.roles(item).into_iter().enumerate() {
+                    assert_eq!(
+                        plan.remaining[&role],
+                        ordinal + u32::try_from(index).unwrap()
+                    );
+                }
+            }
+            assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 48);
+            assert_eq!(plan.remaining.len(), 48);
+        }
+    }
+
+    #[test]
+    fn inner_loop_else_unwinds_only_managers_above_the_outer_loop() {
+        let source = "async def f(items, outer, inner):\n    async with outer:\n        for item in items:\n            async with inner:\n                for sub in items:\n                    continue\n                else:\n                    continue\n";
+        let parsed = parse_module(source).unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::With(outer)] = function.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::For(outer_loop)] = outer.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::With(inner)] = outer_loop.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::For(inner_loop)] = inner.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::Continue(body_exit)] = inner_loop.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::Continue(else_exit)] = inner_loop.orelse.as_slice() else {
+            panic!()
+        };
+        let outer_range = outer.items[0].context_expr.range();
+        let inner_range = inner.items[0].context_expr.range();
+        let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        for range in [outer_range, inner_range] {
+            for role in WithAwait::Continue(body_exit.range).roles(range) {
+                assert!(!plan.remaining.contains_key(&role));
+            }
+        }
+        for role in WithAwait::Continue(else_exit.range).roles(outer_range) {
+            assert!(!plan.remaining.contains_key(&role));
+        }
+        for (index, role) in WithAwait::Continue(else_exit.range)
+            .roles(inner_range)
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(plan.remaining[&role], 24 + u32::try_from(index).unwrap());
+        }
+    }
+}
+
+#[cfg(test)]
+mod async_for_tests {
+    use super::{NativeLabelPlan, NativeRole};
+    use ruff_python_ast::{Expr, Stmt};
+    use ruff_python_parser::parse_module;
+
+    #[test]
+    fn async_for_reserves_loop_labels_before_iterable_and_send_labels_after_it() {
+        let parsed = parse_module(
+            "async def f(flag, left, right):\n    async for item in (left if flag else right):\n        pass\n    if ready:\n        finish()\n",
+        )
+        .unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::For(statement), Stmt::If(following)] = function.body.as_slice() else {
+            panic!()
+        };
+        let Expr::If(iterable) = statement.iter.as_ref() else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        for (role, ordinal) in [
+            (NativeRole::FunctionStart, 1),
+            (NativeRole::AsyncForStart(statement.range), 2),
+            (NativeRole::AsyncForExcept(statement.range), 3),
+            (NativeRole::AsyncForEnd(statement.range), 4),
+            (NativeRole::ValueIfEnd(iterable.range), 5),
+            (NativeRole::ValueIfElse(iterable.range), 6),
+            (NativeRole::AsyncForSend(statement.range), 7),
+            (NativeRole::AsyncForFail(statement.range), 8),
+            (NativeRole::AsyncForExit(statement.range), 9),
+            (NativeRole::IfEnd(following.range), 10),
+            (NativeRole::StopIterationHandler, 11),
+        ] {
+            assert_eq!(plan.remaining[&role], ordinal);
+        }
+    }
+
+    #[test]
+    fn async_for_retains_fallback_for_else_and_unmodelled_targets() {
+        for source in [
+            "async def f(items):\n    async for item in items:\n        pass\n    else:\n        finish()\n",
+            "async def f(items, holder):\n    async for holder.item in items:\n        pass\n",
+        ] {
+            let parsed = parse_module(source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(NativeLabelPlan::function(&function.body, true).is_none());
         }
     }
 }

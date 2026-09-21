@@ -4700,6 +4700,7 @@ impl Compiler<'_> {
                     with_starts: with_unwind_starts,
                     region_starts: region_unwind_starts,
                 } = self.emit_loop_control_finally_unwind(
+                    super::legacy_native_labels::WithAwait::Break(statement.range),
                     context.with_depth,
                     None,
                     copied_break_pop_pair.then_some(copied_break_item),
@@ -5322,6 +5323,7 @@ impl Compiler<'_> {
                     with_starts: with_unwind_starts,
                     region_starts: region_unwind_starts,
                 } = self.emit_loop_control_finally_unwind(
+                    super::legacy_native_labels::WithAwait::Continue(statement.range),
                     context.with_depth,
                     Some(context.continue_label),
                     None,
@@ -7242,7 +7244,7 @@ impl Compiler<'_> {
                                 with_index,
                                 with_index + 1,
                                 preserve_tos,
-                                Some(statement.range),
+                                super::legacy_native_labels::WithAwait::Return(statement.range),
                             )?;
                             if let Some(region_starts) = &mut handler_region_unwind_starts {
                                 for unwind in &starts {
@@ -7307,7 +7309,7 @@ impl Compiler<'_> {
                                 with_index,
                                 with_index + 1,
                                 preserve_tos,
-                                Some(statement.range),
+                                super::legacy_native_labels::WithAwait::Return(statement.range),
                             )?;
                             if let Some(region_starts) = &mut handler_region_unwind_starts {
                                 for unwind in &starts {
@@ -8097,7 +8099,7 @@ impl Compiler<'_> {
                             from_depth,
                             next_with,
                             preserve_tos,
-                            Some(statement.range),
+                            super::legacy_native_labels::WithAwait::Return(statement.range),
                         )?;
                         if none_return_unwinds_inner_managers
                             && let Some(region_starts) = &mut handler_region_unwind_starts
@@ -8345,7 +8347,7 @@ impl Compiler<'_> {
                         finally_context.with_depth,
                         remaining_with,
                         preserve_tos,
-                        Some(statement.range),
+                        super::legacy_native_labels::WithAwait::Return(statement.range),
                     )?);
                     if let Some(region_starts) = &mut handler_region_unwind_starts {
                         for unwind in &starts {
@@ -10276,7 +10278,7 @@ impl Compiler<'_> {
                         with_index,
                         with_index + 1,
                         preserve_tos,
-                        Some(statement.range),
+                        super::legacy_native_labels::WithAwait::Return(statement.range),
                     )?;
                     if tracks_iterator_region_unwinds
                         && let Some(region_starts) = &mut handler_region_unwind_starts
@@ -13074,7 +13076,7 @@ impl Compiler<'_> {
         from_depth: usize,
         to_depth: usize,
         preserve_tos: bool,
-        return_origin: Option<TextRange>,
+        origin: super::legacy_native_labels::WithAwait,
     ) -> Result<Vec<WithUnwind>, CompileError> {
         let mut unwind_starts = Vec::with_capacity(to_depth - from_depth);
         for index in (from_depth..to_depth).rev() {
@@ -13099,10 +13101,7 @@ impl Compiler<'_> {
             self.emit(LOAD_CONST, none, 1)?;
             self.emit_with_exit_call()?;
             if context.is_async {
-                let roles = return_origin.map(|range| {
-                    super::legacy_native_labels::WithAwait::Return(range)
-                        .roles(context.source_range)
-                });
+                let roles = Some(origin.roles(context.source_range));
                 self.compile_awaitable_on_stack_with_native_roles(2, roles)?;
             }
             self.emit(POP_TOP, 0, -1)?;
@@ -13378,6 +13377,7 @@ impl Compiler<'_> {
     // active while an inner finally runs; a manager entered inside that handler exits first.
     fn emit_loop_control_finally_unwind(
         &mut self,
+        origin: super::legacy_native_labels::WithAwait,
         with_depth: usize,
         continue_target: Option<Label>,
         copied_break_item: Option<usize>,
@@ -13440,6 +13440,7 @@ impl Compiler<'_> {
             for (index, context) in finally_contexts.iter().enumerate().rev() {
                 let with_depth_before_cleanup = next_with;
                 self.emit_loop_control_preserved_return_cleanup(
+                    origin,
                     context.loop_context_depth + 1,
                     &mut next_with,
                     &mut with_unwind_starts,
@@ -13458,6 +13459,7 @@ impl Compiler<'_> {
                     None
                 };
                 self.emit_loop_control_cleanup_to(
+                    origin,
                     context.handler_depth.max(first_handler),
                     context.with_depth,
                     &mut next_with,
@@ -13863,12 +13865,14 @@ impl Compiler<'_> {
                 self.assembler.set_location(SourceLocation::NONE);
             }
             self.emit_loop_control_preserved_return_cleanup(
+                origin,
                 0,
                 &mut next_with,
                 &mut with_unwind_starts,
                 &mut region_unwind_starts,
             )?;
             self.emit_loop_control_cleanup_to(
+                origin,
                 first_handler,
                 with_depth,
                 &mut next_with,
@@ -13925,6 +13929,7 @@ impl Compiler<'_> {
 
     fn emit_loop_control_preserved_return_cleanup(
         &mut self,
+        origin: super::legacy_native_labels::WithAwait,
         finally_depth: usize,
         next_with: &mut usize,
         with_unwind_starts: &mut Vec<WithUnwind>,
@@ -13940,6 +13945,7 @@ impl Compiler<'_> {
             && context.loops >= self.control.loops.contexts.len()
         {
             self.emit_loop_control_cleanup_to(
+                origin,
                 context.handlers,
                 context.managers,
                 next_with,
@@ -13955,6 +13961,7 @@ impl Compiler<'_> {
 
     fn emit_loop_control_cleanup_to(
         &mut self,
+        origin: super::legacy_native_labels::WithAwait,
         handler_depth: usize,
         with_depth: usize,
         next_with: &mut usize,
@@ -13969,6 +13976,7 @@ impl Compiler<'_> {
                 .last()
                 .expect("handler exists");
             self.emit_loop_control_with_cleanup(
+                origin,
                 handler.with_depth,
                 next_with,
                 with_unwind_starts,
@@ -13996,6 +14004,7 @@ impl Compiler<'_> {
             self.control.exceptions.active_exception_handlers.pop();
         }
         self.emit_loop_control_with_cleanup(
+            origin,
             with_depth,
             next_with,
             with_unwind_starts,
@@ -14005,12 +14014,13 @@ impl Compiler<'_> {
 
     fn emit_loop_control_with_cleanup(
         &mut self,
+        origin: super::legacy_native_labels::WithAwait,
         with_depth: usize,
         next_with: &mut usize,
         with_unwind_starts: &mut Vec<WithUnwind>,
         region_unwind_starts: &mut [Option<(Label, usize)>],
     ) -> Result<(), CompileError> {
-        let starts = self.emit_with_unwind(with_depth, *next_with, false, None)?;
+        let starts = self.emit_with_unwind(with_depth, *next_with, false, origin)?;
         for unwind in &starts {
             let depth = self.control.withs.active_with_exits[unwind.index].exception_region_depth;
             for (index, region_start) in region_unwind_starts.iter_mut().enumerate().skip(depth) {
@@ -16924,6 +16934,30 @@ impl Compiler<'_> {
         let cleanup_throw = self.assembler.label();
         let async_cleanup = self.assembler.label();
         let end = self.assembler.label();
+        for (role, label) in [
+            (
+                super::legacy_native_labels::NativeRole::AsyncForStart(statement.range),
+                start,
+            ),
+            (
+                super::legacy_native_labels::NativeRole::AsyncForExcept(statement.range),
+                async_cleanup,
+            ),
+            (
+                super::legacy_native_labels::NativeRole::AsyncForSend(statement.range),
+                send,
+            ),
+            (
+                super::legacy_native_labels::NativeRole::AsyncForFail(statement.range),
+                cleanup_throw,
+            ),
+            (
+                super::legacy_native_labels::NativeRole::AsyncForExit(statement.range),
+                send_end,
+            ),
+        ] {
+            self.bind_native_source_label(role, label);
+        }
         let mut newly_initialized_targets = Vec::new();
         collect_target_names(&statement.target, &mut newly_initialized_targets);
         newly_initialized_targets.retain(|name| !self.is_initialized(name));
@@ -17040,6 +17074,16 @@ impl Compiler<'_> {
             self.assembler.emit_backward(END_ASYNC_FOR, send);
         }
         let exhaustion_continuation = self.assembler.label();
+        // The source plan admits only empty else suites. With no break, native
+        // End is this existing continuation; otherwise it is the marked target.
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::AsyncForEnd(statement.range),
+            if has_break {
+                end
+            } else {
+                exhaustion_continuation
+            },
+        );
         if self.context.python_version != crate::PythonVersion::Py313 {
             // 3.13 constructs CFG blocks only for actual jump targets. Its unused
             // async-for end label cannot split END_ASYNC_FOR from a following POP_BLOCK.
@@ -27103,6 +27147,12 @@ impl Compiler<'_> {
                         vec![(first_false, first), (second_false, second)]
                     } else {
                         let condition_false = compiler.assembler.label();
+                        // This unsplit false edge joins the original body end
+                        // immediately before the shared RERAISE instruction.
+                        compiler.bind_native_source_label(
+                            super::legacy_native_labels::NativeRole::IfEnd(final_if.range),
+                            condition_false,
+                        );
                         compiler.with_control_override(
                             |control| &mut control.finally.exceptional_finally_condition,
                             true,

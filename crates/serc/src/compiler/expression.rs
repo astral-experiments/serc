@@ -77,6 +77,8 @@ struct ComprehensionLoop {
 struct MatchContext {
     stores: Vec<NameId>,
     fail_pop: Vec<Label>,
+    // Case or OR-alternative source identity; fail-pop indices belong to this context.
+    native_fail_owner: ruff_text_size::TextRange,
     direct_loop_failure: Option<Label>,
     on_top: usize,
     ownerless_markers_after_specialized_none: bool,
@@ -490,6 +492,10 @@ impl Compiler<'_> {
             self.compile_expression(&statement.subject)?;
         }
         let end = self.assembler.label();
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::MatchEnd(statement.range),
+            end,
+        );
         let has_default = statement.cases.len() > 1
             && statement
                 .cases
@@ -549,6 +555,7 @@ impl Compiler<'_> {
             let mut context = MatchContext {
                 stores: Vec::new(),
                 fail_pop: Vec::new(),
+                native_fail_owner: case.pattern.range(),
                 direct_loop_failure: (!copied_subject
                     && !has_default
                     && case.guard.is_none()
@@ -1264,6 +1271,13 @@ impl Compiler<'_> {
     fn ensure_match_fail_pop(&mut self, context: &mut MatchContext, pops: usize) {
         while context.fail_pop.len() <= pops {
             let label = self.assembler.label();
+            self.bind_native_source_label(
+                super::legacy_native_labels::NativeRole::MatchFailPop(
+                    context.native_fail_owner,
+                    context.fail_pop.len(),
+                ),
+                label,
+            );
             context.fail_pop.push(label);
         }
     }
@@ -1484,6 +1498,10 @@ impl Compiler<'_> {
     ) -> Result<(), CompileError> {
         let entry_depth = self.control.stack.depth;
         let end = self.assembler.label();
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::MatchOrEnd(pattern.range),
+            end,
+        );
         let mut control: Option<Vec<NameId>> = None;
         let mut empty_success = false;
         for (index, alternative) in pattern.patterns.iter().enumerate() {
@@ -1493,6 +1511,7 @@ impl Compiler<'_> {
             let mut alternative_context = MatchContext {
                 stores: Vec::new(),
                 fail_pop: Vec::new(),
+                native_fail_owner: alternative.range(),
                 direct_loop_failure: None,
                 on_top: 0,
                 ownerless_markers_after_specialized_none: context
