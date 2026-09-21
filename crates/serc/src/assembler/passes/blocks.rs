@@ -5928,7 +5928,11 @@ impl OptimizationPipeline {
                 }
             }
             original_return_locations.extend(copied_return_locations);
-            if inline_small_exit || inline_no_location_block || split_iterator_return {
+            let inline_exit_copy =
+                inline_small_exit || inline_no_location_block || split_iterator_return;
+            // A large shared exit can also be copied after an unconditional source.
+            // Its original target owners survive even though this is not inlining.
+            if inline_exit_copy || !source_has_fallthrough {
                 if planned_copy
                     || (inline_no_location_block && target_chain_end > target_position)
                     || comparison_return_revisit.is_some()
@@ -6066,7 +6070,10 @@ impl OptimizationPipeline {
                         .nth(1)
                         .filter(|(_, opcode)| *opcode == NOP)
                         .map(|(position, _)| position);
-                    if !planned_copy && let Some(position) = trailing_nop_position {
+                    if inline_exit_copy
+                        && !planned_copy
+                        && let Some(position) = trailing_nop_position
+                    {
                         whole_copy_exclusion_start = Label(self.next_label);
                         self.next_label += 1;
                         graph.insert_label(source, position, whole_copy_exclusion_start);
