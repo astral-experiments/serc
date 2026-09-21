@@ -742,6 +742,7 @@ mod tests {
     fn layout(items: Vec<Item>, exception_regions: Vec<ExceptionRegion>) -> LayoutAssembler {
         LayoutAssembler {
             python_version: crate::PythonVersion::Py314,
+            legacy_uniform_jump_seed: false,
             items,
             exception_regions,
             exception_owner_provenance:

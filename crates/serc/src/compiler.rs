@@ -17,6 +17,7 @@ mod expression;
 #[cfg(test)]
 mod legacy_annotation_tests;
 mod legacy_native_labels;
+mod legacy_native_seed_bound;
 mod orchestration;
 mod scope;
 mod source;

@@ -1959,7 +1959,10 @@ impl Compiler<'_> {
                     statement.range()
                 };
                 self.assembler.set_location(self.source_location(range));
-                if index + 1 < body.len()
+                // Python 3.13 counts the final literal's NOP before copying small exits.
+                // Keep it until the later NOP cleanup to preserve that original budget.
+                if self.context.python_version == crate::PythonVersion::Py313
+                    || index + 1 < body.len()
                     || (!final_expression_becomes_return
                         && (!matches!(self.unit.scope, Scope::Class { .. })
                             // Legacy CFG propagation needs the authored marker before
@@ -3154,7 +3157,7 @@ impl Compiler<'_> {
                 .any(|body| {
                     matches!(body.last(), Some(Stmt::While(_)))
                         || (self.context.python_version == crate::PythonVersion::Py312
-                            && (matches!(body.last(), Some(Stmt::Try(_)))
+                            && (matches!(body.last(), Some(Stmt::Try(_) | Stmt::If(_)))
                                 || matches!(body.last(), Some(Stmt::For(loop_statement))
                                     if loop_statement.is_async)
                                 || body.iter().any(|statement| {
@@ -3213,6 +3216,9 @@ impl Compiler<'_> {
                 // The discarded true branch remains an empty original CFG block,
                 // stopping CPython's borrowing traversal before the selected else.
                 self.assembler.mark_last_borrow_fallthrough_barrier();
+            }
+            if !truthiness || self.context.python_version <= crate::PythonVersion::Py313 {
+                // Legacy constant folding retains the selected body's original array.
                 let selected = self.assembler.label();
                 self.assembler
                     .record_exception_owner_block_boundary(selected);
@@ -3417,7 +3423,20 @@ impl Compiler<'_> {
                         self.assembler
                             .set_location(self.source_location(condition_fallthrough_range(test)));
                     }
-                    self.mark_terminal_statement_implicit_return_boundary(body);
+                    if self.context.python_version == crate::PythonVersion::Py312
+                        && branch_index < statement.elif_else_clauses.len()
+                    {
+                        // The first native sweep copies this footer after visiting earlier
+                        // expression branches. Its compacted tail can copy on the second sweep.
+                        let implicit_return = self.assembler.label();
+                        let return_location = self.assembler.location();
+                        self.assembler.set_location(SourceLocation::NONE);
+                        self.emit_jump_forward(JUMP_FORWARD, implicit_return, 0)?;
+                        self.assembler.mark(implicit_return);
+                        self.assembler.set_location(return_location);
+                    } else {
+                        self.mark_terminal_statement_implicit_return_boundary(body);
+                    }
                     self.emit_deferred_implicit_return()?;
                 }
                 // The false branch starts its own original instruction array.
@@ -3704,6 +3723,10 @@ impl Compiler<'_> {
         self.emit(NOT_TAKEN, 0, 0)?;
         // Emit the original success edge so the assembler applies CPython's four-slot
         // exit-copy limit before retaining its NOP or relocating the true branch.
+        if self.context.python_version == crate::PythonVersion::Py312 {
+            // 3.12 removes this unlocated bridge before resolving instruction locations.
+            self.assembler.set_location(SourceLocation::NONE);
+        }
         let success_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, body)?;
         self.assembler.preserve_inlined_jump_nop(success_exit);
 
@@ -5246,8 +5269,21 @@ impl Compiler<'_> {
                         finally_unwind_start,
                     );
                 }
-                let copies_finally_continue_exit =
-                    copied_finally_continue_test.is_some_and(|test| {
+                // An ordinary try surrounding the last copied finalizer still emits
+                // POP_BLOCK before the continue. Legacy threading sees that NOP head.
+                let legacy_pending_finally_try = self.context.python_version
+                    <= crate::PythonVersion::Py313
+                    && self
+                        .control
+                        .finally
+                        .active_loop_finally_contexts
+                        .iter()
+                        .find(|finally| finally.loop_depth >= self.control.loops.contexts.len())
+                        .is_some_and(|finally| {
+                            finally.exception_region_depth > context.exception_region_depth
+                        });
+                let copies_finally_continue_exit = !legacy_pending_finally_try
+                    && copied_finally_continue_test.is_some_and(|test| {
                         self.assembler.allow_copied_finally_continue_exit(
                             continue_jump,
                             context.continue_label,
@@ -5256,6 +5292,7 @@ impl Compiler<'_> {
                         )
                     });
                 if !copies_finally_continue_exit
+                    && !legacy_pending_finally_try
                     && self
                         .control
                         .finally
@@ -5602,7 +5639,11 @@ impl Compiler<'_> {
                     {
                         self.assembler.set_location(location);
                         self.emit(NOP, 0, 0)?;
-                        self.assembler.mark_last_as_converted_pop_block();
+                        if self.context.python_version >= crate::PythonVersion::Py314 {
+                            self.assembler.mark_last_as_converted_pop_block();
+                        }
+                        // Legacy codegen emits this authored return-line NOP before
+                        // unwinding the manager, so it retains the manager's owner.
                     } else if self.source_location(value.range()).line != location.line {
                         // The return statement needs its own marker before unwind
                         // cleanup replaces the location of its separately written value.
@@ -7746,7 +7787,8 @@ impl Compiler<'_> {
                         && self.control.loops.contexts.len() == next_loop
                         && usize::try_from(self.control.stack.depth).ok()
                             == Some(
-                                next_loop * usize::try_from(self.iterator_slots()).unwrap() + 2,
+                                next_loop * usize::try_from(self.iterator_slots()).unwrap()
+                                    + usize::try_from(self.with_exit_stack_slots()).unwrap(),
                             )
                         && self
                             .control
@@ -17141,7 +17183,9 @@ impl Compiler<'_> {
             final_chained_comparison(&statement.test).map(|comparison| comparison.range);
         let empty_folded_failure_block =
             condition_truthiness == Some(false) && self.assembler.at_empty_borrow_block();
-        if condition_truthiness == Some(true) {
+        if condition_truthiness == Some(true)
+            && self.context.python_version != crate::PythonVersion::Py313
+        {
             if let Some(constant) = fold_constant(&statement.test) {
                 self.add_constant(constant)?;
             }
@@ -18641,10 +18685,21 @@ impl Compiler<'_> {
             if matched.cases.iter().all(|case| {
                 suite_terminates_before_constant_folding(&case.body)
             }));
+        // A discarded false arm still jumps to this original POP_BLOCK before
+        // 3.13 compacts NOPs. Materialize it so jump threading sees that first
+        // record, instead of threading straight through the normal-exit jump.
+        let false_arm_pop_block = self.context.python_version == crate::PythonVersion::Py313
+            && !statement.is_star
+            && statement.orelse.is_empty()
+            && matches!(statement.body.last(), Some(Stmt::If(branch))
+                if branch.elif_else_clauses.is_empty()
+                    && early_condition_truthiness(&branch.test) == Some(false)
+                    && !suite_terminates_before_constant_folding(&branch.body));
         let removed_try_pop_block = (self.assembler.python_version()
             == crate::PythonVersion::Py312
             || !statement.orelse.is_empty()
-            || match_body_pop_block)
+            || match_body_pop_block
+            || false_arm_pop_block)
             && !suite_terminates(&statement.body)
             && (!self.assembler.last_instruction_is_nop()
                 // A preceding arm's NOP does not replace the unlocated POP_BLOCK
@@ -22972,7 +23027,14 @@ impl Compiler<'_> {
                 self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     && matches!(body.last(), Some(Stmt::If(tail))
                     if handler_cleanup_has_complete_runtime_join(tail))
-                    && self.assembler.at_original_shared_handler_join();
+                    && if self.context.python_version == crate::PythonVersion::Py313 {
+                        // The original arm-end jump has NO_LOCATION in 3.13.
+                        // Its actual target certifies this complete runtime join
+                        // before native exit copying assigns predecessor spans.
+                        self.assembler.at_jump_target()
+                    } else {
+                        self.assembler.at_original_shared_handler_join()
+                    };
             let inline_join_cleanup = inline_join_cleanup || complete_conditional_cleanup;
             // A nested runtime conditional's normal edges also reach one original
             // artificial cleanup. Assign each copied exit its own predecessor's location.

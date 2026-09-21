@@ -380,6 +380,11 @@ impl<'source> Compiler<'source> {
 
     pub(crate) fn compile_module(mut self, body: &Suite) -> Result<CodeObject, CompileError> {
         self.assembler.reserve_items(body.len().saturating_mul(16));
+        if self.context.python_version == PythonVersion::Py312
+            && super::legacy_native_seed_bound::certifies(body)
+        {
+            self.assembler.certify_legacy_uniform_jump_seed();
+        }
         self.symbols
             .module_globals
             .clone_from(&self.context.module_plan().module_globals);
@@ -564,6 +569,9 @@ impl<'source> Compiler<'source> {
     ) -> Result<CodeObject, CompileError> {
         self.assembler.reserve_items(body.len().saturating_mul(16));
         if self.context.python_version == PythonVersion::Py312 {
+            if super::legacy_native_seed_bound::certifies(body) {
+                self.assembler.certify_legacy_uniform_jump_seed();
+            }
             self.native_label_plan = super::legacy_native_labels::NativeLabelPlan::function(
                 body,
                 self.unit.flags & CO_COROUTINE != 0,

@@ -1518,6 +1518,9 @@ pub(super) struct DeferredBorrowEntry {
 #[derive(Debug)]
 pub(crate) struct Assembler {
     pub(super) python_version: PythonVersion,
+    /// A source proof bounds every native 3.12 jump's initial operand to one byte.
+    /// Independent of exact per-label provenance and its cancellation paths.
+    pub(super) legacy_uniform_jump_seed: bool,
     pub(super) code: UnoptimizedCode,
     /// Number of instructions in the linear item stream; labels do not consume offsets.
     pub(super) instruction_count: usize,
@@ -1639,6 +1642,9 @@ pub(super) type AuthoredFinallyBreakEntries = FxHashMap<Label, AuthoredFinallyBr
 #[derive(Debug)]
 pub(super) struct OptimizationPipeline {
     pub(super) python_version: PythonVersion,
+    /// A source proof bounds every native 3.12 jump's initial operand to one byte.
+    /// Independent of exact per-label provenance and its cancellation paths.
+    pub(super) legacy_uniform_jump_seed: bool,
     pub(super) graph: BlockGraph,
     /// Original incoming edges removed before CPython resolves cleanup locations.
     pub(super) folded_original_predecessor_targets: FxHashSet<Label>,
@@ -1711,6 +1717,9 @@ pub(super) struct OptimizationPipeline {
 #[derive(Debug)]
 pub(super) struct LayoutAssembler {
     pub(super) python_version: PythonVersion,
+    /// A source proof bounds every native 3.12 jump's initial operand to one byte.
+    /// Independent of exact per-label provenance and its cancellation paths.
+    pub(super) legacy_uniform_jump_seed: bool,
     pub(super) items: Vec<Item>,
     pub(super) exception_regions: Vec<ExceptionRegion>,
     pub(super) exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance,
@@ -1770,6 +1779,7 @@ impl Default for Assembler {
     fn default() -> Self {
         Self {
             python_version: PythonVersion::default(),
+            legacy_uniform_jump_seed: false,
             code: UnoptimizedCode::Linear(Vec::new()),
             instruction_count: 0,
             emission_stream: EmissionStreamId::next(),

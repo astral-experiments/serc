@@ -499,6 +499,7 @@ impl Assembler {
         Self::restore_legacy_return_pop_blocks(&mut graph, &self.legacy_return_pop_blocks);
         OptimizationPipeline {
             python_version: self.python_version,
+            legacy_uniform_jump_seed: self.legacy_uniform_jump_seed,
             graph,
             folded_original_predecessor_targets: self
                 .folded_away_condition_targets
@@ -1147,6 +1148,7 @@ impl OptimizationPipeline {
         );
         Ok(LayoutAssembler {
             python_version: self.python_version,
+            legacy_uniform_jump_seed: self.legacy_uniform_jump_seed,
             items,
             exception_regions: self.exception_regions,
             exception_owner_provenance: self.exception_owner_provenance,
@@ -1259,7 +1261,22 @@ impl LayoutAssembler {
             }
         }
 
-        let native_jump_widths = self.python_version == crate::PythonVersion::Py312
+        let uniform_jump_widths = self.python_version == crate::PythonVersion::Py312
+            && self.legacy_uniform_jump_seed
+            // Exact nonzero provenance contradicts a universal zero-width
+            // proof. Fail closed to the existing exact/index path for the whole
+            // object, without changing either certificate or any instruction.
+            && self.items.iter().all(|item| match item {
+                Item::Instruction(instruction) => match instruction.operand() {
+                    Operand::Forward(_) | Operand::Backward(_) => instruction
+                        .legacy_initial_jump_width()
+                        .is_none_or(|width| width == 0),
+                    Operand::Value(_) | Operand::Deferred(_) => true,
+                },
+                Item::Label(_) => true,
+            });
+        let native_jump_widths = !uniform_jump_widths
+            && self.python_version == crate::PythonVersion::Py312
             && self.items.iter().all(|item| match item {
                 Item::Instruction(instruction) => match instruction.operand() {
                     Operand::Forward(_) | Operand::Backward(_) => {
@@ -1279,7 +1296,8 @@ impl LayoutAssembler {
         }
         // 3.12 seeds from native symbolic operands; 3.13+ uses instruction indices.
         // Uncertified 3.12 code objects retain the existing compatibility path.
-        let initial_jump_arguments = if !native_jump_widths
+        let initial_jump_arguments = if !uniform_jump_widths
+            && !native_jump_widths
             && instruction_count > usize::from(u8::MAX)
         {
             let mut indices = vec![None; labels.len()];
@@ -1338,11 +1356,20 @@ impl LayoutAssembler {
                     .unwrap_or(0),
                 Operand::Deferred(_) => 0,
             };
-            let width = if native_jump_widths
+            let width = if matches!(
+                instruction.operand(),
+                Operand::Forward(_) | Operand::Backward(_)
+            ) && uniform_jump_widths
+            {
+                // This consistent whole-object proof covers every jump; no
+                // instruction or capture is mutated by accepting it.
+                0
+            } else if native_jump_widths
                 && matches!(
                     instruction.operand(),
                     Operand::Forward(_) | Operand::Backward(_)
-                ) {
+                )
+            {
                 instruction
                     .legacy_initial_jump_width()
                     .expect("all native jumps are certified")
@@ -1424,5 +1451,152 @@ impl LayoutAssembler {
         Err(CompileError::Internal(
             "jump layout did not converge".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod uniform_jump_seed_tests {
+    use super::{Assembler, Instruction, Item, Label, LayoutAssembler, Operand, SourceLocation};
+    use crate::PythonVersion;
+    use crate::target::opcodes::{
+        EXTENDED_ARG, JUMP_BACKWARD, LOAD_CONST, NOP, POP_TOP, RETURN_VALUE,
+    };
+
+    fn boundary_layout(
+        version: PythonVersion,
+        uniform: bool,
+        exact: Option<u32>,
+        wide_value: bool,
+    ) -> LayoutAssembler {
+        let instruction = |opcode, argument| {
+            Item::Instruction(Instruction::new(
+                opcode,
+                Operand::Value(argument),
+                SourceLocation::NONE,
+                None,
+            ))
+        };
+        let mut items = vec![
+            instruction(LOAD_CONST, if wide_value { 0x1234 } else { 1 }),
+            instruction(POP_TOP, 0),
+        ];
+        // The physical target index exceeds255, but a distinct source proof may
+        // certify that all native symbolic operands start without EXTENDED_ARG.
+        items.extend((0..300).map(|_| instruction(NOP, 0)));
+        let target = Label(0);
+        items.push(Item::Label(target));
+        items.extend((0..254).map(|_| instruction(NOP, 0)));
+        let mut jump = Instruction::new(
+            JUMP_BACKWARD,
+            Operand::Backward(target),
+            SourceLocation::NONE,
+            None,
+        );
+        if let Some(argument) = exact {
+            jump.set_legacy_initial_jump_argument(argument);
+        }
+        items.push(Item::Instruction(jump));
+        LayoutAssembler {
+            python_version: version,
+            legacy_uniform_jump_seed: uniform,
+            items,
+            exception_regions: Vec::new(),
+            exception_owner_provenance:
+                crate::assembler::exception_owners::ExceptionOwnerProvenance::default(),
+            preserved_block_boundaries: rustc_hash::FxHashSet::default(),
+            removed_max_depth: None,
+            next_label: 1,
+            has_next_location: false,
+        }
+    }
+
+    #[test]
+    fn uniform_certificate_selects_native_boundary_and_preserves_value_widths() {
+        let version = PythonVersion::Py312;
+        for wide_value in [false, true] {
+            for exact in [None, Some(0)] {
+                let code = boundary_layout(version, true, exact, wide_value)
+                    .finish(1)
+                    .unwrap()
+                    .bytecode;
+                assert!(code.ends_with(&[JUMP_BACKWARD.code_for(version), 255]));
+                if wide_value {
+                    assert_eq!(
+                        &code[..4],
+                        &[
+                            EXTENDED_ARG.code_for(version),
+                            0x12,
+                            LOAD_CONST.code_for(version),
+                            0x34
+                        ]
+                    );
+                } else {
+                    assert_eq!(&code[..2], &[LOAD_CONST.code_for(version), 1]);
+                }
+            }
+            // An existing exact nonzero width contradicts the global bound.
+            // Preserve the native extended fixed point instead of overriding it.
+            let code = boundary_layout(version, true, Some(256), wide_value)
+                .finish(1)
+                .unwrap()
+                .bytecode;
+            assert!(code.ends_with(&[
+                EXTENDED_ARG.code_for(version),
+                1,
+                JUMP_BACKWARD.code_for(version),
+                0
+            ]));
+        }
+        for exact in [None, Some(256)] {
+            let code = boundary_layout(version, false, exact, true)
+                .finish(1)
+                .unwrap()
+                .bytecode;
+            assert!(code.ends_with(&[
+                EXTENDED_ARG.code_for(version),
+                1,
+                JUMP_BACKWARD.code_for(version),
+                0
+            ]));
+        }
+        for version in [
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let without = boundary_layout(version, false, None, true)
+                .finish(1)
+                .unwrap()
+                .bytecode;
+            let with = boundary_layout(version, true, Some(0), true)
+                .finish(1)
+                .unwrap()
+                .bytecode;
+            assert_eq!(with, without);
+        }
+    }
+
+    #[test]
+    fn uniform_certificate_survives_exact_provenance_cancellation_and_pipeline() {
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let mut assembler = Assembler::with_python_version(version);
+            assembler.certify_legacy_uniform_jump_seed();
+            if version == PythonVersion::Py312 {
+                assembler.invalidate_legacy_native_labels();
+            }
+            let expected = version == PythonVersion::Py312;
+            assert_eq!(assembler.legacy_uniform_jump_seed, expected);
+            assembler.emit(LOAD_CONST, 0);
+            assembler.emit(RETURN_VALUE, 0);
+            let pipeline = assembler.into_optimization_pipeline();
+            assert_eq!(pipeline.legacy_uniform_jump_seed, expected);
+            let layout = pipeline.optimize(1, 0, 0, None).unwrap();
+            assert_eq!(layout.legacy_uniform_jump_seed, expected);
+        }
     }
 }

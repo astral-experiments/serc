@@ -10836,6 +10836,7 @@ mod tests {
             marker.set_exception_owner(NormalizedExceptionOwner::DynamicCondition);
             let mut assembler = LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items: vec![
                     plain(NOP, Operand::Value(0)),
                     Item::Label(setup),
@@ -11000,6 +11001,7 @@ mod tests {
             assert_eq!(fused_store.local_policy.hidden_exception_owner_slots(), 2);
             let mut assembler = LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items: pipeline.graph.into_items(),
                 exception_regions: pipeline.exception_regions,
                 exception_owner_provenance: pipeline.exception_owner_provenance,
@@ -11142,6 +11144,7 @@ mod tests {
             marker.set_exception_owner(NormalizedExceptionOwner::Present);
             let mut assembler = LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items: vec![
                     Item::Label(Label(0)),
                     plain(LOAD_CONST, Operand::Value(0)),
@@ -11378,6 +11381,7 @@ mod tests {
             marker.set_exception_owner(NormalizedExceptionOwner::Present);
             let mut assembler = LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items: vec![
                     Item::Instruction(plain(
                         JUMP_FORWARD,
@@ -11577,6 +11581,7 @@ mod tests {
             marker.set_exception_owner(NormalizedExceptionOwner::Present);
             LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items: vec![
                     Item::Label(Label(0)),
                     plain(LOAD_CONST, Operand::Value(0)),
@@ -11862,6 +11867,7 @@ mod tests {
             );
             let layout = LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items: assembler.linear_items().to_vec(),
                 exception_regions: assembler.exception_regions,
                 exception_owner_provenance: assembler.exception_owner_provenance,
@@ -11943,6 +11949,7 @@ mod tests {
             ];
             let mut assembler = LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items: prefix.clone(),
                 exception_regions: Vec::new(),
                 exception_owner_provenance: ExceptionOwnerProvenance {
@@ -12174,6 +12181,7 @@ mod tests {
             }
             let assembler = LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items,
                 exception_owner_provenance: provenance,
                 exception_regions: vec![],
@@ -12327,6 +12335,7 @@ mod tests {
             provenance.capture_uncompacted_conditional_arrays(&items);
             let mut assembler = LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items,
                 exception_owner_provenance: provenance,
                 exception_regions: vec![],
@@ -12465,6 +12474,7 @@ mod tests {
             }
             let assembler = LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items,
                 exception_owner_provenance: provenance,
                 exception_regions: vec![],
@@ -12640,6 +12650,7 @@ mod tests {
             }
             let assembler = LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items,
                 exception_regions: regions,
                 exception_owner_provenance: provenance,
@@ -13034,6 +13045,7 @@ mod tests {
             ]);
             LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items,
                 exception_regions: vec![ExceptionRegion {
                     is_scope_fallback: true,

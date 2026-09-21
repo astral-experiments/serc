@@ -1630,6 +1630,7 @@ fn fused_final_artifacts_preserve_cache_extended_argument_location_and_depth_sem
     let second_location = SourceLocation::new(8, 8, 2, 4);
     let assembler = super::LayoutAssembler {
         python_version: crate::PythonVersion::Py314,
+        legacy_uniform_jump_seed: false,
         items: vec![
             Item::Instruction(Instruction::new(
                 LOAD_GLOBAL,
@@ -1708,6 +1709,7 @@ fn unextended_final_artifacts_preserve_jump_cache_location_and_depth_semantics()
     let target = super::Label(0);
     let assembler = super::LayoutAssembler {
         python_version: crate::PythonVersion::Py314,
+        legacy_uniform_jump_seed: false,
         items: vec![
             Item::Instruction(Instruction::new(
                 LOAD_GLOBAL,
@@ -4211,6 +4213,7 @@ fn retained_setup_nop_identity_survives_consecutive_labels_without_aliasing_remo
         }
         let assembler = super::LayoutAssembler {
             python_version: crate::PythonVersion::Py314,
+            legacy_uniform_jump_seed: false,
             items,
             exception_regions: Vec::new(),
             exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance {

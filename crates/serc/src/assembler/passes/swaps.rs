@@ -87,6 +87,11 @@ impl OptimizationPipeline {
             block_labels.extend([region.start, region.end, region.target]);
         }
         block_labels.extend(self.preserved_block_boundaries.iter().copied());
+        if self.python_version <= crate::PythonVersion::Py313 {
+            // Exit copying can remove the last jump into an original block. Native
+            // swaptimize still cannot move stores across that block's entry.
+            block_labels.extend(&self.exception_owner_provenance.block_boundaries);
+        }
         let blocks = graph.partition_positions(&block_labels, |instruction| {
             !matches!(instruction.operand(), Operand::Value(_)) || ends_scope(instruction.opcode)
         });

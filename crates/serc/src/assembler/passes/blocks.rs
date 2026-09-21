@@ -2295,7 +2295,12 @@ impl OptimizationPipeline {
             .order()
             .iter()
             .enumerate()
-            .filter_map(|(position, block)| loop_anchor_targets.contains(block).then_some(position))
+            .filter_map(|(position, block)| {
+                // 3.12 erases this empty false-condition array before cold relocation.
+                (self.python_version != crate::PythonVersion::Py312
+                    && loop_anchor_targets.contains(block))
+                .then_some(position)
+            })
             .collect::<Vec<_>>();
         for position in loop_anchor_positions.into_iter().rev() {
             let anchor = Label(self.next_label);
@@ -2830,6 +2835,8 @@ impl OptimizationPipeline {
         if self.folded_predecessor_sources.is_empty() {
             return;
         }
+        let original_arrays = (self.python_version == crate::PythonVersion::Py313)
+            .then(|| self.legacy_instruction_arrays());
         let reachable = self.graph.reachable_blocks(&self.exception_regions);
         let order = self.graph.order();
         let positions = order
@@ -2882,7 +2889,21 @@ impl OptimizationPipeline {
                     && jump.pre_fold_extra_instructions() == 0
                     && jump.local_policy.hidden_exception_owner_slots() == 0
                     && jump.jump_policy.allows_threading_target()
-                    && !jump.jump_policy.retains_nop_for(jump.operand())
+                    // Legacy early copying also crosses a normal try exit whose
+                    // later direct-copy policy retains a NOP. The original folded
+                    // path still reaches its successor before line resolution.
+                    && (!jump.jump_policy.retains_nop_for(jump.operand())
+                        || (self.python_version == crate::PythonVersion::Py313
+                            && jump.jump_policy.retained_nop()
+                                == super::super::ir::RetainedJumpNop::DirectTarget
+                            && self.exception_owner_provenance.normal_try_exits.iter().any(
+                                |&(entry, target)| {
+                                    jump.operand() == Operand::Forward(target)
+                                        && items.iter().any(|item| {
+                                            matches!(item, Item::Label(label) if *label == entry)
+                                        })
+                                },
+                            )))
                     && !jump.jump_policy.preserves_nop_after_threading()
                     && !jump.jump_policy.is_interruptible()
                     && !jump.no_location_policy.preserves_location()
@@ -2926,9 +2947,20 @@ impl OptimizationPipeline {
             }
         }
         for block in joins {
-            let instructions = self.graph[block]
-                .items()
+            let order = self.graph.order();
+            // Exception-range endpoints split legacy POP_BLOCK from its located
+            // exit call without starting a new native instruction array. Test
+            // the complete array for early-copy eligibility and source lines.
+            let start = positions[&block];
+            let mut end = start + 1;
+            if let Some(arrays) = &original_arrays {
+                while end < order.len() && arrays[&order[end]] == arrays[&block] {
+                    end += 1;
+                }
+            }
+            let instructions = order[start..end]
                 .iter()
+                .flat_map(|block| self.graph[*block].items())
                 .filter_map(|item| match item {
                     Item::Instruction(instruction) => Some(instruction),
                     Item::Label(_) => None,

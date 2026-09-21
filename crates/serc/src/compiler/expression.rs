@@ -1123,6 +1123,10 @@ impl Compiler<'_> {
                 // The wildcard body falls through to the original match-end block.
                 // Keep its instructions outside the shared implicit-return copy budget.
                 let implicit_return = self.assembler.label();
+                if self.context.python_version <= crate::PythonVersion::Py313 {
+                    self.assembler
+                        .record_exception_owner_block_boundary(implicit_return);
+                }
                 self.assembler.mark(implicit_return);
                 self.emit_deferred_implicit_return()?;
                 failure_reaches_end = case.guard.is_some();
@@ -1197,10 +1201,17 @@ impl Compiler<'_> {
             let unique_false_edge = terminating_body
                 .then(|| unique_condition_jump_target(&statement.test, false))
                 .flatten();
+            // 3.12 copies the following small return before resolving lines.
+            // Its original case-success jump is unlocated, so the replacement
+            // NOP must disappear before a unique false edge can donate a span.
             self.assembler
-                .set_location(unique_false_edge.map_or(SourceLocation::NONE, |test| {
-                    self.source_location(test.range())
-                }));
+                .set_location(if self.context.python_version == PythonVersion::Py312 {
+                    SourceLocation::NONE
+                } else {
+                    unique_false_edge.map_or(SourceLocation::NONE, |test| {
+                        self.source_location(test.range())
+                    })
+                });
             self.assembler.mark_conditional_threading_target(
                 false_exit,
                 self.source_location(synthetic_condition_exit_range(&statement.test)),

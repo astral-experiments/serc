@@ -521,6 +521,28 @@ impl Builder {
                 // Boolean end can therefore alias its parent's end exactly.
                 return Some(());
             }
+            Expr::Generator(generator) => {
+                // compiler_comprehension compiles this child in a separate code
+                // unit, then emits its closure before visiting only the outer
+                // iterable here. GET_ITER/GET_AITER and CALL follow it; even an
+                // async generator does not synthesize an await in this scope.
+                // Builtin generator-call inlining is disabled on legacy targets.
+                let outermost = generator.generators.first()?;
+                self.instruction(); // LOAD_CONST / MAKE_FUNCTION before iterable
+                self.expression(&outermost.iter)?;
+            }
+            Expr::Lambda(lambda) => {
+                // Defaults belong to this scope; the body and its labels do not.
+                // Keep defaults label-free until their evaluation order is
+                // modelled explicitly, as for the admitted named definitions.
+                if let Some(parameters) = &lambda.parameters {
+                    for parameter in parameters.iter_non_variadic_params() {
+                        if let Some(default) = &parameter.default {
+                            Self::label_free_expression(default)?;
+                        }
+                    }
+                }
+            }
             Expr::Attribute(attribute) => self.expression(&attribute.value)?,
             Expr::Named(named) => {
                 self.expression(&named.value)?;
@@ -770,6 +792,52 @@ mod tests {
             panic!()
         };
         assert!(NativeLabelPlan::function(&function.body, true).is_none());
+    }
+
+    #[test]
+    fn generator_and_lambda_children_do_not_allocate_parent_labels() {
+        for source in [
+            "async def f(xs):\n    result = (await action(x) for x in xs if x)\n    await done()\n",
+            "async def f(xs):\n    result = (x async for x in xs if x)\n    await done()\n",
+            "async def f(xs):\n    result = lambda value=default(), *, other=second(): [x for x in xs if x]\n    await done()\n",
+            "async def f(xs):\n    result = all(x for x in xs if x)\n    await done()\n",
+        ] {
+            let parsed = parse_module(source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+            assert_eq!(plan.remaining.len(), 5, "{source}");
+            assert_eq!(
+                plan.remaining[&NativeRole::StopIterationHandler],
+                5,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn generator_outer_await_belongs_to_the_parent_scope() {
+        let parsed = parse_module(
+            "async def f():\n    result = (x for x in await items())\n    await done()\n",
+        )
+        .unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        assert_eq!(plan.remaining.len(), 8);
+        assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 8);
+        for source in [
+            "async def f():\n    result = lambda value=left or right: value\n    await done()\n",
+            "async def f():\n    result = lambda value=await default(): value\n    await done()\n",
+        ] {
+            let parsed = parse_module(source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(NativeLabelPlan::function(&function.body, true).is_none());
+        }
     }
 
     #[test]

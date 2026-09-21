@@ -490,6 +490,16 @@ impl Assembler {
         self.python_version
     }
 
+    /// Accepts a whole-source proof that every native initial jump width is zero.
+    ///
+    /// The proof covers original and CFG-created labels. It remains valid when
+    /// exact physical-label binding is unavailable or is subsequently cancelled.
+    pub(crate) fn certify_legacy_uniform_jump_seed(&mut self) {
+        if self.python_version == crate::PythonVersion::Py312 {
+            self.legacy_uniform_jump_seed = true;
+        }
+    }
+
     /// Binds a physical entry to its canonical native 3.12 codegen label.
     pub(crate) fn bind_legacy_native_label(&mut self, physical: Label, native: u32) {
         debug_assert_eq!(self.python_version, crate::PythonVersion::Py312);

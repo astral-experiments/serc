@@ -141,7 +141,7 @@ impl OptimizationPipeline {
         if self.python_version == PythonVersion::Py313 {
             self.remove_unreachable_instructions();
             let predecessors = self.legacy_predecessors_before_folding(&original_arrays);
-            self.resolve_legacy_locations(predecessors);
+            self.resolve_legacy_locations(predecessors, &original_arrays);
         }
         if let Some(constants) = constants.as_mut() {
             self.optimize_legacy_load_constants(&mut **constants)?;
@@ -170,7 +170,11 @@ impl OptimizationPipeline {
         if let Some(constants) = constants {
             self.prune_legacy_constants(constants);
         }
-        self.add_checks_for_uninitialized_loads(local_count, parameter_count);
+        self.add_legacy_checks_for_uninitialized_loads(
+            local_count,
+            parameter_count,
+            &original_arrays,
+        );
         if self.python_version == PythonVersion::Py313 {
             for block in self.graph.order().to_vec() {
                 self.graph
@@ -232,7 +236,7 @@ impl OptimizationPipeline {
         if self.python_version == PythonVersion::Py312 {
             predecessors.retain(|block, _| blocks_before_cold_relocation.contains(block));
         }
-        self.resolve_legacy_locations(predecessors);
+        self.resolve_legacy_locations(predecessors, &original_arrays);
         if self.python_version == PythonVersion::Py312 {
             self.guarantee_legacy_exit_line_numbers(first_line_number);
         }
@@ -287,6 +291,7 @@ impl OptimizationPipeline {
         }
         Ok(LayoutAssembler {
             python_version: self.python_version,
+            legacy_uniform_jump_seed: self.legacy_uniform_jump_seed,
             items: self.graph.into_items(),
             exception_regions: self.exception_regions,
             exception_owner_provenance: self.exception_owner_provenance,
@@ -1416,7 +1421,11 @@ impl OptimizationPipeline {
         }
     }
 
-    fn resolve_legacy_locations(&mut self, mut predecessors: FxHashMap<BasicBlockId, usize>) {
+    fn resolve_legacy_locations(
+        &mut self,
+        mut predecessors: FxHashMap<BasicBlockId, usize>,
+        original_arrays: &FxHashMap<BasicBlockId, usize>,
+    ) {
         let mut next_native_label = self
             .legacy_native_labels
             .as_ref()
@@ -1434,9 +1443,29 @@ impl OptimizationPipeline {
             if predecessors.get(&target).copied().unwrap_or(0) <= 1 {
                 continue;
             }
-            let instructions = self.graph[target]
-                .items()
+            // Exception-range endpoints can split the original cleanup array.
+            // Native duplicates the complete unlocated exit, including its return
+            // or eval-check jump, rather than just the first physical fragment.
+            let target_index = self
+                .graph
+                .order()
                 .iter()
+                .position(|block| *block == target)
+                .unwrap();
+            let target_array = original_arrays.get(&target).copied();
+            let targets = self.graph.order()[target_index..]
+                .iter()
+                .copied()
+                .take_while(|block| {
+                    *block == target
+                        || (target_array.is_some()
+                            && original_arrays.get(block).copied() == target_array)
+                })
+                .collect::<Vec<_>>();
+            let last_target = *targets.last().unwrap();
+            let instructions = targets
+                .iter()
+                .flat_map(|target| self.graph[*target].items())
                 .filter_map(|item| match item {
                     Item::Instruction(instruction) => Some(*instruction),
                     Item::Label(_) => None,
@@ -1456,7 +1485,10 @@ impl OptimizationPipeline {
                 continue;
             }
             let entry = self.label();
-            let mut copied = self.copy_legacy_block_items(target, target);
+            let mut copied = targets
+                .iter()
+                .flat_map(|target| self.copy_legacy_block_items(*target, last_target))
+                .collect::<Vec<_>>();
             let Some(Item::Instruction(first)) = copied
                 .iter_mut()
                 .find(|item| matches!(item, Item::Instruction(_)))
@@ -1468,7 +1500,7 @@ impl OptimizationPipeline {
                 .graph
                 .order()
                 .iter()
-                .position(|id| *id == target)
+                .position(|id| *id == last_target)
                 .unwrap()
                 + 1;
             let copy = self.graph.insert_block(
@@ -2673,6 +2705,43 @@ mod tests {
                 .unwrap();
             assert_eq!(function.exception_table, expected, "{version:?}");
         }
+    }
+
+    #[test]
+    fn python313_final_literal_counts_toward_exit_copy_limit() {
+        use crate::{CompileOptions, compile_with_options};
+
+        let source = "if condition:\n    with manager():\n        work()\n'literal 0'\n'literal 1'\n'literal 2'\n";
+        let module = compile_with_options(
+            source,
+            "module_literal_copy_budget.py",
+            &CompileOptions {
+                python_version: PythonVersion::Py313,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap()
+        .code;
+        // Pinned CPython 3.13.15: three literal NOPs plus LOAD_CONST/RETURN_VALUE
+        // exceed the four-slot copy limit, keeping the manager's footer shared.
+        assert_eq!(
+            module.bytecode,
+            [
+                149, 0, 92, 0, 40, 0, 0, 0, 0, 0, 0, 0, 97, 23, 0, 0, 92, 1, 34, 0, 53, 0, 0, 0, 0,
+                0, 0, 0, 2, 0, 32, 0, 92, 2, 34, 0, 53, 0, 0, 0, 0, 0, 0, 0, 32, 0, 83, 0, 83, 0,
+                83, 0, 53, 2, 0, 0, 0, 0, 0, 0, 32, 0, 30, 0, 30, 0, 103, 0, 33, 0, 44, 0, 40, 0,
+                0, 0, 0, 0, 0, 0, 100, 1, 0, 0, 102, 2, 32, 0, 31, 0, 32, 0, 32, 0, 78, 17, 61, 3,
+                31, 0, 102, 1,
+            ]
+        );
+        assert_eq!(
+            module.line_table,
+            [
+                240, 3, 1, 1, 1, 222, 3, 12, 217, 9, 16, 141, 25, 217, 8, 12, 140, 6, 247, 3, 0,
+                10, 19, 224, 0, 11, 216, 0, 11, 216, 0, 11, 247, 9, 0, 10, 19, 141, 25, 250,
+            ]
+        );
+        assert_eq!(module.exception_table, [143, 8, 34, 3, 162, 10, 48, 7]);
     }
 
     #[test]
