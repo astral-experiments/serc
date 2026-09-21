@@ -4474,6 +4474,19 @@ impl Compiler<'_> {
                         if early_condition_truthiness(&conditional.test) != Some(true))
                 {
                     self.assembler.preserve_last_no_location();
+                    if self.context.python_version >= crate::PythonVersion::Py314
+                        && !self.control.statements.current_statement_has_following
+                        && matches!(expression.value.as_ref(), Expr::BoolOp(_))
+                        && (self.control.finally.active_normal_finally_bodies > 0
+                            || self.control.finally.active_copied_finally_bodies > 0
+                            || self.control.finally.active_finally_end_blocks > 0)
+                    {
+                        // A finalizer's discard joins the return/reraise cleanup.
+                        // Its private exit copies inherit each Boolean value's donor;
+                        // only the original shared POP_TOP remains unlocated.
+                        self.assembler
+                            .make_last_no_location_copy_inherit_shared_predecessor();
+                    }
                 }
             }
             Stmt::Pass(statement) => self
