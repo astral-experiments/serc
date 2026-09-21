@@ -50,7 +50,8 @@ fn matches_cpython_mixed_big_integer_float_folding() {
                     (format!("{sign}{integer}"), float.to_owned()),
                     (float.to_owned(), format!("{sign}{integer}")),
                 ] {
-                    let source = format!("def mixed():\n    return ({left}) {operator} ({right})\n");
+                    let source =
+                        format!("def mixed():\n    return ({left}) {operator} ({right})\n");
                     common::assert_matches_cpython_marshal(&source, "mixed_big_integer_float.py");
                 }
             }

@@ -1267,12 +1267,7 @@ impl ScopeArena {
         enclosing_private_name: Option<&str>,
     ) {
         let facts = if !self.deferred_annotations && !future_annotations {
-            ScopeBodyFactsCollector::collect(
-                &definition.body,
-                false,
-                ScopeBodyContext::Class,
-                true,
-            )
+            ScopeBodyFactsCollector::collect(&definition.body, false, ScopeBodyContext::Class, true)
         } else {
             ScopeBodyFacts::for_class(&definition.body, future_annotations)
         };
@@ -2801,10 +2796,7 @@ impl ScopeBodyFacts {
         ScopeBodyFactsCollector::collect(body, true, ScopeBodyContext::Function, false)
     }
 
-    pub(super) fn for_class(
-        body: &[Stmt],
-        future_annotations: bool,
-    ) -> Self {
+    pub(super) fn for_class(body: &[Stmt], future_annotations: bool) -> Self {
         ScopeBodyFactsCollector::collect(body, future_annotations, ScopeBodyContext::Class, false)
     }
 }

@@ -3527,7 +3527,11 @@ fn redundant_swap_removal_permutates_pop_spans_without_moving_slot_metadata() {
     last.location = first_location;
     assert_eq!(
         assembler.graph.copy_items(),
-        [outer_swap, Item::Instruction(first), Item::Instruction(last)]
+        [
+            outer_swap,
+            Item::Instruction(first),
+            Item::Instruction(last)
+        ]
     );
     assert!(!assembler.remove_redundant_swaps_before_pops());
 }
