@@ -566,7 +566,7 @@ fn python_312_frozenset_sort_keys_borrow_member_roots() {
                 let ordered = graph.frozen_set_members(members);
                 let first_index = usize::from(version != PythonVersion::Py312 || shared);
                 assert!(
-                    std::ptr::eq(ordered[0].1, &members[first_index]),
+                    std::ptr::eq(ordered[0].1, &raw const members[first_index]),
                     "unexpected member order for {version}, shared={shared}, first={first:?}"
                 );
             }

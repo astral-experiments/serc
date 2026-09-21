@@ -524,9 +524,12 @@ impl<'source> Compiler<'source> {
         let add_implicit_return =
             add_implicit_return && !self.control.statements.emitted_fallthrough_return;
         if add_implicit_return
-            && body
-                .last()
-                .is_some_and(terminal_statement_uses_implicit_return_location)
+            && body.last().is_some_and(|statement| {
+                terminal_statement_uses_implicit_return_location(
+                    statement,
+                    self.context.python_version,
+                )
+            })
         {
             self.assembler.set_location(
                 self.source_location(implicit_return_range(&self, body.last().unwrap())),
@@ -589,9 +592,12 @@ impl<'source> Compiler<'source> {
         let add_implicit_return =
             add_implicit_return && !self.control.statements.emitted_fallthrough_return;
         if add_implicit_return
-            && body
-                .last()
-                .is_some_and(terminal_statement_uses_implicit_return_location)
+            && body.last().is_some_and(|statement| {
+                terminal_statement_uses_implicit_return_location(
+                    statement,
+                    self.context.python_version,
+                )
+            })
         {
             self.assembler.set_location(
                 self.source_location(implicit_return_range(&self, body.last().unwrap())),
@@ -647,8 +653,10 @@ impl<'source> Compiler<'source> {
         self.output.qualified_name_is_canonical = self
             .context
             .record_class_qualified_name(&self.unit.qualified_name);
-        self.context
-            .record_constant_string_origin(&self.unit.qualified_name, true);
+        self.context.record_constant_string_origin(
+            &self.unit.qualified_name,
+            self.has_deferred_annotations() || self.unit.qualified_name == self.unit.name,
+        );
         let qualified_name =
             self.add_constant(Constant::String(self.unit.qualified_name.clone()))?;
         self.emit(LOAD_CONST, qualified_name, 1)?;
@@ -1023,10 +1031,9 @@ impl<'source> Compiler<'source> {
             parameter_count,
             Some(&mut constants),
         )?;
-        let max_depth = if self.context.python_version <= crate::PythonVersion::Py313 {
-            assembled_max_depth
-        } else if removed_max_depth == Some(self.control.stack.max_depth)
-            && assembled_max_depth < self.control.stack.max_depth
+        let max_depth = if self.context.python_version <= crate::PythonVersion::Py313
+            || (removed_max_depth == Some(self.control.stack.max_depth)
+                && assembled_max_depth < self.control.stack.max_depth)
         {
             assembled_max_depth
         } else {

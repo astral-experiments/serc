@@ -34,7 +34,7 @@ use super::scope::{
     type_parameter_required_names,
 };
 use super::source::unparse_annotation;
-use super::statement::suite_contains_yield;
+use super::statement::{legacy_suite_contains_yield, suite_contains_yield};
 use super::symbol::{ComparisonMode, to_u32, unsupported};
 use super::{CPYTHON_STACK_USE_GUIDELINE, Compiler, SUPPORTED_FUTURE_FLAGS, Scope};
 
@@ -537,7 +537,14 @@ impl Compiler<'_> {
             0
         }) | (self.unit.flags & SUPPORTED_FUTURE_FLAGS);
         let contains_yield = self.context.module_plan().has_yield_expressions
-            && suite_contains_yield(&definition.body);
+            && if self.has_deferred_annotations() {
+                suite_contains_yield(&definition.body)
+            } else {
+                legacy_suite_contains_yield(
+                    &definition.body,
+                    self.unit.flags & CO_FUTURE_ANNOTATIONS != 0,
+                )
+            };
         if definition.is_async && contains_yield {
             parameter_flags |= CO_ASYNC_GENERATOR;
         } else if definition.is_async {
@@ -1499,7 +1506,7 @@ impl Compiler<'_> {
     }
 
     /// Before Python 3.14, annotations are evaluated in the defining scope and
-    /// passed to MAKE_FUNCTION as alternating name/value entries.
+    /// passed to `MAKE_FUNCTION` as alternating name/value entries.
     fn compile_eager_function_annotations(
         &mut self,
         definition: &StmtFunctionDef,

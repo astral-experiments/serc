@@ -1597,7 +1597,7 @@ impl Compiler<'_> {
                         }
                         Stmt::TypeAlias(alias) => builder.compile_type_alias(alias)?,
                         Stmt::AnnAssign(_) => {
-                            builder.compile_suite(std::slice::from_ref(statement))?
+                            builder.compile_suite(std::slice::from_ref(statement))?;
                         }
                         _ => unreachable!(),
                     }

@@ -1,17 +1,26 @@
+use std::cmp::Reverse;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::block_graph::{BasicBlockId, ItemPosition};
 use super::super::{
-    Assembler, ConstantTable, ExceptionRegionPriority, Instruction, Item, LayoutAssembler, Operand,
-    OptimizationPipeline, SourceLocation, block_has_fallthrough, block_jump_target,
+    Assembler, ConstantTable, ExceptionPolicy, ExceptionRegionPriority, Instruction, Item,
+    LayoutAssembler, Operand, OptimizationPipeline, SourceLocation, block_has_fallthrough,
+    block_jump_target,
 };
 use crate::target::opcodes::{
     COMPARE_OP, CONTAINS_OP, COPY, IS_OP, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD,
     LOAD_CLOSURE, LOAD_CONST, LOAD_FAST, LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, NOP, POP_TOP, PUSH_NULL,
-    STORE_FAST, STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST, TO_BOOL, UNARY_NOT, YIELD_VALUE,
+    RETURN_GENERATOR, STORE_FAST, STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST, TO_BOOL, UNARY_NOT,
+    YIELD_VALUE,
 };
 use crate::target::{is_conditional_jump_for, is_unconditional_jump};
 use crate::{CompileError, PythonVersion};
+
+// Original priorities are indices into a Vec of IR items, so usize::MAX cannot
+// name an original instruction. Reserve it for exact legacy copied owners:
+// their selected donor handler takes precedence over destination nesting.
+const LEGACY_COPY_PRIORITY_START: usize = usize::MAX;
 
 impl Assembler {
     /// Captures 3.12's exception-stack operand before CFG copying changes protected ranges.
@@ -73,7 +82,7 @@ impl OptimizationPipeline {
         self.inline_legacy_exit_blocks();
         if self.python_version == PythonVersion::Py313 {
             self.remove_unreachable_instructions();
-            self.resolve_legacy_locations();
+            self.resolve_legacy_locations(self.legacy_predecessors());
         }
         if let Some(constants) = constants.as_mut() {
             self.optimize_legacy_load_constants(&mut **constants)?;
@@ -107,7 +116,45 @@ impl OptimizationPipeline {
             }
             self.remove_legacy_nops(&original_arrays, false);
         }
+        // Copied instructions retain their donor's handler, even when the copy lies
+        // inside another protected range. Cold placement rebuilds ordinary regions
+        // by whole block; restore the exact copied spans after that reconstruction.
+        let copied_owners = self
+            .exception_regions
+            .iter()
+            .copied()
+            .filter(|region| {
+                matches!(
+                    region.priority,
+                    ExceptionRegionPriority::Resolved {
+                        start: LEGACY_COPY_PRIORITY_START,
+                        ..
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        // Native cold relocation leaves newly inserted bridge blocks with zero
+        // predecessors. Preserve that provenance across physical graph cleanup.
+        let blocks_before_cold_relocation =
+            self.graph.order().iter().copied().collect::<FxHashSet<_>>();
         self.push_cold_blocks_to_end(None);
+        if !copied_owners.is_empty() {
+            self.exception_regions.retain(|region| {
+                !matches!(
+                    region.priority,
+                    ExceptionRegionPriority::Resolved {
+                        start: LEGACY_COPY_PRIORITY_START,
+                        ..
+                    }
+                )
+            });
+            self.exception_regions
+                .extend(copied_owners.into_iter().filter(|region| {
+                    self.graph.label_block(region.start).is_some()
+                        && self.graph.label_block(region.end).is_some()
+                        && self.graph.label_block(region.target).is_some()
+                }));
+        }
         // Moving cold handlers can leave a jump to the immediately following block.
         // 3.12 retains its NOP through line resolution; 3.13 compacts it immediately.
         if self.python_version == PythonVersion::Py312 {
@@ -115,7 +162,12 @@ impl OptimizationPipeline {
         } else {
             self.remove_legacy_nops_and_jumps(&original_arrays, false);
         }
-        self.resolve_legacy_locations();
+        // Relocation also drops unreachable physical blocks. Recount surviving
+        // edges so their stale predecessors cannot trigger extra exit copies,
+        // while retaining native zero counts for the newly inserted bridges.
+        let mut predecessors = self.legacy_predecessors();
+        predecessors.retain(|block, _| blocks_before_cold_relocation.contains(block));
+        self.resolve_legacy_locations(predecessors);
         // LOAD_CLOSURE remains a distinct pseudo-op until after the owned-local
         // fusion pass in 3.13; 3.12 still has a physical LOAD_CLOSURE instruction.
         if self.python_version == PythonVersion::Py313 {
@@ -256,19 +308,22 @@ impl OptimizationPipeline {
                     continue;
                 }
                 legacy_nop(self.graph.instructions_mut(block).next_back().unwrap());
-                for mut instruction in instructions {
-                    if unlocated_terminal
+                for mut item in self.copy_legacy_block_items(target, block) {
+                    if let Item::Instruction(instruction) = &mut item
+                        && unlocated_terminal
                         && is_unconditional_jump(instruction.opcode)
-                        && jump.opcode != JUMP_BACKWARD_NO_INTERRUPT
-                        && instruction.opcode == JUMP_BACKWARD_NO_INTERRUPT
+                        && legacy_jump_has_eval_check(&jump)
                     {
-                        instruction.opcode = JUMP_BACKWARD;
+                        // Native JUMP preserves its eval check when its unlocated
+                        // successor is copied, including a forward successor.
+                        instruction.jump_policy.mark_interruptible_after_threading();
+                        if instruction.opcode == JUMP_BACKWARD_NO_INTERRUPT {
+                            instruction.opcode = JUMP_BACKWARD;
+                        }
                     }
                     let offset = self.graph[block].items().len();
-                    self.graph.insert_item(
-                        ItemPosition::new(block, offset),
-                        Item::Instruction(instruction),
-                    );
+                    self.graph
+                        .insert_item(ItemPosition::new(block, offset), item);
                 }
                 changed = true;
             }
@@ -276,6 +331,150 @@ impl OptimizationPipeline {
                 break;
             }
         }
+    }
+
+    /// Copies the exception target already assigned to each native instruction.
+    ///
+    /// CPython labels handlers before copying exit blocks. A copied `POP_EXCEPT`
+    /// or return must therefore keep its donor's owner, rather than inherit the
+    /// protected region surrounding the jump that it replaces.
+    fn copy_legacy_block_items(
+        &mut self,
+        target: BasicBlockId,
+        destination: BasicBlockId,
+    ) -> Vec<Item> {
+        if self.exception_regions.is_empty() {
+            return self.graph[target]
+                .items()
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Instruction(instruction) => Some(Item::Instruction(*instruction)),
+                    Item::Label(_) => None,
+                })
+                .collect();
+        }
+        let positions = self
+            .graph
+            .iter_items()
+            .enumerate()
+            .filter_map(|(index, item)| match item {
+                Item::Label(label) => Some((*label, index)),
+                Item::Instruction(_) => None,
+            })
+            .collect::<FxHashMap<_, _>>();
+        let regions = self
+            .exception_regions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, region)| {
+                let start = *positions.get(&region.start)?;
+                let end = *positions.get(&region.end)?;
+                let (priority_start, priority_end) = match region.priority {
+                    ExceptionRegionPriority::OriginalRange(start, end) => {
+                        (*positions.get(&start)?, *positions.get(&end)?)
+                    }
+                    ExceptionRegionPriority::Resolved { start, end } => (start, end),
+                };
+                Some((
+                    start,
+                    end,
+                    (
+                        region.is_scope_fallback,
+                        Reverse(priority_start),
+                        priority_end,
+                        index,
+                    ),
+                    *region,
+                ))
+            })
+            .collect::<Vec<_>>();
+        // Appending inserts before the following block's labels: ranges ending
+        // at that boundary still cover the copy, while ranges starting there do not.
+        let mut destination_end = 0;
+        for block in self.graph.order() {
+            destination_end += self.graph[*block].items().len();
+            if *block == destination {
+                break;
+            }
+        }
+        let destination_owner = regions
+            .iter()
+            .filter(|(begin, end, _, _)| *begin < destination_end && destination_end <= *end)
+            .min_by_key(|(_, _, priority, _)| *priority)
+            .map(|(_, _, _, region)| (region.target, region.depth, region.preserve_lasti));
+        let mut start = 0;
+        for block in self.graph.order() {
+            if *block == target {
+                break;
+            }
+            start += self.graph[*block].items().len();
+        }
+        let instructions = self.graph[target]
+            .items()
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, item)| {
+                let Item::Instruction(instruction) = item else {
+                    return None;
+                };
+                let owner = if instruction.exception_policy().exclusion()
+                    == super::super::ExceptionExclusion::Always
+                {
+                    None
+                } else {
+                    regions
+                        .iter()
+                        .filter(|(begin, end, _, _)| {
+                            *begin <= start + offset && start + offset < *end
+                        })
+                        .min_by_key(|(_, _, priority, _)| *priority)
+                        .map(|(_, _, _, region)| *region)
+                };
+                Some((*instruction, owner))
+            })
+            .collect::<Vec<_>>();
+        let mut copied = Vec::with_capacity(instructions.len());
+        let mut index = 0;
+        while index < instructions.len() {
+            let owner = instructions[index].1;
+            let key = owner.map(|region| (region.target, region.depth, region.preserve_lasti));
+            let end = (index + 1..instructions.len())
+                .find(|next| {
+                    instructions[*next]
+                        .1
+                        .map(|region| (region.target, region.depth, region.preserve_lasti))
+                        != key
+                })
+                .unwrap_or(instructions.len());
+            // Avoid adding a boundary when the existing destination region
+            // already supplies the exact donor owner.
+            let copied_owner = owner.filter(|_| key != destination_owner);
+            let copy_start = copied_owner.map(|_| self.label());
+            if let Some(start) = copy_start {
+                copied.push(Item::Label(start));
+            }
+            for (mut instruction, _) in instructions[index..end].iter().copied() {
+                if owner.is_none() {
+                    instruction.set_exception_policy(ExceptionPolicy::AlwaysAbsent);
+                }
+                copied.push(Item::Instruction(instruction));
+            }
+            if let Some(mut region) = copied_owner {
+                region.start = copy_start.expect("owned copy has a start label");
+                region.end = self.label();
+                // This is an exact donor instruction owner, including an outer
+                // scope handler copied into an otherwise more deeply nested try.
+                region.is_scope_fallback = false;
+                region.priority = ExceptionRegionPriority::Resolved {
+                    start: LEGACY_COPY_PRIORITY_START,
+                    end: 0,
+                };
+                copied.push(Item::Label(region.end));
+                self.exception_regions.push(region);
+            }
+            index = end;
+        }
+        copied
     }
 
     fn optimize_legacy_adjacent_instructions(&mut self) {
@@ -357,9 +556,20 @@ impl OptimizationPipeline {
                 else {
                     break;
                 };
+                // Authored break/continue blocks begin with a temporary native NOP.
+                // Its provenance must still block threading after emission elides it.
+                // Inlineable unlocated joins use the same flag for a later modern
+                // copy phase; they contain no native NOP and remain threadable here.
                 if !is_unconditional_jump(bridge.opcode)
+                    || (!bridge.jump_policy.allows_threading_target()
+                        && !bridge.no_location_policy.allows_block_inlining())
+                    // 3.13 does not thread conditional jumps through JUMP_NO_INTERRUPT.
+                    // A forward instance shares its wire opcode with ordinary JUMP.
+                    || (self.python_version == PythonVersion::Py313
+                        && !unconditional
+                        && !legacy_jump_has_eval_check(&bridge))
                     || (bridge.opcode == JUMP_BACKWARD_NO_INTERRUPT
-                        && (!unconditional || self.python_version == PythonVersion::Py312))
+                        && self.python_version == PythonVersion::Py312)
                     || bridge.operand() == jump.operand()
                     || (self.python_version == PythonVersion::Py312
                         && bridge.location.line >= 0
@@ -387,6 +597,12 @@ impl OptimizationPipeline {
                         bridge.location,
                         jump.depth_after(),
                     );
+                    if unconditional
+                        && (legacy_jump_has_eval_check(&jump)
+                            || legacy_jump_has_eval_check(&bridge))
+                    {
+                        threaded.jump_policy.mark_interruptible();
+                    }
                     threaded.set_exception_policy(super::super::ExceptionPolicy::AlwaysAbsent);
                     let offset = self.graph[block].items().len();
                     self.graph.insert_item(
@@ -423,10 +639,15 @@ impl OptimizationPipeline {
                     });
                     if is_unconditional_jump(instruction.opcode) {
                         instruction.opcode = if backward {
-                            if instruction.opcode == JUMP_BACKWARD_NO_INTERRUPT {
-                                JUMP_BACKWARD_NO_INTERRUPT
+                            let interruptible = if self.python_version == PythonVersion::Py313 {
+                                legacy_jump_has_eval_check(instruction)
                             } else {
+                                instruction.opcode != JUMP_BACKWARD_NO_INTERRUPT
+                            };
+                            if interruptible {
                                 JUMP_BACKWARD
+                            } else {
+                                JUMP_BACKWARD_NO_INTERRUPT
                             }
                         } else {
                             JUMP_FORWARD
@@ -645,8 +866,7 @@ impl OptimizationPipeline {
         predecessors
     }
 
-    fn resolve_legacy_locations(&mut self) {
-        let mut predecessors = self.legacy_predecessors();
+    fn resolve_legacy_locations(&mut self, mut predecessors: FxHashMap<BasicBlockId, usize>) {
         for block in self.graph.order().to_vec() {
             let Some(jump) = self.graph[block].last_instruction().copied() else {
                 continue;
@@ -659,7 +879,7 @@ impl OptimizationPipeline {
             if predecessors.get(&target).copied().unwrap_or(0) <= 1 {
                 continue;
             }
-            let mut instructions = self.graph[target]
+            let instructions = self.graph[target]
                 .items()
                 .iter()
                 .filter_map(|item| match item {
@@ -669,6 +889,11 @@ impl OptimizationPipeline {
                 .collect::<Vec<_>>();
             if !instructions.last().is_some_and(|instruction| {
                 crate::target::is_scope_exit_for(self.python_version, instruction.opcode)
+                    // 3.13 also copies unlocated eval-check blocks. A shared
+                    // backedge must inherit each condition's complete span before
+                    // jump threading removes the original conditional record.
+                    || (self.python_version == PythonVersion::Py313
+                        && legacy_jump_has_eval_check(instruction))
             }) || instructions
                 .iter()
                 .any(|instruction| instruction.location.line >= 0)
@@ -676,7 +901,14 @@ impl OptimizationPipeline {
                 continue;
             }
             let entry = self.label();
-            instructions[0].location = jump.location;
+            let mut copied = self.copy_legacy_block_items(target, target);
+            let Some(Item::Instruction(first)) = copied
+                .iter_mut()
+                .find(|item| matches!(item, Item::Instruction(_)))
+            else {
+                unreachable!("eligible legacy exit contains an instruction");
+            };
+            first.location = jump.location;
             let index = self
                 .graph
                 .order()
@@ -686,9 +918,7 @@ impl OptimizationPipeline {
                 + 1;
             let copy = self.graph.insert_block(
                 index,
-                std::iter::once(Item::Label(entry))
-                    .chain(instructions.into_iter().map(Item::Instruction))
-                    .collect(),
+                std::iter::once(Item::Label(entry)).chain(copied).collect(),
             );
             self.graph
                 .instructions_mut(block)
@@ -698,18 +928,26 @@ impl OptimizationPipeline {
             *predecessors.get_mut(&target).unwrap() -= 1;
             predecessors.insert(copy, 1);
         }
-        let predecessors = self.legacy_predecessors();
         let order = self.graph.order().to_vec();
         for (index, block) in order.iter().copied().enumerate() {
             let mut location = SourceLocation::NONE;
+            let mut follows_generator_prefix = false;
             for instruction in self.graph.instructions_mut(block) {
+                // 3.12 inserts this startup POP_TOP after CFG line propagation. It
+                // retains NO_LOCATION even though RETURN_GENERATOR has a source line.
+                let inserted_generator_pop = self.python_version == PythonVersion::Py312
+                    && follows_generator_prefix
+                    && instruction.opcode == POP_TOP;
                 if instruction.location.line < 0 {
-                    if !instruction.no_location_policy.preserves_location() {
+                    // Modern preservation flags do not apply to native legacy CFG
+                    // propagation; only later prefix insertion escapes this phase.
+                    if !inserted_generator_pop {
                         instruction.location = location;
                     }
                 } else {
                     location = instruction.location;
                 }
+                follows_generator_prefix = instruction.opcode == RETURN_GENERATOR;
             }
             let fallthrough = block_has_fallthrough(self.graph[block].items())
                 .then(|| order.get(index + 1).copied())
@@ -720,13 +958,24 @@ impl OptimizationPipeline {
                 if predecessors.get(&successor) == Some(&1)
                     && let Some(first) = self.graph.instructions_mut(successor).next()
                     && first.location.line < 0
-                    && !first.no_location_policy.preserves_location()
                 {
                     first.location = location;
                 }
             }
         }
     }
+}
+
+/// Recovers native 3.13's direction-independent JUMP pseudo-op.
+///
+/// Forward JUMP and JUMP_NO_INTERRUPT share a wire opcode. Authored breaks
+/// carry the ordinary kind in their emission certificate; copied and threaded
+/// jumps retain it through the interruptible policy bit.
+fn legacy_jump_has_eval_check(instruction: &Instruction) -> bool {
+    is_unconditional_jump(instruction.opcode)
+        && (instruction.opcode == JUMP_BACKWARD
+            || instruction.jump_policy.is_interruptible()
+            || instruction.fusion_policy.is_authored_break())
 }
 
 fn legacy_nop(instruction: &mut Instruction) {
@@ -782,6 +1031,75 @@ mod tests {
     };
 
     #[test]
+    fn legacy_exit_copies_keep_donor_exception_owners() {
+        use crate::code_object::Constant;
+        use crate::{CompileOptions, compile_with_options};
+
+        // Exact tables from pinned CPython 3.12.14 / 3.13.15. These independent
+        // public cases have matching code bytes but used to retain the caller's
+        // handler on copied returns and POP_EXCEPT/name-clearing instructions.
+        let cases: &[(PythonVersion, &str, &[u8])] = &[
+            (
+                PythonVersion::Py312,
+                "def terminal_try_manager(manager, work, Error, handle):\n    try:\n        with manager:\n            work()\n    except Error:\n        handle()\n",
+                &[
+                    130, 2, 33, 0, 132, 8, 21, 3, 140, 8, 33, 0, 149, 5, 30, 7, 154, 3, 33, 0, 158,
+                    3, 33, 0, 161, 12, 48, 3, 175, 1, 48, 3,
+                ],
+            ),
+            (
+                PythonVersion::Py313,
+                "def terminal_try_manager(manager, work, Error, handle):\n    try:\n        with manager:\n            work()\n    except Error:\n        handle()\n",
+                &[
+                    130, 2, 38, 0, 132, 8, 21, 3, 140, 8, 38, 0, 149, 10, 35, 7, 159, 3, 38, 0,
+                    163, 3, 38, 0, 166, 13, 54, 3, 181, 1, 54, 3,
+                ],
+            ),
+            (
+                PythonVersion::Py313,
+                "def named_handler_reraise(work, Error, handled, finish):\n    try:\n        work()\n    except Error as error:\n        if handled(error):\n            pass\n        else:\n            raise\n    finish()\n",
+                &[
+                    130, 7, 17, 0, 145, 6, 47, 3, 151, 13, 42, 3, 169, 1, 42, 3, 170, 5, 47, 3,
+                ],
+            ),
+            (
+                PythonVersion::Py313,
+                "def manager_nested_handler_finally(manager, work, Error, handle, cleanup, finish):\n    with manager:\n        try:\n            work()\n        except Error as error:\n            try:\n                handle(error)\n            finally:\n                cleanup()\n    finish()\n",
+                &[
+                    131, 1, 65, 11, 3, 133, 7, 28, 2, 156, 6, 65, 8, 5, 163, 8, 55, 4, 171, 7, 65,
+                    3, 5, 178, 5, 65, 11, 3, 183, 9, 65, 0, 7, 193, 0, 3, 65, 3, 5, 193, 3, 5, 65,
+                    8, 5, 193, 8, 3, 65, 11, 3, 193, 11, 10, 65, 25, 7,
+                ],
+            ),
+        ];
+        for &(version, source, expected) in cases {
+            let module = compile_with_options(
+                source,
+                "legacy_copy_owners.py",
+                &CompileOptions {
+                    python_version: version,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .code;
+            let function = module
+                .constants
+                .iter()
+                .find_map(|constant| match constant {
+                    Constant::Code(code) => Some(code),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                function.exception_table, expected,
+                "{version:?}: {}",
+                function.name
+            );
+        }
+    }
+
+    #[test]
     fn legacy_generator_break_resolves_none_before_constant_optimization() {
         use crate::code_object::Constant;
         use crate::{CompileOptions, compile_with_options};
@@ -815,6 +1133,22 @@ mod tests {
                 // Both pinned native compilers preserve admission order. A docstring
                 // occupies slot zero, so the break must use the actual None index.
                 let none_index = u8::from(index == 3);
+                if index == 1 {
+                    // Native constant-true loops retain the original backedge after
+                    // the break return, without synthesizing an ownerless edge.
+                    let expected: &[u8] = if version == PythonVersion::Py312 {
+                        &[
+                            75, 0, 1, 0, 151, 0, 9, 0, 100, 1, 150, 1, 151, 1, 125, 0, 124, 0, 114,
+                            1, 121, 0, 140, 8, 173, 3, 119, 1,
+                        ]
+                    } else {
+                        &[
+                            35, 0, 32, 0, 149, 0, 30, 0, 83, 1, 118, 0, 149, 5, 110, 0, 85, 0, 40,
+                            0, 0, 0, 0, 0, 0, 0, 97, 1, 0, 0, 103, 0, 77, 14, 0, 0, 55, 3, 102, 1,
+                        ]
+                    };
+                    assert_eq!(function.bytecode, expected, "{version:?}: {source}");
+                }
                 assert!(
                     match index {
                         0 => matches!(function.constants.as_slice(), [Constant::None]),
@@ -841,6 +1175,210 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn legacy_conditional_continue_retains_the_authored_jump_block() {
+        use crate::code_object::Constant;
+        use crate::{CompileOptions, compile_with_options};
+
+        let source = "def f(xs, a, b):\n    for x in xs:\n        if a or b:\n            continue\n        yield x\n";
+        for version in [PythonVersion::Py312, PythonVersion::Py313] {
+            let module = compile_with_options(
+                source,
+                "cfg.py",
+                &CompileOptions {
+                    python_version: version,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .code;
+            let function = module
+                .constants
+                .iter()
+                .find_map(|constant| match constant {
+                    Constant::Code(code) if code.name == "f" => Some(code),
+                    _ => None,
+                })
+                .unwrap();
+            // Captured from pinned CPython 3.12.14 and 3.13.15. The continue's
+            // temporary NOP prevents the first conditional from being threaded
+            // into a duplicated backedge with a gap in the generator handler.
+            let (bytecode, exception_table): (&[u8], &[u8]) = match version {
+                PythonVersion::Py312 => (
+                    &[
+                        75, 0, 1, 0, 151, 0, 124, 0, 68, 0, 93, 11, 0, 0, 125, 3, 124, 1, 115, 2,
+                        124, 2, 114, 1, 140, 8, 124, 3, 150, 1, 151, 1, 1, 0, 140, 13, 4, 0, 121,
+                        0, 173, 3, 119, 1,
+                    ],
+                    &[130, 18, 20, 1],
+                ),
+                PythonVersion::Py313 => (
+                    &[
+                        35, 0, 32, 0, 149, 0, 85, 0, 19, 0, 72, 23, 0, 0, 110, 3, 85, 1, 40, 0, 0,
+                        0, 0, 0, 0, 0, 100, 7, 0, 0, 85, 2, 40, 0, 0, 0, 0, 0, 0, 0, 97, 2, 0, 0,
+                        77, 19, 0, 0, 85, 3, 118, 0, 149, 5, 32, 0, 77, 25, 0, 0, 11, 0, 32, 0,
+                        103, 0, 55, 3, 102, 1,
+                    ],
+                    &[130, 31, 33, 1],
+                ),
+                _ => unreachable!(),
+            };
+            assert_eq!(function.bytecode, bytecode, "{version:?}");
+            assert_eq!(function.exception_table, exception_table, "{version:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_implicit_backedge_remains_threadable() {
+        use crate::code_object::Constant;
+        use crate::{CompileOptions, compile_with_options};
+
+        let source = "def f(xs):\n for x in xs:\n  if x: break\n else: return 1\n return 2\n";
+        for version in [PythonVersion::Py312, PythonVersion::Py313] {
+            let module = compile_with_options(
+                source,
+                "cfg.py",
+                &CompileOptions {
+                    python_version: version,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .code;
+            let function = module
+                .constants
+                .iter()
+                .find_map(|constant| match constant {
+                    Constant::Code(code) if code.name == "f" => Some(code),
+                    _ => None,
+                })
+                .unwrap();
+            // Unlike an authored continue, the loop's implicit unlocated jump
+            // has no leading NOP. Native threading exposes a backward conditional
+            // that final normalization reverses before the break cleanup.
+            let expected: &[u8] = if version == PythonVersion::Py312 {
+                &[
+                    151, 0, 124, 0, 68, 0, 93, 6, 0, 0, 125, 1, 124, 1, 115, 1, 140, 6, 1, 0, 121,
+                    2, 4, 0, 121, 1,
+                ]
+            } else {
+                &[
+                    149, 0, 85, 0, 19, 0, 72, 12, 0, 0, 110, 1, 85, 1, 40, 0, 0, 0, 0, 0, 0, 0,
+                    100, 2, 0, 0, 77, 12, 0, 0, 32, 0, 103, 2, 11, 0, 32, 0, 103, 1,
+                ]
+            };
+            assert_eq!(function.bytecode, expected, "{version:?}");
+        }
+    }
+
+    #[test]
+    fn python_312_try_body_pop_block_prevents_early_conditional_threading() {
+        use crate::{CompileOptions, compile_with_options};
+
+        let source = "try:\n    first = acquire()\n    second = prepare(first)\n    if (second / \"item\").ready():\n        consume(second)\nexcept Failure:\n    recover()\nfinish()\n";
+        let code = compile_with_options(
+            source,
+            "terminal_try_condition.py",
+            &CompileOptions {
+                python_version: PythonVersion::Py312,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap()
+        .code;
+        // The shared unlocated POP_BLOCK keeps both normal predecessors until
+        // native location propagation. It then disappears without a line event.
+        // These boundaries are captured from pinned CPython 3.12.14.
+        assert_eq!(code.bytecode.len(), 140);
+        assert_eq!(code.bytecode[70..72], [114, 8]);
+        assert_eq!(
+            code.exception_table,
+            [130, 42, 52, 0, 180, 12, 65, 3, 3, 193, 2, 1, 65, 3, 3]
+        );
+    }
+
+    #[test]
+    fn python_313_conditional_retains_no_interrupt_join() {
+        use crate::code_object::Constant;
+        use crate::{CompileOptions, compile_with_options};
+
+        let source = "def f(a, b, c):\n    if a:\n        if b:\n            raise ValueError\n    elif c:\n        raise TypeError\n    result(a)\n";
+        let module = compile_with_options(
+            source,
+            "cfg.py",
+            &CompileOptions {
+                python_version: PythonVersion::Py313,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap()
+        .code;
+        let function = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) if code.name == "f" => Some(code),
+                _ => None,
+            })
+            .unwrap();
+        // CPython 3.13.15 keeps the inner false branch targeting the separate
+        // JUMP_NO_INTERRUPT join, even after assigning that jump a source line.
+        assert_eq!(
+            function.bytecode,
+            [
+                149, 0, 85, 0, 40, 0, 0, 0, 0, 0, 0, 0, 97, 14, 0, 0, 85, 1, 40, 0, 0, 0, 0, 0, 0,
+                0, 97, 6, 0, 0, 91, 0, 0, 0, 0, 0, 0, 0, 0, 0, 101, 1, 79, 13, 85, 2, 40, 0, 0, 0,
+                0, 0, 0, 0, 97, 6, 0, 0, 91, 2, 0, 0, 0, 0, 0, 0, 0, 0, 101, 1, 91, 5, 0, 0, 0, 0,
+                0, 0, 0, 0, 85, 0, 53, 1, 0, 0, 0, 0, 0, 0, 32, 0, 103, 0,
+            ]
+        );
+    }
+
+    #[test]
+    fn python_313_break_copy_retains_its_eval_check() {
+        use crate::code_object::Constant;
+        use crate::{CompileOptions, compile_with_options};
+
+        let source = "def f(values):\n    try:\n        work()\n    except Error as error:\n        for value in values:\n            break\n    finish()\n";
+        let module = compile_with_options(
+            source,
+            "cfg.py",
+            &CompileOptions {
+                python_version: PythonVersion::Py313,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap()
+        .code;
+        let function = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) if code.name == "f" => Some(code),
+                _ => None,
+            })
+            .unwrap();
+        // Pinned CPython 3.13.15 copies the named-handler cleanup onto the
+        // authored break. That copy keeps JUMP's eval check, while normal
+        // exhaustion retains the cleanup's original JUMP_NO_INTERRUPT.
+        assert_eq!(
+            function.bytecode,
+            [
+                149, 0, 30, 0, 91, 1, 0, 0, 0, 0, 0, 0, 0, 0, 53, 0, 0, 0, 0, 0, 0, 0, 32, 0, 91,
+                5, 0, 0, 0, 0, 0, 0, 0, 0, 53, 0, 0, 0, 0, 0, 0, 0, 32, 0, 103, 0, 33, 0, 91, 2, 0,
+                0, 0, 0, 0, 0, 0, 0, 7, 0, 97, 24, 0, 0, 110, 1, 85, 0, 19, 0, 72, 8, 0, 0, 110, 2,
+                32, 0, 31, 0, 83, 0, 110, 1, 65, 1, 77, 33, 0, 0, 11, 0, 32, 0, 31, 0, 83, 0, 110,
+                1, 65, 1, 78, 40, 83, 0, 110, 1, 65, 1, 102, 1, 102, 0, 61, 3, 31, 0, 102, 1,
+            ]
+        );
+        assert_eq!(
+            function.exception_table,
+            [
+                130, 10, 23, 0, 151, 10, 57, 3, 161, 6, 52, 3, 173, 2, 52, 3, 180, 5, 57, 3
+            ]
+        );
     }
 
     #[test]
@@ -1000,6 +1538,111 @@ mod tests {
                 );
                 pipeline.graph.validate().unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn legacy_constant_if_expression_arms_fold_after_exit_copying() {
+        use crate::code_object::Constant;
+        use crate::{CompileOptions, compile_with_options};
+
+        let source = "def conditional_true(manager, values, choose, check):\n    with manager:\n        for value in values:\n            assert check(value) if choose(value) else True\n";
+        // Exact pinned native code and tables from the independent public reducer.
+        let cases: &[(PythonVersion, &[u8], &[u8])] = &[
+            (
+                PythonVersion::Py312,
+                &[
+                    151, 0, 124, 0, 53, 0, 1, 0, 124, 1, 68, 0, 93, 21, 0, 0, 125, 4, 2, 0, 124, 2,
+                    124, 4, 171, 1, 0, 0, 0, 0, 0, 0, 114, 11, 2, 0, 124, 3, 124, 4, 171, 1, 0, 0,
+                    0, 0, 0, 0, 114, 1, 140, 20, 74, 0, 130, 1, 140, 23, 4, 0, 9, 0, 100, 0, 100,
+                    0, 100, 0, 171, 2, 0, 0, 0, 0, 0, 0, 1, 0, 121, 0, 35, 0, 49, 0, 115, 1, 119,
+                    2, 1, 0, 89, 0, 1, 0, 1, 0, 121, 0, 120, 3, 89, 0, 119, 1,
+                ],
+                &[131, 22, 40, 3, 154, 4, 40, 3, 168, 5, 49, 7],
+            ),
+            (
+                PythonVersion::Py313,
+                &[
+                    149, 0, 85, 0, 2, 0, 32, 0, 85, 1, 19, 0, 72, 33, 0, 0, 110, 4, 85, 2, 34, 0,
+                    85, 4, 53, 1, 0, 0, 0, 0, 0, 0, 40, 0, 0, 0, 0, 0, 0, 0, 97, 17, 0, 0, 85, 3,
+                    34, 0, 85, 4, 53, 1, 0, 0, 0, 0, 0, 0, 40, 0, 0, 0, 0, 0, 0, 0, 97, 2, 0, 0,
+                    77, 31, 0, 0, 23, 0, 101, 1, 77, 35, 0, 0, 11, 0, 32, 0, 83, 0, 83, 0, 83, 0,
+                    53, 2, 0, 0, 0, 0, 0, 0, 32, 0, 103, 0, 33, 0, 44, 0, 40, 0, 0, 0, 0, 0, 0, 0,
+                    100, 1, 0, 0, 102, 2, 32, 0, 31, 0, 32, 0, 32, 0, 103, 0, 61, 3, 31, 0, 102, 1,
+                ],
+                &[
+                    131, 30, 52, 3, 165, 2, 52, 3, 169, 2, 52, 3, 180, 10, 65, 2, 7,
+                ],
+            ),
+        ];
+        for &(version, bytecode, table) in cases {
+            let module = compile_with_options(
+                source,
+                "legacy_constant_arms.py",
+                &CompileOptions {
+                    python_version: version,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .code;
+            let function = module
+                .constants
+                .iter()
+                .find_map(|constant| match constant {
+                    Constant::Code(code) => Some(code),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(function.bytecode, bytecode, "{version:?}");
+            assert_eq!(function.exception_table, table, "{version:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_with_suppression_jump_keeps_version_specific_owner() {
+        use crate::code_object::Constant;
+        use crate::{CompileOptions, compile_with_options};
+
+        let source = "def ordinary_try(manager, work, Error, handle, finish):\n    try:\n        with manager:\n            work()\n    except Error:\n        handle()\n    finish()\n";
+        // Pinned CPython 3.12.14 keeps the enclosing handler on the suppression
+        // JUMP_BACKWARD. CPython 3.13.15 copies the ownerless outer-try continuation.
+        let tables: &[(PythonVersion, &[u8])] = &[
+            (
+                PythonVersion::Py312,
+                &[
+                    130, 2, 40, 0, 132, 8, 28, 3, 140, 8, 40, 0, 156, 5, 37, 7, 161, 7, 40, 0, 168,
+                    12, 55, 3, 182, 1, 55, 3,
+                ],
+            ),
+            (
+                PythonVersion::Py313,
+                &[
+                    130, 2, 45, 0, 132, 8, 28, 3, 140, 8, 45, 0, 156, 10, 42, 7, 166, 3, 45, 0,
+                    170, 3, 45, 0, 173, 13, 61, 3, 188, 1, 61, 3,
+                ],
+            ),
+        ];
+        for &(version, expected) in tables {
+            let module = compile_with_options(
+                source,
+                "legacy_with_suppression.py",
+                &CompileOptions {
+                    python_version: version,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .code;
+            let function = module
+                .constants
+                .iter()
+                .find_map(|constant| match constant {
+                    Constant::Code(code) => Some(code),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(function.exception_table, expected, "{version:?}");
         }
     }
 }

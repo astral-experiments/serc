@@ -68,6 +68,11 @@ impl OptimizationPipeline {
                             } else {
                                 JUMP_FORWARD
                             };
+                            if self.python_version == PythonVersion::Py313 {
+                                // Taken constant conditions become native JUMP,
+                                // even while its target still lies forward.
+                                jump.jump_policy.mark_interruptible_after_threading();
+                            }
                         } else {
                             legacy_nop(jump);
                         }

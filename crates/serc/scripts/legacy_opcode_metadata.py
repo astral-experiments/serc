@@ -287,9 +287,14 @@ def rust_stack_expression(expression: str) -> str:
         if isinstance(value, ast.Name) and value.id == "oparg":
             return ast.Name(id="argument", ctx=ast.Load())
         if isinstance(value, ast.BinOp) and isinstance(value.op, operations):
-            return ast.BinOp(
-                left=translate(value.left), op=value.op, right=translate(value.right)
-            )
+            left, right = translate(value.left), translate(value.right)
+            if (
+                isinstance(value.op, ast.Add)
+                and isinstance(left, ast.Constant)
+                and isinstance(right, ast.Constant)
+            ):
+                return ast.Constant(value=left.value + right.value)
+            return ast.BinOp(left=left, op=value.op, right=right)
         if (
             isinstance(value, ast.Compare)
             and len(value.ops) == 1

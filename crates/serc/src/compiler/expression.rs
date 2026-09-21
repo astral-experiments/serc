@@ -612,13 +612,18 @@ impl Compiler<'_> {
             }
             if !guard_always_false {
                 if copied_subject {
-                    self.assembler.set_location(
+                    let location = if self.context.python_version <= PythonVersion::Py313 {
+                        self.source_location(case.pattern.range())
+                    } else {
                         case.body.first().map_or(SourceLocation::NONE, |statement| {
                             self.source_location(statement_execution_range(statement))
-                        }),
-                    );
+                        })
+                    };
+                    self.assembler.set_location(location);
                     self.emit(POP_TOP, 0, -1)?;
-                    self.assembler.use_next_location_for_last_instruction();
+                    if self.context.python_version >= PythonVersion::Py314 {
+                        self.assembler.use_next_location_for_last_instruction();
+                    }
                 }
                 let body_previous_location = self.assembler.last_instruction_location();
                 let body_start = self.assembler.instruction_count();
@@ -2914,8 +2919,17 @@ impl Compiler<'_> {
         } else {
             self.assembler.set_location(call_location);
             match call.arguments.args.as_ref() {
-                [] => self.emit_deferred_constant(Constant::Tuple(Vec::new()))?,
                 [Expr::Starred(starred)] => self.compile_expression(&starred.value)?,
+                arguments if arguments.len() <= 2 && !shape.has_starred => {
+                    // Synthetic argument tuples bypass the AST constant folder. Native
+                    // code generation folds three or more constants; smaller tuples
+                    // are admitted by the CFG pass alongside annotation/default tuples.
+                    for argument in arguments {
+                        self.compile_expression(argument)?;
+                    }
+                    self.assembler.set_location(call_location);
+                    self.emit_build(BUILD_TUPLE, arguments.len())?;
+                }
                 arguments => self.compile_collection(arguments, CollectionKind::Tuple)?,
             }
             let mut have_dict = false;
@@ -3396,16 +3410,12 @@ impl Compiler<'_> {
             .filter_map(|parameter| parameter.default.as_deref())
             .collect();
         if !positional_defaults.is_empty() {
-            let folded_defaults = if positional_defaults.len() <= CPYTHON_STACK_USE_GUIDELINE {
+            let folded_defaults = if self.has_deferred_annotations()
+                && positional_defaults.len() <= CPYTHON_STACK_USE_GUIDELINE
+            {
                 positional_defaults
                     .iter()
-                    .map(|default| {
-                        if self.context.python_version <= PythonVersion::Py313 {
-                            self.source_aware_fold_constant(default)
-                        } else {
-                            fold_constant(default)
-                        }
-                    })
+                    .map(|default| fold_constant(default))
                     .collect::<Option<Vec<_>>>()
             } else {
                 None
@@ -3426,6 +3436,10 @@ impl Compiler<'_> {
             } else {
                 for default in &positional_defaults {
                     self.compile_expression(default)?;
+                }
+                if !self.has_deferred_annotations() {
+                    self.assembler
+                        .set_location(self.source_location(lambda.range));
                 }
                 self.emit_build(BUILD_TUPLE, positional_defaults.len())?;
             }
@@ -6127,7 +6141,8 @@ impl Compiler<'_> {
         self.assembler.set_location(expression_location);
         let result = match expression {
             Expr::Tuple(tuple)
-                if tuple.elts.iter().any(Expr::is_starred_expr) || tuple.elts.len() > 30 =>
+                if self.context.python_version >= PythonVersion::Py314
+                    && (tuple.elts.iter().any(Expr::is_starred_expr) || tuple.elts.len() > 30) =>
             {
                 // The 3.15 flowgraph folds constant append chains before removing this
                 // intrinsic, preserving the tuple's location on the folded load.
@@ -6608,9 +6623,15 @@ impl Compiler<'_> {
         // that conditional's actual fallthrough leaf rather than its whole source range.
         let preserve_nested_no_location = if let Expr::If(nested) = expression.body.as_ref() {
             let fallthrough = conditional_expression_fallthrough(nested);
-            let location = fallthrough.map_or(SourceLocation::NONE, |fallthrough| {
-                self.source_location(fallthrough.range())
-            });
+            let location = if self.context.python_version <= PythonVersion::Py313 {
+                // Native legacy joins stay unlocated through early exit copying;
+                // inheriting the else leaf now would thread away the donor owner.
+                SourceLocation::NONE
+            } else {
+                fallthrough.map_or(SourceLocation::NONE, |fallthrough| {
+                    self.source_location(fallthrough.range())
+                })
+            };
             self.assembler.set_location(location);
             fallthrough.is_none()
         } else {
@@ -7753,7 +7774,7 @@ impl Compiler<'_> {
         let end = self.assembler.label();
         self.compile_jump_if(&conditional.test, false, otherwise)?;
         self.assembler.record_short_circuit_owner_continuation();
-        self.compile_jump_if(&conditional.body, jump_on, body_target)?;
+        self.compile_if_expression_arm_jump(&conditional.body, jump_on, body_target)?;
         self.assembler.set_location(SourceLocation::NONE);
         let body_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
         if self.control.conditions.retained_multiline_assert_ifexp_exit == Some(conditional.range) {
@@ -7778,10 +7799,16 @@ impl Compiler<'_> {
                         .terminal_try_condition_exception_exclusion_depth
                 },
                 None,
-                |compiler| compiler.compile_jump_if(&conditional.orelse, jump_on, else_target),
+                |compiler| {
+                    compiler.compile_if_expression_arm_jump(
+                        &conditional.orelse,
+                        jump_on,
+                        else_target,
+                    )
+                },
             )?;
         } else {
-            self.compile_jump_if(&conditional.orelse, jump_on, else_target)?;
+            self.compile_if_expression_arm_jump(&conditional.orelse, jump_on, else_target)?;
         }
         if body_target == else_target
             && jump_constant_truthiness(&conditional.orelse) == Some(jump_on)
@@ -7795,6 +7822,38 @@ impl Compiler<'_> {
         self.assembler.preserve_block_boundary_if_new(end);
         self.assembler.mark(end);
         Ok(())
+    }
+
+    /// Keeps legacy constant arms conditional until after exit-block copying.
+    fn compile_if_expression_arm_jump(
+        &mut self,
+        expression: &Expr,
+        jump_on: bool,
+        label: Label,
+    ) -> Result<(), CompileError> {
+        if self.context.python_version <= PythonVersion::Py313
+            && self.return_value_is_constant(expression)
+        {
+            // CPython copies exits before folding these instructions. Emitting
+            // a jump early would copy the target's exception owner and remove
+            // the constant NOP that still blocks 3.12 jump threading.
+            self.compile_expression(expression)?;
+            self.assembler
+                .set_location(self.source_location(expression.range()));
+            self.emit(TO_BOOL, 0, 0)?;
+            self.emit_jump_forward(
+                if jump_on {
+                    POP_JUMP_IF_TRUE
+                } else {
+                    POP_JUMP_IF_FALSE
+                },
+                label,
+                -1,
+            )?;
+            self.emit(NOT_TAKEN, 0, 0)
+        } else {
+            self.compile_jump_if(expression, jump_on, label)
+        }
     }
 
     pub(super) fn compile_jump_if(

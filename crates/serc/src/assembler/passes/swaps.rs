@@ -390,7 +390,10 @@ impl OptimizationPipeline {
                     }
                 }
 
-                if first_instruction.local_policy.may_store_null()
+                // 3.12 resolves lines after static swaps, so the exchanged restore
+                // supplies the successor's location instead of the original store.
+                if self.python_version >= crate::PythonVersion::Py313
+                    && first_instruction.local_policy.may_store_null()
                     && last_instruction.opcode == STORE_FAST
                     && !last_instruction.local_policy.may_store_null()
                 {

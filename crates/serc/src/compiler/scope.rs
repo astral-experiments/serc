@@ -486,6 +486,10 @@ impl FunctionPlan {
             locals.insert(parameter.name.as_str());
         }
         let parameter_names = locals.names.iter().cloned().collect::<FxHashSet<_>>();
+        #[expect(
+            clippy::iter_over_hash_type,
+            reason = "Runtime uses claim source-order positions; unused names are filtered and capture-only cells are sorted during lowering."
+        )]
         for name in local_annotation_bindings {
             locals.insert_annotation_only(&name);
         }
@@ -1866,7 +1870,7 @@ pub(super) fn function_annotation_expressions(
         .chain(definition.returns.as_deref())
 }
 
-fn parameter_default_expressions(
+pub(super) fn parameter_default_expressions(
     parameters: &ruff_python_ast::Parameters,
 ) -> impl Iterator<Item = &Expr> {
     parameters

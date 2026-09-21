@@ -4687,7 +4687,7 @@ pub(crate) fn stack_counts(opcode: Opcode, argument: u32) -> (usize, usize) {
         opcodes::POP_TOP => (1, 0),
         opcodes::PUSH_NULL => (0, 1),
         opcodes::INTERPRETER_EXIT => (1, 0),
-        opcodes::END_FOR => (1 + 1, 0 + 0),
+        opcodes::END_FOR => (2, 0),
         opcodes::END_SEND => (2, 1),
         opcodes::NOP => (0, 0),
         opcodes::UNARY_NEGATIVE => (1, 1),

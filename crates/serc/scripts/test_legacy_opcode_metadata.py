@@ -135,6 +135,11 @@ class LegacyMetadataTests(unittest.TestCase):
             "2 + i64::from(argument == 3)",
         )
 
+    def test_combined_literal_stack_counts_are_reduced(self):
+        self.assertEqual(rust_stack_expression("1 + 1"), "2")
+        self.assertEqual(rust_stack_expression("0 + 0"), "0")
+        self.assertEqual(rust_stack_expression("(1 + 1) + oparg"), "2 + argument")
+
     def test_unknown_or_executable_stack_expressions_are_rejected(self):
         for expression in (
             "jump",

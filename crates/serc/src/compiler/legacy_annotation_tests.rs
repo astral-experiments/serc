@@ -1,5 +1,5 @@
 use crate::code_object::{CodeObject, Constant};
-use crate::target::code_flags::{CO_HAS_DOCSTRING, CO_METHOD};
+use crate::target::code_flags::{CO_GENERATOR, CO_HAS_DOCSTRING, CO_METHOD};
 use crate::target::opcodes::{MAKE_FUNCTION, SET_FUNCTION_ATTRIBUTE};
 use crate::{CompileOptions, PythonVersion, compile_with_options};
 
@@ -211,6 +211,38 @@ fn legacy_defaults_fold_in_order_with_future_annotation_tuples() {
 }
 
 #[test]
+fn legacy_synthetic_tuples_follow_native_cfg_admission_order() {
+    for version in [PythonVersion::Py312, PythonVersion::Py313] {
+        let module = compile(
+            "from __future__ import annotations\ndef outer():\n    def annotated(value: Thing): pass\n    callback = lambda item=None: item\n    return callback\n",
+            version,
+        );
+        assert!(matches!(&child(&module, "outer").constants[3..],
+            [Constant::Tuple(annotation), Constant::Tuple(defaults)]
+                if matches!(annotation.as_slice(), [Constant::String(name), Constant::String(value)] if name == "value" && value == "Thing")
+                    && matches!(defaults.as_slice(), [Constant::None])));
+
+        let module = compile(
+            "from __future__ import annotations\ndef annotated(value: Thing): pass\nresult = call(**options)\n",
+            version,
+        );
+        assert!(matches!(&module.constants[4..],
+            [Constant::Tuple(annotation), Constant::Tuple(arguments)]
+                if annotation.len() == 2 && arguments.is_empty()));
+
+        for arguments in ["'first'", "'first', 'second'"] {
+            let module = compile(
+                &format!("def f():\n    return call({arguments}, **options, keyword='later')\n"),
+                version,
+            );
+            assert!(matches!(&child(&module, "f").constants[..],
+                [Constant::None, Constant::String(key), Constant::String(value), Constant::Tuple(_)]
+                    if key == "keyword" && value == "later"));
+        }
+    }
+}
+
+#[test]
 fn legacy_class_qualified_names_remember_discarded_cache_admissions() {
     for (prefix, expected) in [
         ("", [true, true]),
@@ -259,6 +291,15 @@ fn legacy_qualified_names_distinguish_metadata_tuple_hits_from_scalar_admissions
             .zip(expected)
         {
             let module = compile(&source, version);
+            // The composed class constant is a fresh string, even when an import
+            // supplied an equal parser-interned spelling for its code metadata.
+            assert!(
+                !module
+                    .marshal_provenance
+                    .canonical_constant_strings
+                    .contains("Outer.Inner"),
+                "{version:?}: {source}"
+            );
             assert_eq!(
                 child(child(&module, "Outer"), "Inner")
                     .marshal_provenance
@@ -267,5 +308,183 @@ fn legacy_qualified_names_distinguish_metadata_tuple_hits_from_scalar_admissions
                 "{version:?}: {source}"
             );
         }
+    }
+}
+
+#[test]
+fn legacy_loop_control_locations_match_native() {
+    // Exact line tables from the pinned 3.12.14 and 3.13.15 compilers.
+    for (version, source, function, expected) in [
+        (
+            PythonVersion::Py312,
+            "def f(xs):\n for x in xs:\n  try: break\n  finally: work(x)\n",
+            "f",
+            &[
+                128, 0, 219, 10, 12, 128, 81, 216, 7, 12, 220, 11, 15, 144, 1, 142, 55, 241, 5, 0,
+                11, 13, 248, 228, 11, 15, 144, 1, 141, 55, 250,
+            ][..],
+        ),
+        (
+            PythonVersion::Py313,
+            "async def f(xs):\n async for x in xs:\n  if x: break\n",
+            "f",
+            &[
+                233, 0, 128, 0, 217, 16, 18, 247, 0, 1, 2, 14, 136, 49, 223, 5, 6, 128, 81, 137, 5,
+                241, 3, 1, 2, 14, 145, 2, 249,
+            ][..],
+        ),
+        (
+            PythonVersion::Py313,
+            "def visit_present(values, visit):\n    for value in values:\n        if value is not None:\n            visit(value)\n",
+            "visit_present",
+            &[
+                128, 0, 219, 17, 23, 136, 5, 216, 11, 16, 211, 11, 28, 217, 12, 17, 144, 37, 142,
+                76, 242, 5, 0, 18, 24,
+            ][..],
+        ),
+    ] {
+        assert_eq!(
+            child(&compile(source, version), function).line_table,
+            expected,
+            "{version:?}: {source}"
+        );
+    }
+}
+
+#[test]
+fn legacy_annotation_yields_belong_to_the_eager_enclosing_scope() {
+    for version in [PythonVersion::Py312, PythonVersion::Py313] {
+        for (future, signature, is_generator) in [
+            (false, "(x: (yield 1))", true),
+            (false, "() -> (yield from 1)", true),
+            (false, "(x: (lambda: (yield 1)))", false),
+            (true, "(x: (lambda: (yield 1)))", false),
+            (false, "(x=(yield 1))", true),
+            (true, "(x=(yield 1))", true),
+        ] {
+            let prefix = if future {
+                "from __future__ import annotations\n"
+            } else {
+                ""
+            };
+            let source = format!("{prefix}def outer():\n    def inner{signature}: pass\n");
+            let module = compile(&source, version);
+            assert_eq!(
+                child(&module, "outer").flags & CO_GENERATOR != 0,
+                is_generator,
+                "{version:?}: {source}"
+            );
+            assert_eq!(
+                child(child(&module, "outer"), "inner").flags & CO_GENERATOR,
+                0
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_while_tests_and_implicit_exits_match_native() {
+    // Exact bytecode and line tables from the pinned 3.12.14 and 3.13.15 compilers.
+    for (version, source, bytecode, line_table) in [
+        (
+            PythonVersion::Py312,
+            "def f(value):\n    while value:\n        value -= 1\n",
+            &[
+                151, 0, 124, 0, 114, 9, 124, 0, 100, 1, 122, 23, 0, 0, 125, 0, 124, 0, 114, 1, 140,
+                8, 121, 0, 121, 0,
+            ][..],
+            &[
+                128, 0, 217, 10, 15, 216, 8, 13, 144, 17, 137, 10, 136, 5, 244, 3, 0, 11, 16,
+            ][..],
+        ),
+        (
+            PythonVersion::Py312,
+            "def f(left, right):\n    while left and right:\n        left -= 1\n",
+            &[
+                151, 0, 124, 0, 114, 15, 124, 1, 114, 12, 124, 0, 100, 1, 122, 23, 0, 0, 125, 0,
+                124, 0, 114, 4, 124, 1, 114, 1, 140, 10, 121, 0, 121, 0, 121, 0, 121, 0,
+            ][..],
+            &[
+                128, 0, 217, 10, 14, 145, 53, 216, 8, 12, 144, 1, 137, 9, 136, 4, 241, 3, 0, 11,
+                15, 147, 53, 136, 36, 144, 53, 136, 36,
+            ][..],
+        ),
+        (
+            PythonVersion::Py313,
+            "def f(value):\n    while value:\n        value -= 1\n",
+            &[
+                149, 0, 85, 0, 40, 0, 0, 0, 0, 0, 0, 0, 97, 15, 0, 0, 85, 0, 83, 1, 45, 23, 0, 0,
+                110, 0, 85, 0, 40, 0, 0, 0, 0, 0, 0, 0, 97, 2, 0, 0, 77, 14, 0, 0, 103, 0, 103, 0,
+            ][..],
+            &[
+                128, 0, 222, 10, 15, 216, 8, 13, 144, 17, 137, 10, 136, 5, 247, 3, 0, 11, 16, 138,
+                37,
+            ][..],
+        ),
+        (
+            PythonVersion::Py313,
+            "def f(left, right):\n    while left and right:\n        left -= 1\n",
+            &[
+                149, 0, 85, 0, 40, 0, 0, 0, 0, 0, 0, 0, 97, 31, 0, 0, 85, 1, 40, 0, 0, 0, 0, 0, 0,
+                0, 97, 23, 0, 0, 85, 0, 83, 1, 45, 23, 0, 0, 110, 0, 85, 0, 40, 0, 0, 0, 0, 0, 0,
+                0, 97, 10, 0, 0, 85, 1, 40, 0, 0, 0, 0, 0, 0, 0, 97, 2, 0, 0, 77, 21, 0, 0, 103, 0,
+                103, 0, 103, 0, 103, 0,
+            ][..],
+            &[
+                128, 0, 222, 10, 14, 150, 53, 216, 8, 12, 144, 1, 137, 9, 136, 4, 246, 3, 0, 11,
+                15, 151, 53, 145, 53, 136, 36, 144, 53, 136, 36,
+            ][..],
+        ),
+    ] {
+        let module = compile(source, version);
+        let function = child(&module, "f");
+        assert_eq!(function.bytecode, bytecode, "{version:?}: {source}");
+        assert_eq!(function.line_table, line_table, "{version:?}: {source}");
+    }
+}
+
+#[test]
+fn legacy_dynamic_while_breaks_retest_before_the_backedge() {
+    // Exact native 3.12.14 output; both return copies and protected spans matter.
+    for (source, bytecode, line_table, exception_table) in [
+        (
+            "def f(left, right, items):\n    while left and right:\n        try:\n            item = next(items)\n        except StopIteration:\n            break\n        work(item)\n",
+            &[
+                151, 0, 124, 0, 114, 33, 124, 1, 114, 30, 9, 0, 116, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+                124, 2, 171, 1, 0, 0, 0, 0, 0, 0, 125, 3, 116, 5, 0, 0, 0, 0, 0, 0, 0, 0, 124,
+                3, 171, 1, 0, 0, 0, 0, 0, 0, 1, 0, 124, 0, 114, 4, 124, 1, 114, 1, 140, 28,
+                121, 0, 121, 0, 121, 0, 121, 0, 35, 0, 116, 2, 0, 0, 0, 0, 0, 0, 0, 0, 36, 0,
+                114, 3, 1, 0, 89, 0, 121, 0, 119, 0, 120, 3, 89, 0, 119, 1,
+            ][..],
+            &[
+                128, 0, 217, 10, 14, 145, 53, 240, 2, 3, 9, 18, 220, 19, 23, 152, 5, 147, 59,
+                136, 68, 244, 6, 0, 9, 13, 136, 84, 140, 10, 241, 11, 0, 11, 15, 147, 53, 136,
+                36, 144, 53, 136, 36, 248, 244, 6, 0, 16, 29, 242, 0, 1, 9, 18, 217, 12, 17,
+                240, 3, 1, 9, 18, 250,
+            ][..],
+            &[
+                134, 11, 37, 0, 165, 9, 49, 3, 176, 1, 49, 3,
+            ][..],
+        ),
+        (
+            "def f(value):\n    while value:\n        value -= 1\n        if value == 2:\n            break\n",
+            &[
+                151, 0, 124, 0, 114, 15, 124, 0, 100, 1, 122, 23, 0, 0, 125, 0, 124, 0, 100, 2,
+                107, 40, 0, 0, 114, 1, 121, 0, 124, 0, 114, 1, 140, 14, 121, 0, 121, 0,
+            ][..],
+            &[
+                128, 0, 217, 10, 15, 216, 8, 13, 144, 17, 137, 10, 136, 5, 216, 11, 16, 144,
+                65, 138, 58, 216, 12, 17, 244, 7, 0, 11, 16,
+            ][..],
+            &[
+
+            ][..],
+        ),
+    ] {
+        let module = compile(source, PythonVersion::Py312);
+        let function = child(&module, "f");
+        assert_eq!(function.bytecode, bytecode, "{source}");
+        assert_eq!(function.line_table, line_table, "{source}");
+        assert_eq!(function.exception_table, exception_table, "{source}");
     }
 }
