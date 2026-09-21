@@ -658,3 +658,33 @@ fn preserves_trailing_pass_after_compound_try_body() {
         }
     }
 }
+
+#[test]
+fn normal_finally_comparisons_reuse_their_original_owned_slots() {
+    for (scope, suspension) in [
+        ("def", "work()"),
+        ("def", "yield work()"),
+        ("async def", "await work()"),
+        ("async def", "yield await work()"),
+    ] {
+        for protected in [
+            format!("while value:\n    {suspension}\n"),
+            format!("try:\n    {suspension}\nexcept Error as error:\n    raise error\n"),
+        ] {
+            for comparison in ["value > 0", "value == limit", "state.inner.value == ACTIVE"] {
+                let body = format!(
+                    "try:\n{}finally:\n    if {comparison}:\n        clean()\n",
+                    indent(&protected),
+                );
+                let source = format!(
+                    "{scope} f(manager, value, limit, state):\n    with manager:\n{}",
+                    indent(&indent(&body)),
+                );
+                common::assert_matches_cpython_marshal(
+                    &source,
+                    "normal_finally_comparison_slot.py",
+                );
+            }
+        }
+    }
+}

@@ -3460,7 +3460,7 @@ impl Assembler {
         }
     }
 
-    /// Resolves the first condition slot in an exact loop-exit normal-finally prefix.
+    /// Resolves the first condition slot in an exact original normal-finally prefix.
     pub(crate) fn current_normal_finally_condition_slot_owner(&self) -> Option<bool> {
         use crate::target::opcodes::{
             CALL, LOAD_ATTR, LOAD_DEREF, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, TO_BOOL,
@@ -3514,6 +3514,82 @@ impl Assembler {
                         return None;
                     }
                     instructions.push(*instruction);
+                }
+            }
+        }
+        // The comparison folds into its original TO_BOOL record. In this complete
+        // original array, removing that NOP and the normal POP leaves the appended
+        // marker in an owned comparison/condition cell. A leading loop-exit NOP
+        // can remove one more cell, which is still inside the same owned suffix.
+        if self.python_version == crate::PythonVersion::Py314 && truth {
+            let pop_index = usize::from(instructions.first().is_some_and(|record| {
+                record.opcode == NOP && !record.fusion_policy.is_converted_pop_block()
+            }));
+            if let Some(pop) = instructions.get(pop_index)
+                && let Some(base_depth) = pop.depth_after()
+                && let [operands @ .., comparison, condition] =
+                    &instructions[pop_index + 1..]
+                && pop.opcode == NOP
+                && pop.operand() == Operand::Value(0)
+                && pop.location == SourceLocation::NONE
+                && pop.fusion_policy.is_converted_pop_block()
+                && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+                && comparison.opcode == crate::target::opcodes::COMPARE_OP
+                && matches!(comparison.operand(), Operand::Value(argument) if argument & 16 != 0)
+                && comparison.location == condition.location
+                && condition.location.line >= 0
+                && matches!(condition.operand(), Operand::Forward(_))
+                && condition.depth_after() == Some(base_depth)
+                && comparison.depth_after() == base_depth.checked_add(1)
+                && operands.last().and_then(Instruction::depth_after)
+                    == base_depth.checked_add(2)
+                && instructions.iter().all(|record| {
+                    record.pre_fold_extra_instructions() == 0
+                        && record.local_policy.hidden_exception_owner_slots() == 0
+                        && record.no_location_policy.borrow_fallthrough()
+                            == BorrowFallthrough::Reachable
+                })
+                && instructions[pop_index + 1..].iter().all(|record| {
+                    record.exception_policy() == ExceptionPolicy::default()
+                        && !record.fusion_policy.is_converted_pop_block()
+                        && record.location.line == condition.location.line
+                        && record.location.end_line == condition.location.end_line
+                        && record.location.column >= condition.location.column
+                        && record.location.end_column <= condition.location.end_column
+                })
+                && operands.iter().try_fold(base_depth, |depth, record| {
+                    let next = match record.opcode {
+                        LOAD_FAST | LOAD_DEREF | LOAD_CONST | crate::target::opcodes::LOAD_SMALL_INT
+                            if matches!(record.operand(), Operand::Value(_)) => depth.checked_add(1)?,
+                        crate::target::opcodes::LOAD_GLOBAL
+                            if matches!(record.operand(), Operand::Value(argument) if argument & 1 == 0) => depth.checked_add(1)?,
+                        LOAD_ATTR if depth > base_depth
+                            && matches!(record.operand(), Operand::Value(argument) if argument & 1 == 0) => depth,
+                        _ => return None,
+                    };
+                    (record.depth_after() == Some(next)
+                        && Some(next) <= base_depth.checked_add(2)).then_some(next)
+                }) == base_depth.checked_add(2)
+                && (pop_index == 0
+                    || (instructions[0].operand() == Operand::Value(0)
+                        && instructions[0].location.line >= 0
+                        && instructions[0].fusion_policy == ir::FusionPolicy::default()
+                        && instructions[0].exception_policy() == ExceptionPolicy::default()
+                        && instructions[0].depth_after() == pop.depth_after()))
+                && provenance.original_primitive_condition_boundaries.iter()
+                    .filter(|original| **original == *condition).count() == 1
+            {
+                let mut incoming = items.iter().filter_map(|item| match item {
+                    Item::Instruction(jump)
+                        if matches!(jump.operand(), Operand::Forward(target) | Operand::Backward(target)
+                            if labels.contains(&target)) => Some(jump),
+                    _ => None,
+                }).peekable();
+                if incoming.peek().is_some()
+                    && incoming.all(|jump| matches!(jump.operand(), Operand::Forward(target)
+                        if leading_labels.contains(&target)))
+                {
+                    return Some(true);
                 }
             }
         }
