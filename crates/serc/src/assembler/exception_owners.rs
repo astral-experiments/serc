@@ -3416,7 +3416,14 @@ impl LayoutAssembler {
                 continue;
             };
             let (entry_aliases, entry_pop) = self
-                .source_none_entry_prefix(origin, *begin, *end, label_positions, &boundary, &copied)
+                .source_none_entry_prefix(
+                    origin,
+                    *begin,
+                    *end,
+                    label_positions,
+                    &boundary,
+                    &|label| provenance.is_normal_try_copy_label(label),
+                )
                 .unwrap_or_default();
             let mut removed = Vec::new();
             let mut null_setup_cells = FxHashSet::default();
