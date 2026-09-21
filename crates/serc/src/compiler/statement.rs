@@ -34103,7 +34103,11 @@ fn suite_has_unconditional_cleanup_exit(body: &[Stmt]) -> bool {
     match body.last() {
         Some(Stmt::Try(statement)) => {
             statement.finalbody.is_empty()
-                || (suite_has_linear_borrow_fallthrough(&statement.finalbody)
+                // A terminal condition in the protected body can leave an empty
+                // original join before cleanup. Linear finalizer work alone does
+                // not certify the enclosing condition's sole predecessor.
+                || (suite_has_linear_borrow_fallthrough(&statement.body)
+                    && suite_has_linear_borrow_fallthrough(&statement.finalbody)
                     && !suite_contains_yield(&statement.finalbody))
         }
         Some(Stmt::With(_)) => true,
