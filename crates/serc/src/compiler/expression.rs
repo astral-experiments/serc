@@ -2256,6 +2256,18 @@ impl Compiler<'_> {
                 let yielded = self.assembler.label();
                 let yielded_end = self.assembler.label();
                 let cleanup = self.assembler.label();
+                self.bind_native_source_label(
+                    super::legacy_native_labels::NativeRole::YieldFromSend(expression.range),
+                    send,
+                );
+                self.bind_native_source_label(
+                    super::legacy_native_labels::NativeRole::YieldFromFail(expression.range),
+                    cleanup,
+                );
+                self.bind_native_source_label(
+                    super::legacy_native_labels::NativeRole::YieldFromExit(expression.range),
+                    end,
+                );
                 self.assembler.mark(send);
                 self.emit_jump_forward(SEND, end, 0)?;
                 self.assembler.record_exception_setup(yielded, false);

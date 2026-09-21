@@ -147,6 +147,7 @@ struct FinallyProtectedLoopRanges {
 
 #[derive(Clone, Debug)]
 struct FinallyExitContext {
+    source_range: TextRange,
     body: Vec<Stmt>,
     enclosing_finally_try_depth: usize,
     pass_finally_depth: usize,
@@ -9636,9 +9637,17 @@ impl Compiler<'_> {
                                         compiler.with_suspension_exception_depth(
                                             finally_context.suspension_exception_depth,
                                             |compiler| {
-                                                compiler.compile_copied_finally_body(
-                                                    &finally_context.body,
-                                                    None,
+                                                compiler.with_native_finally_copy(
+                                                    finally_context.source_range,
+                                                    super::legacy_native_labels::FinallyCopy::Return(
+                                                        statement.range,
+                                                    ),
+                                                    |compiler| {
+                                                        compiler.compile_copied_finally_body(
+                                                            &finally_context.body,
+                                                            None,
+                                                        )
+                                                    },
                                                 )
                                             },
                                         )
@@ -25649,6 +25658,7 @@ impl Compiler<'_> {
             && self.control.finally.active_copied_finally_bodies == 0;
         let return_context =
             (copy_finally_on_exit || copy_finally_on_loop_exit).then(|| FinallyExitContext {
+                source_range: statement.range,
                 body: statement.finalbody.to_vec(),
                 enclosing_finally_try_depth: self.control.finally.active_finally_try_bodies,
                 pass_finally_depth: self.control.finally.active_pass_finally_locations.len(),
