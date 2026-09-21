@@ -11257,6 +11257,45 @@ impl Assembler {
             .push((start, origin));
     }
 
+    /// Saves a named handler's original cleanup array before exit-copy scheduling.
+    pub(crate) fn record_original_named_handler_cleanup_join(&mut self, entry: Label, end: Label) {
+        let items = self.linear_items();
+        let Some(start) = items.iter().rposition(|item| *item == Item::Label(entry)) else {
+            return;
+        };
+        let array = items[start + 1..]
+            .iter()
+            .skip_while(|item| matches!(item, Item::Label(_)))
+            .map(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction),
+                Item::Label(_) => None,
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(array) = array.and_then(|array| <[Instruction; 5]>::try_from(array).ok()) else {
+            return;
+        };
+        let [pop, load, store, delete, jump] = array;
+        if pop.opcode != POP_EXCEPT
+            || load.opcode != LOAD_CONST
+            || store.opcode != STORE_FAST
+            || delete.opcode != DELETE_FAST
+            || store.operand() != delete.operand()
+            || jump.opcode != JUMP_FORWARD
+            || jump.operand() != Operand::Forward(end)
+            || array.iter().any(|instruction| {
+                instruction.location != SourceLocation::NONE
+                    || instruction.pre_fold_extra_instructions() != 0
+                    || instruction.local_policy.hidden_exception_owner_slots() != 0
+                    || instruction.exception_policy() != ExceptionPolicy::default()
+            })
+        {
+            return;
+        }
+        self.exception_owner_provenance
+            .original_named_handler_cleanup_joins
+            .push((entry, array));
+    }
+
     /// Records an ordinary handler exit copied from an original empty join.
     pub(crate) fn record_original_handler_cleanup_join_exit(
         &mut self,

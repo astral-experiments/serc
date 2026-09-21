@@ -22834,6 +22834,10 @@ impl Compiler<'_> {
                         // it has no line number and cannot fall through.
                         self.assembler
                             .prepare_no_location_block_for_inlining(handler_exit);
+                        if handler.name.is_some() {
+                            self.assembler
+                                .record_original_named_handler_cleanup_join(body_end, end);
+                        }
                         let manager_try_cleanup = cleanup_has_small_return_successor
                             && handler.name.is_none()
                             && self.control.exceptions.active_exception_handlers.is_empty()

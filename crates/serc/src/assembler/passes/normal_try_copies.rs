@@ -2604,6 +2604,7 @@ impl OptimizationPipeline {
         // try exits. Its omitted POP_BLOCK is already carried on POP_EXCEPT; keep
         // all three slots in the same closed schedule instead of threading around it.
         let mut handler_cleanup_joins = FxHashSet::default();
+        let mut direct_handler_return_joins = FxHashSet::default();
         for &block in order {
             let items = graph[block].items();
             let head_len = items
@@ -2636,7 +2637,8 @@ impl OptimizationPipeline {
                     .exception_owner_provenance
                     .original_handler_cleanup_join_exits
                     .contains(&label)
-                || !exits.contains_key(&target)
+                || (!exits.contains_key(&target)
+                    && !matches!(returns.get(&target), Some(OriginalTail::LocalTupleReturn { .. })))
                 || positions[&block] >= positions[&target]
                 || !items[..head_len].iter().any(|item| {
                     matches!(item, Item::Label(label)
@@ -2655,6 +2657,57 @@ impl OptimizationPipeline {
                 continue;
             }
             handler_cleanup_joins.insert(block);
+            if !exits.contains_key(&target) {
+                direct_handler_return_joins.insert(block);
+            }
+            joins.insert(block, target);
+        }
+        // Named cleanup contains two original POP_BLOCK records before POP_EXCEPT.
+        // Its complete source snapshot is necessary: an earlier handler arm can copy
+        // this unlocated array before the cleanup itself acquires a located return.
+        let mut named_cleanup_joins = FxHashSet::default();
+        for &(entry, original) in &self
+            .exception_owner_provenance
+            .original_named_handler_cleanup_joins
+        {
+            let Some(block) = graph.label_block(entry) else {
+                continue;
+            };
+            let items = graph[block].items();
+            let head_len = items
+                .iter()
+                .take_while(|item| matches!(item, Item::Label(_)))
+                .count();
+            let Operand::Forward(label) = original[4].operand() else {
+                continue;
+            };
+            let Some(target) = graph.label_block(label) else {
+                continue;
+            };
+            if !items[..head_len].contains(&Item::Label(entry))
+                || items[head_len..].iter().copied().ne(original.map(Item::Instruction))
+                || positions[&block] >= positions[&target]
+                || !original[4].jump_policy.inline_small_exit()
+                || original[4].jump_policy.retains_nop_for(original[4].operand())
+                || original[4].jump_policy.is_interruptible()
+                || !original[4].no_location_policy.allows_block_inlining()
+                || !items[..head_len].iter().any(|item| {
+                    matches!(item, Item::Label(label)
+                        if self.exception_owner_provenance.source_boundaries.contains(label)
+                            && !self.borrow_block_aliases.contains(label))
+                })
+                || items[..head_len].iter().any(|item| {
+                    matches!(item, Item::Label(label)
+                        if self.original_nop_targets.contains(label)
+                            || self.exception_owner_provenance.omitted_nop_counts.contains_key(label)
+                            || self.exception_owner_provenance.omitted_nop_locations.contains_key(label)
+                            || self.exception_owner_provenance.setups.iter().any(|(entry, _)| entry == label)
+                            || self.exception_regions.iter().any(|region| region.target == *label))
+                })
+            {
+                continue;
+            }
+            named_cleanup_joins.insert(block);
             joins.insert(block, target);
         }
         let successor = |block| {
@@ -2982,6 +3035,25 @@ impl OptimizationPipeline {
                 sources.insert(block);
             }
         }
+        // Extending a schedule through handler cleanup also admits its incoming
+        // sources. Every further unconditional predecessor must participate before
+        // one of those arrays acquires a return; reject incomplete extensions.
+        let extends_handler_cleanup = named_cleanup_joins
+            .iter()
+            .chain(&direct_handler_return_joins)
+            .any(|block| selected_joins.contains(block));
+        if extends_handler_cleanup
+            && order.iter().any(|block| {
+                graph[*block].last_instruction().is_some_and(|jump| {
+                is_unconditional_jump(jump.opcode)
+                    && matches!(jump.operand(), Operand::Forward(label) | Operand::Backward(label)
+                        if graph.label_block(label).is_some_and(|target|
+                            sources.contains(&target) && !targets.contains(&target)))
+            })
+            })
+        {
+            return;
+        }
         if !selected.is_subset(&sources) || !selected_joins.is_subset(&sources) {
             return;
         }
@@ -3068,6 +3140,20 @@ impl OptimizationPipeline {
                                 located: false,
                             },
                         ]);
+                    }
+                    if named_cleanup_joins.contains(&block) {
+                        prefix.extend(
+                            [PrefixSlot {
+                                is_nop: true,
+                                located: false,
+                            }; 2],
+                        );
+                        prefix.extend(
+                            [PrefixSlot {
+                                is_nop: false,
+                                located: false,
+                            }; 4],
+                        );
                     }
                     // An ordinary empty join has no prefix slots.
                     false
@@ -3174,6 +3260,15 @@ impl OptimizationPipeline {
         // Restore original absence only after the complete schedule was accepted.
         // The compiler's inherited final-arm line is not authored on this join.
         for block in ordered_joins {
+            if named_cleanup_joins.contains(&block) {
+                // Carry the two omitted POP_BLOCKs as exact original array width.
+                // Their ownerless NOPs disappear after copying and need no live slots.
+                self.graph
+                    .instructions_mut(block)
+                    .next()
+                    .expect("named cleanup POP_EXCEPT")
+                    .add_pre_fold_extra_instructions(2);
+            }
             let jump = self
                 .graph
                 .instructions_mut(block)
