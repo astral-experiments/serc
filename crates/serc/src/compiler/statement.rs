@@ -12001,7 +12001,12 @@ impl Compiler<'_> {
                     // array proves that the late append reuses a protected slot.
                     self.assembler.defer_last_post_try_condition_owner();
                 }
-                if jump_constant_truthiness(test) == Some(false) {
+                if jump_constant_truthiness(test) == Some(false)
+                    || (self.context.python_version == crate::PythonVersion::Py314
+                        && matches!(test, Expr::UnaryOp(unary)
+                            if unary.op == UnaryOp::Not
+                                && jump_constant_truthiness(&unary.operand) == Some(true)))
+                {
                     // CPython retains the discarded body's empty original block between
                     // this folded condition and the next branch. Even a located condition
                     // NOP cannot make borrowed-load traversal cross that empty block.
