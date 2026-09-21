@@ -114,6 +114,12 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
             "s = 'café'\nt = ('café',)\ndef f():\n    return café\n",
             "def f(a):\n    return a[257:1024:1000], 1025, -6, -5\n",
             "café = 'café' in {'café', 'autre'}\n",
+            // Preserve annotation comprehension cells and target-specific qualified names.
+            "def function(\n    sequence: [lambda: item for item in (1,)],\n    unique: {lambda: item for item in (2,)},\n) -> {key: lambda: key for key in (3,)}:\n    pass\n\ndef outer(values):\n    def inner(argument: [lambda: item for item in values]):\n        pass\n    return inner\n",
+            "sequence: [lambda: item for item in (1,)]\nif True:\n    mapping: {key: lambda: key for key in (2,)}\nnested: [[lambda: (outer, inner) for inner in (3,)] for outer in (4,)]\n",
+            "from __future__ import annotations\nsequence: [lambda: item for item in (1,)]\ndef function(argument: [lambda: item for item in (2,)]):\n    pass\n",
+            "def f[T](x: [lambda: item for item in (1,)]): pass\n",
+            "def outer(values):\n def f[T](x: [lambda: item for item in values]): pass\n return f\n",
         ] {
             fs_err::write(&source_path, source).unwrap();
             let mut oracle = match version {
