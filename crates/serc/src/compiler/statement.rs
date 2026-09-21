@@ -34728,6 +34728,16 @@ fn handler_cleanup_has_runtime_elif_join(statement: &ruff_python_ast::StmtIf) ->
 // false jump. Neither predecessor is an unconditional jump that can copy the
 // cleanup away. Breaks, loop else suites, and nested cleanup retain their old path.
 fn handler_cleanup_has_for_exhaustion_join(body: &[Stmt]) -> bool {
+    // Suspension introduces additional resume/cleanup blocks. Keep those outside
+    // this certificate, including yields in function defaults and annotations.
+    struct SuspensionDetector(bool);
+
+    impl<'ast> Visitor<'ast> for SuspensionDetector {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            self.0 |= expression_suspends_current_scope(expression);
+        }
+    }
+
     let Some((Stmt::For(tail), prefix)) = body.split_last() else {
         return false;
     };
@@ -34741,16 +34751,6 @@ fn handler_cleanup_has_for_exhaustion_join(body: &[Stmt]) -> bool {
         || suite_contains_yield_with_headers(body, true, true)
     {
         return false;
-    }
-
-    // Suspension introduces additional resume/cleanup blocks. Keep those outside
-    // this certificate, including yields in function defaults and annotations.
-    struct SuspensionDetector(bool);
-
-    impl<'ast> Visitor<'ast> for SuspensionDetector {
-        fn visit_expr(&mut self, expression: &'ast Expr) {
-            self.0 |= expression_suspends_current_scope(expression);
-        }
     }
 
     let mut detector = SuspensionDetector(false);
