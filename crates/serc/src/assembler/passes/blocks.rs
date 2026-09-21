@@ -2023,6 +2023,78 @@ impl OptimizationPipeline {
             }
         }
 
+        // CPython propagates the SETUP span across the original fallthrough into
+        // the protected body before converting SETUP to NOP and compacting it.
+        // Resolve this exact seam early so equal-next-line compaction agrees.
+        let setup_prefix_locations = order
+            .windows(2)
+            .filter_map(|pair| {
+                let [source, target] = *pair else {
+                    unreachable!()
+                };
+                let (Item::Instruction(marker), source_labels) =
+                    self.graph[source].items().split_last()?
+                else {
+                    return None;
+                };
+                let [
+                    Item::Label(end),
+                    Item::Label(setup),
+                    Item::Instruction(prefix),
+                    ..,
+                ] = self.graph[target].items()
+                else {
+                    return None;
+                };
+                if predecessors.get(&target).map(|(count, _)| *count) != Some(1)
+                    || marker.opcode != NOP
+                    || marker.location.line < 0
+                    || marker.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+                    || !source_labels
+                        .iter()
+                        .all(|item| matches!(item, Item::Label(_)))
+                    || !self.exception_owner_provenance.setup_nop_ranges.iter().any(
+                        |(start, finish)| {
+                            finish == end && source_labels.contains(&Item::Label(*start))
+                        },
+                    )
+                    || !self
+                        .exception_owner_provenance
+                        .setups
+                        .contains(&(*setup, Some(marker.location)))
+                    || !self
+                        .exception_regions
+                        .iter()
+                        .any(|region| region.start == *setup && !region.is_scope_fallback)
+                    || prefix.opcode != LOAD_CONST
+                    || prefix.location != SourceLocation::NONE
+                    || prefix.no_location_policy.percent_target_location != u8::MAX
+                    || prefix.exception_policy() != ExceptionPolicy::default()
+                    || marker
+                        .depth_after()
+                        .zip(prefix.depth_after())
+                        .is_none_or(|(before, after)| before.checked_add(1) != Some(after))
+                    || [marker, prefix].iter().any(|instruction| {
+                        instruction.pre_fold_extra_instructions() != 0
+                            || instruction.local_policy.hidden_exception_owner_slots() != 0
+                            || !matches!(instruction.operand(), Operand::Value(_))
+                    })
+                {
+                    return None;
+                }
+                Some((target, marker.location))
+            })
+            .collect::<Vec<_>>();
+        for (target, location) in setup_prefix_locations {
+            let prefix = self
+                .graph
+                .instructions_mut(target)
+                .next()
+                .expect("certified prefix");
+            prefix.location = location;
+            prefix.no_location_policy.percent_target_location = 0;
+        }
+
         for target in order {
             let Some(&(source, jump_location, predecessor_location)) =
                 conditional_targets.get(&target)
@@ -7954,6 +8026,107 @@ mod copied_pop_block_location_tests {
                 &[],
                 &heads,
                 &[(first, 8)],
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod percent_prefix_setup_tests {
+    use super::*;
+    use crate::assembler::{Assembler, ExceptionRegionPriority};
+
+    #[test]
+    fn setup_prefix_requires_original_seam_and_untouched_prefix() {
+        for mutation in [
+            "none", "range", "setup", "span", "prefix", "depth", "unknown", "owner", "incoming",
+        ] {
+            let [start, end, setup, stop, handler] =
+                std::array::from_fn(|i| Label(u32::try_from(i).unwrap()));
+            let location = SourceLocation::new(2, 5, 4, 12);
+            let mut marker = Instruction::new(
+                NOP,
+                Operand::Value(0),
+                location,
+                (mutation != "unknown").then_some(0),
+            );
+            marker.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+            let mut prefix = Instruction::new(
+                LOAD_CONST,
+                Operand::Value(0),
+                SourceLocation::NONE,
+                (mutation != "unknown").then_some(if mutation == "depth" { 2 } else { 1 }),
+            );
+            prefix.no_location_policy.percent_target_location =
+                if mutation == "prefix" { 0 } else { u8::MAX };
+            if mutation == "owner" {
+                prefix.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+            }
+            let ret = Item::Instruction(Instruction::new(
+                RETURN_VALUE,
+                Operand::Value(0),
+                SourceLocation::new(3, 3, 8, 20),
+                Some(0),
+            ));
+            let mut items = vec![
+                Item::Label(start),
+                Item::Instruction(marker),
+                Item::Label(end),
+                Item::Label(setup),
+                Item::Instruction(prefix),
+                Item::Label(stop),
+                ret,
+                Item::Label(handler),
+            ];
+            if mutation == "incoming" {
+                items.push(Item::Instruction(Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(setup),
+                    location,
+                    Some(0),
+                )));
+            }
+            items.push(ret);
+            let mut assembler = Assembler::from_linear_items(items);
+            assembler.next_label = 5;
+            let mut pipeline = assembler.into_optimization_pipeline();
+            pipeline.has_synthesized_percent_target_locations = true;
+            if mutation != "range" {
+                pipeline
+                    .exception_owner_provenance
+                    .setup_nop_ranges
+                    .push((start, end));
+            }
+            if mutation != "setup" {
+                pipeline.exception_owner_provenance.setups.push((
+                    setup,
+                    Some(if mutation == "span" {
+                        SourceLocation::new(2, 5, 5, 12)
+                    } else {
+                        location
+                    }),
+                ));
+            }
+            pipeline.exception_regions.push(ExceptionRegion {
+                is_scope_fallback: false,
+                priority: ExceptionRegionPriority::OriginalRange(setup, stop),
+                start: setup,
+                end: stop,
+                target: handler,
+                depth: 0,
+                preserve_lasti: false,
+            });
+            pipeline.resolve_synthesized_percent_locations();
+            let block = pipeline.graph.label_block(setup).unwrap();
+            let actual = pipeline.graph.instructions_mut(block).next().unwrap();
+            assert_eq!(
+                actual.location,
+                if mutation == "none" {
+                    location
+                } else {
+                    SourceLocation::NONE
+                },
+                "{mutation}"
             );
         }
     }
