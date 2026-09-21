@@ -4561,9 +4561,12 @@ impl OptimizationPipeline {
                             && let Some(next) = next
                         {
                             let next = graph.instruction_mut(next).unwrap();
+                            // Synthesized percent literals have a separate predecessor-aware
+                            // writer. A removed jump must not donate its line to a shared join.
                             if next.location.line < 0
                                 && !next.no_location_policy.preserves_location()
                                 && !next.no_location_policy.allows_block_inlining()
+                                && next.no_location_policy.percent_target_location == 0
                             {
                                 next.location = instruction.location;
                             }
