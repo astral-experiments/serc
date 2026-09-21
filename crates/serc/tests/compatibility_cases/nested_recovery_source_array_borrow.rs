@@ -317,3 +317,45 @@ fn preserves_direct_nested_pass_return_borrow_boundaries() {
         }
     }
 }
+
+#[test]
+fn preserves_terminal_nested_join_return_borrows_without_pass() {
+    for (filename, source) in [
+        (
+            "terminal-no-pass.py",
+            r#"def f(value, outer, first, second):
+    if outer:
+        if first:
+            return update(value)
+        elif second:
+            return convert(value)
+    else:
+        value = other(value)
+    return value
+"#,
+        ),
+        (
+            "nested-assignment-raise.py",
+            r#"def f(value, outer, first, second, choose, fallback):
+    if outer:
+        if first:
+            value = update(value)
+        elif second:
+            if choose:
+                value = left(value)
+            elif fallback:
+                value = right(value)
+            else:
+                raise ValueError("no value")
+    elif second:
+        if choose:
+            value = left(value)
+        else:
+            raise ValueError("no value")
+    return value
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
