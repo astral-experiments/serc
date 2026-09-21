@@ -287,7 +287,6 @@ mod try_loop_attribute_ifexp_owner_compatibility;
 mod try_loop_exit_markers;
 mod try_nested_assignment_compatibility;
 mod try_tail_iterator_pass_handler_compatibility;
-mod tuple_store_join_locations;
 mod tuple_unpack_owner_slots;
 mod typed_handler_entry_owner_boundary;
 mod unary_positive_compatibility;
@@ -311,6 +310,7 @@ mod with_handler_finally_exit_nops;
 mod with_loop_exit_markers;
 mod with_terminal_and_compatibility;
 mod with_terminal_and_raise_compatibility;
+
 mod annotation_string_normalization;
 mod exceptional_finally_nested_continuations;
 mod generator_protected_loop_exits;
@@ -328,6 +328,7 @@ mod short_circuit_nested_loop_backedges;
 mod terminal_handler_prefix_copies;
 mod terminal_while_constant_order;
 mod unreachable_import_constants;
+
 mod conditional_comprehension_filters;
 mod constant_assertion_borrow_boundaries;
 mod copied_finally_with_exclusions;
@@ -343,6 +344,7 @@ mod retained_exception_setup_owners;
 mod retained_setup_prefix_owners;
 mod return_copy_original_slots;
 mod try_exit_borrows;
+
 mod constant_assertion_try_star_locations;
 mod copied_finally_intervening_manager;
 mod copied_finally_manager_return;
@@ -355,19 +357,27 @@ mod nested_match_exit_locations;
 mod removed_assertion_borrow_boundaries;
 mod terminal_nested_match_returns;
 mod tuple_exit_superinstructions;
+
 mod loop_exit_borrow_entries;
+
 mod folded_none_finally_suffix_owners;
+
 mod discarded_fold_admissions;
+
 mod assertion_borrow_barriers;
+
 mod terminal_attribute_if_expression;
+
 mod folded_while_header_borrows;
+
 mod folded_failure_assertion_borrows;
+
 mod unicode_identifier_constant_origins;
+
 mod copied_finally_continue_jumps;
 mod enclosing_cleanup_handler_join_locations;
 mod first_slice_constant_admission;
 mod float_floor_division;
-mod fractional_power_folding;
 mod handler_return_pop_block_slots;
 mod lambda_comprehension_outer_references;
 mod match_case_condition_backedge_locations;
@@ -376,187 +386,327 @@ mod original_match_jump_heads;
 mod pass_finalizer_unwind_markers;
 mod protected_loop_condition_exit_locations;
 mod terminating_handler_shared_false_join_locations;
+
 mod try_else_pop_block_prefixes;
 mod try_entry_import_owner;
+
 mod async_generator_builtin_calls;
+
 mod direct_manager_try_exit_borrows;
+
 mod generator_expression_first_constant;
+
 mod copied_finally_prefix_alias_owners;
 mod multi_with_original_slot_owners;
+
 mod annotation_comprehension_slots;
 mod comprehension_symbol_scope_order;
+
 mod retained_borrow_nops;
+
 mod discarded_if_expression_constants;
+
 mod surviving_while_break_borrows;
+
 mod terminal_while_cleanup_constants;
+
 mod discarded_async_for_constants;
+
 mod bare_handler_conditional_cleanup_copies;
+
 mod nested_handler_cleanup_locations;
+
 mod resume_exception_depth;
 mod single_bare_raise_exit_copies;
+
 mod finally_manager_suppression_copies;
+
 mod cell_prologue_owner_vacancies;
 mod comprehension_restore_continuations;
 mod match_capture_nop_lines;
 mod shared_try_exit_nops;
+
 mod manager_try_borrow_successors;
+
 mod try_except_omitted_for_backedges;
 mod try_except_shared_exit_borrows;
+
 mod match_failure_loop_exit_locations;
+
 mod computed_return_try_unwind_markers;
 mod conditional_manager_suppression_join;
 mod match_canceled_rotation_nop_lines;
 mod match_none_capture_swap_locations;
+
 mod retained_setup_null_slot;
+
 mod assert_success_finally_location;
 mod comprehension_restore_copy_boundary;
 mod folded_condition_borrow_boundary;
 mod terminal_assert_await_finally_nop;
+
 mod for_iter_original_cleanup;
+
 mod percent_format_pre_fusion_locations;
 mod retained_finally_nop_entries;
+
 mod handler_shared_exit_locations;
+
 mod normal_try_original_line_events;
+
 mod backward_conditionals_after_cold_blocks;
+
 mod dynamic_while_break_cleanup;
+
 mod copied_region_end_handlers;
+
 mod copied_return_exclusions;
+
 mod nt_missing_finally_reductions;
 mod nt_owner_family_reductions;
+
 mod copied_handler_cleanup_locations;
 mod folded_false_borrow_edges;
 mod nop_producer_owner_compatibility;
+
 mod specialized_none_terminal_owners;
+
 mod assertion_success_shared_finally;
+
 mod retained_pop_none_owners;
+
 mod protected_nested_try_loop_exit;
+
 mod ordinary_named_return_owner_slots;
+
 mod retained_finally_owner_slots;
+
 mod cfg_join_probes;
+
 mod loop_provenance_probes;
+
 mod cleanup_provenance_probes;
+
 mod shared_normal_exit_markers;
+
 mod loop_cleanup_regressions;
+
 mod copied_exit_regressions;
 mod shared_cleanup_positions;
+
 mod match_exit_copy_budget;
+
 mod normal_finally_original_edges;
+
 mod nested_exit_regression_controls;
 mod original_cleanup_provenance;
+
 mod split_loop_tail_owner_continuations;
+
 mod terminal_while_cleanup;
+
 mod extra_not_taken_owner;
+
 mod outer_branch_try_tail;
+
 mod coroutine_nested_value_owners;
+
 mod queue_worker_match_cleanup;
 mod ternary_tuple_exit;
+
 mod empty_try_nop_owner;
+
 mod terminal_await_try_join;
+
 mod keyword_cleanup_borrow;
+
 mod awaited_assignment_finally_borrow;
+
 mod original_try_boundary;
 mod runtime_prefix_owner;
+
 mod copied_inner_finally_owner;
+
 mod sync_with_return_finally_owner;
+
 mod awaited_recovery_nested_handler_regression;
+
 mod retained_finally_closure_receiver;
+
 mod awaited_retry_minimal;
+
 mod missing_nop_source_probes;
+
 mod extra_nop_terminal_loop;
+
 mod terminal_conditional_loops_borrow;
+
 mod bare_handler_manager_backedge;
+
 mod async_manager_assert_owner;
 mod terminal_for_finally_borrow;
+
 mod folded_while_import_borrow;
+
 mod intervening_try_finally_copy;
+
 mod async_generator_finally_owner;
 mod conditional_finally_return_owner;
+
 mod located_manager_handler_join;
 mod manager_return_finally_expressions;
+
 mod dict_or_finally;
+
 mod iterator_inner_finally_owner;
+
 mod conditional_finally_break_entry;
+
 mod tuple_genexpr_keyword_return_compatibility;
+
 mod async_for_nonterminal_join_compatibility;
+
 mod handler_return_cell_guard;
 mod inner_try_first_finally_owner;
 mod nested_setup_await_borrow;
+
 mod handler_continue_guards;
 mod nested_setup_conditional_argument;
 mod related_finally_truth_owners;
 mod sync_with_one_fallthrough;
+
 mod finally_for_borrow;
+
 mod calculated_handler_return;
 mod calculated_handler_return_iterators;
+
 mod calculated_handler_return_two_managers;
 mod mixed_handler_finally_borrow;
 mod normal_finally_handler_fallthrough;
+
 mod nested_match_constant_return_nop;
 mod nested_match_donated_location;
+
 mod calculated_handler_return_retained_async_manager;
+
 mod guarded_arm_finally_borrow;
+
 mod runtime_while_recovery_cleanup;
+
 mod else_break_finally_borrow;
+
 mod terminal_chained_assert_success_locations;
+
 mod nested_or_break_position;
+
 mod terminal_try_while_exit_locations;
+
 mod nested_else_return_location;
+
 mod match_handler_cleanup_join;
+
 mod match_comprehension_exit_positions;
+
 mod match_handler_tuple_fallthrough_donor;
+
 mod named_handler_match_failure_cleanup;
+
 mod folded_nested_if_exit;
+
 mod async_for_direct_assert_exit;
+
 mod async_manager_nested_while_exit;
+
 mod coroutine_guarded_break_finally;
+
 mod finally_source_recovery;
+
 mod manager_assertion_arm_cleanup;
+
 mod await_completion_condition_owners;
+
 mod async_retry_cold_break;
+
 mod async_retry_named_break_marker;
+
 mod handler_comprehension_join;
+
 mod iterator_finally_return_cleanup_location;
+
 mod try_entry_none_fallback;
+
 mod nested_recovery_source_array_borrow;
+
 mod p90_fresh_try_prefix;
+
 mod post_finally_older_iterator_owner;
+
 mod populated_try_else_finally_borrow;
+
 mod nested_loop_tail_boolean_discard_location;
+
 mod p91_fresh_try_nonterminal_cell_prefix;
+
 mod conditional_else_finally_borrow;
+
 mod p92_fresh_try_dynamic_binary_prefix;
+
 mod nested_manager_first_condition_owner;
+
 mod named_handler_shared_false_cleanup_location;
+
 mod three_owner_probes;
+
 mod match_success_normal_try_copies;
+
 mod terminal_cold_join_probes;
+
 mod nested_manager_none_slot;
+
 mod named_handler_jump_locations;
+
 mod authored_finally_empty_heads;
+
 mod async_generator_handler_iterator_return;
+
 mod copied_handler_return_none;
 mod copied_handler_split_return_none;
+
 mod sync_manager_finally_owner;
+
 mod delegated_while_owner;
+
 mod sync_iterator_manager_finally_none;
+
 mod sync_named_handler_break_no_fallthrough;
+
 mod early_return_nop_captured_cell;
+
 mod borrow_loop_exit_compatibility;
+
 mod comprehension_method_ifexp;
+
 mod except_star_finally_source_boundary;
+
 mod protected_loop_surviving_break;
 mod protected_reraise_fixed_point;
 mod synthetic_range_entry_copy_budget;
+
 mod named_elif_cleanup_locations;
+
 mod class_and_percent_constant_origins;
 mod class_annotation_captures;
 mod shared_handler_cleanup_join_locations;
 
-mod literal_statement_spans;
 mod nested_or_sequence_pop_locations;
 mod with_folded_constant_owner;
+
 mod with_pass_finally_owner;
-mod late_constant_boolean_folding;
+
 mod numeric_remainder_folding;
 mod signed_integer_folding;
 mod type_parameter_scope_boundaries;
+mod tuple_store_join_locations;
+mod fractional_power_folding;
+mod literal_statement_spans;
+mod late_constant_boolean_folding;
