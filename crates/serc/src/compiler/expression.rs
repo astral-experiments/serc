@@ -2690,13 +2690,6 @@ impl Compiler<'_> {
         )
     }
 
-    pub(super) fn compile_awaitable_on_stack(
-        &mut self,
-        get_awaitable_argument: u32,
-    ) -> Result<(), CompileError> {
-        self.compile_awaitable_on_stack_with_native_roles(get_awaitable_argument, None)
-    }
-
     pub(super) fn compile_awaitable_on_stack_with_native_roles(
         &mut self,
         get_awaitable_argument: u32,

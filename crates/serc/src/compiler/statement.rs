@@ -205,6 +205,7 @@ struct TryMarkerSlotContext {
 
 #[derive(Clone, Copy, Debug)]
 struct WithExitContext {
+    source_range: TextRange,
     location: SourceLocation,
     handler: Label,
     is_async: bool,
@@ -1774,14 +1775,7 @@ impl Compiler<'_> {
                     Stmt::Try(statement)
                         if !statement.is_star
                             && match self.context.python_version {
-                                crate::PythonVersion::Py312 => {
-                                    statement.finalbody.is_empty()
-                                        || (statement.orelse.is_empty()
-                                            && matches!(
-                                                statement.finalbody.last(),
-                                                Some(Stmt::If(_) | Stmt::Try(_) | Stmt::For(_))
-                                            ))
-                                }
+                                crate::PythonVersion::Py312 => true,
                                 crate::PythonVersion::Py313 => {
                                     statement.orelse.is_empty()
                                         && statement.finalbody.is_empty()
@@ -1791,11 +1785,11 @@ impl Compiler<'_> {
                             } =>
                     {
                         // Native 3.12 emits every ordinary try's normal and handler
-                        // jumps to one shared footer after all cleanup blocks. Preserve
-                        // that original End (and its jump operands) until the two CFG
-                        // copy rounds; eager returns erase its allocation provenance.
-                        // The existing finalizer and 3.13 loop routes need the same
-                        // ordering for their nested exits and cleanup jumps.
+                        // jumps to one shared footer after all cleanup blocks, including
+                        // finally copies. Preserve that original End and its operands
+                        // until CFG copying; its footer also separates FinallyExit from
+                        // the coroutine's StopIterationHandler. The 3.13 loop route
+                        // keeps this ordering for its nested exits and cleanup jumps.
                         let previous = self.assembler.location();
                         self.assembler
                             .set_location(self.source_location(statement.range));
@@ -7244,8 +7238,12 @@ impl Compiler<'_> {
                                 preserve_tos,
                             )?;
                             next_loop = manager.loop_depth;
-                            let starts =
-                                self.emit_with_unwind(with_index, with_index + 1, preserve_tos)?;
+                            let starts = self.emit_with_unwind(
+                                with_index,
+                                with_index + 1,
+                                preserve_tos,
+                                Some(statement.range),
+                            )?;
                             if let Some(region_starts) = &mut handler_region_unwind_starts {
                                 for unwind in &starts {
                                     for region_start in
@@ -7305,8 +7303,12 @@ impl Compiler<'_> {
                                 preserve_tos,
                             )?;
                             next_loop = context.loop_depth;
-                            let starts =
-                                self.emit_with_unwind(with_index, with_index + 1, preserve_tos)?;
+                            let starts = self.emit_with_unwind(
+                                with_index,
+                                with_index + 1,
+                                preserve_tos,
+                                Some(statement.range),
+                            )?;
                             if let Some(region_starts) = &mut handler_region_unwind_starts {
                                 for unwind in &starts {
                                     for region_start in
@@ -8091,7 +8093,12 @@ impl Compiler<'_> {
                     };
                     let mut starts = Vec::new();
                     let remaining_with = if let Some(from_depth) = early_manager_start {
-                        starts = self.emit_with_unwind(from_depth, next_with, preserve_tos)?;
+                        starts = self.emit_with_unwind(
+                            from_depth,
+                            next_with,
+                            preserve_tos,
+                            Some(statement.range),
+                        )?;
                         if none_return_unwinds_inner_managers
                             && let Some(region_starts) = &mut handler_region_unwind_starts
                         {
@@ -8338,6 +8345,7 @@ impl Compiler<'_> {
                         finally_context.with_depth,
                         remaining_with,
                         preserve_tos,
+                        Some(statement.range),
                     )?);
                     if let Some(region_starts) = &mut handler_region_unwind_starts {
                         for unwind in &starts {
@@ -10264,7 +10272,12 @@ impl Compiler<'_> {
                         with_unwind_before_exception_start =
                             with_unwind_starts.len() + remaining_with_starts.len();
                     }
-                    let starts = self.emit_with_unwind(with_index, with_index + 1, preserve_tos)?;
+                    let starts = self.emit_with_unwind(
+                        with_index,
+                        with_index + 1,
+                        preserve_tos,
+                        Some(statement.range),
+                    )?;
                     if tracks_iterator_region_unwinds
                         && let Some(region_starts) = &mut handler_region_unwind_starts
                     {
@@ -13061,6 +13074,7 @@ impl Compiler<'_> {
         from_depth: usize,
         to_depth: usize,
         preserve_tos: bool,
+        return_origin: Option<TextRange>,
     ) -> Result<Vec<WithUnwind>, CompileError> {
         let mut unwind_starts = Vec::with_capacity(to_depth - from_depth);
         for index in (from_depth..to_depth).rev() {
@@ -13085,7 +13099,11 @@ impl Compiler<'_> {
             self.emit(LOAD_CONST, none, 1)?;
             self.emit_with_exit_call()?;
             if context.is_async {
-                self.compile_awaitable_on_stack(2)?;
+                let roles = return_origin.map(|range| {
+                    super::legacy_native_labels::WithAwait::Return(range)
+                        .roles(context.source_range)
+                });
+                self.compile_awaitable_on_stack_with_native_roles(2, roles)?;
             }
             self.emit(POP_TOP, 0, -1)?;
         }
@@ -13992,7 +14010,7 @@ impl Compiler<'_> {
         with_unwind_starts: &mut Vec<WithUnwind>,
         region_unwind_starts: &mut [Option<(Label, usize)>],
     ) -> Result<(), CompileError> {
-        let starts = self.emit_with_unwind(with_depth, *next_with, false)?;
+        let starts = self.emit_with_unwind(with_depth, *next_with, false, None)?;
         for unwind in &starts {
             let depth = self.control.withs.active_with_exits[unwind.index].exception_region_depth;
             for (index, region_start) in region_unwind_starts.iter_mut().enumerate().skip(depth) {
@@ -27740,6 +27758,7 @@ impl Compiler<'_> {
             self.emit(POP_TOP, 0, -1)?;
         }
         let context = WithExitContext {
+            source_range: item.context_expr.range(),
             location: self.source_location(item.context_expr.range()),
             handler,
             is_async: false,
@@ -28274,6 +28293,7 @@ impl Compiler<'_> {
         );
         self.assembler.mark(protected_start);
         let context = WithExitContext {
+            source_range: item.context_expr.range(),
             location: self.source_location(item.context_expr.range()),
             handler,
             is_async: true,

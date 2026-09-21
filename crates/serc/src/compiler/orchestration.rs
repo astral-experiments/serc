@@ -380,10 +380,14 @@ impl<'source> Compiler<'source> {
 
     pub(crate) fn compile_module(mut self, body: &Suite) -> Result<CodeObject, CompileError> {
         self.assembler.reserve_items(body.len().saturating_mul(16));
-        if self.context.python_version == PythonVersion::Py312
-            && super::legacy_native_seed_bound::certifies(body)
-        {
-            self.assembler.certify_legacy_uniform_jump_seed();
+        if self.context.python_version == PythonVersion::Py312 {
+            if super::legacy_native_seed_bound::certifies(body) {
+                self.assembler.certify_legacy_uniform_jump_seed();
+            }
+            self.native_label_plan = super::legacy_native_labels::NativeLabelPlan::module(
+                body,
+                self.unit.flags & CO_FUTURE_ANNOTATIONS != 0,
+            );
         }
         self.symbols
             .module_globals

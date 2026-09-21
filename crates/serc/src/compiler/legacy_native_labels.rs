@@ -68,12 +68,13 @@ pub(super) enum NativeRole {
     WithAwaitExit(TextRange, WithAwait),
 }
 
-/// Distinguishes the three implicit awaits of one original async manager.
+/// Distinguishes original async-manager awaits and authored Return cleanup.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum WithAwait {
     Enter,
     NormalExit,
     ExceptionalExit,
+    Return(TextRange),
 }
 
 impl WithAwait {
@@ -125,9 +126,12 @@ struct Builder {
     finally_depth: usize,
     loop_finally_depths: Vec<usize>,
     manager_depth: usize,
-    handler_depth: usize,
+    async_manager_items: Vec<TextRange>,
     loop_manager_depths: Vec<usize>,
     inside_comprehension_body: bool,
+    // None means local annotations emit no suffix. Modules always store simple
+    // annotations; the bool selects future stringification over eager evaluation.
+    module_annotations: Option<bool>,
 }
 
 impl NativeLabelPlan {
@@ -152,6 +156,26 @@ impl NativeLabelPlan {
             builder.mark(handler);
             builder.instruction();
         }
+        Self::from_builder(builder)
+    }
+
+    /// Plans a module's own label sequence without a function entry allocation.
+    pub(super) fn module(body: &[Stmt], future_annotations: bool) -> Option<Box<Self>> {
+        let mut builder = Builder {
+            module_annotations: Some(future_annotations),
+            ..Builder::default()
+        };
+        // Native enters the zeroed module unit with RESUME. Annotation setup and
+        // a docstring store also allocate no labels; the ordinary suite retains
+        // a nonempty boundary for the docstring, unlike a function's constants.
+        builder.instruction();
+        builder.suite(body)?;
+        builder.instruction(); // unconditional LOAD_CONST / RETURN_VALUE footer
+        Self::from_builder(builder)
+    }
+
+    /// Canonicalizes original source marks across all semantic occurrences.
+    fn from_builder(builder: Builder) -> Option<Box<Self>> {
         let mut aliases = FxHashMap::default();
         for (index, (_, _, boundary)) in builder.labels.iter().enumerate() {
             let ordinal = u32::try_from(index.checked_add(1)?).ok()?;
@@ -223,12 +247,26 @@ impl Builder {
                 Stmt::AnnAssign(assignment)
                     if matches!(assignment.target.as_ref(), Expr::Name(_)) =>
                 {
-                    // Function-local annotations are checked but never evaluated.
-                    // An annotation without a value emits no instruction at all.
+                    if let Some(future_annotations) = self.module_annotations {
+                        // Simple module annotations always have a store suffix.
+                        // Future annotations stringify even label-bearing syntax;
+                        // initially admit only label-free eager evaluation.
+                        if !assignment.simple {
+                            return None;
+                        }
+                        if !future_annotations {
+                            Self::label_free_expression(&assignment.annotation)?;
+                        }
+                    }
                     if let Some(value) = &assignment.value {
                         self.expression(value)?;
                         self.instruction();
                     }
+                    if self.module_annotations.is_some() {
+                        self.instruction(); // annotation value and STORE_SUBSCR
+                    }
+                    // Local annotations emit no suffix, and an annotation
+                    // without a value emits no instruction in a function.
                 }
                 Stmt::Import(_) | Stmt::ImportFrom(_) => self.instruction(),
                 Stmt::Delete(deletion) => {
@@ -258,12 +296,18 @@ impl Builder {
                     self.instruction(); // POP_TOP, or the constant statement's NOP
                 }
                 Stmt::Return(statement) => {
-                    if self.manager_depth != 0 || self.handler_depth != 0 || self.finally_depth != 0
-                    {
+                    if self.finally_depth != 0 {
                         return None;
                     }
                     if let Some(value) = &statement.value {
                         self.expression(value)?;
+                    }
+                    // Only async manager unwind allocates labels. Label-free
+                    // handler/iterator/sync-manager cleanup lies inside the
+                    // nonempty gaps of each await and the final RETURN_VALUE.
+                    for index in (0..self.async_manager_items.len()).rev() {
+                        let manager = self.async_manager_items[index];
+                        self.manager_await(manager, WithAwait::Return(statement.range));
                     }
                     self.instruction();
                 }
@@ -556,9 +600,7 @@ impl Builder {
             let handler_body = self.allocate(NativeRole::HandlerCleanupBody(handler.range));
             self.instruction(); // STORE / SETUP_CLEANUP, or unnamed POP_TOP
             self.mark(handler_body);
-            self.handler_depth += 1;
             self.suite(&handler.body)?;
-            self.handler_depth -= 1;
             // Ordinary try/handler Break and Continue unwinding allocates no
             // labels. Keep these original cleanup/join boundaries even when
             // an abrupt exit makes the normal records unreachable.
@@ -733,10 +775,16 @@ impl Builder {
             self.instruction(); // discard the enter result
         }
         self.manager_depth += 1;
+        if is_async {
+            self.async_manager_items.push(range);
+        }
         if remaining.is_empty() {
             self.suite(body)?;
         } else {
             self.manager_items(remaining, body, is_async)?;
+        }
+        if is_async {
+            self.async_manager_items.pop();
         }
         self.manager_depth -= 1;
         self.instruction(); // original POP_BLOCK and normal exit call
@@ -1648,19 +1696,195 @@ mod manager_tests {
     }
 
     #[test]
-    fn unsupported_manager_unwinds_reject_the_whole_plan() {
+    fn authored_async_return_keeps_later_original_cleanup_labels() {
+        let parsed =
+            parse_module("async def f():\n    async with manager():\n        return value\n")
+                .unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::With(manager)] = function.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::Return(returned)] = manager.body.as_slice() else {
+            panic!()
+        };
+        let range = manager.items[0].context_expr.range();
+        let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        // Native compiler_return emits a distinct yield-from triple before
+        // compiler_async_with visits its dead normal and exceptional exits.
+        for (phase, first) in [
+            (WithAwait::Enter, 6),
+            (WithAwait::Return(returned.range), 9),
+            (WithAwait::NormalExit, 12),
+            (WithAwait::ExceptionalExit, 15),
+        ] {
+            for (role, ordinal) in phase.roles(range).into_iter().zip(first..) {
+                assert_eq!(plan.remaining[&role], ordinal);
+            }
+        }
+        assert_eq!(plan.remaining[&NativeRole::WithExit(range)], 19);
+        assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 20);
+    }
+
+    #[test]
+    fn return_unwinds_async_items_in_reverse_before_normal_source_exits() {
+        let parsed =
+            parse_module("async def f():\n    async with first(), second():\n        return\n")
+                .unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::With(manager)] = function.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::Return(returned)] = manager.body.as_slice() else {
+            panic!()
+        };
+        let outer = manager.items[0].context_expr.range();
+        let inner = manager.items[1].context_expr.range();
+        let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        for (range, phase, first) in [
+            (outer, WithAwait::Enter, 6),
+            (inner, WithAwait::Enter, 13),
+            (inner, WithAwait::Return(returned.range), 16),
+            (outer, WithAwait::Return(returned.range), 19),
+            (inner, WithAwait::NormalExit, 22),
+            (inner, WithAwait::ExceptionalExit, 25),
+            (outer, WithAwait::NormalExit, 30),
+            (outer, WithAwait::ExceptionalExit, 33),
+        ] {
+            for (role, ordinal) in phase.roles(range).into_iter().zip(first..) {
+                assert_eq!(plan.remaining[&role], ordinal);
+            }
+        }
+        assert_eq!(plan.remaining[&NativeRole::WithExit(inner)], 29);
+        assert_eq!(plan.remaining[&NativeRole::WithExit(outer)], 37);
+        assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 38);
+    }
+
+    #[test]
+    fn return_values_precede_unwind_and_dead_returns_keep_distinct_roles() {
+        let parsed = parse_module("async def f():\n    async with manager():\n        return await value()\n        return None\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::With(manager)] = function.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::Return(first), Stmt::Return(second)] = manager.body.as_slice() else {
+            panic!()
+        };
+        let ruff_python_ast::Expr::Await(value) = first.value.as_deref().unwrap() else {
+            panic!()
+        };
+        let range = manager.items[0].context_expr.range();
+        let mut plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        for (role, ordinal) in [
+            (NativeRole::AwaitSend(value.range), 9),
+            (NativeRole::AwaitFail(value.range), 10),
+            (NativeRole::AwaitExit(value.range), 11),
+        ] {
+            assert_eq!(plan.remaining[&role], ordinal);
+        }
+        for (phase, first_ordinal) in [
+            (WithAwait::Return(first.range), 12),
+            (WithAwait::Return(second.range), 15),
+            (WithAwait::NormalExit, 18),
+            (WithAwait::ExceptionalExit, 21),
+        ] {
+            for (role, ordinal) in phase.roles(range).into_iter().zip(first_ordinal..) {
+                assert_eq!(plan.remaining[&role], ordinal);
+            }
+        }
+        // Consuming one authored occurrence cannot consume another Return's
+        // cleanup or substitute the normal manager exit for it.
+        let first_send = NativeRole::WithAwaitSend(range, WithAwait::Return(first.range));
+        assert_eq!(plan.take(first_send), Some(12));
+        assert_eq!(plan.take(first_send), None);
+        assert_eq!(
+            plan.take(NativeRole::WithAwaitSend(
+                range,
+                WithAwait::Return(second.range)
+            )),
+            Some(15)
+        );
+        assert_eq!(
+            plan.take(NativeRole::WithAwaitSend(range, WithAwait::NormalExit)),
+            Some(18)
+        );
+        assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 26);
+    }
+
+    #[test]
+    fn named_handler_return_adds_only_its_outer_async_manager_triple() {
+        let parsed = parse_module("async def f():\n    async with manager():\n        try:\n            action()\n        except Error as error:\n            return error\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::With(manager)] = function.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::Try(tried)] = manager.body.as_slice() else {
+            panic!()
+        };
+        let handler = tried.handlers[0].as_except_handler().unwrap();
+        let [Stmt::Return(returned)] = handler.body.as_slice() else {
+            panic!()
+        };
+        let range = manager.items[0].context_expr.range();
+        let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        for (role, ordinal) in [
+            (NativeRole::TryBody(tried.range), 9),
+            (NativeRole::TryExcept(tried.range), 10),
+            (NativeRole::TryEnd(tried.range), 11),
+            (NativeRole::TryCleanup(tried.range), 12),
+            (NativeRole::HandlerNext(handler.range), 13),
+            (NativeRole::HandlerCleanupEnd(handler.range), 14),
+            (NativeRole::HandlerCleanupBody(handler.range), 15),
+        ] {
+            assert_eq!(plan.remaining[&role], ordinal);
+        }
+        for (phase, first) in [
+            (WithAwait::Return(returned.range), 16),
+            (WithAwait::NormalExit, 19),
+            (WithAwait::ExceptionalExit, 22),
+        ] {
+            for (role, ordinal) in phase.roles(range).into_iter().zip(first..) {
+                assert_eq!(plan.remaining[&role], ordinal);
+            }
+        }
+        assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 27);
+    }
+
+    #[test]
+    fn synchronous_manager_and_ordinary_handler_returns_are_admitted() {
         for source in [
             "def f():\n    with manager():\n        return 1\n",
             "def f():\n    with first(), second():\n        return 1\n",
             "def f():\n    with first():\n        with second():\n            return 1\n",
-            "def f():\n    with manager():\n        try:\n            return value\n        finally:\n            finish()\n",
+            "def f():\n    try:\n        action()\n    except Error:\n        if flag:\n            return value\n",
+            "def f():\n    try:\n        action()\n    except Error:\n        try:\n            return value\n        except Other:\n            pass\n",
         ] {
             let parsed = parse_module(source).unwrap();
             let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
                 panic!()
             };
-            assert!(NativeLabelPlan::function(&function.body, false).is_none());
+            assert!(
+                NativeLabelPlan::function(&function.body, false).is_some(),
+                "{source}"
+            );
         }
+    }
+
+    #[test]
+    fn finally_crossing_manager_return_rejects_the_whole_plan() {
+        let source = "def f():\n    with manager():\n        try:\n            return value\n        finally:\n            finish()\n";
+        let parsed = parse_module(source).unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        assert!(NativeLabelPlan::function(&function.body, false).is_none());
     }
     #[test]
     fn unpacked_for_continue_reuses_the_existing_native_loop_labels() {
@@ -2154,8 +2378,6 @@ mod ordinary_except_tests {
             "def f():\n    try:\n        action()\n    except:\n        pass\n",
             "def f():\n    try:\n        action()\n    except Error:\n        return value\n    finally:\n        done()\n",
             "def f():\n    try:\n        action()\n    except* Error:\n        pass\n",
-            "def f():\n    try:\n        action()\n    except Error:\n        if flag:\n            return value\n",
-            "def f():\n    try:\n        action()\n    except Error:\n        try:\n            return value\n        except Other:\n            pass\n",
             "def f():\n    try:\n        action()\n    except (Error if flag else Other):\n        pass\n",
         ] {
             let parsed = parse_module(source).unwrap();
@@ -2886,5 +3108,106 @@ mod finally_occurrence_tests {
             panic!()
         };
         assert!(NativeLabelPlan::function(&function.body, false).is_some());
+    }
+}
+
+#[cfg(test)]
+mod module_native_label_tests {
+    use super::{NativeLabelPlan, NativeRole};
+    use ruff_python_ast::{Expr, Stmt};
+    use ruff_python_parser::parse_module;
+
+    #[test]
+    fn module_entry_and_child_scopes_reserve_no_parent_label() {
+        let parsed = parse_module(
+            "\"module docs\"\nfrom __future__ import annotations\ndef child():\n    if inside:\n        pass\nclass Child:\n    if inside:\n        pass\nif outside:\n    pass\n",
+        )
+        .unwrap();
+        let Some(Stmt::If(branch)) = parsed.suite().last() else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::module(parsed.suite(), true).unwrap();
+        assert_eq!(plan.remaining.len(), 1);
+        assert_eq!(plan.remaining[&NativeRole::IfEnd(branch.range)], 1);
+        assert!(!plan.remaining.contains_key(&NativeRole::FunctionStart));
+        assert!(
+            !plan
+                .remaining
+                .contains_key(&NativeRole::StopIterationHandler)
+        );
+    }
+
+    #[test]
+    fn module_annotation_suffix_keeps_else_and_end_distinct() {
+        let parsed = parse_module("if flag:\n    pass\nelse:\n    item: Kind\n").unwrap();
+        let [Stmt::If(branch)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        for future_annotations in [false, true] {
+            let plan = NativeLabelPlan::module(parsed.suite(), future_annotations).unwrap();
+            assert_eq!(plan.remaining[&NativeRole::IfEnd(branch.range)], 1);
+            assert_eq!(plan.remaining[&NativeRole::IfElse(branch.range)], 2);
+        }
+        // A value-less local annotation emits nothing: the function's two marks
+        // alias after its original jump, keeping the later Else ordinal.
+        let local = NativeLabelPlan::function(parsed.suite(), false).unwrap();
+        assert_eq!(local.remaining[&NativeRole::IfEnd(branch.range)], 3);
+        assert_eq!(local.remaining[&NativeRole::IfElse(branch.range)], 3);
+    }
+
+    #[test]
+    fn future_annotations_do_not_allocate_expression_labels() {
+        let parsed = parse_module("item: Left if flag else Right\nif ready:\n    pass\n").unwrap();
+        let Some(Stmt::If(branch)) = parsed.suite().last() else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::module(parsed.suite(), true).unwrap();
+        assert_eq!(plan.remaining.len(), 1);
+        assert_eq!(plan.remaining[&NativeRole::IfEnd(branch.range)], 1);
+        assert!(NativeLabelPlan::module(parsed.suite(), false).is_none());
+        for source in [
+            "(item): Kind\n",
+            "object.item: Kind\n",
+            "items[index]: Kind\n",
+        ] {
+            let unsupported = parse_module(source).unwrap();
+            for future_annotations in [false, true] {
+                assert!(
+                    NativeLabelPlan::module(unsupported.suite(), future_annotations).is_none(),
+                    "{source}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn annotation_assignment_value_keeps_its_original_label_order() {
+        let parsed =
+            parse_module("item: Kind = left if flag else right\nif ready:\n    pass\n").unwrap();
+        let [Stmt::AnnAssign(assignment), Stmt::If(branch)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let Some(Expr::If(value)) = assignment.value.as_deref() else {
+            panic!()
+        };
+        for future_annotations in [false, true] {
+            let plan = NativeLabelPlan::module(parsed.suite(), future_annotations).unwrap();
+            assert_eq!(plan.remaining[&NativeRole::ValueIfEnd(value.range)], 1);
+            assert_eq!(plan.remaining[&NativeRole::ValueIfElse(value.range)], 2);
+            assert_eq!(plan.remaining[&NativeRole::IfEnd(branch.range)], 3);
+        }
+    }
+
+    #[test]
+    fn module_counter_preserves_the_first_extended_argument_boundary() {
+        for count in [255_u32, 256] {
+            let source = "if flag:\n    pass\n".repeat(usize::try_from(count).unwrap());
+            let parsed = parse_module(&source).unwrap();
+            let Some(Stmt::If(last)) = parsed.suite().last() else {
+                panic!()
+            };
+            let plan = NativeLabelPlan::module(parsed.suite(), false).unwrap();
+            assert_eq!(plan.remaining[&NativeRole::IfEnd(last.range)], count);
+        }
     }
 }
