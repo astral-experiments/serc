@@ -3772,10 +3772,16 @@ impl LayoutAssembler {
                                     | crate::target::opcodes::POP_JUMP_IF_TRUE
                             )
                             && matches!(instruction.operand(), Operand::Forward(_));
+                        // A captured original SETUP remains a NULL-owner record when
+                        // the compiler explicitly preserves that absence through copies.
                         if instruction.local_policy.hidden_exception_owner_slots() != 0
                             || instruction.pre_fold_extra_instructions() != 0
-                            || instruction.exception_policy()
+                            || (instruction.exception_policy()
                                 != super::ExceptionPolicy::NoneUnchanged
+                                && !(instruction.opcode == NOP
+                                    && retained_setup_nops.contains(&logical)
+                                    && instruction.exception_policy()
+                                        == super::ExceptionPolicy::EXCLUDE_ALWAYS))
                             || instruction.no_location_policy.borrow_fallthrough()
                                 != super::BorrowFallthrough::Reachable
                             || instruction.jump_policy.borrow_empty_block()
@@ -5595,10 +5601,15 @@ impl LayoutAssembler {
                     // Capture the single original POP before the NOP consumes its
                     // transferred slot. Only the immediately adjacent authored SETUP
                     // may use this proof; another instruction or boundary retires it.
+                    // Its explicit exclusion changes neither original record nor slot.
                     transferred_pop_setup = None;
                     if instruction.opcode == NOP
                         && !instruction.fusion_policy.is_converted_pop_block()
-                        && instruction.exception_policy() == super::ExceptionPolicy::NoneUnchanged
+                        && matches!(
+                            instruction.exception_policy(),
+                            super::ExceptionPolicy::NoneUnchanged
+                                | super::ExceptionPolicy::AlwaysUnchanged
+                        )
                         && instruction.local_policy.hidden_exception_owner_slots() == 1
                         && instruction.pre_fold_extra_instructions() == 0
                         && instruction.no_location_policy.borrow_fallthrough()
@@ -10555,7 +10566,11 @@ impl LayoutAssembler {
                     || instruction.location != *location
                     || instruction.fusion_policy.is_converted_pop_block()
                     || instruction.pre_fold_extra_instructions() != 0
-                    || instruction.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+                    || !matches!(
+                        instruction.exception_policy(),
+                        super::ExceptionPolicy::NoneUnchanged
+                            | super::ExceptionPolicy::AlwaysUnchanged
+                    )
                     || provenance
                         .setup_nop_ranges
                         .iter()
@@ -13511,8 +13526,9 @@ mod tests {
     mod entry_retained_setup_null_marker_tests {
         use super::super::ExceptionOwnerProvenance;
         use crate::assembler::{
-            BorrowFallthrough, ExceptionRegion, ExceptionRegionPriority, Instruction, Item, Label,
-            LayoutAssembler, NormalizedExceptionOwner, Operand, SourceLocation,
+            BorrowFallthrough, ExceptionPolicy, ExceptionRegion, ExceptionRegionPriority,
+            Instruction, Item, Label, LayoutAssembler, NormalizedExceptionOwner, Operand,
+            SourceLocation,
         };
         use crate::target::opcodes::{
             CALL, LOAD_CONST, LOAD_FAST, NOP, NOT_TAKEN, POP_JUMP_IF_NONE, POP_TOP, RESUME,
@@ -13655,6 +13671,40 @@ mod tests {
                 recognizes(&fixture(true)),
                 "POP transferred to an intervening call"
             );
+        }
+
+        #[test]
+        fn last_setup_compaction_accepts_only_unchanged_original_setup_owners() {
+            for intervening_call in [false, true] {
+                for policy in [
+                    ExceptionPolicy::NoneUnchanged,
+                    ExceptionPolicy::EXCLUDE_ALWAYS,
+                    ExceptionPolicy::NonePresent,
+                    ExceptionPolicy::NoneAbsent,
+                    ExceptionPolicy::IfExtendedUnchanged,
+                    ExceptionPolicy::AlwaysPresent,
+                    ExceptionPolicy::AlwaysAbsent,
+                    ExceptionPolicy::AlwaysOverridePresent,
+                    ExceptionPolicy::AlwaysDynamic,
+                ] {
+                    let mut assembler = fixture(intervening_call);
+                    for item in &mut assembler.items {
+                        if let Item::Instruction(instruction) = item
+                            && instruction.opcode == NOP
+                        {
+                            instruction.set_exception_policy(policy);
+                        }
+                    }
+                    assert_eq!(
+                        recognizes(&assembler),
+                        matches!(
+                            policy,
+                            ExceptionPolicy::NoneUnchanged | ExceptionPolicy::AlwaysUnchanged
+                        ),
+                        "{intervening_call}: {policy:?}"
+                    );
+                }
+            }
         }
 
         #[test]
