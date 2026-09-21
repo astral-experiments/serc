@@ -7531,6 +7531,55 @@ class Decorated:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_annotation_comprehension_cells() {
+        for (filename, source) in [
+            (
+                "function_annotation_comprehension_cells.py",
+                r"def function(
+    sequence: [lambda: item for item in (1,)],
+    unique: {lambda: item for item in (2,)},
+) -> {key: lambda: key for key in (3,)}:
+    pass
+
+def outer(values):
+    def inner(argument: [lambda: item for item in values]):
+        pass
+    return inner
+",
+            ),
+            (
+                "module_annotation_comprehension_cells.py",
+                r"sequence: [lambda: item for item in (1,)]
+if True:
+    mapping: {key: lambda: key for key in (2,)}
+nested: [[lambda: (outer, inner) for inner in (3,)] for outer in (4,)]
+",
+            ),
+            (
+                "future_annotation_comprehension_cells.py",
+                r"from __future__ import annotations
+sequence: [lambda: item for item in (1,)]
+def function(argument: [lambda: item for item in (2,)]):
+    pass
+",
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
+    fn executes_annotation_comprehension_cells() {
+        let source = r"def function(argument: [lambda: item for item in (1, 2)]):
+    pass
+sequence: [lambda: item for item in (3, 4)]
+print([callback() for callback in function.__annotations__['argument']])
+print([callback() for callback in __annotate__(1)['sequence']])
+";
+        assert_executes(source, "[2, 2]\n[4, 4]\n");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_conditional_class_annotations() {
         let source = r"flag = True
 
