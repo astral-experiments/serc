@@ -79,7 +79,7 @@ impl OptimizationPipeline {
     ) -> Result<LayoutAssembler, CompileError> {
         let original_arrays = self.legacy_instruction_arrays();
         self.preserve_legacy_setup_nops();
-        self.inline_legacy_exit_blocks();
+        self.inline_legacy_exit_blocks(&original_arrays, true);
         if self.python_version == PythonVersion::Py313 {
             self.remove_unreachable_instructions();
             self.resolve_legacy_locations(self.legacy_predecessors());
@@ -94,7 +94,7 @@ impl OptimizationPipeline {
         self.apply_static_swaps((swap_blocks, capture_cleanup_swaps));
         self.remove_legacy_nops_and_pairs(&original_arrays);
         if self.python_version == PythonVersion::Py312 {
-            self.inline_legacy_exit_blocks();
+            self.inline_legacy_exit_blocks(&original_arrays, false);
         }
         self.remove_unreachable_instructions();
         loop {
@@ -268,10 +268,15 @@ impl OptimizationPipeline {
     }
 
     /// Copies native four-slot exit blocks, plus 3.13's unlocated terminal blocks.
-    fn inline_legacy_exit_blocks(&mut self) {
+    fn inline_legacy_exit_blocks(
+        &mut self,
+        original_arrays: &FxHashMap<BasicBlockId, usize>,
+        before_folding: bool,
+    ) {
         loop {
             let mut changed = false;
-            for block in self.graph.order().to_vec() {
+            let order = self.graph.order().to_vec();
+            for block in order.iter().copied() {
                 let Some(jump) = self.graph[block].last_instruction().copied() else {
                     continue;
                 };
@@ -286,9 +291,26 @@ impl OptimizationPipeline {
                 if target == block {
                     continue;
                 }
-                let instructions = self.graph[target]
-                    .items()
+                // Range endpoints split physical blocks without starting another
+                // native instruction array. Include the cleanup/return fragments
+                // after such endpoints, but stop at original source/CFG entries.
+                let target_index = order
                     .iter()
+                    .position(|candidate| *candidate == target)
+                    .unwrap();
+                let target_array = original_arrays[&target];
+                let targets = order[target_index..]
+                    .iter()
+                    .copied()
+                    .take_while(|target| original_arrays.get(target) == Some(&target_array))
+                    .collect::<Vec<_>>();
+                if targets.contains(&block) {
+                    // Metadata splits do not make a native self-loop eligible for copying.
+                    continue;
+                }
+                let instructions = targets
+                    .iter()
+                    .flat_map(|target| self.graph[*target].items())
                     .filter_map(|item| match item {
                         Item::Instruction(instruction) => Some(*instruction),
                         Item::Label(_) => None,
@@ -297,33 +319,48 @@ impl OptimizationPipeline {
                 let Some(last) = instructions.last() else {
                     continue;
                 };
+                // Direct global calls already combine LOAD_GLOBAL and PUSH_NULL
+                // here. Both native versions count them separately before folding;
+                // only 3.12 revisits exits after their fusion and NOP compaction.
+                let instruction_slots = instructions
+                    .iter()
+                    .map(|instruction| {
+                        1 + usize::from(
+                            before_folding
+                                && instruction.opcode == LOAD_GLOBAL
+                                && matches!(instruction.operand(), Operand::Value(arg) if arg & 1 != 0),
+                        )
+                    })
+                    .sum::<usize>();
                 let small_exit = crate::target::is_scope_exit_for(self.python_version, last.opcode)
-                    && instructions.len() <= 4;
+                    && instruction_slots <= 4;
                 let unlocated_terminal = self.python_version == PythonVersion::Py313
                     && instructions
                         .iter()
                         .all(|instruction| instruction.location.line < 0)
-                    && !block_has_fallthrough(self.graph[target].items());
+                    && !block_has_fallthrough(self.graph[*targets.last().unwrap()].items());
                 if !small_exit && !unlocated_terminal {
                     continue;
                 }
                 legacy_nop(self.graph.instructions_mut(block).next_back().unwrap());
-                for mut item in self.copy_legacy_block_items(target, block) {
-                    if let Item::Instruction(instruction) = &mut item
-                        && unlocated_terminal
-                        && is_unconditional_jump(instruction.opcode)
-                        && legacy_jump_has_eval_check(&jump)
-                    {
-                        // Native JUMP preserves its eval check when its unlocated
-                        // successor is copied, including a forward successor.
-                        instruction.jump_policy.mark_interruptible_after_threading();
-                        if instruction.opcode == JUMP_BACKWARD_NO_INTERRUPT {
-                            instruction.opcode = JUMP_BACKWARD;
+                for target in targets {
+                    for mut item in self.copy_legacy_block_items(target, block) {
+                        if let Item::Instruction(instruction) = &mut item
+                            && unlocated_terminal
+                            && is_unconditional_jump(instruction.opcode)
+                            && legacy_jump_has_eval_check(&jump)
+                        {
+                            // Native JUMP preserves its eval check when its unlocated
+                            // successor is copied, including a forward successor.
+                            instruction.jump_policy.mark_interruptible_after_threading();
+                            if instruction.opcode == JUMP_BACKWARD_NO_INTERRUPT {
+                                instruction.opcode = JUMP_BACKWARD;
+                            }
                         }
+                        let offset = self.graph[block].items().len();
+                        self.graph
+                            .insert_item(ItemPosition::new(block, offset), item);
                     }
-                    let offset = self.graph[block].items().len();
-                    self.graph
-                        .insert_item(ItemPosition::new(block, offset), item);
                 }
                 changed = true;
             }
@@ -939,9 +976,11 @@ impl OptimizationPipeline {
                     && follows_generator_prefix
                     && instruction.opcode == POP_TOP;
                 if instruction.location.line < 0 {
-                    // Modern preservation flags do not apply to native legacy CFG
-                    // propagation; only later prefix insertion escapes this phase.
-                    if !inserted_generator_pop {
+                    // Native propagation ignores modern preservation flags except
+                    // certified shared POP_BLOCKs and later prefix insertion.
+                    if !inserted_generator_pop
+                        && !legacy_pop_block_keeps_no_location(self.python_version, instruction)
+                    {
                         instruction.location = location;
                     }
                 } else {
@@ -958,6 +997,7 @@ impl OptimizationPipeline {
                 if predecessors.get(&successor) == Some(&1)
                     && let Some(first) = self.graph.instructions_mut(successor).next()
                     && first.location.line < 0
+                    && !legacy_pop_block_keeps_no_location(self.python_version, first)
                 {
                     first.location = location;
                 }
@@ -966,9 +1006,21 @@ impl OptimizationPipeline {
     }
 }
 
+/// Keeps a shared `POP_BLOCK` unlocated while 3.13 still has its folded predecessor.
+///
+/// The compiler certifies joins whose constant-test false edge has already been
+/// elided. Native 3.13 resolves locations before folding that edge; 3.12 folds
+/// first, so its remaining predecessor may donate a location normally.
+fn legacy_pop_block_keeps_no_location(version: PythonVersion, instruction: &Instruction) -> bool {
+    version == PythonVersion::Py313
+        && instruction.opcode == NOP
+        && instruction.fusion_policy.is_converted_pop_block()
+        && instruction.no_location_policy.preserves_location()
+}
+
 /// Recovers native 3.13's direction-independent JUMP pseudo-op.
 ///
-/// Forward JUMP and JUMP_NO_INTERRUPT share a wire opcode. Authored breaks
+/// Forward `JUMP` and `JUMP_NO_INTERRUPT` share a wire opcode. Authored breaks
 /// carry the ordinary kind in their emission certificate; copied and threaded
 /// jumps retain it through the interruptible policy bit.
 fn legacy_jump_has_eval_check(instruction: &Instruction) -> bool {
@@ -1029,6 +1081,101 @@ mod tests {
     use crate::target::opcodes::{
         LOAD_CONST, POP_JUMP_IF_FALSE, RERAISE, RETURN_CONST, RETURN_VALUE,
     };
+
+    #[test]
+    fn legacy_high_locals_respect_native_block_boundaries() {
+        use crate::code_object::Constant;
+        use crate::{CompileOptions, compile_with_options};
+
+        // CPython 3.12.14 resets high locals at the initial while test and SETUP
+        // continuation. 3.13.15 retains initialization across these entries.
+        // The straight-line control must keep unchecked loads on both targets.
+        let parameters = (0..64)
+            .map(|index| format!("a{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cases: &[(PythonVersion, &str, &[u8])] = &[
+            (
+                PythonVersion::Py312,
+                "    value = next_value()\n    while value == 0:\n        value = next_value()\n    return value\n",
+                &[
+                    151, 0, 116, 1, 0, 0, 0, 0, 0, 0, 0, 0, 171, 0, 0, 0, 0, 0, 0, 0, 125, 64, 127,
+                    64, 100, 1, 107, 40, 0, 0, 114, 16, 116, 1, 0, 0, 0, 0, 0, 0, 0, 0, 171, 0, 0,
+                    0, 0, 0, 0, 0, 125, 64, 124, 64, 100, 1, 107, 40, 0, 0, 114, 1, 140, 16, 127,
+                    64, 83, 0,
+                ],
+            ),
+            (
+                PythonVersion::Py312,
+                "    for value in values:\n        try:\n            consume(value)\n        except Exception:\n            pass\n",
+                &[
+                    151, 0, 116, 0, 0, 0, 0, 0, 0, 0, 0, 0, 68, 0, 93, 14, 0, 0, 125, 64, 9, 0,
+                    116, 3, 0, 0, 0, 0, 0, 0, 0, 0, 127, 64, 171, 1, 0, 0, 0, 0, 0, 0, 1, 0, 140,
+                    16, 4, 0, 121, 0, 35, 0, 116, 4, 0, 0, 0, 0, 0, 0, 0, 0, 36, 0, 114, 3, 1, 0,
+                    89, 0, 140, 29, 119, 0, 120, 3, 89, 0, 119, 1,
+                ],
+            ),
+            (
+                PythonVersion::Py312,
+                "    value = next_value()\n    consume(value)\n    return value\n",
+                &[
+                    151, 0, 116, 1, 0, 0, 0, 0, 0, 0, 0, 0, 171, 0, 0, 0, 0, 0, 0, 0, 125, 64, 116,
+                    3, 0, 0, 0, 0, 0, 0, 0, 0, 124, 64, 171, 1, 0, 0, 0, 0, 0, 0, 1, 0, 124, 64,
+                    83, 0,
+                ],
+            ),
+            (
+                PythonVersion::Py313,
+                "    value = next_value()\n    while value == 0:\n        value = next_value()\n    return value\n",
+                &[
+                    149, 0, 91, 1, 0, 0, 0, 0, 0, 0, 0, 0, 53, 0, 0, 0, 0, 0, 0, 0, 110, 64, 85,
+                    64, 83, 1, 58, 88, 0, 0, 97, 18, 0, 0, 91, 1, 0, 0, 0, 0, 0, 0, 0, 0, 53, 0, 0,
+                    0, 0, 0, 0, 0, 110, 64, 85, 64, 83, 1, 58, 88, 0, 0, 97, 2, 0, 0, 77, 18, 0, 0,
+                    87, 64, 36, 0,
+                ],
+            ),
+            (
+                PythonVersion::Py313,
+                "    for value in values:\n        try:\n            consume(value)\n        except Exception:\n            pass\n",
+                &[
+                    149, 0, 91, 0, 0, 0, 0, 0, 0, 0, 0, 0, 19, 0, 72, 15, 0, 0, 110, 64, 30, 0, 91,
+                    3, 0, 0, 0, 0, 0, 0, 0, 0, 85, 64, 53, 1, 0, 0, 0, 0, 0, 0, 32, 0, 77, 17, 0,
+                    0, 11, 0, 32, 0, 103, 0, 33, 0, 91, 4, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 97, 4, 0,
+                    0, 32, 0, 31, 0, 77, 33, 0, 0, 102, 0, 61, 3, 31, 0, 102, 1,
+                ],
+            ),
+            (
+                PythonVersion::Py313,
+                "    value = next_value()\n    consume(value)\n    return value\n",
+                &[
+                    149, 0, 91, 1, 0, 0, 0, 0, 0, 0, 0, 0, 53, 0, 0, 0, 0, 0, 0, 0, 110, 64, 91, 3,
+                    0, 0, 0, 0, 0, 0, 0, 0, 85, 64, 53, 1, 0, 0, 0, 0, 0, 0, 32, 0, 85, 64, 36, 0,
+                ],
+            ),
+        ];
+        for &(python_version, body, expected) in cases {
+            let source = format!("def f({parameters}):\n{body}");
+            let module = compile_with_options(
+                &source,
+                "high_locals.py",
+                &CompileOptions {
+                    python_version,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .code;
+            let function = module
+                .constants
+                .iter()
+                .find_map(|constant| match constant {
+                    Constant::Code(code) if code.name == "f" => Some(code),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(function.bytecode, expected, "{python_version:?}: {body}");
+        }
+    }
 
     #[test]
     fn legacy_exit_copies_keep_donor_exception_owners() {
@@ -1382,6 +1529,90 @@ mod tests {
     }
 
     #[test]
+    fn python_313_finally_join_keeps_the_unfolded_loop_predecessor() {
+        use crate::code_object::Constant;
+        use crate::{CompileOptions, compile_with_options};
+
+        let source = "def f():\n    try:\n        while True:\n            work()\n    except Error as error:\n        recover(error)\n    finally:\n        finish()\n";
+        let module = compile_with_options(
+            source,
+            "cfg.py",
+            &CompileOptions {
+                python_version: PythonVersion::Py313,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap()
+        .code;
+        let function = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) if code.name == "f" => Some(code),
+                _ => None,
+            })
+            .unwrap();
+        // Pinned CPython 3.13.15 removes the unlocated normal POP_BLOCK.
+        // The recovery's line must not create a NOP before the finally call.
+        assert_eq!(
+            function.bytecode,
+            [
+                149, 0, 30, 0, 30, 0, 91, 1, 0, 0, 0, 0, 0, 0, 0, 0, 53, 0, 0, 0, 0, 0, 0, 0, 32,
+                0, 77, 12, 0, 0, 33, 0, 91, 2, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 97, 21, 0, 0, 110, 0,
+                91, 5, 0, 0, 0, 0, 0, 0, 0, 0, 85, 0, 53, 1, 0, 0, 0, 0, 0, 0, 32, 0, 31, 0, 83, 0,
+                110, 0, 65, 0, 79, 8, 83, 0, 110, 0, 65, 0, 102, 1, 102, 0, 61, 3, 31, 0, 102, 1,
+                91, 7, 0, 0, 0, 0, 0, 0, 0, 0, 53, 0, 0, 0, 0, 0, 0, 0, 32, 0, 103, 0, 33, 0, 91,
+                7, 0, 0, 0, 0, 0, 0, 0, 0, 53, 0, 0, 0, 0, 0, 0, 0, 32, 0, 102, 0, 61, 3, 31, 0,
+                102, 1,
+            ]
+        );
+        assert_eq!(
+            function.exception_table,
+            [
+                130, 13, 15, 0, 143, 10, 46, 3, 153, 11, 41, 3, 164, 5, 60, 0, 169, 5, 46, 3, 174,
+                3, 60, 0, 188, 12, 65, 8, 3
+            ]
+        );
+    }
+
+    #[test]
+    fn python_313_match_condition_threads_through_ordinary_case_exit() {
+        use crate::code_object::Constant;
+        use crate::{CompileOptions, compile_with_options};
+
+        let source = "def f(value, check):\n    match value:\n        case 1:\n            if check:\n                raise Error\n        case _:\n            raise Other\n    finish()\n";
+        let module = compile_with_options(
+            source,
+            "cfg.py",
+            &CompileOptions {
+                python_version: PythonVersion::Py313,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap()
+        .code;
+        let function = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) if code.name == "f" => Some(code),
+                _ => None,
+            })
+            .unwrap();
+        // Pinned CPython 3.13.15: the false condition threads through the
+        // case's ordinary JUMP directly to the continuation after the match.
+        assert_eq!(
+            function.bytecode,
+            [
+                149, 0, 85, 0, 83, 1, 58, 88, 0, 0, 97, 13, 0, 0, 85, 1, 40, 0, 0, 0, 0, 0, 0, 0,
+                97, 13, 0, 0, 91, 0, 0, 0, 0, 0, 0, 0, 0, 0, 101, 1, 30, 0, 91, 2, 0, 0, 0, 0, 0,
+                0, 0, 0, 101, 1, 91, 5, 0, 0, 0, 0, 0, 0, 0, 0, 53, 0, 0, 0, 0, 0, 0, 0, 32, 0,
+                103, 0,
+            ]
+        );
+    }
+
+    #[test]
     fn legacy_setup_nop_keeps_its_span_until_pseudo_conversion() {
         let start = Label(0);
         let end = Label(1);
@@ -1451,9 +1682,146 @@ mod tests {
                 assembler.python_version = python_version;
                 assembler.next_label = 1;
                 let mut pipeline = assembler.into_optimization_pipeline();
-                pipeline.inline_legacy_exit_blocks();
+                let original_arrays = pipeline.legacy_instruction_arrays();
+                pipeline.inline_legacy_exit_blocks(&original_arrays, true);
                 let first = pipeline.graph.block_at(0);
                 assert_eq!(pipeline.graph[first].last_instruction(), Some(&exit));
+                pipeline.graph.validate().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_exit_copies_cross_only_metadata_boundaries() {
+        use crate::target::opcodes::CALL;
+
+        for python_version in [PythonVersion::Py312, PythonVersion::Py313] {
+            for source_boundary in [false, true] {
+                let target = Label(0);
+                let range_end = Label(1);
+                let handler = Label(2);
+                let location = SourceLocation::new(2, 2, 0, 5);
+                let mut assembler = Assembler::from_linear_items(vec![
+                    Item::Instruction(Instruction::new(
+                        JUMP_FORWARD,
+                        Operand::Forward(target),
+                        location,
+                        None,
+                    )),
+                    Item::Label(target),
+                    Item::Instruction(Instruction::new(CALL, Operand::Value(1), location, None)),
+                    Item::Label(range_end),
+                    Item::Instruction(Instruction::new(
+                        RETURN_VALUE,
+                        Operand::Value(0),
+                        location,
+                        None,
+                    )),
+                    Item::Label(handler),
+                    Item::Instruction(Instruction::new(RERAISE, Operand::Value(0), location, None)),
+                ]);
+                assembler.python_version = python_version;
+                assembler.next_label = 3;
+                assembler.add_exception_region(target, range_end, handler, 0, false);
+                if source_boundary {
+                    assembler.record_exception_owner_block_boundary(range_end);
+                }
+                let mut pipeline = assembler.into_optimization_pipeline();
+                let original_arrays = pipeline.legacy_instruction_arrays();
+                pipeline.inline_legacy_exit_blocks(&original_arrays, true);
+                let first = pipeline.graph.block_at(0);
+                let instructions = pipeline.graph[first]
+                    .items()
+                    .iter()
+                    .filter_map(|item| match item {
+                        Item::Instruction(instruction) => Some(instruction),
+                        Item::Label(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                if source_boundary {
+                    assert_eq!(instructions.len(), 1);
+                    assert_eq!(instructions[0].opcode, JUMP_FORWARD);
+                } else {
+                    assert_eq!(
+                        instructions
+                            .iter()
+                            .map(|instruction| instruction.opcode)
+                            .collect::<Vec<_>>(),
+                        [NOP, CALL, RETURN_VALUE],
+                    );
+                    assert_eq!(
+                        instructions[2].exception_policy(),
+                        ExceptionPolicy::AlwaysAbsent,
+                    );
+                    assert!(pipeline.exception_regions.iter().any(|region| {
+                        region.target == handler
+                            && pipeline.graph.label_block(region.start) == Some(first)
+                            && pipeline.graph.label_block(region.end) == Some(first)
+                    }));
+                }
+                pipeline.graph.validate().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_exit_copy_budget_uses_original_slots_before_folding() {
+        use crate::target::opcodes::CALL;
+
+        for python_version in [PythonVersion::Py312, PythonVersion::Py313] {
+            for fused_null in [false, true] {
+                let target = Label(0);
+                let location = SourceLocation::new(2, 2, 0, 5);
+                let load = Instruction::new(
+                    LOAD_GLOBAL,
+                    Operand::Value(u32::from(fused_null)),
+                    location,
+                    None,
+                );
+                let mut assembler = Assembler::from_linear_items(vec![
+                    Item::Instruction(Instruction::new(
+                        JUMP_FORWARD,
+                        Operand::Forward(target),
+                        location,
+                        None,
+                    )),
+                    Item::Label(target),
+                    Item::Instruction(load),
+                    Item::Instruction(Instruction::new(
+                        LOAD_FAST,
+                        Operand::Value(0),
+                        location,
+                        None,
+                    )),
+                    Item::Instruction(Instruction::new(CALL, Operand::Value(1), location, None)),
+                    Item::Instruction(Instruction::new(
+                        RETURN_VALUE,
+                        Operand::Value(0),
+                        location,
+                        None,
+                    )),
+                ]);
+                assembler.python_version = python_version;
+                assembler.next_label = 1;
+                let mut pipeline = assembler.into_optimization_pipeline();
+                let original_arrays = pipeline.legacy_instruction_arrays();
+                pipeline.inline_legacy_exit_blocks(&original_arrays, true);
+                let first = pipeline.graph.block_at(0);
+                assert_eq!(
+                    pipeline.graph[first].last_instruction().unwrap().opcode,
+                    if fused_null {
+                        JUMP_FORWARD
+                    } else {
+                        RETURN_VALUE
+                    },
+                );
+                if python_version == PythonVersion::Py312 {
+                    pipeline.inline_legacy_exit_blocks(&original_arrays, false);
+                    assert_eq!(
+                        pipeline.graph[first].last_instruction().unwrap().opcode,
+                        RETURN_VALUE,
+                    );
+                }
                 pipeline.graph.validate().unwrap();
             }
         }

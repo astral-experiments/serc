@@ -15313,6 +15313,11 @@ impl Compiler<'_> {
         let anchor = self.assembler.label();
         let end = self.assembler.label();
         self.assembler.mark(start);
+        if self.context.python_version == crate::PythonVersion::Py312 {
+            // The initial test is a native block even when only the repeated test
+            // has an incoming loop edge. High-local initialization resets here.
+            self.assembler.record_exception_owner_block_boundary(start);
+        }
         self.compile_jump_if(&statement.test, false, anchor)?;
         self.assembler.mark(body);
         let context = self.loop_context(
@@ -16186,13 +16191,15 @@ impl Compiler<'_> {
                     && !self
                         .assembler
                         .current_join_has_located_compacted_predecessor();
-            if self.context.python_version <= crate::PythonVersion::Py313 {
+            if let Some(Stmt::Pass(statement)) = statement.body.last() {
+                // Suite emission can elide this native NOP, leaving only its
+                // location to donate to the original loop backedge.
+                self.assembler
+                    .set_location(self.source_location(statement.range));
+            } else if self.context.python_version <= crate::PythonVersion::Py313 {
                 // Legacy CPython emits an unlocated original backedge before exit
                 // copying and threading choose each incoming arm's line and owner.
                 self.assembler.set_location(SourceLocation::NONE);
-            } else if let Some(Stmt::Pass(statement)) = statement.body.last() {
-                self.assembler
-                    .set_location(self.source_location(statement.range));
             } else if self.assembler.instruction_count() > body_start
                 && let Some(location) = self.assembler.last_instruction_location()
             {
@@ -19049,10 +19056,15 @@ impl Compiler<'_> {
                                             && !expression_contains_inline_branch(&awaited.value)
                                             && !expression_suspends_current_scope(&awaited.value)))
                         }));
-            if self.assembler.python_version() == crate::PythonVersion::Py313 {
-                // CPython emits the normal try exit without a location. Its early
-                // CFG propagation keeps shared joins unlocated, allowing each
-                // predecessor to retain its own span through jump threading.
+            if self.assembler.python_version() == crate::PythonVersion::Py313
+                || (self.assembler.python_version() == crate::PythonVersion::Py312
+                    && statement.orelse.is_empty()
+                    && deferred_try_pop_block
+                    && !removed_shared_try_pop_block)
+            {
+                // CPython emits this normal try exit without a location. Native
+                // CFG propagation keeps shared joins unlocated so each incoming
+                // path supplies its own span at the target version's phase.
                 self.assembler.set_location(SourceLocation::NONE);
             }
             let normal_exit = if (match_body_pop_block
@@ -25782,6 +25794,11 @@ impl Compiler<'_> {
                 // four-instruction exit-copy limit. Inlining it leaves an orphan empty
                 // original array on the normal continuation's borrowed-load route.
                 self.assembler.prevent_borrow_fallthrough_reachability(end);
+            }
+            if self.context.python_version <= crate::PythonVersion::Py313 {
+                // Legacy finalizer exits start unlocated. Native CFG propagation
+                // assigns locations before shared continuations are threaded.
+                self.assembler.set_location(SourceLocation::NONE);
             }
             let normal_exit = self.emit_jump_forward_instruction_with_exception_policy(
                 JUMP_FORWARD,

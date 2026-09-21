@@ -2190,6 +2190,16 @@ impl OptimizationPipeline {
         let mut block_labels = self.preserved_block_boundaries.clone();
         // Original source joins and jump targets stay distinct after their jumps disappear.
         block_labels.extend(&self.exception_owner_provenance.block_boundaries);
+        if self.python_version == crate::PythonVersion::Py312 {
+            // A native SETUP starts a new block even when its target is the handler.
+            // Its protected continuation is distinct from a synthetic range split.
+            block_labels.extend(
+                self.exception_owner_provenance
+                    .setups
+                    .iter()
+                    .map(|(label, _)| *label),
+            );
+        }
         for region in &self.exception_regions {
             block_labels.insert(region.target);
         }

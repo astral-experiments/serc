@@ -1187,7 +1187,7 @@ impl Compiler<'_> {
                 self.assembler
                     .preserve_redundant_jump_nop_after_threading(success_exit);
             }
-            if unique_false_edge.is_some() {
+            if unique_false_edge.is_some() && self.context.python_version != PythonVersion::Py313 {
                 // Only the false edge reaches this original empty block. Preserve its
                 // condition slot even when a containing match retargets the case exit
                 // before a small return replaces the jump.
