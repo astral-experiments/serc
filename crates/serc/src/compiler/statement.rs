@@ -16417,6 +16417,15 @@ impl Compiler<'_> {
                                 == self.control.exceptions.active_exception_region_exclusions.len()
                             && !suite_contains_yield(&context.body)
                             && (self.suite_has_nonempty_borrow_entry(&context.body)
+                                // This surviving jump enters the retained setup NOP,
+                                // even when a later cleanup handler exits abruptly.
+                                || matches!(context.body.first(), Some(Stmt::Try(cleanup))
+                                    if !cleanup.is_star
+                                        && cleanup.body.first().is_some_and(|first| {
+                                            suite_has_linear_borrow_fallthrough(std::slice::from_ref(first))
+                                                && self.source_location(first.range()).line
+                                                    != self.source_location(cleanup.range).line
+                                        }))
                                 // Preserve the existing synchronous recovery entry,
                                 // whose call survives even when its setup NOP shares a line.
                                 || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
@@ -16447,7 +16456,9 @@ impl Compiler<'_> {
                                                         && !expression_suspends_current_scope(&nested.test)
                                                         && nested.elif_else_clauses.is_empty()
                                                         && suite_has_linear_borrow_fallthrough(&nested.body)))
-                                            && (tail.is_empty() || suite_has_linear_borrow_fallthrough(tail)))
+                                            // Later structured cleanup does not erase
+                                            // the runtime condition at this jump target.
+                                            && !suite_contains_abrupt_control_flow(tail))
                                 }))
                     })
                 {
