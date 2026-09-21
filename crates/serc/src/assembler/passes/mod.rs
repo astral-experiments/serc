@@ -15,6 +15,8 @@ use crate::CompileError;
 mod blocks;
 mod constants;
 mod control_flow;
+mod legacy;
+mod legacy_constants;
 mod linear;
 mod locals;
 mod normal_try_copies;
@@ -192,6 +194,7 @@ impl Assembler {
         constants: Option<&mut dyn ConstantTable>,
     ) -> Result<AssembledCode, CompileError> {
         self.resolve_operand_patches()?;
+        self.prepare_legacy_yield_arguments();
         self.resolve_folded_condition_borrow_entries();
         if self.python_version == crate::PythonVersion::Py314
             && (self.has_only_linear_assertion_side_exits()
@@ -225,6 +228,19 @@ impl Assembler {
                 (graph, Some(reachable))
             }
         };
+        if self.python_version <= crate::PythonVersion::Py313
+            && let Some(index) = self.deferred_none_constant_index
+        {
+            // Legacy targets prune constants after CFG optimization. Resolve the
+            // already-admitted None before LOAD_CONST can fold into RETURN_CONST.
+            graph.for_each_instruction_mut(|instruction| {
+                if instruction.opcode == crate::target::opcodes::LOAD_CONST
+                    && instruction.operand() == Operand::Value(u32::MAX)
+                {
+                    instruction.set_operand(Operand::Value(index));
+                }
+            });
+        }
         for (entry, original) in self.folded_arm_exit_origins {
             let Operand::Forward(target) = original.operand() else {
                 continue;
@@ -546,6 +562,9 @@ impl OptimizationPipeline {
         parameter_count: usize,
         constants: Option<&mut dyn ConstantTable>,
     ) -> Result<LayoutAssembler, CompileError> {
+        if self.python_version <= crate::PythonVersion::Py313 {
+            return self.optimize_legacy(local_count, parameter_count, constants);
+        }
         let reversed_store_handler_exits = self.capture_reversed_store_handler_exits();
         self.preserve_shared_original_manager_pop_locations();
         self.record_shared_unlocated_jump_entries();
@@ -1143,7 +1162,20 @@ impl LayoutAssembler {
         use crate::target::operands315::{IteratorMode, ResumeLocation as ResumeLocation315};
 
         let operand = instruction.operand();
-        if self.python_version == crate::PythonVersion::Py314 {
+        if self.python_version != crate::PythonVersion::Py315 {
+            if self.python_version <= crate::PythonVersion::Py313
+                && instruction.opcode == RESUME
+                && let Operand::Value(argument) = operand
+            {
+                let argument = if argument == GENEXPR_RESUME_ARGUMENT {
+                    0
+                } else if self.python_version == crate::PythonVersion::Py312 {
+                    argument & 3
+                } else {
+                    argument
+                };
+                return Ok(Operand::Value(argument));
+            }
             return Ok(operand);
         }
         let Operand::Value(argument) = operand else {

@@ -13,7 +13,6 @@ use super::{
     LOAD_SMALL_INT, MAKE_CELL, MAKE_FUNCTION, NOP, POP_TOP, RESUME, RETURN_GENERATOR, RETURN_VALUE,
     SETUP_ANNOTATIONS, STORE_DEREF,
 };
-use crate::CompileError;
 use crate::assembler::{AssembledCode, Assembler, ConstantTable, SourceLocation};
 use crate::code_object::{
     CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance,
@@ -27,12 +26,14 @@ use crate::target::local_kinds::{
     CO_FAST_LOCAL,
 };
 use crate::target::operands::{FunctionAttribute, ResumeLocation, UnaryIntrinsic};
+use crate::{CompileError, PythonVersion};
 
 use super::constant::{DeferredConstantTarget, OutputState, fold_constant};
 use super::definition::clean_doc;
 use super::scope::{
     LoweringFunctionPlan, NameId, NameSet, ScopeId, class_static_attributes,
-    collect_conditional_simple_annotations, collect_simple_annotations, has_simple_annotations,
+    collect_conditional_simple_annotations, collect_simple_annotations, has_annotations,
+    has_simple_annotations,
 };
 use super::source::{CompilationContext, implicit_return_range};
 use super::statement::{
@@ -411,9 +412,10 @@ impl<'source> Compiler<'source> {
         }
         let simple_module_annotations = self.context.module_plan().has_simple_annotations;
         let module_annotations = self.context.module_plan().has_annotations;
+        let deferred_annotations = self.has_deferred_annotations();
         let future_module_annotations =
             self.unit.flags & CO_FUTURE_ANNOTATIONS != 0 && module_annotations;
-        if module_annotations {
+        if module_annotations && deferred_annotations {
             let annotation_cell =
                 to_u32(self.symbols.locals.len(), "module annotation cell index")?;
             let annotation_name = self.required_name_id("__conditional_annotations__");
@@ -427,7 +429,7 @@ impl<'source> Compiler<'source> {
         // Match the deferred annotation function's visitation order, including suites
         // omitted during lowering. Repeated cleanup visits require occurrence IDs,
         // so those modules retain their existing sequential registration path.
-        if simple_module_annotations && !future_module_annotations {
+        if deferred_annotations && simple_module_annotations && !future_module_annotations {
             let mut annotations = Vec::new();
             collect_simple_annotations(body, &mut annotations);
             for (index, annotation) in annotations.into_iter().enumerate() {
@@ -444,7 +446,14 @@ impl<'source> Compiler<'source> {
             }
         }
         let mut deferred_module_annotations = None;
-        if module_annotations {
+        if module_annotations && !deferred_annotations {
+            if let Some(statement) = body.first() {
+                self.assembler
+                    .set_location(self.source_location(statement.range()));
+            }
+            self.emit(SETUP_ANNOTATIONS, 0, 0)?;
+        }
+        if module_annotations && deferred_annotations {
             self.name_index("__conditional_annotations__")?;
             if let Some(statement) = body.first() {
                 self.assembler
@@ -475,14 +484,22 @@ impl<'source> Compiler<'source> {
 
         let body = if let Some(Stmt::Expr(expression)) = body.first() {
             if let Expr::StringLiteral(string) = expression.value.as_ref() {
-                let constant =
-                    self.add_constant(Constant::String(clean_doc(string.value.to_str())))?;
+                let constant = self.add_constant(Constant::String(
+                    if self.context.python_version == PythonVersion::Py312 {
+                        string.value.to_str().to_string()
+                    } else {
+                        clean_doc(string.value.to_str())
+                    },
+                ))?;
                 self.assembler
                     .set_location(self.source_location(expression.range));
                 self.emit(LOAD_CONST, constant, 1)?;
                 self.store_name("__doc__")?;
                 &body[1..]
-            } else if module_annotations && fold_constant(&expression.value).is_some() {
+            } else if deferred_annotations
+                && module_annotations
+                && fold_constant(&expression.value).is_some()
+            {
                 &body[1..]
             } else {
                 body.as_slice()
@@ -532,11 +549,32 @@ impl<'source> Compiler<'source> {
     ) -> Result<CodeObject, CompileError> {
         self.assembler.reserve_items(body.len().saturating_mul(16));
         self.emit_function_prologue()?;
+        if self.context.python_version == PythonVersion::Py312 {
+            // CPython 3.12 starts a separate body block even for ordinary functions.
+            // A same-line `pass` must not inherit RESUME's synthetic 0:0 span.
+            let body_entry = self.assembler.label();
+            self.assembler.mark(body_entry);
+            self.assembler
+                .record_exception_owner_block_boundary(body_entry);
+        }
+        if !self.has_deferred_annotations()
+            && !matches!(body.first(), Some(Stmt::Expr(expression)) if expression.value.is_string_literal_expr())
+        {
+            self.add_constant(Constant::None)?;
+        }
 
         let body = if let Some(Stmt::Expr(expression)) = body.first() {
             if let Expr::StringLiteral(string) = expression.value.as_ref() {
-                self.add_constant(Constant::String(clean_doc(string.value.to_str())))?;
-                self.unit.flags |= CO_HAS_DOCSTRING;
+                self.add_constant(Constant::String(
+                    if self.context.python_version == PythonVersion::Py312 {
+                        string.value.to_str().to_string()
+                    } else {
+                        clean_doc(string.value.to_str())
+                    },
+                ))?;
+                if self.has_deferred_annotations() {
+                    self.unit.flags |= CO_HAS_DOCSTRING;
+                }
                 &body[1..]
             } else {
                 body.as_slice()
@@ -606,6 +644,9 @@ impl<'source> Compiler<'source> {
         self.emit_resume(ResumeLocation::AT_FUNC_START, ResumeDepth::Zero)?;
         self.load_name("__name__")?;
         self.store_name("__module__")?;
+        self.output.qualified_name_is_canonical = self
+            .context
+            .record_class_qualified_name(&self.unit.qualified_name);
         self.context
             .record_constant_string_origin(&self.unit.qualified_name, true);
         let qualified_name =
@@ -613,14 +654,17 @@ impl<'source> Compiler<'source> {
         self.emit(LOAD_CONST, qualified_name, 1)?;
         self.output.qualified_name_constant_index = Some(qualified_name);
         self.store_name("__qualname__")?;
-        if u8::try_from(self.unit.first_line_number).is_ok() {
-            self.emit(LOAD_SMALL_INT, self.unit.first_line_number, 1)?;
-        } else {
-            let first_line_number =
-                self.add_constant(Constant::Int(u64::from(self.unit.first_line_number)))?;
-            self.emit(LOAD_CONST, first_line_number, 1)?;
+        if self.context.python_version != PythonVersion::Py312 {
+            if self.has_deferred_annotations() && u8::try_from(self.unit.first_line_number).is_ok()
+            {
+                self.emit(LOAD_SMALL_INT, self.unit.first_line_number, 1)?;
+            } else {
+                let first_line_number =
+                    self.add_constant(Constant::Int(u64::from(self.unit.first_line_number)))?;
+                self.emit(LOAD_CONST, first_line_number, 1)?;
+            }
+            self.store_name("__firstlineno__")?;
         }
-        self.store_name("__firstlineno__")?;
         if self
             .symbols
             .free_names
@@ -645,14 +689,23 @@ impl<'source> Compiler<'source> {
             let index = self.closure_index("__conditional_annotations__")?;
             self.emit(STORE_DEREF, index, -1)?;
         }
-        if self.unit.flags & CO_FUTURE_ANNOTATIONS != 0 && has_simple_annotations(body) {
+        if if self.has_deferred_annotations() {
+            self.unit.flags & CO_FUTURE_ANNOTATIONS != 0 && has_simple_annotations(body)
+        } else {
+            has_annotations(body)
+        } {
             self.emit(SETUP_ANNOTATIONS, 0, 0)?;
         }
 
         let body = if let Some(Stmt::Expr(expression)) = body.first() {
             if let Expr::StringLiteral(string) = expression.value.as_ref() {
-                let docstring =
-                    self.add_constant(Constant::String(clean_doc(string.value.to_str())))?;
+                let docstring = self.add_constant(Constant::String(
+                    if self.context.python_version == PythonVersion::Py312 {
+                        string.value.to_str().to_string()
+                    } else {
+                        clean_doc(string.value.to_str())
+                    },
+                ))?;
                 self.assembler
                     .set_location(self.source_location(expression.range));
                 self.emit(LOAD_CONST, docstring, 1)?;
@@ -704,7 +757,8 @@ impl<'source> Compiler<'source> {
             }
         }
 
-        if self.unit.flags & CO_FUTURE_ANNOTATIONS == 0
+        if self.has_deferred_annotations()
+            && self.unit.flags & CO_FUTURE_ANNOTATIONS == 0
             && let Some((annotation_child, closure_names)) = self.compile_class_annotations(body)?
         {
             let line = i32::try_from(self.unit.first_line_number).unwrap_or(i32::MAX);
@@ -719,18 +773,20 @@ impl<'source> Compiler<'source> {
         }
 
         self.assembler.set_location(footer_location);
-        let static_attributes = class_static_attributes(body)
-            .into_iter()
-            .map(Constant::String)
-            .collect::<Vec<_>>();
-        self.context
-            .record_static_attribute_tuple(&static_attributes);
-        let static_attributes = self
-            .output
-            .constants
-            .intern(Constant::Tuple(static_attributes))?;
-        self.emit(LOAD_CONST, static_attributes, 1)?;
-        self.store_name("__static_attributes__")?;
+        if self.context.python_version != PythonVersion::Py312 {
+            let static_attributes = class_static_attributes(body)
+                .into_iter()
+                .map(Constant::String)
+                .collect::<Vec<_>>();
+            self.context
+                .record_static_attribute_tuple(&static_attributes);
+            let static_attributes = self
+                .output
+                .constants
+                .intern(Constant::Tuple(static_attributes))?;
+            self.emit(LOAD_CONST, static_attributes, 1)?;
+            self.store_name("__static_attributes__")?;
+        }
         if has_classdict_cell {
             let index = self
                 .symbols
@@ -738,7 +794,15 @@ impl<'source> Compiler<'source> {
                 .iter()
                 .position(|name| *name == self.required_name_id("__classdict__"))
                 .expect("classdict cell is present");
-            self.emit(LOAD_FAST, to_u32(index, "classdict cell index")?, 1)?;
+            self.emit(
+                if self.context.python_version == PythonVersion::Py312 {
+                    super::LOAD_CLOSURE
+                } else {
+                    LOAD_FAST
+                },
+                to_u32(index, "classdict cell index")?,
+                1,
+            )?;
             self.store_name("__classdictcell__")?;
         }
         if has_class_cell {
@@ -748,7 +812,15 @@ impl<'source> Compiler<'source> {
                 .iter()
                 .position(|name| *name == self.required_name_id("__class__"))
                 .expect("class cell is present");
-            self.emit(LOAD_FAST, to_u32(index, "class cell index")?, 1)?;
+            self.emit(
+                if self.context.python_version == PythonVersion::Py312 {
+                    super::LOAD_CLOSURE
+                } else {
+                    LOAD_FAST
+                },
+                to_u32(index, "class cell index")?,
+                1,
+            )?;
             self.emit(COPY, 1, 1)?;
             self.store_name("__classcell__")?;
             self.emit(RETURN_VALUE, 0, -1)?;
@@ -847,7 +919,9 @@ impl<'source> Compiler<'source> {
         }
         self.assembler.resolve_operand_patches()?;
         self.assembler.optimize_constant_pops();
-        self.remove_unused_constants();
+        if self.has_deferred_annotations() {
+            self.remove_unused_constants();
+        }
 
         let local_kinds = self
             .symbols
@@ -858,7 +932,9 @@ impl<'source> Compiler<'source> {
                 let positional_only = usize::try_from(self.unit.positional_only_arg_count).unwrap();
                 let positional = usize::try_from(self.unit.arg_count).unwrap();
                 let keyword_only = usize::try_from(self.unit.keyword_only_arg_count).unwrap();
-                let argument_kind = if index < positional_only {
+                let argument_kind = if !self.has_deferred_annotations() {
+                    0
+                } else if index < positional_only {
                     CO_FAST_ARG_POS
                 } else if index < positional {
                     CO_FAST_ARG_POS | CO_FAST_ARG_KW
@@ -947,7 +1023,9 @@ impl<'source> Compiler<'source> {
             parameter_count,
             Some(&mut constants),
         )?;
-        let max_depth = if removed_max_depth == Some(self.control.stack.max_depth)
+        let max_depth = if self.context.python_version <= crate::PythonVersion::Py313 {
+            assembled_max_depth
+        } else if removed_max_depth == Some(self.control.stack.max_depth)
             && assembled_max_depth < self.control.stack.max_depth
         {
             assembled_max_depth
@@ -959,6 +1037,8 @@ impl<'source> Compiler<'source> {
             && self.control.generators.generator_region_start.is_some()
         {
             max_depth.max(self.control.generators.generator_region_depth + 2)
+        } else if self.context.python_version == PythonVersion::Py312 {
+            max_depth
         } else {
             max_depth.max(1)
         };
@@ -1002,6 +1082,7 @@ impl<'source> Compiler<'source> {
                 },
                 canonical_constant_strings,
                 qualified_name_constant_index: self.output.qualified_name_constant_index,
+                qualified_name_is_canonical: self.output.qualified_name_is_canonical,
                 metadata_ids: Some(metadata_ids),
                 subtree_has_frozenset_constants: Some(self.output.has_frozenset_constants),
             },
@@ -1072,7 +1153,13 @@ impl<'source> Compiler<'source> {
             // This physical +1/-1 frame-startup pair precedes logical expression lowering and
             // intentionally does not participate in the compiler's value-depth accounting.
             self.assembler.emit(RETURN_GENERATOR, 0);
+            if self.context.python_version == PythonVersion::Py312 {
+                self.assembler.set_location(SourceLocation::NONE);
+            }
             self.assembler.emit(POP_TOP, 0);
+            if self.context.python_version == PythonVersion::Py312 {
+                self.assembler.preserve_last_no_location();
+            }
             let start = self.assembler.label();
             self.assembler.mark(start);
             self.control.generators.generator_region_start = Some(start);

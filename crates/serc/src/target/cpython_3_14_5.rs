@@ -1630,11 +1630,11 @@ impl Opcode {
                 | opcodes::UNPACK_SEQUENCE
                 | opcodes::YIELD_VALUE
                 | opcodes::RESUME
-        )
+        ) || super::legacy_opcodes::has_argument(self)
     }
 
     pub(crate) const fn has_constant(self) -> bool {
-        matches!(self, opcodes::LOAD_CONST)
+        matches!(self, opcodes::LOAD_CONST) || super::legacy_opcodes::has_constant(self)
     }
 
     pub(crate) const fn has_name(self) -> bool {
@@ -1653,7 +1653,7 @@ impl Opcode {
                 | opcodes::STORE_ATTR
                 | opcodes::STORE_GLOBAL
                 | opcodes::STORE_NAME
-        )
+        ) || super::legacy_opcodes::has_name(self)
     }
 
     pub(crate) const fn has_jump(self) -> bool {
@@ -1669,7 +1669,7 @@ impl Opcode {
                 | opcodes::POP_JUMP_IF_NOT_NONE
                 | opcodes::POP_JUMP_IF_TRUE
                 | opcodes::SEND
-        )
+        ) || super::legacy_opcodes::has_jump(self)
     }
 
     pub(crate) const fn has_free(self) -> bool {
@@ -1679,7 +1679,7 @@ impl Opcode {
                 | opcodes::LOAD_FROM_DICT_OR_DEREF
                 | opcodes::MAKE_CELL
                 | opcodes::STORE_DEREF
-        )
+        ) || super::legacy_opcodes::has_free(self)
     }
 
     pub(crate) const fn has_local(self) -> bool {
@@ -1697,7 +1697,7 @@ impl Opcode {
                 | opcodes::STORE_FAST
                 | opcodes::STORE_FAST_LOAD_FAST
                 | opcodes::STORE_FAST_STORE_FAST
-        )
+        ) || super::legacy_opcodes::has_local(self)
     }
 }
 

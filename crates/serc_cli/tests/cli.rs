@@ -55,7 +55,12 @@ fn compile_keeps_python_versions_in_separate_caches() {
     let source_path = directory.path().join("module.py");
     fs_err::write(&source_path, "answer = 42\n").unwrap();
 
-    for version in [serc::PythonVersion::Py314, serc::PythonVersion::Py315] {
+    for version in [
+        serc::PythonVersion::Py312,
+        serc::PythonVersion::Py313,
+        serc::PythonVersion::Py314,
+        serc::PythonVersion::Py315,
+    ] {
         let output = serc()
             .args([
                 "compile",
@@ -90,20 +95,25 @@ fn compile_keeps_python_versions_in_separate_caches() {
 #[test]
 fn compile_rejects_unsupported_python_version() {
     let output = serc()
-        .args(["compile", "--python-version", "3.13", "--check"])
+        .args(["compile", "--python-version", "3.11", "--check"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unsupported Python version"));
-    assert!(stderr.contains("3.14 or 3.15"));
+    assert!(stderr.contains("3.12, 3.13, 3.14, or 3.15"));
 }
 
 #[test]
 fn compile_matches_cpython_for_version_specific_marshal_identity() {
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("module.py");
-    for version in [serc::PythonVersion::Py314, serc::PythonVersion::Py315] {
+    for version in [
+        serc::PythonVersion::Py312,
+        serc::PythonVersion::Py313,
+        serc::PythonVersion::Py314,
+        serc::PythonVersion::Py315,
+    ] {
         let (_, minor, _) = version.target().version;
         let pyc_path = directory
             .path()
@@ -117,6 +127,8 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
         ] {
             fs_err::write(&source_path, source).unwrap();
             let mut oracle = match version {
+                serc::PythonVersion::Py312 => common::python_312_command(),
+                serc::PythonVersion::Py313 => common::python_313_command(),
                 serc::PythonVersion::Py314 => common::python_3145_command(),
                 serc::PythonVersion::Py315 => common::python_315_command(),
             };

@@ -531,6 +531,94 @@ fn frozen_set_keys_and_reference_order_ignore_input_order() {
 }
 
 #[test]
+fn python_312_frozenset_sort_keys_borrow_member_roots() {
+    use crate::{InitialInternState, PythonVersion};
+
+    // CPython 3.12 borrows the root used by its independent marshal sort key.
+    // A unique integer or nonidentifier string sorts before an interned string;
+    // a shared integer, or any member retained by 3.13+, sorts after it.
+    for first in [
+        Constant::Int(1000),
+        Constant::String("marshal probe text".to_string()),
+    ] {
+        for shared in [false, true] {
+            let mut code = code_object(vec![Constant::FrozenSet(vec![
+                first.clone(),
+                Constant::String("marshal_probe_identifier".to_string()),
+            ])]);
+            if shared {
+                code.constants.push(first.clone());
+            }
+            let Constant::FrozenSet(members) = &code.constants[0] else {
+                unreachable!()
+            };
+            for version in [
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ] {
+                let graph = ObjectGraph::for_code_with_options(
+                    &code,
+                    version,
+                    &InitialInternState::default(),
+                );
+                let ordered = graph.frozen_set_members(members);
+                let first_index = usize::from(version != PythonVersion::Py312 || shared);
+                assert!(
+                    std::ptr::eq(ordered[0].1, &members[first_index]),
+                    "unexpected member order for {version}, shared={shared}, first={first:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn python_312_filename_remains_distinct_from_an_equal_interned_constant() {
+    use super::writer::encode_code_with_options;
+    use crate::{InitialInternState, PythonVersion};
+
+    let mut code = code_object(vec![Constant::String("filename".to_string())]);
+    code.filename = "filename".to_string();
+    let state = InitialInternState::default();
+    let old = encode_code_with_options(&code, PythonVersion::Py312, &state);
+    let new = encode_code_with_options(&code, PythonVersion::Py313, &state);
+    let interned = b"\xda\x08filename";
+    let plain = b"\xfa\x08filename";
+    assert!(old.windows(interned.len()).any(|bytes| bytes == interned));
+    assert!(old.windows(plain.len()).any(|bytes| bytes == plain));
+    assert!(new.windows(interned.len()).any(|bytes| bytes == interned));
+    assert!(!new.windows(plain.len()).any(|bytes| bytes == plain));
+}
+
+#[test]
+fn python_312_dynamic_code_names_keep_per_definition_identity() {
+    use super::writer::encode_code_with_options;
+    use crate::{InitialInternState, PythonVersion};
+
+    let name = "<generic parameters of f>";
+    let mut child = code_object(vec![]);
+    child.name = name.to_string();
+    child.qualified_name = name.to_string();
+    let code = code_object(vec![
+        Constant::Code(Box::new(child.clone())),
+        Constant::Code(Box::new(child)),
+    ]);
+    let state = InitialInternState::default();
+    for (version, expected) in [(PythonVersion::Py312, 2), (PythonVersion::Py313, 1)] {
+        let bytes = encode_code_with_options(&code, version, &state);
+        assert_eq!(
+            bytes
+                .windows(name.len())
+                .filter(|bytes| *bytes == name.as_bytes())
+                .count(),
+            expected,
+        );
+    }
+}
+
+#[test]
 fn nested_frozen_set_wire_order_uses_recursive_member_keys() {
     let first_nested = Constant::FrozenSet(vec![
         Constant::Int(1),
@@ -964,6 +1052,52 @@ fn static_attribute_cache_admission_controls_frozenset_identity() {
                 graph.is_shared(&constant_key(set), false),
                 shared,
                 "{python_version}: {prefix}"
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_discarded_constants_preserve_qualified_name_identity() {
+    use crate::{CompileOptions, PythonVersion, compile_with_options};
+
+    for python_version in [PythonVersion::Py312, PythonVersion::Py313] {
+        let options = CompileOptions {
+            python_version,
+            ..CompileOptions::default()
+        };
+        for (prefix, copies) in [
+            ("", 1),
+            ("if False:\n    earlier = 'Outer.Inner'\n", 2),
+            ("earlier = 'Outer.Inner' if False else None\n", 2),
+            (
+                "if False:\n    def earlier():\n        return 'Outer.Inner'\n",
+                2,
+            ),
+            (
+                "if False:\n    class Outer:\n        class Inner:\n            pass\n",
+                if python_version == PythonVersion::Py312 {
+                    2
+                } else {
+                    1
+                },
+            ),
+        ] {
+            let source = format!("{prefix}class Outer:\n    class Inner:\n        pass\n");
+            let module = compile_with_options(&source, "qualified_name.py", &options).unwrap();
+            let bytes = super::writer::encode_code_with_options(
+                &module.code,
+                options.python_version,
+                &options.initial_intern_state,
+            );
+            let name = b"Outer.Inner";
+            assert_eq!(
+                bytes
+                    .windows(name.len())
+                    .filter(|value| *value == name)
+                    .count(),
+                copies,
+                "{python_version}: {source}"
             );
         }
     }

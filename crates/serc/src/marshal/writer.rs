@@ -11,13 +11,34 @@ use super::v5::{
     TYPE_STRING, TYPE_TRUE, TYPE_TUPLE, TYPE_UNICODE,
 };
 
-// CPython 3.15 adds marshal v6's frozendict tag. The scalar, tuple, frozenset, slice,
-// and code-object tags emitted here retain their v5 wire representation. Verify this
-// against both generated release tables so a target regeneration cannot silently
-// change the shared encoder's assumptions.
+// Marshal v5 adds slices and v6 adds frozendicts. The shared tags retain their wire
+// representation across all supported targets. Verify the generated release tables
+// so target regeneration cannot silently change the encoder's assumptions.
 const _: () = {
+    assert!(super::v4::MARSHAL_VERSION == 4);
     assert!(super::v5::MARSHAL_VERSION == 5);
     assert!(super::v6::MARSHAL_VERSION == 6);
+    assert!(super::v4::FLAG_REF == super::v5::FLAG_REF);
+    assert!(super::v4::TYPE_ASCII == super::v5::TYPE_ASCII);
+    assert!(super::v4::TYPE_ASCII_INTERNED == super::v5::TYPE_ASCII_INTERNED);
+    assert!(super::v4::TYPE_BINARY_COMPLEX == super::v5::TYPE_BINARY_COMPLEX);
+    assert!(super::v4::TYPE_BINARY_FLOAT == super::v5::TYPE_BINARY_FLOAT);
+    assert!(super::v4::TYPE_CODE == super::v5::TYPE_CODE);
+    assert!(super::v4::TYPE_ELLIPSIS == super::v5::TYPE_ELLIPSIS);
+    assert!(super::v4::TYPE_FALSE == super::v5::TYPE_FALSE);
+    assert!(super::v4::TYPE_FROZENSET == super::v5::TYPE_FROZENSET);
+    assert!(super::v4::TYPE_INT == super::v5::TYPE_INT);
+    assert!(super::v4::TYPE_INTERNED == super::v5::TYPE_INTERNED);
+    assert!(super::v4::TYPE_LONG == super::v5::TYPE_LONG);
+    assert!(super::v4::TYPE_NONE == super::v5::TYPE_NONE);
+    assert!(super::v4::TYPE_REF == super::v5::TYPE_REF);
+    assert!(super::v4::TYPE_SHORT_ASCII == super::v5::TYPE_SHORT_ASCII);
+    assert!(super::v4::TYPE_SHORT_ASCII_INTERNED == super::v5::TYPE_SHORT_ASCII_INTERNED);
+    assert!(super::v4::TYPE_SMALL_TUPLE == super::v5::TYPE_SMALL_TUPLE);
+    assert!(super::v4::TYPE_STRING == super::v5::TYPE_STRING);
+    assert!(super::v4::TYPE_TRUE == super::v5::TYPE_TRUE);
+    assert!(super::v4::TYPE_TUPLE == super::v5::TYPE_TUPLE);
+    assert!(super::v4::TYPE_UNICODE == super::v5::TYPE_UNICODE);
     assert!(super::v5::FLAG_REF == super::v6::FLAG_REF);
     assert!(super::v5::TYPE_ASCII == super::v6::TYPE_ASCII);
     assert!(super::v5::TYPE_ASCII_INTERNED == super::v6::TYPE_ASCII_INTERNED);
@@ -75,7 +96,7 @@ pub(crate) fn encode_pyc_code_into_with_options(
     // uniquely owned at marshal.dumps. A retained-code marshal call still has
     // an external owner, which encode_code_with_options models separately.
     let root_reference = match python_version {
-        PythonVersion::Py314 => ReferenceMode::Forced,
+        PythonVersion::Py312 | PythonVersion::Py313 | PythonVersion::Py314 => ReferenceMode::Forced,
         PythonVersion::Py315 => ReferenceMode::IfShared,
     };
     encode_code_into_with_mode(
@@ -352,6 +373,10 @@ impl Writer<'_, '_, '_> {
                 true
             }
             Constant::Slice { .. } => {
+                assert!(
+                    self.graph.python_version() >= PythonVersion::Py314,
+                    "slice constants require marshal v5 or later"
+                );
                 let object = self.next_object(OccurrenceKind::Constant);
                 let Some(flag) = self.begin_object(object, reference_mode) else {
                     return false;
@@ -569,6 +594,16 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
     fn metadata_string(&mut self, value: &'code str, _metadata_id: Option<u32>) {
         let object = self.next_object(OccurrenceKind::MetadataString);
         self.string_with_object(object, value, ReferenceMode::IfShared);
+    }
+
+    fn code_filename(&mut self, code: &'code CodeObject, metadata_id: Option<u32>) {
+        if self.graph.python_version() == PythonVersion::Py312 {
+            // The compile caller retains its filename alongside the code object.
+            let object = self.next_object(OccurrenceKind::MetadataString);
+            self.string_with_object(object, &code.filename, ReferenceMode::Forced);
+        } else {
+            self.metadata_string(&code.filename, metadata_id);
+        }
     }
 
     #[inline]

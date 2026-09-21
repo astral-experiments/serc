@@ -3,11 +3,11 @@ use ruff_python_ast::{BoolOp, CmpOp, Expr, Pattern, PatternKeyword, Singleton, S
 use ruff_text_size::{Ranged, TextRange};
 
 use super::{
-    BINARY_SLICE, BUILD_LIST, BUILD_MAP, BUILD_SET, BUILD_TUPLE, CALL, CHECK_EG_MATCH,
-    CHECK_EXC_MATCH, CLEANUP_THROW, COPY, END_ASYNC_FOR, END_FOR, END_SEND, FOR_ITER, GET_AITER,
-    GET_ANEXT, GET_ITER, IMPORT_FROM, IMPORT_NAME, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT,
-    JUMP_FORWARD, LIST_APPEND, LOAD_ATTR, LOAD_CONST, LOAD_DEREF, LOAD_FAST_AND_CLEAR, LOAD_GLOBAL,
-    LOAD_SMALL_INT, MAP_ADD, NOP, NOT_TAKEN, POP_EXCEPT, POP_ITER, POP_JUMP_IF_FALSE,
+    BEFORE_ASYNC_WITH, BEFORE_WITH, BINARY_SLICE, BUILD_LIST, BUILD_MAP, BUILD_SET, BUILD_TUPLE,
+    CALL, CHECK_EG_MATCH, CHECK_EXC_MATCH, CLEANUP_THROW, COPY, END_ASYNC_FOR, END_SEND, FOR_ITER,
+    GET_AITER, GET_ANEXT, GET_ITER, IMPORT_FROM, IMPORT_NAME, JUMP_BACKWARD,
+    JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, LIST_APPEND, LOAD_ATTR, LOAD_CONST, LOAD_DEREF,
+    LOAD_FAST_AND_CLEAR, LOAD_GLOBAL, MAP_ADD, NOP, NOT_TAKEN, POP_EXCEPT, POP_JUMP_IF_FALSE,
     POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP, PUSH_EXC_INFO, PUSH_NULL,
     RAISE_VARARGS, RETURN_VALUE, SEND, SET_ADD, STORE_ATTR, STORE_SLICE, STORE_SUBSCR, SWAP,
     TO_BOOL, WITH_EXCEPT_START, YIELD_VALUE,
@@ -2982,8 +2982,7 @@ impl Compiler<'_> {
         self.set_depth(base_depth + self.iterator_slots() + 1);
         self.assembler
             .set_location(self.source_location(statement.iter.range()));
-        self.emit(END_FOR, 0, -1)?;
-        self.emit(POP_ITER, 0, -self.iterator_slots())?;
+        self.emit_end_for_cleanup()?;
         self.emit_implicit_return()?;
         self.set_depth(base_depth);
         Ok(())
@@ -3829,7 +3828,7 @@ impl Compiler<'_> {
             self.compile_expression(comparator)?;
             self.emit(SWAP, 2, 0)?;
             self.emit(COPY, 2, 1)?;
-            let (opcode, argument) = comparison_operator(*operator);
+            let (opcode, argument) = comparison_operator(*operator, self.context.python_version);
             self.emit(opcode, argument, -1)?;
             self.emit(COPY, 1, 1)?;
             self.emit(TO_BOOL, 0, 0)?;
@@ -3839,7 +3838,7 @@ impl Compiler<'_> {
         }
         let operator = *expression.ops.last().unwrap();
         self.compile_comparison_rhs(operator, expression.comparators.last().unwrap())?;
-        let (opcode, argument) = comparison_operator(operator);
+        let (opcode, argument) = comparison_operator(operator, self.context.python_version);
         self.emit(opcode, argument, -1)?;
         self.assembler
             .set_location(self.source_location(expression.range));
@@ -3883,6 +3882,10 @@ impl Compiler<'_> {
             Stmt::Assign(assignment) => {
                 let unpacked = if let [target] = assignment.targets.as_slice()
                     && let Expr::Tuple(value) = assignment.value.as_ref()
+                    // Legacy AST folding replaces constant tuples before code generation,
+                    // so their LOAD_CONST remains followed by UNPACK_SEQUENCE.
+                    && !(self.context.python_version <= crate::PythonVersion::Py313
+                        && self.return_value_is_constant(&assignment.value))
                 {
                     let targets = match target {
                         Expr::Tuple(target) => Some(target.elts.as_slice()),
@@ -5122,7 +5125,7 @@ impl Compiler<'_> {
                 let preserve_tos = statement
                     .value
                     .as_deref()
-                    .is_some_and(|value| !is_literal_constant(value));
+                    .is_some_and(|value| !self.return_value_is_constant(value));
                 let overriding_unwind_start = if return_is_overridden
                     && !preserve_tos
                     && !self
@@ -12259,6 +12262,12 @@ impl Compiler<'_> {
         restart: Label,
         split_short_circuit: bool,
     ) -> Result<LoopBackedge, CompileError> {
+        if self.context.python_version <= crate::PythonVersion::Py313 {
+            // Preserve the original body and backedge for legacy jump threading, which
+            // creates fresh conditional edges with their own exception ownership.
+            self.compile_suite(body)?;
+            return Ok(LoopBackedge::Required);
+        }
         self.compile_loop_tail_suite_inner(
             body,
             restart,
@@ -12470,6 +12479,20 @@ impl Compiler<'_> {
                 .is_empty()
     }
 
+    /// Python 3.14 replaced the bound exit callable with a callable/self pair.
+    fn with_exit_stack_slots(&self) -> i32 {
+        if self.context.python_version <= crate::PythonVersion::Py313 {
+            1
+        } else {
+            2
+        }
+    }
+
+    fn emit_with_exit_call(&mut self) -> Result<(), CompileError> {
+        let slots = self.with_exit_stack_slots();
+        self.emit(CALL, (slots + 1).cast_unsigned(), -slots - 2)
+    }
+
     fn emit_with_unwind(
         &mut self,
         from_depth: usize,
@@ -12488,14 +12511,16 @@ impl Compiler<'_> {
             });
             self.assembler.set_location(context.location);
             if preserve_tos {
-                self.emit(SWAP, 3, 0)?;
+                if self.with_exit_stack_slots() == 2 {
+                    self.emit(SWAP, 3, 0)?;
+                }
                 self.emit(SWAP, 2, 0)?;
             }
             let none = self.add_constant(Constant::None)?;
             self.emit(LOAD_CONST, none, 1)?;
             self.emit(LOAD_CONST, none, 1)?;
             self.emit(LOAD_CONST, none, 1)?;
-            self.emit(CALL, 3, -4)?;
+            self.emit_with_exit_call()?;
             if context.is_async {
                 self.compile_awaitable_on_stack(2)?;
             }
@@ -12858,9 +12883,12 @@ impl Compiler<'_> {
                     &mut with_unwind_starts,
                     &mut region_unwind_starts,
                 )?;
-                if index + 1 == finally_contexts.len()
-                    && matches!(context.body.as_slice(), [Stmt::Pass(_)])
+                if self.context.python_version == crate::PythonVersion::Py312
+                    || (index + 1 == finally_contexts.len()
+                        && matches!(context.body.as_slice(), [Stmt::Pass(_)]))
                 {
+                    // 3.12 retains every unwinding POP_BLOCK until pseudo-op conversion;
+                    // its span can outlive the preceding SETUP and authored break NOPs.
                     // The first copied Pass keeps the preceding loop-control line. Native
                     // NOP compaction retains this POP_BLOCK and removes the authored marker,
                     // so the surviving line marker needs the popped block's unowned slot.
@@ -15210,6 +15238,66 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    /// Whether CPython has replaced a return value with a Constant AST node before lowering.
+    pub(super) fn return_value_is_constant(&self, expression: &Expr) -> bool {
+        if is_literal_constant(expression) {
+            return true;
+        }
+        if self.context.python_version >= crate::PythonVersion::Py314 {
+            return false;
+        }
+        let constant_operands = match expression {
+            Expr::Name(name) => name.id.as_str() == "__debug__",
+            Expr::UnaryOp(unary) => self.return_value_is_constant(&unary.operand),
+            Expr::BinOp(binary) => {
+                self.return_value_is_constant(&binary.left)
+                    && self.return_value_is_constant(&binary.right)
+            }
+            Expr::Tuple(tuple) => tuple
+                .elts
+                .iter()
+                .all(|element| self.return_value_is_constant(element)),
+            Expr::Subscript(subscript) => {
+                self.return_value_is_constant(&subscript.value)
+                    && self.return_value_is_constant(&subscript.slice)
+            }
+            _ => false,
+        };
+        constant_operands && self.source_aware_fold_constant(expression).is_some()
+    }
+
+    /// Older targets emit the loop test both at entry and after the body.
+    fn compile_legacy_dynamic_while(
+        &mut self,
+        statement: &ruff_python_ast::StmtWhile,
+    ) -> Result<(), CompileError> {
+        let base_depth = self.control.stack.depth;
+        let start = self.assembler.label();
+        let body = self.assembler.label();
+        let anchor = self.assembler.label();
+        let end = self.assembler.label();
+        self.assembler.mark(start);
+        self.compile_jump_if(&statement.test, false, anchor)?;
+        self.assembler.mark(body);
+        let context = self.loop_context(
+            start,
+            end,
+            IteratorCleanup::None,
+            self.loop_break_policy(statement.range),
+        );
+        self.with_loop_context(context, |compiler| {
+            compiler.compile_suite(&statement.body)?;
+            compiler.set_depth(base_depth);
+            compiler.compile_jump_if(&statement.test, true, body)
+        })?;
+        self.assembler.mark(anchor);
+        self.set_depth(base_depth);
+        self.compile_suite(&statement.orelse)?;
+        self.assembler.mark(end);
+        self.set_depth(base_depth);
+        Ok(())
+    }
+
     fn compile_while(
         &mut self,
         statement: &ruff_python_ast::StmtWhile,
@@ -15666,6 +15754,9 @@ impl Compiler<'_> {
             }
             return Ok(());
         }
+        if self.context.python_version <= crate::PythonVersion::Py313 {
+            return self.compile_legacy_dynamic_while(statement);
+        }
         let start = self.assembler.label();
         let else_label = self.assembler.label();
         let end = self.assembler.label();
@@ -16095,8 +16186,7 @@ impl Compiler<'_> {
         self.set_depth(base_depth + self.iterator_slots() + 1);
         self.assembler
             .set_location(self.source_location(statement.iter.range()));
-        self.emit(END_FOR, 0, -1)?;
-        self.emit(POP_ITER, 0, -self.iterator_slots())?;
+        self.emit_end_for_cleanup()?;
         for name in &newly_initialized_targets {
             let name = self.required_name_id(name);
             self.symbols.initialized_locals.remove(name);
@@ -16233,7 +16323,11 @@ impl Compiler<'_> {
             )
         })?;
         if tail_jumps == LoopBackedge::Required && !suite_terminates(&statement.body) {
-            if let Some(Stmt::Pass(statement)) = statement.body.last() {
+            if self.context.python_version <= crate::PythonVersion::Py313 {
+                // Legacy CFG propagation takes the location from the continuing edge,
+                // which can differ from the last lexical statement (such as a break).
+                self.assembler.set_location(SourceLocation::NONE);
+            } else if let Some(Stmt::Pass(statement)) = statement.body.last() {
                 self.assembler
                     .set_location(self.source_location(statement.range));
             } else if self.assembler.instruction_count() > body_start
@@ -16264,7 +16358,11 @@ impl Compiler<'_> {
         self.set_depth(base_depth + 2);
         self.assembler.set_location(iterator_location);
         self.apply_compiler_stack_effect(END_ASYNC_FOR, 0, -2)?;
-        self.assembler.emit_backward(END_ASYNC_FOR, send);
+        if self.context.python_version <= crate::PythonVersion::Py313 {
+            self.assembler.emit(END_ASYNC_FOR, 0);
+        } else {
+            self.assembler.emit_backward(END_ASYNC_FOR, send);
+        }
         let exhaustion_continuation = self.assembler.label();
         self.assembler
             .record_exception_owner_block_boundary(exhaustion_continuation);
@@ -16442,7 +16540,7 @@ impl Compiler<'_> {
             Expr::Subscript(target) => {
                 self.compile_expression(&target.value)?;
                 let optimized_slice = if let Expr::Slice(slice) = target.slice.as_ref()
-                    && two_element_slice_optimization(slice)
+                    && two_element_slice_optimization(slice, self.context.python_version)
                 {
                     let slice_location = self.source_location(slice.range);
                     self.compile_optional_slice_bound(slice.lower.as_deref(), slice_location)?;
@@ -16489,7 +16587,9 @@ impl Compiler<'_> {
         &mut self,
         assignment: &ruff_python_ast::StmtAnnAssign,
     ) -> Result<(), CompileError> {
+        let eager_annotations = self.context.python_version <= crate::PythonVersion::Py313;
         if assignment.simple
+            && !eager_annotations
             && matches!(self.unit.scope, Scope::Class { .. })
             && self.unit.flags & CO_FUTURE_ANNOTATIONS == 0
         {
@@ -16519,7 +16619,7 @@ impl Compiler<'_> {
         if assignment.simple
             && (matches!(self.unit.scope, Scope::Module)
                 || matches!(self.unit.scope, Scope::Class { .. })
-                    && self.unit.flags & CO_FUTURE_ANNOTATIONS != 0)
+                    && (eager_annotations || self.unit.flags & CO_FUTURE_ANNOTATIONS != 0))
         {
             if let Some(value) = &assignment.value {
                 self.compile_expression(value)?;
@@ -16528,11 +16628,16 @@ impl Compiler<'_> {
             let Expr::Name(target) = assignment.target.as_ref() else {
                 return Err(unsupported("simple annotation target"));
             };
-            if self.unit.flags & CO_FUTURE_ANNOTATIONS != 0 {
+            if eager_annotations || self.unit.flags & CO_FUTURE_ANNOTATIONS != 0 {
                 self.assembler
                     .set_location(self.source_location(assignment.annotation.range()));
-                let annotation = unparse_annotation(&assignment.annotation, self.context.source);
-                self.load_string_constant(&annotation)?;
+                if self.unit.flags & CO_FUTURE_ANNOTATIONS != 0 {
+                    let annotation =
+                        unparse_annotation(&assignment.annotation, self.context.source);
+                    self.load_string_constant(&annotation)?;
+                } else {
+                    self.compile_expression(&assignment.annotation)?;
+                }
                 self.assembler
                     .set_location(self.source_location(assignment.range));
                 self.load_name("__annotations__")?;
@@ -16565,25 +16670,34 @@ impl Compiler<'_> {
         if let Some(value) = &assignment.value {
             self.compile_expression(value)?;
             self.compile_store_target(&assignment.target)?;
-            return Ok(());
+        } else {
+            match assignment.target.as_ref() {
+                Expr::Name(_) => {}
+                Expr::Attribute(attribute) => {
+                    self.compile_expression(&attribute.value)?;
+                    self.assembler
+                        .set_location(self.source_location(attribute.value.range()));
+                    self.emit(POP_TOP, 0, -1)?;
+                }
+                Expr::Subscript(subscript) => {
+                    self.compile_expression(&subscript.value)?;
+                    self.assembler
+                        .set_location(self.source_location(subscript.value.range()));
+                    self.emit(POP_TOP, 0, -1)?;
+                    self.compile_discarded_annotation_slice(&subscript.slice)?;
+                }
+                _ => return Err(unsupported("annotated assignment target")),
+            }
         }
-
-        match assignment.target.as_ref() {
-            Expr::Name(_) => {}
-            Expr::Attribute(attribute) => {
-                self.compile_expression(&attribute.value)?;
-                self.assembler
-                    .set_location(self.source_location(attribute.value.range()));
-                self.emit(POP_TOP, 0, -1)?;
-            }
-            Expr::Subscript(subscript) => {
-                self.compile_expression(&subscript.value)?;
-                self.assembler
-                    .set_location(self.source_location(subscript.value.range()));
-                self.emit(POP_TOP, 0, -1)?;
-                self.compile_discarded_annotation_slice(&subscript.slice)?;
-            }
-            _ => return Err(unsupported("annotated assignment target")),
+        if eager_annotations
+            && !assignment.simple
+            && matches!(self.unit.scope, Scope::Module | Scope::Class { .. })
+            && self.unit.flags & CO_FUTURE_ANNOTATIONS == 0
+        {
+            self.compile_expression(&assignment.annotation)?;
+            self.assembler
+                .set_location(self.source_location(assignment.annotation.range()));
+            self.emit(POP_TOP, 0, -1)?;
         }
         Ok(())
     }
@@ -24380,6 +24494,10 @@ impl Compiler<'_> {
 
         let statement_nop_start = self.assembler.label();
         self.assembler.mark(statement_nop_start);
+        if self.context.python_version == crate::PythonVersion::Py313 {
+            self.assembler
+                .set_location(self.source_location(statement.range));
+        }
         self.emit(NOP, 0, 0)?;
         let statement_nop_end = self.assembler.label();
         self.assembler.mark(statement_nop_end);
@@ -26111,7 +26229,7 @@ impl Compiler<'_> {
         let preserve_value = statement
             .value
             .as_deref()
-            .is_some_and(|value| !is_literal_constant(value));
+            .is_some_and(|value| !self.return_value_is_constant(value));
         if preserve_value {
             self.compile_expression(
                 statement
@@ -26522,6 +26640,7 @@ impl Compiler<'_> {
             return self.compile_suite(body);
         };
         let base_depth = self.control.stack.depth;
+        let exit_slots = self.with_exit_stack_slots();
         let protected_start = self.assembler.label();
         let protected_end = self.assembler.label();
         let handler = self.assembler.label();
@@ -26533,7 +26652,7 @@ impl Compiler<'_> {
             .control
             .stack
             .max_depth
-            .max((base_depth + 7).cast_unsigned());
+            .max((base_depth + exit_slots + 5).cast_unsigned());
         let newly_initialized_targets =
             item.optional_vars
                 .as_deref()
@@ -26549,12 +26668,16 @@ impl Compiler<'_> {
             .record_with_context_location(self.source_location(item.context_expr.range()));
         self.assembler
             .set_location(self.source_location(item.context_expr.range()));
-        self.emit(COPY, 1, 1)?;
-        self.emit_special_method(SpecialMethod::__EXIT__)?;
-        self.emit(SWAP, 2, 0)?;
-        self.emit(SWAP, 3, 0)?;
-        self.emit_special_method(SpecialMethod::__ENTER__)?;
-        self.emit(CALL, 0, -1)?;
+        if exit_slots == 1 {
+            self.emit(BEFORE_WITH, 0, 1)?;
+        } else {
+            self.emit(COPY, 1, 1)?;
+            self.emit_special_method(SpecialMethod::__EXIT__)?;
+            self.emit(SWAP, 2, 0)?;
+            self.emit(SWAP, 3, 0)?;
+            self.emit_special_method(SpecialMethod::__ENTER__)?;
+            self.emit(CALL, 0, -1)?;
+        }
         self.assembler
             .record_synchronous_with_exception_setup(protected_start);
         self.assembler.mark(protected_start);
@@ -26818,7 +26941,7 @@ impl Compiler<'_> {
             self.emit(LOAD_CONST, none, 1)?;
             self.emit(LOAD_CONST, none, 1)?;
             self.emit(LOAD_CONST, none, 1)?;
-            self.emit(CALL, 3, -4)?;
+            self.emit_with_exit_call()?;
             self.emit(POP_TOP, 0, -1)?;
             if terminal {
                 self.emit_implicit_return()?;
@@ -26868,7 +26991,7 @@ impl Compiler<'_> {
                 region_start,
                 exclusion_start,
                 handler,
-                (base_depth + 2).cast_unsigned(),
+                (base_depth + exit_slots).cast_unsigned(),
                 true,
                 (protected_start, protected_end),
             );
@@ -26878,14 +27001,14 @@ impl Compiler<'_> {
             region_start,
             protected_end,
             handler,
-            (base_depth + 2).cast_unsigned(),
+            (base_depth + exit_slots).cast_unsigned(),
             true,
             (protected_start, protected_end),
         );
 
         self.assembler.record_exception_setup(handler, false);
         self.assembler.mark(handler);
-        self.set_depth(base_depth + 4);
+        self.set_depth(base_depth + exit_slots + 2);
         self.assembler
             .set_location(self.source_location(item.context_expr.range()));
         self.emit(PUSH_EXC_INFO, 0, 1)?;
@@ -26895,20 +27018,21 @@ impl Compiler<'_> {
         self.emit(NOT_TAKEN, 0, 0)?;
         self.emit_reraise(ReraiseStackState::WithHandler)?;
         self.assembler.mark(suppress);
-        self.set_depth(base_depth + 5);
+        self.set_depth(base_depth + exit_slots + 3);
         self.emit(POP_TOP, 0, -1)?;
         self.assembler.mark(handler_end);
         self.assembler.add_exception_region(
             handler,
             handler_end,
             cleanup,
-            (base_depth + 4).cast_unsigned(),
+            (base_depth + exit_slots + 2).cast_unsigned(),
             true,
         );
         self.emit(POP_EXCEPT, 0, -1)?;
         self.emit(POP_TOP, 0, -1)?;
-        self.emit(POP_TOP, 0, -1)?;
-        self.emit(POP_TOP, 0, -1)?;
+        for _ in 0..exit_slots {
+            self.emit(POP_TOP, 0, -1)?;
+        }
         if terminal {
             self.emit_implicit_return()?;
         } else {
@@ -26964,8 +27088,9 @@ impl Compiler<'_> {
         }
 
         self.assembler.mark(cleanup);
-        // The handler preserves four values, then exception dispatch adds lasti and exc.
-        self.set_depth(base_depth + 6);
+        // The handler preserves the exit callable(s), lasti, and the exception value.
+        // Exception dispatch then adds another lasti and exception value.
+        self.set_depth(base_depth + exit_slots + 4);
         self.assembler.set_location(SourceLocation::NONE);
         self.emit(COPY, 3, 1)?;
         self.emit(POP_EXCEPT, 0, -1)?;
@@ -27011,6 +27136,7 @@ impl Compiler<'_> {
             return self.compile_suite(body);
         };
         let base_depth = self.control.stack.depth;
+        let exit_slots = self.with_exit_stack_slots();
         let protected_start = self.assembler.label();
         let protected_end = self.assembler.label();
         let handler = self.assembler.label();
@@ -27033,12 +27159,16 @@ impl Compiler<'_> {
             .record_with_context_location(self.source_location(item.context_expr.range()));
         self.assembler
             .set_location(self.source_location(item.context_expr.range()));
-        self.emit(COPY, 1, 1)?;
-        self.emit_special_method(SpecialMethod::__AEXIT__)?;
-        self.emit(SWAP, 2, 0)?;
-        self.emit(SWAP, 3, 0)?;
-        self.emit_special_method(SpecialMethod::__AENTER__)?;
-        self.emit(CALL, 0, -1)?;
+        if exit_slots == 1 {
+            self.emit(BEFORE_ASYNC_WITH, 0, 1)?;
+        } else {
+            self.emit(COPY, 1, 1)?;
+            self.emit_special_method(SpecialMethod::__AEXIT__)?;
+            self.emit(SWAP, 2, 0)?;
+            self.emit(SWAP, 3, 0)?;
+            self.emit_special_method(SpecialMethod::__AENTER__)?;
+            self.emit(CALL, 0, -1)?;
+        }
         self.compile_awaitable_on_stack(1)?;
         self.assembler
             .record_async_with_exception_setup(protected_start);
@@ -27165,7 +27295,7 @@ impl Compiler<'_> {
         self.emit(LOAD_CONST, none, 1)?;
         self.emit(LOAD_CONST, none, 1)?;
         self.emit(LOAD_CONST, none, 1)?;
-        self.emit(CALL, 3, -4)?;
+        self.emit_with_exit_call()?;
         self.compile_awaitable_on_stack(2)?;
         self.emit(POP_TOP, 0, -1)?;
         if terminal {
@@ -27194,7 +27324,7 @@ impl Compiler<'_> {
                 region_start,
                 exclusion_start,
                 handler,
-                (base_depth + 2).cast_unsigned(),
+                (base_depth + exit_slots).cast_unsigned(),
                 true,
                 (protected_start, protected_end),
             );
@@ -27204,14 +27334,14 @@ impl Compiler<'_> {
             region_start,
             protected_end,
             handler,
-            (base_depth + 2).cast_unsigned(),
+            (base_depth + exit_slots).cast_unsigned(),
             true,
             (protected_start, protected_end),
         );
 
         self.assembler.record_exception_setup(handler, false);
         self.assembler.mark(handler);
-        self.set_depth(base_depth + 4);
+        self.set_depth(base_depth + exit_slots + 2);
         self.assembler
             .set_location(self.source_location(item.context_expr.range()));
         self.emit(PUSH_EXC_INFO, 0, 1)?;
@@ -27270,27 +27400,28 @@ impl Compiler<'_> {
         }
         self.emit_reraise(ReraiseStackState::WithHandler)?;
         self.assembler.mark(suppress);
-        self.set_depth(base_depth + 5);
+        self.set_depth(base_depth + exit_slots + 3);
         self.emit(POP_TOP, 0, -1)?;
         self.assembler.mark(handler_end);
         self.assembler.add_exception_region(
             handler,
             not_taken_start,
             cleanup,
-            (base_depth + 4).cast_unsigned(),
+            (base_depth + exit_slots + 2).cast_unsigned(),
             true,
         );
         self.assembler.add_exception_region(
             not_taken_end,
             handler_end,
             cleanup,
-            (base_depth + 4).cast_unsigned(),
+            (base_depth + exit_slots + 2).cast_unsigned(),
             true,
         );
         self.emit(POP_EXCEPT, 0, -1)?;
         self.emit(POP_TOP, 0, -1)?;
-        self.emit(POP_TOP, 0, -1)?;
-        self.emit(POP_TOP, 0, -1)?;
+        for _ in 0..exit_slots {
+            self.emit(POP_TOP, 0, -1)?;
+        }
         if terminal {
             if outer_exception_owns_exit {
                 // This cleanup belongs to the surrounding try. The following original
@@ -27367,8 +27498,9 @@ impl Compiler<'_> {
         }
 
         self.assembler.mark(cleanup);
-        // The handler preserves four values, then exception dispatch adds lasti and exc.
-        self.set_depth(base_depth + 6);
+        // The handler preserves the exit callable(s), lasti, and the exception value.
+        // Exception dispatch then adds another lasti and exception value.
+        self.set_depth(base_depth + exit_slots + 4);
         self.assembler.set_location(SourceLocation::NONE);
         self.emit(COPY, 3, 1)?;
         self.emit(POP_EXCEPT, 0, -1)?;
@@ -27397,7 +27529,7 @@ impl Compiler<'_> {
             if self.output.constants.is_empty() {
                 self.add_constant(Constant::Int(0))?;
             }
-            self.emit(LOAD_SMALL_INT, 0, 1)?;
+            self.emit_unsigned_constant(0)?;
             let none = self.add_constant(Constant::None)?;
             self.emit(LOAD_CONST, none, 1)?;
             let module = alias.name.as_str();

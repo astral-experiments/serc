@@ -4,12 +4,26 @@ set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ $# -gt 2 ]]; then
-    echo "usage: check-cpython-compatibility [PYTHON [3.14|3.15]]" >&2
+    echo "usage: check-cpython-compatibility [PYTHON [3.12|3.13|3.14|3.15]]" >&2
     exit 2
 fi
 
 python_version="${2:-3.14}"
 case "$python_version" in
+    3.12)
+        expected_exact=2174
+        expected_rejected=277
+        expected_matched_rejection=210
+        expected_rejection_mismatch=61
+        expected_compiler_failure=6
+        ;;
+    3.13)
+        expected_exact=2193
+        expected_rejected=258
+        expected_matched_rejection=196
+        expected_rejection_mismatch=55
+        expected_compiler_failure=7
+        ;;
     3.14)
         expected_exact=2230
         expected_rejected=221
@@ -25,7 +39,7 @@ case "$python_version" in
         expected_compiler_failure=14
         ;;
     *)
-        echo "error: unsupported Python target '$python_version'; expected 3.14 or 3.15" >&2
+        echo "error: unsupported Python target '$python_version'; expected 3.12, 3.13, 3.14, or 3.15" >&2
         exit 2
         ;;
 esac
@@ -66,7 +80,7 @@ comparison_args=(
     --expected-outcome oracle-failure=0
     --require-all
 )
-if [[ "$python_version" == 3.15 ]]; then
+if [[ "$python_version" != 3.14 ]]; then
     comparison_args+=(--source-bytes)
 fi
 

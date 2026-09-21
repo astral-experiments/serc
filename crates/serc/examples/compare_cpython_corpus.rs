@@ -132,7 +132,7 @@ enum CompilerOutcome {
 struct Options {
     #[arg(long, default_value = "python3", value_name = "PATH")]
     python: String,
-    #[arg(long, default_value_t = PythonVersion::default(), value_name = "3.14|3.15")]
+    #[arg(long, default_value_t = PythonVersion::default(), value_name = "3.12|3.13|3.14|3.15")]
     python_version: PythonVersion,
     #[arg(value_name = "ROOT", default_values_os_t = default_roots())]
     roots: Vec<PathBuf>,
@@ -545,7 +545,7 @@ impl PythonIdentity {
     fn matches(&self, version: PythonVersion) -> bool {
         let target = version.target();
         let (release_level, release_serial) = match version {
-            PythonVersion::Py314 => ("final", 0),
+            PythonVersion::Py312 | PythonVersion::Py313 | PythonVersion::Py314 => ("final", 0),
             PythonVersion::Py315 => ("candidate", 2),
         };
         self.implementation == target.implementation
@@ -901,11 +901,21 @@ mod tests {
 
     #[test]
     fn selected_python_version_is_parsed_and_validated() {
-        let options =
-            Options::try_parse_from(["compare_cpython_corpus", "--python-version", "3.15"])
-                .unwrap();
-        assert_eq!(options.python_version, PythonVersion::Py315);
-        let error = Options::try_parse_from(["compare_cpython_corpus", "--python-version", "3.13"])
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let options = Options::try_parse_from([
+                "compare_cpython_corpus",
+                "--python-version",
+                &version.to_string(),
+            ])
+            .unwrap();
+            assert_eq!(options.python_version, version);
+        }
+        let error = Options::try_parse_from(["compare_cpython_corpus", "--python-version", "3.11"])
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::ValueValidation);
     }
@@ -991,10 +1001,15 @@ mod tests {
 
     #[test]
     fn oracle_identity_rejects_other_targets_and_release_candidates() {
-        for python_version in [PythonVersion::Py314, PythonVersion::Py315] {
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
             let target = python_version.target();
             let (release_level, release_serial) = match python_version {
-                PythonVersion::Py314 => ("final", 0),
+                PythonVersion::Py312 | PythonVersion::Py313 | PythonVersion::Py314 => ("final", 0),
                 PythonVersion::Py315 => ("candidate", 2),
             };
             let mut identity = PythonIdentity {
@@ -1005,11 +1020,14 @@ mod tests {
                 magic: target.magic_hex(),
             };
             assert!(identity.matches(python_version));
-            let other = match python_version {
-                PythonVersion::Py314 => PythonVersion::Py315,
-                PythonVersion::Py315 => PythonVersion::Py314,
-            };
-            assert!(!identity.matches(other));
+            for other in [
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ] {
+                assert_eq!(identity.matches(other), other == python_version);
+            }
             identity.release_serial += 1;
             assert!(!identity.matches(python_version));
             identity.release_serial = release_serial;
@@ -1033,7 +1051,12 @@ mod tests {
 
     #[test]
     fn selected_target_reaches_both_input_modes() {
-        for python_version in [PythonVersion::Py314, PythonVersion::Py315] {
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
             let options = CompileOptions {
                 python_version,
                 ..CompileOptions::default()

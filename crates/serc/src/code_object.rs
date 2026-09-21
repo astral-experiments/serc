@@ -223,6 +223,8 @@ pub(crate) struct MarshalProvenance {
     pub(crate) canonical_constant_strings: FxHashSet<String>,
     /// The class-body constant loaded into `__qualname__`, when present.
     pub(crate) qualified_name_constant_index: Option<u32>,
+    /// Legacy qualified-name ownership recorded before discarded constants are pruned.
+    pub(crate) qualified_name_is_canonical: Option<bool>,
     pub(crate) metadata_ids: Option<MarshalMetadataIds>,
     /// Whether this code tree can contain a frozenset constant; `None` keeps legacy analysis.
     pub(crate) subtree_has_frozenset_constants: Option<bool>,

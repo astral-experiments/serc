@@ -375,7 +375,7 @@ fn reachable_constant_indices(
             let Item::Instruction(instruction) = item else {
                 continue;
             };
-            if instruction.opcode == load_const
+            if uses_constant_index(instruction.opcode, load_const)
                 && let Operand::Value(index) = instruction.operand()
                 && let Some(slot) = used.get_mut(index as usize)
             {
@@ -390,6 +390,15 @@ fn reachable_constant_indices(
         }
     }
     used
+}
+
+fn uses_constant_index(opcode: Opcode, load_const: Opcode) -> bool {
+    opcode == load_const
+        || (load_const == LOAD_CONST
+            && matches!(
+                opcode,
+                crate::target::opcodes::RETURN_CONST | crate::target::opcodes::KW_NAMES
+            ))
 }
 
 /// Marks reachable constants in an assertion-only stream and reports linear-optimizer eligibility.
@@ -4499,7 +4508,9 @@ impl Assembler {
         // Python 3.15 keeps an index beside the synchronous iterator, so its
         // value-preserving cleanup is SWAP(3), POP_TOP, POP_TOP.
         let (cleanup_width, swap_depth) = match self.python_version {
-            crate::PythonVersion::Py314 => (2, 2),
+            crate::PythonVersion::Py312
+            | crate::PythonVersion::Py313
+            | crate::PythonVersion::Py314 => (2, 2),
             crate::PythonVersion::Py315 => (3, 3),
         };
         let cleanup_instructions = cleanup_width * iterators;
@@ -6198,7 +6209,9 @@ impl Assembler {
         items: &'a [Item],
     ) -> Option<(&'a [Item], &'a Instruction, &'a Instruction)> {
         let width = match self.python_version {
-            crate::PythonVersion::Py314 => 1,
+            crate::PythonVersion::Py312
+            | crate::PythonVersion::Py313
+            | crate::PythonVersion::Py314 => 1,
             crate::PythonVersion::Py315 => 2,
         };
         let start = items.len().checked_sub(width + 1)?;
@@ -6261,7 +6274,9 @@ impl Assembler {
     /// Returns the extra stack cell in a synchronous iterator for this target.
     const fn iterator_break_extra_slot(&self) -> u32 {
         match self.python_version {
-            crate::PythonVersion::Py314 => 0,
+            crate::PythonVersion::Py312
+            | crate::PythonVersion::Py313
+            | crate::PythonVersion::Py314 => 0,
             crate::PythonVersion::Py315 => 1,
         }
     }
@@ -11589,7 +11604,9 @@ impl Assembler {
             return None;
         }
         let iterator_slots = match self.python_version {
-            crate::PythonVersion::Py314 => 1,
+            crate::PythonVersion::Py312
+            | crate::PythonVersion::Py313
+            | crate::PythonVersion::Py314 => 1,
             crate::PythonVersion::Py315 => 2,
         };
         let tail = items.get(index.checked_sub(iterator_slots + 1)?..=index)?;
@@ -13670,7 +13687,7 @@ impl Assembler {
                 straight_line = false;
                 break;
             }
-            if instruction.opcode == load_const
+            if uses_constant_index(instruction.opcode, load_const)
                 && let Operand::Value(index) = instruction.operand()
                 && let Some(slot) = used.get_mut(index as usize)
             {
@@ -13734,7 +13751,7 @@ impl Assembler {
         // survivors stay duplicates when their constant indices change together.
         let original_uniform_folds = &self.exception_owner_provenance.original_uniform_folds;
         let remap = |instruction: &mut Instruction| {
-            if instruction.opcode != load_const {
+            if !uses_constant_index(instruction.opcode, load_const) {
                 return;
             }
             let Operand::Value(mut index) = instruction.operand() else {

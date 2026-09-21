@@ -1,8 +1,8 @@
 //! Compile Python source to CPython bytecode without starting a Python interpreter.
 //!
-//! Select the Python target with [`CompileOptions`]. The default targets CPython 3.14.5;
-//! Python 3.15 targets CPython 3.15.0rc2. Bytecode, code objects, marshal, and `.pyc`
-//! formats are implementation details tied to these exact CPython releases.
+//! Select Python 3.12, 3.13, 3.14, or 3.15 with [`CompileOptions`]; Python 3.14 is the default.
+//! [`PythonVersion::target`] identifies each pinned CPython release. Bytecode, code objects,
+//! marshal, and `.pyc` formats are implementation details tied to those exact releases.
 
 mod assembler;
 mod code_object;
@@ -280,6 +280,8 @@ fn compile_normalized(
     options: &CompileOptions,
 ) -> Result<CompiledModule, CompileError> {
     let target_version = match options.python_version {
+        PythonVersion::Py312 => ruff_python_ast::PythonVersion::PY312,
+        PythonVersion::Py313 => ruff_python_ast::PythonVersion::PY313,
         PythonVersion::Py314 => ruff_python_ast::PythonVersion::PY314,
         PythonVersion::Py315 => ruff_python_ast::PythonVersion::PY315,
     };

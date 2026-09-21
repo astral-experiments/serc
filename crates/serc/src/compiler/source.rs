@@ -24,6 +24,61 @@ use super::scope::{ModulePlan, ScopeArena, class_static_attributes};
 use super::symbol::mangle_name;
 use super::{CachedSourceLine, Compiler};
 
+#[derive(Debug, Default)]
+struct LegacyConstantOrigins {
+    strings: FxHashMap<String, bool>,
+    string_tuples: FxHashSet<Vec<String>>,
+}
+
+impl LegacyConstantOrigins {
+    fn record_constant(&mut self, constant: &Constant) {
+        match constant {
+            Constant::String(value) => {
+                self.strings.entry(value.clone()).or_insert(false);
+            }
+            Constant::Tuple(values) => {
+                // Metadata tuples enter the native cache without admitting their members.
+                // Reusing one as a literal must not create scalar cache entries afterwards.
+                if let Some(strings) = Self::string_tuple(values)
+                    && !self.string_tuples.insert(strings)
+                {
+                    return;
+                }
+                for value in values {
+                    self.record_constant(value);
+                }
+            }
+            Constant::FrozenSet(values) => {
+                for value in values {
+                    self.record_constant(value);
+                }
+            }
+            // Nested code objects recorded their admissions while compiling their bodies.
+            _ => {}
+        }
+    }
+
+    fn string_tuple(values: &[Constant]) -> Option<Vec<String>> {
+        values
+            .iter()
+            .map(|value| match value {
+                Constant::String(value) => Some(value.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn record_code_assembly(&mut self, code: &CodeObject) {
+        self.string_tuples.insert(code.names.clone());
+        if let Some(strings) = Self::string_tuple(&code.constants) {
+            self.string_tuples.insert(strings);
+        }
+        if code.marshal_provenance.locals_identity == crate::code_object::LocalsIdentity::ByValue {
+            self.string_tuples.insert(code.locals.clone());
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct CompilationContext<'source> {
     pub(super) python_version: crate::PythonVersion,
@@ -33,6 +88,9 @@ pub(super) struct CompilationContext<'source> {
     line_index: LineIndex,
     pub(super) scopes: ScopeArena,
     constant_string_origins: FxHashMap<String, AtomicU8>,
+    // Legacy class qualified-name identity depends on the first scalar cache admission,
+    // even when that constant or the defining class is later removed as unreachable.
+    legacy_constant_string_origins: Option<Mutex<LegacyConstantOrigins>>,
     static_attribute_names: FxHashSet<String>,
     cached_static_attribute_tuples: Mutex<FxHashSet<Vec<String>>>,
     pub(super) generated_mangled_strings: FxHashSet<String>,
@@ -70,8 +128,15 @@ impl<'source> CompilationContext<'source> {
         body: &Suite,
         python_version: crate::PythonVersion,
     ) -> Self {
-        let scopes = ScopeArena::analyze(body);
+        let scopes = if python_version == crate::PythonVersion::Py314 {
+            ScopeArena::analyze(body)
+        } else {
+            ScopeArena::analyze_with_python_version(body, python_version)
+        };
         let mut generated_mangled_strings = FxHashSet::default();
+        let legacy_constant_string_origins = (python_version <= crate::PythonVersion::Py313
+            && scopes.has_class_scopes())
+        .then(Mutex::default);
         let mut requires_interning_trace = false;
         let mut static_attribute_names = FxHashSet::default();
         let constant_string_origins = parser_interned_strings(
@@ -88,6 +153,7 @@ impl<'source> CompilationContext<'source> {
             line_index: LineIndex::from_source_text(source),
             scopes,
             constant_string_origins,
+            legacy_constant_string_origins,
             static_attribute_names,
             cached_static_attribute_tuples: Mutex::new(FxHashSet::default()),
             generated_mangled_strings,
@@ -122,6 +188,13 @@ impl<'source> CompilationContext<'source> {
     }
 
     pub(super) fn record_constant_string_origins(&self, constant: &Constant, interned: bool) {
+        if let Some(origins) = &self.legacy_constant_string_origins {
+            origins.lock().unwrap().record_constant(constant);
+        }
+        self.record_interned_constant_string_origins(constant, interned);
+    }
+
+    fn record_interned_constant_string_origins(&self, constant: &Constant, interned: bool) {
         if self.constant_string_origins.is_empty() {
             return;
         }
@@ -141,7 +214,7 @@ impl<'source> CompilationContext<'source> {
                     self.record_cached_string_tuple(values);
                 }
                 for value in values {
-                    self.record_constant_string_origins(value, interned);
+                    self.record_interned_constant_string_origins(value, interned);
                 }
             }
             // A nested code object's constants were recorded while compiling its body.
@@ -225,6 +298,9 @@ impl<'source> CompilationContext<'source> {
     }
 
     pub(super) fn record_code_assembly(&self, code: &CodeObject) -> Option<usize> {
+        if let Some(origins) = &self.legacy_constant_string_origins {
+            origins.lock().unwrap().record_code_assembly(code);
+        }
         // Assembly merges these tuples without recursively admitting their members.
         self.record_static_attribute_tuple_cache(
             code.names.iter().map(|value| Some(value.as_str())),
@@ -256,7 +332,38 @@ impl<'source> CompilationContext<'source> {
     }
 
     pub(super) fn has_tracked_string_origins(&self) -> bool {
-        !self.constant_string_origins.is_empty()
+        !self.constant_string_origins.is_empty() || self.tracks_legacy_qualified_names()
+    }
+
+    pub(super) fn tracks_legacy_qualified_names(&self) -> bool {
+        self.legacy_constant_string_origins.is_some()
+    }
+
+    pub(super) fn requires_discarded_builders(&self) -> bool {
+        self.requires_interning_trace || self.tracks_legacy_qualified_names()
+    }
+
+    /// Records the class body's actual qualified-name constant admission.
+    ///
+    /// Python 3.12 aliases metadata only for the winning class definition. Python
+    /// 3.13 interns that winner, so later equal class names can share its identity.
+    pub(super) fn record_class_qualified_name(&self, value: &str) -> Option<bool> {
+        let origins = self.legacy_constant_string_origins.as_ref()?;
+        let mut origins = origins.lock().unwrap();
+        match origins.strings.entry(value.to_string()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                // A dotted import interns its complete spelling while parsing. In 3.13,
+                // code construction reuses that object for the qualified-name metadata,
+                // leaving the class's newly cached scalar constant distinct.
+                let canonical = self.python_version == crate::PythonVersion::Py312
+                    || !self.constant_string_origins.contains_key(value);
+                entry.insert(canonical);
+                Some(canonical)
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                Some(self.python_version == crate::PythonVersion::Py313 && *entry.get())
+            }
+        }
     }
 
     /// Takes the completed module's string keys when no child still shares the context.
@@ -787,6 +894,34 @@ impl Compiler<'_> {
 
     /// Folds constants while preserving surrogate escapes that Ruff represents as U+FFFD.
     pub(super) fn source_aware_fold_constant(&self, expression: &Expr) -> Option<Constant> {
+        #[derive(Default)]
+        struct ContainsSlice(bool);
+
+        impl<'a> Visitor<'a> for ContainsSlice {
+            fn visit_expr(&mut self, expression: &'a Expr) {
+                if matches!(expression, Expr::Slice(_)) {
+                    self.0 = true;
+                } else if !self.0 {
+                    walk_expr(self, expression);
+                }
+            }
+        }
+
+        if !self.has_deferred_annotations() {
+            // These targets construct slices at runtime, including when the indexed
+            // object is a literal and the slice sits inside another folded expression.
+            let mut slices = ContainsSlice::default();
+            slices.visit_expr(expression);
+            if slices.0 {
+                return None;
+            }
+            if let Expr::UnaryOp(unary) = expression
+                && unary.op == ruff_python_ast::UnaryOp::Invert
+                && let Some(Constant::Bool(value)) = fold_constant(&unary.operand)
+            {
+                return Some(Constant::SignedInt(-i64::from(value) - 1));
+            }
+        }
         match expression {
             Expr::StringLiteral(string) => Some(self.string_literal_constant(string)),
             Expr::Tuple(tuple) if tuple.ctx == ExprContext::Load => tuple

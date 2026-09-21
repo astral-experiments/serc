@@ -30,6 +30,10 @@ pub(super) enum ObjectKey<'a> {
     // compiler constant cache still shares equal constants with each other.
     ConstantString(&'a str),
     String(&'a str),
+    // Python 3.12 retains the caller's filename object without interning it.
+    Filename(&'a str),
+    // Dynamically allocated code names stay distinct even when their values match.
+    UninternedMetadata(usize),
     SurrogateString(&'a [u8]),
     Bytes(&'a [u8]),
     ConstantTuple(ConstantTupleKey<'a>),
@@ -441,7 +445,7 @@ pub(super) type ConstantSortKey = SmallVec<[u8; 16]>;
 pub(super) type FrozenSetMembers<'a> = SmallVec<[(ConstantSortKey, &'a Constant); 4]>;
 
 pub(super) fn constant_sort_key(value: &Constant) -> ConstantSortKey {
-    constant_sort_key_with_properties(value, &|value| {
+    constant_sort_key_with_properties(value, PythonVersion::Py314, &|value| {
         (
             true,
             matches!(value, Constant::String(value) if should_intern(value)),
@@ -452,12 +456,14 @@ pub(super) fn constant_sort_key(value: &Constant) -> ConstantSortKey {
 /// Encodes an independent marshal stream, including references local to the sort key.
 fn constant_sort_key_with_properties<'a>(
     value: &'a Constant,
+    python_version: PythonVersion,
     properties: &impl Fn(&'a Constant) -> (bool, bool),
 ) -> ConstantSortKey {
     fn append<'a>(
         output: &mut ConstantSortKey,
         value: &'a Constant,
         force_reference: bool,
+        python_version: PythonVersion,
         properties: &impl Fn(&'a Constant) -> (bool, bool),
         references: &mut FxHashMap<ObjectKey<'a>, u32>,
     ) {
@@ -622,7 +628,7 @@ fn constant_sort_key_with_properties<'a>(
                     );
                 }
                 for value in values {
-                    append(output, value, false, properties, references);
+                    append(output, value, false, python_version, properties, references);
                 }
             }
             Constant::FrozenSet(values) => {
@@ -632,15 +638,17 @@ fn constant_sort_key_with_properties<'a>(
                         .expect("sort-key frozenset length fits in u32")
                         .to_le_bytes(),
                 );
-                for (_, value) in frozen_set_members_with_properties(values, properties) {
-                    append(output, value, true, properties, references);
+                for (_, value) in
+                    frozen_set_members_with_properties(values, python_version, properties)
+                {
+                    append(output, value, true, python_version, properties, references);
                 }
             }
             Constant::Slice { lower, upper, step } => {
                 output.push(TYPE_SLICE | flag);
-                append(output, lower, false, properties, references);
-                append(output, upper, false, properties, references);
-                append(output, step, false, properties, references);
+                append(output, lower, false, python_version, properties, references);
+                append(output, upper, false, python_version, properties, references);
+                append(output, step, false, python_version, properties, references);
             }
             Constant::Code(_) => output.push(TYPE_CODE | flag),
         }
@@ -650,7 +658,10 @@ fn constant_sort_key_with_properties<'a>(
     append(
         &mut output,
         value,
-        true,
+        // Python 3.12 borrows each member while computing its independent sort key.
+        // Later targets retain a reference through _PySet_NextEntryRef.
+        python_version >= PythonVersion::Py313,
+        python_version,
         properties,
         &mut FxHashMap::default(),
     );
@@ -668,11 +679,15 @@ pub(super) fn frozen_set_members_in_wire_order(values: &[Constant]) -> FrozenSet
 
 pub(super) fn frozen_set_members_with_properties<'a>(
     values: &'a [Constant],
+    python_version: PythonVersion,
     properties: &impl Fn(&'a Constant) -> (bool, bool),
 ) -> FrozenSetMembers<'a> {
     let mut members = FrozenSetMembers::new();
     for value in values {
-        members.push((constant_sort_key_with_properties(value, properties), value));
+        members.push((
+            constant_sort_key_with_properties(value, python_version, properties),
+            value,
+        ));
     }
     members.sort_by(|(left, _), (right, _)| left.cmp(right));
     members

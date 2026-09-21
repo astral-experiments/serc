@@ -14,7 +14,6 @@ use super::{
     LOAD_LOCALS, LOAD_NAME, LOAD_SPECIAL, RERAISE, RESUME, SET_FUNCTION_ATTRIBUTE, STORE_DEREF,
     STORE_FAST, STORE_GLOBAL, STORE_NAME, YIELD_VALUE,
 };
-use crate::CompileError;
 use crate::assembler::{EmittedInstruction, EmittedJump, ExceptionPolicy, Label, SourceLocation};
 use crate::code_object::Constant;
 use crate::target::code_flags::{CO_ASYNC_GENERATOR, CO_COROUTINE, CO_FUTURE_ANNOTATIONS};
@@ -24,6 +23,7 @@ use crate::target::operands::{
 };
 use crate::target::stack_counts_for as opcode_stack_counts;
 use crate::target::{Opcode, is_unconditional_jump};
+use crate::{CompileError, PythonVersion};
 
 use super::RETURN_VALUE;
 
@@ -85,7 +85,7 @@ pub(super) enum ReraiseStackState {
     StopIterationHandler,
     /// CPython's standard `[exc_info, lasti, exc]` handler-cleanup sequence.
     HandlerCleanup,
-    /// An unsuccessful synchronous or asynchronous `with` handler retains five logical values.
+    /// An unsuccessful `with` handler retains five values, or four before Python 3.14.
     WithHandler,
 }
 
@@ -622,6 +622,10 @@ impl Compiler<'_> {
     pub(super) fn emit_closure_tuple(&mut self, names: &[NameId]) -> Result<(), CompileError> {
         for name in names {
             let local = self.closure_index_id(*name)?;
+            if self.context.python_version == PythonVersion::Py312 {
+                self.emit(crate::target::opcodes::LOAD_CLOSURE, local, 1)?;
+                continue;
+            }
             let emitted = self.emit_instruction(LOAD_FAST, local)?;
             // CPython lowers pseudo `LOAD_CLOSURE` instructions after checking ordinary fast
             // loads for initialization and after forming superinstructions.
@@ -852,7 +856,7 @@ impl Compiler<'_> {
         }
 
         #[derive(Default)]
-        struct Collector<'source, 'ast> {
+        struct Collector<'compiler, 'source, 'ast> {
             actions: Vec<SkippedAction<'ast>>,
             build_discarded: bool,
             names: Vec<(String, bool)>,
@@ -866,10 +870,24 @@ impl Compiler<'_> {
             private_name: Option<String>,
             inlined_targets: Vec<String>,
             future_annotations: bool,
+            legacy_compiler: Option<&'compiler Compiler<'source>>,
+            legacy_annotated_scope: bool,
             source: &'source str,
         }
 
-        impl<'ast> Collector<'_, 'ast> {
+        impl<'ast> Collector<'_, '_, 'ast> {
+            fn legacy_folded_constant(&self, expression: &Expr) -> Option<Constant> {
+                let compiler = self.legacy_compiler?;
+                if matches!(
+                    expression,
+                    Expr::BinOp(_) | Expr::Subscript(_) | Expr::UnaryOp(_) | Expr::Tuple(_)
+                ) {
+                    compiler.source_aware_fold_constant(expression)
+                } else {
+                    None
+                }
+            }
+
             fn record_interpolated_constant(&mut self, constant: Constant) {
                 if self.record_string_origins {
                     self.string_origin_constants.push((constant.clone(), false));
@@ -930,6 +948,7 @@ impl Compiler<'_> {
                     record_string_origins: true,
                     private_name,
                     future_annotations: self.future_annotations,
+                    legacy_compiler: self.legacy_compiler,
                     source: self.source,
                     ..Self::default()
                 }
@@ -958,7 +977,7 @@ impl Compiler<'_> {
             }
         }
 
-        impl<'ast> Visitor<'ast> for Collector<'_, 'ast> {
+        impl<'ast> Visitor<'ast> for Collector<'_, '_, 'ast> {
             fn visit_body(&mut self, body: &'ast [Stmt]) {
                 let register_folds = self.register_folds;
                 for statement in body {
@@ -972,13 +991,55 @@ impl Compiler<'_> {
 
             fn visit_stmt(&mut self, statement: &'ast Stmt) {
                 match statement {
-                    Stmt::Expr(expression) if literal_constant(&expression.value).is_some() => {
+                    Stmt::Expr(expression)
+                        if literal_constant(&expression.value).is_some()
+                            || self.legacy_folded_constant(&expression.value).is_some() =>
+                    {
                         return;
                     }
                     Stmt::AnnAssign(assignment) => {
+                        let build = self.legacy_compiler.is_some() && self.record_string_origins;
+                        if build {
+                            self.flush_origins();
+                            self.actions.push(SkippedAction::Statement(statement));
+                            self.record_string_origins = false;
+                        }
                         if let Some(value) = &assignment.value {
                             self.visit_expr(value);
                             self.visit_expr(&assignment.target);
+                        } else if self.legacy_compiler.is_some() {
+                            match assignment.target.as_ref() {
+                                Expr::Attribute(attribute) => self.visit_expr(&attribute.value),
+                                Expr::Subscript(subscript) => {
+                                    self.visit_expr(&subscript.value);
+                                    self.visit_expr(&subscript.slice);
+                                }
+                                _ => {}
+                            }
+                        }
+                        if self.legacy_annotated_scope {
+                            if self.future_annotations && assignment.simple {
+                                self.record_interpolated_constant(Constant::String(
+                                    unparse_annotation(&assignment.annotation, self.source),
+                                ));
+                            } else if !self.future_annotations {
+                                self.visit_expr(&assignment.annotation);
+                            }
+                            if assignment.simple {
+                                self.names.push(("__annotations__".to_string(), false));
+                                if self.register_literals
+                                    && let Expr::Name(name) = assignment.target.as_ref()
+                                {
+                                    self.constants.push(Constant::String(
+                                        mangle_name(name.id.as_str(), self.private_name.as_deref())
+                                            .into_owned(),
+                                    ));
+                                }
+                            }
+                        }
+                        if build {
+                            self.record_string_origins = true;
+                            self.string_origin_constants.clear();
                         }
                         return;
                     }
@@ -1205,6 +1266,21 @@ impl Compiler<'_> {
             }
 
             fn visit_expr(&mut self, expression: &'ast Expr) {
+                if let Some(constant) = self.legacy_folded_constant(expression) {
+                    // Legacy AST folding admits only the result, before the next child
+                    // is built. Replaying operands or delaying this action changes which
+                    // object a later class-qualified-name constant finds in the cache.
+                    if self.record_string_origins {
+                        self.flush_origins();
+                        self.actions.push(SkippedAction::Expression(expression));
+                    }
+                    if self.register_literals {
+                        self.constants.push(constant);
+                    } else if self.register_folds {
+                        self.folded_expressions.push(expression);
+                    }
+                    return;
+                }
                 let elements = match expression {
                     Expr::Tuple(tuple) => Some(tuple.elts.as_slice()),
                     Expr::List(list) => Some(list.elts.as_slice()),
@@ -1461,10 +1537,16 @@ impl Compiler<'_> {
         let mut collector = Collector {
             register_literals,
             register_folds,
-            build_discarded: self.context.requires_interning_trace,
+            build_discarded: self.context.requires_discarded_builders(),
             record_string_origins: self.context.has_tracked_string_origins(),
             private_name: self.unit.private_name.clone(),
             future_annotations: self.unit.flags & CO_FUTURE_ANNOTATIONS != 0,
+            legacy_compiler: self
+                .context
+                .tracks_legacy_qualified_names()
+                .then_some(&*self),
+            legacy_annotated_scope: self.context.tracks_legacy_qualified_names()
+                && matches!(self.unit.scope, Scope::Module | Scope::Class { .. }),
             source: self.context.source,
             ..Collector::default()
         };
@@ -1485,9 +1567,18 @@ impl Compiler<'_> {
             collector.visit_body(body);
         }
         collector.flush_origins();
-        let mut builder = (collector.build_discarded || first_expression.is_some())
-            .then(|| self.discarded_builder());
-        for action in collector.actions {
+        let Collector {
+            actions,
+            build_discarded,
+            has_untracked_collection,
+            constants,
+            folded_expressions,
+            names,
+            ..
+        } = collector;
+        let mut builder =
+            (build_discarded || first_expression.is_some()).then(|| self.discarded_builder());
+        for action in actions {
             match action {
                 SkippedAction::Origins(origins) => {
                     for (constant, interned) in origins {
@@ -1505,6 +1596,9 @@ impl Compiler<'_> {
                             builder.compile_class_definition(definition)?;
                         }
                         Stmt::TypeAlias(alias) => builder.compile_type_alias(alias)?,
+                        Stmt::AnnAssign(_) => {
+                            builder.compile_suite(std::slice::from_ref(statement))?
+                        }
                         _ => unreachable!(),
                     }
                 }
@@ -1521,17 +1615,17 @@ impl Compiler<'_> {
                 }
             }
         }
-        self.output.has_untracked_discarded_collection |= collector.has_untracked_collection;
-        for constant in collector.constants {
+        self.output.has_untracked_discarded_collection |= has_untracked_collection;
+        for constant in constants {
             self.add_constant(constant)?;
         }
         // The first CFG reachability pass retains both edges of a constant condition.
         // Its discarded branch can therefore create a folded value before the later
         // reachability pass removes the branch; surviving uses retain that cache slot.
-        for expression in collector.folded_expressions {
+        for expression in folded_expressions {
             self.record_folded_value(expression)?;
         }
-        for (name, force_name) in collector.names {
+        for (name, force_name) in names {
             let name_id = self.required_name_id(&name);
             let is_local_or_free = matches!(
                 &self.unit.scope,
@@ -1660,6 +1754,7 @@ impl Compiler<'_> {
         opcode: Opcode,
         argument: u32,
     ) -> Result<EmittedInstruction, CompileError> {
+        let opcode = self.emission_opcode(opcode);
         let effect =
             required_compiler_stack_effect(self.assembler.python_version(), opcode, argument)?;
         self.apply_stack_effect(effect)?;
@@ -1673,6 +1768,9 @@ impl Compiler<'_> {
 
     /// Emits an async-iteration branch marker before exception ownership is assigned.
     pub(super) fn emit_authored_not_taken(&mut self) -> Result<(), CompileError> {
+        if self.context.python_version <= PythonVersion::Py313 {
+            return Ok(());
+        }
         let emitted = self.emit_instruction(crate::target::opcodes::NOT_TAKEN, 0)?;
         if self.assembler.python_version() == crate::PythonVersion::Py315 {
             self.assembler.mark_authored_branch_marker(emitted);
@@ -1696,6 +1794,11 @@ impl Compiler<'_> {
         effect: i32,
         exception_policy: ExceptionPolicy,
     ) -> Result<(), CompileError> {
+        if self.omits_opcode(opcode) {
+            debug_assert_eq!(effect, 0);
+            return Ok(());
+        }
+        let opcode = self.emission_opcode(opcode);
         self.apply_compiler_stack_effect(opcode, argument, effect)?;
         self.assembler.emit_value_with_depth_discard(
             opcode,
@@ -1706,8 +1809,46 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    /// Identifies zero-effect markers absent from an older bytecode target.
+    fn omits_opcode(&self, opcode: Opcode) -> bool {
+        (self.context.python_version <= PythonVersion::Py313
+            && opcode == crate::target::opcodes::NOT_TAKEN)
+            || (self.context.python_version == PythonVersion::Py312
+                && opcode == crate::target::opcodes::TO_BOOL)
+    }
+
+    /// Resolves equivalent instructions before validating their target stack effects.
+    fn emission_opcode(&self, opcode: Opcode) -> Opcode {
+        if self.omits_opcode(opcode) {
+            // Emission sites retaining an instruction handle need a removable slot.
+            crate::target::opcodes::NOP
+        } else if self.context.python_version <= PythonVersion::Py313
+            && opcode == crate::target::opcodes::POP_ITER
+        {
+            crate::target::opcodes::POP_TOP
+        } else {
+            opcode
+        }
+    }
+
+    /// Emits the target's cleanup for the iterator-exhausted edge of a loop.
+    pub(super) fn emit_end_for_cleanup(&mut self) -> Result<(), CompileError> {
+        if self.context.python_version == PythonVersion::Py312 {
+            self.emit(crate::target::opcodes::END_FOR, 0, -2)
+        } else {
+            self.emit(crate::target::opcodes::END_FOR, 0, -1)?;
+            self.emit(crate::target::opcodes::POP_ITER, 0, -self.iterator_slots())
+        }
+    }
+
     pub(super) fn emit_reraise(&mut self, state: ReraiseStackState) -> Result<(), CompileError> {
-        let (argument, effect) = state.argument_and_effect();
+        let (argument, mut effect) = state.argument_and_effect();
+        if self.context.python_version <= PythonVersion::Py313
+            && matches!(state, ReraiseStackState::WithHandler)
+        {
+            // Older with statements retain only the exit callable on the stack.
+            effect += 1;
+        }
         self.apply_stack_effect(effect)?;
         self.assembler.emit_value_with_depth_discard(
             RERAISE,
@@ -1743,6 +1884,11 @@ impl Compiler<'_> {
         &mut self,
         constant: CommonConstant,
     ) -> Result<(), CompileError> {
+        if self.context.python_version <= PythonVersion::Py313
+            && constant == CommonConstant::ASSERTIONERROR
+        {
+            return self.emit(crate::target::opcodes::LOAD_ASSERTION_ERROR, 0, 1);
+        }
         self.emit(LOAD_COMMON_CONSTANT, constant.argument(), 1)
     }
 
@@ -1751,7 +1897,12 @@ impl Compiler<'_> {
         location: ResumeLocation,
         depth: ResumeDepth,
     ) -> Result<(), CompileError> {
-        self.emit(RESUME, location.at_depth(depth.is_one()), 0)?;
+        let argument = if self.context.python_version == PythonVersion::Py312 {
+            location.argument()
+        } else {
+            location.at_depth(depth.is_one())
+        };
+        self.emit(RESUME, argument, 0)?;
         if location == ResumeLocation::AFTER_AWAIT
             && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
         {
@@ -1768,6 +1919,11 @@ impl Compiler<'_> {
         &mut self,
         operation: BinaryOperation,
     ) -> Result<(), CompileError> {
+        if self.context.python_version <= PythonVersion::Py313
+            && operation == BinaryOperation::SUBSCR
+        {
+            return self.emit(crate::target::opcodes::BINARY_SUBSCR, 0, -1);
+        }
         self.emit(BINARY_OP, operation.argument(), -1)
     }
 
@@ -1776,9 +1932,14 @@ impl Compiler<'_> {
         operation: ComparisonOperation,
         mode: ComparisonMode,
     ) -> Result<(), CompileError> {
-        let argument = match mode {
-            ComparisonMode::Value => operation.argument(),
-            ComparisonMode::Boolean => operation.boolean_argument(),
+        let argument = if self.context.python_version == PythonVersion::Py312 {
+            let argument = operation.argument();
+            ((argument >> 5) << 4) | (argument & 15)
+        } else {
+            match mode {
+                ComparisonMode::Value => operation.argument(),
+                ComparisonMode::Boolean => operation.boolean_argument(),
+            }
         };
         self.emit(COMPARE_OP, argument, -1)
     }

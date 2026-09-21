@@ -14,6 +14,8 @@ use crate::target::opcodes::*;
 mod constant;
 mod definition;
 mod expression;
+#[cfg(test)]
+mod legacy_annotation_tests;
 mod orchestration;
 mod scope;
 mod source;
@@ -77,6 +79,40 @@ struct CachedSourceLine {
 }
 
 impl Compiler<'_> {
+    /// Python 3.14 introduced lazily evaluated annotation functions.
+    fn has_deferred_annotations(&self) -> bool {
+        matches!(
+            self.context.python_version,
+            crate::PythonVersion::Py314 | crate::PythonVersion::Py315
+        )
+    }
+
+    /// Attach function payloads in the order consumed by the target runtime.
+    fn emit_make_function(&mut self, flags: u32) -> Result<(), crate::CompileError> {
+        use crate::target::operands::FunctionAttribute;
+
+        if self.context.python_version == crate::PythonVersion::Py312 {
+            return self.emit(
+                MAKE_FUNCTION,
+                flags,
+                -i32::try_from(flags.count_ones()).unwrap(),
+            );
+        }
+        self.emit(MAKE_FUNCTION, 0, 0)?;
+        for attribute in [
+            FunctionAttribute::CLOSURE,
+            FunctionAttribute::ANNOTATIONS,
+            FunctionAttribute::ANNOTATE,
+            FunctionAttribute::KWDEFAULTS,
+            FunctionAttribute::DEFAULTS,
+        ] {
+            if flags & attribute.argument() != 0 {
+                self.emit_function_attribute(attribute)?;
+            }
+        }
+        Ok(())
+    }
+
     /// CPython 3.15 keeps an index slot alongside each synchronous iterator.
     fn iterator_extra_slots(&self) -> i32 {
         i32::from(self.context.python_version == crate::PythonVersion::Py315)

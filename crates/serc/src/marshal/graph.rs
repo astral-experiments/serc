@@ -178,6 +178,7 @@ pub(super) struct ObjectGraph<'a> {
     cached_scalar_ids: Option<Box<[u32]>>,
     cache_scalars: bool,
     needs_reference_sorting: bool,
+    legacy_qualified_name_aliases: FxHashSet<usize>,
     objects_by_id: Vec<Object>,
     occurrences: Vec<Occurrence>,
     #[cfg(debug_assertions)]
@@ -199,7 +200,8 @@ impl<'a> ObjectGraph<'a> {
         if graph.needs_reference_sorting {
             // Tuple members sort by complete marshal streams: their descendants' reference flags
             // depend on sharing across the entire code graph. Resolve that sharing before recording
-            // occurrences in the final member order. Scalar-only sets do not need this extra pass.
+            // occurrences in the final member order. Python 3.12 also needs this pass for scalar
+            // members because it borrows their roots while computing sort keys.
             Self::build_for_code(code, python_version, initial_intern_state, Some(&graph))
         } else {
             graph
@@ -241,6 +243,11 @@ impl<'a> ObjectGraph<'a> {
             .unwrap_or_default();
         let mut graph = Self {
             python_version,
+            legacy_qualified_name_aliases: if python_version == PythonVersion::Py312 {
+                legacy_qualified_name_aliases(code)
+            } else {
+                FxHashSet::default()
+            },
             metadata_aliased_constants: collect_metadata_aliased_constants(code, &metadata_tuples),
             cache_scalars: code.constants.len() >= MIN_CACHED_SCALAR_CONSTANTS,
             metadata_slots,
@@ -260,7 +267,9 @@ impl<'a> ObjectGraph<'a> {
 
     pub(super) fn frozen_set_members(&self, values: &'a [Constant]) -> FrozenSetMembers<'a> {
         if self.needs_reference_sorting {
-            frozen_set_members_with_properties(values, &|value| self.sort_key_properties(value))
+            frozen_set_members_with_properties(values, self.python_version, &|value| {
+                self.sort_key_properties(value)
+            })
         } else {
             frozen_set_members_in_wire_order(values)
         }
@@ -708,7 +717,7 @@ fn collect_explicitly_interned<'a>(
         } else {
             collect_interning_provenance(code, python_version, values, metadata_tuples)
         };
-    if !has_qualified_name_constant {
+    if !has_qualified_name_constant || python_version == PythonVersion::Py312 {
         return frozenset_recreation_need;
     }
 
@@ -717,10 +726,12 @@ fn collect_explicitly_interned<'a>(
     // the class constant instead reuses that plain object and remains distinct from the metadata.
     let mut qualified_name_constants = FxHashSet::default();
     let mut qualified_name_values = FxHashSet::default();
+    let mut recorded_origins = FxHashMap::default();
     collect_qualified_name_constants(
         code,
         &mut qualified_name_constants,
         &mut qualified_name_values,
+        &mut recorded_origins,
     );
     let mut seen = FxHashSet::default();
     let mut ordinary_first = FxHashSet::default();
@@ -731,7 +742,12 @@ fn collect_explicitly_interned<'a>(
         &mut seen,
         &mut ordinary_first,
     );
-    values.extend(qualified_name_values.difference(&ordinary_first).copied());
+    values.extend(qualified_name_values.into_iter().filter(|value| {
+        recorded_origins
+            .get(value)
+            .copied()
+            .unwrap_or_else(|| !ordinary_first.contains(value))
+    }));
     frozenset_recreation_need
 }
 
@@ -794,21 +810,100 @@ fn collect_interning_provenance<'a>(
     (has_qualified_name_constant, frozenset_recreation_need)
 }
 
+/// Identifies class qualified names that first entered the compilation's constant cache.
+///
+/// Python 3.12 keeps these objects uninterned. The first class can share its qualified name
+/// with the cached constant, while an earlier equal literal or class leaves later metadata
+/// distinct from the shared constant value.
+fn legacy_qualified_name_aliases(code: &CodeObject) -> FxHashSet<usize> {
+    fn collect<'a>(
+        code: &'a CodeObject,
+        owners: &mut FxHashMap<usize, usize>,
+        values: &mut FxHashSet<&'a str>,
+    ) {
+        if let Some(index) = code.marshal_provenance.qualified_name_constant_index
+            && let Some(constant @ Constant::String(value)) = code.constants.get(index as usize)
+        {
+            owners.insert(
+                std::ptr::from_ref(constant).addr(),
+                std::ptr::from_ref(code).addr(),
+            );
+            values.insert(value);
+        }
+        for constant in &code.constants {
+            if let Constant::Code(code) = constant {
+                collect(code, owners, values);
+            }
+        }
+    }
+
+    fn visit<'a>(
+        constant: &'a Constant,
+        owners: &FxHashMap<usize, usize>,
+        values: &FxHashSet<&'a str>,
+        seen: &mut FxHashSet<&'a str>,
+        aliases: &mut FxHashSet<usize>,
+    ) {
+        match constant {
+            Constant::String(value) if values.contains(value.as_str()) => {
+                if seen.insert(value)
+                    && let Some(owner) = owners.get(&std::ptr::from_ref(constant).addr())
+                {
+                    aliases.insert(*owner);
+                }
+            }
+            Constant::Tuple(members) | Constant::FrozenSet(members) => {
+                for value in members {
+                    visit(value, owners, values, seen, aliases);
+                }
+            }
+            Constant::Code(code) => {
+                for value in &code.constants {
+                    visit(value, owners, values, seen, aliases);
+                }
+            }
+            Constant::Slice { lower, upper, step } => {
+                for value in [lower.as_ref(), upper.as_ref(), step.as_ref()] {
+                    visit(value, owners, values, seen, aliases);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut owners = FxHashMap::default();
+    let mut values = FxHashSet::default();
+    collect(code, &mut owners, &mut values);
+    let mut aliases = FxHashSet::default();
+    if !values.is_empty() {
+        let mut seen = FxHashSet::default();
+        for constant in &code.constants {
+            visit(constant, &owners, &values, &mut seen, &mut aliases);
+        }
+    }
+    aliases
+}
+
 fn collect_qualified_name_constants<'a>(
     code: &'a CodeObject,
     constants: &mut FxHashSet<usize>,
     values: &mut FxHashSet<&'a str>,
+    recorded_origins: &mut FxHashMap<&'a str, bool>,
 ) {
     if let Some(index) = code.marshal_provenance.qualified_name_constant_index {
         let index = usize::try_from(index).expect("constant index always fits in usize");
         if let Some(constant @ Constant::String(value)) = code.constants.get(index) {
             constants.insert(std::ptr::from_ref(constant).addr());
             values.insert(value.as_str());
+            if let Some(canonical) = code.marshal_provenance.qualified_name_is_canonical {
+                // Compilation provenance includes earlier admissions from discarded code.
+                recorded_origins.insert(value.as_str(), canonical);
+            }
         }
     }
     for constant in &code.constants {
         if let Constant::Code(code) = constant {
-            collect_qualified_name_constants(code, constants, values);
+            collect_qualified_name_constants(code, constants, values, recorded_origins);
         }
     }
 }
@@ -1499,9 +1594,11 @@ fn intern_code_object<'a>(
         interned_strings,
         interned_constant_strings,
     );
-    interned_strings.insert(&code.filename);
-    interned_strings.insert(&code.name);
-    interned_strings.insert(&code.qualified_name);
+    if interned_strings.python_version >= PythonVersion::Py313 {
+        interned_strings.insert(&code.filename);
+        interned_strings.insert(&code.name);
+        interned_strings.insert(&code.qualified_name);
+    }
 }
 
 fn intern_code_summary<'a>(
@@ -1532,9 +1629,11 @@ fn intern_code_summary<'a>(
         interned_strings,
         interned_constant_strings,
     );
-    interned_strings.insert(&summary.filename);
-    interned_strings.insert(&summary.name);
-    interned_strings.insert(&summary.qualified_name);
+    if interned_strings.python_version >= PythonVersion::Py313 {
+        interned_strings.insert(&summary.filename);
+        interned_strings.insert(&summary.name);
+        interned_strings.insert(&summary.qualified_name);
+    }
 }
 
 /// Returns whether CPython replaces the constant while recursively interning code constants.
@@ -1712,6 +1811,56 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     #[inline]
     fn first_line(&mut self, _value: u32) {}
 
+    fn code_filename(&mut self, code: &'code CodeObject, metadata_id: Option<u32>) {
+        if self.graph.python_version != PythonVersion::Py312
+            || code.filename.is_empty()
+            || is_cached_character(&code.filename)
+        {
+            self.metadata_string(&code.filename, metadata_id);
+        } else {
+            self.graph.record_keyed(
+                OccurrenceKind::MetadataString,
+                ObjectKey::Filename(&code.filename),
+            );
+        }
+    }
+
+    fn code_name(&mut self, code: &'code CodeObject, metadata_id: Option<u32>) {
+        if self.graph.python_version == PythonVersion::Py312
+            && code.name.starts_with("<generic parameters of ")
+        {
+            self.graph.record_keyed(
+                OccurrenceKind::MetadataString,
+                ObjectKey::UninternedMetadata(std::ptr::from_ref(&code.name).addr()),
+            );
+        } else {
+            self.metadata_string(&code.name, metadata_id);
+        }
+    }
+
+    fn code_qualified_name(&mut self, code: &'code CodeObject, metadata_id: Option<u32>) {
+        if self.graph.python_version != PythonVersion::Py312 {
+            self.metadata_string(&code.qualified_name, metadata_id);
+        } else if code.name == code.qualified_name {
+            self.code_name(code, metadata_id);
+        } else {
+            let aliases_constant = code
+                .marshal_provenance
+                .qualified_name_is_canonical
+                .unwrap_or_else(|| {
+                    self.graph
+                        .legacy_qualified_name_aliases
+                        .contains(&std::ptr::from_ref(code).addr())
+                });
+            let key = if aliases_constant {
+                ObjectKey::ConstantString(&code.qualified_name)
+            } else {
+                ObjectKey::UninternedMetadata(std::ptr::from_ref(&code.qualified_name).addr())
+            };
+            self.graph.record_keyed(OccurrenceKind::MetadataString, key);
+        }
+    }
+
     #[inline]
     fn bytes(&mut self, value: &'code [u8]) {
         match value {
@@ -1733,9 +1882,11 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     #[inline]
     fn constant(&mut self, value: &'code Constant, _reference_mode: ReferenceMode) -> bool {
         if let Constant::FrozenSet(values) = value {
-            self.graph.needs_reference_sorting |= values
-                .iter()
-                .any(|value| matches!(value, Constant::Tuple(_) | Constant::FrozenSet(_)));
+            self.graph.needs_reference_sorting |=
+                (self.graph.python_version == PythonVersion::Py312 && values.len() > 1)
+                    || values
+                        .iter()
+                        .any(|value| matches!(value, Constant::Tuple(_) | Constant::FrozenSet(_)));
         }
         match value {
             Constant::None | Constant::Bool(_) | Constant::Ellipsis => true,

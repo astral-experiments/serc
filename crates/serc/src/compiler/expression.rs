@@ -12,16 +12,16 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use super::{
     BINARY_SLICE, BUILD_INTERPOLATION, BUILD_LIST, BUILD_MAP, BUILD_SET, BUILD_SLICE, BUILD_STRING,
     BUILD_TEMPLATE, BUILD_TUPLE, CALL, CALL_FUNCTION_EX, CALL_KW, CLEANUP_THROW, COMPARE_OP,
-    CONTAINS_OP, COPY, DELETE_ATTR, DELETE_SUBSCR, DICT_MERGE, DICT_UPDATE, END_ASYNC_FOR, END_FOR,
+    CONTAINS_OP, COPY, DELETE_ATTR, DELETE_SUBSCR, DICT_MERGE, DICT_UPDATE, END_ASYNC_FOR,
     END_SEND, FOR_ITER, FORMAT_SIMPLE, FORMAT_WITH_SPEC, GET_AITER, GET_ANEXT, GET_AWAITABLE,
     GET_ITER, GET_LEN, GET_YIELD_FROM_ITER, IS_OP, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT,
     JUMP_FORWARD, LIST_APPEND, LIST_EXTEND, LOAD_ATTR, LOAD_COMMON_CONSTANT, LOAD_CONST,
     LOAD_DEREF, LOAD_FAST, LOAD_FAST_AND_CLEAR, LOAD_GLOBAL, LOAD_SMALL_INT, LOAD_SUPER_ATTR,
-    MAKE_CELL, MAKE_FUNCTION, MAP_ADD, MATCH_CLASS, MATCH_KEYS, MATCH_MAPPING, MATCH_SEQUENCE, NOP,
-    NOT_TAKEN, POP_ITER, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE,
-    POP_JUMP_IF_TRUE, POP_TOP, PUSH_NULL, RETURN_VALUE, SEND, SET_ADD, SET_UPDATE, STORE_ATTR,
-    STORE_FAST, STORE_SLICE, STORE_SUBSCR, SWAP, TO_BOOL, UNARY_INVERT, UNARY_NEGATIVE, UNARY_NOT,
-    UNPACK_EX, UNPACK_SEQUENCE,
+    MAKE_CELL, MAP_ADD, MATCH_CLASS, MATCH_KEYS, MATCH_MAPPING, MATCH_SEQUENCE, NOP, NOT_TAKEN,
+    POP_ITER, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP,
+    PUSH_NULL, RETURN_VALUE, SEND, SET_ADD, SET_UPDATE, STORE_ATTR, STORE_FAST, STORE_SLICE,
+    STORE_SUBSCR, SWAP, TO_BOOL, UNARY_INVERT, UNARY_NEGATIVE, UNARY_NOT, UNPACK_EX,
+    UNPACK_SEQUENCE,
 };
 use crate::assembler::{ExceptionPolicy, Label, SourceLocation};
 use crate::code_object::Constant;
@@ -29,6 +29,7 @@ use crate::target::code_flags::{
     CO_ASYNC_GENERATOR, CO_COROUTINE, CO_GENERATOR, CO_METHOD, CO_NESTED, CO_VARARGS,
     CO_VARKEYWORDS,
 };
+use crate::target::opcodes::{BUILD_CONST_KEY_MAP, FORMAT_VALUE, KW_NAMES};
 use crate::target::operands::{
     BinaryOperation, CommonConstant, ComparisonOperation, Conversion, FunctionAttribute,
     ResumeLocation, UnaryIntrinsic,
@@ -1973,7 +1974,8 @@ impl Compiler<'_> {
                         imag: *imag,
                     },
                 };
-                if let Number::Int(value) = &number.value
+                if self.context.python_version >= PythonVersion::Py314
+                    && let Number::Int(value) = &number.value
                     && let Some(value) = value.as_u8()
                 {
                     if self.output.constants.is_empty() {
@@ -2059,7 +2061,9 @@ impl Compiler<'_> {
                 if let Expr::Slice(slice) = subscript.slice.as_ref() {
                     let slice_location = self.source_location(slice.range);
                     let subscript_location = self.source_location(subscript.range);
-                    if let Some(constant) = constant_slice(slice) {
+                    if self.context.python_version >= PythonVersion::Py314
+                        && let Some(constant) = constant_slice(slice)
+                    {
                         let index = self.add_constant(constant)?;
                         self.assembler.set_location(slice_location);
                         self.emit(LOAD_CONST, index, 1)?;
@@ -2441,6 +2445,36 @@ impl Compiler<'_> {
         self.compile_expression(&interpolation.expression)?;
         self.assembler
             .set_location(self.source_location(interpolation.range));
+        if self.context.python_version == PythonVersion::Py312 {
+            use crate::target::operands312::FormatValue;
+            let mut argument = match interpolation.conversion {
+                ConversionFlag::None
+                    if interpolation.debug_text.is_some()
+                        && interpolation.format_spec.is_none() =>
+                {
+                    FormatValue::REPR.argument()
+                }
+                ConversionFlag::None => FormatValue::NONE.argument(),
+                ConversionFlag::Str => FormatValue::STR.argument(),
+                ConversionFlag::Repr => FormatValue::REPR.argument(),
+                ConversionFlag::Ascii => FormatValue::ASCII.argument(),
+            };
+            if let Some(format_spec) = &interpolation.format_spec {
+                self.compile_interpolated_elements(
+                    &format_spec.elements,
+                    format_spec.range,
+                    is_raw,
+                )?;
+                argument |= FormatValue::HAVE_SPEC.argument();
+            }
+            self.assembler
+                .set_location(self.source_location(interpolation.range));
+            return self.emit(
+                FORMAT_VALUE,
+                argument,
+                -i32::from(interpolation.format_spec.is_some()),
+            );
+        }
         match interpolation.conversion {
             ConversionFlag::None
                 if interpolation.debug_text.is_some() && interpolation.format_spec.is_none() =>
@@ -2490,6 +2524,25 @@ impl Compiler<'_> {
                     self.compile_expression(expression)?;
                     let location = self.source_location(expression.range());
                     self.assembler.set_location(location);
+                    if self.context.python_version == PythonVersion::Py312 {
+                        use crate::target::operands312::FormatValue;
+                        let mut argument = if conversion == Conversion::STR {
+                            FormatValue::STR.argument()
+                        } else if conversion == Conversion::REPR {
+                            FormatValue::REPR.argument()
+                        } else {
+                            FormatValue::ASCII.argument()
+                        };
+                        let has_spec = format_spec.is_some();
+                        if let Some(format_spec) = format_spec {
+                            self.assembler.set_location(SourceLocation::NONE);
+                            self.load_string_constant(&format_spec)?;
+                            self.assembler.set_location(location);
+                            argument |= FormatValue::HAVE_SPEC.argument();
+                        }
+                        self.emit(FORMAT_VALUE, argument, -i32::from(has_spec))?;
+                        continue;
+                    }
                     self.emit_conversion(conversion)?;
                     if let Some(format_spec) = format_spec {
                         self.assembler.set_location(SourceLocation::NONE);
@@ -2607,6 +2660,9 @@ impl Compiler<'_> {
     }
 
     fn compile_call(&mut self, call: &ruff_python_ast::ExprCall) -> Result<(), CompileError> {
+        if self.context.python_version <= PythonVersion::Py313 {
+            return self.compile_legacy_call(call);
+        }
         if let Some(callable) =
             optimized_generator_callable_for_target(call, self.context.python_version)
         {
@@ -2771,6 +2827,138 @@ impl Compiler<'_> {
         self.emit(CALL_FUNCTION_EX, 0, -3)
     }
 
+    /// Emits the 3.12/3.13 call protocols, including their optional keyword dictionary.
+    fn compile_legacy_call(
+        &mut self,
+        call: &ruff_python_ast::ExprCall,
+    ) -> Result<(), CompileError> {
+        let shape = self.call_shape(call);
+        let python312 = self.context.python_version == PythonVersion::Py312;
+        let direct_method = if let Some(attribute) = shape.direct_method {
+            if self.compile_super_attribute(attribute, SuperAttributeKind::Method)?
+                == SpecializedLowering::NotApplicable
+            {
+                self.compile_expression(&attribute.value)?;
+                let index = self.name_index(attribute.attr.as_str())?;
+                self.assembler
+                    .set_location(self.attribute_opcode_location(attribute));
+                self.emit(LOAD_ATTR, (index << 1) | 1, 1)?;
+            }
+            true
+        } else {
+            false
+        };
+        if !direct_method
+            && self.compile_direct_global_callable(&call.func)?
+                == SpecializedLowering::NotApplicable
+        {
+            self.assembler
+                .set_location(self.source_location(call.func.range()));
+            if python312 {
+                self.emit(PUSH_NULL, 0, 1)?;
+            }
+            if let Some(attribute) = shape.imported_module_callable {
+                self.compile_expression(&attribute.value)?;
+                let index = self.name_index(attribute.attr.as_str())?;
+                self.assembler
+                    .set_location(self.attribute_opcode_location(attribute));
+                self.emit(LOAD_ATTR, index << 1, 0)?;
+            } else {
+                self.compile_expression(&call.func)?;
+            }
+            self.assembler
+                .set_location(self.source_location(call.func.range()));
+            if !python312 {
+                self.emit(PUSH_NULL, 0, 1)?;
+            }
+        }
+        let call_location = self.call_opcode_location_with_method(call, shape.direct_method);
+        if !shape.has_starred
+            && !shape.has_keyword_unpack
+            && (direct_method || shape.positional_count + shape.keyword_count * 2 <= 30)
+        {
+            for argument in &call.arguments.args {
+                self.compile_expression(argument)?;
+            }
+            for keyword in &call.arguments.keywords {
+                self.compile_expression(&keyword.value)?;
+            }
+            let count = to_u32(
+                call.arguments.args.len() + call.arguments.keywords.len(),
+                "call argument count",
+            )?;
+            self.assembler.set_location(call_location);
+            if call.arguments.keywords.is_empty() {
+                return self.emit(CALL, count, -i32::try_from(count).unwrap() - 1);
+            }
+            let keys = call
+                .arguments
+                .keywords
+                .iter()
+                .map(|keyword| Constant::String(keyword.arg.as_ref().unwrap().as_str().to_owned()))
+                .collect();
+            let keys = self.add_interned_string_tuple(keys)?;
+            if let Some(attribute) = shape.direct_method {
+                self.assembler
+                    .set_location(self.attribute_opcode_location(attribute));
+            }
+            if python312 {
+                self.emit(KW_NAMES, keys, 0)?;
+                self.assembler.set_location(call_location);
+                self.emit(CALL, count, -i32::try_from(count).unwrap() - 1)
+            } else {
+                self.emit(LOAD_CONST, keys, 1)?;
+                self.assembler.set_location(call_location);
+                self.emit(CALL_KW, count, -i32::try_from(count).unwrap() - 2)
+            }
+        } else {
+            self.assembler.set_location(call_location);
+            match call.arguments.args.as_ref() {
+                [] => self.emit_deferred_constant(Constant::Tuple(Vec::new()))?,
+                [Expr::Starred(starred)] => self.compile_expression(&starred.value)?,
+                arguments => self.compile_collection(arguments, CollectionKind::Tuple)?,
+            }
+            let mut have_dict = false;
+            let mut named_start = 0;
+            for (index, keyword) in call.arguments.keywords.iter().enumerate() {
+                if keyword.arg.is_some() {
+                    continue;
+                }
+                if named_start < index {
+                    self.compile_keyword_map(
+                        call_location,
+                        &call.arguments.keywords[named_start..index],
+                    )?;
+                    if have_dict {
+                        self.emit(DICT_MERGE, 1, -1)?;
+                    }
+                    have_dict = true;
+                }
+                if !have_dict {
+                    self.emit(BUILD_MAP, 0, 1)?;
+                    have_dict = true;
+                }
+                self.compile_expression(&keyword.value)?;
+                self.assembler.set_location(call_location);
+                self.emit(DICT_MERGE, 1, -1)?;
+                named_start = index + 1;
+            }
+            if named_start < call.arguments.keywords.len() {
+                self.compile_keyword_map(call_location, &call.arguments.keywords[named_start..])?;
+                if have_dict {
+                    self.emit(DICT_MERGE, 1, -1)?;
+                }
+            }
+            self.assembler.set_location(call_location);
+            let has_keywords = !call.arguments.keywords.is_empty();
+            self.emit(
+                CALL_FUNCTION_EX,
+                u32::from(has_keywords),
+                -2 - i32::from(has_keywords),
+            )
+        }
+    }
+
     fn compile_optimized_generator_call(
         &mut self,
         call: &ruff_python_ast::ExprCall,
@@ -2907,8 +3095,7 @@ impl Compiler<'_> {
         self.assembler.mark(exhausted);
         self.set_depth(iterator_depth + 1);
         self.assembler.set_location(callable_location);
-        self.emit(END_FOR, 0, -1)?;
-        self.emit(POP_ITER, 0, -self.iterator_slots())?;
+        self.emit_end_for_cleanup()?;
         self.assembler.set_location(callable_location);
         if callable == "tuple" {
             self.emit_unary_intrinsic(UnaryIntrinsic::LIST_TO_TUPLE)?;
@@ -2944,7 +3131,21 @@ impl Compiler<'_> {
         keywords: &[Keyword],
     ) -> Result<(), CompileError> {
         debug_assert!(!keywords.is_empty() && keywords.iter().all(|keyword| keyword.arg.is_some()));
-        if keywords.len() * 2 > 30 {
+        if self.context.python_version <= PythonVersion::Py313 && (2..=15).contains(&keywords.len())
+        {
+            let mut keys = Vec::with_capacity(keywords.len());
+            for keyword in keywords {
+                self.compile_expression(&keyword.value)?;
+                let name = keyword.arg.as_ref().unwrap().as_str();
+                self.context.record_constant_string_origin(name, true);
+                keys.push(Constant::String(name.to_owned()));
+            }
+            let keys = self.add_interned_string_tuple(keys)?;
+            self.assembler.set_location(call_location);
+            self.emit(LOAD_CONST, keys, 1)?;
+            let count = to_u32(keywords.len(), "keyword count")?;
+            self.emit(BUILD_CONST_KEY_MAP, count, -i32::try_from(count).unwrap())?;
+        } else if keywords.len() * 2 > 30 {
             self.assembler.set_location(SourceLocation::NONE);
             self.emit(BUILD_MAP, 0, 1)?;
             for keyword in keywords {
@@ -3198,7 +3399,13 @@ impl Compiler<'_> {
             let folded_defaults = if positional_defaults.len() <= CPYTHON_STACK_USE_GUIDELINE {
                 positional_defaults
                     .iter()
-                    .map(|default| fold_constant(default))
+                    .map(|default| {
+                        if self.context.python_version <= PythonVersion::Py313 {
+                            self.source_aware_fold_constant(default)
+                        } else {
+                            fold_constant(default)
+                        }
+                    })
                     .collect::<Option<Vec<_>>>()
             } else {
                 None
@@ -3233,7 +3440,20 @@ impl Compiler<'_> {
                     .map(|default| (parameter.name().as_str(), default))
             })
             .collect();
-        if !keyword_defaults.is_empty() {
+        if !keyword_defaults.is_empty() && self.context.python_version <= PythonVersion::Py313 {
+            let mut keys = Vec::with_capacity(keyword_defaults.len());
+            for (name, default) in &keyword_defaults {
+                self.compile_expression(default)?;
+                let mangled = self.mangled_name(name);
+                self.context
+                    .record_identifier_constant_origin(name, &mangled);
+                keys.push(Constant::String(mangled));
+            }
+            let keys = self.add_interned_string_tuple(keys)?;
+            self.emit(LOAD_CONST, keys, 1)?;
+            let count = to_u32(keyword_defaults.len(), "keyword default count")?;
+            self.emit(BUILD_CONST_KEY_MAP, count, -i32::try_from(count).unwrap())?;
+        } else if !keyword_defaults.is_empty() {
             for (name, default) in &keyword_defaults {
                 let mangled = self.mangled_name(name);
                 self.context
@@ -3295,12 +3515,15 @@ impl Compiler<'_> {
         {
             CO_NESTED
         } else if matches!(self.unit.scope, Scope::Class { .. }) {
-            CO_METHOD
-                | if self.unit.class_scope_is_nested {
-                    CO_NESTED
-                } else {
-                    0
-                }
+            (if self.context.python_version >= PythonVersion::Py314 {
+                CO_METHOD
+            } else {
+                0
+            }) | if self.unit.class_scope_is_nested {
+                CO_NESTED
+            } else {
+                0
+            }
         } else if !closure_names.is_empty() {
             CO_NESTED
         } else {
@@ -3333,6 +3556,9 @@ impl Compiler<'_> {
             .imported_scope_names
             .clone_from(&self.symbols.imported_scope_names);
         child.emit_function_prologue()?;
+        if self.context.python_version <= PythonVersion::Py313 {
+            child.add_constant(Constant::None)?;
+        }
         if parameter_flags & CO_GENERATOR != 0 {
             // CPython does not wrap generator lambdas in the stop-iteration
             // handler used by `def` generators and generator expressions.
@@ -3347,16 +3573,20 @@ impl Compiler<'_> {
         }
         let constant = self.add_constant(Constant::Code(Box::new(child)))?;
         self.emit(LOAD_CONST, constant, 1)?;
-        self.emit(MAKE_FUNCTION, 0, 0)?;
-        if !closure_names.is_empty() {
-            self.emit_function_attribute(FunctionAttribute::CLOSURE)?;
-        }
-        if !keyword_defaults.is_empty() {
-            self.emit_function_attribute(FunctionAttribute::KWDEFAULTS)?;
-        }
-        if !positional_defaults.is_empty() {
-            self.emit_function_attribute(FunctionAttribute::DEFAULTS)?;
-        }
+        let flags = if closure_names.is_empty() {
+            0
+        } else {
+            FunctionAttribute::CLOSURE.argument()
+        } | if keyword_defaults.is_empty() {
+            0
+        } else {
+            FunctionAttribute::KWDEFAULTS.argument()
+        } | if positional_defaults.is_empty() {
+            0
+        } else {
+            FunctionAttribute::DEFAULTS.argument()
+        };
+        self.emit_make_function(flags)?;
         Ok(())
     }
 
@@ -3382,7 +3612,7 @@ impl Compiler<'_> {
         } else {
             self.compile_iterable_expression(&generators[0].iter)?;
         }
-        if self.context.python_version == PythonVersion::Py314 {
+        if self.context.python_version <= PythonVersion::Py314 {
             self.assembler
                 .set_location(self.source_location(generators[0].iter.range()));
             self.emit_comprehension_iterator(generators[0].is_async)?;
@@ -3948,20 +4178,22 @@ impl Compiler<'_> {
             .comprehensions
             .active_comprehension_local_names
             .is_empty();
-        let flags =
-            if is_async {
-                CO_ASYNC_GENERATOR
-            } else {
-                CO_GENERATOR
-            } | if self.child_function_is_nested() || inlined_comprehension_parent {
-                CO_NESTED
-            } else {
-                0
-            } | if matches!(self.unit.scope, Scope::Class { .. }) && !inlined_comprehension_parent {
-                CO_METHOD
-            } else {
-                0
-            } | (self.unit.flags & SUPPORTED_FUTURE_FLAGS);
+        let flags = if is_async {
+            CO_ASYNC_GENERATOR
+        } else {
+            CO_GENERATOR
+        } | if self.child_function_is_nested() || inlined_comprehension_parent {
+            CO_NESTED
+        } else {
+            0
+        } | if self.context.python_version >= PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Class { .. })
+            && !inlined_comprehension_parent
+        {
+            CO_METHOD
+        } else {
+            0
+        } | (self.unit.flags & SUPPORTED_FUTURE_FLAGS);
         let mut child = Self::function(
             Arc::clone(&self.context),
             "<genexpr>",
@@ -4013,16 +4245,17 @@ impl Compiler<'_> {
         }
         let code = self.add_constant(Constant::Code(Box::new(child)))?;
         self.emit(LOAD_CONST, code, 1)?;
-        self.emit(MAKE_FUNCTION, 0, 0)?;
-        if !closure_names.is_empty() {
-            self.emit_function_attribute(FunctionAttribute::CLOSURE)?;
-        }
+        self.emit_make_function(if closure_names.is_empty() {
+            0
+        } else {
+            FunctionAttribute::CLOSURE.argument()
+        })?;
         if generator.generators[0].is_async || self.context.python_version == PythonVersion::Py315 {
             self.compile_expression(&generator.generators[0].iter)?;
         } else {
             self.compile_iterable_expression(&generator.generators[0].iter)?;
         }
-        if self.context.python_version == PythonVersion::Py314 {
+        if self.context.python_version <= PythonVersion::Py314 {
             self.assembler
                 .set_location(self.source_location(generator.generators[0].iter.range()));
             self.emit_comprehension_iterator(generator.generators[0].is_async)?;
@@ -4048,8 +4281,18 @@ impl Compiler<'_> {
                 generator_location,
             );
         }
+        if self.context.python_version == PythonVersion::Py313 {
+            self.assembler
+                .set_location(self.source_location(generator.iter.range()));
+            self.emit_comprehension_iterator(false)?;
+        }
         let loop_depth = self.control.stack.depth;
         let start = self.assembler.label();
+        let filter_cleanup = if self.context.python_version <= PythonVersion::Py313 {
+            self.assembler.label()
+        } else {
+            start
+        };
         let cleanup = self.assembler.label();
         self.assembler.mark(start);
         self.assembler
@@ -4058,7 +4301,7 @@ impl Compiler<'_> {
         self.compile_store_target(&generator.target)?;
         for condition in &generator.ifs {
             let accepted = self.assembler.label();
-            self.compile_generator_filter(condition, element, accepted, start)?;
+            self.compile_generator_filter(condition, element, accepted, filter_cleanup)?;
             self.assembler.mark(accepted);
         }
         self.compile_generator_expression_tail(
@@ -4066,15 +4309,20 @@ impl Compiler<'_> {
             index,
             element,
             generator_location,
-            start,
+            filter_cleanup,
         )?;
+        if self.context.python_version <= PythonVersion::Py313 {
+            // Keep CPython's original rejection block until jump threading and
+            // backward-conditional normalization run in the assembler.
+            self.assembler.preserve_block_boundary(filter_cleanup);
+            self.assembler.mark(filter_cleanup);
+        }
         self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
         self.assembler.mark(cleanup);
         self.set_depth(loop_depth + 1);
         self.assembler
             .set_location(self.source_location(generator.iter.range()));
-        self.emit(END_FOR, 0, -1)?;
-        self.emit(POP_ITER, 0, -self.iterator_slots())?;
+        self.emit_end_for_cleanup()?;
         Ok(())
     }
 
@@ -4089,6 +4337,11 @@ impl Compiler<'_> {
         let loop_depth = self.control.stack.depth;
         let cleanup_location = generator_location;
         let start = self.assembler.label();
+        let filter_cleanup = if self.context.python_version <= PythonVersion::Py313 {
+            self.assembler.label()
+        } else {
+            start
+        };
         let protected_start = self.assembler.label();
         let yielded = self.assembler.label();
         let yielded_end = self.assembler.label();
@@ -4134,7 +4387,7 @@ impl Compiler<'_> {
 
         for condition in &generator.ifs {
             let accepted = self.assembler.label();
-            self.compile_generator_filter(condition, element, accepted, start)?;
+            self.compile_generator_filter(condition, element, accepted, filter_cleanup)?;
             self.assembler.mark(accepted);
         }
         self.compile_generator_expression_tail(
@@ -4142,8 +4395,14 @@ impl Compiler<'_> {
             index,
             element,
             generator_location,
-            start,
+            filter_cleanup,
         )?;
+        if self.context.python_version <= PythonVersion::Py313 {
+            // Keep CPython's original rejection block until jump threading and
+            // backward-conditional normalization run in the assembler.
+            self.assembler.preserve_block_boundary(filter_cleanup);
+            self.assembler.mark(filter_cleanup);
+        }
         self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
         self.assembler.set_location(cleanup_location);
 
@@ -4157,7 +4416,11 @@ impl Compiler<'_> {
         self.assembler.mark(async_cleanup);
         self.set_depth(loop_depth + 1);
         self.apply_compiler_stack_effect(END_ASYNC_FOR, 0, -2)?;
-        self.assembler.emit_backward(END_ASYNC_FOR, send);
+        if self.context.python_version <= PythonVersion::Py313 {
+            self.assembler.emit(END_ASYNC_FOR, 0);
+        } else {
+            self.assembler.emit_backward(END_ASYNC_FOR, send);
+        }
         self.assembler.add_exception_region(
             protected_start,
             protected_end,
@@ -4312,8 +4575,7 @@ impl Compiler<'_> {
             self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
             self.assembler.mark(end);
             self.set_depth(loop_depth + 1);
-            self.emit(END_FOR, 0, -1)?;
-            self.emit(POP_ITER, 0, -self.iterator_slots())?;
+            self.emit_end_for_cleanup()?;
         } else {
             self.compile_expression(element)?;
             self.assembler
@@ -4372,6 +4634,9 @@ impl Compiler<'_> {
         accepted: Label,
         restart: Label,
     ) -> Result<(), CompileError> {
+        if self.context.python_version <= PythonVersion::Py313 {
+            return self.compile_jump_if(condition, false, restart);
+        }
         if let Expr::If(conditional) = condition {
             return self.compile_conditional_filter(
                 conditional,
@@ -4949,6 +5214,9 @@ impl Compiler<'_> {
         include_with_region_exclusion: bool,
         include_protected_region_exclusion: bool,
     ) -> Result<(), CompileError> {
+        if self.context.python_version <= PythonVersion::Py313 {
+            return self.compile_jump_if(condition, false, restart);
+        }
         if let Expr::If(conditional) = condition {
             return self.compile_conditional_filter(
                 conditional,
@@ -5236,7 +5504,9 @@ impl Compiler<'_> {
             );
         }
         let comprehension_location = self.assembler.location();
-        if index == 0 && self.context.python_version == PythonVersion::Py315 {
+        if self.context.python_version == PythonVersion::Py313
+            || (index == 0 && self.context.python_version == PythonVersion::Py315)
+        {
             self.assembler
                 .set_location(self.source_location(generator.iter.range()));
             self.emit_comprehension_iterator(false)?;
@@ -5244,6 +5514,11 @@ impl Compiler<'_> {
         }
         let loop_depth = self.control.stack.depth;
         let start = self.assembler.label();
+        let filter_cleanup = if self.context.python_version <= PythonVersion::Py313 {
+            self.assembler.label()
+        } else {
+            start
+        };
         let cleanup = self.assembler.label();
         self.assembler.mark(start);
         self.assembler
@@ -5267,7 +5542,7 @@ impl Compiler<'_> {
                 condition,
                 self.source_location(element_range),
                 accepted,
-                start,
+                filter_cleanup,
                 add_opcode == LIST_APPEND,
                 true,
             )?;
@@ -5281,18 +5556,23 @@ impl Compiler<'_> {
             value,
             add_opcode,
             ComprehensionLoop {
-                restart: start,
+                restart: filter_cleanup,
                 iterator_depth: iterator_depth + usize::try_from(self.iterator_slots()).unwrap(),
                 comprehension_location,
             },
         )?;
+        if self.context.python_version <= PythonVersion::Py313 {
+            // Keep CPython's original rejection block until jump threading and
+            // backward-conditional normalization run in the assembler.
+            self.assembler.preserve_block_boundary(filter_cleanup);
+            self.assembler.mark(filter_cleanup);
+        }
         self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
         self.assembler.mark(cleanup);
         self.set_depth(loop_depth + 1);
         self.assembler
             .set_location(self.source_location(generator.iter.range()));
-        self.emit(END_FOR, 0, -1)?;
-        self.emit(POP_ITER, 0, -self.iterator_slots())?;
+        self.emit_end_for_cleanup()?;
         Ok(())
     }
 
@@ -5447,6 +5727,11 @@ impl Compiler<'_> {
         }
         let loop_depth = self.control.stack.depth;
         let start = self.assembler.label();
+        let filter_cleanup = if self.context.python_version <= PythonVersion::Py313 {
+            self.assembler.label()
+        } else {
+            start
+        };
         let protected_start = self.assembler.label();
         let yielded = self.assembler.label();
         let yielded_end = self.assembler.label();
@@ -5504,7 +5789,7 @@ impl Compiler<'_> {
                 condition,
                 self.source_location(element_range),
                 accepted,
-                start,
+                filter_cleanup,
                 add_opcode == LIST_APPEND,
                 true,
             )?;
@@ -5522,11 +5807,17 @@ impl Compiler<'_> {
             value,
             add_opcode,
             ComprehensionLoop {
-                restart: start,
+                restart: filter_cleanup,
                 iterator_depth: iterator_depth + 1,
                 comprehension_location: cleanup_location,
             },
         )?;
+        if self.context.python_version <= PythonVersion::Py313 {
+            // Keep CPython's original rejection block until jump threading and
+            // backward-conditional normalization run in the assembler.
+            self.assembler.preserve_block_boundary(filter_cleanup);
+            self.assembler.mark(filter_cleanup);
+        }
         self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
         if let Some(exclusion_start) = filtered_element_exclusion_start {
             let exclusion_end = self.assembler.label();
@@ -5547,7 +5838,11 @@ impl Compiler<'_> {
         self.assembler.mark(async_cleanup);
         self.set_depth(loop_depth + 1);
         self.apply_compiler_stack_effect(END_ASYNC_FOR, 0, -2)?;
-        self.assembler.emit_backward(END_ASYNC_FOR, send);
+        if self.context.python_version <= PythonVersion::Py313 {
+            self.assembler.emit(END_ASYNC_FOR, 0);
+        } else {
+            self.assembler.emit_backward(END_ASYNC_FOR, send);
+        }
         let async_cleanup_end = self.assembler.label();
         self.assembler.mark(async_cleanup_end);
         self.control
@@ -5618,6 +5913,16 @@ impl Compiler<'_> {
         result
     }
 
+    /// Legacy code generation admits folded display constants before visiting later code.
+    fn emit_collection_constant(&mut self, constant: Constant) -> Result<(), CompileError> {
+        if self.context.python_version <= PythonVersion::Py313 {
+            let index = self.add_constant(constant)?;
+            self.emit(LOAD_CONST, index, 1)
+        } else {
+            self.emit_deferred_constant(constant)
+        }
+    }
+
     fn compile_collection(
         &mut self,
         elements: &[Expr],
@@ -5632,13 +5937,15 @@ impl Compiler<'_> {
                     .collect::<Option<Vec<_>>>()
             {
                 for element in elements {
-                    self.record_folded_value(element)?;
+                    if self.context.python_version >= PythonVersion::Py314 {
+                        self.record_folded_value(element)?;
+                    }
                 }
                 for element in elements {
                     self.emit_folded_tuple_not_nops(element)?;
                 }
                 self.assembler.set_location(collection_location);
-                self.emit_deferred_constant(Constant::Tuple(constants))?;
+                self.emit_collection_constant(Constant::Tuple(constants))?;
                 self.assembler
                     .add_last_constant_fold_slots(folded_elements_owner_slots(
                         elements,
@@ -5664,7 +5971,13 @@ impl Compiler<'_> {
                 }
                 return Ok(());
             }
-            if elements.len() > 30 {
+            if elements.len() > 30
+                && !(self.context.python_version <= PythonVersion::Py313
+                    && matches!(kind, CollectionKind::List | CollectionKind::Set)
+                    && elements
+                        .iter()
+                        .all(|element| self.source_aware_fold_constant(element).is_some()))
+            {
                 self.emit(kind.build_opcode_for_unpacking(), 0, 1)?;
                 for element in elements {
                     self.compile_expression(element)?;
@@ -5683,7 +5996,9 @@ impl Compiler<'_> {
                     .collect::<Option<Vec<_>>>()
             {
                 for element in elements {
-                    self.record_folded_value(element)?;
+                    if self.context.python_version >= PythonVersion::Py314 {
+                        self.record_folded_value(element)?;
+                    }
                 }
                 for element in elements {
                     self.emit_folded_tuple_not_nops(element)?;
@@ -5695,7 +6010,7 @@ impl Compiler<'_> {
                     Constant::Tuple(constants)
                 };
                 self.emit(kind.build_opcode_for_unpacking(), 0, 1)?;
-                self.emit_deferred_constant(constant)?;
+                self.emit_collection_constant(constant)?;
                 self.emit(
                     if kind == CollectionKind::List {
                         LIST_EXTEND
@@ -5749,14 +6064,17 @@ impl Compiler<'_> {
                 .position(Expr::is_starred_expr)
                 .unwrap_or(elements.len())
         };
-        if unpacking_start >= 3
+        if self.context.python_version >= PythonVersion::Py314
+            && unpacking_start >= 3
             && let Some(constants) = elements[..unpacking_start]
                 .iter()
                 .map(|element| self.source_aware_fold_constant(element))
                 .collect::<Option<Vec<_>>>()
         {
             for element in &elements[..unpacking_start] {
-                self.record_folded_value(element)?;
+                if self.context.python_version >= PythonVersion::Py314 {
+                    self.record_folded_value(element)?;
+                }
             }
             for element in &elements[..unpacking_start] {
                 self.emit_folded_tuple_not_nops(element)?;
@@ -5768,7 +6086,7 @@ impl Compiler<'_> {
                 Constant::Tuple(constants)
             };
             self.emit(kind.build_opcode_for_unpacking(), 0, 1)?;
-            self.emit_deferred_constant(constant)?;
+            self.emit_collection_constant(constant)?;
             self.emit(kind.extend_opcode(), 1, -1)?;
             self.assembler
                 .add_last_constant_fold_slots(folded_elements_owner_slots(
@@ -5828,13 +6146,15 @@ impl Compiler<'_> {
                         .collect::<Option<Vec<_>>>()
                 {
                     for element in &list.elts {
-                        self.record_folded_value(element)?;
+                        if self.context.python_version >= PythonVersion::Py314 {
+                            self.record_folded_value(element)?;
+                        }
                     }
                     for element in &list.elts {
                         self.emit_folded_tuple_not_nops(element)?;
                     }
                     self.assembler.set_location(expression_location);
-                    self.emit_deferred_constant(Constant::Tuple(constants))?;
+                    self.emit_collection_constant(Constant::Tuple(constants))?;
                     self.assembler
                         .add_last_constant_fold_slots(folded_elements_owner_slots(
                             &list.elts,
@@ -5866,7 +6186,9 @@ impl Compiler<'_> {
             {
                 let mut constants = Vec::with_capacity(set.elts.len());
                 for element in &set.elts {
-                    self.record_folded_value(element)?;
+                    if self.context.python_version >= PythonVersion::Py314 {
+                        self.record_folded_value(element)?;
+                    }
                     constants.push(self.source_aware_fold_constant(element).unwrap());
                 }
                 for element in &set.elts {
@@ -5874,7 +6196,7 @@ impl Compiler<'_> {
                 }
                 self.assembler.set_location(expression_location);
                 let constant = self.fold_frozenset_constant(constants);
-                self.emit_deferred_constant(constant)?;
+                self.emit_collection_constant(constant)?;
                 self.assembler
                     .add_last_constant_fold_slots(folded_elements_owner_slots(
                         &set.elts,
@@ -5932,6 +6254,26 @@ impl Compiler<'_> {
                 index += 1;
             }
             let group = &items[group_start..index];
+            if self.context.python_version <= PythonVersion::Py313
+                && (2..=15).contains(&group.len())
+                && let Some(keys) = group
+                    .iter()
+                    .map(|item| self.source_aware_fold_constant(item.key.as_ref().unwrap()))
+                    .collect::<Option<Vec<_>>>()
+            {
+                for item in group {
+                    self.compile_expression(&item.value)?;
+                }
+                let keys = self.add_constant(Constant::Tuple(keys))?;
+                self.emit(LOAD_CONST, keys, 1)?;
+                let count = to_u32(group.len(), "dictionary item count")?;
+                self.emit(BUILD_CONST_KEY_MAP, count, -i32::try_from(count).unwrap())?;
+                if have_dict {
+                    self.emit(DICT_UPDATE, 1, -1)?;
+                }
+                have_dict = true;
+                continue;
+            }
             let large = group.len() > 15;
             if large {
                 self.emit(BUILD_MAP, 0, 1)?;
@@ -5964,7 +6306,9 @@ impl Compiler<'_> {
 
     fn compile_slice(&mut self, slice: &ruff_python_ast::ExprSlice) -> Result<(), CompileError> {
         let slice_location = self.source_location(slice.range);
-        if let Some(constant) = constant_slice(slice) {
+        if self.context.python_version >= PythonVersion::Py314
+            && let Some(constant) = constant_slice(slice)
+        {
             let index = self.add_constant(constant)?;
             self.assembler.set_location(slice_location);
             return self.emit(LOAD_CONST, index, 1);
@@ -6492,7 +6836,35 @@ impl Compiler<'_> {
         expression: &ruff_python_ast::ExprBoolOp,
         continuation: Option<(BoolOp, SourceLocation)>,
     ) -> Result<(), CompileError> {
-        self.compile_bool_expression_at(expression, continuation, false)
+        if self.context.python_version <= PythonVersion::Py313 {
+            let end = self.assembler.label();
+            let location = self.source_location(expression.range);
+            let jump = if expression.op == BoolOp::And {
+                POP_JUMP_IF_FALSE
+            } else {
+                POP_JUMP_IF_TRUE
+            };
+            let Some((last, leading)) = expression.values.split_last() else {
+                return Err(CompileError::Internal(
+                    "Boolean expression has no operands".to_owned(),
+                ));
+            };
+            for value in leading {
+                self.compile_expression(value)?;
+                self.assembler.set_location(location);
+                self.emit(COPY, 1, 1)?;
+                if self.context.python_version == PythonVersion::Py313 {
+                    self.emit(TO_BOOL, 0, 0)?;
+                }
+                self.emit_jump_forward(jump, end, -1)?;
+                self.emit(POP_TOP, 0, -1)?;
+            }
+            self.compile_expression(last)?;
+            self.assembler.mark(end);
+            Ok(())
+        } else {
+            self.compile_bool_expression_at(expression, continuation, false)
+        }
     }
 
     fn compile_bool_expression_at(
@@ -6974,7 +7346,7 @@ impl Compiler<'_> {
     }
 
     pub(super) fn emit_boolean_comparison(&mut self, operator: CmpOp) -> Result<(), CompileError> {
-        let (opcode, argument) = comparison_operator_boolean(operator);
+        let (opcode, argument) = comparison_operator_boolean(operator, self.context.python_version);
         self.emit(opcode, argument, -1)?;
         if matches!(opcode, IS_OP | CONTAINS_OP) {
             // CPython folds the original comparison into its following TO_BOOL slot.
@@ -6990,7 +7362,8 @@ impl Compiler<'_> {
         self.compile_expression(&expression.left)?;
         if expression.ops.len() == 1 {
             self.compile_comparison_rhs(expression.ops[0], &expression.comparators[0])?;
-            let (opcode, argument) = comparison_operator(expression.ops[0]);
+            let (opcode, argument) =
+                comparison_operator(expression.ops[0], self.context.python_version);
             return self.emit(opcode, argument, -1);
         }
 
@@ -7005,7 +7378,7 @@ impl Compiler<'_> {
             self.compile_expression(comparator)?;
             self.emit(SWAP, 2, 0)?;
             self.emit(COPY, 2, 1)?;
-            let (opcode, argument) = comparison_operator(*operator);
+            let (opcode, argument) = comparison_operator(*operator, self.context.python_version);
             self.emit(opcode, argument, -1)?;
             self.emit(COPY, 1, 1)?;
             self.emit(TO_BOOL, 0, 0)?;
@@ -7041,7 +7414,7 @@ impl Compiler<'_> {
         }
         let operator = *expression.ops.last().unwrap();
         self.compile_comparison_rhs(operator, expression.comparators.last().unwrap())?;
-        let (opcode, argument) = comparison_operator(operator);
+        let (opcode, argument) = comparison_operator(operator, self.context.python_version);
         self.emit(opcode, argument, -1)?;
         let end = self.assembler.label();
         self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
@@ -7430,8 +7803,11 @@ impl Compiler<'_> {
         jump_on: bool,
         label: Label,
     ) -> Result<(), CompileError> {
+        let legacy_constant = self.context.python_version <= PythonVersion::Py313
+            && self.return_value_is_constant(expression);
         if let Expr::UnaryOp(unary) = expression
             && unary.op == UnaryOp::Not
+            && !legacy_constant
         {
             let defer_terminal_with_exclusion = self.control.withs.terminal_with_condition
                 == Some(expression.range())
@@ -7498,7 +7874,13 @@ impl Compiler<'_> {
             }
             return Ok(());
         }
-        let constant_truthiness = jump_constant_truthiness(expression);
+        let constant_truthiness = if legacy_constant {
+            self.source_aware_fold_constant(expression)
+                .as_ref()
+                .map(super::constant::constant_truthiness)
+        } else {
+            jump_constant_truthiness(expression)
+        };
         if let Some(truthiness) = constant_truthiness {
             let empty_folded_block = self.assembler.at_empty_borrow_block();
             self.record_folded_value(expression)?;
@@ -7668,6 +8050,9 @@ impl Compiler<'_> {
                 )?;
             }
             self.emit(NOT_TAKEN, 0, 0)?;
+            if self.context.python_version <= PythonVersion::Py313 {
+                self.assembler.set_location(SourceLocation::NONE);
+            }
             let comparison_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
             if self.control.conditions.retained_chained_comparison_exit == Some(comparison.range) {
                 // CPython retains this final comparison fallthrough jump as a NOP when its
@@ -7679,8 +8064,15 @@ impl Compiler<'_> {
 
             self.assembler.mark(cleanup);
             self.set_depth(base_depth + 1);
+            if self.context.python_version <= PythonVersion::Py313 {
+                self.assembler
+                    .set_location(self.source_location(comparison.range));
+            }
             self.emit(POP_TOP, 0, -1)?;
             if !jump_on {
+                if self.context.python_version <= PythonVersion::Py313 {
+                    self.assembler.set_location(SourceLocation::NONE);
+                }
                 let cleanup_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, label)?;
                 if self.control.statements.in_terminal_if_branch_suite
                     && self.control.conditions.retained_chained_comparison_exit
@@ -7979,7 +8371,7 @@ impl Compiler<'_> {
             Expr::Subscript(subscript) => {
                 self.compile_expression(&subscript.value)?;
                 if let Expr::Slice(slice) = subscript.slice.as_ref()
-                    && two_element_slice_optimization(slice)
+                    && two_element_slice_optimization(slice, self.context.python_version)
                 {
                     let slice_location = self.source_location(slice.range);
                     self.compile_optional_slice_bound(slice.lower.as_deref(), slice_location)?;
@@ -8202,6 +8594,9 @@ pub(super) fn optimized_generator_callable_for_target(
     call: &ruff_python_ast::ExprCall,
     python_version: PythonVersion,
 ) -> Option<&str> {
+    if python_version <= PythonVersion::Py313 {
+        return None;
+    }
     let Expr::Name(name) = call.func.as_ref() else {
         return None;
     };
@@ -8401,8 +8796,8 @@ pub(super) fn binary_operator(operator: Operator, inplace: bool) -> BinaryOperat
     }
 }
 
-pub(super) fn comparison_operator(operator: CmpOp) -> (Opcode, u32) {
-    match operator {
+pub(super) fn comparison_operator(operator: CmpOp, python_version: PythonVersion) -> (Opcode, u32) {
+    let (opcode, argument) = match operator {
         CmpOp::Lt => (COMPARE_OP, ComparisonOperation::LT.argument()),
         CmpOp::LtE => (COMPARE_OP, ComparisonOperation::LE.argument()),
         CmpOp::Eq => (COMPARE_OP, ComparisonOperation::EQ.argument()),
@@ -8413,15 +8808,27 @@ pub(super) fn comparison_operator(operator: CmpOp) -> (Opcode, u32) {
         CmpOp::IsNot => (IS_OP, 1),
         CmpOp::In => (CONTAINS_OP, 0),
         CmpOp::NotIn => (CONTAINS_OP, 1),
+    };
+    if opcode == COMPARE_OP && python_version == PythonVersion::Py312 {
+        // Python 3.12 stores the comparison index above four mask bits; later
+        // targets insert a fifth bit that requests a Boolean result.
+        (opcode, ((argument >> 5) << 4) | (argument & 15))
+    } else {
+        (opcode, argument)
     }
 }
 
-pub(super) fn comparison_operator_boolean(operator: CmpOp) -> (Opcode, u32) {
-    let (opcode, argument) = comparison_operator(operator);
-    if matches!(
-        operator,
-        CmpOp::Lt | CmpOp::LtE | CmpOp::Eq | CmpOp::NotEq | CmpOp::Gt | CmpOp::GtE
-    ) {
+pub(super) fn comparison_operator_boolean(
+    operator: CmpOp,
+    python_version: PythonVersion,
+) -> (Opcode, u32) {
+    let (opcode, argument) = comparison_operator(operator, python_version);
+    if python_version != PythonVersion::Py312
+        && matches!(
+            operator,
+            CmpOp::Lt | CmpOp::LtE | CmpOp::Eq | CmpOp::NotEq | CmpOp::Gt | CmpOp::GtE
+        )
+    {
         (opcode, ComparisonOperation::force_boolean(argument))
     } else {
         (opcode, argument)

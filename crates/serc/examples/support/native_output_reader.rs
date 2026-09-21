@@ -514,7 +514,12 @@ mod tests {
 
     #[test]
     fn admitted_cache_identity_is_bound_to_its_python_target() {
-        for python_version in [PythonVersion::Py314, PythonVersion::Py315] {
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
             let target = python_version.target();
             let mut identity = json!({"profile": {"target": {
                 "implementation": target.implementation,
@@ -524,11 +529,17 @@ mod tests {
                 "magic_hex": target.magic_hex(),
             }}});
             assert!(admitted_target_matches(&identity, python_version));
-            let other = match python_version {
-                PythonVersion::Py314 => PythonVersion::Py315,
-                PythonVersion::Py315 => PythonVersion::Py314,
-            };
-            assert!(!admitted_target_matches(&identity, other));
+            for other in [
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ] {
+                assert_eq!(
+                    admitted_target_matches(&identity, other),
+                    other == python_version
+                );
+            }
             identity["profile"]["target"]["commit"] = json!("other interpreter build");
             assert!(!admitted_target_matches(&identity, python_version));
         }

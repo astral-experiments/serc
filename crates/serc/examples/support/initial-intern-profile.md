@@ -9,9 +9,9 @@ The profile describes **one captured process**, including mortal strings. It is 
 The JSON object has these fields; unknown fields are rejected:
 
 - `schema_version`: `1`.
-- `target`: `implementation`, dotted `version`, release `tag`, source `commit`, and `magic_hex`, all equal to `CPYTHON_TARGET`.
+- `target`: `implementation`, dotted `version`, release `tag`, source `commit`, and `magic_hex`, all equal to the selected `PythonVersion::target()`.
 - `compiler_input_mode`: `source-bytes` with `--source-bytes`, or `utf8-text` otherwise. The CPython oracle always reads bytes; this field selects the existing Rust compiler input path.
-- `oracle`: exact `script_sha256`; `arguments` equal to `["-I", "-S", "-c"]`; `source_input` equal to `bytes`; `compile_mode` equal to `exec`; `dont_inherit` true; `optimize` zero; and `capture_boundary` equal to `Py_CompileStringObject:entry-after-argument-and-AST-init-before-parser`.
+- `oracle`: exact `script_sha256`; `arguments` equal to `["-I", "-S", "-c"]`; `source_input` equal to `bytes`; `compile_mode` equal to `exec`; `dont_inherit` true; `optimize` zero; and `capture_boundary` equal to `Py_CompileStringObject:entry-after-argument-and-AST-init-before-parser` for Python 3.12–3.14 or `_Py_CompileString:entry-after-argument-and-AST-init-before-parser` for Python 3.15.
 - Artifact references `executable`, `snapshot`, `capture`, `observer`, `layout`, `headers`, `runtime_inputs`, `process_maps`, and `runtime_capture`. Each reference has an absolute `path` and lowercase hexadecimal `sha256`.
 
 The capture boundary follows normal compile argument handling, lazy AST-type initialization, and source conversion, but precedes target parser and arena allocation. Existing compiler startup knowledge and subsequent source chronology remain active; the supplied profile supplements them.

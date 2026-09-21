@@ -7,8 +7,8 @@ use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
 use ruff_python_ast::{Expr, ExprContext, Pattern, Stmt, StmtClassDef, StmtFunctionDef, TypeParam};
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
-use crate::CompileError;
 use crate::target::code_flags::{CO_FUTURE_ANNOTATIONS, CO_FUTURE_BARRY_AS_BDFL};
+use crate::{CompileError, PythonVersion};
 
 use super::symbol::mangle_name;
 use super::{Compiler, SHADOWED_SUPER_SENTINEL, Scope};
@@ -71,6 +71,7 @@ impl Compiler<'_> {
             .annotation_references
             .iter()
             .copied()
+            .filter(|_| arena.deferred_annotations || definition.type_params.is_some())
             .collect::<Vec<_>>()
         {
             let captures_name = match &self.unit.scope {
@@ -339,6 +340,9 @@ pub(super) struct ScopeBodyFacts {
     pub(super) has_type_alias: bool,
     pub(super) has_simple_annotations: bool,
     has_inlined_comprehension: bool,
+    local_annotation_references: BTreeSet<String>,
+    local_annotation_bindings: FxHashSet<String>,
+    local_annotation_cellvars: FxHashSet<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -420,6 +424,7 @@ impl FunctionPlan {
         definition: &StmtFunctionDef,
         module_parent: bool,
         future_annotations: bool,
+        eager_annotations: bool,
         facts: ScopeBodyFacts,
         nested_function_requirements: &FxHashSet<NameId>,
         nested_function_annotation_references: &FxHashSet<NameId>,
@@ -438,6 +443,9 @@ impl FunctionPlan {
             generator_named_targets,
             inlined_comprehension_cellvars,
             has_inlined_comprehension,
+            local_annotation_references,
+            local_annotation_bindings,
+            local_annotation_cellvars,
             ..
         } = facts;
 
@@ -459,6 +467,7 @@ impl FunctionPlan {
             has_inlined_comprehension,
             ignore_generator_body_comprehension_targets: generator_named_targets.is_empty(),
             nonlocals,
+            eager_function_annotations: eager_annotations,
             ..LocalCollector::default()
         };
         for parameter in definition
@@ -477,6 +486,9 @@ impl FunctionPlan {
             locals.insert(parameter.name.as_str());
         }
         let parameter_names = locals.names.iter().cloned().collect::<FxHashSet<_>>();
+        for name in local_annotation_bindings {
+            locals.insert_annotation_only(&name);
+        }
         locals.collect_suite(&definition.body);
         locals.retain_bindings();
         let comprehension_fast_bindings = locals.comprehension_iteration_targets.clone();
@@ -487,7 +499,7 @@ impl FunctionPlan {
         // Child references in a module-level function resolve globally before comprehensions
         // are inlined. A temporary target cannot turn those references into closure captures.
         // Enclosing function bindings have different cell promotion during CPython's inlining.
-        let comprehension_shadowed_targets = locals
+        let mut comprehension_shadowed_targets = locals
             .comprehension_targets
             .iter()
             .filter(|name| {
@@ -553,6 +565,22 @@ impl FunctionPlan {
                     .get(name)
                     .is_some_and(|name| nested_function_requirements.contains(&name))
         });
+        let mut annotation_cell_locals = local_annotation_cellvars
+            .iter()
+            .filter(|name| !local_names.contains(name.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        annotation_cell_locals.sort();
+        // These comprehension cells exist even though no annotation code executes. Their
+        // names must not replace a global or free variable used by the actual function body.
+        comprehension_shadowed_targets.extend(
+            annotation_cell_locals
+                .iter()
+                .map(|name| Name::from(name.as_str())),
+        );
+        locals
+            .names
+            .extend(annotation_cell_locals.into_iter().map(Name::from));
         references.extend(
             class_requirements
                 .iter()
@@ -561,6 +589,7 @@ impl FunctionPlan {
         references.extend(lambda_requirements.iter().cloned());
         references.extend(generator_requirements.iter().cloned());
         references.extend(annotation_scope_requirements.iter().cloned());
+        references.extend(local_annotation_references);
         let is_closure_local = |name: &str| {
             local_names.contains(name) && !comprehension_shadowed_targets.contains(name)
         };
@@ -568,6 +597,7 @@ impl FunctionPlan {
             .into_iter()
             .filter(|name| is_closure_local(name))
             .collect::<FxHashSet<_>>();
+        cellvars.extend(local_annotation_cellvars);
         cellvars.extend(
             class_requirements
                 .iter()
@@ -604,7 +634,11 @@ impl FunctionPlan {
             .chain(&locals.nonlocals)
             .filter(|name| {
                 (comprehension_shadowed_targets.contains(name.as_str())
-                    || !retained_local_names.contains(name.as_str()))
+                    || if eager_annotations {
+                        !local_names.contains(name.as_str())
+                    } else {
+                        !retained_local_names.contains(name.as_str())
+                    })
                     && !locals.globals.contains(*name)
             })
             .cloned()
@@ -747,6 +781,7 @@ impl ClassPlan {
         names: &mut NameInterner,
         definition: &StmtClassDef,
         future_annotations: bool,
+        deferred_annotations: bool,
         facts: ScopeBodyFacts,
         method_requirements: &FxHashSet<NameId>,
         method_annotation_references: &FxHashSet<NameId>,
@@ -756,7 +791,9 @@ impl ClassPlan {
         // CPython retains this synthetic cell under future annotations even though
         // the annotation thunk does not capture it in that mode.
         let mut conditional_annotations = Vec::new();
-        collect_conditional_simple_annotations(&definition.body, &mut conditional_annotations);
+        if deferred_annotations {
+            collect_conditional_simple_annotations(&definition.body, &mut conditional_annotations);
+        }
         let has_conditional_annotations = !conditional_annotations.is_empty();
         let ScopeBodyFacts {
             globals,
@@ -776,6 +813,8 @@ impl ClassPlan {
             globals,
             nonlocals,
             ignore_generator_body_comprehension_targets: true,
+            eager_function_annotations: !deferred_annotations && !future_annotations,
+            eager_statement_annotations: !deferred_annotations && !future_annotations,
             ..LocalCollector::default()
         };
         locals.collect_suite(&definition.body);
@@ -829,7 +868,9 @@ impl ClassPlan {
             child_needs_class_closure || nested_lambda_requirements.contains("__class__");
         let needs_classdict = has_type_alias
             || has_generic_definition
-            || !future_annotations && (has_function_definition || has_simple_annotations);
+            || deferred_annotations
+                && !future_annotations
+                && (has_function_definition || has_simple_annotations);
         let comprehension_targets = std::mem::take(&mut locals.comprehension_targets)
             .into_iter()
             .map(|name| names.intern(name.as_str()))
@@ -914,6 +955,7 @@ pub(super) struct ScopeArena {
     module: ModulePlan,
     nodes: Vec<ScopeNode>,
     by_parent_and_origin: FxHashMap<(ScopeId, ScopeOrigin), ScopeId>,
+    deferred_annotations: bool,
 }
 
 #[derive(Debug, Default)]
@@ -994,24 +1036,46 @@ impl Default for ScopeArena {
                 children: Vec::new(),
             }],
             by_parent_and_origin: FxHashMap::default(),
+            deferred_annotations: true,
         }
     }
 }
 
 impl ScopeArena {
+    pub(super) fn has_class_scopes(&self) -> bool {
+        self.nodes
+            .iter()
+            .any(|node| matches!(node.plan, ScopePlan::Class(_)))
+    }
+
     pub(super) fn analyze(body: &[Stmt]) -> Self {
+        Self::analyze_with_python_version(body, PythonVersion::Py314)
+    }
+
+    pub(super) fn analyze_with_python_version(
+        body: &[Stmt],
+        python_version: PythonVersion,
+    ) -> Self {
         let future_flags = future_feature_flags(body);
         let future_annotations = future_flags & CO_FUTURE_ANNOTATIONS != 0;
+        let deferred_annotations =
+            !matches!(python_version, PythonVersion::Py312 | PythonVersion::Py313);
+        let eager_annotations = !deferred_annotations && !future_annotations;
         let mut arena = Self {
             names: NameInterner::seeded(&SCOPE_SEED_NAMES),
+            deferred_annotations,
             ..Self::default()
         };
         // The name walk also records scope definitions in preorder. Allocating their nodes first
         // and then finishing plans in reverse preserves lexical child order and closure
         // requirements without walking the statement tree a second time.
         let (facts, definitions, requires_module_bindings) =
-            ModuleNameCollector::collect(&mut arena.names, body);
-        let mut bindings = LocalCollector::default();
+            ModuleNameCollector::collect(&mut arena.names, body, eager_annotations);
+        let mut bindings = LocalCollector {
+            eager_function_annotations: eager_annotations,
+            eager_statement_annotations: eager_annotations,
+            ..LocalCollector::default()
+        };
         if requires_module_bindings {
             bindings.collect_suite(body);
         }
@@ -1095,7 +1159,12 @@ impl ScopeArena {
             return;
         }
 
-        let facts = ScopeBodyFacts::for_function(&definition.body);
+        let eager_annotations = !self.deferred_annotations && !future_annotations;
+        let facts = if eager_annotations {
+            ScopeBodyFactsCollector::collect(&definition.body, true, true, true)
+        } else {
+            ScopeBodyFacts::for_function(&definition.body)
+        };
         let (nested_function_requirements, nested_function_annotation_references) =
             self.nested_function_requirements(id);
         let class_requirements = self.nested_class_requirements(id);
@@ -1104,6 +1173,7 @@ impl ScopeArena {
             definition,
             parent == ScopeId::MODULE,
             future_annotations,
+            eager_annotations,
             facts,
             &nested_function_requirements,
             &nested_function_annotation_references,
@@ -1113,7 +1183,11 @@ impl ScopeArena {
     }
 
     fn build_class(&mut self, id: ScopeId, definition: &StmtClassDef, future_annotations: bool) {
-        let facts = ScopeBodyFacts::for_class(&definition.body, future_annotations);
+        let facts = if !self.deferred_annotations && !future_annotations {
+            ScopeBodyFactsCollector::collect(&definition.body, false, false, true)
+        } else {
+            ScopeBodyFacts::for_class(&definition.body, future_annotations)
+        };
         let (method_requirements, method_annotation_references) =
             self.nested_function_requirements(id);
         let nested_class_requirements = self.nested_class_requirements(id);
@@ -1129,6 +1203,7 @@ impl ScopeArena {
             &mut self.names,
             definition,
             future_annotations,
+            self.deferred_annotations,
             facts,
             &method_requirements,
             &method_annotation_references,
@@ -1154,12 +1229,14 @@ impl ScopeArena {
                     .filter(|name| !plan.type_parameter_names.contains(*name))
                     .copied(),
             );
-            annotation_references.extend(
-                plan.annotation_references
-                    .iter()
-                    .filter(|name| !plan.type_parameter_names.contains(*name))
-                    .copied(),
-            );
+            if self.deferred_annotations || !plan.type_parameter_names.is_empty() {
+                annotation_references.extend(
+                    plan.annotation_references
+                        .iter()
+                        .filter(|name| !plan.type_parameter_names.contains(*name))
+                        .copied(),
+                );
+            }
         }
         (required, annotation_references)
     }
@@ -1218,6 +1295,7 @@ struct ModuleNameCollector<'a, 'ast> {
     requires_module_bindings: bool,
     flat_function: Option<FlatFunctionInputs>,
     definitions: Vec<ScopeBuildInput<'ast>>,
+    eager_annotations: bool,
 }
 
 #[derive(Debug)]
@@ -1289,6 +1367,7 @@ impl<'a, 'ast> ModuleNameCollector<'a, 'ast> {
     fn collect(
         names: &'a mut NameInterner,
         body: &'ast [Stmt],
+        eager_annotations: bool,
     ) -> (ModulePlanBuilder, Vec<ScopeBuildInput<'ast>>, bool) {
         let mut collector = Self {
             names,
@@ -1302,6 +1381,7 @@ impl<'a, 'ast> ModuleNameCollector<'a, 'ast> {
             requires_module_bindings: false,
             flat_function: None,
             definitions: Vec::new(),
+            eager_annotations,
         };
         collector.collect_suite(body);
         (
@@ -1451,6 +1531,13 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                         self.facts
                             .comprehension_cell_names
                             .extend(inlined_comprehension_cell_names_in_expression(default));
+                    }
+                    if self.eager_annotations && definition.type_params.is_none() {
+                        for annotation in function_annotation_expressions(definition) {
+                            self.facts
+                                .comprehension_cell_names
+                                .extend(inlined_comprehension_cell_names_in_expression(annotation));
+                        }
                     }
                 }
                 if let Some(type_params) = definition.type_params.as_deref() {
@@ -1744,6 +1831,41 @@ fn function_default_expressions(definition: &StmtFunctionDef) -> impl Iterator<I
     parameter_default_expressions(&definition.parameters)
 }
 
+// Eager annotation code generation evaluates ordinary arguments before positional-only
+// arguments. Symbol analysis visits them in parameter order instead.
+pub(super) fn function_annotation_expressions(
+    definition: &StmtFunctionDef,
+) -> impl Iterator<Item = &Expr> {
+    definition
+        .parameters
+        .args
+        .iter()
+        .chain(&definition.parameters.posonlyargs)
+        .filter_map(|parameter| parameter.parameter.annotation.as_deref())
+        .chain(
+            definition
+                .parameters
+                .vararg
+                .iter()
+                .filter_map(|parameter| parameter.annotation.as_deref()),
+        )
+        .chain(
+            definition
+                .parameters
+                .kwonlyargs
+                .iter()
+                .filter_map(|parameter| parameter.parameter.annotation.as_deref()),
+        )
+        .chain(
+            definition
+                .parameters
+                .kwarg
+                .iter()
+                .filter_map(|parameter| parameter.annotation.as_deref()),
+        )
+        .chain(definition.returns.as_deref())
+}
+
 fn parameter_default_expressions(
     parameters: &ruff_python_ast::Parameters,
 ) -> impl Iterator<Item = &Expr> {
@@ -1796,6 +1918,8 @@ struct LocalCollector {
     nonlocals: FxHashSet<String>,
     has_inlined_comprehension: bool,
     ignore_generator_body_comprehension_targets: bool,
+    eager_function_annotations: bool,
+    eager_statement_annotations: bool,
 }
 
 fn reorder_comprehension_fast_cells<T>(
@@ -2087,6 +2211,9 @@ impl LocalCollector {
                             target => self.collect_target(target),
                         }
                     }
+                    if self.eager_statement_annotations {
+                        self.collect_expression(&assignment.annotation);
+                    }
                 }
                 Stmt::FunctionDef(definition) => {
                     for decorator in &definition.decorator_list {
@@ -2094,6 +2221,11 @@ impl LocalCollector {
                     }
                     for default in function_default_expressions(definition) {
                         self.collect_definition_header_expression(default);
+                    }
+                    if self.eager_function_annotations && definition.type_params.is_none() {
+                        for annotation in function_annotation_expressions(definition) {
+                            self.collect_definition_header_expression(annotation);
+                        }
                     }
                     self.insert(definition.name.as_str());
                 }
@@ -2532,11 +2664,11 @@ impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
 
 impl ScopeBodyFacts {
     pub(super) fn for_function(body: &[Stmt]) -> Self {
-        ScopeBodyFactsCollector::collect(body, true, true)
+        ScopeBodyFactsCollector::collect(body, true, true, false)
     }
 
     pub(super) fn for_class(body: &[Stmt], future_annotations: bool) -> Self {
-        ScopeBodyFactsCollector::collect(body, future_annotations, false)
+        ScopeBodyFactsCollector::collect(body, future_annotations, false, false)
     }
 }
 
@@ -2546,10 +2678,29 @@ struct ScopeBodyFactsCollector<'ast> {
     outside_inlined_comprehension_references: Option<FxHashSet<String>>,
     skip_annotations: bool,
     collect_function_scope_facts: bool,
+    eager_function_annotations: bool,
     generator_depth: usize,
     inlined_comprehension_depth: usize,
     seen_inlined_comprehension_targets: FxHashSet<String>,
     class_comprehension_targets: Vec<String>,
+}
+
+#[derive(Default)]
+struct LocalAnnotationBindings(FxHashSet<String>);
+
+impl<'ast> Visitor<'ast> for LocalAnnotationBindings {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if let Expr::Lambda(lambda) = expression {
+            visit_lambda_defaults(self, lambda);
+            return;
+        }
+        if let Expr::Named(named) = expression
+            && let Expr::Name(name) = named.target.as_ref()
+        {
+            self.0.insert(name.id.as_str().to_string());
+        }
+        walk_expr(self, expression);
+    }
 }
 
 impl<'ast> ScopeBodyFactsCollector<'ast> {
@@ -2557,6 +2708,7 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
         body: &'ast [Stmt],
         skip_annotations: bool,
         collect_function_scope_facts: bool,
+        eager_function_annotations: bool,
     ) -> ScopeBodyFacts {
         let mut collector = Self {
             facts: ScopeBodyFacts::default(),
@@ -2564,6 +2716,7 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
             outside_inlined_comprehension_references: None,
             skip_annotations,
             collect_function_scope_facts,
+            eager_function_annotations,
             generator_depth: 0,
             inlined_comprehension_depth: 0,
             seen_inlined_comprehension_targets: FxHashSet::default(),
@@ -2601,6 +2754,36 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
         for decorator in &definition.decorator_list {
             self.visit_expr(&decorator.expression);
         }
+        if self.eager_function_annotations && definition.type_params.is_none() {
+            for parameter in definition
+                .parameters
+                .posonlyargs
+                .iter()
+                .chain(&definition.parameters.args)
+            {
+                if let Some(annotation) = parameter.parameter.annotation.as_deref() {
+                    self.visit_expr(annotation);
+                }
+            }
+            for parameter in definition
+                .parameters
+                .vararg
+                .iter()
+                .chain(&definition.parameters.kwarg)
+            {
+                if let Some(annotation) = parameter.annotation.as_deref() {
+                    self.visit_expr(annotation);
+                }
+            }
+            for parameter in &definition.parameters.kwonlyargs {
+                if let Some(annotation) = parameter.parameter.annotation.as_deref() {
+                    self.visit_expr(annotation);
+                }
+            }
+            if let Some(annotation) = definition.returns.as_deref() {
+                self.visit_expr(annotation);
+            }
+        }
         let Some(type_params) = definition.type_params.as_deref() else {
             return;
         };
@@ -2614,6 +2797,27 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
                 .difference(&type_names)
                 .cloned(),
         );
+    }
+
+    fn collect_local_annotation(&mut self, annotation: &Expr) {
+        // Before PEP 649, local annotations are omitted from bytecode but still participate
+        // in symbol analysis. Their closures survive, while their fast-local positions do not.
+        let analysis =
+            analyze_expression_scope(&ruff_python_ast::Parameters::default(), annotation);
+        let mut bindings = LocalAnnotationBindings::default();
+        bindings.visit_expr(annotation);
+        self.facts.nested_lambda_requirements.extend(
+            nested_expression_required_names(annotation)
+                .into_iter()
+                .filter(|name| analysis.required.contains(name) || bindings.0.contains(name)),
+        );
+        self.facts
+            .local_annotation_references
+            .extend(analysis.required);
+        self.facts.local_annotation_bindings.extend(bindings.0);
+        self.facts
+            .local_annotation_cellvars
+            .extend(analysis.cellvars);
     }
 
     fn collect_class_header(&mut self, definition: &'ast StmtClassDef) {
@@ -2725,6 +2929,9 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
                     self.visit_expr(&annotation.target);
                     if let Some(value) = &annotation.value {
                         self.visit_expr(value);
+                    }
+                    if self.eager_function_annotations && self.collect_function_scope_facts {
+                        self.collect_local_annotation(&annotation.annotation);
                     }
                     return;
                 }
@@ -3023,6 +3230,13 @@ pub(super) struct LambdaScopeAnalysis {
 pub(super) fn analyze_lambda_scope(lambda: &ruff_python_ast::ExprLambda) -> LambdaScopeAnalysis {
     let empty_parameters = ruff_python_ast::Parameters::default();
     let parameters = lambda.parameters.as_deref().unwrap_or(&empty_parameters);
+    analyze_expression_scope(parameters, &lambda.body)
+}
+
+fn analyze_expression_scope(
+    parameters: &ruff_python_ast::Parameters,
+    body: &Expr,
+) -> LambdaScopeAnalysis {
     let mut locals = LocalCollector::default();
     for parameter in parameters
         .posonlyargs
@@ -3039,15 +3253,15 @@ pub(super) fn analyze_lambda_scope(lambda: &ruff_python_ast::ExprLambda) -> Lamb
         locals.insert(parameter.name.as_str());
     }
     let parameter_names = locals.names.iter().cloned().collect::<FxHashSet<_>>();
-    locals.collect_expression(&lambda.body);
+    locals.collect_expression(body);
 
     let mut references = ReferenceCollector {
         skip_generator_bodies: true,
         ..ReferenceCollector::default()
     };
-    references.visit_expr(&lambda.body);
-    let mut nested_requirements = nested_lambda_required_names_in_expression(&lambda.body);
-    nested_requirements.extend(nested_generator_required_names_in_expression(&lambda.body));
+    references.visit_expr(body);
+    let mut nested_requirements = nested_lambda_required_names_in_expression(body);
+    nested_requirements.extend(nested_generator_required_names_in_expression(body));
     let local_names = locals.names.iter().cloned().collect::<FxHashSet<_>>();
     let mut outside_references = ReferenceCollector {
         skip_generator_bodies: true,
@@ -3057,7 +3271,7 @@ pub(super) fn analyze_lambda_scope(lambda: &ruff_python_ast::ExprLambda) -> Lamb
     // A comprehension's first iterable can read an outer binding with its target's spelling.
     // Lambda defaults are evaluated here too; nested lambda bodies retain their own captures.
     if !locals.comprehension_targets.is_empty() {
-        outside_references.visit_expr(&lambda.body);
+        outside_references.visit_expr(body);
     }
     let cellvars: FxHashSet<_> = nested_requirements
         .iter()
@@ -3075,8 +3289,7 @@ pub(super) fn analyze_lambda_scope(lambda: &ruff_python_ast::ExprLambda) -> Lamb
         })
         .cloned()
         .collect();
-    let mut inlined_comprehension_cellvars =
-        inlined_comprehension_cell_names_in_expression(&lambda.body);
+    let mut inlined_comprehension_cellvars = inlined_comprehension_cell_names_in_expression(body);
     let comprehension_fast_cellvars = locals
         .comprehension_iteration_targets
         .iter()
@@ -3884,6 +4097,30 @@ pub(super) fn has_simple_annotations(body: &[Stmt]) -> bool {
     !annotations.is_empty()
 }
 
+pub(super) fn has_annotations(body: &[Stmt]) -> bool {
+    #[derive(Default)]
+    struct AnnotationFinder(bool);
+
+    impl<'ast> Visitor<'ast> for AnnotationFinder {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            match statement {
+                Stmt::AnnAssign(_) => self.0 = true,
+                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+                _ if !self.0 => walk_stmt(self, statement),
+                _ => {}
+            }
+        }
+
+        fn visit_expr(&mut self, _expression: &'ast Expr) {}
+    }
+
+    let mut finder = AnnotationFinder::default();
+    for statement in body {
+        finder.visit_stmt(statement);
+    }
+    finder.0
+}
+
 pub(super) fn collect_conditional_simple_annotations<'a>(
     body: &'a [Stmt],
     annotations: &mut Vec<&'a ruff_python_ast::StmtAnnAssign>,
@@ -3982,10 +4219,124 @@ mod tests {
     use ruff_python_parser::parse_module;
     use rustc_hash::{FxHashMap, FxHashSet};
 
+    use crate::PythonVersion;
+
     use super::{
         FlatFunctionInputs, LocalCollector, ModuleNameCollector, NameId, NameInterner,
-        SCOPE_SEED_NAMES, ScopeDefinition, ScopeId, definitely_evaluated_references,
+        SCOPE_SEED_NAMES, ScopeArena, ScopeDefinition, ScopeId, definitely_evaluated_references,
+        has_annotations,
     };
+
+    #[test]
+    fn eager_annotations_use_parent_locals_except_in_generic_scopes() {
+        for generic in [false, true] {
+            let type_params = if generic { "[T]" } else { "" };
+            let source = format!(
+                "def outer(annotation):\n    def inner{type_params}(value: annotation):\n        pass\n    return inner\n"
+            );
+            let parsed = parse_module(&source).unwrap();
+            for version in [
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ] {
+                let arena = ScopeArena::analyze_with_python_version(parsed.suite(), version);
+                let annotation = arena.names.get("annotation").unwrap();
+                let outer = arena.function(ScopeId(1)).unwrap();
+                assert_eq!(
+                    outer.cellvars.contains(&annotation),
+                    generic || matches!(version, PythonVersion::Py314 | PythonVersion::Py315),
+                    "{version:?}, generic={generic}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eager_class_annotations_do_not_request_deferred_cells() {
+        let parsed = parse_module("class C:\n    if condition:\n        value: int\n    def method(self, argument: value):\n        pass\n").unwrap();
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let arena = ScopeArena::analyze_with_python_version(parsed.suite(), version);
+            let class = arena.class(ScopeId(1)).unwrap();
+            let deferred = matches!(version, PythonVersion::Py314 | PythonVersion::Py315);
+            assert_eq!(class.needs_classdict, deferred, "{version:?}");
+            assert_eq!(class.has_conditional_annotations, deferred, "{version:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_local_annotations_preserve_symbol_captures_without_runtime_slots() {
+        for version in [PythonVersion::Py312, PythonVersion::Py313] {
+            for future in [false, true] {
+                let source = format!(
+                    "{}def outer(annotation):\n    def inner():\n        local: annotation\n    return inner\n",
+                    if future {
+                        "from __future__ import annotations\n"
+                    } else {
+                        ""
+                    }
+                );
+                let parsed = parse_module(&source).unwrap();
+                let arena = ScopeArena::analyze_with_python_version(parsed.suite(), version);
+                let annotation = arena.names.get("annotation").unwrap();
+                assert_eq!(
+                    arena
+                        .function(ScopeId(1))
+                        .unwrap()
+                        .cellvars
+                        .contains(&annotation),
+                    !future
+                );
+                assert!(arena.function(ScopeId(2)).unwrap().locals.is_empty());
+            }
+
+            let parsed = parse_module(
+                "def f():\n    local: (bound := int)\n    later = 1\n    return bound\n",
+            )
+            .unwrap();
+            let arena = ScopeArena::analyze_with_python_version(parsed.suite(), version);
+            let plan = arena.function(ScopeId(1)).unwrap();
+            assert_eq!(
+                plan.locals
+                    .iter()
+                    .map(|name| arena.names.resolve(*name))
+                    .collect::<Vec<_>>(),
+                ["later", "bound"]
+            );
+
+            let parsed =
+                parse_module("def f(values):\n    local: [(lambda: item) for item in values]\n")
+                    .unwrap();
+            let arena = ScopeArena::analyze_with_python_version(parsed.suite(), version);
+            let plan = arena.function(ScopeId(1)).unwrap();
+            assert_eq!(
+                plan.locals
+                    .iter()
+                    .map(|name| arena.names.resolve(*name))
+                    .collect::<Vec<_>>(),
+                ["values", "item"]
+            );
+            assert!(plan.cellvars.contains(&arena.names.get("item").unwrap()));
+        }
+    }
+
+    #[test]
+    fn annotation_setup_includes_nonsimple_targets_and_stays_in_own_scope() {
+        for (source, expected) in [
+            ("if condition:\n    object.attribute: int\n", true),
+            ("def inner():\n    value: int\n", false),
+            ("class Inner:\n    value: int\n", false),
+        ] {
+            let parsed = parse_module(source).unwrap();
+            assert_eq!(has_annotations(parsed.suite()), expected);
+        }
+    }
 
     #[test]
     fn scope_seed_names_are_unique() {
@@ -4140,7 +4491,7 @@ mod tests {
         let mut names = NameInterner::seeded(&SCOPE_SEED_NAMES);
 
         let (_, definitions, requires_module_bindings) =
-            ModuleNameCollector::collect(&mut names, parsed.suite());
+            ModuleNameCollector::collect(&mut names, parsed.suite(), false);
 
         assert!(!requires_module_bindings);
         assert_eq!(
@@ -4190,7 +4541,7 @@ mod tests {
             let parsed = parse_module(source).unwrap();
             let mut names = NameInterner::seeded(&SCOPE_SEED_NAMES);
             let (_, _, requires_module_bindings) =
-                ModuleNameCollector::collect(&mut names, parsed.suite());
+                ModuleNameCollector::collect(&mut names, parsed.suite(), false);
             assert_eq!(requires_module_bindings, expected, "source:\n{source}");
         }
     }

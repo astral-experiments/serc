@@ -2152,6 +2152,7 @@ impl OptimizationPipeline {
     pub(in crate::assembler) fn normalize_backward_conditionals(
         &mut self,
     ) -> Result<bool, crate::CompileError> {
+        let has_branch_markers = self.python_version >= crate::PythonVersion::Py314;
         let mut changed = false;
         let mut position = 0;
         while position < self.graph.order().len() {
@@ -2174,25 +2175,29 @@ impl OptimizationPipeline {
                     continue;
                 }
             };
-            // Code generation already emitted the forward form's marker. CPython
-            // instead creates it in the new backedge block at this late stage.
-            let marker = self.graph.order()[position + 1..].iter().find_map(|block| {
-                self.graph[*block].items().iter().enumerate().find_map(
-                    |(offset, item)| match item {
-                        Item::Instruction(marker) => {
-                            Some((*block, ItemPosition::new(*block, offset), marker.opcode))
-                        }
-                        Item::Label(_) => None,
-                    },
-                )
-            });
-            let Some((_marker_block, marker, NOT_TAKEN)) = marker else {
-                return Err(crate::CompileError::Internal(
-                    "backward conditional has no fallthrough marker".to_owned(),
-                ));
-            };
-            // Remove the marker before inserting a successor label can shift its offset.
-            self.graph.remove_item(marker);
+            if has_branch_markers {
+                // Code generation already emitted the forward form's marker. CPython
+                // instead creates it in the new backedge block at this late stage.
+                let marker = self.graph.order()[position + 1..].iter().find_map(|block| {
+                    self.graph[*block]
+                        .items()
+                        .iter()
+                        .enumerate()
+                        .find_map(|(offset, item)| match item {
+                            Item::Instruction(marker) => {
+                                Some((*block, ItemPosition::new(*block, offset), marker.opcode))
+                            }
+                            Item::Label(_) => None,
+                        })
+                });
+                let Some((_marker_block, marker, NOT_TAKEN)) = marker else {
+                    return Err(crate::CompileError::Internal(
+                        "backward conditional has no fallthrough marker".to_owned(),
+                    ));
+                };
+                // Remove the marker before inserting a successor label can shift its offset.
+                self.graph.remove_item(marker);
+            }
             changed = true;
             let successor = self.graph.block_at(position + 1);
             let fallthrough =
@@ -2207,30 +2212,29 @@ impl OptimizationPipeline {
             let conditional = self.graph.instructions_mut(block).next_back().unwrap();
             conditional.opcode = reversed;
             conditional.retarget(Operand::Forward(fallthrough));
-            let mut marker = Instruction::synthetic(
-                NOT_TAKEN,
-                Operand::Value(0),
-                instruction.location,
-                instruction.depth_after(),
-            );
+            let mut items = vec![Item::Label(fresh_entry)];
+            // Python 3.12 and 3.13 insert only the backedge, without a branch marker.
+            if has_branch_markers {
+                let mut marker = Instruction::synthetic(
+                    NOT_TAKEN,
+                    Operand::Value(0),
+                    instruction.location,
+                    instruction.depth_after(),
+                );
+                // The new CPython instruction array starts with null exception owners.
+                marker.set_exception_policy(ExceptionPolicy::AlwaysAbsent);
+                items.push(Item::Instruction(marker));
+            }
             let mut backedge = Instruction::synthetic(
                 JUMP_BACKWARD,
                 Operand::Backward(target),
                 instruction.location,
                 instruction.depth_after(),
             );
-            // The new CPython instruction array starts with null exception owners.
-            marker.set_exception_policy(ExceptionPolicy::AlwaysAbsent);
             backedge.set_exception_policy(ExceptionPolicy::AlwaysAbsent);
+            items.push(Item::Instruction(backedge));
             self.preserved_block_boundaries.insert(fresh_entry);
-            self.graph.insert_block(
-                position + 1,
-                vec![
-                    Item::Label(fresh_entry),
-                    Item::Instruction(marker),
-                    Item::Instruction(backedge),
-                ],
-            );
+            self.graph.insert_block(position + 1, items);
             position += 2;
         }
         Ok(changed)
@@ -2474,6 +2478,13 @@ impl OptimizationPipeline {
                 None,
             );
             bridge.exclude_from_exception_table(exception_exclusion);
+            if self.python_version == crate::PythonVersion::Py312 {
+                // 3.12 creates an ordinary jump with no location and leaves its
+                // new block's predecessor count at zero, preventing line inheritance.
+                bridge.opcode = JUMP_BACKWARD;
+                bridge.location = SourceLocation::NONE;
+                bridge.no_location_policy.preserve_location();
+            }
             if empty_while_anchor {
                 // CPython's empty original anchor separates the authored break NOP
                 // from this new cold bridge. It cannot donate its line across that
@@ -2734,7 +2745,10 @@ impl OptimizationPipeline {
                 instruction.retarget(Operand::Backward(target));
                 if instruction.opcode == JUMP_FORWARD || instruction.jump_policy.is_interruptible()
                 {
-                    instruction.opcode = if instruction.fusion_policy.is_authored_break()
+                    // 3.12's ordinary JUMP retains its eval check after cold relocation.
+                    // Explicit SEND backedges already use JUMP_BACKWARD_NO_INTERRUPT.
+                    instruction.opcode = if self.python_version == crate::PythonVersion::Py312
+                        || instruction.fusion_policy.is_authored_break()
                         || instruction.jump_policy.is_interruptible()
                     {
                         JUMP_BACKWARD

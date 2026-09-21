@@ -8,10 +8,10 @@ use ruff_text_size::Ranged;
 use rustc_hash::FxHashSet;
 
 use super::{
-    BUILD_LIST, BUILD_MAP, BUILD_TUPLE, CALL, CALL_FUNCTION_EX, CALL_KW, CONTAINS_OP, COPY,
-    DICT_MERGE, LIST_APPEND, LIST_EXTEND, LOAD_BUILD_CLASS, LOAD_CONST, LOAD_DEREF, LOAD_FAST,
-    LOAD_SMALL_INT, MAKE_FUNCTION, MAP_ADD, NOT_TAKEN, POP_JUMP_IF_FALSE, PUSH_NULL, RAISE_VARARGS,
-    RETURN_VALUE, STORE_SUBSCR, SWAP, UNPACK_SEQUENCE,
+    BUILD_CONST_KEY_MAP, BUILD_LIST, BUILD_MAP, BUILD_TUPLE, CALL, CALL_FUNCTION_EX, CALL_KW,
+    CONTAINS_OP, COPY, DICT_MERGE, LIST_APPEND, LIST_EXTEND, LOAD_BUILD_CLASS, LOAD_CONST,
+    LOAD_DEREF, LOAD_FAST, LOAD_SMALL_INT, MAP_ADD, NOT_TAKEN, POP_JUMP_IF_FALSE, PUSH_NULL,
+    RAISE_VARARGS, RETURN_VALUE, STORE_SUBSCR, SWAP, UNPACK_SEQUENCE,
 };
 use crate::assembler::SourceLocation;
 use crate::code_object::{CodeObject, Constant};
@@ -28,7 +28,8 @@ use super::constant::{fold_constant, folded_constant_owner_slots};
 use super::scope::{
     LoweringFunctionPlan, NameId, ReferenceCollector, collect_conditional_simple_annotations,
     collect_simple_annotations, expression_required_names,
-    expression_requirements_outside_comprehensions, inlined_comprehension_cell_names_in_expression,
+    expression_requirements_outside_comprehensions, function_annotation_expressions,
+    inlined_comprehension_cell_names_in_expression,
     inlined_comprehension_local_names_in_expression, nested_expression_required_names,
     type_parameter_required_names,
 };
@@ -86,6 +87,7 @@ impl Compiler<'_> {
             &statement.value,
             statement.range,
             self.child_function_is_nested(),
+            true,
         )?;
         self.emit_build(BUILD_TUPLE, 3)?;
         self.emit_unary_intrinsic(UnaryIntrinsic::TYPEALIAS)?;
@@ -175,22 +177,28 @@ impl Compiler<'_> {
         wrapper.context.record_constant_string_origin(name, true);
         wrapper.load_string_constant(name)?;
         wrapper.compile_type_parameters(type_params)?;
-        wrapper.compile_type_parameter_thunk(name, value, statement.range, true)?;
+        wrapper.compile_type_parameter_thunk(name, value, statement.range, true, true)?;
         wrapper.emit_build(BUILD_TUPLE, 3)?;
         wrapper.emit_unary_intrinsic(UnaryIntrinsic::TYPEALIAS)?;
         wrapper.emit(RETURN_VALUE, 0, -1)?;
         let wrapper = wrapper.finish_inner(false)?;
         let wrapper_closure_names = plan.freevars;
+        if self.context.python_version == PythonVersion::Py312 {
+            self.emit(PUSH_NULL, 0, 1)?;
+        }
         if !wrapper_closure_names.is_empty() {
             self.emit_closure_tuple(&wrapper_closure_names)?;
         }
         let code = self.add_constant(Constant::Code(Box::new(wrapper)))?;
         self.emit(LOAD_CONST, code, 1)?;
-        self.emit(MAKE_FUNCTION, 0, 0)?;
-        if !wrapper_closure_names.is_empty() {
-            self.emit_function_attribute(FunctionAttribute::CLOSURE)?;
+        self.emit_make_function(if wrapper_closure_names.is_empty() {
+            0
+        } else {
+            FunctionAttribute::CLOSURE.argument()
+        })?;
+        if self.context.python_version != PythonVersion::Py312 {
+            self.emit(PUSH_NULL, 0, 1)?;
         }
-        self.emit(PUSH_NULL, 0, 1)?;
         self.emit(CALL, 0, -1)?;
         self.store_name(name)
     }
@@ -219,6 +227,10 @@ impl Compiler<'_> {
             TokenKind::Def,
             definition.is_async,
         );
+        if self.context.python_version == PythonVersion::Py312 {
+            self.assembler.set_location(definition_location);
+            self.emit(PUSH_NULL, 0, 1)?;
+        }
         let defaults = self.compile_function_defaults(definition, definition_location)?;
         let default_argument_count = defaults.count();
         if default_argument_count == 2 {
@@ -271,8 +283,42 @@ impl Compiler<'_> {
         };
         wrapper_plan.absorb_child_requirements(
             child_plan.required.iter().copied(),
-            child_plan.annotation_references.iter().copied(),
+            child_plan
+                .annotation_references
+                .iter()
+                .copied()
+                .filter(|_| self.has_deferred_annotations()),
         );
+        if !self.has_deferred_annotations() && self.unit.flags & CO_FUTURE_ANNOTATIONS == 0 {
+            // Legacy signatures execute inside the generic wrapper. Only their
+            // nested functions need cells; direct type-parameter loads stay fast.
+            for annotation in function_annotation_expressions(definition) {
+                for local in
+                    self.name_ids(inlined_comprehension_local_names_in_expression(annotation))
+                {
+                    if !wrapper_plan.locals.contains(&local) {
+                        wrapper_plan.locals.push(local);
+                    }
+                }
+                let cells =
+                    self.name_id_set(inlined_comprehension_cell_names_in_expression(annotation));
+                wrapper_plan
+                    .inlined_comprehension_cellvars
+                    .extend(cells.iter().copied());
+                wrapper_plan.cellvars.extend(cells);
+                wrapper_plan.absorb_child_requirements(
+                    self.name_ids(nested_expression_required_names(annotation)),
+                    [],
+                );
+            }
+            wrapper_plan.required.extend(
+                child_plan
+                    .annotation_references
+                    .iter()
+                    .copied()
+                    .filter(|name| !wrapper_plan.locals.contains(name)),
+            );
+        }
         for name in wrapper_plan.required.iter().copied().collect::<Vec<_>>() {
             if self.can_provide_closure_id(name) {
                 wrapper_plan.insert_freevar(&arena.names, name);
@@ -326,6 +372,14 @@ impl Compiler<'_> {
             .clone_from(&self.symbols.imported_scope_names);
         let type_parameter_names = type_names.iter().copied().collect();
         wrapper.symbols.type_parameter_names = type_parameter_names;
+        if !self.has_deferred_annotations() {
+            wrapper.unit.child_qualified_name_parent = Some(
+                self.annotation_child_qualified_name(definition.name.as_str())
+                    .rsplit_once('.')
+                    .map_or("", |(parent, _)| parent)
+                    .to_string(),
+            );
+        }
         wrapper.unit.generic_target_qualified_name = Some(target_qualified_name);
         if matches!(self.unit.scope, Scope::Class { .. }) {
             wrapper.unit.annotation_classdict_index = Some(wrapper.closure_index("__classdict__")?);
@@ -361,11 +415,31 @@ impl Compiler<'_> {
         }
         let code = self.add_constant(Constant::Code(Box::new(wrapper)))?;
         self.emit(LOAD_CONST, code, 1)?;
-        self.emit(MAKE_FUNCTION, 0, 0)?;
-        if !wrapper_closure_names.is_empty() {
-            self.emit_function_attribute(FunctionAttribute::CLOSURE)?;
-        }
-        if default_argument_count == 0 {
+        self.emit_make_function(if wrapper_closure_names.is_empty() {
+            0
+        } else {
+            FunctionAttribute::CLOSURE.argument()
+        })?;
+        if self.context.python_version == PythonVersion::Py312 {
+            if default_argument_count > 0 {
+                self.emit(
+                    SWAP,
+                    to_u32(
+                        default_argument_count + 1,
+                        "generic function wrapper call depth",
+                    )?,
+                    0,
+                )?;
+            }
+            self.emit(
+                CALL,
+                to_u32(
+                    default_argument_count,
+                    "generic function wrapper call argument count",
+                )?,
+                -i32::try_from(default_argument_count).unwrap() - 1,
+            )?;
+        } else if default_argument_count == 0 {
             self.emit(PUSH_NULL, 0, 1)?;
             self.emit(CALL, 0, -1)?;
         } else {
@@ -422,7 +496,12 @@ impl Compiler<'_> {
 
         let (scope_id, plan) = self.resolved_function_plan(definition)?;
         let closure_names = plan.freevars.clone();
-        let annotation_child = self.compile_function_annotations(definition, &plan)?;
+        let annotation_child = if self.has_deferred_annotations() {
+            self.compile_function_annotations(definition, &plan)?
+        } else {
+            self.compile_eager_function_annotations(definition, definition_location)?;
+            None
+        };
 
         let arg_count = to_u32(
             parameters.posonlyargs.len() + parameters.args.len(),
@@ -445,12 +524,15 @@ impl Compiler<'_> {
         } | if matches!(self.unit.scope, Scope::Function { .. }) {
             CO_NESTED
         } else if matches!(self.unit.scope, Scope::Class { .. }) {
-            CO_METHOD
-                | if self.unit.class_scope_is_nested {
-                    CO_NESTED
-                } else {
-                    0
-                }
+            (if self.has_deferred_annotations() {
+                CO_METHOD
+            } else {
+                0
+            }) | if self.unit.class_scope_is_nested {
+                CO_NESTED
+            } else {
+                0
+            }
         } else {
             0
         }) | (self.unit.flags & SUPPORTED_FUTURE_FLAGS);
@@ -509,29 +591,35 @@ impl Compiler<'_> {
             }
             let annotation = self.add_constant(Constant::Code(Box::new(annotation_child)))?;
             self.emit(LOAD_CONST, annotation, 1)?;
-            self.emit(MAKE_FUNCTION, 0, 0)?;
-            if !annotation_closure_names.is_empty() {
-                self.emit_function_attribute(FunctionAttribute::CLOSURE)?;
-            }
+            self.emit_make_function(if annotation_closure_names.is_empty() {
+                0
+            } else {
+                FunctionAttribute::CLOSURE.argument()
+            })?;
         }
         if !closure_names.is_empty() {
             self.emit_closure_tuple(&closure_names)?;
         }
         let constant = self.add_constant(Constant::Code(Box::new(child)))?;
         self.emit(LOAD_CONST, constant, 1)?;
-        self.emit(MAKE_FUNCTION, 0, 0)?;
+        let mut flags = 0;
         if !closure_names.is_empty() {
-            self.emit_function_attribute(FunctionAttribute::CLOSURE)?;
+            flags |= FunctionAttribute::CLOSURE.argument();
         }
         if function_has_annotations(definition) {
-            self.emit_function_attribute(FunctionAttribute::ANNOTATE)?;
+            flags |= if self.has_deferred_annotations() {
+                FunctionAttribute::ANNOTATE.argument()
+            } else {
+                FunctionAttribute::ANNOTATIONS.argument()
+            };
         }
         if defaults.keyword {
-            self.emit_function_attribute(FunctionAttribute::KWDEFAULTS)?;
+            flags |= FunctionAttribute::KWDEFAULTS.argument();
         }
         if defaults.positional {
-            self.emit_function_attribute(FunctionAttribute::DEFAULTS)?;
+            flags |= FunctionAttribute::DEFAULTS.argument();
         }
+        self.emit_make_function(flags)?;
         if decorators == DefinitionDecorators::Compile {
             for decorator in definition.decorator_list.iter().rev() {
                 self.assembler
@@ -560,7 +648,9 @@ impl Compiler<'_> {
             .filter_map(|parameter| parameter.default.as_deref())
             .collect();
         if !positional_defaults.is_empty() {
-            let folded_defaults = if positional_defaults.len() <= CPYTHON_STACK_USE_GUIDELINE {
+            let folded_defaults = if self.has_deferred_annotations()
+                && positional_defaults.len() <= CPYTHON_STACK_USE_GUIDELINE
+            {
                 positional_defaults
                     .iter()
                     .map(|default| fold_constant(default))
@@ -618,18 +708,29 @@ impl Compiler<'_> {
             })
             .collect();
         if !keyword_defaults.is_empty() {
+            let mut names = Vec::new();
             for (name, default) in &keyword_defaults {
                 self.assembler.set_location(definition_location);
                 let mangled = self.mangled_name(name);
                 self.context
                     .record_identifier_constant_origin(name, &mangled);
-                let name = self.add_constant(Constant::String(mangled))?;
-                self.emit(LOAD_CONST, name, 1)?;
+                if self.has_deferred_annotations() {
+                    let name = self.add_constant(Constant::String(mangled))?;
+                    self.emit(LOAD_CONST, name, 1)?;
+                } else {
+                    names.push(Constant::String(mangled));
+                }
                 self.compile_expression(default)?;
             }
             let count = to_u32(keyword_defaults.len(), "keyword default count")?;
             self.assembler.set_location(definition_location);
-            self.emit(BUILD_MAP, count, 1 - i32::try_from(count).unwrap() * 2)?;
+            if self.has_deferred_annotations() {
+                self.emit(BUILD_MAP, count, 1 - i32::try_from(count).unwrap() * 2)?;
+            } else {
+                let names = self.add_interned_string_tuple(names)?;
+                self.emit(LOAD_CONST, names, 1)?;
+                self.emit(BUILD_CONST_KEY_MAP, count, -i32::try_from(count).unwrap())?;
+            }
         }
 
         Ok(CompiledFunctionDefaults {
@@ -783,16 +884,22 @@ impl Compiler<'_> {
             false,
         );
         self.assembler.set_location(definition_location);
+        if self.context.python_version == PythonVersion::Py312 {
+            self.emit(PUSH_NULL, 0, 1)?;
+        }
         if !wrapper_closure_names.is_empty() {
             self.emit_closure_tuple(&wrapper_closure_names)?;
         }
         let code = self.add_constant(Constant::Code(Box::new(wrapper)))?;
         self.emit(LOAD_CONST, code, 1)?;
-        self.emit(MAKE_FUNCTION, 0, 0)?;
-        if !wrapper_closure_names.is_empty() {
-            self.emit_function_attribute(FunctionAttribute::CLOSURE)?;
+        self.emit_make_function(if wrapper_closure_names.is_empty() {
+            0
+        } else {
+            FunctionAttribute::CLOSURE.argument()
+        })?;
+        if self.context.python_version != PythonVersion::Py312 {
+            self.emit(PUSH_NULL, 0, 1)?;
         }
-        self.emit(PUSH_NULL, 0, 1)?;
         self.emit(CALL, 0, -1)?;
         for decorator in definition.decorator_list.iter().rev() {
             self.assembler
@@ -888,17 +995,23 @@ impl Compiler<'_> {
             false,
         );
         self.assembler.set_location(definition_location);
+        if self.context.python_version == PythonVersion::Py312 {
+            self.emit(PUSH_NULL, 0, 1)?;
+        }
         self.emit(LOAD_BUILD_CLASS, 0, 1)?;
-        self.emit(PUSH_NULL, 0, 1)?;
+        if self.context.python_version != PythonVersion::Py312 {
+            self.emit(PUSH_NULL, 0, 1)?;
+        }
         if !closure_names.is_empty() {
             self.emit_closure_tuple(&closure_names)?;
         }
         let code = self.add_constant(Constant::Code(Box::new(child)))?;
         self.emit(LOAD_CONST, code, 1)?;
-        self.emit(MAKE_FUNCTION, 0, 0)?;
-        if !closure_names.is_empty() {
-            self.emit_function_attribute(FunctionAttribute::CLOSURE)?;
-        }
+        self.emit_make_function(if closure_names.is_empty() {
+            0
+        } else {
+            FunctionAttribute::CLOSURE.argument()
+        })?;
         self.context
             .record_constant_string_origin(definition.name.as_str(), true);
         let name = self.add_constant(Constant::String(definition.name.as_str().to_string()))?;
@@ -1032,11 +1145,21 @@ impl Compiler<'_> {
                         self.emit(DICT_MERGE, 1, -1)?;
                     }
                 }
-            } else {
+            } else if self.has_deferred_annotations() {
                 self.emit(PUSH_NULL, 0, 1)?;
             }
             self.assembler.set_location(definition_location);
-            self.emit(CALL_FUNCTION_EX, 0, -3)?;
+            if self.has_deferred_annotations() {
+                self.emit(CALL_FUNCTION_EX, 0, -3)?;
+            } else {
+                let has_keywords =
+                    arguments.is_some_and(|arguments| !arguments.keywords.is_empty());
+                self.emit(
+                    CALL_FUNCTION_EX,
+                    u32::from(has_keywords),
+                    -2 - i32::from(has_keywords),
+                )?;
+            }
         } else {
             if let Some(arguments) = arguments {
                 for argument in &arguments.args {
@@ -1061,9 +1184,14 @@ impl Compiler<'_> {
                     })
                     .collect();
                 let names = self.add_interned_string_tuple(keyword_names)?;
-                self.emit(LOAD_CONST, names, 1)?;
                 let count = to_u32(argument_count + 2, "class argument count")?;
-                self.emit(CALL_KW, count, -i32::try_from(argument_count).unwrap() - 4)?;
+                if self.context.python_version == PythonVersion::Py312 {
+                    self.emit(super::KW_NAMES, names, 0)?;
+                    self.emit(CALL, count, -i32::try_from(argument_count).unwrap() - 3)?;
+                } else {
+                    self.emit(LOAD_CONST, names, 1)?;
+                    self.emit(CALL_KW, count, -i32::try_from(argument_count).unwrap() - 4)?;
+                }
             } else {
                 let count = to_u32(argument_count + 2, "class argument count")?;
                 self.emit(CALL, count, -i32::try_from(argument_count).unwrap() - 3)?;
@@ -1091,6 +1219,20 @@ impl Compiler<'_> {
     ) -> Result<(), CompileError> {
         debug_assert!(!keywords.is_empty() && keywords.iter().all(|keyword| keyword.arg.is_some()));
         let large_map = keywords.len() * 2 > CPYTHON_STACK_USE_GUIDELINE;
+        if !self.has_deferred_annotations() && !large_map && keywords.len() > 1 {
+            for keyword in keywords {
+                self.compile_expression(&keyword.value)?;
+            }
+            self.assembler.set_location(definition_location);
+            let names = keywords
+                .iter()
+                .map(|keyword| Constant::String(keyword.arg.as_ref().unwrap().as_str().to_string()))
+                .collect();
+            let names = self.add_interned_string_tuple(names)?;
+            self.emit(LOAD_CONST, names, 1)?;
+            let count = to_u32(keywords.len(), "class keyword count")?;
+            return self.emit(BUILD_CONST_KEY_MAP, count, -i32::try_from(count).unwrap());
+        }
         if large_map {
             self.assembler.set_location(SourceLocation::NONE);
             self.emit(BUILD_MAP, 0, 1)?;
@@ -1146,7 +1288,12 @@ impl Compiler<'_> {
             match parameter {
                 TypeParam::TypeVar(parameter) => {
                     if let Some(bound) = &parameter.bound {
-                        self.compile_type_parameter_thunk(name, bound, bound.range(), true)?;
+                        let setup_range = if self.context.python_version == PythonVersion::Py312 {
+                            parameter.range
+                        } else {
+                            bound.range()
+                        };
+                        self.compile_type_parameter_thunk(name, bound, setup_range, true, false)?;
                         self.assembler
                             .set_location(self.source_location(parameter.range()));
                         let intrinsic = if matches!(bound.as_ref(), Expr::Tuple(_)) {
@@ -1165,7 +1312,7 @@ impl Compiler<'_> {
                 }
             }
             if let Some(default) = parameter.default() {
-                self.compile_type_parameter_thunk(name, default, default.range(), true)?;
+                self.compile_type_parameter_thunk(name, default, default.range(), true, false)?;
                 self.assembler
                     .set_location(self.source_location(parameter.range()));
                 self.emit_binary_intrinsic(BinaryIntrinsic::SET_TYPEPARAM_DEFAULT)?;
@@ -1186,6 +1333,7 @@ impl Compiler<'_> {
         expression: &Expr,
         setup_range: ruff_text_size::TextRange,
         nested: bool,
+        type_alias: bool,
     ) -> Result<(), CompileError> {
         let mut references = ReferenceCollector::default();
         references.visit_expr(expression);
@@ -1194,7 +1342,11 @@ impl Compiler<'_> {
                 .symbols
                 .free_names
                 .contains(&self.required_name_id("__classdict__"));
-        let mut local_names = vec![".format".to_string()];
+        let mut local_names = if self.has_deferred_annotations() {
+            vec![".format".to_string()]
+        } else {
+            Vec::new()
+        };
         let inlined_cellvars = if can_see_class_scope {
             FxHashSet::default()
         } else {
@@ -1260,11 +1412,17 @@ impl Compiler<'_> {
             } else {
                 self.annotation_child_qualified_name(name)
             },
-            self.line_number(u32::from(setup_range.start())),
+            self.line_number(u32::from(
+                if self.context.python_version == PythonVersion::Py312 && !type_alias {
+                    expression.range().start()
+                } else {
+                    setup_range.start()
+                },
+            )),
             &plan,
             self.unit.scope_id,
-            1,
-            1,
+            u32::from(self.has_deferred_annotations()),
+            u32::from(self.has_deferred_annotations()),
             0,
             (if nested { CO_NESTED } else { 0 }) | (self.unit.flags & SUPPORTED_FUTURE_FLAGS),
         )?;
@@ -1282,11 +1440,24 @@ impl Compiler<'_> {
             child.unit.annotation_classdict_index = Some(child.closure_index("__classdict__")?);
         }
         child.emit_function_prologue()?;
+        if type_alias && !self.has_deferred_annotations() {
+            child.add_constant(Constant::None)?;
+        }
         child
             .assembler
             .set_location(child.source_location(setup_range));
-        child.emit_annotation_format_guard(".format")?;
-        child.compile_expression(expression)?;
+        if self.has_deferred_annotations() {
+            child.emit_annotation_format_guard(".format")?;
+        }
+        if let Expr::Starred(starred) = expression {
+            child.compile_expression(&starred.value)?;
+            child
+                .assembler
+                .set_location(child.source_location(setup_range));
+            child.emit(UNPACK_SEQUENCE, 1, 0)?;
+        } else {
+            child.compile_expression(expression)?;
+        }
         child
             .assembler
             .set_location(child.source_location(setup_range));
@@ -1295,18 +1466,21 @@ impl Compiler<'_> {
 
         self.assembler
             .set_location(self.source_location(setup_range));
-        let defaults = self.add_constant(Constant::Tuple(vec![Constant::Int(1)]))?;
-        self.emit(LOAD_CONST, defaults, 1)?;
+        let mut flags = 0;
+        if self.has_deferred_annotations() {
+            let defaults = self.add_constant(Constant::Tuple(vec![Constant::Int(1)]))?;
+            self.emit(LOAD_CONST, defaults, 1)?;
+            flags |= FunctionAttribute::DEFAULTS.argument();
+        }
         if !closure_names.is_empty() {
             self.emit_closure_tuple(&closure_names)?;
         }
         let code = self.add_constant(Constant::Code(Box::new(child)))?;
         self.emit(LOAD_CONST, code, 1)?;
-        self.emit(MAKE_FUNCTION, 0, 0)?;
         if !closure_names.is_empty() {
-            self.emit_function_attribute(FunctionAttribute::CLOSURE)?;
+            flags |= FunctionAttribute::CLOSURE.argument();
         }
-        self.emit_function_attribute(FunctionAttribute::DEFAULTS)
+        self.emit_make_function(flags)
     }
 
     fn emit_annotation_format_guard(&mut self, parameter: &str) -> Result<(), CompileError> {
@@ -1321,6 +1495,63 @@ impl Compiler<'_> {
         self.emit(RAISE_VARARGS, 1, -1)?;
         self.assembler.mark(supported);
         self.set_depth(0);
+        Ok(())
+    }
+
+    /// Before Python 3.14, annotations are evaluated in the defining scope and
+    /// passed to MAKE_FUNCTION as alternating name/value entries.
+    fn compile_eager_function_annotations(
+        &mut self,
+        definition: &StmtFunctionDef,
+        location: SourceLocation,
+    ) -> Result<(), CompileError> {
+        let parameters = &definition.parameters;
+        let mut annotations = Vec::new();
+        for parameter in parameters.args.iter().chain(&parameters.posonlyargs) {
+            if let Some(annotation) = parameter.parameter.annotation.as_deref() {
+                annotations.push((parameter.name().as_str(), annotation));
+            }
+        }
+        if let Some(parameter) = &parameters.vararg
+            && let Some(annotation) = parameter.annotation.as_deref()
+        {
+            annotations.push((parameter.name.as_str(), annotation));
+        }
+        for parameter in &parameters.kwonlyargs {
+            if let Some(annotation) = parameter.parameter.annotation.as_deref() {
+                annotations.push((parameter.name().as_str(), annotation));
+            }
+        }
+        if let Some(parameter) = &parameters.kwarg
+            && let Some(annotation) = parameter.annotation.as_deref()
+        {
+            annotations.push((parameter.name.as_str(), annotation));
+        }
+        if let Some(annotation) = definition.returns.as_deref() {
+            annotations.push(("return", annotation));
+        }
+        for (name, annotation) in &annotations {
+            self.assembler.set_location(location);
+            let mangled = self.mangled_name(name);
+            self.context
+                .record_identifier_constant_origin(name, &mangled);
+            self.load_string_constant(&mangled)?;
+            if self.unit.flags & CO_FUTURE_ANNOTATIONS != 0 {
+                self.assembler
+                    .set_location(self.source_location(annotation.range()));
+                self.load_string_constant(&unparse_annotation(annotation, self.context.source))?;
+            } else if let Expr::Starred(starred) = annotation {
+                self.compile_expression(&starred.value)?;
+                self.assembler.set_location(location);
+                self.emit(UNPACK_SEQUENCE, 1, 0)?;
+            } else {
+                self.compile_expression(annotation)?;
+            }
+        }
+        if !annotations.is_empty() {
+            self.assembler.set_location(location);
+            self.emit_build(BUILD_TUPLE, annotations.len() * 2)?;
+        }
         Ok(())
     }
 

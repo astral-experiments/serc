@@ -12,9 +12,9 @@ use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use smallvec::SmallVec;
 
 use super::{LOAD_CONST, LOAD_SMALL_INT, NOP, STORE_NAME};
-use crate::CompileError;
 use crate::assembler::{Label, OperandPatchId};
 use crate::target::operands::Conversion;
+use crate::{CompileError, PythonVersion};
 
 use super::Compiler;
 use super::expression::literal_truthiness;
@@ -249,6 +249,7 @@ pub(super) struct OutputState {
     name_indices: FxHashMap<NameId, u32>,
     pub(super) interned_constant_strings: FxHashSet<String>,
     pub(super) qualified_name_constant_index: Option<u32>,
+    pub(super) qualified_name_is_canonical: Option<bool>,
     pub(super) has_frozenset_constants: bool,
     pub(super) first_flowgraph_constant: usize,
 }
@@ -434,7 +435,11 @@ impl Compiler<'_> {
         expression: &Expr,
         constant: Constant,
     ) -> Result<(), CompileError> {
-        if matches!(expression, Expr::Name(name) if name.id.as_str() == "__debug__") {
+        if self.context.python_version <= PythonVersion::Py313
+            || matches!(expression, Expr::Name(name) if name.id.as_str() == "__debug__")
+        {
+            // Older targets fold the AST before code generation, so only the result is
+            // admitted here. Recording operands would change the first constant and its order.
             return self.emit_preprocessed_constant(expression, constant);
         }
         if let Some(literal) = literal_constant(expression) {
@@ -450,7 +455,8 @@ impl Compiler<'_> {
                 .set_location(self.source_location(expression.range()));
         }
         let hidden_owner_slots = folded_constant_owner_slots(expression);
-        if let Constant::Int(value) = constant
+        if self.context.python_version >= PythonVersion::Py314
+            && let Constant::Int(value) = constant
             && let Ok(value) = u8::try_from(value)
         {
             self.emit(LOAD_SMALL_INT, u32::from(value), 1)?;
@@ -508,7 +514,9 @@ impl Compiler<'_> {
             }
             Expr::Subscript(subscript) => {
                 self.record_folded_value(&subscript.value)?;
-                if let Expr::Slice(slice) = subscript.slice.as_ref() {
+                if self.context.python_version <= PythonVersion::Py313 {
+                    self.record_folded_value(&subscript.slice)?;
+                } else if let Expr::Slice(slice) = subscript.slice.as_ref() {
                     if let Some(constant) = constant_slice(slice) {
                         self.add_constant(constant)?;
                     } else {
@@ -528,6 +536,9 @@ impl Compiler<'_> {
             }
             Expr::UnaryOp(unary) => self.record_folded_value(&unary.operand)?,
             _ => {}
+        }
+        if self.context.python_version <= PythonVersion::Py313 {
+            return Ok(());
         }
         let operands: Vec<_> = match expression {
             Expr::BinOp(binary) => [&*binary.left, &*binary.right]
@@ -599,6 +610,9 @@ impl Compiler<'_> {
         &mut self,
         expression: &Expr,
     ) -> Result<(), CompileError> {
+        if self.context.python_version <= PythonVersion::Py313 {
+            return Ok(());
+        }
         match expression {
             Expr::Tuple(tuple) => {
                 for element in &tuple.elts {
@@ -624,7 +638,8 @@ impl Compiler<'_> {
             self.add_constant(constant)?;
             return Ok(());
         }
-        if matches!(expression, Expr::Slice(_))
+        if self.context.python_version >= PythonVersion::Py314
+            && matches!(expression, Expr::Slice(_))
             && let Some(constant) = fold_constant(expression)
         {
             self.add_constant(constant)?;
@@ -653,6 +668,27 @@ impl Compiler<'_> {
             return Ok(());
         }
 
+        if self.context.python_version <= PythonVersion::Py313 {
+            if let Expr::Slice(slice) = expression {
+                // Marshal v4 cannot encode slices: code generation loads their bounds.
+                for bound in [&slice.lower, &slice.upper] {
+                    if let Some(bound) = bound {
+                        self.record_folded_value(bound)?;
+                    } else {
+                        self.add_constant(Constant::None)?;
+                    }
+                }
+                if let Some(step) = &slice.step {
+                    self.record_folded_value(step)?;
+                }
+            } else if let Some(constant) = self.source_aware_fold_constant(expression) {
+                self.add_constant(constant)?;
+            } else {
+                self.record_folded_operands(expression)?;
+            }
+            return Ok(());
+        }
+
         self.record_folded_operands(expression)?;
         if let Some(constant) = fold_constant(expression)
             && !matches!(constant, Constant::Int(value) if u8::try_from(value).is_ok())
@@ -667,7 +703,8 @@ impl Compiler<'_> {
         expression: &Expr,
         constant: Constant,
     ) -> Result<(), CompileError> {
-        if let Constant::Int(value) = constant
+        if self.context.python_version >= PythonVersion::Py314
+            && let Constant::Int(value) = constant
             && let Ok(value) = u8::try_from(value)
         {
             if self.output.constants.is_empty()
@@ -719,11 +756,11 @@ impl Compiler<'_> {
     }
 
     pub(super) fn emit_unsigned_constant(&mut self, value: u32) -> Result<(), CompileError> {
-        if u8::try_from(value).is_ok() {
+        if self.context.python_version >= PythonVersion::Py314 && u8::try_from(value).is_ok() {
             self.emit(LOAD_SMALL_INT, value, 1)
         } else {
-            // CPython's small-integer load table ends at 255. Larger synthesized integers
-            // must be loaded from the constant table.
+            // Older targets load every integer from the constant table; newer targets
+            // use that table only beyond LOAD_SMALL_INT's 255 limit.
             let constant = self.add_constant(Constant::Int(u64::from(value)))?;
             self.emit(LOAD_CONST, constant, 1)
         }
@@ -2438,8 +2475,12 @@ pub(super) fn constant_slice(slice: &ruff_python_ast::ExprSlice) -> Option<Const
     })
 }
 
-pub(super) fn two_element_slice_optimization(slice: &ruff_python_ast::ExprSlice) -> bool {
-    slice.step.is_none() && constant_slice(slice).is_none()
+pub(super) fn two_element_slice_optimization(
+    slice: &ruff_python_ast::ExprSlice,
+    python_version: PythonVersion,
+) -> bool {
+    slice.step.is_none()
+        && (python_version <= PythonVersion::Py313 || constant_slice(slice).is_none())
 }
 
 pub(super) fn first_literal_constant(expression: &Expr) -> Option<Constant> {
@@ -2554,6 +2595,103 @@ fn first_constant(
             }
         }
 
+        /// Older code generation builds an entire constant display before visiting its items.
+        fn legacy_collection_constant(&self, elements: &[Expr], is_set: bool) -> Option<Constant> {
+            if elements.len() < 3 {
+                return None;
+            }
+            let constants = elements
+                .iter()
+                .map(|element| self.compiler.source_aware_fold_constant(element))
+                .collect::<Option<Vec<_>>>()?;
+            if is_set {
+                let mut unique = Vec::with_capacity(constants.len());
+                for constant in constants {
+                    if !unique
+                        .iter()
+                        .any(|existing| python_constant_values_equal(existing, &constant))
+                    {
+                        unique.push(constant);
+                    }
+                }
+                Some(Constant::FrozenSet(unique))
+            } else {
+                Some(Constant::Tuple(constants))
+            }
+        }
+
+        fn visit_legacy_dict(&mut self, items: &'ast [ruff_python_ast::DictItem]) {
+            let mut index = 0;
+            while index < items.len() && !self.is_complete() {
+                if items[index].key.is_none() {
+                    self.visit_expr(&items[index].value);
+                    index += 1;
+                    continue;
+                }
+                let start = index;
+                // A mapping flushes after its seventeenth pair or before unpacking.
+                while index < items.len() && items[index].key.is_some() && index - start < 17 {
+                    index += 1;
+                }
+                let group = &items[start..index];
+                if (2..=15).contains(&group.len())
+                    && let Some(keys) = group
+                        .iter()
+                        .map(|item| {
+                            self.compiler
+                                .source_aware_fold_constant(item.key.as_ref().unwrap())
+                        })
+                        .collect::<Option<Vec<_>>>()
+                {
+                    for item in group {
+                        self.visit_expr(&item.value);
+                    }
+                    if !self.is_complete() {
+                        self.constant = Some(Constant::Tuple(keys));
+                    }
+                } else {
+                    for item in group {
+                        self.visit_expr(item.key.as_ref().unwrap());
+                        self.visit_expr(&item.value);
+                    }
+                }
+            }
+        }
+
+        fn visit_legacy_keywords(&mut self, keywords: &'ast [ruff_python_ast::Keyword]) {
+            let mut index = 0;
+            while index < keywords.len() && !self.is_complete() {
+                if keywords[index].arg.is_none() {
+                    self.visit_expr(&keywords[index].value);
+                    index += 1;
+                    continue;
+                }
+                let start = index;
+                while index < keywords.len() && keywords[index].arg.is_some() {
+                    index += 1;
+                }
+                let group = &keywords[start..index];
+                if (2..=15).contains(&group.len()) {
+                    for keyword in group {
+                        self.visit_expr(&keyword.value);
+                    }
+                    if !self.is_complete() {
+                        self.constant = Some(Constant::Tuple(
+                            group
+                                .iter()
+                                .map(|keyword| {
+                                    Constant::String(keyword.arg.as_ref().unwrap().to_string())
+                                })
+                                .collect(),
+                        ));
+                    }
+                } else {
+                    self.constant =
+                        Some(Constant::String(group[0].arg.as_ref().unwrap().to_string()));
+                }
+            }
+        }
+
         fn visit_interpolated_components(
             &mut self,
             components: Vec<super::expression::InterpolatedStringComponent<'ast>>,
@@ -2647,11 +2785,10 @@ fn first_constant(
                         return;
                     }
                     Stmt::Return(return_) => {
-                        // CPython defers a syntactic Constant return until after unwind.
-                        // Tuple, unary and binary expressions still admit their components
-                        // before cleanup, even when later optimization folds their value.
+                        // CPython defers AST constants until after unwind, including values
+                        // folded before code generation by the older targets.
                         if let Some(value) = &return_.value
-                            && !is_literal_constant(value)
+                            && !self.compiler.return_value_is_constant(value)
                         {
                             self.visit_expr(value);
                         }
@@ -2754,17 +2891,49 @@ fn first_constant(
                 self.constant = Some(Constant::Bool(true));
                 return;
             }
+            if self.compiler.context.python_version <= PythonVersion::Py313 {
+                match expression {
+                    Expr::List(list) if list.ctx == ExprContext::Load => {
+                        if let Some(constant) = self.legacy_collection_constant(&list.elts, false) {
+                            self.constant = Some(constant);
+                            return;
+                        }
+                    }
+                    Expr::Set(set) => {
+                        if let Some(constant) = self.legacy_collection_constant(&set.elts, true) {
+                            self.constant = Some(constant);
+                            return;
+                        }
+                    }
+                    Expr::Dict(dict) => {
+                        self.visit_legacy_dict(&dict.items);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             if let Expr::Call(call) = expression {
                 self.visit_expr(&call.func);
-                for argument in &call.arguments.args {
-                    self.visit_expr(argument);
-                }
                 let shape = self.compiler.call_shape(call);
                 let expanded = shape.has_starred
                     || shape.has_keyword_unpack
                     || (shape.direct_method.is_none()
                         && shape.positional_count + shape.keyword_count * 2 > 30);
-                if expanded {
+                if self.compiler.context.python_version <= PythonVersion::Py313
+                    && expanded
+                    && !self.is_complete()
+                    && let Some(constant) =
+                        self.legacy_collection_constant(&call.arguments.args, false)
+                {
+                    self.constant = Some(constant);
+                } else {
+                    for argument in &call.arguments.args {
+                        self.visit_expr(argument);
+                    }
+                }
+                if expanded && self.compiler.context.python_version <= PythonVersion::Py313 {
+                    self.visit_legacy_keywords(&call.arguments.keywords);
+                } else if expanded {
                     for keyword in &call.arguments.keywords {
                         if !self.is_complete()
                             && let Some(name) = &keyword.arg
@@ -2792,7 +2961,9 @@ fn first_constant(
                 return;
             }
             if let Expr::Slice(slice) = expression {
-                if let Some(constant) = constant_slice(slice) {
+                if self.compiler.context.python_version >= PythonVersion::Py314
+                    && let Some(constant) = constant_slice(slice)
+                {
                     self.constant = Some(constant);
                 } else {
                     // Slice lowering admits an implicit None for each omitted bound.
@@ -2828,7 +2999,12 @@ fn first_constant(
                 self.constant = Some(Constant::None);
                 return;
             }
-            if let Some(constant) = literal_constant(expression) {
+            let constant = if self.compiler.context.python_version <= PythonVersion::Py313 {
+                self.compiler.source_aware_fold_constant(expression)
+            } else {
+                literal_constant(expression)
+            };
+            if let Some(constant) = constant {
                 self.constant = Some(constant);
             } else {
                 walk_expr(self, expression);

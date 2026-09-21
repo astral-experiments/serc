@@ -16,7 +16,7 @@ use walkdir::WalkDir;
 
 fn capture_boundary(python_version: PythonVersion) -> &'static str {
     match python_version {
-        PythonVersion::Py314 => {
+        PythonVersion::Py312 | PythonVersion::Py313 | PythonVersion::Py314 => {
             "Py_CompileStringObject:entry-after-argument-and-AST-init-before-parser"
         }
         PythonVersion::Py315 => "_Py_CompileString:entry-after-argument-and-AST-init-before-parser",
@@ -547,7 +547,12 @@ mod tests {
 
     #[test]
     fn profiles_are_bound_to_the_selected_python_target() {
-        for python_version in [PythonVersion::Py314, PythonVersion::Py315] {
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
             let target = python_version.target();
             let mut value = contract();
             value["target"] = json!({
@@ -564,11 +569,17 @@ mod tests {
                     .validate_contract(python_version, true, "oracle")
                     .is_ok()
             );
-            let other = match python_version {
-                PythonVersion::Py314 => PythonVersion::Py315,
-                PythonVersion::Py315 => PythonVersion::Py314,
-            };
-            assert!(profile.validate_contract(other, true, "oracle").is_err());
+            for other in [
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ] {
+                assert_eq!(
+                    profile.validate_contract(other, true, "oracle").is_ok(),
+                    other == python_version
+                );
+            }
             assert!(
                 profile
                     .validate_contract(python_version, true, "other oracle")

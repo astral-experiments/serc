@@ -147,6 +147,44 @@ class TargetSelectionTest(unittest.TestCase):
     def tearDown(self) -> None:
         generator.select_target_version("3.14")
 
+    def test_legacy_targets_have_exact_independent_inputs(self) -> None:
+        for minor, version, module, supplement_count in [
+            ("3.12", (3, 12, 14), "cpython_3_12_14.rs", 2956),
+            ("3.13", (3, 13, 15), "cpython_3_13_15.rs", 2648),
+        ]:
+            with self.subTest(minor=minor):
+                generator.select_target_version(minor)
+                self.assertEqual(generator.TARGET_VERSION, version)
+                self.assertEqual(generator.OUTPUT.name, module)
+                self.assertEqual(generator.MARSHAL_OUTPUT.name, "v4.rs")
+                self.assertIn("Python/compile.c", generator.TARGET_INPUTS)
+                self.assertNotIn("Python/codegen.c", generator.TARGET_INPUTS)
+                self.assertNotIn(
+                    "Include/internal/pycore_magic_number.h", generator.TARGET_INPUTS
+                )
+                self.assertIn(
+                    "Lib/importlib/_bootstrap_external.py", generator.TARGET_INPUTS
+                )
+                self.assertEqual(
+                    len(generator.read_startup_strings()), supplement_count
+                )
+        generator.select_target_version("3.14")
+        self.assertEqual(generator.TARGET_INPUTS, generator.MODERN_TARGET_INPUTS)
+
+    def test_shared_legacy_semantic_properties_are_source_checked(self) -> None:
+        from generate_legacy_target import render_legacy_opcodes
+
+        for name, flags in [
+            ("RETURN_CONST", {"HAS_ARG_FLAG", "HAS_CONST_FLAG"}),
+            ("LOAD_CLOSURE", {"HAS_ARG_FLAG", "HAS_FREE_FLAG"}),
+            ("KW_NAMES", {"HAS_ARG_FLAG", "HAS_CONST_FLAG"}),
+        ]:
+            with self.subTest(name=name):
+                generated = render_legacy_opcodes({"flags": {name: flags}})
+                self.assertIn(f"const {name}: Opcode", generated)
+                with self.assertRaisesRegex(ValueError, "semantic properties differ"):
+                    render_legacy_opcodes({"flags": {name: set()}})
+
     def test_selects_exact_release_and_protocol_inputs(self) -> None:
         generator.select_target_version("3.15")
         self.assertEqual(generator.TARGET_TAG, "v3.15.0rc2")
