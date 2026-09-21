@@ -877,6 +877,25 @@ impl Compiler<'_> {
         }
 
         #[derive(Default)]
+        struct UnwindExitDetector(bool);
+
+        impl<'ast> Visitor<'ast> for UnwindExitDetector {
+            fn visit_stmt(&mut self, statement: &'ast Stmt) {
+                if self.0 || matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                    return;
+                }
+                if matches!(
+                    statement,
+                    Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_)
+                ) {
+                    self.0 = true;
+                } else {
+                    walk_stmt(self, statement);
+                }
+            }
+        }
+
+        #[derive(Default)]
         struct Collector<'compiler, 'source, 'ast> {
             actions: Vec<SkippedAction<'ast>>,
             build_discarded: bool,
@@ -884,6 +903,7 @@ impl Compiler<'_> {
             constants: Vec<Constant>,
             folded_expressions: Vec<&'ast Expr>,
             has_untracked_collection: bool,
+            reorder_try_suites: bool,
             register_literals: bool,
             register_folds: bool,
             string_origin_constants: Vec<(Constant, bool)>,
@@ -1223,7 +1243,7 @@ impl Compiler<'_> {
                         self.visit_body(&statement.orelse);
                         return;
                     }
-                    Stmt::Try(statement) if !statement.is_star => {
+                    Stmt::Try(statement) if self.reorder_try_suites && !statement.is_star => {
                         // Ordinary try codegen visits the else suite before handlers.
                         // Except-star keeps the AST order: handlers before else.
                         self.visit_body(&statement.body);
@@ -1808,7 +1828,13 @@ impl Compiler<'_> {
             }
         }
 
+        // Returns and loop exits can compile an enclosing finalizer before later
+        // suites. Preserve the existing admission traversal until those copies are
+        // replayed; raises do not inline finalizers during code generation.
+        let mut unwind_exits = UnwindExitDetector::default();
+        unwind_exits.visit_body(body);
         let mut collector = Collector {
+            reorder_try_suites: !unwind_exits.0,
             register_literals,
             register_folds,
             build_discarded: self.context.requires_discarded_builders(),

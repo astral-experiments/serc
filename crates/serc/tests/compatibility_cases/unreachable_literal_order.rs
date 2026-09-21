@@ -83,3 +83,46 @@ fn matches_cpython_names_in_unreachable_try_suites() {
         }
     }
 }
+
+#[test]
+fn preserves_unreachable_try_admissions_with_finally_unwinds() {
+    for exit in [
+        "return body_name('reused')",
+        "body_name('reused')\n    break",
+    ] {
+        for outer in [false, true] {
+            let inner = format!(
+                "try:\n    {exit}\nexcept HandlerError:\n    handler_name('reused')\nelse:\n    else_name('reused')\n"
+            );
+            let mut suite = if outer {
+                format!(
+                    "try:\n{}",
+                    inner
+                        .lines()
+                        .map(|line| format!("    {line}\n"))
+                        .collect::<String>()
+                )
+            } else {
+                inner
+            };
+            suite.push_str("finally:\n    HandlerError('reused')\n    handler_name('reused')\n");
+            if exit.contains("break") {
+                suite = format!(
+                    "while loop_test:\n{}",
+                    suite
+                        .lines()
+                        .map(|line| format!("    {line}\n"))
+                        .collect::<String>()
+                );
+            }
+            let source = format!(
+                "def f(flag):\n    if flag:\n        raise NotImplementedError\n{}    return ('reused',)\n",
+                suite
+                    .lines()
+                    .map(|line| format!("        {line}\n"))
+                    .collect::<String>()
+            );
+            common::assert_matches_cpython_marshal(&source, "unreachable_try_finally_unwind.py");
+        }
+    }
+}
