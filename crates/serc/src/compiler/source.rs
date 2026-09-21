@@ -1309,7 +1309,7 @@ fn fstring_literal_span(
                                 source,
                                 literal.range,
                                 fstring.flags.prefix().is_raw(),
-                            ))
+                            ));
                         }
                         InterpolatedStringElement::Interpolation(_) => return None,
                     }
