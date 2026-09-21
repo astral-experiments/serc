@@ -1,6 +1,5 @@
 #![allow(clippy::print_stderr, clippy::print_stdout)]
 
-use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Write as _;
 use std::hint::black_box;
@@ -220,10 +219,10 @@ impl Metric {
         }
     }
 
-    const fn value(self, row: &RawRow) -> u64 {
+    const fn value(self, timings: &Timings) -> u64 {
         match self {
-            Self::Wall => row.wall_elapsed_ns,
-            Self::ProcessCpu => row.process_cpu_ns,
+            Self::Wall => timings.wall_elapsed_ns,
+            Self::ProcessCpu => timings.process_cpu_ns,
         }
     }
 }
@@ -242,23 +241,6 @@ struct SourceFile {
     path: PathBuf,
     filename: String,
     source: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RawRow {
-    phase: &'static str,
-    block: usize,
-    position: usize,
-    order: &'static str,
-    kind: &'static str,
-    first_engine: &'static str,
-    engine: &'static str,
-    cooldown_ms: u128,
-    wall_elapsed_ns: u64,
-    process_cpu_ns: u64,
-    file_count: usize,
-    source_bytes: usize,
-    included: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -330,8 +312,6 @@ struct Summary {
 
 #[derive(Clone, Copy, Debug)]
 struct BlockSample {
-    block: usize,
-    order: &'static str,
     rust_mean_ns: f64,
     cpython_mean_ns: f64,
     ratio: f64,
@@ -416,37 +396,25 @@ fn run() -> Result<(), String> {
     manifest.marshaled.clear();
     manifest.marshaled.shrink_to_fit();
 
-    let expected_rows = expected_row_count(&options)?;
-    let mut rows = Vec::with_capacity(expected_rows);
+    let mut blocks = Vec::with_capacity(expected_row_count(&options)? / 4);
     run_blocks(
         options.phase,
-        "warmup",
         options.warmups,
         options.cooldown,
-        false,
         &accepted,
         &precompiled,
         &mut python,
-        &mut rows,
+        &mut blocks,
     )?;
     run_blocks(
         options.phase,
-        "measured",
         options.samples,
         options.cooldown,
-        true,
         &accepted,
         &precompiled,
         &mut python,
-        &mut rows,
+        &mut blocks,
     )?;
-    if rows.len() != expected_rows {
-        return Err(format!(
-            "phase {} produced {} observations, expected {expected_rows}",
-            options.phase.label(),
-            rows.len(),
-        ));
-    }
     python.finish()?;
 
     let metadata = metadata(
@@ -457,8 +425,8 @@ fn run() -> Result<(), String> {
         &manifest,
         accepted_source_bytes,
     )?;
-    write_raw(&options.output, &metadata, &accepted, &rows)?;
-    print_summaries(&rows, options.phase)?;
+    write_raw(&options, &metadata, &accepted, &blocks)?;
+    print_summaries(&blocks[options.warmups..], options.phase)?;
     Ok(())
 }
 
@@ -755,54 +723,42 @@ fn parse_sample_response(line: &str) -> Result<SampleResult, String> {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_blocks(
     phase: Phase,
-    kind: &'static str,
-    blocks: usize,
+    count: usize,
     cooldown: Duration,
-    included: bool,
     accepted: &[&SourceFile],
     precompiled: &[CompiledModule],
     python: &mut PythonRunner,
-    rows: &mut Vec<RawRow>,
+    blocks: &mut Vec<[Timings; 4]>,
 ) -> Result<(), String> {
-    let source_bytes = accepted.iter().map(|source| source.source.len()).sum();
-    for block in 1..=blocks {
-        let order = block_order(block);
-        for (position, engine) in order.into_iter().enumerate() {
-            thread::sleep(cooldown);
-            let sample = match engine {
-                Engine::Rust => run_rust_phase(phase, accepted, precompiled)?,
-                Engine::Cpython => {
-                    let sample = python.run_phase(phase)?;
-                    if sample.count != accepted.len() {
-                        return Err(format!(
-                            "CPython returned {} outputs for {} accepted files",
-                            sample.count,
-                            accepted.len()
-                        ));
-                    }
-                    black_box(sample.observed);
-                    sample.timings
+    let mut sample = |engine| {
+        thread::sleep(cooldown);
+        let timings = match engine {
+            Engine::Rust => run_rust_phase(phase, accepted, precompiled)?,
+            Engine::Cpython => {
+                let sample = python.run_phase(phase)?;
+                if sample.count != accepted.len() {
+                    return Err(format!(
+                        "CPython returned {} outputs for {} accepted files",
+                        sample.count,
+                        accepted.len()
+                    ));
                 }
-            };
-            rows.push(RawRow {
-                phase: phase.label(),
-                block,
-                position: position + 1,
-                order: block_order_label(block),
-                kind,
-                first_engine: order[0].label(),
-                engine: engine.label(),
-                cooldown_ms: cooldown.as_millis(),
-                wall_elapsed_ns: sample.wall_elapsed_ns,
-                process_cpu_ns: sample.process_cpu_ns,
-                file_count: accepted.len(),
-                source_bytes,
-                included,
-            });
-        }
+                black_box(sample.observed);
+                sample.timings
+            }
+        };
+        Ok(timings)
+    };
+    for block in 1..=count {
+        let [first, second, third, fourth] = block_order(block);
+        blocks.push([
+            sample(first)?,
+            sample(second)?,
+            sample(third)?,
+            sample(fourth)?,
+        ]);
     }
     Ok(())
 }
@@ -1216,10 +1172,10 @@ fn cooldown_metadata(options: &Options) -> (String, String) {
 }
 
 fn write_raw(
-    output: &Path,
+    options: &Options,
     metadata: &[(String, String)],
     accepted: &[&SourceFile],
-    rows: &[RawRow],
+    blocks: &[[Timings; 4]],
 ) -> Result<(), String> {
     let mut text = String::new();
     for (key, value) in metadata {
@@ -1233,33 +1189,44 @@ fn write_raw(
     text.push_str(
         "phase\tblock\tposition\torder\tkind\tfirst_engine\tengine\tcooldown_ms\twall_elapsed_ns\tprocess_cpu_ns\tfile_count\tsource_bytes\tincluded\n",
     );
-    for row in rows {
-        writeln!(
-            &mut text,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            row.phase,
-            row.block,
-            row.position,
-            row.order,
-            row.kind,
-            row.first_engine,
-            row.engine,
-            row.cooldown_ms,
-            row.wall_elapsed_ns,
-            row.process_cpu_ns,
-            row.file_count,
-            row.source_bytes,
-            row.included,
-        )
-        .map_err(|error| format!("failed to format sample: {error}"))?;
+    let source_bytes = accepted
+        .iter()
+        .map(|source| source.source.len())
+        .sum::<usize>();
+    let (warmups, measured) = blocks.split_at(options.warmups);
+    for (kind, included, blocks) in [("warmup", false, warmups), ("measured", true, measured)] {
+        for (index, timings) in blocks.iter().enumerate() {
+            let block = index + 1;
+            let order = block_order(block);
+            for (position, (engine, timing)) in order.into_iter().zip(timings).enumerate() {
+                writeln!(
+                    &mut text,
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    options.phase.label(),
+                    block,
+                    position + 1,
+                    block_order_label(block),
+                    kind,
+                    order[0].label(),
+                    engine.label(),
+                    options.cooldown.as_millis(),
+                    timing.wall_elapsed_ns,
+                    timing.process_cpu_ns,
+                    accepted.len(),
+                    source_bytes,
+                    included,
+                )
+                .map_err(|error| format!("failed to format sample: {error}"))?;
+            }
+        }
     }
-    fs_err::write(output, text)
-        .map_err(|error| format!("failed to write {}: {error}", output.display()))
+    fs_err::write(&options.output, text)
+        .map_err(|error| format!("failed to write {}: {error}", options.output.display()))
 }
 
-fn print_summaries(rows: &[RawRow], phase: Phase) -> Result<(), String> {
+fn print_summaries(blocks: &[[Timings; 4]], phase: Phase) -> Result<(), String> {
     for metric in Metric::ALL {
-        let blocks = block_samples(rows, phase.label(), metric)?;
+        let blocks = block_samples(blocks, metric);
         let rust = blocks
             .iter()
             .map(|block| block.rust_mean_ns)
@@ -1315,89 +1282,42 @@ fn print_summaries(rows: &[RawRow], phase: Phase) -> Result<(), String> {
     clippy::cast_precision_loss,
     reason = "benchmark nanosecond samples are intentionally converted to floating-point means"
 )]
-fn block_samples(rows: &[RawRow], phase: &str, metric: Metric) -> Result<Vec<BlockSample>, String> {
-    let mut grouped = BTreeMap::<usize, Vec<&RawRow>>::new();
-    for row in rows.iter().filter(|row| row.included && row.phase == phase) {
-        grouped.entry(row.block).or_default().push(row);
-    }
-    if grouped.is_empty() {
-        return Err(format!("no measured blocks for {phase}"));
-    }
-
-    grouped
-        .into_iter()
-        .map(|(block, mut rows)| {
-            rows.sort_by_key(|row| row.position);
-            let expected_order = block_order(block);
-            if rows.len() != expected_order.len() {
-                return Err(format!(
-                    "{phase} block {block} has {} observations, expected {}",
-                    rows.len(),
-                    expected_order.len()
-                ));
-            }
-            let expected_label = block_order_label(block);
-            for (index, (row, expected_engine)) in rows.iter().zip(expected_order).enumerate() {
-                if row.position != index + 1
-                    || row.order != expected_label
-                    || row.engine != expected_engine.label()
-                {
-                    return Err(format!(
-                        "{phase} block {block} has malformed position {}",
-                        index + 1
-                    ));
-                }
-            }
-            let rust = rows
-                .iter()
-                .filter(|row| row.engine == Engine::Rust.label())
-                .map(|row| metric.value(row) as f64)
-                .collect::<Vec<_>>();
-            let cpython = rows
-                .iter()
-                .filter(|row| row.engine == Engine::Cpython.label())
-                .map(|row| metric.value(row) as f64)
-                .collect::<Vec<_>>();
-            if rust.len() != 2 || cpython.len() != 2 {
-                return Err(format!(
-                    "{phase} block {block} must contain two observations per engine"
-                ));
-            }
-            let rust_mean_ns = rust.iter().sum::<f64>() / 2.0;
-            let cpython_mean_ns = cpython.iter().sum::<f64>() / 2.0;
-            Ok(BlockSample {
-                block,
-                order: expected_label,
+fn block_samples(blocks: &[[Timings; 4]], metric: Metric) -> Vec<BlockSample> {
+    blocks
+        .iter()
+        .enumerate()
+        .map(|(index, timings)| {
+            let [first, second, third, fourth] = timings.map(|timing| metric.value(&timing) as f64);
+            let outer_mean = f64::midpoint(first, fourth);
+            let inner_mean = f64::midpoint(second, third);
+            let (rust_mean_ns, cpython_mean_ns) = if block_order(index + 1)[0] == Engine::Rust {
+                (outer_mean, inner_mean)
+            } else {
+                (inner_mean, outer_mean)
+            };
+            BlockSample {
                 rust_mean_ns,
                 cpython_mean_ns,
                 ratio: rust_mean_ns / cpython_mean_ns,
-            })
+            }
         })
         .collect()
 }
 
 fn ratio_statistics(blocks: &[BlockSample]) -> Result<RatioStatistics, String> {
-    for (index, block) in blocks.iter().enumerate() {
-        if block.block != index + 1 {
-            return Err(format!(
-                "measured blocks must be contiguous: expected {}, got {}",
-                index + 1,
-                block.block
-            ));
-        }
-    }
     let ratios = blocks.iter().map(|block| block.ratio).collect::<Vec<_>>();
     let summary = summarize(&ratios)?;
     let (bootstrap_low, bootstrap_high) =
         bootstrap_median_ci(&ratios, BOOTSTRAP_SAMPLES, BOOTSTRAP_SEED)?;
     let abba = blocks
         .iter()
-        .filter(|block| block.order == "ABBA")
+        .step_by(2)
         .map(|block| block.ratio)
         .collect::<Vec<_>>();
     let baab = blocks
         .iter()
-        .filter(|block| block.order == "BAAB")
+        .skip(1)
+        .step_by(2)
         .map(|block| block.ratio)
         .collect::<Vec<_>>();
     let abba_median = (!abba.is_empty()).then(|| median_f64(&abba)).transpose()?;
@@ -1516,11 +1436,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BOOTSTRAP_SEED, BlockSample, Engine, Metric, Options, Phase, PythonRunner, RawRow,
-        SourceFile, Timings, block_order, block_order_label, block_samples, bootstrap_median_ci,
-        cooldown_metadata, discover, expected_row_count, parse_sample_response,
-        process_timer_result, profile_from_executable, ratio_statistics, summarize,
-        verify_exact_marshal, write_raw,
+        BOOTSTRAP_SEED, BlockSample, Engine, Metric, Options, Phase, PythonRunner, SourceFile,
+        Timings, block_order, block_samples, bootstrap_median_ci, cooldown_metadata, discover,
+        expected_row_count, parse_sample_response, process_timer_result, profile_from_executable,
+        ratio_statistics, summarize, verify_exact_marshal, write_raw,
     };
 
     #[test]
@@ -1604,30 +1523,6 @@ mod tests {
         let marshaled_bytes = expected_marshal.iter().map(Vec::len).sum::<usize>();
         assert_eq!(samples[1].observed, marshaled_bytes);
         assert_eq!(samples[2].observed, marshaled_bytes);
-    }
-
-    fn raw_row(
-        block: usize,
-        position: usize,
-        engine: Engine,
-        wall_elapsed_ns: u64,
-        process_cpu_ns: u64,
-    ) -> RawRow {
-        RawRow {
-            phase: "compiler_core",
-            block,
-            position,
-            order: block_order_label(block),
-            kind: "measured",
-            first_engine: block_order(block)[0].label(),
-            engine: engine.label(),
-            cooldown_ms: 0,
-            wall_elapsed_ns,
-            process_cpu_ns,
-            file_count: 2,
-            source_bytes: 20,
-            included: true,
-        }
     }
 
     #[test]
@@ -1912,42 +1807,24 @@ mod tests {
 
     #[test]
     fn aggregates_two_observations_per_engine() {
-        let rows = vec![
-            raw_row(1, 1, Engine::Rust, 100, 70),
-            raw_row(1, 2, Engine::Cpython, 80, 60),
-            raw_row(1, 3, Engine::Cpython, 100, 70),
-            raw_row(1, 4, Engine::Rust, 120, 90),
-        ];
-        let wall = block_samples(&rows, "compiler_core", Metric::Wall).expect("valid block");
-        assert_eq!(wall.len(), 1);
-        assert_eq!(wall[0].rust_mean_ns, 110.0);
-        assert_eq!(wall[0].cpython_mean_ns, 90.0);
-        assert_eq!(wall[0].ratio, 110.0 / 90.0);
-
-        let process_cpu =
-            block_samples(&rows, "compiler_core", Metric::ProcessCpu).expect("valid block");
-        assert_eq!(process_cpu[0].rust_mean_ns, 80.0);
-        assert_eq!(process_cpu[0].cpython_mean_ns, 65.0);
-        assert_eq!(process_cpu[0].ratio, 80.0 / 65.0);
-    }
-
-    #[test]
-    fn selects_each_clock_from_raw_rows() {
-        let row = raw_row(1, 1, Engine::Rust, 120, 90);
-        assert_eq!(Metric::Wall.value(&row), 120);
-        assert_eq!(Metric::ProcessCpu.value(&row), 90);
-    }
-
-    #[test]
-    fn rejects_a_malformed_block() {
-        let rows = vec![
-            raw_row(1, 1, Engine::Rust, 100, 90),
-            raw_row(1, 2, Engine::Cpython, 80, 70),
-            raw_row(1, 3, Engine::Cpython, 100, 90),
-        ];
-        let error = block_samples(&rows, "compiler_core", Metric::ProcessCpu)
-            .expect_err("block is incomplete");
-        assert!(error.contains("3 observations, expected 4"));
+        let blocks = [
+            [(100, 70), (80, 60), (100, 70), (120, 90)],
+            [(80, 60), (100, 70), (120, 90), (100, 70)],
+        ]
+        .map(|block| block.map(|(wall, cpu)| Timings::new(wall, cpu).unwrap()));
+        let wall = block_samples(&blocks, Metric::Wall);
+        assert_eq!(wall.len(), 2);
+        for block in &wall {
+            assert_eq!(block.rust_mean_ns, 110.0);
+            assert_eq!(block.cpython_mean_ns, 90.0);
+            assert_eq!(block.ratio, 110.0 / 90.0);
+        }
+        let process_cpu = block_samples(&blocks, Metric::ProcessCpu);
+        for block in &process_cpu {
+            assert_eq!(block.rust_mean_ns, 80.0);
+            assert_eq!(block.cpython_mean_ns, 65.0);
+            assert_eq!(block.ratio, 80.0 / 65.0);
+        }
     }
 
     #[test]
@@ -1956,8 +1833,6 @@ mod tests {
             .map(|block| {
                 let ratio = if block % 2 == 1 { 1.001 } else { 0.999 };
                 BlockSample {
-                    block,
-                    order: block_order_label(block),
                     rust_mean_ns: ratio * 100.0,
                     cpython_mean_ns: 100.0,
                     ratio,
@@ -1974,8 +1849,6 @@ mod tests {
             .map(|block| {
                 let ratio = if block % 2 == 1 { 1.0 } else { 1.1 };
                 BlockSample {
-                    block,
-                    order: block_order_label(block),
                     rust_mean_ns: ratio * 100.0,
                     cpython_mean_ns: 100.0,
                     ratio,
@@ -2001,25 +1874,40 @@ mod tests {
     }
 
     #[test]
-    fn serializes_both_clocks() {
+    fn serializes_warmups_and_both_block_orders() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let output = directory.path().join("samples.tsv");
+        let options = Options {
+            python: "python3".to_string(),
+            phase: Phase::CompilerCore,
+            warmups: 1,
+            samples: 2,
+            cooldown: Duration::from_millis(5000),
+            output: directory.path().join("samples.tsv"),
+            roots: vec![PathBuf::from("corpus")],
+            limit: None,
+        };
         let source = SourceFile {
             path: PathBuf::from("source.py"),
             filename: "source.py".to_string(),
             source: "pass\n".to_string(),
         };
+        let blocks = [
+            [(10, 5); 4],
+            [(120, 90), (80, 60), (100, 70), (140, 100)],
+            [(200, 150), (210, 160), (220, 170), (230, 180)],
+        ]
+        .map(|block| block.map(|(wall, cpu)| Timings::new(wall, cpu).unwrap()));
         write_raw(
-            &output,
+            &options,
             &[(
                 "primary_attribution_metric".to_string(),
                 "process_cpu_ns".to_string(),
             )],
             &[&source],
-            &[raw_row(1, 1, Engine::Rust, 120, 90)],
+            &blocks,
         )
         .expect("serialize raw observations");
-        let text = fs_err::read_to_string(output).expect("read raw observations");
+        let text = fs_err::read_to_string(&options.output).expect("read raw observations");
         assert_eq!(
             text,
             concat!(
@@ -2028,8 +1916,18 @@ mod tests {
                 "phase\tblock\tposition\torder\tkind\tfirst_engine\tengine\t",
                 "cooldown_ms\twall_elapsed_ns\tprocess_cpu_ns\tfile_count\t",
                 "source_bytes\tincluded\n",
-                "compiler_core\t1\t1\tABBA\tmeasured\trust\trust\t0\t120\t90\t",
-                "2\t20\ttrue\n",
+                "compiler_core\t1\t1\tABBA\twarmup\trust\trust\t5000\t10\t5\t1\t5\tfalse\n",
+                "compiler_core\t1\t2\tABBA\twarmup\trust\tcpython\t5000\t10\t5\t1\t5\tfalse\n",
+                "compiler_core\t1\t3\tABBA\twarmup\trust\tcpython\t5000\t10\t5\t1\t5\tfalse\n",
+                "compiler_core\t1\t4\tABBA\twarmup\trust\trust\t5000\t10\t5\t1\t5\tfalse\n",
+                "compiler_core\t1\t1\tABBA\tmeasured\trust\trust\t5000\t120\t90\t1\t5\ttrue\n",
+                "compiler_core\t1\t2\tABBA\tmeasured\trust\tcpython\t5000\t80\t60\t1\t5\ttrue\n",
+                "compiler_core\t1\t3\tABBA\tmeasured\trust\tcpython\t5000\t100\t70\t1\t5\ttrue\n",
+                "compiler_core\t1\t4\tABBA\tmeasured\trust\trust\t5000\t140\t100\t1\t5\ttrue\n",
+                "compiler_core\t2\t1\tBAAB\tmeasured\tcpython\tcpython\t5000\t200\t150\t1\t5\ttrue\n",
+                "compiler_core\t2\t2\tBAAB\tmeasured\tcpython\trust\t5000\t210\t160\t1\t5\ttrue\n",
+                "compiler_core\t2\t3\tBAAB\tmeasured\tcpython\trust\t5000\t220\t170\t1\t5\ttrue\n",
+                "compiler_core\t2\t4\tBAAB\tmeasured\tcpython\tcpython\t5000\t230\t180\t1\t5\ttrue\n",
             )
         );
     }
