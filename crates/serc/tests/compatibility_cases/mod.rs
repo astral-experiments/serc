@@ -20,6 +20,7 @@ mod chained_else_return_copies;
 mod chained_raise_copies;
 mod class_comprehension_cells;
 mod class_pattern_wildcard_locations;
+mod class_static_attribute_ownership;
 mod cleanup_interrupt_checks;
 mod cleanup_throw_stack_depth;
 mod cold_with_handler_cleanup;

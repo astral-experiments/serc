@@ -3641,50 +3641,6 @@ pub(super) fn type_parameter_required_names(
     required
 }
 
-pub(super) fn class_static_attributes(body: &[Stmt]) -> Vec<String> {
-    #[derive(Default)]
-    struct Collector {
-        attributes: BTreeSet<String>,
-    }
-
-    impl<'ast> Visitor<'ast> for Collector {
-        fn visit_stmt(&mut self, statement: &'ast Stmt) {
-            // A nested class becomes the nearest enclosing class compiler for
-            // any `self.attr` stores in its body.
-            if matches!(statement, Stmt::ClassDef(_)) {
-                return;
-            }
-            // CPython's augmented-assignment lowering and an annotation without
-            // a value never pass the attribute through the ordinary Store path.
-            if matches!(statement, Stmt::AugAssign(_))
-                || matches!(statement, Stmt::AnnAssign(annotation) if annotation.value.is_none())
-            {
-                return;
-            }
-            walk_stmt(self, statement);
-        }
-
-        fn visit_expr(&mut self, expression: &'ast Expr) {
-            if let Expr::Attribute(attribute) = expression
-                && attribute.ctx == ExprContext::Store
-                && matches!(
-                    attribute.value.as_ref(),
-                    Expr::Name(name) if name.id.as_str() == "self"
-                )
-            {
-                self.attributes.insert(attribute.attr.as_str().to_string());
-            }
-            walk_expr(self, expression);
-        }
-    }
-
-    let mut collector = Collector::default();
-    for statement in body {
-        collector.visit_stmt(statement);
-    }
-    collector.attributes.into_iter().collect()
-}
-
 pub(super) fn collect_target_names(target: &Expr, names: &mut Vec<String>) {
     match target {
         Expr::Name(name) => names.push(name.id.as_str().to_string()),

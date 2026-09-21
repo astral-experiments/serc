@@ -870,6 +870,7 @@ impl Compiler<'_> {
         // its defaults, decorators, and nested scopes; the disposable parent is never assembled.
         enum SkippedAction<'ast> {
             Origins(Vec<(Constant, bool)>),
+            StaticAttribute(&'ast str),
             Statement(&'ast Stmt),
             Expression(&'ast Expr),
             FirstExpression(&'ast Expr),
@@ -1138,6 +1139,19 @@ impl Compiler<'_> {
                     {
                         return;
                     }
+                    Stmt::AugAssign(assignment) => {
+                        // Augmented assignment evaluates its target but does not lower it
+                        // through the ordinary attribute Store path.
+                        match assignment.target.as_ref() {
+                            Expr::Attribute(attribute) => {
+                                self.visit_expr(&attribute.value);
+                                self.names.push((attribute.attr.as_str().to_string(), true));
+                            }
+                            target => self.visit_expr(target),
+                        }
+                        self.visit_expr(&assignment.value);
+                        return;
+                    }
                     Stmt::AnnAssign(assignment) => {
                         let build = self.build_discarded
                             && self.legacy_compiler.is_some()
@@ -1150,7 +1164,9 @@ impl Compiler<'_> {
                         if let Some(value) = &assignment.value {
                             self.visit_expr(value);
                             self.visit_expr(&assignment.target);
-                        } else if self.legacy_compiler.is_some() {
+                        } else {
+                            // Even an unevaluated annotation still evaluates the
+                            // owner or index of a complex assignment target.
                             match assignment.target.as_ref() {
                                 Expr::Attribute(attribute) => self.visit_expr(&attribute.value),
                                 Expr::Subscript(subscript) => {
@@ -1634,6 +1650,13 @@ impl Compiler<'_> {
                         }
                     }
                     Expr::Attribute(attribute) => {
+                        if self.record_string_origins
+                            && attribute.ctx == ExprContext::Store
+                            && matches!(attribute.value.as_ref(), Expr::Name(name) if name.id.as_str() == "self")
+                        {
+                            self.actions
+                                .push(SkippedAction::StaticAttribute(attribute.attr.as_str()));
+                        }
                         self.visit_expr(&attribute.value);
                         self.names.push((attribute.attr.as_str().to_string(), true));
                         return;
@@ -1817,6 +1840,12 @@ impl Compiler<'_> {
             (build_discarded || first_expression.is_some()).then(|| self.discarded_builder());
         for action in actions {
             match action {
+                SkippedAction::StaticAttribute(name) => {
+                    self.context.record_static_attribute(
+                        name,
+                        matches!(self.unit.scope, Scope::Class { .. }),
+                    );
+                }
                 SkippedAction::Origins(origins) => {
                     for (constant, interned) in origins {
                         self.context

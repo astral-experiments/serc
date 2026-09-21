@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use ruff_python_ast::token::{TokenKind, Tokens};
@@ -17,7 +18,7 @@ use crate::assembler::SourceLocation;
 use crate::code_object::{CodeInterningSummary, CodeObject, CompilationInterningEvent, Constant};
 
 use super::constant::{explicit_surrogate_string, fold_constant};
-use super::scope::{ModulePlan, ScopeArena, class_static_attributes};
+use super::scope::{ModulePlan, ScopeArena};
 use super::symbol::mangle_name;
 use super::{CachedSourceLine, Compiler};
 
@@ -89,6 +90,7 @@ pub(super) struct CompilationContext<'source> {
     // even when that constant or the defining class is later removed as unreachable.
     legacy_constant_string_origins: Option<RefCell<LegacyConstantOrigins>>,
     static_attribute_names: FxHashSet<String>,
+    active_class_static_attributes: RefCell<Vec<BTreeSet<String>>>,
     cached_static_attribute_tuples: RefCell<FxHashSet<Vec<String>>>,
     pub(super) generated_mangled_strings: FxHashSet<String>,
     // Generated names can first become canonical when an otherwise discarded child assembles.
@@ -151,6 +153,7 @@ impl<'source> CompilationContext<'source> {
             constant_string_origins,
             legacy_constant_string_origins,
             static_attribute_names,
+            active_class_static_attributes: RefCell::default(),
             cached_static_attribute_tuples: RefCell::new(FxHashSet::default()),
             generated_mangled_strings,
             requires_interning_trace,
@@ -236,6 +239,34 @@ impl<'source> CompilationContext<'source> {
             .cached_static_attribute_tuples
             .borrow_mut()
             .insert(values)
+    }
+
+    pub(super) fn begin_class_static_attributes(&self) {
+        self.active_class_static_attributes
+            .borrow_mut()
+            .push(BTreeSet::new());
+    }
+
+    /// CPython searches the enclosing compiler units, excluding the current unit.
+    /// A store in a nested class body therefore belongs to its outer class.
+    pub(super) fn record_static_attribute(&self, name: &str, current_unit_is_class: bool) {
+        let mut classes = self.active_class_static_attributes.borrow_mut();
+        if let Some(index) = classes
+            .len()
+            .checked_sub(1 + usize::from(current_unit_is_class))
+        {
+            classes[index].insert(name.to_string());
+        }
+    }
+
+    pub(super) fn finish_class_static_attributes(&self) -> Vec<Constant> {
+        self.active_class_static_attributes
+            .borrow_mut()
+            .pop()
+            .expect("class static attributes were initialized")
+            .into_iter()
+            .map(Constant::String)
+            .collect()
     }
 
     /// Static attributes enter the recursive cache as raw parser-interned identifiers.
@@ -329,7 +360,9 @@ impl<'source> CompilationContext<'source> {
     }
 
     pub(super) fn requires_discarded_builders(&self) -> bool {
-        self.requires_interning_trace || self.tracks_legacy_qualified_names()
+        self.requires_interning_trace
+            || self.tracks_legacy_qualified_names()
+            || !self.active_class_static_attributes.borrow().is_empty()
     }
 
     /// Records the class body's actual qualified-name constant admission.
@@ -461,8 +494,6 @@ fn parser_interned_strings(
                     }
                 }
                 Stmt::ClassDef(definition) => {
-                    self.static_attribute_names
-                        .extend(class_static_attributes(&definition.body));
                     self.record_raw_name(definition.name.as_str());
                     for decorator in &definition.decorator_list {
                         self.visit_decorator(decorator);
@@ -542,7 +573,17 @@ fn parser_interned_strings(
         fn visit_expr(&mut self, expression: &'a Expr) {
             match expression {
                 Expr::Name(name) => self.record_raw_name(name.id.as_str()),
-                Expr::Attribute(attribute) => self.record_raw_name(attribute.attr.as_str()),
+                Expr::Attribute(attribute) => {
+                    self.record_raw_name(attribute.attr.as_str());
+                    // Collect a conservative cache filter in this existing traversal.
+                    // Actual class ownership is determined by the lowering Store path.
+                    if attribute.ctx == ExprContext::Store
+                        && matches!(attribute.value.as_ref(), Expr::Name(name) if name.id.as_str() == "self")
+                    {
+                        self.static_attribute_names
+                            .insert(attribute.attr.to_string());
+                    }
+                }
                 _ => {}
             }
             walk_expr(self, expression);

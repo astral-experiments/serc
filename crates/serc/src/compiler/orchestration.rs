@@ -31,9 +31,8 @@ use crate::{CompileError, PythonVersion};
 use super::constant::{DeferredConstantTarget, OutputState, fold_constant};
 use super::definition::clean_doc;
 use super::scope::{
-    LoweringFunctionPlan, NameId, NameSet, ScopeId, class_static_attributes,
-    collect_conditional_simple_annotations, collect_simple_annotations, has_annotations,
-    has_simple_annotations,
+    LoweringFunctionPlan, NameId, NameSet, ScopeId, collect_conditional_simple_annotations,
+    collect_simple_annotations, has_annotations, has_simple_annotations,
 };
 use super::source::{CompilationContext, implicit_return_range};
 use super::statement::{
@@ -650,6 +649,9 @@ impl<'source> Compiler<'source> {
     }
 
     pub(super) fn compile_class_body(mut self, body: &Suite) -> Result<CodeObject, CompileError> {
+        if self.context.python_version != PythonVersion::Py312 {
+            self.context.begin_class_static_attributes();
+        }
         self.assembler.reserve_items(body.len().saturating_mul(16));
         let has_classdict_cell = self.is_cell("__classdict__");
         let has_class_cell = self.is_cell("__class__");
@@ -832,10 +834,7 @@ impl<'source> Compiler<'source> {
 
         self.assembler.set_location(footer_location);
         if self.context.python_version != PythonVersion::Py312 {
-            let static_attributes = class_static_attributes(body)
-                .into_iter()
-                .map(Constant::String)
-                .collect::<Vec<_>>();
+            let static_attributes = self.context.finish_class_static_attributes();
             self.context
                 .record_static_attribute_tuple(&static_attributes);
             let static_attributes = self

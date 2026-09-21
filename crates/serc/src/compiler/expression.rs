@@ -8679,6 +8679,13 @@ impl Compiler<'_> {
         match expression {
             Expr::Name(name) => self.store_name(name.id.as_str()),
             Expr::Attribute(attribute) => {
+                if matches!(attribute.value.as_ref(), Expr::Name(name) if name.id.as_str() == "self")
+                {
+                    self.context.record_static_attribute(
+                        attribute.attr.as_str(),
+                        matches!(self.unit.scope, Scope::Class { .. }),
+                    );
+                }
                 self.compile_expression(&attribute.value)?;
                 let index = self.name_index(attribute.attr.as_str())?;
                 self.assembler
