@@ -9,6 +9,7 @@ use super::ir::{Item, Label};
 pub(super) struct LegacyNativeLabels {
     bindings: FxHashMap<Label, u32>,
     blocks: FxHashMap<BasicBlockId, u32>,
+    original_arrays: FxHashMap<BasicBlockId, usize>,
     certified: bool,
     invalidated: bool,
 }
@@ -39,7 +40,11 @@ impl LegacyNativeLabels {
     }
 
     /// Binds original native block labels after exact codegen alias resolution.
-    pub(super) fn initialize_blocks(&mut self, graph: &BlockGraph) {
+    pub(super) fn initialize_blocks(
+        &mut self,
+        graph: &BlockGraph,
+        original_arrays: &FxHashMap<BasicBlockId, usize>,
+    ) {
         if !self.certified {
             return;
         }
@@ -63,6 +68,56 @@ impl LegacyNativeLabels {
                 self.blocks.insert(block, native);
             }
         }
+        // Exception-range labels can split one original instruction array into
+        // physical fragments. Certify only groups beginning with a known native
+        // entry and no later native entry after live instructions. Unbound or
+        // unreferenced codegen entries retain the physical-block fallback.
+        let mut groups = FxHashMap::<usize, (Option<u32>, bool, bool)>::default();
+        for block in graph.order().iter().copied() {
+            let Some(&array) = original_arrays.get(&block) else {
+                continue;
+            };
+            let (label, seen_instruction, valid) =
+                groups
+                    .entry(array)
+                    .or_insert((None, false, self.blocks.contains_key(&block)));
+            if let Some(&bound) = self.blocks.get(&block) {
+                if *seen_instruction || label.is_some_and(|previous| previous != bound) {
+                    *valid = false;
+                }
+                *label = Some(bound);
+            }
+            *seen_instruction |= graph[block].last_instruction().is_some();
+        }
+        for block in graph.order().iter().copied() {
+            let Some(&array) = original_arrays.get(&block) else {
+                continue;
+            };
+            let &(label, _, valid) = &groups[&array];
+            if valid {
+                self.original_arrays.insert(block, array);
+                if let Some(label) = label {
+                    self.blocks.insert(block, label);
+                }
+            }
+        }
+    }
+
+    /// Checks native array occupancy without crossing an original source entry.
+    pub(super) fn target_is_nonempty(&self, graph: &BlockGraph, target: BasicBlockId) -> bool {
+        if graph[target].last_instruction().is_some() {
+            return true;
+        }
+        let Some(array) = self.original_arrays.get(&target) else {
+            return false;
+        };
+        let Some(index) = graph.order().iter().position(|block| *block == target) else {
+            return false;
+        };
+        graph.order()[index + 1..]
+            .iter()
+            .take_while(|block| self.original_arrays.get(block) == Some(array))
+            .any(|block| graph[*block].last_instruction().is_some())
     }
 
     pub(super) fn block_label(&self, block: BasicBlockId) -> Option<u32> {
@@ -93,5 +148,103 @@ impl LegacyNativeLabels {
             *next += 1;
             label
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::assembler::{Instruction, Operand, SourceLocation};
+    use crate::target::opcodes::{NOP, RETURN_VALUE};
+    use rustc_hash::FxHashSet;
+
+    fn fragmented_graph() -> BlockGraph {
+        BlockGraph::from_items(
+            vec![
+                Item::Label(Label(0)),
+                Item::Instruction(Instruction::new(
+                    NOP,
+                    Operand::Value(0),
+                    SourceLocation::NONE,
+                    None,
+                )),
+                Item::Label(Label(1)),
+                Item::Instruction(Instruction::new(
+                    RETURN_VALUE,
+                    Operand::Value(0),
+                    SourceLocation::NONE,
+                    None,
+                )),
+            ],
+            &FxHashSet::default(),
+        )
+    }
+
+    #[test]
+    fn native_array_label_survives_an_empty_metadata_head() {
+        let mut graph = fragmented_graph();
+        let head = graph.label_block(Label(0)).unwrap();
+        let tail = graph.label_block(Label(1)).unwrap();
+        let arrays = [(head, 7), (tail, 7)].into_iter().collect();
+        let mut native = LegacyNativeLabels::default();
+        native.bind(Label(0), 255);
+        native.certify();
+        native.initialize_blocks(&graph, &arrays);
+        graph.retain_items(head, |item| matches!(item, Item::Label(_)));
+
+        assert!(native.is_certified());
+        assert!(native.target_is_nonempty(&graph, head));
+        assert_eq!(native.block_label(tail), Some(255));
+        assert_eq!(native.next_cfg_label(&graph), 256);
+        let mut next = 256;
+        assert_eq!(native.allocate_for_block(tail, &mut next), 255);
+        assert_eq!(next, 256);
+        graph.retain_items(tail, |item| matches!(item, Item::Label(_)));
+        assert!(!native.target_is_nonempty(&graph, head));
+    }
+
+    #[test]
+    fn native_fragment_certificate_declines_unknown_and_distinct_entries() {
+        // Unknown original entry, later native entry after live instructions,
+        // distinct native entries in one coarse array, and a real next array.
+        for case in 0..4 {
+            let mut graph = fragmented_graph();
+            let head = graph.label_block(Label(0)).unwrap();
+            let tail = graph.label_block(Label(1)).unwrap();
+            let arrays = [(head, 7), (tail, if case == 3 { 8 } else { 7 })]
+                .into_iter()
+                .collect();
+            let mut native = LegacyNativeLabels::default();
+            if case >= 2 {
+                native.bind(Label(0), 255);
+            }
+            if case == 1 || case == 2 {
+                native.bind(Label(1), 256);
+            }
+            native.certify();
+            native.initialize_blocks(&graph, &arrays);
+            graph.retain_items(head, |item| matches!(item, Item::Label(_)));
+            assert!(native.is_certified());
+            assert!(!native.target_is_nonempty(&graph, head), "case {case}");
+            assert_eq!(
+                native.block_label(tail),
+                (case == 1 || case == 2).then_some(256)
+            );
+        }
+    }
+
+    #[test]
+    fn native_fragment_certificate_never_skips_an_intervening_array() {
+        let mut graph = fragmented_graph();
+        let head = graph.label_block(Label(0)).unwrap();
+        let tail = graph.label_block(Label(1)).unwrap();
+        let arrays = [(head, 7), (tail, 7)].into_iter().collect();
+        let mut native = LegacyNativeLabels::default();
+        native.bind(Label(0), 255);
+        native.certify();
+        native.initialize_blocks(&graph, &arrays);
+        graph.retain_items(head, |item| matches!(item, Item::Label(_)));
+        graph.insert_block(1, vec![Item::Label(Label(2))]);
+        assert!(!native.target_is_nonempty(&graph, head));
     }
 }

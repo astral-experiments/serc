@@ -128,7 +128,7 @@ impl OptimizationPipeline {
         mut constants: Option<&mut dyn ConstantTable>,
     ) -> Result<LayoutAssembler, CompileError> {
         let original_arrays = self.legacy_instruction_arrays();
-        self.initialize_legacy_native_jump_seeds();
+        self.initialize_legacy_native_jump_seeds(&original_arrays);
         self.reject_unmodeled_empty_native_jump_targets();
         self.preserve_legacy_setup_nops();
         if self.python_version == PythonVersion::Py313 {
@@ -312,11 +312,14 @@ impl OptimizationPipeline {
     }
 
     /// Freezes native jump operands before any pointer-only CFG retargeting.
-    fn initialize_legacy_native_jump_seeds(&mut self) {
+    fn initialize_legacy_native_jump_seeds(
+        &mut self,
+        original_arrays: &FxHashMap<BasicBlockId, usize>,
+    ) {
         let Some(native) = self.legacy_native_labels.as_mut() else {
             return;
         };
-        native.initialize_blocks(&self.graph);
+        native.initialize_blocks(&self.graph, original_arrays);
         if !native.is_certified() {
             return;
         }
@@ -452,7 +455,7 @@ impl OptimizationPipeline {
                 };
                 self.graph
                     .label_block(target)
-                    .is_none_or(|target| self.graph[target].last_instruction().is_none())
+                    .is_none_or(|target| !native.target_is_nonempty(&self.graph, target))
             })
         {
             native.invalidate();
@@ -1780,7 +1783,8 @@ mod tests {
                 .original_comprehension_normal_exits
                 .push((normal_end, captured_normal_exit));
             let mut pipeline = assembler.into_optimization_pipeline();
-            pipeline.initialize_legacy_native_jump_seeds();
+            let original_arrays = pipeline.legacy_instruction_arrays();
+            pipeline.initialize_legacy_native_jump_seeds(&original_arrays);
             let expected = (unknown_capture == 0).then_some(u8::from(native_label > 255));
             let normal_expected =
                 (unknown_capture == 0).then_some(u8::from(native_label + 1 > 255));

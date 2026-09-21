@@ -15847,6 +15847,26 @@ impl Compiler<'_> {
         let body = self.assembler.label();
         let anchor = self.assembler.label();
         let end = self.assembler.label();
+        for (role, label) in [
+            (
+                super::legacy_native_labels::NativeRole::WhileLoop(statement.range),
+                start,
+            ),
+            (
+                super::legacy_native_labels::NativeRole::WhileBody(statement.range),
+                body,
+            ),
+            (
+                super::legacy_native_labels::NativeRole::WhileEnd(statement.range),
+                end,
+            ),
+            (
+                super::legacy_native_labels::NativeRole::WhileAnchor(statement.range),
+                anchor,
+            ),
+        ] {
+            self.bind_native_source_label(role, label);
+        }
         self.assembler.mark(start);
         if self.context.python_version == crate::PythonVersion::Py312 {
             // The initial test is a native block even when only the repeated test
@@ -15926,6 +15946,30 @@ impl Compiler<'_> {
             self.assembler.record_folded_predecessor_source(start, end);
             // Folding the test preserves the authored loop body's separate original array.
             let body = self.assembler.label();
+            if statement.orelse.is_empty() {
+                // The initial folded-test NOP separates Loop from Body. Only
+                // Anchor and End share an original offset when else is empty.
+                for (role, label) in [
+                    (
+                        super::legacy_native_labels::NativeRole::WhileLoop(statement.range),
+                        start,
+                    ),
+                    (
+                        super::legacy_native_labels::NativeRole::WhileBody(statement.range),
+                        body,
+                    ),
+                    (
+                        super::legacy_native_labels::NativeRole::WhileEnd(statement.range),
+                        end,
+                    ),
+                    (
+                        super::legacy_native_labels::NativeRole::WhileAnchor(statement.range),
+                        end,
+                    ),
+                ] {
+                    self.bind_native_source_label(role, label);
+                }
+            }
             self.assembler.record_exception_owner_block_boundary(body);
             // Borrowed-reference producers are indexed within that original array,
             // including CPython's shadowed index for IMPORT_FROM and similar opcodes.
@@ -17798,6 +17842,18 @@ impl Compiler<'_> {
         if statement.handlers.is_empty() {
             return Err(unsupported("try statement without handlers"));
         }
+        // CPython folds every successful arm of a trailing nested conversion chain directly onto
+        // the iterator backedge. Restrict that layout to recursive one-call try/except/else arms
+        // so ordinary nested handlers keep their shared joins.
+        let nested_loop_conversion_try = self.control.in_iterator_loop()
+            && !self.control.statements.current_statement_has_following
+            && is_loop_conversion_try(statement)
+            && (!self.control.exceptions.active_exception_handlers.is_empty()
+                || statement.handlers.iter().any(|handler| {
+                    handler
+                        .as_except_handler()
+                        .is_some_and(|handler| matches!(handler.body.as_slice(), [Stmt::Try(_)]))
+                }));
         // Only this ordinary source route preserves the native shared joins.
         // Unsupported lowering leaves its planned roles unconsumed, cancelling
         // the complete certificate without guessing transformed label aliases.
@@ -17806,6 +17862,9 @@ impl Compiler<'_> {
             && emit_statement_nop
             && !exclude_terminal_body_not_taken
             && !retained_else_break_exit
+            // This eager backedge has already replaced native JUMP TryEnd;
+            // its live loop target cannot supply the original native operand.
+            && !nested_loop_conversion_try
             && loop_tail.is_none()
             && else_loop_tail.is_none()
             && else_match_tail.is_none();
@@ -17911,18 +17970,6 @@ impl Compiler<'_> {
                 .as_except_handler()
                 .is_some_and(|handler| handler.type_.is_none())
         });
-        // CPython folds every successful arm of a trailing nested conversion chain directly onto
-        // the iterator backedge. Restrict that layout to recursive one-call try/except/else arms
-        // so ordinary nested handlers keep their shared joins.
-        let nested_loop_conversion_try = self.control.in_iterator_loop()
-            && !self.control.statements.current_statement_has_following
-            && is_loop_conversion_try(statement)
-            && (!self.control.exceptions.active_exception_handlers.is_empty()
-                || statement.handlers.iter().any(|handler| {
-                    handler
-                        .as_except_handler()
-                        .is_some_and(|handler| matches!(handler.body.as_slice(), [Stmt::Try(_)]))
-                }));
         let has_tuple_handler = statement.handlers.iter().any(|handler| {
             handler
                 .as_except_handler()

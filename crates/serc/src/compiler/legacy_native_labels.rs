@@ -41,6 +41,10 @@ pub(super) enum NativeRole {
     ForBody(TextRange),
     ForCleanup(TextRange),
     ForEnd(TextRange),
+    WhileLoop(TextRange),
+    WhileBody(TextRange),
+    WhileEnd(TextRange),
+    WhileAnchor(TextRange),
     ComprehensionCleanup(TextRange),
     ComprehensionEnd(TextRange),
     ComprehensionStart(TextRange),
@@ -92,7 +96,7 @@ struct Builder {
     labels: Vec<(NativeRole, Option<usize>)>,
     manager_depth: usize,
     handler_depth: usize,
-    for_manager_depths: Vec<usize>,
+    loop_manager_depths: Vec<usize>,
     inside_comprehension_body: bool,
 }
 
@@ -226,7 +230,7 @@ impl Builder {
                     let end = self.allocate(NativeRole::ForEnd(statement.range));
                     // Native pushes FOR_LOOP before evaluating the iterable. A
                     // continue can reuse its start only without crossing a manager.
-                    self.for_manager_depths.push(self.manager_depth);
+                    self.loop_manager_depths.push(self.manager_depth);
                     self.expression(&statement.iter)?;
                     self.instruction(); // GET_ITER
                     self.mark(start);
@@ -238,20 +242,19 @@ impl Builder {
                     self.instruction(); // original backedge, including dead source
                     self.mark(cleanup);
                     self.instruction(); // END_FOR
-                    self.for_manager_depths.pop();
+                    self.loop_manager_depths.pop();
                     self.suite(&statement.orelse)?;
                     self.mark(end);
                 }
-                Stmt::Break(_) if self.for_manager_depths.last() == Some(&self.manager_depth) => {
-                    self.instruction(); // original break NOP
-                    self.instruction(); // POP_TOP unwinds the nearest For iterator
-                    self.instruction(); // JUMP to the existing ForEnd, after else
+                Stmt::While(statement) => self.while_statement(statement)?,
+                Stmt::Break(_) if self.loop_manager_depths.last() == Some(&self.manager_depth) => {
+                    self.instruction(); // original NOP, optional iterator cleanup and exit jump
                 }
                 Stmt::Continue(_)
-                    if self.for_manager_depths.last() == Some(&self.manager_depth) =>
+                    if self.loop_manager_depths.last() == Some(&self.manager_depth) =>
                 {
                     self.instruction(); // original continue NOP
-                    self.instruction(); // JUMP to the existing nearest ForStart
+                    self.instruction(); // JUMP to the existing nearest loop start
                 }
                 Stmt::Assert(statement) => {
                     let end = self.allocate(NativeRole::AssertEnd(statement.range));
@@ -333,13 +336,38 @@ impl Builder {
         Some(())
     }
 
+    /// Mirrors both original tests of `compiler_while`, including dead source.
+    fn while_statement(&mut self, statement: &ruff_python_ast::StmtWhile) -> Option<()> {
+        let literal_true =
+            matches!(statement.test.as_ref(), Expr::BooleanLiteral(value) if value.value);
+        if !(runtime_condition(&statement.test) || literal_true && statement.orelse.is_empty()) {
+            return None;
+        }
+        let start = self.allocate(NativeRole::WhileLoop(statement.range));
+        let body = self.allocate(NativeRole::WhileBody(statement.range));
+        let end = self.allocate(NativeRole::WhileEnd(statement.range));
+        let anchor = self.allocate(NativeRole::WhileAnchor(statement.range));
+        self.mark(start);
+        self.loop_manager_depths.push(self.manager_depth);
+        // Native's original LOAD_CONST / conditional also separates the marks
+        // for literal True. Constant folding is a later CFG operation.
+        self.condition(&statement.test, false)?;
+        self.mark(body);
+        self.suite(&statement.body)?;
+        self.condition(&statement.test, true)?;
+        self.loop_manager_depths.pop();
+        self.mark(anchor);
+        self.suite(&statement.orelse)?;
+        self.mark(end);
+        // Flat Boolean tests reserve their join in only one polarity. Tests
+        // that allocate the same source role twice invalidate the whole plan
+        // in finalization; neither visit may borrow the other's native labels.
+        Some(())
+    }
+
     /// Mirrors typed `compiler_try_except` handlers with their original shared join.
     fn try_except(&mut self, statement: &ruff_python_ast::StmtTry) -> Option<()> {
-        if statement.is_star
-            || statement.handlers.is_empty()
-            || !statement.finalbody.is_empty()
-            || !statement.orelse.is_empty()
-        {
+        if statement.is_star || statement.handlers.is_empty() || !statement.finalbody.is_empty() {
             return None;
         }
         // Native reserves all four before visiting the protected suite. The
@@ -351,7 +379,9 @@ impl Builder {
         self.instruction(); // SETUP_FINALLY
         self.mark(body);
         self.suite(&statement.body)?;
-        self.instruction(); // original POP_BLOCK and JUMP End, even after an exit
+        self.instruction(); // original POP_BLOCK, even after an exit
+        self.suite(&statement.orelse)?;
+        self.instruction(); // JUMP End follows else, before any handler labels
         self.mark(except);
         self.instruction(); // SETUP_CLEANUP and PUSH_EXC_INFO
         for handler in &statement.handlers {
@@ -1065,7 +1095,7 @@ mod tests {
     fn unsupported_or_constant_elif_invalidates_the_whole_plan() {
         for source in [
             "def f(a):\n    if a:\n        pass\n    elif True:\n        pass\n",
-            "def f(a, b):\n    if a:\n        return\n    elif b:\n        return\n        while work():\n            pass\n",
+            "def f(a, b):\n    if a:\n        return\n    elif b:\n        return\n        while False:\n            pass\n",
         ] {
             let parsed = parse_module(source).unwrap();
             let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
@@ -1220,19 +1250,12 @@ mod tests {
 
     #[test]
     fn unsupported_for_routes_reject_the_whole_scope() {
-        for source in [
-            "async def f(xs):\n    async for item in xs:\n        pass\n",
-            "def f(xs):\n    while xs:\n        break\n",
-        ] {
-            let parsed = parse_module(source).unwrap();
-            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
-                panic!()
-            };
-            assert!(
-                NativeLabelPlan::function(&function.body, function.is_async).is_none(),
-                "{source}"
-            );
-        }
+        let source = "async def f(xs):\n    async for item in xs:\n        pass\n";
+        let parsed = parse_module(source).unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        assert!(NativeLabelPlan::function(&function.body, function.is_async).is_none());
     }
 
     #[test]
@@ -1272,7 +1295,10 @@ mod tests {
 
     #[test]
     fn unsupported_dead_source_invalidates_the_entire_native_plan() {
-        let parsed = parse_module("async def f():\n    await action()\n    return\n    while condition():\n        pass\n").unwrap();
+        let parsed = parse_module(
+            "async def f():\n    await action()\n    return\n    while False:\n        pass\n",
+        )
+        .unwrap();
         let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
             panic!()
         };
@@ -1487,7 +1513,6 @@ mod manager_tests {
         for source in [
             "def f(items, cm):\n    for first, second in items:\n        with cm:\n            continue\n",
             "def f(items):\n    for first, second in items:\n        pass\n    else:\n        continue\n",
-            "def f(items):\n    while items:\n        continue\n",
         ] {
             let parsed = parse_module(source).unwrap();
             let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
@@ -1776,7 +1801,6 @@ mod manager_tests {
         for source in [
             "def f(items, cm):\n    for item in items:\n        with cm:\n            break\n",
             "def f(items):\n    for item in items:\n        pass\n    else:\n        break\n",
-            "def f(items):\n    while items:\n        break\n",
             "async def f(items):\n    async for item in items:\n        break\n",
         ] {
             let parsed = parse_module(source).unwrap();
@@ -1938,7 +1962,6 @@ mod ordinary_except_tests {
     fn unsupported_handlers_reject_the_entire_native_label_plan() {
         for source in [
             "def f():\n    try:\n        action()\n    except:\n        pass\n",
-            "def f():\n    try:\n        action()\n    except Error:\n        pass\n    else:\n        done()\n",
             "def f():\n    try:\n        action()\n    except Error:\n        pass\n    finally:\n        done()\n",
             "def f():\n    try:\n        action()\n    except* Error:\n        pass\n",
             "def f():\n    try:\n        action()\n    except Error:\n        if flag:\n            return value\n",
@@ -2361,5 +2384,192 @@ mod expression_family_tests {
             assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 18);
             assert_eq!(plan.remaining.len(), 18);
         }
+    }
+}
+
+#[cfg(test)]
+mod while_else_tests {
+    use super::{NativeLabelPlan, NativeRole};
+    use ruff_python_ast::{Expr, Stmt};
+    use ruff_python_parser::parse_module;
+
+    #[test]
+    fn runtime_and_true_while_keep_distinct_entry_body_and_shared_empty_else() {
+        for condition in ["flag", "True"] {
+            let source = format!("def f():\n    while {condition}:\n        continue\n");
+            let parsed = parse_module(&source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            let [Stmt::While(statement)] = function.body.as_slice() else {
+                panic!()
+            };
+            let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+            assert_eq!(plan.remaining[&NativeRole::WhileLoop(statement.range)], 2);
+            assert_eq!(plan.remaining[&NativeRole::WhileBody(statement.range)], 3);
+            assert_eq!(plan.remaining[&NativeRole::WhileEnd(statement.range)], 5);
+            assert_eq!(plan.remaining[&NativeRole::WhileAnchor(statement.range)], 5);
+            assert_eq!(plan.remaining.len(), 5);
+        }
+    }
+
+    #[test]
+    fn while_else_labels_follow_both_tests_and_precede_following_source() {
+        let parsed = parse_module("async def f():\n    while flag:\n        await step()\n    else:\n        await finished()\n    await done()\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::While(statement), Stmt::Expr(after)] = function.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::Expr(body)] = statement.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::Expr(otherwise)] = statement.orelse.as_slice() else {
+            panic!()
+        };
+        let (Expr::Await(body), Expr::Await(otherwise), Expr::Await(after)) = (
+            body.value.as_ref(),
+            otherwise.value.as_ref(),
+            after.value.as_ref(),
+        ) else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        assert_eq!(plan.remaining[&NativeRole::WhileAnchor(statement.range)], 5);
+        assert_eq!(plan.remaining[&NativeRole::WhileEnd(statement.range)], 4);
+        assert_eq!(plan.remaining[&NativeRole::AwaitSend(body.range)], 6);
+        assert_eq!(plan.remaining[&NativeRole::AwaitSend(otherwise.range)], 9);
+        assert_eq!(plan.remaining[&NativeRole::AwaitSend(after.range)], 12);
+        assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 15);
+    }
+
+    #[test]
+    fn while_boolean_join_belongs_to_only_one_original_test() {
+        for (operator, body_ordinal, exit_ordinal) in [("and", 3, 6), ("or", 6, 5)] {
+            let source = format!("def f():\n    while a {operator} b:\n        pass\n");
+            let parsed = parse_module(&source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            let [Stmt::While(statement)] = function.body.as_slice() else {
+                panic!()
+            };
+            let Expr::BoolOp(boolean) = statement.test.as_ref() else {
+                panic!()
+            };
+            let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+            assert_eq!(
+                plan.remaining[&NativeRole::ConditionBoolEnd(boolean.range)],
+                6
+            );
+            assert_eq!(
+                plan.remaining[&NativeRole::WhileBody(statement.range)],
+                body_ordinal
+            );
+            assert_eq!(
+                plan.remaining[&NativeRole::WhileAnchor(statement.range)],
+                exit_ordinal
+            );
+            assert_eq!(
+                plan.remaining[&NativeRole::WhileEnd(statement.range)],
+                exit_ordinal
+            );
+            assert_eq!(plan.remaining.len(), 6);
+        }
+    }
+
+    #[test]
+    fn repeated_condition_roles_and_unsupported_constant_loops_reject_whole_plan() {
+        for source in [
+            "def f():\n    while False:\n        pass\n",
+            "def f():\n    while True:\n        pass\n    else:\n        done()\n",
+            "def f():\n    while (a if flag else b):\n        pass\n",
+            "def f():\n    while (a or b) < c:\n        pass\n",
+            "def f():\n    while (a or b) and c:\n        pass\n",
+            "async def f():\n    while await ready():\n        pass\n",
+        ] {
+            let parsed = parse_module(source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(
+                NativeLabelPlan::function(&function.body, function.is_async).is_none(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn while_transfers_use_nearest_loop_and_pop_it_before_else() {
+        for source in [
+            "def f():\n    with manager():\n        while flag:\n            break\n",
+            "def f():\n    while flag:\n        for item in items:\n            continue\n        break\n",
+            "def f():\n    for item in items:\n        while flag:\n            break\n        else:\n            continue\n",
+            "def f():\n    while flag:\n        try:\n            action()\n        except Error:\n            continue\n",
+            "def f():\n    while a and (b or c):\n        pass\n",
+        ] {
+            let parsed = parse_module(source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(
+                NativeLabelPlan::function(&function.body, false).is_some(),
+                "{source}"
+            );
+        }
+        for source in [
+            "def f():\n    while flag:\n        with manager():\n            break\n",
+            "def f():\n    for item in items:\n        with manager():\n            while flag:\n                break\n            else:\n                continue\n",
+        ] {
+            let parsed = parse_module(source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(
+                NativeLabelPlan::function(&function.body, false).is_none(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_try_else_allocates_its_expression_labels_before_handlers() {
+        let parsed = parse_module("async def f():\n    try:\n        await work()\n    except Error as error:\n        handle()\n    else:\n        if flag:\n            await success()\n    await done()\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::Try(statement), Stmt::Expr(after)] = function.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::If(branch)] = statement.orelse.as_slice() else {
+            panic!()
+        };
+        let [Stmt::Expr(otherwise)] = branch.body.as_slice() else {
+            panic!()
+        };
+        let (Expr::Await(otherwise), Expr::Await(after)) =
+            (otherwise.value.as_ref(), after.value.as_ref())
+        else {
+            panic!()
+        };
+        let handler = statement.handlers[0].as_except_handler().unwrap();
+        let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        assert_eq!(plan.remaining[&NativeRole::TryBody(statement.range)], 2);
+        assert_eq!(plan.remaining[&NativeRole::TryExcept(statement.range)], 3);
+        assert_eq!(plan.remaining[&NativeRole::IfEnd(branch.range)], 9);
+        assert_eq!(plan.remaining[&NativeRole::AwaitSend(otherwise.range)], 10);
+        assert_eq!(plan.remaining[&NativeRole::HandlerNext(handler.range)], 13);
+        assert_eq!(
+            plan.remaining[&NativeRole::HandlerCleanupEnd(handler.range)],
+            14
+        );
+        assert_eq!(
+            plan.remaining[&NativeRole::HandlerCleanupBody(handler.range)],
+            15
+        );
+        assert_eq!(plan.remaining[&NativeRole::AwaitSend(after.range)], 16);
+        assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 19);
+        assert_eq!(plan.remaining.len(), 19);
     }
 }
