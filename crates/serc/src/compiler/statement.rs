@@ -3,11 +3,11 @@ use ruff_python_ast::{BoolOp, CmpOp, Expr, Pattern, PatternKeyword, Singleton, S
 use ruff_text_size::{Ranged, TextRange};
 
 use super::{
-    BINARY_SLICE, BUILD_LIST, BUILD_MAP, BUILD_SET, BUILD_TUPLE, CALL, CHECK_EG_MATCH,
-    CHECK_EXC_MATCH, CLEANUP_THROW, COPY, END_ASYNC_FOR, END_FOR, END_SEND, FOR_ITER, GET_AITER,
-    GET_ANEXT, GET_ITER, IMPORT_FROM, IMPORT_NAME, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT,
-    JUMP_FORWARD, LIST_APPEND, LOAD_ATTR, LOAD_CONST, LOAD_DEREF, LOAD_FAST_AND_CLEAR, LOAD_GLOBAL,
-    LOAD_SMALL_INT, MAP_ADD, NOP, NOT_TAKEN, POP_EXCEPT, POP_ITER, POP_JUMP_IF_FALSE,
+    BEFORE_ASYNC_WITH, BEFORE_WITH, BINARY_SLICE, BUILD_LIST, BUILD_MAP, BUILD_SET, BUILD_TUPLE,
+    CALL, CHECK_EG_MATCH, CHECK_EXC_MATCH, CLEANUP_THROW, COPY, END_ASYNC_FOR, END_SEND, FOR_ITER,
+    GET_AITER, GET_ANEXT, GET_ITER, IMPORT_FROM, IMPORT_NAME, JUMP_BACKWARD,
+    JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, LIST_APPEND, LOAD_ATTR, LOAD_CONST, LOAD_DEREF,
+    LOAD_FAST_AND_CLEAR, LOAD_GLOBAL, MAP_ADD, NOP, NOT_TAKEN, POP_EXCEPT, POP_JUMP_IF_FALSE,
     POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP, PUSH_EXC_INFO, PUSH_NULL,
     RAISE_VARARGS, RETURN_VALUE, SEND, SET_ADD, STORE_ATTR, STORE_SLICE, STORE_SUBSCR, SWAP,
     TO_BOOL, WITH_EXCEPT_START, YIELD_VALUE,
@@ -36,7 +36,10 @@ use super::expression::{
     expression_suspends_current_scope, jump_constant_truthiness, optimized_generator_callable,
     optimized_generator_callable_for_target,
 };
-use super::scope::{NameId, NameSet, ReferenceCollector, collect_target_names};
+use super::scope::{
+    NameId, NameSet, ReferenceCollector, collect_target_names, function_annotation_expressions,
+    parameter_default_expressions,
+};
 use super::source::{
     condition_exit_range, implicit_return_range, synthetic_condition_exit_range,
     unary_not_condition_exit_range, unparse_annotation,
@@ -144,6 +147,7 @@ struct FinallyProtectedLoopRanges {
 
 #[derive(Clone, Debug)]
 struct FinallyExitContext {
+    source_range: TextRange,
     body: Vec<Stmt>,
     enclosing_finally_try_depth: usize,
     pass_finally_depth: usize,
@@ -202,6 +206,7 @@ struct TryMarkerSlotContext {
 
 #[derive(Clone, Copy, Debug)]
 struct WithExitContext {
+    source_range: TextRange,
     location: SourceLocation,
     handler: Label,
     is_async: bool,
@@ -453,6 +458,9 @@ pub(super) struct ExceptionState {
 
 #[derive(Debug, Default)]
 pub(super) struct FinallyState {
+    // A complete two-level source certificate uses recursive native return
+    // unwinding even when both finalizers replace the pending return.
+    copies_terminating_finally_returns: bool,
     // The direct tail statement is followed by the copied lexical unwind.
     copied_finally_tail: Option<TextRange>,
     // CPython retains the normal finally exit when it directly ends a synchronous with body.
@@ -1508,6 +1516,31 @@ impl Compiler<'_> {
             && self.control.finally.active_finally_try_bodies == 0
     }
 
+    /// Retains the `JoinedStr` wrapper used when AST folding would create a docstring.
+    pub(super) fn compile_scope_suite(
+        &mut self,
+        body: &[Stmt],
+        final_expression_becomes_return: bool,
+        has_docstring: bool,
+    ) -> Result<(), CompileError> {
+        if self.context.python_version <= crate::PythonVersion::Py313
+            && !has_docstring
+            && let Some((statement @ Stmt::Expr(expression), remaining)) = body.split_first()
+            && !is_literal_constant(&expression.value)
+            && matches!(
+                self.source_aware_fold_constant(&expression.value),
+                Some(Constant::String(_) | Constant::SurrogateString(_))
+            )
+        {
+            // CPython wraps this first folded string in JoinedStr so it cannot
+            // become a docstring. It still emits a load/pop and admits its constant.
+            self.compile_statement(statement)?;
+            self.compile_suite_inner(remaining, final_expression_becomes_return)
+        } else {
+            self.compile_suite_inner(body, final_expression_becomes_return)
+        }
+    }
+
     pub(super) fn compile_suite(&mut self, body: &[Stmt]) -> Result<(), CompileError> {
         self.compile_suite_inner(body, false)
     }
@@ -1632,7 +1665,8 @@ impl Compiler<'_> {
             if is_final && final_expression_becomes_return {
                 match statement {
                     Stmt::While(statement)
-                        if statement.orelse.is_empty()
+                        if self.context.python_version >= crate::PythonVersion::Py314
+                            && statement.orelse.is_empty()
                             && !suite_contains_loop_break(&statement.body)
                             && matches!(statement.test.as_ref(), Expr::BoolOp(boolean) if boolean.op == BoolOp::And && boolean.values.len() > 1) =>
                     {
@@ -1642,7 +1676,9 @@ impl Compiler<'_> {
                     }
                     Stmt::While(statement)
                         if statement.orelse.is_empty()
-                            && suite_contains_loop_break(&statement.body) =>
+                            && suite_contains_loop_break(&statement.body)
+                            && (self.context.python_version >= crate::PythonVersion::Py314
+                                || early_condition_truthiness(&statement.test) == Some(true)) =>
                     {
                         self.compile_terminal_while_break(statement)?;
                         self.control.statements.emitted_fallthrough_return = true;
@@ -1698,7 +1734,7 @@ impl Compiler<'_> {
                         if matches!(assignment.value.as_ref(), Expr::If(_))
                             && self.control.statements.terminal_assignment_return_boundary
                                 != Some(assignment.range)
-                            && Self::terminal_assignment_if_expression_requires_specialization(
+                            && self.terminal_assignment_if_expression_requires_specialization(
                                 assignment,
                             ) =>
                     {
@@ -1710,12 +1746,58 @@ impl Compiler<'_> {
                         continue;
                     }
                     Stmt::With(statement) if !statement.is_async => {
-                        self.compile_with_statement(statement, true, None)?;
+                        if self.context.python_version == crate::PythonVersion::Py312 {
+                            // Keep the shared footer after both manager exits, before
+                            // the coroutine's separate stop-iteration handler label.
+                            self.compile_with_statement(statement, false, None)?;
+                            self.assembler.set_location(SourceLocation::NONE);
+                            self.emit_deferred_implicit_return()?;
+                        } else {
+                            self.compile_with_statement(statement, true, None)?;
+                        }
                         self.control.statements.emitted_fallthrough_return = true;
                         continue;
                     }
                     Stmt::With(statement) => {
-                        self.compile_async_with(statement, true)?;
+                        if self.context.python_version == crate::PythonVersion::Py312 {
+                            // Native 3.12 emits both manager exits before its shared
+                            // unlocated footer. Keep that original block until CFG
+                            // copying, so the manager end and StopIteration handler
+                            // retain their distinct original label operands.
+                            self.compile_async_with(statement, false)?;
+                            self.assembler.set_location(SourceLocation::NONE);
+                            self.emit_deferred_implicit_return()?;
+                        } else {
+                            self.compile_async_with(statement, true)?;
+                        }
+                        self.control.statements.emitted_fallthrough_return = true;
+                        continue;
+                    }
+                    Stmt::Try(statement)
+                        if !statement.is_star
+                            && match self.context.python_version {
+                                crate::PythonVersion::Py312 => true,
+                                crate::PythonVersion::Py313 => {
+                                    statement.orelse.is_empty()
+                                        && statement.finalbody.is_empty()
+                                        && matches!(statement.body.last(), Some(Stmt::While(_)))
+                                }
+                                _ => false,
+                            } =>
+                    {
+                        // Native 3.12 emits every ordinary try's normal and handler
+                        // jumps to one shared footer after all cleanup blocks, including
+                        // finally copies. Preserve that original End and its operands
+                        // until CFG copying; its footer also separates FinallyExit from
+                        // the coroutine's StopIterationHandler. The 3.13 loop route
+                        // keeps this ordering for its nested exits and cleanup jumps.
+                        let previous = self.assembler.location();
+                        self.assembler
+                            .set_location(self.source_location(statement.range));
+                        self.compile_try_inner(statement, TryCompileOptions::STANDARD)?;
+                        self.assembler.set_location(SourceLocation::NONE);
+                        self.emit_deferred_implicit_return()?;
+                        self.assembler.set_location(previous);
                         self.control.statements.emitted_fallthrough_return = true;
                         continue;
                     }
@@ -1726,6 +1808,18 @@ impl Compiler<'_> {
                         let result = self.compile_try_inner(statement, TryCompileOptions::TERMINAL);
                         self.assembler.set_location(previous);
                         result?;
+                        self.control.statements.emitted_fallthrough_return = true;
+                        continue;
+                    }
+                    Stmt::Match(statement)
+                        if self.context.python_version == crate::PythonVersion::Py312 =>
+                    {
+                        // Keep the original case-success jumps and one shared footer.
+                        // 3.12's two forward copy rounds must visit earlier case exits
+                        // before later compound joins acquire a copied return.
+                        self.compile_match(statement)?;
+                        self.assembler.set_location(SourceLocation::NONE);
+                        self.emit_deferred_implicit_return()?;
                         self.control.statements.emitted_fallthrough_return = true;
                         continue;
                     }
@@ -1811,6 +1905,28 @@ impl Compiler<'_> {
                 && (self.control.exceptions.active_exception_region_exclusions.is_empty()
                     || self.control.finally.active_finally_end_blocks > 0
                     || protected_async_with_pass
+                    // A direct synchronous manager tail transfers its authored
+                    // Pass location to the following converted POP_BLOCK.
+                    || (self.context.python_version <= crate::PythonVersion::Py313
+                        && body.len() > 1
+                        && self.control.withs.active_with_exits.last().is_some_and(|manager| {
+                            !manager.is_async
+                                && manager.terminal_statement_range == Some(statement.range)
+                        }))
+                    // Legacy exits start unlocated. Keep an authored trailing Pass
+                    // after work or a join until CFG copying and line propagation,
+                    // rather than replacing its donor with the preceding instruction.
+                    || (self.context.python_version <= crate::PythonVersion::Py313
+                        && body.len() > 1
+                        && (self.control.withs.active_with_exits.is_empty()
+                            || self.control.exceptions.active_exception_handlers.last().is_some_and(
+                                |handler| {
+                                    // A direct handler tail owns its Pass even inside a
+                                    // manager. Its artificial cleanup inherits this span.
+                                    handler.with_depth == self.control.withs.active_with_exits.len()
+                                        && handler.trailing_statement == Some(statement.range)
+                                },
+                            )))
                     || ((!is_final || inherited_statement_has_following)
                         && self.control.withs.active_with_exits.is_empty()))
                 && (self.control.withs.active_with_region_exclusions.is_empty() || body.len() > 1)
@@ -1859,9 +1975,15 @@ impl Compiler<'_> {
                     }
                 }
             } else if let Stmt::Expr(expression) = statement
-                && fold_constant(&expression.value).is_some()
+                && if self.context.python_version <= crate::PythonVersion::Py313 {
+                    self.return_value_is_constant(&expression.value)
+                } else {
+                    fold_constant(&expression.value).is_some()
+                }
             {
-                if literal_constant(&expression.value).is_none() {
+                if self.context.python_version >= crate::PythonVersion::Py314
+                    && literal_constant(&expression.value).is_none()
+                {
                     let first_fold = self.output.deferred_constants.len();
                     self.record_folded_value(&expression.value)?;
                     if self.context.python_version == crate::PythonVersion::Py315 {
@@ -1876,9 +1998,15 @@ impl Compiler<'_> {
                     statement.range()
                 };
                 self.assembler.set_location(self.source_location(range));
-                if index + 1 < body.len()
+                // Python 3.13 counts the final literal's NOP before copying small exits.
+                // Keep it until the later NOP cleanup to preserve that original budget.
+                if self.context.python_version == crate::PythonVersion::Py313
+                    || index + 1 < body.len()
                     || (!final_expression_becomes_return
-                        && !matches!(self.unit.scope, Scope::Class { .. }))
+                        && (!matches!(self.unit.scope, Scope::Class { .. })
+                            // Legacy CFG propagation needs the authored marker before
+                            // case exits and loop backedges can inherit its location.
+                            || self.context.python_version <= crate::PythonVersion::Py313))
                     || (matches!(self.unit.scope, Scope::Module)
                         && self.control.statements.in_terminal_if_branch_suite
                         && matches!(body.get(index.wrapping_sub(1)), Some(Stmt::With(previous))
@@ -1937,6 +2065,11 @@ impl Compiler<'_> {
                             // but CPython still counts it during the earlier exit-copy pass.
                             self.assembler.add_last_original_block_slots(1);
                         }
+                    } else if self.context.python_version <= crate::PythonVersion::Py313 {
+                        // Native constant statements stay in the current CFG block.
+                        // Artificial marker labels would interrupt line inheritance
+                        // after a same-line NOP disappears in the legacy optimizer.
+                        self.emit(NOP, 0, 0)?;
                     } else {
                         // Other constants retain boundaries used by following authored
                         // passes and terminal manager/branch line propagation.
@@ -2217,6 +2350,9 @@ impl Compiler<'_> {
                         .direct_comprehension_assignment_results
                         .clone()
                 } else if matches!(statement, Stmt::If(_) | Stmt::Try(_))
+                    // In 3.12, the try body's label starts a new high-local scan block.
+                    && (self.context.python_version != crate::PythonVersion::Py312
+                        || !matches!(statement, Stmt::Try(_)))
                     && let Some(Stmt::Assign(assignment)) = body.get(index - 1)
                     && matches!(
                         assignment.value.as_ref(),
@@ -2517,7 +2653,9 @@ impl Compiler<'_> {
     }
 
     fn mark_terminal_statement_implicit_return_boundary(&mut self, body: &[Stmt]) {
-        let needs_boundary = matches!(body.last(), Some(Stmt::Assign(_)))
+        let legacy = self.context.python_version <= crate::PythonVersion::Py313;
+        let needs_boundary = legacy
+            || matches!(body.last(), Some(Stmt::Assign(_)))
             || matches!(body.last(), Some(Stmt::Expr(expression))
                 if matches!(expression.value.as_ref(), Expr::Call(_)));
         if needs_boundary {
@@ -2525,6 +2663,9 @@ impl Compiler<'_> {
             // Keep that original boundary when terminal lowering distributes the return into
             // a branch, so an incoming jump cannot copy an assignment or call with the footer.
             let implicit_return = self.assembler.label();
+            if legacy {
+                self.assembler.preserve_block_boundary(implicit_return);
+            }
             self.assembler.mark(implicit_return);
         }
     }
@@ -2810,12 +2951,17 @@ impl Compiler<'_> {
                 compiler.compile_jump_if(&statement.test, false, condition_false)
             })?;
         }
-        if fold_constant(&statement.test).is_some_and(|constant| constant_truthiness(&constant)) {
+        let body_entry = if fold_constant(&statement.test)
+            .is_some_and(|constant| constant_truthiness(&constant))
+        {
             // The folded test and authored body retain separate original instruction arrays.
             let body = self.assembler.label();
             self.assembler.record_exception_owner_block_boundary(body);
             self.assembler.mark(body);
-        }
+            Some(body)
+        } else {
+            None
+        };
         if self.output.constants.is_empty()
             && let Some(FirstConstant::Literal(constant)) =
                 first_suite_constant(self, &statement.body)
@@ -2851,7 +2997,22 @@ impl Compiler<'_> {
                         clause.test.as_ref().is_none_or(condition_has_only_runtime_tests)
                     })
         );
-        if normalize_final_condition || complete_tail_has_no_fallthrough {
+        if self.context.python_version <= crate::PythonVersion::Py313
+            && let Some(body_entry) = body_entry
+        {
+            self.with_loop_context(context, |compiler| compiler.compile_suite(&statement.body))?;
+            if !suite_terminates(&statement.body) {
+                // The trailing constant test is still a NOP when jump threading runs.
+                // Its backedge targets the body; authored continue targets the header.
+                self.assembler
+                    .set_location(self.source_location(statement.test.range()));
+                self.emit(NOP, 0, 0)?;
+                let backedge = self.emit_jump_backward_instruction(JUMP_BACKWARD, body_entry)?;
+                // Jump emission compacts the NOP; its native phase barrier remains.
+                self.assembler.prevent_jump_threading_target(backedge);
+                self.assembler.record_last_original_loop_backedge();
+            }
+        } else if normalize_final_condition || complete_tail_has_no_fallthrough {
             // CPython normalizes a backward conditional jump by reversing it around an explicit
             // backedge. A final `if` keeps that layout when its body does work before breaking.
             // A terminating final else leaves no fallthrough into the original common
@@ -2982,8 +3143,7 @@ impl Compiler<'_> {
         self.set_depth(base_depth + self.iterator_slots() + 1);
         self.assembler
             .set_location(self.source_location(statement.iter.range()));
-        self.emit(END_FOR, 0, -1)?;
-        self.emit(POP_ITER, 0, -self.iterator_slots())?;
+        self.emit_end_for_cleanup()?;
         self.emit_implicit_return()?;
         self.set_depth(base_depth);
         Ok(())
@@ -3025,6 +3185,56 @@ impl Compiler<'_> {
         &mut self,
         statement: &ruff_python_ast::StmtIf,
     ) -> Result<(), CompileError> {
+        if self.context.python_version == crate::PythonVersion::Py312
+            && statement
+                .elif_else_clauses
+                .iter()
+                .any(|clause| clause.test.is_some())
+        {
+            // Native emits elif as nested If nodes with one original shared end.
+            // Keep that footer until legacy CFG optimization duplicates exits;
+            // eager per-arm returns lose the original end-label aliases.
+            self.compile_if(statement)?;
+            self.assembler.set_location(SourceLocation::NONE);
+            return self.emit_deferred_implicit_return();
+        }
+        if self.context.python_version <= crate::PythonVersion::Py313
+            && std::iter::once(statement.body.as_slice())
+                .chain(
+                    statement
+                        .elif_else_clauses
+                        .iter()
+                        .map(|clause| clause.body.as_slice()),
+                )
+                .any(|body| {
+                    matches!(body.last(), Some(Stmt::While(_)))
+                        || (self.context.python_version == crate::PythonVersion::Py312
+                            && (matches!(body.last(), Some(Stmt::Try(_) | Stmt::If(_) | Stmt::Match(_) | Stmt::For(_)))
+                                || matches!(body.last(), Some(Stmt::Expr(expression))
+                                    if matches!(expression.value.as_ref(), Expr::Await(_)))
+                                || suite_has_cold_only_terminal_if_continuation(body)
+                                || body.iter().any(|statement| {
+                                    matches!(statement, Stmt::Assign(assignment)
+                                    if super::expression::expression_defers_async_comprehension_restore(
+                                        &assignment.value,
+                                    ))
+                                })))
+                })
+        {
+            // Keep each compound arm's original jump to the shared footer. 3.12
+            // visits exit blocks in source order, so nested recovery exits cannot
+            // copy a return that a later arm exit has not acquired yet. Async
+            // comprehension restoration, loop exhaustion, ordinary await cleanup,
+            // and their continuations also stay cold until relocation inserts a bridge
+            // to the shared warm return. Keeping that original footer also preserves the
+            // terminal IfEnd label for native jump sizing.
+            // A runtime while's two false edges retain their unlocated shared exit until
+            // native exit duplication assigns each predecessor its own return. In 3.13
+            // this happens before folding; 3.12 duplicates exits after CFG optimization.
+            self.compile_if(statement)?;
+            self.assembler.set_location(SourceLocation::NONE);
+            return self.emit_deferred_implicit_return();
+        }
         if statement.elif_else_clauses.is_empty()
             && let Expr::Compare(comparison) = statement.test.as_ref()
             && comparison.ops.len() > 1
@@ -3061,6 +3271,9 @@ impl Compiler<'_> {
                 // The discarded true branch remains an empty original CFG block,
                 // stopping CPython's borrowing traversal before the selected else.
                 self.assembler.mark_last_borrow_fallthrough_barrier();
+            }
+            if !truthiness || self.context.python_version <= crate::PythonVersion::Py313 {
+                // Legacy constant folding retains the selected body's original array.
                 let selected = self.assembler.label();
                 self.assembler
                     .record_exception_owner_block_boundary(selected);
@@ -3119,6 +3332,17 @@ impl Compiler<'_> {
         for (branch_index, (test, body)) in branches.into_iter().enumerate() {
             if let Some(test) = test {
                 let next = self.assembler.label();
+                if self.context.python_version == crate::PythonVersion::Py312
+                    && statement.elif_else_clauses.is_empty()
+                {
+                    // Without an else, native compiler_if uses IfEnd as the false
+                    // target. Eager copies of the true arm's footer do not change
+                    // that source boundary or its original native label.
+                    self.bind_native_source_label(
+                        super::legacy_native_labels::NativeRole::IfEnd(statement.range),
+                        next,
+                    );
+                }
                 let exclude_not_taken = self.control.conditions.exclude_terminal_if_not_taken
                     || (!self.control.withs.active_with_region_exclusions.is_empty()
                         && branch_index > 0
@@ -3233,7 +3457,13 @@ impl Compiler<'_> {
                     },
                 )?;
                 if !suite_terminates(body) && !emitted_fallthrough {
-                    if let Some(range) = suite_assert_success_fallthrough_range(body) {
+                    if self.context.python_version == crate::PythonVersion::Py312
+                        && matches!(body.last(), Some(Stmt::Assign(_)))
+                    {
+                        // Native 3.12 resolves the implicit return after static swaps,
+                        // so its donor is the final emitted store after reordering.
+                        self.assembler.set_location(SourceLocation::NONE);
+                    } else if let Some(range) = suite_assert_success_fallthrough_range(body) {
                         self.assembler.set_location(self.source_location(range));
                     } else if let Some(range) = suite_unary_not_fallthrough_range(body) {
                         self.assembler.set_location(self.source_location(range));
@@ -3259,7 +3489,20 @@ impl Compiler<'_> {
                         self.assembler
                             .set_location(self.source_location(condition_fallthrough_range(test)));
                     }
-                    self.mark_terminal_statement_implicit_return_boundary(body);
+                    if self.context.python_version == crate::PythonVersion::Py312
+                        && branch_index < statement.elif_else_clauses.len()
+                    {
+                        // The first native sweep copies this footer after visiting earlier
+                        // expression branches. Its compacted tail can copy on the second sweep.
+                        let implicit_return = self.assembler.label();
+                        let return_location = self.assembler.location();
+                        self.assembler.set_location(SourceLocation::NONE);
+                        self.emit_jump_forward(JUMP_FORWARD, implicit_return, 0)?;
+                        self.assembler.mark(implicit_return);
+                        self.assembler.set_location(return_location);
+                    } else {
+                        self.mark_terminal_statement_implicit_return_boundary(body);
+                    }
                     self.emit_deferred_implicit_return()?;
                 }
                 // The false branch starts its own original instruction array.
@@ -3285,7 +3528,21 @@ impl Compiler<'_> {
                     },
                 )?;
                 if !suite_terminates(body) && !emitted_fallthrough {
-                    if let Some(range) = suite_assert_success_fallthrough_range(body) {
+                    if self.context.python_version <= crate::PythonVersion::Py313
+                        && body.iter().all(|statement| {
+                            matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))
+                        })
+                    {
+                        // Declarations emit no native instructions. Keep the footer
+                        // unlocated until its incoming condition supplies the span.
+                        self.assembler.set_location(SourceLocation::NONE);
+                    } else if self.context.python_version == crate::PythonVersion::Py312
+                        && matches!(body.last(), Some(Stmt::Assign(_)))
+                    {
+                        // Native 3.12 resolves the implicit return after static swaps,
+                        // so its donor is the final emitted store after reordering.
+                        self.assembler.set_location(SourceLocation::NONE);
+                    } else if let Some(range) = suite_assert_success_fallthrough_range(body) {
                         self.assembler.set_location(self.source_location(range));
                     } else if let Some(range) = suite_unary_not_fallthrough_range(body) {
                         self.assembler.set_location(self.source_location(range));
@@ -3407,6 +3664,9 @@ impl Compiler<'_> {
             self.emit_jump_forward(POP_JUMP_IF_FALSE, condition_false, -1)?;
         }
         self.emit(NOT_TAKEN, 0, 0)?;
+        if self.context.python_version <= crate::PythonVersion::Py313 {
+            self.assembler.set_location(SourceLocation::NONE);
+        }
         let body_entry = self.emit_jump_forward_instruction(JUMP_FORWARD, body)?;
         if matches!(
             statement.body.last(),
@@ -3461,6 +3721,16 @@ impl Compiler<'_> {
                 self.source_location(last.range())
             };
             self.assembler.set_location(location);
+        }
+        if self.context.python_version <= crate::PythonVersion::Py313
+            && !suite_terminates(&statement.body)
+        {
+            // The native if-body falls through to a separate implicit-return
+            // block. Do not expose its authored instructions as a small exit
+            // before the legacy CFG optimizer reaches that join.
+            let implicit_return = self.assembler.label();
+            self.assembler.preserve_block_boundary(implicit_return);
+            self.assembler.mark(implicit_return);
         }
         self.emit_deferred_implicit_return()?;
 
@@ -3527,6 +3797,10 @@ impl Compiler<'_> {
         self.emit(NOT_TAKEN, 0, 0)?;
         // Emit the original success edge so the assembler applies CPython's four-slot
         // exit-copy limit before retaining its NOP or relocating the true branch.
+        if self.context.python_version == crate::PythonVersion::Py312 {
+            // 3.12 removes this unlocated bridge before resolving instruction locations.
+            self.assembler.set_location(SourceLocation::NONE);
+        }
         let success_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, body)?;
         self.assembler.preserve_inlined_jump_nop(success_exit);
 
@@ -3564,8 +3838,15 @@ impl Compiler<'_> {
             compiler.compile_jump_if(&expression.test, false, otherwise)
         })?;
         self.compile_expression(&expression.body)?;
-        self.assembler
-            .set_location(self.source_location(expression.body.range()));
+        // The discarded expression's POP_TOP is authored without a location.
+        // 3.12 resolves it after static swaps, so it must not inherit this arm yet.
+        self.assembler.set_location(
+            if self.context.python_version == crate::PythonVersion::Py312 {
+                SourceLocation::NONE
+            } else {
+                self.source_location(expression.body.range())
+            },
+        );
         self.emit(POP_TOP, 0, -1)?;
         self.emit_implicit_return()?;
 
@@ -3576,8 +3857,15 @@ impl Compiler<'_> {
         // optimizer therefore does not remove a constant else value with this POP_TOP.
         let end = self.assembler.label();
         self.assembler.mark(end);
-        self.assembler
-            .set_location(self.source_location(expression.orelse.range()));
+        // The discarded expression's POP_TOP is authored without a location.
+        // 3.12 resolves it after static swaps, so it must not inherit this arm yet.
+        self.assembler.set_location(
+            if self.context.python_version == crate::PythonVersion::Py312 {
+                SourceLocation::NONE
+            } else {
+                self.source_location(expression.orelse.range())
+            },
+        );
         self.emit(POP_TOP, 0, -1)?;
         self.emit_implicit_return()?;
         self.set_depth(base_depth);
@@ -3620,6 +3908,7 @@ impl Compiler<'_> {
     }
 
     fn terminal_assignment_if_expression_requires_specialization(
+        &self,
         assignment: &ruff_python_ast::StmtAssign,
     ) -> bool {
         // CPython only copies terminal exit blocks with at most four pre-fusion instructions.
@@ -3632,6 +3921,12 @@ impl Compiler<'_> {
                 // Keep an optimized tuple call's original join until the assembler
                 // copies the attribute-store exit and accounts for its jump slot.
                 matches!(attribute.value.as_ref(), Expr::Name(_))
+                    // The chained-test cleanup must reach the original shared else
+                    // assignment before 3.12's second small-exit copy pass.
+                    && !(self.context.python_version == crate::PythonVersion::Py312
+                        && matches!(assignment.value.as_ref(), Expr::If(expression)
+                            if matches!(expression.test.as_ref(), Expr::Compare(compare)
+                                if compare.ops.len() > 1)))
                     && !matches!(assignment.value.as_ref(), Expr::If(expression)
                         if matches!(expression.body.as_ref(), Expr::Call(call)
                             if optimized_generator_callable(call) == Some("tuple")))
@@ -3689,8 +3984,18 @@ impl Compiler<'_> {
             }
         }
         if preserve_fallthrough_join_nop {
-            self.assembler
-                .set_location(self.source_location(expression.orelse.range()));
+            if self.context.python_version <= crate::PythonVersion::Py313 {
+                // This NOP replaces the outer expression's jump in the nested
+                // expression's original join. 3.12 removes it before line resolution;
+                // 3.13 first inherits the fallthrough leaf's location into this block.
+                let join = self.assembler.label();
+                self.assembler.record_exception_owner_block_boundary(join);
+                self.assembler.mark(join);
+                self.assembler.set_location(SourceLocation::NONE);
+            } else {
+                self.assembler
+                    .set_location(self.source_location(expression.orelse.range()));
+            }
             self.emit(NOP, 0, 0)?;
         }
         self.compile_assignment_targets(&assignment.targets)?;
@@ -3733,7 +4038,9 @@ impl Compiler<'_> {
             let short_circuit = self.assembler.label();
             let continue_outer = self.assembler.label();
             short_circuits.push(short_circuit);
-            if let Expr::BoolOp(inner) = value {
+            if self.context.python_version >= crate::PythonVersion::Py314
+                && let Expr::BoolOp(inner) = value
+            {
                 self.compile_bool_expression_short_to(
                     inner,
                     if inner.op == expression.op {
@@ -3829,7 +4136,7 @@ impl Compiler<'_> {
             self.compile_expression(comparator)?;
             self.emit(SWAP, 2, 0)?;
             self.emit(COPY, 2, 1)?;
-            let (opcode, argument) = comparison_operator(*operator);
+            let (opcode, argument) = comparison_operator(*operator, self.context.python_version);
             self.emit(opcode, argument, -1)?;
             self.emit(COPY, 1, 1)?;
             self.emit(TO_BOOL, 0, 0)?;
@@ -3839,7 +4146,7 @@ impl Compiler<'_> {
         }
         let operator = *expression.ops.last().unwrap();
         self.compile_comparison_rhs(operator, expression.comparators.last().unwrap())?;
-        let (opcode, argument) = comparison_operator(operator);
+        let (opcode, argument) = comparison_operator(operator, self.context.python_version);
         self.emit(opcode, argument, -1)?;
         self.assembler
             .set_location(self.source_location(expression.range));
@@ -3850,6 +4157,13 @@ impl Compiler<'_> {
         self.set_depth(base_depth + 2);
         self.emit(SWAP, 2, 0)?;
         self.emit(POP_TOP, 0, -1)?;
+        if self.context.python_version <= crate::PythonVersion::Py313 {
+            // The comparison's cleanup falls through to the expression-statement
+            // discard in a separate native block, preventing cross-block swaps.
+            let end = self.assembler.label();
+            self.assembler.preserve_block_boundary(end);
+            self.assembler.mark(end);
+        }
         self.emit(POP_TOP, 0, -1)?;
         self.emit_implicit_return()?;
         self.set_depth(base_depth);
@@ -3883,6 +4197,10 @@ impl Compiler<'_> {
             Stmt::Assign(assignment) => {
                 let unpacked = if let [target] = assignment.targets.as_slice()
                     && let Expr::Tuple(value) = assignment.value.as_ref()
+                    // Legacy AST folding replaces constant tuples before code generation,
+                    // so their LOAD_CONST remains followed by UNPACK_SEQUENCE.
+                    && !(self.context.python_version <= crate::PythonVersion::Py313
+                        && self.return_value_is_constant(&assignment.value))
                 {
                     let targets = match target {
                         Expr::Tuple(target) => Some(target.elts.as_slice()),
@@ -4298,6 +4616,41 @@ impl Compiler<'_> {
                     },
                 )?;
                 let marker_end = self.assembler.instruction_count();
+                if self.context.python_version == crate::PythonVersion::Py312
+                    && self.control.withs.active_with_exits.len() == context.with_depth
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_handlers
+                        .iter()
+                        .all(|handler| handler.loop_depth < self.control.loops.contexts.len())
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.finally.active_loop_finally_contexts.is_empty()
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                {
+                    // Only ordinary try bodies lie between this break and its loop;
+                    // handlers surrounding the loop remain active after the break.
+                    // Native 3.12 keeps their POP_BLOCKs through exit copying and
+                    // NOP cleanup, so the last ownerless POP retains the break line.
+                    let ordinary_try_pops = self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+                        .saturating_sub(context.exception_region_depth);
+                    for _ in 0..ordinary_try_pops {
+                        self.emit_with_exception_policy(
+                            NOP,
+                            0,
+                            0,
+                            ExceptionPolicy::EXCLUDE_ALWAYS,
+                        )?;
+                        self.assembler.mark_last_as_converted_pop_block();
+                    }
+                }
                 if self.control.withs.active_with_exits.len() > context.with_depth
                     && self
                         .control
@@ -4348,6 +4701,7 @@ impl Compiler<'_> {
                     with_starts: with_unwind_starts,
                     region_starts: region_unwind_starts,
                 } = self.emit_loop_control_finally_unwind(
+                    super::legacy_native_labels::WithAwait::Break(statement.range),
                     context.with_depth,
                     None,
                     copied_break_pop_pair.then_some(copied_break_item),
@@ -4377,6 +4731,25 @@ impl Compiler<'_> {
                 .then(|| self.assembler.item_count());
                 self.emit_iterator_cleanup(context.iterator_cleanup, false)?;
                 if context.break_policy.returns() {
+                    if self.context.python_version == crate::PythonVersion::Py313
+                        && self.assembler.instruction_count() == marker_end
+                        && self.control.exceptions.active_exception_handlers.is_empty()
+                        && let Some(boundary) = exclusion_start
+                    {
+                        // This break unwinds only ordinary try blocks: no manager,
+                        // handler, or finalizer emitted cleanup after its marker.
+                        // Their POP_BLOCKs are still NOP slots during native early
+                        // exit copying, before the already-copied return pair.
+                        for _ in context.exception_region_depth
+                            ..self
+                                .control
+                                .exceptions
+                                .active_exception_region_exclusions
+                                .len()
+                        {
+                            self.assembler.add_legacy_pop_block_copy_slot(boundary);
+                        }
+                    }
                     if self.unit.flags & CO_GENERATOR != 0 {
                         self.output.has_deferred_break_none = true;
                         self.emit(LOAD_CONST, u32::MAX, 1)?;
@@ -4404,12 +4777,15 @@ impl Compiler<'_> {
                     // a NOP for that jump until after all small-exit copies finish.
                     self.assembler.add_last_inlined_jump_slot();
                 } else {
+                    // 3.12 threads the authored break jump in place, retaining the
+                    // surrounding try owner when this break does not unwind that try.
                     let jump_exclusion_start = (self
                         .control
                         .exceptions
                         .active_exception_region_exclusions
                         .len()
                         == context.exception_region_depth
+                        && self.context.python_version >= crate::PythonVersion::Py314
                         && context.exception_region_depth > 0
                         && context.finally_end_depth == 0
                         && !context.break_target_keeps_exception_owner
@@ -4435,9 +4811,13 @@ impl Compiler<'_> {
                     let has_no_emitted_cleanup = self.assembler.instruction_count() == marker_end;
                     let break_jump =
                         self.emit_jump_forward_instruction(JUMP_FORWARD, context.break_label)?;
-                    // CPython's temporary break NOP prevents incoming jumps from threading
-                    // through this exit before redundant instructions are removed.
-                    self.assembler.prevent_jump_threading_target(break_jump);
+                    // The authored break NOP precedes unwinding. A legacy finalizer's
+                    // new join starts after that marker and can be threaded directly.
+                    if self.context.python_version >= crate::PythonVersion::Py314
+                        || has_no_emitted_cleanup
+                    {
+                        self.assembler.prevent_jump_threading_target(break_jump);
+                    }
                     self.assembler.mark_jump_as_authored_break(break_jump);
                     self.assembler.record_copied_finally_break_head(
                         break_jump,
@@ -4944,6 +5324,7 @@ impl Compiler<'_> {
                     with_starts: with_unwind_starts,
                     region_starts: region_unwind_starts,
                 } = self.emit_loop_control_finally_unwind(
+                    super::legacy_native_labels::WithAwait::Continue(statement.range),
                     context.with_depth,
                     Some(context.continue_label),
                     None,
@@ -4991,8 +5372,21 @@ impl Compiler<'_> {
                         finally_unwind_start,
                     );
                 }
-                let copies_finally_continue_exit =
-                    copied_finally_continue_test.is_some_and(|test| {
+                // An ordinary try surrounding the last copied finalizer still emits
+                // POP_BLOCK before the continue. Legacy threading sees that NOP head.
+                let legacy_pending_finally_try = self.context.python_version
+                    <= crate::PythonVersion::Py313
+                    && self
+                        .control
+                        .finally
+                        .active_loop_finally_contexts
+                        .iter()
+                        .find(|finally| finally.loop_depth >= self.control.loops.contexts.len())
+                        .is_some_and(|finally| {
+                            finally.exception_region_depth > context.exception_region_depth
+                        });
+                let copies_finally_continue_exit = !legacy_pending_finally_try
+                    && copied_finally_continue_test.is_some_and(|test| {
                         self.assembler.allow_copied_finally_continue_exit(
                             continue_jump,
                             context.continue_label,
@@ -5001,6 +5395,7 @@ impl Compiler<'_> {
                         )
                     });
                 if !copies_finally_continue_exit
+                    && !legacy_pending_finally_try
                     && self
                         .control
                         .finally
@@ -5122,7 +5517,7 @@ impl Compiler<'_> {
                 let preserve_tos = statement
                     .value
                     .as_deref()
-                    .is_some_and(|value| !is_literal_constant(value));
+                    .is_some_and(|value| !self.return_value_is_constant(value));
                 let overriding_unwind_start = if return_is_overridden
                     && !preserve_tos
                     && !self
@@ -5347,7 +5742,11 @@ impl Compiler<'_> {
                     {
                         self.assembler.set_location(location);
                         self.emit(NOP, 0, 0)?;
-                        self.assembler.mark_last_as_converted_pop_block();
+                        if self.context.python_version >= crate::PythonVersion::Py314 {
+                            self.assembler.mark_last_as_converted_pop_block();
+                        }
+                        // Legacy codegen emits this authored return-line NOP before
+                        // unwinding the manager, so it retains the manager's owner.
                     } else if self.source_location(value.range()).line != location.line {
                         // The return statement needs its own marker before unwind
                         // cleanup replaces the location of its separately written value.
@@ -6625,6 +7024,38 @@ impl Compiler<'_> {
                                     .active_exception_region_exclusions
                                     .len()
                     });
+                // FINALLY_END retires its cleanup owner before POP_EXCEPT, then the
+                // surrounding FINALLY_TRY retires separately before its copied body.
+                // The saved depths identify two adjacent regions with no intervening
+                // handler, manager, iterator, or ordinary try to unwind.
+                let tracks_finally_end_before_outer_finally = self.context.python_version
+                    <= crate::PythonVersion::Py313
+                    && !return_is_overridden
+                    && self.control.finally.active_finally_end_blocks == 1
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self
+                        .control
+                        .finally
+                        .preserved_return_value_contexts
+                        .is_empty()
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.exceptions.active_try_marker_slots.is_empty()
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+                        == 2
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.loops.contexts.is_empty()
+                    && matches!(self.control.finally.active_return_finally_contexts.as_slice(),
+                        [context] if context.exception_region_depth == 0
+                            && context.try_body_depth == 0
+                            && context.handler_depth == 0
+                            && context.with_depth == 0
+                            && context.loop_depth == 0);
                 let mut handler_region_unwind_starts = ((tracks_iterator_region_unwinds
                     || tracks_handler_enclosing_try_unwinds
                     || tracks_two_handlers_inside_ordinary_try
@@ -6645,7 +7076,8 @@ impl Compiler<'_> {
                             .active_return_finally_contexts
                             .is_empty()))
                     && (self.control.finally.active_finally_end_blocks == 0
-                        || unwinds_finally_end_inside_handler))
+                        || unwinds_finally_end_inside_handler
+                        || tracks_finally_end_before_outer_finally))
                     .then(|| {
                         vec![
                             None;
@@ -6655,6 +7087,13 @@ impl Compiler<'_> {
                                 .len()
                         ]
                     });
+                if tracks_finally_end_before_outer_finally
+                    && let Some(starts) = &mut handler_region_unwind_starts
+                {
+                    // SWAP/POP_TOP/SWAP still belong to the exceptional finalizer;
+                    // POP_EXCEPT belongs to the surrounding try until its own POP.
+                    starts[1] = finally_end_unwind_start;
+                }
                 if unwinds_finally_end_inside_handler
                     && let Some((depth, start)) = nested_finally_region_unwind_start
                     && let Some(starts) = &mut handler_region_unwind_starts
@@ -6802,8 +7241,12 @@ impl Compiler<'_> {
                                 preserve_tos,
                             )?;
                             next_loop = manager.loop_depth;
-                            let starts =
-                                self.emit_with_unwind(with_index, with_index + 1, preserve_tos)?;
+                            let starts = self.emit_with_unwind(
+                                with_index,
+                                with_index + 1,
+                                preserve_tos,
+                                super::legacy_native_labels::WithAwait::Return(statement.range),
+                            )?;
                             if let Some(region_starts) = &mut handler_region_unwind_starts {
                                 for unwind in &starts {
                                     for region_start in
@@ -6863,8 +7306,12 @@ impl Compiler<'_> {
                                 preserve_tos,
                             )?;
                             next_loop = context.loop_depth;
-                            let starts =
-                                self.emit_with_unwind(with_index, with_index + 1, preserve_tos)?;
+                            let starts = self.emit_with_unwind(
+                                with_index,
+                                with_index + 1,
+                                preserve_tos,
+                                super::legacy_native_labels::WithAwait::Return(statement.range),
+                            )?;
                             if let Some(region_starts) = &mut handler_region_unwind_starts {
                                 for unwind in &starts {
                                     for region_start in
@@ -6966,11 +7413,23 @@ impl Compiler<'_> {
                                     && return_finally_contexts[0].exception_region_depth + 1 == region_depth
                                     && self.control.exceptions.active_try_marker_slots.is_empty()
                                     && self.control.withs.active_with_exits.iter().all(|manager| !manager.is_async)));
-                        if preserve_named_handler_pop_slots && preserves_enclosing_try_return_owner
+                        let preserve_legacy_inner_try_pop_slots = self.context.python_version
+                            <= crate::PythonVersion::Py313
+                            && handler_count == 1
+                            && return_finally_contexts.is_empty()
+                            && self.control.withs.active_with_exits.is_empty()
+                            && self.control.loops.contexts.is_empty()
+                            && self.control.exceptions.active_exception_group_handlers == 0
+                            && self.control.finally.active_finally_end_blocks == 0
+                            && self.control.finally.active_normal_finally_bodies == 0
+                            && self.control.finally.active_copied_finally_bodies == 0;
+                        if (preserve_named_handler_pop_slots
+                            && preserves_enclosing_try_return_owner)
+                            || preserve_legacy_inner_try_pop_slots
                         {
                             // Ordinary tries entered inside this handler unwind before its
-                            // name-cleanup and handler POP_BLOCK records. Keep their NULL
-                            // slots in the same original array as the protected name clear.
+                            // SWAP and handler POP_BLOCK. Legacy small-exit copying counts
+                            // each original POP before NOP removal folds it away.
                             for _ in try_body_depth
                                 ..self.control.exceptions.active_try_marker_slots.len()
                             {
@@ -6995,7 +7454,10 @@ impl Compiler<'_> {
                         let named_handler_pop_start = (preserve_named_handler_pop_slots
                             && preserve_tos)
                             .then(|| self.assembler.item_count());
-                        if preserve_named_handler_pop_slots {
+                        if preserve_named_handler_pop_slots
+                            || (self.context.python_version <= crate::PythonVersion::Py313
+                                && name.is_some())
+                        {
                             // Named handlers unwind their name-cleanup block before a saved
                             // value's SWAP, then their handler block before POP_EXCEPT. Both
                             // ownerless slots remain in the original array for constant returns
@@ -7132,9 +7594,12 @@ impl Compiler<'_> {
                         }
                         let preserve_handler_pop_slot = (name.is_none() && next_finally > 0)
                             || preserve_named_handler_pop_slots;
-                        if preserve_handler_pop_slot {
-                            // Preserve the handler's ownerless POP_BLOCK slot when this cleanup
-                            // feeds a pending finally copy. It shares POP_EXCEPT's location.
+                        if preserve_handler_pop_slot
+                            || self.context.python_version <= crate::PythonVersion::Py313
+                        {
+                            // Legacy exit copying counts the handler's POP_BLOCK before
+                            // folding; a literal return otherwise appears one slot too small.
+                            // The slot shares POP_EXCEPT's location.
                             self.emit_with_exception_policy(
                                 NOP,
                                 0,
@@ -7473,7 +7938,8 @@ impl Compiler<'_> {
                         && self.control.loops.contexts.len() == next_loop
                         && usize::try_from(self.control.stack.depth).ok()
                             == Some(
-                                next_loop * usize::try_from(self.iterator_slots()).unwrap() + 2,
+                                next_loop * usize::try_from(self.iterator_slots()).unwrap()
+                                    + usize::try_from(self.with_exit_stack_slots()).unwrap(),
                             )
                         && self
                             .control
@@ -7630,7 +8096,12 @@ impl Compiler<'_> {
                     };
                     let mut starts = Vec::new();
                     let remaining_with = if let Some(from_depth) = early_manager_start {
-                        starts = self.emit_with_unwind(from_depth, next_with, preserve_tos)?;
+                        starts = self.emit_with_unwind(
+                            from_depth,
+                            next_with,
+                            preserve_tos,
+                            super::legacy_native_labels::WithAwait::Return(statement.range),
+                        )?;
                         if none_return_unwinds_inner_managers
                             && let Some(region_starts) = &mut handler_region_unwind_starts
                         {
@@ -7877,6 +8348,7 @@ impl Compiler<'_> {
                         finally_context.with_depth,
                         remaining_with,
                         preserve_tos,
+                        super::legacy_native_labels::WithAwait::Return(statement.range),
                     )?);
                     if let Some(region_starts) = &mut handler_region_unwind_starts {
                         for unwind in &starts {
@@ -8999,6 +9471,18 @@ impl Compiler<'_> {
                     if !starts_jump_target
                         || copied_guard_exit_location.is_some()
                         || matches!(finally_context.body.as_slice(), [Stmt::Pass(_)])
+                        // A preceding copied finalizer can finish at a conditional join.
+                        // Its outer POP_BLOCK must survive 3.12's early NOP cleanup so
+                        // final line propagation can inherit the continuing edge's span.
+                        || (self.context.python_version == crate::PythonVersion::Py312
+                            && return_finally_contexts.get(context_index + 1).is_some_and(|inner| {
+                                inner.loop_depth == finally_context.loop_depth
+                                    && inner.with_depth == finally_context.with_depth
+                                    && inner.handler_depth == finally_context.handler_depth
+                                    && inner.try_body_depth == finally_context.try_body_depth
+                                    && inner.exception_region_depth
+                                        == finally_context.exception_region_depth + 1
+                            }))
                         // Adjacent copied cleanup tries share the outer POP_BLOCK between
                         // the inner normal and handled exits. Preserve its original kind
                         // so shared-head location repair can keep that POP_BLOCK unlocated.
@@ -9153,9 +9637,17 @@ impl Compiler<'_> {
                                         compiler.with_suspension_exception_depth(
                                             finally_context.suspension_exception_depth,
                                             |compiler| {
-                                                compiler.compile_copied_finally_body(
-                                                    &finally_context.body,
-                                                    None,
+                                                compiler.with_native_finally_copy(
+                                                    finally_context.source_range,
+                                                    super::legacy_native_labels::FinallyCopy::Return(
+                                                        statement.range,
+                                                    ),
+                                                    |compiler| {
+                                                        compiler.compile_copied_finally_body(
+                                                            &finally_context.body,
+                                                            None,
+                                                        )
+                                                    },
                                                 )
                                             },
                                         )
@@ -9791,7 +10283,12 @@ impl Compiler<'_> {
                         with_unwind_before_exception_start =
                             with_unwind_starts.len() + remaining_with_starts.len();
                     }
-                    let starts = self.emit_with_unwind(with_index, with_index + 1, preserve_tos)?;
+                    let starts = self.emit_with_unwind(
+                        with_index,
+                        with_index + 1,
+                        preserve_tos,
+                        super::legacy_native_labels::WithAwait::Return(statement.range),
+                    )?;
                     if tracks_iterator_region_unwinds
                         && let Some(region_starts) = &mut handler_region_unwind_starts
                     {
@@ -9973,10 +10470,42 @@ impl Compiler<'_> {
                 {
                     // Regions surrounding the handlers and managers remain active throughout
                     // their cleanup; only the final return leaves those enclosing regions.
+                    let outer_try_pop_count = if self.context.python_version
+                        == crate::PythonVersion::Py312
+                        && preserve_tos
+                        && handler_count == 1
+                        && self.control.loops.contexts.is_empty()
+                        && with_unwind_starts.is_empty()
+                        && let [handler] =
+                            self.control.exceptions.active_exception_handlers.as_slice()
+                        && handler.name.is_none()
+                        && handler.try_body_depth > 0
+                        && handler.try_body_depth
+                            == self.control.exceptions.active_try_marker_slots.len()
+                        && handler.exception_region_depth == handler.try_body_depth
+                        && region_starts.iter().filter(|start| start.is_none()).count()
+                            == handler.try_body_depth
+                    {
+                        handler.try_body_depth
+                    } else {
+                        0
+                    };
                     let start = self.assembler.label();
                     self.assembler.mark(start);
                     for region_start in region_starts {
                         region_start.get_or_insert(start);
+                    }
+                    // The handler's SWAP/POP_BLOCK/POP_EXCEPT is followed by each
+                    // remaining outer try's POP_BLOCK in the same original array.
+                    // 3.12 counts these records in both four-slot exit-copy sweeps.
+                    for _ in 0..outer_try_pop_count {
+                        self.emit_with_exception_policy(
+                            NOP,
+                            0,
+                            0,
+                            ExceptionPolicy::EXCLUDE_ALWAYS,
+                        )?;
+                        self.assembler.mark_last_as_converted_pop_block();
                     }
                 }
                 if !preserve_tos && !return_is_overridden {
@@ -10131,7 +10660,13 @@ impl Compiler<'_> {
                         let original_pop = exception_unwind_start
                             .or(return_exclusion_start)
                             .expect("ordinary return unwind has a boundary");
-                        self.assembler.record_name_return_pop_boundary(original_pop);
+                        self.assembler.record_name_return_pop_boundary(
+                            original_pop,
+                            self.control
+                                .exceptions
+                                .active_exception_region_exclusions
+                                .len(),
+                        );
                         // A shared value join can alias the first POP with the iterator
                         // footer's entry. No physical block split counts that slot there.
                         let pop_at_entry = self
@@ -10259,7 +10794,16 @@ impl Compiler<'_> {
         {
             return self.compile_terminating_if_chained_compare_with_else(statement, comparison);
         }
+        // Legacy CFG passes still see a terminating arm's false continuation.
+        // Folded false edges must also survive until jump threading and exit copying.
+        // 3.13's early location pass additionally sees each fallthrough arm and
+        // false edge sharing their original join.
         if let Some(truthiness) = early_condition_truthiness(&statement.test)
+            && !(self.context.python_version <= crate::PythonVersion::Py313
+                && statement.elif_else_clauses.is_empty()
+                && (self.context.python_version == crate::PythonVersion::Py313
+                    || !truthiness
+                    || suite_terminates(&statement.body)))
             && statement.elif_else_clauses.len() <= 1
             && statement
                 .elif_else_clauses
@@ -10314,7 +10858,11 @@ impl Compiler<'_> {
                     if self.assembler.last_instruction_is_nop() {
                         self.assembler.preserve_last_nop();
                     }
-                    if let Some(location) = self.assembler.last_instruction_location() {
+                    if self.context.python_version <= crate::PythonVersion::Py313 {
+                        // Native implicit exits acquire their span in the target's CFG
+                        // location pass, after jump threading on 3.12.
+                        self.assembler.set_location(SourceLocation::NONE);
+                    } else if let Some(location) = self.assembler.last_instruction_location() {
                         self.assembler.set_location(location);
                     }
                     let end = self.assembler.label();
@@ -10421,6 +10969,18 @@ impl Compiler<'_> {
             || self.control.exceptions.direct_try_assignment_branch_exit == Some(statement.range)
             || direct_try_chain_exit;
         let end = self.assembler.label();
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::IfEnd(statement.range),
+            end,
+        );
+        for clause in &statement.elif_else_clauses {
+            if clause.test.is_some() {
+                self.bind_native_source_label(
+                    super::legacy_native_labels::NativeRole::IfEnd(clause.range),
+                    end,
+                );
+            }
+        }
         let mut branches: Vec<(Option<&Expr>, &[Stmt])> =
             vec![(Some(&statement.test), statement.body.as_slice())];
         branches.extend(
@@ -10456,6 +11016,17 @@ impl Compiler<'_> {
                 } else {
                     self.assembler.label()
                 };
+                if next != end {
+                    let range = if branch_index == 0 {
+                        statement.range
+                    } else {
+                        statement.elif_else_clauses[branch_index - 1].range
+                    };
+                    self.bind_native_source_label(
+                        super::legacy_native_labels::NativeRole::IfElse(range),
+                        next,
+                    );
+                }
                 let negated_method_call_condition = matches!(test, Expr::UnaryOp(unary)
                     if unary.op == UnaryOp::Not
                         && matches!(unary.operand.as_ref(), Expr::Call(call)
@@ -11729,7 +12300,18 @@ impl Compiler<'_> {
                             .current_original_block_pre_fusion_instruction_count()
                             == 1
                         && self.assembler.current_original_block_location().is_none();
-                    let branch_exit = if direct_try_body_exit
+                    if self.assembler.python_version() <= crate::PythonVersion::Py313 {
+                        // Legacy native codegen leaves implicit exits unlocated. The
+                        // target's CFG schedule supplies their span before threading
+                        // in 3.13 and after threading and small-exit copying in 3.12.
+                        self.assembler.set_location(SourceLocation::NONE);
+                    }
+                    // Legacy assembly preserves the authored owner's identity through
+                    // actual CFG copying and threading. Modern lowering predicts the
+                    // later copy of the continuation after the try POP_BLOCK.
+                    let exclude_direct_try_body_exit = direct_try_body_exit
+                        && self.context.python_version >= crate::PythonVersion::Py314;
+                    let branch_exit = if exclude_direct_try_body_exit
                         && self.control.in_iterator_loop()
                         && self
                             .control
@@ -11746,7 +12328,7 @@ impl Compiler<'_> {
                             ExceptionPolicy::EXCLUDE_ALWAYS,
                         )?
                     } else {
-                        let direct_try_body_exit_start = direct_try_body_exit.then(|| {
+                        let direct_try_body_exit_start = exclude_direct_try_body_exit.then(|| {
                             let start = self.assembler.label();
                             self.assembler.mark(start);
                             start
@@ -12259,6 +12841,20 @@ impl Compiler<'_> {
         restart: Label,
         split_short_circuit: bool,
     ) -> Result<LoopBackedge, CompileError> {
+        if self.context.python_version <= crate::PythonVersion::Py313 {
+            // Preserve the original body and backedge for legacy jump threading, which
+            // creates fresh conditional edges with their own exception ownership.
+            if let [Stmt::Pass(statement)] = body {
+                // This is the loop's original body array, not a cleanup fallthrough.
+                // Its Pass must survive until NOP cleanup sees the later test/backedge.
+                self.assembler
+                    .set_location(self.source_location(statement.range));
+                self.emit(NOP, 0, 0)?;
+            } else {
+                self.compile_suite(body)?;
+            }
+            return Ok(LoopBackedge::Required);
+        }
         self.compile_loop_tail_suite_inner(
             body,
             restart,
@@ -12470,11 +13066,26 @@ impl Compiler<'_> {
                 .is_empty()
     }
 
+    /// Python 3.14 replaced the bound exit callable with a callable/self pair.
+    fn with_exit_stack_slots(&self) -> i32 {
+        if self.context.python_version <= crate::PythonVersion::Py313 {
+            1
+        } else {
+            2
+        }
+    }
+
+    fn emit_with_exit_call(&mut self) -> Result<(), CompileError> {
+        let slots = self.with_exit_stack_slots();
+        self.emit(CALL, (slots + 1).cast_unsigned(), -slots - 2)
+    }
+
     fn emit_with_unwind(
         &mut self,
         from_depth: usize,
         to_depth: usize,
         preserve_tos: bool,
+        origin: super::legacy_native_labels::WithAwait,
     ) -> Result<Vec<WithUnwind>, CompileError> {
         let mut unwind_starts = Vec::with_capacity(to_depth - from_depth);
         for index in (from_depth..to_depth).rev() {
@@ -12488,16 +13099,19 @@ impl Compiler<'_> {
             });
             self.assembler.set_location(context.location);
             if preserve_tos {
-                self.emit(SWAP, 3, 0)?;
+                if self.with_exit_stack_slots() == 2 {
+                    self.emit(SWAP, 3, 0)?;
+                }
                 self.emit(SWAP, 2, 0)?;
             }
             let none = self.add_constant(Constant::None)?;
             self.emit(LOAD_CONST, none, 1)?;
             self.emit(LOAD_CONST, none, 1)?;
             self.emit(LOAD_CONST, none, 1)?;
-            self.emit(CALL, 3, -4)?;
+            self.emit_with_exit_call()?;
             if context.is_async {
-                self.compile_awaitable_on_stack(2)?;
+                let roles = Some(origin.roles(context.source_range));
+                self.compile_awaitable_on_stack_with_native_roles(2, roles)?;
             }
             self.emit(POP_TOP, 0, -1)?;
         }
@@ -12772,6 +13386,7 @@ impl Compiler<'_> {
     // active while an inner finally runs; a manager entered inside that handler exits first.
     fn emit_loop_control_finally_unwind(
         &mut self,
+        origin: super::legacy_native_labels::WithAwait,
         with_depth: usize,
         continue_target: Option<Label>,
         copied_break_item: Option<usize>,
@@ -12834,6 +13449,7 @@ impl Compiler<'_> {
             for (index, context) in finally_contexts.iter().enumerate().rev() {
                 let with_depth_before_cleanup = next_with;
                 self.emit_loop_control_preserved_return_cleanup(
+                    origin,
                     context.loop_context_depth + 1,
                     &mut next_with,
                     &mut with_unwind_starts,
@@ -12852,15 +13468,19 @@ impl Compiler<'_> {
                     None
                 };
                 self.emit_loop_control_cleanup_to(
+                    origin,
                     context.handler_depth.max(first_handler),
                     context.with_depth,
                     &mut next_with,
                     &mut with_unwind_starts,
                     &mut region_unwind_starts,
                 )?;
-                if index + 1 == finally_contexts.len()
-                    && matches!(context.body.as_slice(), [Stmt::Pass(_)])
+                if self.context.python_version == crate::PythonVersion::Py312
+                    || (index + 1 == finally_contexts.len()
+                        && matches!(context.body.as_slice(), [Stmt::Pass(_)]))
                 {
+                    // 3.12 retains every unwinding POP_BLOCK until pseudo-op conversion;
+                    // its span can outlive the preceding SETUP and authored break NOPs.
                     // The first copied Pass keeps the preceding loop-control line. Native
                     // NOP compaction retains this POP_BLOCK and removes the authored marker,
                     // so the surviving line marker needs the popped block's unowned slot.
@@ -13254,12 +13874,14 @@ impl Compiler<'_> {
                 self.assembler.set_location(SourceLocation::NONE);
             }
             self.emit_loop_control_preserved_return_cleanup(
+                origin,
                 0,
                 &mut next_with,
                 &mut with_unwind_starts,
                 &mut region_unwind_starts,
             )?;
             self.emit_loop_control_cleanup_to(
+                origin,
                 first_handler,
                 with_depth,
                 &mut next_with,
@@ -13316,6 +13938,7 @@ impl Compiler<'_> {
 
     fn emit_loop_control_preserved_return_cleanup(
         &mut self,
+        origin: super::legacy_native_labels::WithAwait,
         finally_depth: usize,
         next_with: &mut usize,
         with_unwind_starts: &mut Vec<WithUnwind>,
@@ -13331,6 +13954,7 @@ impl Compiler<'_> {
             && context.loops >= self.control.loops.contexts.len()
         {
             self.emit_loop_control_cleanup_to(
+                origin,
                 context.handlers,
                 context.managers,
                 next_with,
@@ -13346,6 +13970,7 @@ impl Compiler<'_> {
 
     fn emit_loop_control_cleanup_to(
         &mut self,
+        origin: super::legacy_native_labels::WithAwait,
         handler_depth: usize,
         with_depth: usize,
         next_with: &mut usize,
@@ -13360,6 +13985,7 @@ impl Compiler<'_> {
                 .last()
                 .expect("handler exists");
             self.emit_loop_control_with_cleanup(
+                origin,
                 handler.with_depth,
                 next_with,
                 with_unwind_starts,
@@ -13387,6 +14013,7 @@ impl Compiler<'_> {
             self.control.exceptions.active_exception_handlers.pop();
         }
         self.emit_loop_control_with_cleanup(
+            origin,
             with_depth,
             next_with,
             with_unwind_starts,
@@ -13396,12 +14023,13 @@ impl Compiler<'_> {
 
     fn emit_loop_control_with_cleanup(
         &mut self,
+        origin: super::legacy_native_labels::WithAwait,
         with_depth: usize,
         next_with: &mut usize,
         with_unwind_starts: &mut Vec<WithUnwind>,
         region_unwind_starts: &mut [Option<(Label, usize)>],
     ) -> Result<(), CompileError> {
-        let starts = self.emit_with_unwind(with_depth, *next_with, false)?;
+        let starts = self.emit_with_unwind(with_depth, *next_with, false, origin)?;
         for unwind in &starts {
             let depth = self.control.withs.active_with_exits[unwind.index].exception_region_depth;
             for (index, region_start) in region_unwind_starts.iter_mut().enumerate().skip(depth) {
@@ -13662,7 +14290,7 @@ impl Compiler<'_> {
             self.emit(CALL, 0, -1)?;
         }
         self.assembler
-            .set_location(self.source_location(statement.test.range()));
+            .set_location(self.expression_location(&statement.test));
         self.emit(RAISE_VARARGS, 1, -1)
     }
 
@@ -13768,7 +14396,7 @@ impl Compiler<'_> {
                 self.emit(CALL, 0, -1)?;
             }
             self.assembler
-                .set_location(self.source_location(statement.test.range()));
+                .set_location(self.expression_location(&statement.test));
             self.emit(RAISE_VARARGS, 1, -1)?;
 
             self.assembler.mark(success);
@@ -13810,7 +14438,7 @@ impl Compiler<'_> {
             self.emit(CALL, 0, -1)?;
         }
         self.assembler
-            .set_location(self.source_location(statement.test.range()));
+            .set_location(self.expression_location(&statement.test));
         self.emit(RAISE_VARARGS, 1, -1)?;
         Ok(())
     }
@@ -15210,6 +15838,100 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    /// Whether CPython has replaced a return value with a Constant AST node before lowering.
+    pub(super) fn return_value_is_constant(&self, expression: &Expr) -> bool {
+        if is_literal_constant(expression) {
+            return true;
+        }
+        if self.context.python_version >= crate::PythonVersion::Py314 {
+            return false;
+        }
+        let constant_operands = match expression {
+            Expr::Name(name) => name.id.as_str() == "__debug__",
+            Expr::UnaryOp(unary) => self.return_value_is_constant(&unary.operand),
+            Expr::BinOp(binary) => {
+                self.return_value_is_constant(&binary.left)
+                    && self.return_value_is_constant(&binary.right)
+            }
+            Expr::Tuple(tuple) => tuple
+                .elts
+                .iter()
+                .all(|element| self.return_value_is_constant(element)),
+            Expr::Subscript(subscript) => {
+                self.return_value_is_constant(&subscript.value)
+                    && self.return_value_is_constant(&subscript.slice)
+            }
+            _ => false,
+        };
+        constant_operands && self.source_aware_fold_constant(expression).is_some()
+    }
+
+    /// Older targets emit the loop test both at entry and after the body.
+    fn compile_legacy_dynamic_while(
+        &mut self,
+        statement: &ruff_python_ast::StmtWhile,
+    ) -> Result<(), CompileError> {
+        let base_depth = self.control.stack.depth;
+        let start = self.assembler.label();
+        let body = self.assembler.label();
+        let anchor = self.assembler.label();
+        let end = self.assembler.label();
+        for (role, label) in [
+            (
+                super::legacy_native_labels::NativeRole::WhileLoop(statement.range),
+                start,
+            ),
+            (
+                super::legacy_native_labels::NativeRole::WhileBody(statement.range),
+                body,
+            ),
+            (
+                super::legacy_native_labels::NativeRole::WhileEnd(statement.range),
+                end,
+            ),
+            (
+                super::legacy_native_labels::NativeRole::WhileAnchor(statement.range),
+                anchor,
+            ),
+        ] {
+            self.bind_native_source_label(role, label);
+        }
+        self.assembler.mark(start);
+        if self.context.python_version == crate::PythonVersion::Py312 {
+            // The initial test is a native block even when only the repeated test
+            // has an incoming loop edge. High-local initialization resets here.
+            self.assembler.record_exception_owner_block_boundary(start);
+        }
+        self.compile_jump_if(&statement.test, false, anchor)?;
+        self.assembler.mark(body);
+        let context = self.loop_context(
+            start,
+            end,
+            IteratorCleanup::None,
+            self.loop_break_policy(statement.range),
+        );
+        self.with_loop_context(context, |compiler| {
+            if let [Stmt::Pass(pass)] = statement.body.as_slice() {
+                // The repeated test follows this original body array. Its different
+                // source line keeps the authored Pass through legacy NOP removal.
+                compiler
+                    .assembler
+                    .set_location(compiler.source_location(pass.range));
+                compiler.emit(NOP, 0, 0)?;
+            } else {
+                compiler.compile_suite(&statement.body)?;
+            }
+            compiler.set_depth(base_depth);
+            compiler.compile_jump_if(&statement.test, true, body)
+        })?;
+        self.assembler.mark(anchor);
+        self.set_depth(base_depth);
+        self.compile_suite(&statement.orelse)?;
+        self.assembler.mark(end);
+        self.set_depth(base_depth);
+        Ok(())
+    }
+
     fn compile_while(
         &mut self,
         statement: &ruff_python_ast::StmtWhile,
@@ -15253,6 +15975,30 @@ impl Compiler<'_> {
             self.assembler.record_folded_predecessor_source(start, end);
             // Folding the test preserves the authored loop body's separate original array.
             let body = self.assembler.label();
+            if statement.orelse.is_empty() {
+                // The initial folded-test NOP separates Loop from Body. Only
+                // Anchor and End share an original offset when else is empty.
+                for (role, label) in [
+                    (
+                        super::legacy_native_labels::NativeRole::WhileLoop(statement.range),
+                        start,
+                    ),
+                    (
+                        super::legacy_native_labels::NativeRole::WhileBody(statement.range),
+                        body,
+                    ),
+                    (
+                        super::legacy_native_labels::NativeRole::WhileEnd(statement.range),
+                        end,
+                    ),
+                    (
+                        super::legacy_native_labels::NativeRole::WhileAnchor(statement.range),
+                        end,
+                    ),
+                ] {
+                    self.bind_native_source_label(role, label);
+                }
+            }
             self.assembler.record_exception_owner_block_boundary(body);
             // Borrowed-reference producers are indexed within that original array,
             // including CPython's shadowed index for IMPORT_FROM and similar opcodes.
@@ -15350,7 +16096,20 @@ impl Compiler<'_> {
                     self.assembler
                         .allow_borrow_surviving_break_at_trailing_loop_exit();
                 }
-                self.emit_while_backedge(&statement.body, body_start, start)?;
+                if self.context.python_version <= crate::PythonVersion::Py313 {
+                    // The trailing constant test folds to NOP before jump threading.
+                    // Retain that slot so a branch to it cannot bypass the original
+                    // backedge, which targets the body after the initial test.
+                    self.assembler
+                        .set_location(self.source_location(statement.test.range()));
+                    self.emit(NOP, 0, 0)?;
+                    let backedge = self.emit_jump_backward_instruction(JUMP_BACKWARD, body)?;
+                    // Jump emission compacts the NOP; its native phase barrier remains.
+                    self.assembler.prevent_jump_threading_target(backedge);
+                    self.assembler.record_last_original_loop_backedge();
+                } else {
+                    self.emit_while_backedge(&statement.body, body_start, start)?;
+                }
             }
             self.pre_register_conditionally_discarded_suite(&statement.orelse)?;
             // The break destination starts an original array after the loop's backedge,
@@ -15666,6 +16425,9 @@ impl Compiler<'_> {
             }
             return Ok(());
         }
+        if self.context.python_version <= crate::PythonVersion::Py313 {
+            return self.compile_legacy_dynamic_while(statement);
+        }
         let start = self.assembler.label();
         let else_label = self.assembler.label();
         let end = self.assembler.label();
@@ -15946,6 +16708,8 @@ impl Compiler<'_> {
     }
 
     fn compile_for(&mut self, statement: &ruff_python_ast::StmtFor) -> Result<(), CompileError> {
+        use super::legacy_native_labels::NativeRole;
+
         let base_depth = self.control.stack.depth;
         let has_break = suite_contains_loop_break(&statement.body);
         let start = self.assembler.label();
@@ -15972,6 +16736,10 @@ impl Compiler<'_> {
             .set_location(self.source_location(statement.target.range()));
         self.emit(NOP, 0, 0)?;
         self.compile_store_target(&statement.target)?;
+        self.consume_unreferenced_native_for_body(statement.range);
+        self.bind_native_source_label(NativeRole::ForStart(statement.range), start);
+        self.bind_native_source_label(NativeRole::ForCleanup(statement.range), cleanup);
+        self.bind_native_source_label(NativeRole::ForEnd(statement.range), end);
         self.assembler.record_for_target_owner_prefix(body);
 
         let mut context = self.loop_context(
@@ -16046,9 +16814,21 @@ impl Compiler<'_> {
                     && !self
                         .assembler
                         .current_join_has_located_compacted_predecessor();
-            if let Some(Stmt::Pass(statement)) = statement.body.last() {
+            if self.context.python_version == crate::PythonVersion::Py312
+                && self.assembler.last_instruction_is_nop()
+            {
+                // Keep the real body NOP until native 3.12 removes same-line NOPs
+                // before it assigns the originally unlocated backedge's span.
+                self.assembler.set_location(SourceLocation::NONE);
+            } else if let Some(Stmt::Pass(statement)) = statement.body.last() {
+                // Suite emission can elide this native NOP, leaving only its
+                // location to donate to the original loop backedge.
                 self.assembler
                     .set_location(self.source_location(statement.range));
+            } else if self.context.python_version <= crate::PythonVersion::Py313 {
+                // Legacy CPython emits an unlocated original backedge before exit
+                // copying and threading choose each incoming arm's line and owner.
+                self.assembler.set_location(SourceLocation::NONE);
             } else if self.assembler.instruction_count() > body_start
                 && let Some(location) = self.assembler.last_instruction_location()
             {
@@ -16095,8 +16875,7 @@ impl Compiler<'_> {
         self.set_depth(base_depth + self.iterator_slots() + 1);
         self.assembler
             .set_location(self.source_location(statement.iter.range()));
-        self.emit(END_FOR, 0, -1)?;
-        self.emit(POP_ITER, 0, -self.iterator_slots())?;
+        self.emit_end_for_cleanup()?;
         for name in &newly_initialized_targets {
             let name = self.required_name_id(name);
             self.symbols.initialized_locals.remove(name);
@@ -16119,12 +16898,18 @@ impl Compiler<'_> {
             self.emit(NOP, 0, 0)?;
             let noop_end = self.assembler.label();
             self.assembler.mark(noop_end);
-            for exclusions in &mut self.control.withs.active_with_region_exclusions {
-                exclusions.push((noop_start, noop_end));
+            if self.context.python_version >= crate::PythonVersion::Py314 {
+                for exclusions in &mut self.control.withs.active_with_region_exclusions {
+                    exclusions.push((noop_start, noop_end));
+                }
             }
         }
-        if has_break {
-            if self.assembler.has_authored_forward_break_to(end) {
+        if has_break || self.context.python_version == crate::PythonVersion::Py312 {
+            if self.context.python_version == crate::PythonVersion::Py312
+                || self.assembler.has_authored_forward_break_to(end)
+            {
+                // 3.12 retains the authored end label even without a break: a
+                // following POP_BLOCK has its own array after END_FOR.
                 // An emitted break targets a separate original array after END_FOR
                 // and POP_ITER. Its cleanup conditions cannot borrow earlier slots.
                 self.assembler.record_exception_owner_block_boundary(end);
@@ -16158,6 +16943,30 @@ impl Compiler<'_> {
         let cleanup_throw = self.assembler.label();
         let async_cleanup = self.assembler.label();
         let end = self.assembler.label();
+        for (role, label) in [
+            (
+                super::legacy_native_labels::NativeRole::AsyncForStart(statement.range),
+                start,
+            ),
+            (
+                super::legacy_native_labels::NativeRole::AsyncForExcept(statement.range),
+                async_cleanup,
+            ),
+            (
+                super::legacy_native_labels::NativeRole::AsyncForSend(statement.range),
+                send,
+            ),
+            (
+                super::legacy_native_labels::NativeRole::AsyncForFail(statement.range),
+                cleanup_throw,
+            ),
+            (
+                super::legacy_native_labels::NativeRole::AsyncForExit(statement.range),
+                send_end,
+            ),
+        ] {
+            self.bind_native_source_label(role, label);
+        }
         let mut newly_initialized_targets = Vec::new();
         collect_target_names(&statement.target, &mut newly_initialized_targets);
         newly_initialized_targets.retain(|name| !self.is_initialized(name));
@@ -16233,7 +17042,11 @@ impl Compiler<'_> {
             )
         })?;
         if tail_jumps == LoopBackedge::Required && !suite_terminates(&statement.body) {
-            if let Some(Stmt::Pass(statement)) = statement.body.last() {
+            if self.context.python_version <= crate::PythonVersion::Py313 {
+                // Legacy CFG propagation takes the location from the continuing edge,
+                // which can differ from the last lexical statement (such as a break).
+                self.assembler.set_location(SourceLocation::NONE);
+            } else if let Some(Stmt::Pass(statement)) = statement.body.last() {
                 self.assembler
                     .set_location(self.source_location(statement.range));
             } else if self.assembler.instruction_count() > body_start
@@ -16264,10 +17077,28 @@ impl Compiler<'_> {
         self.set_depth(base_depth + 2);
         self.assembler.set_location(iterator_location);
         self.apply_compiler_stack_effect(END_ASYNC_FOR, 0, -2)?;
-        self.assembler.emit_backward(END_ASYNC_FOR, send);
+        if self.context.python_version <= crate::PythonVersion::Py313 {
+            self.assembler.emit(END_ASYNC_FOR, 0);
+        } else {
+            self.assembler.emit_backward(END_ASYNC_FOR, send);
+        }
         let exhaustion_continuation = self.assembler.label();
-        self.assembler
-            .record_exception_owner_block_boundary(exhaustion_continuation);
+        // The source plan admits only empty else suites. With no break, native
+        // End is this existing continuation; otherwise it is the marked target.
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::AsyncForEnd(statement.range),
+            if has_break {
+                end
+            } else {
+                exhaustion_continuation
+            },
+        );
+        if self.context.python_version != crate::PythonVersion::Py313 {
+            // 3.13 constructs CFG blocks only for actual jump targets. Its unused
+            // async-for end label cannot split END_ASYNC_FOR from a following POP_BLOCK.
+            self.assembler
+                .record_exception_owner_block_boundary(exhaustion_continuation);
+        }
         self.assembler.mark(exhaustion_continuation);
         self.assembler.add_exception_region(
             protected_start,
@@ -16373,6 +17204,12 @@ impl Compiler<'_> {
                 .set_location(self.source_location(statement.iter.range()));
             let instruction_index = self.assembler.instruction_count();
             let instruction = self.emit_instruction(NOP, 0)?;
+            if self.context.python_version == crate::PythonVersion::Py312 {
+                // This normal protected-body exit is the original POP_BLOCK. It
+                // stays ownerless through cold relocation and late pseudo-op removal.
+                self.assembler.exclude_last_from_exception_table();
+                self.assembler.mark_last_as_converted_pop_block();
+            }
             let noop_end = self.assembler.label();
             self.assembler.mark(noop_end);
             // CPython's coroutine stop handler excludes both the synthetic end block and the
@@ -16442,7 +17279,7 @@ impl Compiler<'_> {
             Expr::Subscript(target) => {
                 self.compile_expression(&target.value)?;
                 let optimized_slice = if let Expr::Slice(slice) = target.slice.as_ref()
-                    && two_element_slice_optimization(slice)
+                    && two_element_slice_optimization(slice, self.context.python_version)
                 {
                     let slice_location = self.source_location(slice.range);
                     self.compile_optional_slice_bound(slice.lower.as_deref(), slice_location)?;
@@ -16489,7 +17326,9 @@ impl Compiler<'_> {
         &mut self,
         assignment: &ruff_python_ast::StmtAnnAssign,
     ) -> Result<(), CompileError> {
+        let eager_annotations = self.context.python_version <= crate::PythonVersion::Py313;
         if assignment.simple
+            && !eager_annotations
             && matches!(self.unit.scope, Scope::Class { .. })
             && self.unit.flags & CO_FUTURE_ANNOTATIONS == 0
         {
@@ -16519,7 +17358,7 @@ impl Compiler<'_> {
         if assignment.simple
             && (matches!(self.unit.scope, Scope::Module)
                 || matches!(self.unit.scope, Scope::Class { .. })
-                    && self.unit.flags & CO_FUTURE_ANNOTATIONS != 0)
+                    && (eager_annotations || self.unit.flags & CO_FUTURE_ANNOTATIONS != 0))
         {
             if let Some(value) = &assignment.value {
                 self.compile_expression(value)?;
@@ -16528,11 +17367,16 @@ impl Compiler<'_> {
             let Expr::Name(target) = assignment.target.as_ref() else {
                 return Err(unsupported("simple annotation target"));
             };
-            if self.unit.flags & CO_FUTURE_ANNOTATIONS != 0 {
+            if eager_annotations || self.unit.flags & CO_FUTURE_ANNOTATIONS != 0 {
                 self.assembler
                     .set_location(self.source_location(assignment.annotation.range()));
-                let annotation = unparse_annotation(&assignment.annotation, self.context.source);
-                self.load_string_constant(&annotation)?;
+                if self.unit.flags & CO_FUTURE_ANNOTATIONS != 0 {
+                    let annotation =
+                        unparse_annotation(&assignment.annotation, self.context.source);
+                    self.load_string_constant(&annotation)?;
+                } else {
+                    self.compile_expression(&assignment.annotation)?;
+                }
                 self.assembler
                     .set_location(self.source_location(assignment.range));
                 self.load_name("__annotations__")?;
@@ -16565,25 +17409,34 @@ impl Compiler<'_> {
         if let Some(value) = &assignment.value {
             self.compile_expression(value)?;
             self.compile_store_target(&assignment.target)?;
-            return Ok(());
+        } else {
+            match assignment.target.as_ref() {
+                Expr::Name(_) => {}
+                Expr::Attribute(attribute) => {
+                    self.compile_expression(&attribute.value)?;
+                    self.assembler
+                        .set_location(self.source_location(attribute.value.range()));
+                    self.emit(POP_TOP, 0, -1)?;
+                }
+                Expr::Subscript(subscript) => {
+                    self.compile_expression(&subscript.value)?;
+                    self.assembler
+                        .set_location(self.source_location(subscript.value.range()));
+                    self.emit(POP_TOP, 0, -1)?;
+                    self.compile_discarded_annotation_slice(&subscript.slice)?;
+                }
+                _ => return Err(unsupported("annotated assignment target")),
+            }
         }
-
-        match assignment.target.as_ref() {
-            Expr::Name(_) => {}
-            Expr::Attribute(attribute) => {
-                self.compile_expression(&attribute.value)?;
-                self.assembler
-                    .set_location(self.source_location(attribute.value.range()));
-                self.emit(POP_TOP, 0, -1)?;
-            }
-            Expr::Subscript(subscript) => {
-                self.compile_expression(&subscript.value)?;
-                self.assembler
-                    .set_location(self.source_location(subscript.value.range()));
-                self.emit(POP_TOP, 0, -1)?;
-                self.compile_discarded_annotation_slice(&subscript.slice)?;
-            }
-            _ => return Err(unsupported("annotated assignment target")),
+        if eager_annotations
+            && !assignment.simple
+            && matches!(self.unit.scope, Scope::Module | Scope::Class { .. })
+            && self.unit.flags & CO_FUTURE_ANNOTATIONS == 0
+        {
+            self.compile_expression(&assignment.annotation)?;
+            self.assembler
+                .set_location(self.source_location(assignment.annotation.range()));
+            self.emit(POP_TOP, 0, -1)?;
         }
         Ok(())
     }
@@ -16649,7 +17502,9 @@ impl Compiler<'_> {
             final_chained_comparison(&statement.test).map(|comparison| comparison.range);
         let empty_folded_failure_block =
             condition_truthiness == Some(false) && self.assembler.at_empty_borrow_block();
-        if condition_truthiness == Some(true) {
+        if condition_truthiness == Some(true)
+            && self.context.python_version != crate::PythonVersion::Py313
+        {
             if let Some(constant) = fold_constant(&statement.test) {
                 self.add_constant(constant)?;
             }
@@ -16658,7 +17513,7 @@ impl Compiler<'_> {
                 self.pre_register_expression_constants(message)?;
             }
             self.assembler
-                .set_location(self.source_location(statement.test.range()));
+                .set_location(self.expression_location(&statement.test));
             self.emit(NOP, 0, 0)?;
             // The original LOAD_CONST, TO_BOOL, and conditional jump survive until
             // after CPython decides which small exit blocks to copy.
@@ -16667,6 +17522,10 @@ impl Compiler<'_> {
             // CPython's borrowed-load traversal stops at that empty block.
             self.assembler.mark_last_borrow_fallthrough_barrier();
             let success = self.assembler.label();
+            self.bind_native_source_label(
+                super::legacy_native_labels::NativeRole::AssertEnd(statement.range),
+                success,
+            );
             self.assembler
                 .record_exception_owner_block_boundary(success);
             self.assembler.mark(success);
@@ -16704,13 +17563,17 @@ impl Compiler<'_> {
         {
             let base_depth = self.control.stack.depth;
             let end = self.assembler.label();
+            self.bind_native_source_label(
+                super::legacy_native_labels::NativeRole::AssertEnd(statement.range),
+                end,
+            );
             self.assembler.mark_assertion_side_exit_candidate();
             self.compile_linear_assert_condition(&statement.test, end)?;
             self.assembler
                 .set_location(self.source_location(statement.range));
             self.emit_common_constant(CommonConstant::ASSERTIONERROR)?;
             self.assembler
-                .set_location(self.source_location(statement.test.range()));
+                .set_location(self.expression_location(&statement.test));
             self.emit(RAISE_VARARGS, 1, -1)?;
             self.assembler.record_exception_owner_block_boundary(end);
             self.assembler.mark(end);
@@ -16719,6 +17582,10 @@ impl Compiler<'_> {
         }
         let base_depth = self.control.stack.depth;
         let end = self.assembler.label();
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::AssertEnd(statement.range),
+            end,
+        );
         let include_none_owner = self.control.conditions.include_assert_none_condition_owner
             || !self.control.withs.active_with_region_exclusions.is_empty()
             || (!self
@@ -16923,7 +17790,7 @@ impl Compiler<'_> {
             self.emit(CALL, 0, -1)?;
         }
         self.assembler
-            .set_location(self.source_location(statement.test.range()));
+            .set_location(self.expression_location(&statement.test));
         self.emit(RAISE_VARARGS, 1, -1)?;
         self.assembler.record_exception_owner_block_boundary(end);
         self.assembler.mark(end);
@@ -17021,6 +17888,8 @@ impl Compiler<'_> {
         statement: &ruff_python_ast::StmtTry,
         options: TryCompileOptions,
     ) -> Result<(), CompileError> {
+        use super::legacy_native_labels::NativeRole;
+
         let TryCompileOptions {
             terminal,
             emit_statement_nop,
@@ -17036,6 +17905,32 @@ impl Compiler<'_> {
         if statement.handlers.is_empty() {
             return Err(unsupported("try statement without handlers"));
         }
+        // CPython folds every successful arm of a trailing nested conversion chain directly onto
+        // the iterator backedge. Restrict that layout to recursive one-call try/except/else arms
+        // so ordinary nested handlers keep their shared joins.
+        let nested_loop_conversion_try = self.control.in_iterator_loop()
+            && !self.control.statements.current_statement_has_following
+            && is_loop_conversion_try(statement)
+            && (!self.control.exceptions.active_exception_handlers.is_empty()
+                || statement.handlers.iter().any(|handler| {
+                    handler
+                        .as_except_handler()
+                        .is_some_and(|handler| matches!(handler.body.as_slice(), [Stmt::Try(_)]))
+                }));
+        // Only this ordinary source route preserves the native shared joins.
+        // Unsupported lowering leaves its planned roles unconsumed, cancelling
+        // the complete certificate without guessing transformed label aliases.
+        let native_try_labels = self.context.python_version == crate::PythonVersion::Py312
+            && !terminal
+            && emit_statement_nop
+            && !exclude_terminal_body_not_taken
+            && !retained_else_break_exit
+            // This eager backedge has already replaced native JUMP TryEnd;
+            // its live loop target cannot supply the original native operand.
+            && !nested_loop_conversion_try
+            && loop_tail.is_none()
+            && else_loop_tail.is_none()
+            && else_match_tail.is_none();
 
         let base_depth = self.control.stack.depth;
         let direct_return_handler_try_with_depth = (self
@@ -17109,6 +18004,12 @@ impl Compiler<'_> {
         let handler_start = self.assembler.label();
         let common_cleanup = self.assembler.label();
         let end = self.assembler.label();
+        if native_try_labels {
+            self.bind_native_source_label(NativeRole::TryBody(statement.range), try_start);
+            self.bind_native_source_label(NativeRole::TryExcept(statement.range), handler_start);
+            self.bind_native_source_label(NativeRole::TryEnd(statement.range), end);
+            self.bind_native_source_label(NativeRole::TryCleanup(statement.range), common_cleanup);
+        }
         let body_ends_with_break_loop = statement.orelse.is_empty()
             && matches!(
                 statement.body.last(),
@@ -17132,29 +18033,21 @@ impl Compiler<'_> {
                 .as_except_handler()
                 .is_some_and(|handler| handler.type_.is_none())
         });
-        // CPython folds every successful arm of a trailing nested conversion chain directly onto
-        // the iterator backedge. Restrict that layout to recursive one-call try/except/else arms
-        // so ordinary nested handlers keep their shared joins.
-        let nested_loop_conversion_try = self.control.in_iterator_loop()
-            && !self.control.statements.current_statement_has_following
-            && is_loop_conversion_try(statement)
-            && (!self.control.exceptions.active_exception_handlers.is_empty()
-                || statement.handlers.iter().any(|handler| {
-                    handler
-                        .as_except_handler()
-                        .is_some_and(|handler| matches!(handler.body.as_slice(), [Stmt::Try(_)]))
-                }));
         let has_tuple_handler = statement.handlers.iter().any(|handler| {
             handler
                 .as_except_handler()
                 .is_some_and(|handler| matches!(handler.type_.as_deref(), Some(Expr::Tuple(_))))
         });
-        let trailing_fallthrough_handler_try = self
-            .control
-            .exceptions
-            .active_exception_handlers
-            .last()
-            .is_some_and(|handler| handler.name.is_none())
+        // 3.12 retargets original jumps in place, preserving the enclosing handler.
+        // Later targets can replace these exits with fresh ownerless threaded jumps.
+        let trailing_fallthrough_handler_try = self.context.python_version
+            != crate::PythonVersion::Py312
+            && self
+                .control
+                .exceptions
+                .active_exception_handlers
+                .last()
+                .is_some_and(|handler| handler.name.is_none())
             && self
                 .control
                 .is_direct_trailing_handler_statement(statement.range)
@@ -17995,6 +18888,18 @@ impl Compiler<'_> {
             }
             if retained_assertion_exit {
                 self.assembler.mark_before_trailing_labels(try_end);
+            } else if self.context.python_version <= crate::PythonVersion::Py313
+                && self.assembler.last_instruction_is_nop()
+                && let Some(Stmt::Expr(tail)) = statement.body.last()
+                && self.return_value_is_constant(&tail.value)
+                && self.assembler.last_instruction_location()
+                    == Some(self.source_location(tail.range))
+            {
+                // The constant NOP donates its span to POP_BLOCK before disappearing.
+                // Native POP_BLOCK itself never receives an exception owner.
+                self.assembler.exclude_last_from_exception_table();
+                self.assembler.mark_last_as_converted_pop_block();
+                self.assembler.mark_before_trailing_instructions(try_end, 1);
             } else {
                 self.assembler.mark(try_end);
             }
@@ -18014,7 +18919,14 @@ impl Compiler<'_> {
                         ExceptionPolicy::default()
                     };
                 self.emit_with_exception_policy(NOP, 0, 0, exception_policy)?;
-                self.assembler.mark_last_as_converted_pop_block();
+                if self.context.python_version != crate::PythonVersion::Py313
+                    || !statement.orelse.is_empty()
+                {
+                    self.assembler.mark_last_as_converted_pop_block();
+                }
+                // 3.13 removes the original POP beside the normal-exit jump.
+                // Without an else suite, this retained NOP is that jump's record
+                // and keeps its outer owner. 3.12 retains POP_BLOCK until later.
                 self.assembler.preserve_last_nop();
                 if early_condition_truthiness(&assertion.test) == Some(true) {
                     self.assembler.mark_last_borrow_fallthrough_barrier();
@@ -18044,13 +18956,16 @@ impl Compiler<'_> {
                     self.assembler.preserve_last_nop();
                 }
                 if let Some(location) = location {
-                    // If `try` and its pass body share a line, CPython retains the enclosing
-                    // statement location on the synthetic body marker.
-                    let location = self
-                        .assembler
-                        .last_instruction_location()
-                        .filter(|previous| previous.line == location.line)
-                        .unwrap_or(location);
+                    // 3.12 removes SETUP only after the authored Pass has located
+                    // POP_BLOCK. Later targets retain the enclosing same-line span.
+                    let location = if self.context.python_version == crate::PythonVersion::Py312 {
+                        location
+                    } else {
+                        self.assembler
+                            .last_instruction_location()
+                            .filter(|previous| previous.line == location.line)
+                            .unwrap_or(location)
+                    };
                     self.assembler.set_location(location);
                     // The no-op body does not inherit an enclosing finally's exception owner.
                     let exception_policy = if self.control.exceptions.prevent_try_exit_inlining
@@ -18111,15 +19026,40 @@ impl Compiler<'_> {
             if matched.cases.iter().all(|case| {
                 suite_terminates_before_constant_folding(&case.body)
             }));
-        let removed_try_pop_block = (!statement.orelse.is_empty() || match_body_pop_block)
+        // A discarded false arm still jumps to this original POP_BLOCK before
+        // 3.13 compacts NOPs. Materialize it so jump threading sees that first
+        // record, instead of threading straight through the normal-exit jump.
+        let false_arm_pop_block = self.context.python_version == crate::PythonVersion::Py313
+            && !statement.is_star
+            && statement.orelse.is_empty()
+            && matches!(statement.body.last(), Some(Stmt::If(branch))
+                if branch.elif_else_clauses.is_empty()
+                    && early_condition_truthiness(&branch.test) == Some(false)
+                    && !suite_terminates_before_constant_folding(&branch.body));
+        let removed_try_pop_block = (self.assembler.python_version()
+            == crate::PythonVersion::Py312
+            || !statement.orelse.is_empty()
+            || match_body_pop_block
+            || false_arm_pop_block)
             && !suite_terminates(&statement.body)
-            && !self.assembler.last_instruction_is_nop();
+            && (!self.assembler.last_instruction_is_nop()
+                // A preceding arm's NOP does not replace the unlocated POP_BLOCK
+                // in this separate original join. 3.12 must keep that record
+                // through exit copying before each incoming path donates a span.
+                || (self.context.python_version == crate::PythonVersion::Py312
+                    && (self.assembler.at_empty_borrow_block()
+                        || self.assembler.at_original_match_join())));
         let sole_else_pop_location = (removed_try_pop_block
             && suite_ends_in_sole_else_fallthrough(&statement.body))
         .then(|| self.assembler.original_fallthrough_join_location())
         .flatten();
+        // 3.12 keeps every original POP_BLOCK through both small-exit copy
+        // passes. A hidden early-copy slot would disappear before the second
+        // pass, and an untargeted loop exhaustion array still owns this record.
         let deferred_try_pop_block = removed_try_pop_block
-            && (self.assembler.at_jump_target() || sole_else_pop_location.is_some());
+            && (self.context.python_version == crate::PythonVersion::Py312
+                || self.assembler.at_jump_target()
+                || sole_else_pop_location.is_some());
         let removed_shared_try_pop_block =
             deferred_try_pop_block && self.assembler.has_folded_shared_conditional_entry();
         let deferred_try_pop_instruction = self.assembler.instruction_count();
@@ -18127,8 +19067,20 @@ impl Compiler<'_> {
             // An original normal-exit array can have a sole physical else donor
             // even when every earlier arm terminates. Other incoming edges still
             // defer their POP_BLOCK location to CFG propagation and NOP removal.
+            let location = sole_else_pop_location.or_else(|| {
+                if self.context.python_version == crate::PythonVersion::Py312
+                    && let Some(Stmt::Pass(pass)) = statement.body.last()
+                {
+                    let location = self.source_location(pass.range);
+                    self.assembler
+                        .has_single_omitted_fallthrough_nop_before_label(try_end, location)
+                        .then_some(location)
+                } else {
+                    None
+                }
+            });
             self.assembler
-                .set_location(sole_else_pop_location.unwrap_or(SourceLocation::NONE));
+                .set_location(location.unwrap_or(SourceLocation::NONE));
             self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
             self.assembler.mark_last_as_converted_pop_block();
             if sole_else_pop_location.is_some() {
@@ -18139,6 +19091,11 @@ impl Compiler<'_> {
             // The normal try-body POP_BLOCK is removed during CPython's first
             // compaction, leaving a slot for markers appended in the else suite.
             self.assembler.add_last_hidden_exception_owner_slots(1);
+        }
+        if !deferred_try_pop_block && !normal_return_emitted && !suite_terminates(&statement.body) {
+            // Native 3.13 retains this linear POP_BLOCK as a NOP through early
+            // exit copying, independently of modern exception-owner vacancies.
+            self.assembler.add_legacy_pop_block_copy_slot(try_end);
         }
         let orelse_start_item = self.assembler.item_count();
         let orelse_instruction_count = self.assembler.instruction_count();
@@ -18253,9 +19210,12 @@ impl Compiler<'_> {
                 && let Some(range) = suite_assert_success_fallthrough_range(&statement.body)
             {
                 self.assembler.set_location(self.source_location(range));
-            } else if statement.orelse.is_empty()
-                && terminal_for_break_exit_inherits_predecessor(&statement.body)
+            } else if (statement.orelse.is_empty()
+                || self.context.python_version <= crate::PythonVersion::Py313)
+                && terminal_for_break_exit_inherits_predecessor(normal_exit_suite)
             {
+                // A legacy try-else footer is copied onto breaks from that else
+                // suite too; each copy inherits its own authored break span.
                 self.assembler.set_location(SourceLocation::NONE);
             } else if statement.orelse.is_empty()
                 && let Some(Stmt::While(loop_statement)) = statement.body.last()
@@ -18723,6 +19683,7 @@ impl Compiler<'_> {
                 .is_empty()
                 && (body_ends_with_overridden_return
                     || (body_noop_location.is_some()
+                        && self.context.python_version >= crate::PythonVersion::Py314
                         && (self.control.finally.active_overriding_finally_returns > 0
                             || (pass_only_handlers
                                 && !self.control.exceptions.prevent_try_exit_inlining))))
@@ -18750,8 +19711,11 @@ impl Compiler<'_> {
             // When every handler exits, an empty body leading directly to its own finally
             // retains its unowned POP_BLOCK marker. Other shared or enclosing-region exits
             // retain the normal jump's exception owner.
+            // Legacy passes retain the original empty-body exit jump's owner
+            // until actual copying replaces it with the owner's donor record.
             let exception_policy = if exclude_nested_normal_exit
                 || (body_noop_location.is_some()
+                    && self.context.python_version >= crate::PythonVersion::Py314
                     && statement.orelse.is_empty()
                     && !self
                         .control
@@ -18871,13 +19835,39 @@ impl Compiler<'_> {
                                             && !expression_contains_inline_branch(&awaited.value)
                                             && !expression_suspends_current_scope(&awaited.value)))
                         }));
-            let normal_exit = if match_body_pop_block
+            if (self.assembler.python_version() == crate::PythonVersion::Py312
+                && (matches!(normal_exit_suite.last(), Some(Stmt::Assign(_)))
+                    || matches!(normal_exit_suite.last(), Some(Stmt::AnnAssign(assignment))
+                        if assignment.value.is_some())
+                    || matches!(normal_exit_suite.last(), Some(Stmt::While(tail))
+                        if early_condition_truthiness(&tail.test) == Some(true)
+                            && tail.orelse.is_empty()
+                            && suite_contains_loop_break(&tail.body))
+                    || (!statement.orelse.is_empty() && orelse_noop_location.is_none())))
+                || (self.assembler.python_version() == crate::PythonVersion::Py313
+                    && orelse_noop_location.is_none()
+                    && !(statement.orelse.is_empty()
+                        && (body_noop_location.is_some() || omitted_fallthrough_pass_exit)))
+                || (self.assembler.python_version() == crate::PythonVersion::Py312
+                    && statement.orelse.is_empty()
+                    && deferred_try_pop_block
+                    && !removed_shared_try_pop_block)
+            {
+                // CPython emits this normal try exit without a location. Native
+                // CFG propagation keeps shared joins unlocated so each incoming
+                // path supplies its own span at the target version's phase. A
+                // front-end omitted body or else NOP already donates its location above.
+                self.assembler.set_location(SourceLocation::NONE);
+            }
+            let normal_exit = if (match_body_pop_block
+                || self.assembler.python_version() == crate::PythonVersion::Py312)
                 && statement.orelse.is_empty()
                 && deferred_try_pop_block
                 && !removed_shared_try_pop_block
             {
-                // The original POP_BLOCK must inherit the final pattern's line before
-                // NOP removal. Absorbing it into this jump loses that line on exit copying.
+                // Keep the original POP_BLOCK through its native phase. In 3.12 it
+                // blocks early jump threading before late location propagation; a
+                // match exit must likewise inherit its pattern's span before removal.
                 self.emit_jump_forward_instruction_preserving_nop(
                     JUMP_FORWARD,
                     end,
@@ -20004,6 +20994,9 @@ impl Compiler<'_> {
                 CompileError::Internal("invalid exception handler node".to_string())
             })?;
             let next_handler = self.assembler.label();
+            if native_try_labels {
+                self.bind_native_source_label(NativeRole::HandlerNext(handler.range), next_handler);
+            }
             let handler_location = self.source_location_including_trailing_semicolon(handler.range);
             final_handler_location = handler_location;
             self.set_depth(base_depth + 2);
@@ -20096,6 +21089,18 @@ impl Compiler<'_> {
             let body_start = self.assembler.label();
             let body_end = self.assembler.label();
             let name_cleanup = self.assembler.label();
+            if native_try_labels {
+                self.bind_native_source_label(
+                    NativeRole::HandlerCleanupBody(handler.range),
+                    body_start,
+                );
+                if handler.name.is_some() {
+                    self.bind_native_source_label(
+                        NativeRole::HandlerCleanupEnd(handler.range),
+                        name_cleanup,
+                    );
+                }
+            }
             if handler.name.is_some() {
                 self.assembler.record_exception_setup(body_start, false);
             } else {
@@ -20331,7 +21336,14 @@ impl Compiler<'_> {
                 .map(|name| self.required_name_id(name.as_str()));
             let previously_owned =
                 handler_name.is_some_and(|name| !self.symbols.owned_load_locals.insert(name));
+            // A named cleanup has five instructions even after RETURN_CONST
+            // folding. 3.12 only copies exits of at most four instructions;
+            // 3.13 also copies arbitrarily sized unlocated terminal blocks.
+            let can_copy_handler_return = self.context.python_version
+                != crate::PythonVersion::Py312
+                || handler.name.is_none();
             let terminal_handler_if = if terminal
+                && can_copy_handler_return
                 && let Some(name) = &handler.name
                 && let [Stmt::If(statement)] = handler.body.as_slice()
                 && terminal_exception_handler_if_supported(statement)
@@ -20344,6 +21356,7 @@ impl Compiler<'_> {
             // return onto several exits. Keep the handler active while compiling those exits
             // so each return carries its own handler cleanup, including after a handler prefix.
             let terminal_handler_suite = terminal
+                && can_copy_handler_return
                 && terminal_handler_if.is_none()
                 && handler.body.last().is_some_and(|tail| match tail {
                     Stmt::Try(_) => true,
@@ -21177,6 +22190,17 @@ impl Compiler<'_> {
                         .chain(tail.elif_else_clauses.iter().map(|clause| clause.body.as_slice()))
                         .any(|body| matches!(body.last(), Some(Stmt::Expr(expression))
                             if matches!(expression.value.as_ref(), Expr::Await(_) | Expr::Yield(_) | Expr::YieldFrom(_)))));
+            // 3.12 emits artificial named cleanup without a location. A source-less
+            // original join must remain eligible for late exit duplication; a preceding
+            // instruction in the same block still supplies its ordinary fallthrough span.
+            let legacy_terminal_cleanup_location = (terminal
+                && self.context.python_version == crate::PythonVersion::Py312
+                && handler.name.is_some())
+            .then(|| {
+                self.assembler
+                    .current_block_last_instruction_location()
+                    .unwrap_or(SourceLocation::NONE)
+            });
             self.assembler.mark(body_end);
             if handler.name.is_some() {
                 self.assembler
@@ -21364,9 +22388,12 @@ impl Compiler<'_> {
                             && suite_has_linear_raise_exit(&tail.body)
                             && matches!(tail.body.last(), Some(Stmt::Raise(raise))
                                 if raise.exc.is_none() && raise.cause.is_none())));
-                // CPython propagates a handler's sole condition-fallthrough edge onto the
-                // normal cleanup block, even when code follows the enclosing try statement.
-                if handler_cleanup_from_original_join
+                // Legacy cleanup starts unlocated at emitted jump targets: each target's
+                // CFG pass resolves sole donors and keeps shared loop/branch exits unlocated.
+                // A loop's initial false jump and footer fallthrough are distinct predecessors.
+                if (self.context.python_version <= crate::PythonVersion::Py313
+                    && self.assembler.at_jump_target())
+                    || handler_cleanup_from_original_join
                     || handler_has_shared_normal_finally_cleanup
                     || handler_ends_with_unlocated_bare_raise_branch_cleanup
                     || handler_has_shared_terminal_false_cleanup
@@ -21442,6 +22469,14 @@ impl Compiler<'_> {
                 } else if let Some(Stmt::Pass(statement)) = handler.body.last() {
                     self.assembler
                         .set_location(self.source_location(statement.range));
+                } else if self.context.python_version <= crate::PythonVersion::Py313
+                    && !handler_body_has_instructions
+                    && matches!(handler.body.last(), Some(Stmt::AnnAssign(assignment))
+                        if assignment.value.is_none())
+                {
+                    // An erased annotation has no NOP to donate a location. Native
+                    // cleanup inherits the preceding exception-match or name store.
+                    self.assembler.set_location(SourceLocation::NONE);
                 } else if !handler_body_has_instructions
                     && let Some(statement) = handler.body.last()
                 {
@@ -21455,6 +22490,16 @@ impl Compiler<'_> {
                     // The only live predecessor is the manager's suppression exit. Its
                     // context expression supplies the cleanup's location after cold ordering.
                     self.assembler.set_location(self.source_location(range));
+                } else if self.context.python_version == crate::PythonVersion::Py312
+                    && (matches!(handler.body.last(), Some(Stmt::Assign(_)))
+                        || matches!(handler.body.last(), Some(Stmt::AnnAssign(assignment))
+                            if assignment.value.is_some()))
+                {
+                    // Static swaps can reorder assignment stores before 3.12 resolves
+                    // cleanup locations. Let the final optimized store supply the span.
+                    self.assembler.set_location(SourceLocation::NONE);
+                } else if let Some(location) = legacy_terminal_cleanup_location {
+                    self.assembler.set_location(location);
                 } else if let Some(location) = self.assembler.last_instruction_location() {
                     self.assembler.set_location(location);
                 }
@@ -21503,10 +22548,21 @@ impl Compiler<'_> {
                 } else {
                     0
                 };
+                let legacy_handler_pop = self.context.python_version <= crate::PythonVersion::Py313
+                    && handler.name.is_none();
+                if legacy_handler_pop {
+                    // Native handler fallthrough keeps its POP_BLOCK until after early
+                    // exit copying. Together with POP_EXCEPT and the replaced exit
+                    // jump, it can put a following name return over the four-slot limit.
+                    self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
+                    self.assembler.mark_last_as_converted_pop_block();
+                }
                 self.emit(POP_EXCEPT, 0, -1)?;
-                if original_cleanup_slots != 0 {
-                    self.assembler
-                        .add_last_original_block_slots(original_cleanup_slots);
+                let materialized_cleanup_slots = usize::from(legacy_handler_pop);
+                if original_cleanup_slots > materialized_cleanup_slots {
+                    self.assembler.add_last_original_block_slots(
+                        original_cleanup_slots - materialized_cleanup_slots,
+                    );
                 }
                 if inlineable_bare_handler_if_with_multiline_join
                     || handler_ends_with_nonterminal_with
@@ -21636,7 +22692,9 @@ impl Compiler<'_> {
                             self.assembler.mark(start);
                             start
                         });
-                    let exclude_nested_handler_exit = handler_body_has_instructions
+                    let exclude_nested_handler_exit = self.context.python_version
+                        >= crate::PythonVersion::Py314
+                        && handler_body_has_instructions
                         && nested_in_final_outer_try_statement
                         && self
                             .control
@@ -21669,6 +22727,11 @@ impl Compiler<'_> {
                         } else {
                             ExceptionPolicy::default()
                         };
+                    if self.context.python_version == crate::PythonVersion::Py312 {
+                        // Native duplicates unlocated exits before propagating handler
+                        // locations. A cold handler must not pre-locate a warm return copy.
+                        self.assembler.set_location(SourceLocation::NONE);
+                    }
                     let handler_exit = self.emit_jump_forward_instruction_with_exception_policy(
                         JUMP_FORWARD,
                         end,
@@ -21890,10 +22953,21 @@ impl Compiler<'_> {
             .active_exception_region_exclusions
             .pop()
             .expect("active try-star region has exclusion collector");
-        // A retained no-op still supplies the original normal exit's source span,
+        let body_ends_with_nop = self.assembler.last_instruction_is_nop();
+        if self.context.python_version == crate::PythonVersion::Py312
+            && normal_exit_starts_in_empty_block
+        {
+            // The original POP_BLOCK starts this otherwise empty array. Keep it
+            // through both native exit-copy sweeps and jump threading; 3.12 removes
+            // it only after cold placement and location propagation.
+            self.assembler.set_location(SourceLocation::NONE);
+            self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
+            self.assembler.mark_last_as_converted_pop_block();
+        }
+        // A retained body no-op still supplies the original normal exit's source span,
         // even when its borrowed-load boundary prevents jump emission from removing it.
         self.assembler
-            .set_location(if terminal || self.assembler.last_instruction_is_nop() {
+            .set_location(if terminal || body_ends_with_nop {
                 body_fallthrough_location.unwrap_or(SourceLocation::NONE)
             } else {
                 SourceLocation::NONE
@@ -21944,7 +23018,16 @@ impl Compiler<'_> {
             let no_match = self.assembler.label();
             let body_cleanup = self.assembler.label();
 
-            self.set_depth(base_depth + 2);
+            // Later legacy handlers retain the original exception, accumulated
+            // exceptions, and unmatched subgroup above the saved exception state.
+            let handler_depth = if handler_index > 0
+                && self.context.python_version <= crate::PythonVersion::Py313
+            {
+                base_depth + 4
+            } else {
+                base_depth + 2
+            };
+            self.set_depth(handler_depth);
             if handler_index == 0 {
                 self.assembler.set_location(handler_location);
                 self.emit(BUILD_LIST, 0, 1)?;
@@ -22049,6 +23132,20 @@ impl Compiler<'_> {
                 && self.assembler.at_original_shared_handler_join();
             let body_end = self.assembler.label();
             self.assembler.mark(body_end);
+            if self.context.python_version == crate::PythonVersion::Py312 {
+                // The native subgroup cleanup starts with POP_BLOCK. It remains a
+                // real record through 3.12 jump threading, so assertion success edges
+                // cannot skip directly through the following normal-cleanup jump.
+                // An omitted body Pass supplies the cleanup span before the preceding
+                // handler dispatch can donate its unrelated location.
+                self.assembler.set_location(if body_has_instructions {
+                    SourceLocation::NONE
+                } else {
+                    body_cleanup_location
+                });
+                self.emit(NOP, 0, 0)?;
+                self.assembler.mark_last_as_converted_pop_block();
+            }
             self.assembler.set_location(body_cleanup_location);
             if let Some(name) = &handler.name {
                 let none = self.add_constant(Constant::None)?;
@@ -22060,7 +23157,7 @@ impl Compiler<'_> {
                 self.delete_name(name.as_str())?;
             }
             let is_last = handler_index + 1 == statement.handlers.len();
-            if is_last {
+            if is_last && self.assembler.python_version() >= crate::PythonVersion::Py314 {
                 self.emit(LIST_APPEND, 1, -1)?;
                 if preserve_cleanup_no_location && handler.name.is_none() {
                     self.assembler.preserve_last_no_location();
@@ -22101,18 +23198,28 @@ impl Compiler<'_> {
             }
             self.emit(LIST_APPEND, 3, -1)?;
             self.emit(POP_TOP, 0, -1)?;
-            if is_last {
+            if is_last && self.assembler.python_version() >= crate::PythonVersion::Py314 {
                 self.emit(LIST_APPEND, 1, -1)?;
                 self.emit_jump_forward(JUMP_FORWARD, reraise_star, 0)?;
             } else {
                 self.emit_jump_forward(JUMP_FORWARD, handler_error, 0)?;
             }
 
-            if !is_last {
+            if !is_last || self.assembler.python_version() <= crate::PythonVersion::Py313 {
                 self.assembler.mark(next_handler);
                 self.set_depth(base_depth + 4);
                 self.emit(NOP, 0, 0)?;
-                self.emit_jump_forward(JUMP_FORWARD, handler_error, 0)?;
+                if self.assembler.python_version() <= crate::PythonVersion::Py313 {
+                    // The native join's NOP blocks 3.12's early jump threading.
+                    // 3.13 copies this unlocated block before resolving locations.
+                    self.emit_jump_forward_instruction_preserving_nop(
+                        JUMP_FORWARD,
+                        handler_error,
+                        ExceptionPolicy::default(),
+                    )?;
+                } else {
+                    self.emit_jump_forward(JUMP_FORWARD, handler_error, 0)?;
+                }
             }
 
             self.assembler.mark(no_match);
@@ -22121,11 +23228,16 @@ impl Compiler<'_> {
             self.emit(POP_TOP, 0, -1)?;
 
             self.set_depth(base_depth + 4);
+            if self.assembler.python_version() <= crate::PythonVersion::Py313 {
+                // Legacy codegen joins the three outcomes before appending the
+                // unmatched subgroup. Its shared successor starts unlocated.
+                self.assembler.mark(handler_error);
+            }
             if is_last {
                 self.assembler.set_location(SourceLocation::NONE);
                 self.emit(LIST_APPEND, 1, -1)?;
                 self.emit_jump_forward(JUMP_FORWARD, reraise_star, 0)?;
-            } else {
+            } else if self.assembler.python_version() >= crate::PythonVersion::Py314 {
                 self.assembler.mark(handler_error);
             }
         }
@@ -22288,7 +23400,14 @@ impl Compiler<'_> {
                 self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     && matches!(body.last(), Some(Stmt::If(tail))
                     if handler_cleanup_has_complete_runtime_join(tail))
-                    && self.assembler.at_original_shared_handler_join();
+                    && if self.context.python_version == crate::PythonVersion::Py313 {
+                        // The original arm-end jump has NO_LOCATION in 3.13.
+                        // Its actual target certifies this complete runtime join
+                        // before native exit copying assigns predecessor spans.
+                        self.assembler.at_jump_target()
+                    } else {
+                        self.assembler.at_original_shared_handler_join()
+                    };
             let inline_join_cleanup = inline_join_cleanup || complete_conditional_cleanup;
             // A nested runtime conditional's normal edges also reach one original
             // artificial cleanup. Assign each copied exit its own predecessor's location.
@@ -22461,6 +23580,49 @@ impl Compiler<'_> {
         statement: &ruff_python_ast::StmtTry,
         terminal: bool,
     ) -> Result<(), CompileError> {
+        let finally = &self.control.finally;
+        if self.context.python_version <= crate::PythonVersion::Py313
+            && !finally.copies_terminating_finally_returns
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.exceptions.active_try_marker_slots.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && finally.active_return_finally_contexts.is_empty()
+            && finally.active_loop_finally_contexts.is_empty()
+            && finally.active_pass_finally_locations.is_empty()
+            && finally.preserved_return_value_contexts.is_empty()
+            && finally.copied_return_finally_preserved_values == 0
+            && finally.active_finally_try_bodies == 0
+            && finally.active_normal_finally_bodies == 0
+            && finally.active_copied_finally_bodies == 0
+            && finally.active_finally_end_blocks == 0
+            && finally.active_overriding_finally_returns == 0
+            && supports_nested_terminating_finally_returns(statement)
+        {
+            return self.with_control_override(
+                |control| &mut control.finally.copies_terminating_finally_returns,
+                true,
+                |compiler| compiler.compile_try_finally_inner(statement, terminal),
+            );
+        }
+        self.compile_try_finally_inner(statement, terminal)
+    }
+
+    fn compile_try_finally_inner(
+        &mut self,
+        statement: &ruff_python_ast::StmtTry,
+        terminal: bool,
+    ) -> Result<(), CompileError> {
+        use super::legacy_native_labels::{FinallyCopy, NativeRole};
+
         let preserve_exit_nop =
             std::mem::take(&mut self.control.finally.preserve_next_finally_exit_nop);
         let capture_manager_pop =
@@ -22599,6 +23761,10 @@ impl Compiler<'_> {
         let finally_handler = self.assembler.label();
         let cleanup = self.assembler.label();
         let end = self.assembler.label();
+        self.bind_native_source_label(NativeRole::FinallyBody(statement.range), protected_start);
+        self.bind_native_source_label(NativeRole::FinallyHandler(statement.range), finally_handler);
+        self.bind_native_source_label(NativeRole::FinallyExit(statement.range), end);
+        self.bind_native_source_label(NativeRole::FinallyCleanup(statement.range), cleanup);
         let empty_loop_finally_entry = statement.handlers.is_empty()
             && suite_ends_in_constant_break_loop(&statement.body)
             && matches!(statement.finalbody.first(), Some(Stmt::While(loop_statement))
@@ -24380,6 +25546,10 @@ impl Compiler<'_> {
 
         let statement_nop_start = self.assembler.label();
         self.assembler.mark(statement_nop_start);
+        if self.context.python_version == crate::PythonVersion::Py313 {
+            self.assembler
+                .set_location(self.source_location(statement.range));
+        }
         self.emit(NOP, 0, 0)?;
         let statement_nop_end = self.assembler.label();
         self.assembler.mark(statement_nop_end);
@@ -24455,7 +25625,11 @@ impl Compiler<'_> {
                 statement.finalbody.as_slice(),
                 [Stmt::Delete(delete)] if matches!(delete.targets.as_slice(), [Expr::Name(_)])
             );
-        let copy_finally_on_exit = !suite_terminates(&statement.finalbody);
+        // Native FINALLY_TRY visits the cleanup before any overriding Return
+        // discards the pending value. The certified chain uses the existing
+        // copied-return contexts for terminating and falling-through cleanup.
+        let copy_finally_on_exit = self.control.finally.copies_terminating_finally_returns
+            || !suite_terminates(&statement.finalbody);
         let noop_finally_body = statement.finalbody.iter().all(|statement| {
             matches!(statement, Stmt::Pass(_))
                 || matches!(statement, Stmt::Expr(expression) if fold_constant(&expression.value).is_some())
@@ -24484,6 +25658,7 @@ impl Compiler<'_> {
             && self.control.finally.active_copied_finally_bodies == 0;
         let return_context =
             (copy_finally_on_exit || copy_finally_on_loop_exit).then(|| FinallyExitContext {
+                source_range: statement.range,
                 body: statement.finalbody.to_vec(),
                 enclosing_finally_try_depth: self.control.finally.active_finally_try_bodies,
                 pass_finally_depth: self.control.finally.active_pass_finally_locations.len(),
@@ -24510,7 +25685,7 @@ impl Compiler<'_> {
             self.control.finally.pending_name_return_borrow_exit.take();
         let protected_result = self.with_finally_protected_context(
             pass_finally_location,
-            overriding_return,
+            overriding_return && !self.control.finally.copies_terminating_finally_returns,
             FinallyProtectedLoopRanges {
                 preserve_break_exit: preserve_break_exit_loop_range,
                 borrow_reachable_exit: inner_try_break_loop_range
@@ -24633,6 +25808,11 @@ impl Compiler<'_> {
                             compiler.compile_try_except(
                                 statement,
                                 TryCompileOptions {
+                                    // 3.12 keeps the inner SETUP_FINALLY between the
+                                    // outer finally body and the ordinary try body.
+                                    emit_statement_nop: compiler.context.python_version
+                                        == crate::PythonVersion::Py312
+                                        && !statement.is_star,
                                     retained_else_break_exit:
                                         terminal_else_break_bypasses_empty_exit,
                                     ..TryCompileOptions::NESTED_HANDLER
@@ -24802,15 +25982,32 @@ impl Compiler<'_> {
             self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
             index
         };
-        if statement.handlers.is_empty()
+        if (statement.handlers.is_empty()
+            || (self.context.python_version == crate::PythonVersion::Py313
+                && !statement.orelse.is_empty()))
             && !overriding_return
-            && matches!(statement.body.last(), Some(Stmt::While(tail))
+            && matches!((if statement.orelse.is_empty() {
+                &statement.body
+            } else {
+                &statement.orelse
+            }).last(), Some(Stmt::While(tail))
                 if early_condition_truthiness(&tail.test) == Some(true)
                     && tail.orelse.is_empty())
         {
             // The loop's false edge still reaches this join when CPython propagates
             // locations, before constant-test folding removes that predecessor. A final
             // return can instead copy its small exit onto the loop breaks.
+            self.assembler.preserve_last_no_location();
+        }
+        if self.context.python_version == crate::PythonVersion::Py313
+            && statement.handlers.is_empty()
+            && !overriding_return
+            && matches!(statement.body.last(), Some(Stmt::With(manager))
+                if suite_terminates(&manager.body)
+                    && !suite_terminates_before_constant_folding(&manager.body))
+        {
+            // The manager's normal exit and suppression exit both reach this POP_BLOCK
+            // before constant folding removes the infinite loop's normal exit.
             self.assembler.preserve_last_no_location();
         }
         if !suite_terminates(&statement.orelse)
@@ -24883,7 +26080,11 @@ impl Compiler<'_> {
                     .as_except_handler()
                     .is_some_and(|handler| suite_terminates_before_constant_folding(&handler.body))
             });
-        if statement.handlers.is_empty()
+        // 3.12 keeps this original POP_BLOCK through both exit-copy passes.
+        // After copying, an omitted else NOP can donate its line to this
+        // ownerless slot before pseudo-op conversion removes redundant NOPs.
+        if self.context.python_version == crate::PythonVersion::Py312
+            || statement.handlers.is_empty()
             || !noop_finally_body
             || single_assertion_success_predecessor
         {
@@ -24987,7 +26188,10 @@ impl Compiler<'_> {
         }
         let finalbody_block = self.assembler.current_block_token();
         let finalbody_instruction_start = self.assembler.instruction_count();
-        let ((), finalbody_emitted_fallthrough) = self.with_fallthrough_tracking(|compiler| {
+        let ((), finalbody_emitted_fallthrough) = self.with_native_finally_copy(
+            statement.range,
+            FinallyCopy::Normal,
+            |compiler| compiler.with_fallthrough_tracking(|compiler| {
             if let Some(location) = pass_finally_location {
                 compiler.assembler.set_location(location);
                 if compiler
@@ -25081,7 +26285,8 @@ impl Compiler<'_> {
                 )?;
             }
             Ok(())
-        })?;
+            }),
+        )?;
         if let Some(normal_exit) = name_return_borrow_exit {
             self.assembler
                 .mark_noncopyable_finally_borrow_barrier(normal_exit, normal_finally_pop_block);
@@ -25131,10 +26336,16 @@ impl Compiler<'_> {
                 .exclude_normalized_exception_owner_at(normal_finally_pop_block);
         }
         if terminal && !finalbody_emitted_fallthrough && !suite_terminates(&statement.finalbody) {
-            if matches!(
-                statement.finalbody.last(),
-                Some(Stmt::For(_) | Stmt::While(_) | Stmt::Match(_))
-            ) {
+            if (self.context.python_version == crate::PythonVersion::Py312
+                && statement.finalbody.last().is_some_and(|statement| {
+                    matches!(statement, Stmt::Assign(_))
+                        || matches!(statement, Stmt::AnnAssign(assignment) if assignment.value.is_some())
+                }))
+                || matches!(
+                    statement.finalbody.last(),
+                    Some(Stmt::For(_) | Stmt::While(_) | Stmt::Match(_))
+                )
+            {
                 // This return follows the shared normal-finally exit. Preserve the
                 // individual branch donor when a loop break or match arm copies it.
                 self.assembler.set_location(SourceLocation::NONE);
@@ -25593,6 +26804,11 @@ impl Compiler<'_> {
                 // original array on the normal continuation's borrowed-load route.
                 self.assembler.prevent_borrow_fallthrough_reachability(end);
             }
+            if self.context.python_version <= crate::PythonVersion::Py313 {
+                // Legacy finalizer exits start unlocated. Native CFG propagation
+                // assigns locations before shared continuations are threaded.
+                self.assembler.set_location(SourceLocation::NONE);
+            }
             let normal_exit = self.emit_jump_forward_instruction_with_exception_policy(
                 JUMP_FORWARD,
                 end,
@@ -25846,22 +27062,29 @@ impl Compiler<'_> {
             if let Some(exit_exclusion_start) = exit_exclusion_start {
                 let exit_exclusion_end = self.assembler.label();
                 self.assembler.mark(exit_exclusion_end);
-                if !original_sync_conditional_manager_jump
-                    && !original_async_generator_conditional_manager_jump
-                    && !original_nested_raising_manager_jump
-                {
-                    for exclusions in &mut self.control.withs.active_with_region_exclusions {
+                // Legacy CFG passes retain the original normal-finally jump's owner.
+                // The manager POP_BLOCK remains a separate ownerless record; actual
+                // copying and threading determine any later replacement's owner.
+                if self.context.python_version >= crate::PythonVersion::Py314 {
+                    if !original_sync_conditional_manager_jump
+                        && !original_async_generator_conditional_manager_jump
+                        && !original_nested_raising_manager_jump
+                    {
+                        for exclusions in &mut self.control.withs.active_with_region_exclusions {
+                            exclusions.push((exit_exclusion_start, exit_exclusion_end));
+                        }
+                    }
+                    for exclusions in
+                        &mut self.control.exceptions.active_exception_region_exclusions
+                    {
                         exclusions.push((exit_exclusion_start, exit_exclusion_end));
                     }
-                }
-                for exclusions in &mut self.control.exceptions.active_exception_region_exclusions {
-                    exclusions.push((exit_exclusion_start, exit_exclusion_end));
-                }
-                if self.control.generators.generator_region_start.is_some() {
-                    self.control
-                        .generators
-                        .generator_region_exclusions
-                        .push((exit_exclusion_start, exit_exclusion_end));
+                    if self.control.generators.generator_region_start.is_some() {
+                        self.control
+                            .generators
+                            .generator_region_exclusions
+                            .push((exit_exclusion_start, exit_exclusion_end));
+                    }
                 }
             }
         }
@@ -25895,93 +27118,113 @@ impl Compiler<'_> {
             .exceptions
             .active_exception_region_exclusions
             .push(Vec::new());
-        let mut explicit_handler_end = None;
-        let has_enclosing_finally_cleanup = self.control.finally.active_finally_try_bodies > 0
-            || self.control.finally.active_normal_finally_bodies > 0
-            || self.control.finally.active_finally_end_blocks > 0
-            || self.control.finally.active_copied_finally_bodies > 0;
-        if let Some((Stmt::Return(return_statement), leading)) = statement.finalbody.split_last()
-            && has_enclosing_finally_cleanup
-        {
-            self.compile_suite(leading)?;
-            explicit_handler_end =
-                Some(self.compile_return_from_exception_handler(return_statement)?);
-        } else if let [Stmt::If(final_if)] = statement.finalbody.as_slice()
-            && final_if.elif_else_clauses.is_empty()
-        {
-            let condition_false = if self.control.in_synchronous_with()
-                && matches!(final_if.body.as_slice(), [Stmt::Expr(_)])
-                && let Expr::BoolOp(boolean) = final_if.test.as_ref()
-                && boolean.op == BoolOp::And
-                && let [first, second] = boolean.values.as_slice()
-                && matches!((first, second), (Expr::Compare(_), Expr::Name(_)))
-            {
-                let first_false = self.assembler.label();
-                let second_false = self.assembler.label();
-                self.with_control_override(
-                    |control| &mut control.finally.exceptional_finally_condition,
-                    true,
-                    |compiler| {
-                        compiler.compile_jump_if(first, false, first_false)?;
-                        compiler.compile_jump_if(second, false, second_false)
-                    },
-                )?;
-                vec![(first_false, first), (second_false, second)]
-            } else {
-                let condition_false = self.assembler.label();
-                self.with_control_override(
-                    |control| &mut control.finally.exceptional_finally_condition,
-                    true,
-                    |compiler| compiler.compile_jump_if(&final_if.test, false, condition_false),
-                )?;
-                vec![(condition_false, final_if.test.as_ref())]
-            };
-            self.assembler.record_short_circuit_owner_continuation();
-            self.compile_exceptional_finally_suite(&final_if.body)?;
-            // Keep an ordinary guard's original end label before RERAISE. Inner joins
-            // still fall through during initial small-exit classification; the assembler
-            // duplicates the shared exceptional exit later while resolving locations.
-            if condition_false.len() > 1 && !suite_terminates(&final_if.body) {
-                self.assembler.set_location(SourceLocation::NONE);
-                self.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
-            }
-            for (condition_false, _test) in condition_false.into_iter().rev() {
-                self.assembler.mark(condition_false);
-                self.set_depth(base_depth + 2);
-                self.assembler.set_location(SourceLocation::NONE);
-                self.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
-            }
-        } else {
-            if let Some(location) = pass_finally_location {
-                self.assembler.set_location(location);
-                self.emit(NOP, 0, 0)?;
-            } else {
-                self.compile_exceptional_finally_suite(&statement.finalbody)?;
-            }
-            if !suite_terminates(&statement.finalbody) {
-                if matches!(
-                    statement.finalbody.last(),
-                    Some(Stmt::If(_) | Stmt::For(_) | Stmt::While(_) | Stmt::Match(_))
-                ) {
-                    // CPython leaves the shared exceptional exit unlocated. Each incoming
-                    // branch, including a loop break, supplies the copied exit's location.
-                    self.assembler.set_location(SourceLocation::NONE);
-                } else if let Some(range) = suite_unary_not_fallthrough_range(&statement.finalbody)
+        let explicit_handler_end = self.with_native_finally_copy(
+            statement.range,
+            FinallyCopy::Exceptional,
+            |compiler| {
+                let mut explicit_handler_end = None;
+                let has_enclosing_finally_cleanup = compiler.control.finally.active_finally_try_bodies > 0
+                    || compiler.control.finally.active_normal_finally_bodies > 0
+                    || compiler.control.finally.active_finally_end_blocks > 0
+                    || compiler.control.finally.active_copied_finally_bodies > 0;
+                if let Some((Stmt::Return(return_statement), leading)) = statement.finalbody.split_last()
+                    && has_enclosing_finally_cleanup
+                    && !compiler.control.finally.copies_terminating_finally_returns
                 {
-                    self.assembler.set_location(self.source_location(range));
-                } else if let Some(statement) = statement
-                    .finalbody
-                    .last()
-                    .filter(|statement| statement_uses_implicit_return_location(statement))
+                    compiler.compile_suite(leading)?;
+                    explicit_handler_end =
+                        Some(compiler.compile_return_from_exception_handler(return_statement)?);
+                } else if let [Stmt::If(final_if)] = statement.finalbody.as_slice()
+                    && final_if.elif_else_clauses.is_empty()
                 {
-                    self.assembler
-                        .set_location(self.source_location(implicit_return_range(self, statement)));
-                } else if let Some(location) = self.assembler.last_instruction_location() {
-                    self.assembler.set_location(location);
+                    let condition_false = if compiler.control.in_synchronous_with()
+                        && matches!(final_if.body.as_slice(), [Stmt::Expr(_)])
+                        && let Expr::BoolOp(boolean) = final_if.test.as_ref()
+                        && boolean.op == BoolOp::And
+                        && let [first, second] = boolean.values.as_slice()
+                        && matches!((first, second), (Expr::Compare(_), Expr::Name(_)))
+                    {
+                        let first_false = compiler.assembler.label();
+                        let second_false = compiler.assembler.label();
+                        compiler.with_control_override(
+                            |control| &mut control.finally.exceptional_finally_condition,
+                            true,
+                            |compiler| {
+                                compiler.compile_jump_if(first, false, first_false)?;
+                                compiler.compile_jump_if(second, false, second_false)
+                            },
+                        )?;
+                        vec![(first_false, first), (second_false, second)]
+                    } else {
+                        let condition_false = compiler.assembler.label();
+                        // This unsplit false edge joins the original body end
+                        // immediately before the shared RERAISE instruction.
+                        compiler.bind_native_source_label(
+                            super::legacy_native_labels::NativeRole::IfEnd(final_if.range),
+                            condition_false,
+                        );
+                        compiler.with_control_override(
+                            |control| &mut control.finally.exceptional_finally_condition,
+                            true,
+                            |compiler| compiler.compile_jump_if(&final_if.test, false, condition_false),
+                        )?;
+                        vec![(condition_false, final_if.test.as_ref())]
+                    };
+                    compiler.assembler.record_short_circuit_owner_continuation();
+                    compiler.compile_exceptional_finally_suite(&final_if.body)?;
+                    // Keep an ordinary guard's original end label before RERAISE. Inner joins
+                    // still fall through during initial small-exit classification; the assembler
+                    // duplicates the shared exceptional exit later while resolving locations.
+                    if condition_false.len() > 1 && !suite_terminates(&final_if.body) {
+                        compiler.assembler.set_location(SourceLocation::NONE);
+                        compiler.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
+                    }
+                    for (condition_false, _test) in condition_false.into_iter().rev() {
+                        compiler.assembler.mark(condition_false);
+                        compiler.set_depth(base_depth + 2);
+                        compiler.assembler.set_location(SourceLocation::NONE);
+                        compiler.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
+                    }
+                } else {
+                    if let Some(location) = pass_finally_location {
+                        compiler.assembler.set_location(location);
+                        compiler.emit(NOP, 0, 0)?;
+                    } else {
+                        compiler.compile_exceptional_finally_suite(&statement.finalbody)?;
+                    }
+                    if !suite_terminates(&statement.finalbody) {
+                        if (compiler.context.python_version == crate::PythonVersion::Py312
+                            && statement.finalbody.last().is_some_and(|statement| {
+                                matches!(statement, Stmt::Assign(_))
+                                    || matches!(statement, Stmt::AnnAssign(assignment) if assignment.value.is_some())
+                            }))
+                            || matches!(
+                                statement.finalbody.last(),
+                                Some(Stmt::If(_) | Stmt::For(_) | Stmt::While(_) | Stmt::Match(_))
+                            )
+                        {
+                            // CPython leaves the shared exceptional exit unlocated. Each incoming
+                            // branch, including a loop break, supplies the copied exit's location.
+                            compiler.assembler.set_location(SourceLocation::NONE);
+                        } else if let Some(range) = suite_unary_not_fallthrough_range(&statement.finalbody)
+                        {
+                            compiler.assembler.set_location(compiler.source_location(range));
+                        } else if let Some(statement) = statement
+                            .finalbody
+                            .last()
+                            .filter(|statement| statement_uses_implicit_return_location(statement))
+                        {
+                            compiler.assembler
+                                .set_location(compiler.source_location(implicit_return_range(compiler, statement)));
+                        } else if let Some(location) = compiler.assembler.last_instruction_location() {
+                            compiler.assembler.set_location(location);
+                        }
+                        compiler.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
+                    }
                 }
-                self.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
-            }
-        }
+                Ok(explicit_handler_end)
+            },
+        )?;
         let handler_end = if let Some(handler_end) = explicit_handler_end {
             handler_end
         } else {
@@ -26111,7 +27354,7 @@ impl Compiler<'_> {
         let preserve_value = statement
             .value
             .as_deref()
-            .is_some_and(|value| !is_literal_constant(value));
+            .is_some_and(|value| !self.return_value_is_constant(value));
         if preserve_value {
             self.compile_expression(
                 statement
@@ -26232,7 +27475,9 @@ impl Compiler<'_> {
             &statement.items,
             &statement.body,
             terminal,
-            exclude_handler_exit,
+            // Legacy CFG copying carries the donor's actual exception owner.
+            // Only modern lowering predicts an ownerless outer-try continuation.
+            exclude_handler_exit && self.context.python_version >= crate::PythonVersion::Py314,
             following_return,
         )
     }
@@ -26522,6 +27767,7 @@ impl Compiler<'_> {
             return self.compile_suite(body);
         };
         let base_depth = self.control.stack.depth;
+        let exit_slots = self.with_exit_stack_slots();
         let protected_start = self.assembler.label();
         let protected_end = self.assembler.label();
         let handler = self.assembler.label();
@@ -26533,7 +27779,7 @@ impl Compiler<'_> {
             .control
             .stack
             .max_depth
-            .max((base_depth + 7).cast_unsigned());
+            .max((base_depth + exit_slots + 5).cast_unsigned());
         let newly_initialized_targets =
             item.optional_vars
                 .as_deref()
@@ -26549,14 +27795,22 @@ impl Compiler<'_> {
             .record_with_context_location(self.source_location(item.context_expr.range()));
         self.assembler
             .set_location(self.source_location(item.context_expr.range()));
-        self.emit(COPY, 1, 1)?;
-        self.emit_special_method(SpecialMethod::__EXIT__)?;
-        self.emit(SWAP, 2, 0)?;
-        self.emit(SWAP, 3, 0)?;
-        self.emit_special_method(SpecialMethod::__ENTER__)?;
-        self.emit(CALL, 0, -1)?;
+        if exit_slots == 1 {
+            self.emit(BEFORE_WITH, 0, 1)?;
+        } else {
+            self.emit(COPY, 1, 1)?;
+            self.emit_special_method(SpecialMethod::__EXIT__)?;
+            self.emit(SWAP, 2, 0)?;
+            self.emit(SWAP, 3, 0)?;
+            self.emit_special_method(SpecialMethod::__ENTER__)?;
+            self.emit(CALL, 0, -1)?;
+        }
         self.assembler
             .record_synchronous_with_exception_setup(protected_start);
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::WithBlock(item.context_expr.range()),
+            protected_start,
+        );
         self.assembler.mark(protected_start);
         if let Some(target) = &item.optional_vars {
             self.compile_store_target(target)?;
@@ -26564,6 +27818,7 @@ impl Compiler<'_> {
             self.emit(POP_TOP, 0, -1)?;
         }
         let context = WithExitContext {
+            source_range: item.context_expr.range(),
             location: self.source_location(item.context_expr.range()),
             handler,
             is_async: false,
@@ -26753,6 +28008,13 @@ impl Compiler<'_> {
                 .or(body_noop),
             _ => body_noop,
         };
+        let body_noop = body_noop.or_else(|| {
+            // Both legacy targets resolve the original POP_BLOCK's location
+            // before NOP cleanup. A structured body can leave one continuing
+            // predecessor whose span remains visible on the manager exit.
+            (self.context.python_version <= crate::PythonVersion::Py313)
+                .then_some(WithBodyExitNoop::ConvertedPopBlock)
+        });
         let mut unlocated_body_pop = None;
         if let Some(body_noop) = body_noop {
             let noop_start = self.assembler.label();
@@ -26781,6 +28043,17 @@ impl Compiler<'_> {
             self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
             if converted_pop_block {
                 self.assembler.mark_last_as_converted_pop_block();
+                if self.context.python_version == crate::PythonVersion::Py313
+                    && location == SourceLocation::NONE
+                    && !retain_nop
+                    && remaining.is_empty()
+                    && self.control.withs.active_with_exits.is_empty()
+                    && with_body_has_folded_while_predecessor(body)
+                {
+                    // Native resolves this shared POP_BLOCK before folding the
+                    // infinite loop's false exit. Neither arm is its sole donor.
+                    self.assembler.preserve_last_no_location();
+                }
             }
             if retain_nop {
                 // The original conditional join starts a separate block, so a preceding
@@ -26818,7 +28091,7 @@ impl Compiler<'_> {
             self.emit(LOAD_CONST, none, 1)?;
             self.emit(LOAD_CONST, none, 1)?;
             self.emit(LOAD_CONST, none, 1)?;
-            self.emit(CALL, 3, -4)?;
+            self.emit_with_exit_call()?;
             self.emit(POP_TOP, 0, -1)?;
             if terminal {
                 self.emit_implicit_return()?;
@@ -26868,7 +28141,7 @@ impl Compiler<'_> {
                 region_start,
                 exclusion_start,
                 handler,
-                (base_depth + 2).cast_unsigned(),
+                (base_depth + exit_slots).cast_unsigned(),
                 true,
                 (protected_start, protected_end),
             );
@@ -26878,14 +28151,18 @@ impl Compiler<'_> {
             region_start,
             protected_end,
             handler,
-            (base_depth + 2).cast_unsigned(),
+            (base_depth + exit_slots).cast_unsigned(),
             true,
             (protected_start, protected_end),
         );
 
         self.assembler.record_exception_setup(handler, false);
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::WithFinal(item.context_expr.range()),
+            handler,
+        );
         self.assembler.mark(handler);
-        self.set_depth(base_depth + 4);
+        self.set_depth(base_depth + exit_slots + 2);
         self.assembler
             .set_location(self.source_location(item.context_expr.range()));
         self.emit(PUSH_EXC_INFO, 0, 1)?;
@@ -26894,21 +28171,26 @@ impl Compiler<'_> {
         self.emit_jump_forward(POP_JUMP_IF_TRUE, suppress, -1)?;
         self.emit(NOT_TAKEN, 0, 0)?;
         self.emit_reraise(ReraiseStackState::WithHandler)?;
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::WithSuppress(item.context_expr.range()),
+            suppress,
+        );
         self.assembler.mark(suppress);
-        self.set_depth(base_depth + 5);
+        self.set_depth(base_depth + exit_slots + 3);
         self.emit(POP_TOP, 0, -1)?;
         self.assembler.mark(handler_end);
         self.assembler.add_exception_region(
             handler,
             handler_end,
             cleanup,
-            (base_depth + 4).cast_unsigned(),
+            (base_depth + exit_slots + 2).cast_unsigned(),
             true,
         );
         self.emit(POP_EXCEPT, 0, -1)?;
         self.emit(POP_TOP, 0, -1)?;
-        self.emit(POP_TOP, 0, -1)?;
-        self.emit(POP_TOP, 0, -1)?;
+        for _ in 0..exit_slots {
+            self.emit(POP_TOP, 0, -1)?;
+        }
         if terminal {
             self.emit_implicit_return()?;
         } else {
@@ -26963,14 +28245,27 @@ impl Compiler<'_> {
             }
         }
 
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::WithCleanup(item.context_expr.range()),
+            cleanup,
+        );
         self.assembler.mark(cleanup);
-        // The handler preserves four values, then exception dispatch adds lasti and exc.
-        self.set_depth(base_depth + 6);
+        // The handler preserves the exit callable(s), lasti, and the exception value.
+        // Exception dispatch then adds another lasti and exception value.
+        self.set_depth(base_depth + exit_slots + 4);
         self.assembler.set_location(SourceLocation::NONE);
         self.emit(COPY, 3, 1)?;
         self.emit(POP_EXCEPT, 0, -1)?;
         self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
         self.assembler.record_exception_owner_block_boundary(end);
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::WithHelperExit(item.context_expr.range()),
+            end,
+        );
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::WithExit(item.context_expr.range()),
+            end,
+        );
         self.assembler.mark(end);
         self.set_depth(base_depth);
         for name in newly_initialized_targets {
@@ -27011,6 +28306,7 @@ impl Compiler<'_> {
             return self.compile_suite(body);
         };
         let base_depth = self.control.stack.depth;
+        let exit_slots = self.with_exit_stack_slots();
         let protected_start = self.assembler.label();
         let protected_end = self.assembler.label();
         let handler = self.assembler.label();
@@ -27033,17 +28329,31 @@ impl Compiler<'_> {
             .record_with_context_location(self.source_location(item.context_expr.range()));
         self.assembler
             .set_location(self.source_location(item.context_expr.range()));
-        self.emit(COPY, 1, 1)?;
-        self.emit_special_method(SpecialMethod::__AEXIT__)?;
-        self.emit(SWAP, 2, 0)?;
-        self.emit(SWAP, 3, 0)?;
-        self.emit_special_method(SpecialMethod::__AENTER__)?;
-        self.emit(CALL, 0, -1)?;
-        self.compile_awaitable_on_stack(1)?;
+        if exit_slots == 1 {
+            self.emit(BEFORE_ASYNC_WITH, 0, 1)?;
+        } else {
+            self.emit(COPY, 1, 1)?;
+            self.emit_special_method(SpecialMethod::__AEXIT__)?;
+            self.emit(SWAP, 2, 0)?;
+            self.emit(SWAP, 3, 0)?;
+            self.emit_special_method(SpecialMethod::__AENTER__)?;
+            self.emit(CALL, 0, -1)?;
+        }
+        self.compile_awaitable_on_stack_with_native_roles(
+            1,
+            self.native_label_plan.as_ref().map(|_| {
+                super::legacy_native_labels::WithAwait::Enter.roles(item.context_expr.range())
+            }),
+        )?;
         self.assembler
             .record_async_with_exception_setup(protected_start);
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::WithBlock(item.context_expr.range()),
+            protected_start,
+        );
         self.assembler.mark(protected_start);
         let context = WithExitContext {
+            source_range: item.context_expr.range(),
             location: self.source_location(item.context_expr.range()),
             handler,
             is_async: true,
@@ -27165,8 +28475,13 @@ impl Compiler<'_> {
         self.emit(LOAD_CONST, none, 1)?;
         self.emit(LOAD_CONST, none, 1)?;
         self.emit(LOAD_CONST, none, 1)?;
-        self.emit(CALL, 3, -4)?;
-        self.compile_awaitable_on_stack(2)?;
+        self.emit_with_exit_call()?;
+        self.compile_awaitable_on_stack_with_native_roles(
+            2,
+            self.native_label_plan.as_ref().map(|_| {
+                super::legacy_native_labels::WithAwait::NormalExit.roles(item.context_expr.range())
+            }),
+        )?;
         self.emit(POP_TOP, 0, -1)?;
         if terminal {
             if outer_exception_owns_exit {
@@ -27194,7 +28509,7 @@ impl Compiler<'_> {
                 region_start,
                 exclusion_start,
                 handler,
-                (base_depth + 2).cast_unsigned(),
+                (base_depth + exit_slots).cast_unsigned(),
                 true,
                 (protected_start, protected_end),
             );
@@ -27204,19 +28519,29 @@ impl Compiler<'_> {
             region_start,
             protected_end,
             handler,
-            (base_depth + 2).cast_unsigned(),
+            (base_depth + exit_slots).cast_unsigned(),
             true,
             (protected_start, protected_end),
         );
 
         self.assembler.record_exception_setup(handler, false);
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::WithFinal(item.context_expr.range()),
+            handler,
+        );
         self.assembler.mark(handler);
-        self.set_depth(base_depth + 4);
+        self.set_depth(base_depth + exit_slots + 2);
         self.assembler
             .set_location(self.source_location(item.context_expr.range()));
         self.emit(PUSH_EXC_INFO, 0, 1)?;
         self.emit(WITH_EXCEPT_START, 0, 1)?;
-        self.compile_awaitable_on_stack(2)?;
+        self.compile_awaitable_on_stack_with_native_roles(
+            2,
+            self.native_label_plan.as_ref().map(|_| {
+                super::legacy_native_labels::WithAwait::ExceptionalExit
+                    .roles(item.context_expr.range())
+            }),
+        )?;
         self.emit(TO_BOOL, 0, 0)?;
         self.emit_jump_forward(POP_JUMP_IF_TRUE, suppress, -1)?;
         let not_taken_start = self.assembler.label();
@@ -27269,28 +28594,33 @@ impl Compiler<'_> {
             }
         }
         self.emit_reraise(ReraiseStackState::WithHandler)?;
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::WithSuppress(item.context_expr.range()),
+            suppress,
+        );
         self.assembler.mark(suppress);
-        self.set_depth(base_depth + 5);
+        self.set_depth(base_depth + exit_slots + 3);
         self.emit(POP_TOP, 0, -1)?;
         self.assembler.mark(handler_end);
         self.assembler.add_exception_region(
             handler,
             not_taken_start,
             cleanup,
-            (base_depth + 4).cast_unsigned(),
+            (base_depth + exit_slots + 2).cast_unsigned(),
             true,
         );
         self.assembler.add_exception_region(
             not_taken_end,
             handler_end,
             cleanup,
-            (base_depth + 4).cast_unsigned(),
+            (base_depth + exit_slots + 2).cast_unsigned(),
             true,
         );
         self.emit(POP_EXCEPT, 0, -1)?;
         self.emit(POP_TOP, 0, -1)?;
-        self.emit(POP_TOP, 0, -1)?;
-        self.emit(POP_TOP, 0, -1)?;
+        for _ in 0..exit_slots {
+            self.emit(POP_TOP, 0, -1)?;
+        }
         if terminal {
             if outer_exception_owns_exit {
                 // This cleanup belongs to the surrounding try. The following original
@@ -27308,7 +28638,9 @@ impl Compiler<'_> {
                 self.assembler.mark(generator_cleanup_start);
             }
         } else {
-            let finally_depth = (!self.control.statements.current_statement_has_following
+            // 3.12 keeps the original suppression jump inside the surrounding try.
+            let finally_depth = (self.context.python_version != crate::PythonVersion::Py312
+                && !self.control.statements.current_statement_has_following
                 && !self.control.exceptions.direct_try_body_has_else
                 && self.control.exceptions.direct_try_body_statements.last()
                     == direct_try_range.as_ref())
@@ -27319,7 +28651,8 @@ impl Compiler<'_> {
             )
             .flatten();
             let exception_exit_depth = finally_depth.or_else(|| {
-                (self.unit.flags & CO_COROUTINE != 0
+                (self.context.python_version != crate::PythonVersion::Py312
+                    && self.unit.flags & CO_COROUTINE != 0
                     && self.unit.flags & CO_ASYNC_GENERATOR == 0
                     && !self.control.statements.current_statement_has_following
                     && self.control.exceptions.direct_try_body_has_successor
@@ -27366,14 +28699,27 @@ impl Compiler<'_> {
             }
         }
 
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::WithCleanup(item.context_expr.range()),
+            cleanup,
+        );
         self.assembler.mark(cleanup);
-        // The handler preserves four values, then exception dispatch adds lasti and exc.
-        self.set_depth(base_depth + 6);
+        // The handler preserves the exit callable(s), lasti, and the exception value.
+        // Exception dispatch then adds another lasti and exception value.
+        self.set_depth(base_depth + exit_slots + 4);
         self.assembler.set_location(SourceLocation::NONE);
         self.emit(COPY, 3, 1)?;
         self.emit(POP_EXCEPT, 0, -1)?;
         self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
         self.assembler.record_exception_owner_block_boundary(end);
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::WithHelperExit(item.context_expr.range()),
+            end,
+        );
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::WithExit(item.context_expr.range()),
+            end,
+        );
         self.assembler.mark(end);
         if outer_exception_owns_exit && terminal {
             self.control
@@ -27397,7 +28743,7 @@ impl Compiler<'_> {
             if self.output.constants.is_empty() {
                 self.add_constant(Constant::Int(0))?;
             }
-            self.emit(LOAD_SMALL_INT, 0, 1)?;
+            self.emit_unsigned_constant(0)?;
             let none = self.add_constant(Constant::None)?;
             self.emit(LOAD_CONST, none, 1)?;
             let module = alias.name.as_str();
@@ -28377,6 +29723,51 @@ fn handler_cold_with_exit_range(body: &[Stmt]) -> Option<TextRange> {
     }
 }
 
+// Keep a terminal if's shared footer warm through its false edge when an earlier
+// statement leaves the arm's remaining instructions reachable only from a handler.
+fn suite_has_cold_only_terminal_if_continuation(body: &[Stmt]) -> bool {
+    body.iter().any(|statement| match statement {
+        Stmt::For(statement) => statement.is_async && !suite_contains_loop_break(&statement.body),
+        Stmt::With(statement) if !statement.is_async => statement.body.iter().any(|statement| {
+            matches!(statement, Stmt::While(loop_statement)
+                    if early_condition_truthiness(&loop_statement.test) == Some(true)
+                        && loop_statement.orelse.is_empty()
+                        && suite_loop_breaks_are_only_in_direct_handlers(&loop_statement.body))
+        }),
+        Stmt::Try(statement) => {
+            !statement.is_star
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty()
+                && (suite_terminates(&statement.body)
+                    || statement.body.iter().any(|statement| {
+                        matches!(statement, Stmt::Assert(assertion)
+                            if jump_constant_truthiness(&assertion.test) == Some(false))
+                    }))
+                && statement.handlers.iter().any(|handler| {
+                    handler
+                        .as_except_handler()
+                        .is_some_and(|handler| !suite_terminates(&handler.body))
+                })
+        }
+        _ => false,
+    })
+}
+
+// A direct try handler is cold. Count every other break conservatively, including
+// breaks in the successful body, else, and copied finally suites. Reuse the loop
+// visitor so nested-loop bodies and nested scopes cannot donate an outer break.
+fn suite_loop_breaks_are_only_in_direct_handlers(body: &[Stmt]) -> bool {
+    suite_contains_loop_break(body)
+        && body.iter().all(|statement| match statement {
+            Stmt::Try(statement) if !statement.is_star => {
+                !suite_contains_loop_break(&statement.body)
+                    && !suite_contains_loop_break(&statement.orelse)
+                    && !suite_contains_loop_break(&statement.finalbody)
+            }
+            _ => !suite_contains_loop_break(std::slice::from_ref(statement)),
+        })
+}
+
 // A terminating manager body still has a fallthrough path when its exception exit
 // suppresses an error. That cold path does not supply the normal predecessor needed
 // to copy a surrounding handler cleanup before cold-block relocation.
@@ -28691,6 +30082,27 @@ fn with_body_continue_exit_donor(body: &[Stmt]) -> Option<(TextRange, u8)> {
         }
         _ => None,
     }
+}
+
+/// Recognizes the two original predecessors of a manager's folded while join.
+fn with_body_has_folded_while_predecessor(body: &[Stmt]) -> bool {
+    let Some(Stmt::If(statement)) = body.last() else {
+        return false;
+    };
+    let [otherwise] = statement.elif_else_clauses.as_slice() else {
+        return false;
+    };
+    if otherwise.test.is_some() || !condition_has_only_runtime_tests(&statement.test) {
+        return false;
+    }
+    let infinite_loop = |body: &[Stmt]| {
+        matches!(body, [Stmt::While(statement)]
+            if matches!(statement.test.as_ref(), Expr::BooleanLiteral(test) if test.value)
+                && statement.orelse.is_empty()
+                && suite_has_linear_borrow_fallthrough(&statement.body))
+    };
+    (infinite_loop(&statement.body) && suite_has_linear_borrow_fallthrough(&otherwise.body))
+        || (infinite_loop(&otherwise.body) && suite_has_linear_borrow_fallthrough(&statement.body))
 }
 
 // A complete conditional with one terminal arm leaves the other arm as the sole
@@ -30048,6 +31460,65 @@ fn finalizer_tail_has_matching_linear_copies(body: &[Stmt]) -> bool {
         })
 }
 
+/// Certifies the two adjacent finally frames covered by the existing return
+/// owner proof. An exceptional inner return crosses `FINALLY_END`, then the one
+/// outer `FINALLY_TRY`. Cleanup adds no handler, manager, or abrupt loop exit.
+fn supports_nested_terminating_finally_returns(statement: &ruff_python_ast::StmtTry) -> bool {
+    fn supported_return(statement: &ruff_python_ast::StmtReturn) -> bool {
+        statement
+            .value
+            .as_deref()
+            .is_none_or(|value| matches!(value, Expr::Name(_)) || is_literal_constant(value))
+    }
+
+    fn supported_call(expression: &Expr) -> bool {
+        matches!(expression, Expr::Call(_))
+            && !expression_contains_inline_branch(expression)
+            && !expression_suspends_current_scope(expression)
+    }
+
+    fn supported_work(statement: &Stmt) -> bool {
+        match statement {
+            Stmt::Pass(_) => true,
+            Stmt::Expr(expression) => match expression.value.as_ref() {
+                Expr::Await(awaited) => supported_call(&awaited.value),
+                value => supported_call(value),
+            },
+            _ => false,
+        }
+    }
+
+    fn supported_finally(statement: &ruff_python_ast::StmtTry) -> bool {
+        if statement.is_star || !statement.handlers.is_empty() || !statement.orelse.is_empty() {
+            return false;
+        }
+        let Some((Stmt::Return(tail), leading)) = statement.finalbody.split_last() else {
+            return false;
+        };
+        supported_return(tail)
+            && leading.iter().all(|statement| {
+                if let Stmt::For(loop_statement) = statement {
+                    !loop_statement.is_async
+                        && matches!(loop_statement.target.as_ref(), Expr::Name(_))
+                        && (matches!(loop_statement.iter.as_ref(), Expr::Name(_))
+                            || supported_call(&loop_statement.iter))
+                        && loop_statement.orelse.is_empty()
+                        && loop_statement.body.iter().all(supported_work)
+                } else {
+                    supported_work(statement)
+                }
+            })
+    }
+
+    let [Stmt::Try(inner)] = statement.body.as_slice() else {
+        return false;
+    };
+    let [Stmt::Return(return_statement)] = inner.body.as_slice() else {
+        return false;
+    };
+    supported_finally(statement) && supported_finally(inner) && supported_return(return_statement)
+}
+
 // Certify an emitted-work path with no internal branch or cleanup entry. A suite
 // containing only pass markers or folded literals does not provide this evidence.
 pub(super) fn suite_has_linear_borrow_fallthrough(body: &[Stmt]) -> bool {
@@ -30525,15 +31996,44 @@ fn suite_contains_abrupt_control_flow(body: &[Stmt]) -> bool {
 }
 
 pub(super) fn suite_contains_yield(body: &[Stmt]) -> bool {
-    #[derive(Default)]
+    suite_contains_yield_with_headers(body, false, false)
+}
+
+/// Legacy function annotations execute in the enclosing scope unless postponed.
+pub(super) fn legacy_suite_contains_yield(body: &[Stmt], future_annotations: bool) -> bool {
+    suite_contains_yield_with_headers(body, true, !future_annotations)
+}
+
+fn suite_contains_yield_with_headers(
+    body: &[Stmt],
+    visit_function_headers: bool,
+    eager_annotations: bool,
+) -> bool {
     struct YieldCollector {
         found: bool,
+        visit_function_headers: bool,
+        eager_annotations: bool,
     }
 
     impl<'ast> Visitor<'ast> for YieldCollector {
         fn visit_stmt(&mut self, statement: &'ast Stmt) {
             match statement {
-                Stmt::FunctionDef(_) => return,
+                Stmt::FunctionDef(definition) => {
+                    if self.visit_function_headers {
+                        for decorator in &definition.decorator_list {
+                            self.visit_expr(&decorator.expression);
+                        }
+                        for default in parameter_default_expressions(&definition.parameters) {
+                            self.visit_expr(default);
+                        }
+                        if self.eager_annotations && definition.type_params.is_none() {
+                            for annotation in function_annotation_expressions(definition) {
+                                self.visit_expr(annotation);
+                            }
+                        }
+                    }
+                    return;
+                }
                 Stmt::ClassDef(definition) => {
                     for decorator in &definition.decorator_list {
                         self.visit_expr(&decorator.expression);
@@ -30554,7 +32054,14 @@ pub(super) fn suite_contains_yield(body: &[Stmt]) -> bool {
         }
 
         fn visit_expr(&mut self, expression: &'ast Expr) {
-            if matches!(expression, Expr::Lambda(_)) {
+            if let Expr::Lambda(lambda) = expression {
+                if self.visit_function_headers
+                    && let Some(parameters) = lambda.parameters.as_deref()
+                {
+                    for default in parameter_default_expressions(parameters) {
+                        self.visit_expr(default);
+                    }
+                }
                 return;
             }
             if matches!(expression, Expr::Yield(_) | Expr::YieldFrom(_)) {
@@ -30565,7 +32072,11 @@ pub(super) fn suite_contains_yield(body: &[Stmt]) -> bool {
         }
     }
 
-    let mut collector = YieldCollector::default();
+    let mut collector = YieldCollector {
+        found: false,
+        visit_function_headers,
+        eager_annotations,
+    };
     for statement in body {
         collector.visit_stmt(statement);
     }
@@ -33124,12 +34635,26 @@ fn suite_contains_class_keyword_none_match_break(body: &[Stmt]) -> bool {
 }
 
 /// Keeps a shared scope-exit return unlocated until each condition edge receives its copy.
-pub(super) fn terminal_statement_uses_implicit_return_location(statement: &Stmt) -> bool {
+pub(super) fn terminal_statement_uses_implicit_return_location(
+    statement: &Stmt,
+    python_version: crate::PythonVersion,
+    eager_annotations: bool,
+) -> bool {
     statement_uses_implicit_return_location(statement)
+        // Eager annotation evaluation supplies its own final POP_TOP donor. In
+        // 3.12 comprehension restores also move before locations are resolved.
+        && !(matches!(statement, Stmt::AnnAssign(_))
+            && (python_version == crate::PythonVersion::Py312
+                || (python_version == crate::PythonVersion::Py313 && eager_annotations)))
+        && !(python_version == crate::PythonVersion::Py312
+            && matches!(statement, Stmt::Assign(_)))
         && !matches!(statement, Stmt::While(statement)
             if statement.orelse.is_empty()
-                && !suite_contains_loop_break(&statement.body)
-                && condition_jump_target_count(&statement.test, false) > 1)
+                // Legacy loops test both before and after the body. Their shared
+                // implicit exit must receive separate predecessor locations.
+                && (python_version <= crate::PythonVersion::Py313
+                    || (!suite_contains_loop_break(&statement.body)
+                        && condition_jump_target_count(&statement.test, false) > 1)))
 }
 
 pub(super) fn statement_uses_implicit_return_location(statement: &Stmt) -> bool {
@@ -34760,10 +36285,46 @@ mod tests {
     use super::{
         first_coroutine_try_else_condition, first_iterator_assignment_condition,
         suite_contains_multiple_loop_breaks, suite_terminates,
-        terminal_assert_splits_success_return,
+        supports_nested_terminating_finally_returns, terminal_assert_splits_success_return,
     };
     use ruff_python_ast::Stmt;
     use ruff_python_parser::parse_module;
+
+    #[test]
+    fn recursive_finally_return_certificate_requires_two_complete_frames() {
+        let prefix = "async def f():\n    try:\n        try:\n            return payload\n        finally:\n            await inner()\n            return inner_result\n    finally:\n";
+        for body in [
+            "        return outer_result\n",
+            "        cleanup()\n        return None\n",
+            "        for item in items:\n            await outer(item)\n        return outer_result\n",
+        ] {
+            let parsed = parse_module(&format!("{prefix}{body}")).unwrap();
+            let Stmt::FunctionDef(function) = &parsed.suite()[0] else {
+                panic!()
+            };
+            let Stmt::Try(statement) = &function.body[0] else {
+                panic!()
+            };
+            assert!(supports_nested_terminating_finally_returns(statement));
+        }
+        for body in [
+            "        return action()\n",
+            "        if flag:\n            cleanup()\n        return outer_result\n",
+            "        for item in items:\n            break\n        return outer_result\n",
+            "        async for item in items:\n            await outer(item)\n        return outer_result\n",
+            "        await (left() if flag else right())\n        return outer_result\n",
+            "        with manager():\n            cleanup()\n        return outer_result\n",
+        ] {
+            let parsed = parse_module(&format!("{prefix}{body}")).unwrap();
+            let Stmt::FunctionDef(function) = &parsed.suite()[0] else {
+                panic!()
+            };
+            let Stmt::Try(statement) = &function.body[0] else {
+                panic!()
+            };
+            assert!(!supports_nested_terminating_finally_returns(statement));
+        }
+    }
 
     fn terminal_assert_splits(expression: &str) -> bool {
         let parsed = parse_module(&format!("assert {expression}"))

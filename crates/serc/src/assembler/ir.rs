@@ -1053,7 +1053,11 @@ impl InstructionMetadata {
     const NORMAL_STATES: u16 = Self::POLICY_COUNT * 5 * 2;
     const RETIRED_CONTAINS: u16 = 1 << 15;
     const LATE_FOLD_LOCATION: u16 = 1 << 14;
-    const FLAGS: u16 = Self::RETIRED_CONTAINS | Self::LATE_FOLD_LOCATION;
+    const LEGACY_JUMP_SEED_PRESENT: u16 = 1 << 9;
+    const LEGACY_JUMP_SEED_SHIFT: u16 = 10;
+    const LEGACY_JUMP_SEED_WIDTH: u16 = 3 << Self::LEGACY_JUMP_SEED_SHIFT;
+    const LEGACY_JUMP_SEED: u16 = Self::LEGACY_JUMP_SEED_PRESENT | Self::LEGACY_JUMP_SEED_WIDTH;
+    const FLAGS: u16 = Self::RETIRED_CONTAINS | Self::LATE_FOLD_LOCATION | Self::LEGACY_JUMP_SEED;
 
     const fn flags(self) -> u16 {
         self.0.get() & Self::FLAGS
@@ -1253,6 +1257,42 @@ impl Instruction {
 
     pub(super) const fn has_late_fold_location(&self) -> bool {
         self.metadata.flags() & InstructionMetadata::LATE_FOLD_LOCATION != 0
+    }
+
+    /// Freezes the width of an exact native 3.12 jump operand before offset resolution.
+    ///
+    /// Native jump threading changes the target pointer while retaining this operand.
+    /// The offset solver reads only its encoded width before replacing it with a delta,
+    /// so three independent metadata bits preserve the complete sizing input.
+    pub(super) fn set_legacy_initial_jump_argument(&mut self, argument: u32) {
+        debug_assert!(matches!(
+            self.operand(),
+            Operand::Forward(_) | Operand::Backward(_)
+        ));
+        let width = u16::from(super::extended_arg_count(argument));
+        let flags = (self.metadata.flags() & !InstructionMetadata::LEGACY_JUMP_SEED)
+            | InstructionMetadata::LEGACY_JUMP_SEED_PRESENT
+            | (width << InstructionMetadata::LEGACY_JUMP_SEED_SHIFT);
+        self.metadata = self.metadata.with_flags(flags);
+    }
+
+    /// Cancels a code object's incomplete native operand provenance as one transaction.
+    pub(super) fn clear_legacy_initial_jump_argument(&mut self) {
+        self.metadata = self
+            .metadata
+            .with_flags(self.metadata.flags() & !InstructionMetadata::LEGACY_JUMP_SEED);
+    }
+
+    /// Returns an exact native jump seed width, or none while provenance is incomplete.
+    pub(super) const fn legacy_initial_jump_width(&self) -> Option<u8> {
+        if self.metadata.flags() & InstructionMetadata::LEGACY_JUMP_SEED_PRESENT == 0 {
+            None
+        } else {
+            Some(
+                ((self.metadata.flags() & InstructionMetadata::LEGACY_JUMP_SEED_WIDTH)
+                    >> InstructionMetadata::LEGACY_JUMP_SEED_SHIFT) as u8,
+            )
+        }
     }
 
     pub(super) const fn exception_policy(&self) -> ExceptionPolicy {
@@ -1478,6 +1518,9 @@ pub(super) struct DeferredBorrowEntry {
 #[derive(Debug)]
 pub(crate) struct Assembler {
     pub(super) python_version: PythonVersion,
+    /// A source proof bounds every native 3.12 jump's initial operand to one byte.
+    /// Independent of exact per-label provenance and its cancellation paths.
+    pub(super) legacy_uniform_jump_seed: bool,
     pub(super) code: UnoptimizedCode,
     /// Number of instructions in the linear item stream; labels do not consume offsets.
     pub(super) instruction_count: usize,
@@ -1496,6 +1539,7 @@ pub(crate) struct Assembler {
     pub(super) deferred_none_constant_index: Option<u32>,
     pub(super) discarded_fold_admissions: FxHashMap<Label, Vec<u32>>,
     pub(super) next_label: u32,
+    pub(super) legacy_native_labels: Option<Box<super::legacy_native_labels::LegacyNativeLabels>>,
     pub(super) location: SourceLocation,
     pub(super) exception_regions: Vec<ExceptionRegion>,
     /// Original tail location retained when lowering emits an already-reordered restore.
@@ -1514,6 +1558,8 @@ pub(crate) struct Assembler {
     pub(super) deferred_name_return_borrow_exits: Vec<super::NameReturnBorrowExit>,
     /// Exact omitted ordinary-try POP slots in pending local-return targets.
     pub(super) name_return_pop_boundaries: FxHashSet<Label>,
+    /// Ordinary-return `POP_BLOCK` records needed by the legacy CFG copy phases.
+    pub(super) legacy_return_pop_blocks: FxHashMap<Label, usize>,
     /// Iterator-region aliases immediately following an ordinary-return POP boundary.
     pub(super) name_return_iterator_region_aliases: FxHashMap<Label, Label>,
     /// Disconnected loop exits and the normal entries that remain reachable.
@@ -1596,6 +1642,9 @@ pub(super) type AuthoredFinallyBreakEntries = FxHashMap<Label, AuthoredFinallyBr
 #[derive(Debug)]
 pub(super) struct OptimizationPipeline {
     pub(super) python_version: PythonVersion,
+    /// A source proof bounds every native 3.12 jump's initial operand to one byte.
+    /// Independent of exact per-label provenance and its cancellation paths.
+    pub(super) legacy_uniform_jump_seed: bool,
     pub(super) graph: BlockGraph,
     /// Original incoming edges removed before CPython resolves cleanup locations.
     pub(super) folded_original_predecessor_targets: FxHashSet<Label>,
@@ -1609,6 +1658,7 @@ pub(super) struct OptimizationPipeline {
     /// Erased handler entries must not mark a later block reached through label aliasing.
     pub(super) retired_exception_handler_targets: FxHashSet<Label>,
     pub(super) next_label: u32,
+    pub(super) legacy_native_labels: Option<Box<super::legacy_native_labels::LegacyNativeLabels>>,
     pub(super) exception_regions: Vec<ExceptionRegion>,
     pub(super) exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance,
     pub(super) preserved_block_boundaries: FxHashSet<Label>,
@@ -1667,6 +1717,9 @@ pub(super) struct OptimizationPipeline {
 #[derive(Debug)]
 pub(super) struct LayoutAssembler {
     pub(super) python_version: PythonVersion,
+    /// A source proof bounds every native 3.12 jump's initial operand to one byte.
+    /// Independent of exact per-label provenance and its cancellation paths.
+    pub(super) legacy_uniform_jump_seed: bool,
     pub(super) items: Vec<Item>,
     pub(super) exception_regions: Vec<ExceptionRegion>,
     pub(super) exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance,
@@ -1726,6 +1779,7 @@ impl Default for Assembler {
     fn default() -> Self {
         Self {
             python_version: PythonVersion::default(),
+            legacy_uniform_jump_seed: false,
             code: UnoptimizedCode::Linear(Vec::new()),
             instruction_count: 0,
             emission_stream: EmissionStreamId::next(),
@@ -1738,6 +1792,7 @@ impl Default for Assembler {
             deferred_none_constant_index: None,
             discarded_fold_admissions: FxHashMap::default(),
             next_label: 0,
+            legacy_native_labels: None,
             location: SourceLocation::NONE,
             exception_regions: Vec::new(),
             original_fallthrough_location: None,
@@ -1751,6 +1806,7 @@ impl Default for Assembler {
             deferred_borrow_entries: Vec::new(),
             deferred_name_return_borrow_exits: Vec::new(),
             name_return_pop_boundaries: FxHashSet::default(),
+            legacy_return_pop_blocks: FxHashMap::default(),
             name_return_iterator_region_aliases: FxHashMap::default(),
             borrow_loop_exit_blocks: FxHashMap::default(),
             borrow_finally_entries: FxHashMap::default(),
@@ -1919,6 +1975,39 @@ mod initial_borrow_metadata_tests {
                 instruction.pre_fold_extra_instructions(),
                 (original.pre_fold_extra_instructions() + 1).min(4)
             );
+        }
+    }
+
+    #[test]
+    fn native_jump_seed_survives_pointer_retargeting_and_policy_changes() {
+        for argument in [0, 255, 256, 65_535, 65_536, 16_777_215, 16_777_216] {
+            for raw in 1..=276 {
+                let mut original = Instruction::synthetic(
+                    JUMP_FORWARD,
+                    Operand::Forward(Label(1)),
+                    SourceLocation::NONE,
+                    None,
+                );
+                original.metadata = InstructionMetadata(NonZeroU16::new(raw).unwrap());
+                original.mark_retired_contains();
+                original.mark_late_fold_location();
+                original.set_legacy_initial_jump_argument(argument);
+                let width = Some(crate::assembler::extended_arg_count(argument));
+                assert_eq!(original.legacy_initial_jump_width(), width);
+                for policy in POLICIES {
+                    let mut retargeted = original;
+                    retargeted.retarget(Operand::Forward(Label(999)));
+                    retargeted.set_exception_policy(policy);
+                    retargeted.add_pre_fold_extra_instructions(1);
+                    assert_eq!(retargeted.legacy_initial_jump_width(), width);
+                    assert!(retargeted.is_retired_contains());
+                    assert!(retargeted.has_late_fold_location());
+                    assert_eq!(retargeted.exception_policy(), policy);
+                }
+                // Empty-block elimination is an explicit native operand rewrite.
+                original.set_legacy_initial_jump_argument(0);
+                assert_eq!(original.legacy_initial_jump_width(), Some(0));
+            }
         }
     }
 

@@ -58,6 +58,39 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: python/cpython
+          ref: 2abcf904b8dac8c999d2b3aac76681abb333798a
+          path: target/cpython-3.12
+          persist-credentials: false
+          sparse-checkout: |
+            Include
+            Python/assemble.c
+            Python/compile.c
+            Python/flowgraph.c
+            Python/Python-ast.c
+            Python/marshal.c
+            Lib/importlib/_bootstrap_external.py
+            Python/opcode_metadata.h
+            Lib/opcode.py
+          sparse-checkout-cone-mode: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: python/cpython
+          ref: 4061bc4c35f7c26f25264666d4ba083b93d2f6f9
+          path: target/cpython-3.13
+          persist-credentials: false
+          sparse-checkout: |
+            Include
+            Python/assemble.c
+            Python/compile.c
+            Python/flowgraph.c
+            Python/Python-ast.c
+            Python/marshal.c
+            Lib/importlib/_bootstrap_external.py
+            Lib/_opcode_metadata.py
+          sparse-checkout-cone-mode: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: python/cpython
           ref: 5607950ef232dad16d75c0cf53101d9649d89115
           path: target/cpython
           persist-credentials: false
@@ -101,6 +134,10 @@ jobs:
         run: python scripts/mypy_primer_corpus.py check-catalog --primer-checkout target/mypy_primer
       - name: "Test target generator"
         run: python -m unittest discover -s crates/serc/scripts -p 'test_*.py'
+      - name: "Check generated Python 3.12 target"
+        run: python crates/serc/scripts/generate_cpython_target.py --cpython target/cpython-3.12 --target-version 3.12 --check
+      - name: "Check generated Python 3.13 target"
+        run: python crates/serc/scripts/generate_cpython_target.py --cpython target/cpython-3.13 --target-version 3.13 --check
       - name: "Check generated Python 3.14 target"
         run: python crates/serc/scripts/generate_cpython_target.py --cpython target/cpython --target-version 3.14 --check
       - name: "Check generated Python 3.15 target"
@@ -180,6 +217,16 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        id: python312
+        with:
+          python-version: "3.12.14"
+          update-environment: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        id: python313
+        with:
+          python-version: "3.13.15"
+          update-environment: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         id: python314
         with:
           python-version: "3.14.5"
@@ -193,13 +240,15 @@ jobs:
         run: rustup show
       - name: "Cargo test"
         env:
+          SERC_TEST_PYTHON_312: ${{ steps.python312.outputs.python-path }}
+          SERC_TEST_PYTHON_313: ${{ steps.python313.outputs.python-path }}
           SERC_TEST_PYTHON: ${{ steps.python314.outputs.python-path }}
           SERC_TEST_PYTHON_315: ${{ steps.python315.outputs.python-path }}
         run: cargo test --workspace --all-targets --all-features --locked
 
   test-other:
     name: "cargo test (${{ matrix.os }})"
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -216,6 +265,18 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+      # actions/python-versions provides this security release only for Linux.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: python/cpython
+          ref: 2abcf904b8dac8c999d2b3aac76681abb333798a
+          path: .cpython-3.12-build
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        id: python313
+        with:
+          python-version: "3.13.15"
+          update-environment: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         id: python314
         with:
@@ -225,6 +286,37 @@ jobs:
         with:
           python-version: "3.15.0-rc.2"
           update-environment: false
+      - name: "Build CPython 3.12.14 (macOS)"
+        if: runner.os == 'macOS'
+        id: python312-macos
+        shell: bash
+        working-directory: .cpython-3.12-build
+        run: |
+          ./configure --prefix="$RUNNER_TEMP/cpython-3.12.14" --without-ensurepip
+          make -j"$(sysctl -n hw.logicalcpu)"
+          make install
+          echo "python-path=$RUNNER_TEMP/cpython-3.12.14/bin/python3.12" >> "$GITHUB_OUTPUT"
+      - name: "Build CPython 3.12.14 (Windows)"
+        if: runner.os == 'Windows'
+        id: python312-windows
+        shell: pwsh
+        working-directory: .cpython-3.12-build
+        env:
+          PYTHON: ${{ steps.python313.outputs.python-path }}
+        run: |
+          # Preserve the quotes build.bat requires around MSBuild properties.
+          & .\PCbuild\build.bat --% -p x64 -c Release -e --no-ctypes "/p:IncludeTests=false" "/p:PlatformToolset=v143"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $python312Path = Join-Path $PWD "PCbuild\amd64\python.exe"
+          "python-path=$python312Path" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: "Verify CPython 3.12.14 oracle"
+        id: python312
+        shell: bash
+        env:
+          PYTHON312: ${{ steps.python312-macos.outputs.python-path || steps.python312-windows.outputs.python-path }}
+        run: |
+          "$PYTHON312" -B -I -S -c "import compileall, importlib.util, json, marshal, py_compile, struct, sys; assert sys.implementation.name == 'cpython'; assert sys.version_info == (3, 12, 14, 'final', 0); assert importlib.util.MAGIC_NUMBER.hex() == 'cb0d0d0a'"
+          echo "python-path=$PYTHON312" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-bin: false
@@ -232,6 +324,8 @@ jobs:
         run: rustup show
       - name: "Test core library and binary"
         env:
+          SERC_TEST_PYTHON_312: ${{ steps.python312.outputs.python-path }}
+          SERC_TEST_PYTHON_313: ${{ steps.python313.outputs.python-path }}
           SERC_TEST_PYTHON: ${{ steps.python314.outputs.python-path }}
           SERC_TEST_PYTHON_315: ${{ steps.python315.outputs.python-path }}
         run: cargo test --workspace --lib --bins --all-features --locked
@@ -239,16 +333,22 @@ jobs:
       # Bash-specific tooling.
       - name: "Test CPython compatibility"
         env:
+          SERC_TEST_PYTHON_312: ${{ steps.python312.outputs.python-path }}
+          SERC_TEST_PYTHON_313: ${{ steps.python313.outputs.python-path }}
           SERC_TEST_PYTHON: ${{ steps.python314.outputs.python-path }}
           SERC_TEST_PYTHON_315: ${{ steps.python315.outputs.python-path }}
         run: cargo test -p serc --test compatibility --all-features --locked
       - name: "Test pinned inputs"
         env:
+          SERC_TEST_PYTHON_312: ${{ steps.python312.outputs.python-path }}
+          SERC_TEST_PYTHON_313: ${{ steps.python313.outputs.python-path }}
           SERC_TEST_PYTHON: ${{ steps.python314.outputs.python-path }}
           SERC_TEST_PYTHON_315: ${{ steps.python315.outputs.python-path }}
         run: cargo test -p serc --test pinned_inputs --all-features --locked
       - name: "Test CLI"
         env:
+          SERC_TEST_PYTHON_312: ${{ steps.python312.outputs.python-path }}
+          SERC_TEST_PYTHON_313: ${{ steps.python313.outputs.python-path }}
           SERC_TEST_PYTHON: ${{ steps.python314.outputs.python-path }}
           SERC_TEST_PYTHON_315: ${{ steps.python315.outputs.python-path }}
         run: cargo test -p serc-cli --test cli --all-features --locked
@@ -274,6 +374,16 @@ jobs:
         with:
           python-version: "3.14.5"
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        id: python312
+        with:
+          python-version: "3.12.14"
+          update-environment: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        id: python313
+        with:
+          python-version: "3.13.15"
+          update-environment: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         id: python315
         with:
           python-version: "3.15.0-rc.2"
@@ -289,6 +399,15 @@ jobs:
         env:
           CPYTHON: ${{ steps.python315.outputs.python-path }}
         run: ./scripts/check-cpython-compatibility "$CPYTHON" 3.15
+
+      - name: "Compare with CPython 3.12"
+        env:
+          CPYTHON: ${{ steps.python312.outputs.python-path }}
+        run: ./scripts/check-cpython-compatibility "$CPYTHON" 3.12
+      - name: "Compare with CPython 3.13"
+        env:
+          CPYTHON: ${{ steps.python313.outputs.python-path }}
+        run: ./scripts/check-cpython-compatibility "$CPYTHON" 3.13
 
   benchmark:
     name: "CodSpeed benchmarks"

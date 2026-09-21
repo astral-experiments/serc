@@ -748,7 +748,9 @@ impl OptimizationPipeline {
                 || cleanup_throw.depth_after() != Some(region.depth)
                 || end_send.depth_after()
                     != region.depth.checked_sub(match self.python_version {
-                        crate::PythonVersion::Py314 => 1,
+                        crate::PythonVersion::Py312
+                        | crate::PythonVersion::Py313
+                        | crate::PythonVersion::Py314 => 1,
                         crate::PythonVersion::Py315 => 2,
                     })
                 || !self

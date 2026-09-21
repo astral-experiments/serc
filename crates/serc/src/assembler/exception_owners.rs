@@ -135,6 +135,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) populated_try_else_borrow_exits: Vec<(Label, Label)>,
     pub(super) omitted_nop_locations: FxHashMap<Label, SourceLocation>,
     pub(super) omitted_nop_counts: FxHashMap<Label, usize>,
+    // Native early-copy slots from eager footer jumps and copied omitted records.
+    pub(super) legacy_early_copy_slots: FxHashMap<Label, usize>,
     // One omitted fallthrough marker with no original label: item offset, location, count.
     pub(super) omitted_nop_tail: Option<(usize, SourceLocation, usize)>,
     // Original constant-expression/Pass pairs sharing only their fresh marker labels.
@@ -167,6 +169,547 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) source_none_conditions: Vec<SourceNoneCondition>,
     // Exact terminal pairs produced by original conditional jump threading.
     pub(super) threaded_condition_origins: Vec<(Instruction, Instruction)>,
+}
+
+impl ExceptionOwnerProvenance {
+    /// Validates fields whose producer contract requires an authored jump.
+    pub(super) fn legacy_seed_capture_shapes_valid(&self) -> bool {
+        let forward =
+            |instruction: &Instruction| matches!(instruction.operand(), Operand::Forward(_));
+        if !self
+            .ordinary_await_ends
+            .iter()
+            .map(|origin| &origin.send)
+            .chain(self.async_with_setups.iter().map(|origin| &origin.send))
+            .all(forward)
+            || !self
+                .original_primitive_condition_boundaries
+                .iter()
+                .chain(
+                    self.source_none_conditions
+                        .iter()
+                        .map(|origin| &origin.instruction),
+                )
+                .chain(
+                    self.original_comprehension_normal_exits
+                        .iter()
+                        .map(|(_, instruction)| instruction),
+                )
+                .all(|instruction| {
+                    matches!(
+                        instruction.operand(),
+                        Operand::Forward(_) | Operand::Backward(_)
+                    )
+                })
+        {
+            return false;
+        }
+        if !self.original_normal_finally_arrays.iter().all(|origin| {
+            origin.incoming.iter().all(|instruction| {
+                matches!(instruction.operand(), Operand::Forward(target) if target == origin.entry)
+            })
+        }) {
+            return false;
+        }
+        self.normal_finally_none_prefixes
+            .iter()
+            .map(|origin| &origin.2)
+            .chain(
+                self.normal_finally_method_none_prefixes
+                    .iter()
+                    .map(|prefix| &prefix[4]),
+            )
+            .chain(
+                self.normal_finally_truth_prefixes
+                    .iter()
+                    .map(|prefix| &prefix[3]),
+            )
+            .chain(
+                self.copied_return_none_prefixes
+                    .iter()
+                    .map(|origin| &origin.condition),
+            )
+            .chain(
+                self.copied_cleanup_return_none_prefixes
+                    .iter()
+                    .map(|origin| &origin.condition),
+            )
+            .chain(
+                self.copied_return_truth_prefixes
+                    .iter()
+                    .map(|origin| &origin.condition),
+            )
+            .chain(
+                self.copied_return_membership_prefixes
+                    .iter()
+                    .map(|origin| &origin.condition),
+            )
+            .chain(
+                self.copied_return_call_prefixes
+                    .iter()
+                    .map(|origin| &origin.condition),
+            )
+            .chain(
+                self.copied_return_attribute_truth_prefixes
+                    .iter()
+                    .map(|origin| &origin.condition),
+            )
+            .chain(
+                self.copied_manager_return_none_prefixes
+                    .iter()
+                    .map(|origin| &origin.condition),
+            )
+            .chain(
+                self.retained_manager_return_none_prefixes
+                    .iter()
+                    .map(|origin| &origin.condition),
+            )
+            .chain(
+                self.copied_manager_return_compactions
+                    .iter()
+                    .map(|origin| &origin.condition),
+            )
+            .chain(
+                self.copied_named_break_truth_prefixes
+                    .iter()
+                    .map(|origin| &origin.original_condition),
+            )
+            .chain(
+                self.copied_handler_return_none_prefixes
+                    .iter()
+                    .map(|origin| &origin.1[5]),
+            )
+            .chain(
+                self.copied_bare_handler_none_prefixes
+                    .iter()
+                    .map(|origin| &origin.2[8]),
+            )
+            .chain(
+                self.copied_iterator_attribute_none_prefixes
+                    .iter()
+                    .map(|prefix| &prefix[3]),
+            )
+            .all(forward)
+    }
+
+    /// Visits full instruction witnesses for exact native seeds and cancellation.
+    ///
+    /// Visit every record when clearing: a seeded jump may have become a NOP.
+    /// Seeding filters jump operands separately and validates all targets first.
+    /// Each record is resolved or cleared independently; callbacks do not mutate
+    /// map keys, membership, graph targets, or the native-label lookup.
+    #[expect(
+        clippy::iter_over_hash_type,
+        reason = "capture callbacks resolve or clear each record independently of map order"
+    )]
+    pub(super) fn visit_legacy_seed_captures_mut(
+        &mut self,
+        mut visit: impl FnMut(&mut Instruction),
+    ) {
+        for origin in &mut self.ordinary_await_ends {
+            visit(&mut origin.send);
+            visit(&mut origin.end_send);
+            for item in &mut origin.cleanup {
+                if let Item::Instruction(instruction) = item {
+                    visit(instruction);
+                }
+            }
+            if let Some(record) = origin.bridge.as_mut() {
+                visit(&mut record.1);
+            }
+        }
+        for record in &mut self.empty_while_break_anchors {
+            visit(&mut record.2);
+        }
+        for record in &mut self.early_return_nop_pairs {
+            visit(&mut record.0);
+            visit(&mut record.1);
+        }
+        for record in &mut self.early_return_iterator_pops {
+            visit(&mut record.0);
+            visit(&mut record.1);
+            visit(&mut record.2);
+        }
+        for origin in &mut self.copied_handler_cleanups {
+            visit(&mut origin.return_nop);
+            if let Some(instruction) = origin.return_iterator.as_mut() {
+                visit(instruction);
+            }
+            for instruction in &mut origin.instructions {
+                visit(instruction);
+            }
+            if let Some(record) = origin.assignment_pop.as_mut() {
+                visit(&mut record.1);
+            }
+            if let Some(record) = origin.continued_call.as_mut() {
+                for instruction in &mut record.0 {
+                    visit(instruction);
+                }
+                visit(&mut record.1);
+            }
+            if let Some(record) = origin.continued_attribute_none.as_mut() {
+                for instruction in &mut record.0 {
+                    visit(instruction);
+                }
+                visit(&mut record.1);
+            }
+        }
+        for origin in &mut self.named_handler_pop_pairs {
+            for item in &mut origin.items {
+                if let Item::Instruction(instruction) = item {
+                    visit(instruction);
+                }
+            }
+        }
+        for origin in &mut self.named_handler_try_prefixes {
+            for item in &mut origin.items {
+                if let Item::Instruction(instruction) = item {
+                    visit(instruction);
+                }
+            }
+        }
+        for origin in &mut self.continued_handler_try_prefixes {
+            for item in &mut origin.items {
+                if let Item::Instruction(instruction) = item {
+                    visit(instruction);
+                }
+            }
+        }
+        for origin in &mut self.copied_handler_finally_pops {
+            for item in &mut origin.items {
+                if let Item::Instruction(instruction) = item {
+                    visit(instruction);
+                }
+            }
+        }
+        for record in &mut self.iterator_return_pop_spans {
+            visit(&mut record.0);
+            for item in &mut record.1.items {
+                if let Item::Instruction(instruction) = item {
+                    visit(instruction);
+                }
+            }
+        }
+        for record in &mut self.fused_manager_owners {
+            visit(&mut record.0);
+            visit(&mut record.1);
+        }
+        for origin in &mut self.handler_dispatch_arrays {
+            for item in &mut origin.items {
+                if let Item::Instruction(instruction) = item {
+                    visit(instruction);
+                }
+            }
+        }
+        for record in &mut self.original_value_jump_prefixes {
+            for item in &mut record.1 {
+                if let Item::Instruction(instruction) = item {
+                    visit(instruction);
+                }
+            }
+        }
+        for origin in &mut self.retained_setup_value_arrays {
+            for item in &mut origin.prefix {
+                if let Item::Instruction(instruction) = item {
+                    visit(instruction);
+                }
+            }
+        }
+        for record in &mut self.copied_finally_iterator_returns {
+            for item in &mut record.1 {
+                if let Item::Instruction(instruction) = item {
+                    visit(instruction);
+                }
+            }
+        }
+        for prefix in &mut self.copied_conjunction_break_prefixes {
+            for item in prefix.iter_mut() {
+                if let Item::Instruction(instruction) = item {
+                    visit(instruction);
+                }
+            }
+        }
+        for origin in &mut self.copied_named_break_truth_prefixes {
+            for item in &mut origin.items {
+                if let Item::Instruction(instruction) = item {
+                    visit(instruction);
+                }
+            }
+            visit(&mut origin.original_condition);
+        }
+        for prefix in &mut self.copied_shared_break_truth_prefixes {
+            for item in prefix.iter_mut() {
+                if let Item::Instruction(instruction) = item {
+                    visit(instruction);
+                }
+            }
+        }
+        for origin in &mut self.original_normal_finally_arrays {
+            for item in &mut origin.prefix {
+                if let Item::Instruction(instruction) = item {
+                    visit(instruction);
+                }
+            }
+            for instruction in &mut origin.incoming {
+                visit(instruction);
+            }
+            if let Some(record) = origin.borrow_join.as_mut() {
+                visit(&mut record.1);
+            }
+        }
+        for record in &mut self.normal_finally_none_prefixes {
+            visit(&mut record.0);
+            visit(&mut record.1);
+            visit(&mut record.2);
+        }
+        for prefix in &mut self.normal_finally_method_none_prefixes {
+            for instruction in prefix.iter_mut() {
+                visit(instruction);
+            }
+        }
+        for prefix in &mut self.normal_finally_truth_prefixes {
+            for instruction in prefix.iter_mut() {
+                visit(instruction);
+            }
+        }
+        for origin in &mut self.copied_return_none_prefixes {
+            if let Some(instruction) = origin.return_nop.as_mut() {
+                visit(instruction);
+            }
+            for instruction in &mut origin.pops {
+                visit(instruction);
+            }
+            if let Some(instruction) = origin.additional_pop.as_mut() {
+                visit(instruction);
+            }
+            visit(&mut origin.load);
+            visit(&mut origin.condition);
+        }
+        for record in &mut self.copied_break_none_nops {
+            for instruction in &mut record.1 {
+                visit(instruction);
+            }
+        }
+        for record in &mut self.copied_bare_handler_none_prefixes {
+            for instruction in &mut record.2 {
+                visit(instruction);
+            }
+        }
+        for prefix in &mut self.copied_iterator_attribute_none_prefixes {
+            for instruction in prefix.iter_mut() {
+                visit(instruction);
+            }
+        }
+        for origin in &mut self.copied_cleanup_return_none_prefixes {
+            for instruction in &mut origin.cleanup {
+                visit(instruction);
+            }
+            visit(&mut origin.pop);
+            visit(&mut origin.load);
+            visit(&mut origin.condition);
+            visit(&mut origin.marker);
+        }
+        for origin in &mut self.copied_return_pop_prefixes {
+            for instruction in &mut origin.records {
+                visit(instruction);
+            }
+        }
+        for origin in &mut self.copied_return_truth_prefixes {
+            visit(&mut origin.return_nop);
+            for instruction in &mut origin.pops {
+                visit(instruction);
+            }
+            visit(&mut origin.load);
+            visit(&mut origin.to_bool);
+            visit(&mut origin.condition);
+        }
+        for origin in &mut self.copied_return_membership_prefixes {
+            visit(&mut origin.return_value);
+            for instruction in &mut origin.pops {
+                visit(instruction);
+            }
+            visit(&mut origin.load);
+            visit(&mut origin.constant);
+            visit(&mut origin.contains);
+            visit(&mut origin.condition);
+            visit(&mut origin.marker);
+        }
+        for origin in &mut self.copied_return_call_prefixes {
+            visit(&mut origin.return_nop);
+            for instruction in &mut origin.pops {
+                visit(instruction);
+            }
+            for instruction in &mut origin.prefix {
+                visit(instruction);
+            }
+            visit(&mut origin.condition);
+        }
+        for origin in &mut self.copied_return_attribute_truth_prefixes {
+            visit(&mut origin.return_nop);
+            for instruction in &mut origin.pops {
+                visit(instruction);
+            }
+            for instruction in &mut origin.prefix {
+                visit(instruction);
+            }
+            visit(&mut origin.condition);
+        }
+        for record in &mut self.copied_handler_return_none_prefixes {
+            for instruction in &mut record.1 {
+                visit(instruction);
+            }
+        }
+        for origin in &mut self.saved_named_handler_none_prefixes {
+            for item in &mut origin.items {
+                if let Item::Instruction(instruction) = item {
+                    visit(instruction);
+                }
+            }
+        }
+        for origin in &mut self.copied_manager_return_none_prefixes {
+            for instruction in &mut origin.prefix {
+                visit(instruction);
+            }
+            visit(&mut origin.pop);
+            visit(&mut origin.load);
+            visit(&mut origin.condition);
+        }
+        for origin in &mut self.retained_manager_return_none_prefixes {
+            visit(&mut origin.entry);
+            for instruction in &mut origin.prefix {
+                visit(instruction);
+            }
+            visit(&mut origin.pop);
+            visit(&mut origin.load);
+            visit(&mut origin.condition);
+            visit(&mut origin.marker);
+        }
+        for origin in &mut self.copied_manager_return_compactions {
+            for instruction in &mut origin.cleanup {
+                visit(instruction);
+            }
+            if let Some(prefix) = origin.earlier_cleanup.as_mut() {
+                for instruction in prefix.iter_mut() {
+                    visit(instruction);
+                }
+            }
+            if let Some(prefix) = origin.named_handler_cleanup.as_mut() {
+                for instruction in prefix.iter_mut() {
+                    visit(instruction);
+                }
+            }
+            if let Some(origin) = origin.constant_return_prefix.as_mut() {
+                visit(&mut origin.authored_nop);
+                if let Some(instruction) = origin.retained_inner_try_pop.as_mut() {
+                    visit(instruction);
+                }
+                if let Some(instruction) = origin.handler_pop.as_mut() {
+                    visit(instruction);
+                }
+                for instruction in &mut origin.instructions {
+                    visit(instruction);
+                }
+            }
+            if let Some(instruction) = origin.to_bool.as_mut() {
+                visit(instruction);
+            }
+            visit(&mut origin.pop);
+            visit(&mut origin.load);
+            visit(&mut origin.condition);
+        }
+        for origin in &mut self.uncompacted_conditional_arrays {
+            for item in &mut origin.prefix {
+                if let Item::Instruction(instruction) = item {
+                    visit(instruction);
+                }
+            }
+        }
+        for instruction in &mut self.original_primitive_condition_boundaries {
+            visit(instruction);
+        }
+        for record in self.shared_match_return_donors.values_mut() {
+            visit(&mut record.0);
+            visit(&mut record.1);
+        }
+        for record in &mut self.original_comprehension_normal_exits {
+            visit(&mut record.1);
+        }
+        for prefix in self.original_comprehension_normal_restores.values_mut() {
+            for instruction in prefix.iter_mut() {
+                visit(instruction);
+            }
+        }
+        for record in &mut self.for_target_owner_prefixes {
+            visit(&mut record.1);
+        }
+        for record in &mut self.comprehension_restore_owner_prefixes {
+            visit(&mut record.1);
+        }
+        for origin in &mut self.async_with_setups {
+            visit(&mut origin.send);
+            for item in &mut origin.prefix {
+                if let Item::Instruction(instruction) = item {
+                    visit(instruction);
+                }
+            }
+            for item in &mut origin.cleanup {
+                if let Item::Instruction(instruction) = item {
+                    visit(instruction);
+                }
+            }
+            if let Some(record) = origin.bridge.as_mut() {
+                visit(&mut record.1);
+            }
+        }
+        for record in &mut self.synthetic_manager_join_exits {
+            visit(&mut record.1);
+        }
+        for origin in &mut self.normal_try_break_pop_owners {
+            for item in &mut origin.prefix {
+                if let Item::Instruction(instruction) = item {
+                    visit(instruction);
+                }
+            }
+        }
+        for record in self.normal_try_fallthrough_donors.values_mut() {
+            visit(&mut record.0);
+            visit(&mut record.1);
+        }
+        for record in self.compound_try_fallthrough_donors.values_mut() {
+            visit(&mut record.0);
+            visit(&mut record.1);
+        }
+        for instruction in self.original_fallthrough_pop_blocks.values_mut() {
+            visit(instruction);
+        }
+        for record in &mut self.ownerless_compound_try_nops {
+            visit(&mut record.2);
+        }
+        for origin in self.normal_try_copy_join_origins.values_mut() {
+            visit(&mut origin.store);
+            visit(&mut origin.jump);
+        }
+        for record in self.normal_try_copy_join_donors.values_mut() {
+            visit(&mut record.0);
+        }
+        for instruction in &mut self.original_uniform_folds {
+            visit(instruction);
+        }
+        for origin in &mut self.source_none_conditions {
+            visit(&mut origin.instruction);
+            if let Some(prefix) = origin.entry_prefix.as_mut() {
+                for item in prefix.iter_mut() {
+                    if let Item::Instruction(instruction) = item {
+                        visit(instruction);
+                    }
+                }
+            }
+        }
+        for record in &mut self.threaded_condition_origins {
+            visit(&mut record.0);
+            visit(&mut record.1);
+        }
+    }
 }
 
 /// Original try-exit slot absorbed by a normal-finally marker after jump threading.
@@ -10834,6 +11377,7 @@ mod tests {
             marker.set_exception_owner(NormalizedExceptionOwner::DynamicCondition);
             let mut assembler = LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items: vec![
                     plain(NOP, Operand::Value(0)),
                     Item::Label(setup),
@@ -10998,6 +11542,7 @@ mod tests {
             assert_eq!(fused_store.local_policy.hidden_exception_owner_slots(), 2);
             let mut assembler = LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items: pipeline.graph.into_items(),
                 exception_regions: pipeline.exception_regions,
                 exception_owner_provenance: pipeline.exception_owner_provenance,
@@ -11140,6 +11685,7 @@ mod tests {
             marker.set_exception_owner(NormalizedExceptionOwner::Present);
             let mut assembler = LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items: vec![
                     Item::Label(Label(0)),
                     plain(LOAD_CONST, Operand::Value(0)),
@@ -11376,6 +11922,7 @@ mod tests {
             marker.set_exception_owner(NormalizedExceptionOwner::Present);
             let mut assembler = LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items: vec![
                     Item::Instruction(plain(
                         JUMP_FORWARD,
@@ -11575,6 +12122,7 @@ mod tests {
             marker.set_exception_owner(NormalizedExceptionOwner::Present);
             LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items: vec![
                     Item::Label(Label(0)),
                     plain(LOAD_CONST, Operand::Value(0)),
@@ -11860,6 +12408,7 @@ mod tests {
             );
             let layout = LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items: assembler.linear_items().to_vec(),
                 exception_regions: assembler.exception_regions,
                 exception_owner_provenance: assembler.exception_owner_provenance,
@@ -11941,6 +12490,7 @@ mod tests {
             ];
             let mut assembler = LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items: prefix.clone(),
                 exception_regions: Vec::new(),
                 exception_owner_provenance: ExceptionOwnerProvenance {
@@ -12172,6 +12722,7 @@ mod tests {
             }
             let assembler = LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items,
                 exception_owner_provenance: provenance,
                 exception_regions: vec![],
@@ -12325,6 +12876,7 @@ mod tests {
             provenance.capture_uncompacted_conditional_arrays(&items);
             let mut assembler = LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items,
                 exception_owner_provenance: provenance,
                 exception_regions: vec![],
@@ -12463,6 +13015,7 @@ mod tests {
             }
             let assembler = LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items,
                 exception_owner_provenance: provenance,
                 exception_regions: vec![],
@@ -12638,6 +13191,7 @@ mod tests {
             }
             let assembler = LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items,
                 exception_regions: regions,
                 exception_owner_provenance: provenance,
@@ -13032,6 +13586,7 @@ mod tests {
             ]);
             LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
                 items,
                 exception_regions: vec![ExceptionRegion {
                     is_scope_fallback: true,

@@ -12,12 +12,28 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+# Resolve only adjacent, repository-owned generator helpers, including with -P/-I.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 TARGET_TAG = "v3.14.5"
 TARGET_COMMIT = "5607950ef232dad16d75c0cf53101d9649d89115"
 TARGET_VERSION = (3, 14, 5)
 TARGET_MINOR = "3.14"
 TARGETS = {
+    "3.12": (
+        "v3.12.14",
+        "2abcf904b8dac8c999d2b3aac76681abb333798a",
+        (3, 12, 14),
+        4,
+    ),
+    "3.13": (
+        "v3.13.15",
+        "4061bc4c35f7c26f25264666d4ba083b93d2f6f9",
+        (3, 13, 15),
+        4,
+    ),
     "3.14": (TARGET_TAG, TARGET_COMMIT, TARGET_VERSION, 5),
     "3.15": (
         "v3.15.0rc2",
@@ -43,6 +59,24 @@ TARGET_INPUTS = (
     "Python/codegen.c",
     "Python/flowgraph.c",
     "Python/Python-ast.c",
+)
+MODERN_TARGET_INPUTS = TARGET_INPUTS
+LEGACY_TARGET_INPUTS = (
+    "Include/opcode.h",
+    "Include/object.h",
+    "Include/ceval.h",
+    "Include/internal/pycore_opcode_utils.h",
+    "Include/internal/pycore_intrinsics.h",
+    "Include/cpython/code.h",
+    "Include/internal/pycore_code.h",
+    "Include/internal/pycore_global_strings.h",
+    "Include/internal/pycore_global_objects.h",
+    "Include/patchlevel.h",
+    "Python/compile.c",
+    "Python/flowgraph.c",
+    "Python/assemble.c",
+    "Python/Python-ast.c",
+    "Lib/importlib/_bootstrap_external.py",
 )
 MARSHAL_INPUTS = (
     "Include/marshal.h",
@@ -100,13 +134,46 @@ OUTPUT = CRATE_ROOT / "src" / "target" / "cpython_3_14_5.rs"
 MARSHAL_OUTPUT = CRATE_ROOT / "src" / "marshal" / "v5.rs"
 STARTUP_315_INPUT = "scripts/target_metadata/cpython_3_15_0rc2_startup.json"
 STARTUP_315_SHA256 = "bec0bd2dedbe3b38ca68e446c67abf0f8d0f4793b551d9c7036acb0517765d63"
+LEGACY_STARTUP_INPUTS = {
+    "3.12": (
+        "scripts/target_metadata/cpython_3_12_14_startup.json",
+        "a360df44273c826ac83a1e20cd3f0651d916ec3904120c059e9288965c6b5b3f",
+    ),
+    "3.13": (
+        "scripts/target_metadata/cpython_3_13_15_startup.json",
+        "185f5860fdb6507fa3f8642c7919993fa6813b7d3a96c1cd4d5919a7f877a4ef",
+    ),
+}
+V4_INPUT_DIGESTS = {
+    "3.12": {
+        "Include/marshal.h": "d7f5760ef6496776cee99aca5491789f6ab261a78b156b5758538ea15e1827e5",
+        "Python/marshal.c": "6d2dc841001316ed7f9255ec03aeeb6e14780421f44ba61436da638c6f49bf0c",
+    },
+    "3.13": {
+        "Include/marshal.h": "d7f5760ef6496776cee99aca5491789f6ab261a78b156b5758538ea15e1827e5",
+        "Python/marshal.c": "e82da48b37ce030f2fa5c6996b1636d1f6b5082a2448b5b6f76188b470b38fe2",
+    },
+}
+
+
+def startup_input() -> tuple[str, str]:
+    if TARGET_MINOR == "3.15":
+        return STARTUP_315_INPUT, STARTUP_315_SHA256
+    if TARGET_MINOR not in LEGACY_STARTUP_INPUTS:
+        raise ValueError(
+            f"verified startup supplement is not available for {TARGET_MINOR}"
+        )
+    return LEGACY_STARTUP_INPUTS[TARGET_MINOR]
 
 
 def read_startup_strings() -> tuple[str, ...]:
     """Read the verified neutral Linux startup supplement for the selected target."""
-    data = (CRATE_ROOT / STARTUP_315_INPUT).read_bytes()
-    if hashlib.sha256(data).hexdigest() != STARTUP_315_SHA256:
-        raise ValueError("pinned Python 3.15 startup profile checksum mismatch")
+    relative, digest = startup_input()
+    data = (CRATE_ROOT / relative).read_bytes()
+    if hashlib.sha256(data).hexdigest() != digest:
+        raise ValueError(
+            f"pinned Python {TARGET_MINOR} startup profile checksum mismatch"
+        )
     profile = json.loads(data)
     if profile["target_tag"] != TARGET_TAG or profile["target_commit"] != TARGET_COMMIT:
         raise ValueError("startup profile does not match the selected CPython target")
@@ -124,18 +191,28 @@ def select_target_version(version: str) -> None:
     global TARGET_INPUTS, MARSHAL_INPUTS, OUTPUT, MARSHAL_OUTPUT
     TARGET_MINOR = version
     TARGET_TAG, TARGET_COMMIT, TARGET_VERSION, marshal_version = TARGETS[version]
-    TARGET_INPUTS = tuple(
-        p
-        for p in TARGET_INPUTS
-        if p not in {"Python/assemble.c", "Include/internal/pycore_runtime_structs.h"}
-    )
+    TARGET_INPUTS = MODERN_TARGET_INPUTS
+    if version == "3.12":
+        TARGET_INPUTS = (
+            *LEGACY_TARGET_INPUTS,
+            "Include/internal/pycore_opcode.h",
+            "Python/opcode_metadata.h",
+            "Lib/opcode.py",
+        )
+    elif version == "3.13":
+        TARGET_INPUTS = (
+            *LEGACY_TARGET_INPUTS,
+            "Include/opcode_ids.h",
+            "Include/internal/pycore_opcode_metadata.h",
+            "Lib/_opcode_metadata.py",
+        )
     if version == "3.15":
         TARGET_INPUTS += (
             "Python/assemble.c",
             "Include/internal/pycore_runtime_structs.h",
         )
     marshal_header = (
-        "Include/marshal.h" if version == "3.14" else "Include/cpython/marshal.h"
+        "Include/cpython/marshal.h" if version == "3.15" else "Include/marshal.h"
     )
     MARSHAL_INPUTS = (marshal_header, "Python/marshal.c")
     module = TARGET_TAG.removeprefix("v").replace(".", "_")
@@ -585,6 +662,10 @@ def rust_byte(value: int) -> str:
 
 
 def render(sources: dict[str, str]) -> str:
+    if TARGET_MINOR in {"3.12", "3.13"}:
+        from generate_legacy_target import render_legacy_target
+
+        return render_legacy_target(sources, SimpleNamespace(**globals()))
     opcode_ids = sources["Include/opcode_ids.h"]
     opcode_header = sources["Include/opcode.h"]
     object_header = sources["Include/object.h"]
@@ -975,23 +1056,51 @@ def render(sources: dict[str, str]) -> str:
         lookup[0] = "fn is_preinterned_static_string(value: &str) -> bool {"
         lines.extend(lookup)
     if TARGET_MINOR == "3.14":
-        jump_opcodes = {
-            name for name in opcode_names if "HAS_JUMP_FLAG" in opcode_flags[name]
-        }
-        expression = opcode_match_expression(opcodes, jump_opcodes).replace(
-            "opcode", "self", 1
-        )
-        lines.extend(
-            [
-                "",
-                "impl Opcode {",
-                "    pub(crate) const fn has_jump(self) -> bool {",
-                f"        {expression}",
-                "    }",
-                "}",
-                "",
-            ]
-        )
+        lines.extend(["", "impl Opcode {"])
+        for method, flag in (
+            ("has_argument", "HAS_ARG_FLAG"),
+            ("has_constant", "HAS_CONST_FLAG"),
+            ("has_name", "HAS_NAME_FLAG"),
+            ("has_jump", "HAS_JUMP_FLAG"),
+            ("has_free", "HAS_FREE_FLAG"),
+            ("has_local", "HAS_LOCAL_FLAG"),
+        ):
+            names = {name for name in opcode_names if flag in opcode_flags[name]}
+            expression = opcode_match_expression(opcodes, names).replace(
+                "opcode", "self", 1
+            )
+            lines.extend(
+                [
+                    f"    pub(crate) const fn {method}(self) -> bool {{",
+                    f"        {expression} || super::legacy_opcodes::{method}(self)",
+                    "    }",
+                    "",
+                ]
+            )
+        lines.extend(["}", ""])
+    else:
+        for method, flag in (
+            ("has_argument", "HAS_ARG_FLAG"),
+            ("has_constant", "HAS_CONST_FLAG"),
+            ("has_name", "HAS_NAME_FLAG"),
+            ("has_jump", "HAS_JUMP_FLAG"),
+            ("has_free", "HAS_FREE_FLAG"),
+            ("has_local", "HAS_LOCAL_FLAG"),
+        ):
+            names = {name for name in opcode_names if flag in opcode_flags[name]}
+            if "GET_ITER" in names:
+                names.add("GET_YIELD_FROM_ITER")
+            semantic_opcodes = [*opcodes, ("GET_YIELD_FROM_ITER", 0)]
+            expression = opcode_match_expression(semantic_opcodes, names)
+            lines.extend(
+                [
+                    "#[allow(dead_code)]",
+                    f"pub(crate) const fn {method}(opcode: Opcode) -> bool {{",
+                    f"    {expression}",
+                    "}",
+                    "",
+                ]
+            )
     for name, names in predicates.items():
         lines.extend(
             [
@@ -1174,6 +1283,8 @@ def render_marshal(sources: dict[str, str]) -> str:
     }
     if version >= 6:
         required_tags.add("TYPE_FROZENDICT")
+    if version < 5:
+        required_tags.remove("TYPE_SLICE")
     all_tags = parse_character_defines(marshal_source, "TYPE_")
     tags = [definition for definition in all_tags if definition[0] in required_tags]
     require_definitions(tags, required_tags, "marshal type-tag table")
@@ -1187,9 +1298,25 @@ def render_marshal(sources: dict[str, str]) -> str:
         "// @generated by scripts/generate_cpython_target.py; do not edit.",
         f"// CPython marshal format {version} from {TARGET_TAG} ({TARGET_COMMIT}).",
     ]
-    for relative in MARSHAL_INPUTS:
-        digest = hashlib.sha256(sources[relative].encode()).hexdigest()
-        lines.append(f"// {relative}: sha256:{digest}")
+    if version == 4:
+        lines[1] = (
+            "// CPython marshal format 4 shared by the pinned 3.12 and 3.13 targets."
+        )
+        for minor, expected in V4_INPUT_DIGESTS.items():
+            tag, commit, _, _ = TARGETS[minor]
+            lines.append(f"// {tag} ({commit}):")
+            for relative, digest in expected.items():
+                if minor == TARGET_MINOR:
+                    actual = hashlib.sha256(sources[relative].encode()).hexdigest()
+                    if actual != digest:
+                        raise ValueError(
+                            f"unexpected marshal-v4 input {relative} for {minor}"
+                        )
+                lines.append(f"// {relative}: sha256:{digest}")
+    else:
+        for relative in MARSHAL_INPUTS:
+            digest = hashlib.sha256(sources[relative].encode()).hexdigest()
+            lines.append(f"// {relative}: sha256:{digest}")
     lines.extend(
         [
             "",
@@ -1242,7 +1369,7 @@ def check_numeric_authority() -> None:
                 raise ValueError(f"{relative} duplicates numeric opcode {name}")
 
     for path in sorted((CRATE_ROOT / "src" / "marshal").rglob("*.rs")):
-        if path.name in {"v5.rs", "v6.rs"}:
+        if path.name in {"v4.rs", "v5.rs", "v6.rs"}:
             continue
         relative = path.relative_to(CRATE_ROOT)
         if re.search(
@@ -1277,12 +1404,23 @@ def main() -> int:
         sources = read_inputs(options.cpython)
         generated = format_rust(render(sources))
         generated_marshal = format_rust(render_marshal(sources))
+        outputs = [(OUTPUT, generated), (MARSHAL_OUTPUT, generated_marshal)]
+        if TARGET_MINOR in {"3.12", "3.13"}:
+            from generate_legacy_target import render_legacy_opcodes
+            from legacy_opcode_metadata import parse_312_metadata, parse_313_metadata
+
+            metadata = (
+                parse_312_metadata if TARGET_MINOR == "3.12" else parse_313_metadata
+            )(sources)
+            outputs.append(
+                (
+                    CRATE_ROOT / "src" / "target" / "legacy_opcodes.rs",
+                    format_rust(render_legacy_opcodes(metadata)),
+                )
+            )
         if options.check:
             stale = False
-            for output, expected in (
-                (OUTPUT, generated),
-                (MARSHAL_OUTPUT, generated_marshal),
-            ):
+            for output, expected in outputs:
                 current = output.read_text() if output.exists() else ""
                 if current != expected:
                     stale = True
@@ -1298,10 +1436,9 @@ def main() -> int:
                 return 1
             check_numeric_authority()
             return 0
-        OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-        OUTPUT.write_text(generated)
-        MARSHAL_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-        MARSHAL_OUTPUT.write_text(generated_marshal)
+        for output, generated in outputs:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(generated)
         return 0
     except (OSError, subprocess.CalledProcessError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)

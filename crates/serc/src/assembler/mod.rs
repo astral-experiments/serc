@@ -3,6 +3,7 @@ mod exception_owners;
 mod fusion_owner_slots;
 mod ir;
 mod layout;
+mod legacy_native_labels;
 mod passes;
 
 #[cfg(test)]
@@ -374,7 +375,7 @@ fn reachable_constant_indices(
             let Item::Instruction(instruction) = item else {
                 continue;
             };
-            if instruction.opcode == LOAD_CONST
+            if uses_constant_index(instruction.opcode)
                 && let Operand::Value(index) = instruction.operand()
                 && let Some(slot) = used.get_mut(index as usize)
             {
@@ -389,6 +390,13 @@ fn reachable_constant_indices(
         }
     }
     used
+}
+
+fn uses_constant_index(opcode: Opcode) -> bool {
+    matches!(
+        opcode,
+        LOAD_CONST | crate::target::opcodes::RETURN_CONST | crate::target::opcodes::KW_NAMES
+    )
 }
 
 /// Marks reachable constants in an assertion-only stream and reports linear-optimizer eligibility.
@@ -473,6 +481,40 @@ impl Assembler {
 
     pub(crate) const fn python_version(&self) -> crate::PythonVersion {
         self.python_version
+    }
+
+    /// Accepts a whole-source proof that every native initial jump width is zero.
+    ///
+    /// The proof covers original and CFG-created labels. It remains valid when
+    /// exact physical-label binding is unavailable or is subsequently cancelled.
+    pub(crate) fn certify_legacy_uniform_jump_seed(&mut self) {
+        if self.python_version == crate::PythonVersion::Py312 {
+            self.legacy_uniform_jump_seed = true;
+        }
+    }
+
+    /// Binds a physical entry to its canonical native 3.12 codegen label.
+    pub(crate) fn bind_legacy_native_label(&mut self, physical: Label, native: u32) {
+        debug_assert_eq!(self.python_version, crate::PythonVersion::Py312);
+        self.legacy_native_labels
+            .get_or_insert_with(Default::default)
+            .bind(physical, native);
+    }
+
+    /// Enables exact native operands only after every codegen occurrence is covered.
+    pub(crate) fn certify_legacy_native_labels(&mut self) {
+        debug_assert_eq!(self.python_version, crate::PythonVersion::Py312);
+        self.legacy_native_labels
+            .get_or_insert_with(Default::default)
+            .certify();
+    }
+
+    /// Cancels the complete code object's provenance if any producer is unsupported.
+    pub(crate) fn invalidate_legacy_native_labels(&mut self) {
+        debug_assert_eq!(self.python_version, crate::PythonVersion::Py312);
+        self.legacy_native_labels
+            .get_or_insert_with(Default::default)
+            .invalidate();
     }
 
     /// Records a branch marker emitted before exception targets were assigned.
@@ -4494,7 +4536,9 @@ impl Assembler {
         // Python 3.15 keeps an index beside the synchronous iterator, so its
         // value-preserving cleanup is SWAP(3), POP_TOP, POP_TOP.
         let (cleanup_width, swap_depth) = match self.python_version {
-            crate::PythonVersion::Py314 => (2, 2),
+            crate::PythonVersion::Py312
+            | crate::PythonVersion::Py313
+            | crate::PythonVersion::Py314 => (2, 2),
             crate::PythonVersion::Py315 => (3, 3),
         };
         let cleanup_instructions = cleanup_width * iterators;
@@ -4533,7 +4577,10 @@ impl Assembler {
     }
 
     /// Records the first erased ordinary-try POP before a return's remaining unwind.
-    pub(crate) fn record_name_return_pop_boundary(&mut self, boundary: Label) {
+    pub(crate) fn record_name_return_pop_boundary(&mut self, boundary: Label, pop_count: usize) {
+        if self.python_version <= crate::PythonVersion::Py313 {
+            self.legacy_return_pop_blocks.insert(boundary, pop_count);
+        }
         if !self.deferred_name_return_borrow_exits.is_empty() {
             self.name_return_pop_boundaries.insert(boundary);
         }
@@ -4937,6 +4984,34 @@ impl Assembler {
             .add_hidden_exception_owner_slots(slots);
     }
 
+    /// Counts an omitted normal `POP_BLOCK` at its original boundary for 3.13 copying.
+    pub(crate) fn add_legacy_pop_block_copy_slot(&mut self, boundary: Label) {
+        if self.python_version != crate::PythonVersion::Py313 {
+            return;
+        }
+        let index = self
+            .linear_items()
+            .iter()
+            .position(|item| *item == Item::Label(boundary))
+            .expect("normal POP_BLOCK boundary is emitted");
+        let materialized = self.linear_items()[index + 1..]
+            .iter()
+            .find_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction),
+                Item::Label(_) => None,
+            })
+            .is_some_and(|instruction| instruction.fusion_policy.is_converted_pop_block());
+        if !materialized {
+            // Reuse the logical POP boundary. Inserting a label before its last
+            // predecessor can split a fused pair or belong to another original array.
+            *self
+                .exception_owner_provenance
+                .legacy_early_copy_slots
+                .entry(boundary)
+                .or_default() += 1;
+        }
+    }
+
     /// Moves one compiler-removed NULL `POP_BLOCK` to its original linear successor.
     ///
     /// The caller already counted that record on the protected predecessor. Keeping it
@@ -5142,6 +5217,31 @@ impl Assembler {
     pub(crate) fn add_last_inlined_jump_slot(&mut self) {
         self.required_last_instruction_mut("recording an inlined jump slot")
             .add_pre_fold_extra_instructions(1);
+        if self.python_version <= crate::PythonVersion::Py313 {
+            // Keep this exact producer separate from expression folds and POP_BLOCK
+            // counts in the general pre-fold metadata. The label is metadata only.
+            // The footer's LOAD_CONST/RETURN_VALUE must remain adjacent for
+            // native constant-return folding. Attach the certificate to its load.
+            let index = self
+                .linear_items()
+                .iter()
+                .enumerate()
+                .rev()
+                .filter_map(|(index, item)| matches!(item, Item::Instruction(_)).then_some(index))
+                .nth(1)
+                .expect("inlined exit contains a constant-return pair");
+            debug_assert!(matches!(self.linear_items()[index], Item::Instruction(load)
+                if load.opcode == crate::target::opcodes::LOAD_CONST));
+            debug_assert!(matches!(
+                self.linear_items().iter().rev().find(|item| matches!(item, Item::Instruction(_))),
+                Some(Item::Instruction(instruction)) if instruction.opcode == crate::target::opcodes::RETURN_VALUE
+            ));
+            let entry = self.label();
+            self.insert_label(index, entry);
+            self.exception_owner_provenance
+                .legacy_early_copy_slots
+                .insert(entry, 1);
+        }
     }
 
     /// Whether a return's first erased POP shares an original iterator-cleanup join.
@@ -5234,6 +5334,11 @@ impl Assembler {
 
     /// Resolves condition markers whose instructions all precede CFG optimization.
     pub(crate) fn defer_last_original_condition_exception_owner(&mut self) {
+        if self.python_version <= crate::PythonVersion::Py313 {
+            // These targets omit NOT_TAKEN. Their actual condition jump keeps
+            // its enclosing handler; only modern appended markers need lookup.
+            return;
+        }
         let instruction =
             self.required_last_instruction_mut("deferring an original condition owner");
         let mut policy = instruction.exception_policy();
@@ -5894,6 +5999,11 @@ impl Assembler {
 
     /// Allows a condition jump followed by a marker to copy a split return.
     pub(crate) fn allow_last_condition_split_return_copy(&mut self) {
+        if self.python_version <= crate::PythonVersion::Py313 {
+            // Legacy conditions have no NOT_TAKEN marker, and their native CFG
+            // pipeline determines exit copying without this modern policy.
+            return;
+        }
         let mut instructions =
             self.linear_items_mut()
                 .iter_mut()
@@ -6193,7 +6303,9 @@ impl Assembler {
         items: &'a [Item],
     ) -> Option<(&'a [Item], &'a Instruction, &'a Instruction)> {
         let width = match self.python_version {
-            crate::PythonVersion::Py314 => 1,
+            crate::PythonVersion::Py312
+            | crate::PythonVersion::Py313
+            | crate::PythonVersion::Py314 => 1,
             crate::PythonVersion::Py315 => 2,
         };
         let start = items.len().checked_sub(width + 1)?;
@@ -6256,7 +6368,9 @@ impl Assembler {
     /// Returns the extra stack cell in a synchronous iterator for this target.
     const fn iterator_break_extra_slot(&self) -> u32 {
         match self.python_version {
-            crate::PythonVersion::Py314 => 0,
+            crate::PythonVersion::Py312
+            | crate::PythonVersion::Py313
+            | crate::PythonVersion::Py314 => 0,
             crate::PythonVersion::Py315 => 1,
         }
     }
@@ -8652,10 +8766,21 @@ impl Assembler {
         }
     }
 
+    /// Excludes a surviving pseudo-op marker from every enclosing exception region.
+    pub(crate) fn exclude_last_from_exception_table(&mut self) {
+        self.required_last_instruction_mut("excluding a pseudo-op marker")
+            .set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+    }
+
     pub(crate) fn mark_last_as_converted_pop_block(&mut self) {
-        self.required_last_instruction_mut("marking a converted POP_BLOCK")
-            .fusion_policy
-            .mark_converted_pop_block();
+        let legacy = self.python_version <= crate::PythonVersion::Py313;
+        let instruction = self.required_last_instruction_mut("marking a converted POP_BLOCK");
+        instruction.fusion_policy.mark_converted_pop_block();
+        if legacy {
+            // Native POP_BLOCK has no owner. Set its original exclusion before
+            // provenance captures the instruction; copied records normalize later.
+            instruction.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+        }
     }
 
     /// Reuses the emitted normal-exhaustion record for its original outer `POP_BLOCK`.
@@ -11584,7 +11709,9 @@ impl Assembler {
             return None;
         }
         let iterator_slots = match self.python_version {
-            crate::PythonVersion::Py314 => 1,
+            crate::PythonVersion::Py312
+            | crate::PythonVersion::Py313
+            | crate::PythonVersion::Py314 => 1,
             crate::PythonVersion::Py315 => 2,
         };
         let tail = items.get(index.checked_sub(iterator_slots + 1)?..=index)?;
@@ -13661,7 +13788,7 @@ impl Assembler {
                 straight_line = false;
                 break;
             }
-            if instruction.opcode == LOAD_CONST
+            if uses_constant_index(instruction.opcode)
                 && let Operand::Value(index) = instruction.operand()
                 && let Some(slot) = used.get_mut(index as usize)
             {
@@ -13725,7 +13852,7 @@ impl Assembler {
         // survivors stay duplicates when their constant indices change together.
         let original_uniform_folds = &self.exception_owner_provenance.original_uniform_folds;
         let remap = |instruction: &mut Instruction| {
-            if instruction.opcode != LOAD_CONST {
+            if !uses_constant_index(instruction.opcode) {
                 return;
             }
             let Operand::Value(mut index) = instruction.operand() else {
@@ -13739,7 +13866,8 @@ impl Assembler {
                 .expect("constant index should fit in usize");
                 index = index_map[old_index].expect("deferred None constant should be retained");
             } else if let Some(new_index) = index_map[usize::try_from(index).unwrap()] {
-                original_uniform_fold = instruction.jump_policy.has_original_uniform_fold()
+                original_uniform_fold = instruction.opcode == LOAD_CONST
+                    && instruction.jump_policy.has_original_uniform_fold()
                     && original_uniform_folds
                         .iter()
                         .filter(|original| **original == *instruction)
@@ -13883,7 +14011,9 @@ impl Assembler {
     /// Removes a side-effect-free constant whose value is immediately discarded.
     pub(crate) fn optimize_constant_pops(&mut self) {
         self.resolve_folded_condition_borrow_entries();
-        if !self.has_constant_pop_candidate {
+        // Legacy CFG optimization removes same-line body NOPs before folding
+        // constant/POP_TOP pairs. Keep the real POP_TOP as their location donor.
+        if self.python_version <= crate::PythonVersion::Py313 || !self.has_constant_pop_candidate {
             return;
         }
         let is_constant_load =

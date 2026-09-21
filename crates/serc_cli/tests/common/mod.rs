@@ -82,3 +82,57 @@ pub(crate) fn python_315_command() -> Command {
     command.args(["-B", "-I", "-S"]);
     command
 }
+
+static PYTHON_312: OnceLock<Result<String, String>> = OnceLock::new();
+static PYTHON_313: OnceLock<Result<String, String>> = OnceLock::new();
+
+pub(crate) fn python_312_command() -> Command {
+    python_final_release_command(
+        serc::PythonVersion::Py312,
+        &PYTHON_312,
+        "SERC_TEST_PYTHON_312",
+        "python3.12",
+    )
+}
+
+pub(crate) fn python_313_command() -> Command {
+    python_final_release_command(
+        serc::PythonVersion::Py313,
+        &PYTHON_313,
+        "SERC_TEST_PYTHON_313",
+        "python3.13",
+    )
+}
+
+fn python_final_release_command(
+    version: serc::PythonVersion,
+    cache: &'static OnceLock<Result<String, String>>,
+    variable: &str,
+    default: &str,
+) -> Command {
+    let executable = cache.get_or_init(|| {
+        let target = version.target();
+        let executable = std::env::var(variable).unwrap_or_else(|_| default.to_string());
+        let output = Command::new(&executable)
+            .args([
+                "-B", "-I", "-S", "-c",
+                "import importlib.util, sys; expected = tuple(map(int, sys.argv[2].split('.'))) + ('final', 0); ok = sys.implementation.name == sys.argv[1] and sys.version_info == expected and sys.version.split()[0] == sys.argv[2] and importlib.util.MAGIC_NUMBER.hex() == sys.argv[3]; print(sys.version, file=sys.stderr); raise SystemExit(not ok)",
+                target.implementation,
+                &target.version_string(),
+                &target.magic_hex(),
+            ])
+            .output()
+            .map_err(|error| format!("failed to run pinned CPython {} at {executable}: {error}; set {variable}", target.tag))?;
+        if !output.status.success() {
+            return Err(format!("{variable} must name CPython {} with magic {}: {}", target.tag, target.magic_hex(), String::from_utf8_lossy(&output.stderr).trim()));
+        }
+        Ok(executable)
+    });
+    let mut command = Command::new(
+        executable
+            .as_ref()
+            .unwrap_or_else(|error| panic!("{error}")),
+    );
+    command.args(["-B", "-I", "-S"]);
+    command
+}

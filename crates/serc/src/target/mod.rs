@@ -1,10 +1,14 @@
 //! Metadata for the exact CPython bytecode target.
 
+pub(crate) mod cpython_3_12_14;
+pub(crate) mod cpython_3_13_15;
 mod cpython_3_14_5;
 pub(crate) mod cpython_3_15_0rc2;
+mod legacy_opcodes;
 
 use crate::PythonVersion;
 
+pub(crate) use cpython_3_12_14::operands as operands312;
 pub(crate) use cpython_3_15_0rc2::operands as operands315;
 
 /// Internal marker distinguishing generator-expression entry from a resume depth flag.
@@ -12,12 +16,23 @@ pub(crate) const GENEXPR_RESUME_ARGUMENT: u32 = 0x100;
 
 pub(crate) use cpython_3_14_5::code_flags;
 pub(crate) use cpython_3_14_5::local_kinds;
-pub(crate) use cpython_3_14_5::opcodes;
+pub(crate) mod opcodes {
+    pub(crate) use super::cpython_3_14_5::opcodes::*;
+    pub(crate) use super::legacy_opcodes::{
+        BEFORE_ASYNC_WITH, BEFORE_WITH, BINARY_SUBSCR, BUILD_CONST_KEY_MAP, ENTER_EXECUTOR,
+        FORMAT_VALUE, KW_NAMES, LOAD_ASSERTION_ERROR, LOAD_CLOSURE, RETURN_CONST,
+    };
+}
 pub(crate) use cpython_3_14_5::operands;
 pub(crate) use cpython_3_14_5::{
     TARGET_COMMIT, TARGET_IMPLEMENTATION, TARGET_MAGIC_NUMBER, TARGET_TAG, TARGET_VERSION,
-    is_conditional_jump, is_preinterned_string, is_scope_exit, is_unconditional_jump, stack_counts,
+    is_conditional_jump, is_preinterned_string, is_unconditional_jump, stack_counts,
 };
+
+/// Recognizes scope exits across the semantic IR, including legacy constant returns.
+pub(crate) const fn is_scope_exit(opcode: Opcode) -> bool {
+    cpython_3_14_5::is_scope_exit(opcode) || matches!(opcode, opcodes::RETURN_CONST)
+}
 
 /// An opcode for the selected CPython target.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -38,7 +53,12 @@ impl Opcode {
     /// Returns the wire opcode generated for the selected CPython release.
     pub(crate) const fn code_for(self, version: PythonVersion) -> u8 {
         match version {
-            PythonVersion::Py314 => self.code(),
+            PythonVersion::Py312 => cpython_3_12_14::code(self),
+            PythonVersion::Py313 => cpython_3_13_15::code(self),
+            PythonVersion::Py314 => {
+                assert!(self.code() <= 128, "legacy opcode used for CPython 3.14");
+                self.code()
+            }
             PythonVersion::Py315 => cpython_3_15_0rc2::code(self),
         }
     }
@@ -46,9 +66,101 @@ impl Opcode {
     /// Returns the selected release's inline-cache width.
     pub(crate) const fn caches_for(self, version: PythonVersion) -> u8 {
         match version {
+            PythonVersion::Py312 => cpython_3_12_14::caches(self),
+            PythonVersion::Py313 => cpython_3_13_15::caches(self),
             PythonVersion::Py314 => self.caches(),
             PythonVersion::Py315 => cpython_3_15_0rc2::caches(self),
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn has_argument_for(self, version: PythonVersion) -> bool {
+        match version {
+            PythonVersion::Py312 => cpython_3_12_14::has_argument(self),
+            PythonVersion::Py313 => cpython_3_13_15::has_argument(self),
+            PythonVersion::Py314 => self.code() <= 128 && self.has_argument(),
+            PythonVersion::Py315 => cpython_3_15_0rc2::has_argument(self),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn has_constant_for(self, version: PythonVersion) -> bool {
+        match version {
+            PythonVersion::Py312 => cpython_3_12_14::has_constant(self),
+            PythonVersion::Py313 => cpython_3_13_15::has_constant(self),
+            PythonVersion::Py314 => self.code() <= 128 && self.has_constant(),
+            PythonVersion::Py315 => cpython_3_15_0rc2::has_constant(self),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn has_name_for(self, version: PythonVersion) -> bool {
+        match version {
+            PythonVersion::Py312 => cpython_3_12_14::has_name(self),
+            PythonVersion::Py313 => cpython_3_13_15::has_name(self),
+            PythonVersion::Py314 => self.code() <= 128 && self.has_name(),
+            PythonVersion::Py315 => cpython_3_15_0rc2::has_name(self),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn has_jump_for(self, version: PythonVersion) -> bool {
+        match version {
+            PythonVersion::Py312 => cpython_3_12_14::has_jump(self),
+            PythonVersion::Py313 => cpython_3_13_15::has_jump(self),
+            PythonVersion::Py314 => self.code() <= 128 && self.has_jump(),
+            PythonVersion::Py315 => cpython_3_15_0rc2::has_jump(self),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn has_free_for(self, version: PythonVersion) -> bool {
+        match version {
+            PythonVersion::Py312 => cpython_3_12_14::has_free(self),
+            PythonVersion::Py313 => cpython_3_13_15::has_free(self),
+            PythonVersion::Py314 => self.code() <= 128 && self.has_free(),
+            PythonVersion::Py315 => cpython_3_15_0rc2::has_free(self),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn has_local_for(self, version: PythonVersion) -> bool {
+        match version {
+            PythonVersion::Py312 => cpython_3_12_14::has_local(self),
+            PythonVersion::Py313 => cpython_3_13_15::has_local(self),
+            PythonVersion::Py314 => self.code() <= 128 && self.has_local(),
+            PythonVersion::Py315 => cpython_3_15_0rc2::has_local(self),
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) const fn is_scope_exit_for(version: PythonVersion, opcode: Opcode) -> bool {
+    match version {
+        PythonVersion::Py312 => cpython_3_12_14::is_scope_exit(opcode),
+        PythonVersion::Py313 => cpython_3_13_15::is_scope_exit(opcode),
+        PythonVersion::Py314 => cpython_3_14_5::is_scope_exit(opcode),
+        PythonVersion::Py315 => cpython_3_15_0rc2::is_scope_exit(opcode),
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) const fn is_unconditional_jump_for(version: PythonVersion, opcode: Opcode) -> bool {
+    match version {
+        PythonVersion::Py312 => cpython_3_12_14::is_unconditional_jump(opcode),
+        PythonVersion::Py313 => cpython_3_13_15::is_unconditional_jump(opcode),
+        PythonVersion::Py314 => cpython_3_14_5::is_unconditional_jump(opcode),
+        PythonVersion::Py315 => cpython_3_15_0rc2::is_unconditional_jump(opcode),
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) const fn is_conditional_jump_for(version: PythonVersion, opcode: Opcode) -> bool {
+    match version {
+        PythonVersion::Py312 => cpython_3_12_14::is_conditional_jump(opcode),
+        PythonVersion::Py313 => cpython_3_13_15::is_conditional_jump(opcode),
+        PythonVersion::Py314 => cpython_3_14_5::is_conditional_jump(opcode),
+        PythonVersion::Py315 => cpython_3_15_0rc2::is_conditional_jump(opcode),
     }
 }
 
@@ -59,6 +171,8 @@ pub(crate) fn stack_counts_for(
     argument: u32,
 ) -> (usize, usize) {
     match version {
+        PythonVersion::Py312 => cpython_3_12_14::stack_counts(opcode, argument),
+        PythonVersion::Py313 => cpython_3_13_15::stack_counts(opcode, argument),
         PythonVersion::Py314 => stack_counts(opcode, argument),
         PythonVersion::Py315 => cpython_3_15_0rc2::stack_counts(opcode, argument),
     }
@@ -67,6 +181,8 @@ pub(crate) fn stack_counts_for(
 /// Checks the selected release's static, startup and compiler interned strings.
 pub(crate) fn is_preinterned_string_for(version: PythonVersion, value: &str) -> bool {
     match version {
+        PythonVersion::Py312 => cpython_3_12_14::is_preinterned_string(value),
+        PythonVersion::Py313 => cpython_3_13_15::is_preinterned_string(value),
         PythonVersion::Py314 => is_preinterned_string(value),
         PythonVersion::Py315 => cpython_3_15_0rc2::is_preinterned_string(value),
     }
@@ -75,6 +191,14 @@ pub(crate) fn is_preinterned_string_for(version: PythonVersion, value: &str) -> 
 /// Returns inclusive bounds of the target interpreter's cached integer singletons.
 pub(crate) const fn small_int_bounds_for(version: PythonVersion) -> (i64, i64) {
     match version {
+        PythonVersion::Py312 => (
+            cpython_3_12_14::SMALL_INT_MIN,
+            cpython_3_12_14::SMALL_INT_MAX,
+        ),
+        PythonVersion::Py313 => (
+            cpython_3_13_15::SMALL_INT_MIN,
+            cpython_3_13_15::SMALL_INT_MAX,
+        ),
         // CPython 3.14.5 Include/internal/pycore_runtime_structs.h.
         PythonVersion::Py314 => (-5, 256),
         PythonVersion::Py315 => (
@@ -87,6 +211,8 @@ pub(crate) const fn small_int_bounds_for(version: PythonVersion) -> (i64, i64) {
 /// Returns the SEND-to-END_SEND offset for the release's yield-from sequence.
 pub(crate) const fn end_send_offset_for(version: PythonVersion) -> u32 {
     match version {
+        // Legacy END_ASYNC_FOR has no SEND-relative jump operand.
+        PythonVersion::Py312 | PythonVersion::Py313 => 0,
         // CPython 3.14.5 Python/assemble.c: END_SEND_OFFSET.
         PythonVersion::Py314 => 5,
         PythonVersion::Py315 => cpython_3_15_0rc2::END_SEND_OFFSET,
@@ -97,6 +223,84 @@ pub(crate) const fn end_send_offset_for(version: PythonVersion) -> u32 {
 mod tests {
     use super::cpython_3_14_5::{COMPILER_INTERNED_STRINGS, PREINTERNED_STRINGS};
     use super::is_preinterned_string;
+
+    #[test]
+    fn legacy_targets_keep_semantic_identity_and_exact_stack_shapes() {
+        use super::{is_scope_exit, opcodes, stack_counts_for};
+        use crate::PythonVersion::{Py312, Py313, Py314, Py315};
+
+        assert_eq!(opcodes::LOAD_CONST.code(), 82);
+        assert_eq!(opcodes::RETURN_CONST.code_for(Py312), 121);
+        assert_eq!(opcodes::RETURN_CONST.code_for(Py313), 103);
+        assert_eq!(opcodes::KW_NAMES.code_for(Py312), 172);
+        assert_eq!(opcodes::BEFORE_WITH.code_for(Py312), 53);
+        assert_eq!(opcodes::BEFORE_WITH.code_for(Py313), 2);
+        assert!(is_scope_exit(opcodes::RETURN_CONST));
+        assert!(opcodes::RETURN_CONST.has_constant());
+        assert!(opcodes::KW_NAMES.has_constant());
+        assert!(opcodes::LOAD_CLOSURE.has_free());
+        assert_eq!(stack_counts_for(Py312, opcodes::END_FOR, 0), (2, 0));
+        assert_eq!(stack_counts_for(Py313, opcodes::END_FOR, 0), (1, 0));
+        assert_eq!(stack_counts_for(Py312, opcodes::MAKE_FUNCTION, 15), (5, 1));
+        assert_eq!(stack_counts_for(Py312, opcodes::FORMAT_VALUE, 4), (2, 1));
+        assert_eq!(stack_counts_for(Py312, opcodes::KW_NAMES, 0), (0, 0));
+        assert_eq!(opcodes::POP_JUMP_IF_FALSE.caches_for(Py312), 0);
+        assert_eq!(opcodes::POP_JUMP_IF_FALSE.caches_for(Py313), 1);
+        assert!(!opcodes::END_ASYNC_FOR.has_jump_for(Py312));
+        assert!(!opcodes::END_ASYNC_FOR.has_jump_for(Py313));
+        assert!(opcodes::END_ASYNC_FOR.has_jump_for(Py314));
+        assert!(opcodes::GET_ITER.has_argument_for(Py315));
+        assert!(!opcodes::GET_ITER.has_argument_for(Py314));
+    }
+
+    #[test]
+    fn legacy_operands_preserve_comparison_and_format_layouts() {
+        use super::cpython_3_13_15::operands as operands313;
+        use super::operands312;
+
+        assert_eq!(operands312::ComparisonOperation::EQ.argument(), 40);
+        assert_eq!(operands313::ComparisonOperation::EQ.argument(), 72);
+        assert_eq!(operands313::ComparisonOperation::EQ.boolean_argument(), 88);
+        assert_eq!(operands312::FormatValue::REPR.argument(), 2);
+        assert_eq!(operands312::FormatValue::HAVE_SPEC.argument(), 4);
+        assert_eq!(operands313::ResumeLocation::AFTER_AWAIT.at_depth(true), 7);
+    }
+
+    #[test]
+    fn legacy_intern_lookups_include_their_independent_profiles() {
+        use super::{cpython_3_12_14, cpython_3_13_15, is_preinterned_string_for};
+        use crate::PythonVersion::{Py312, Py313};
+
+        for (version, static_strings, compiler_strings, startup_strings) in [
+            (
+                Py312,
+                cpython_3_12_14::PREINTERNED_STRINGS,
+                cpython_3_12_14::COMPILER_INTERNED_STRINGS,
+                cpython_3_12_14::STARTUP_INTERNED_STRINGS,
+            ),
+            (
+                Py313,
+                cpython_3_13_15::PREINTERNED_STRINGS,
+                cpython_3_13_15::COMPILER_INTERNED_STRINGS,
+                cpython_3_13_15::STARTUP_INTERNED_STRINGS,
+            ),
+        ] {
+            assert!(static_strings.windows(2).all(|pair| pair[0] < pair[1]));
+            assert!(startup_strings.windows(2).all(|pair| pair[0] < pair[1]));
+            for value in static_strings.iter().chain(compiler_strings) {
+                assert!(
+                    is_preinterned_string_for(version, value),
+                    "{version}: {value:?}"
+                );
+            }
+            for value in startup_strings {
+                assert_eq!(
+                    is_preinterned_string_for(version, value),
+                    cfg!(target_os = "linux")
+                );
+            }
+        }
+    }
 
     #[test]
     fn selected_target_preserves_semantic_opcode_identity() {

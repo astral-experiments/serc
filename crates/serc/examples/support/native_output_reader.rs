@@ -68,6 +68,7 @@ pub(super) struct Reader {
     native_identity_sha256: String,
     index: BTreeMap<String, IndexRow>,
     inputs: Vec<Artifact>,
+    required_absent_paths: Vec<PathBuf>,
     context: Artifact,
     selected: Vec<PathBuf>,
     records: Mutex<BTreeMap<usize, (Artifact, String)>>,
@@ -116,6 +117,7 @@ impl Reader {
         oracle: &str,
         python_version: PythonVersion,
         paths: &[PathBuf],
+        caller_model: Option<&super::caller_intern_model::LoadedModel>,
     ) -> io::Result<Self> {
         let config_bytes = regular_bytes(config_path)?;
         let config: Config = serde_json::from_slice(&config_bytes)?;
@@ -165,6 +167,12 @@ impl Reader {
         ]) {
             item.read()?;
             inputs.push(item.clone());
+        }
+        if let Some(model) = caller_model {
+            for item in &model.inputs {
+                item.read()?;
+                inputs.push(item.clone());
+            }
         }
         let profile_bytes = regular_bytes(profile_path)?;
         let profile: Value = serde_json::from_slice(&profile_bytes)?;
@@ -263,7 +271,7 @@ impl Reader {
             std::env::current_dir()? == cwd,
             "reader cwd changed while loading",
         )?;
-        let context = json!({
+        let mut context = json!({
             "schema": 1, "cache_read_enabled": true, "admission": config.admission,
             "admission_actual": config.admission_actual, "native_identity": native_identity,
             "compiler": compiler, "compiler_source_manifest": config.compiler_source_manifest,
@@ -274,6 +282,9 @@ impl Reader {
             "native_provenance": "historical admitted capture; no per-file native process executed",
             "external_admission_authenticity_and_current_runtime_guards_required": true,
         });
+        if let Some(model) = caller_model {
+            context["compiler_caller_context"] = model.evidence.clone();
+        }
         fs::create_dir(&config.output_directory)?;
         fs::create_dir(config.output_directory.join("blobs"))?;
         fs::create_dir(config.output_directory.join("entries"))?;
@@ -286,6 +297,8 @@ impl Reader {
             native_identity_sha256: digest(&serde_json::to_vec(&native_identity)?),
             index,
             inputs,
+            required_absent_paths: caller_model
+                .map_or_else(Vec::new, |model| model.required_absent_paths.clone()),
             context: artifact(&context_path, &context_bytes),
             selected: paths.to_vec(),
             records: Mutex::new(BTreeMap::new()),
@@ -388,9 +401,15 @@ impl Reader {
         Ok(artifact(&path, bytes))
     }
 
-    pub(super) fn compare(&self, index: usize, path: &Path, options: &CompileOptions) -> Outcome {
+    pub(super) fn compare(
+        &self,
+        index: usize,
+        path: &Path,
+        options: &CompileOptions,
+        caller_model: Option<&super::caller_intern_model::LoadedModel>,
+    ) -> Outcome {
         self.compare_with(index, path, |input, filename| {
-            super::compile_input(input, filename, options)
+            super::compile_input(input, filename, options, caller_model)
         })
     }
 
@@ -481,6 +500,8 @@ impl Reader {
         for input in &self.inputs {
             input.read()?;
         }
+        super::caller_intern_model::validate_absent_paths(&self.required_absent_paths)
+            .map_err(io::Error::other)?;
         let records = self
             .records
             .lock()
@@ -514,7 +535,12 @@ mod tests {
 
     #[test]
     fn admitted_cache_identity_is_bound_to_its_python_target() {
-        for python_version in [PythonVersion::Py314, PythonVersion::Py315] {
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
             let target = python_version.target();
             let mut identity = json!({"profile": {"target": {
                 "implementation": target.implementation,
@@ -524,11 +550,17 @@ mod tests {
                 "magic_hex": target.magic_hex(),
             }}});
             assert!(admitted_target_matches(&identity, python_version));
-            let other = match python_version {
-                PythonVersion::Py314 => PythonVersion::Py315,
-                PythonVersion::Py315 => PythonVersion::Py314,
-            };
-            assert!(!admitted_target_matches(&identity, other));
+            for other in [
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ] {
+                assert_eq!(
+                    admitted_target_matches(&identity, other),
+                    other == python_version
+                );
+            }
             identity["profile"]["target"]["commit"] = json!("other interpreter build");
             assert!(!admitted_target_matches(&identity, python_version));
         }
@@ -597,6 +629,7 @@ mod tests {
             native_identity_sha256: identity,
             index: BTreeMap::from([(filename, row)]),
             inputs: Vec::new(),
+            required_absent_paths: Vec::new(),
             context: artifact(&context_path, b"synthetic unit context"),
             selected: vec![source.clone()],
             records: Mutex::new(BTreeMap::new()),
@@ -626,6 +659,24 @@ mod tests {
             entry["cached_native"]["fresh_native_process_executed"],
             false
         );
+    }
+
+    #[test]
+    fn completion_rechecks_required_absence() {
+        let (directory, mut reader, source) = fixture(false);
+        let absent = directory.path().join("runtime.zip");
+        reader.required_absent_paths.push(absent.clone());
+        assert_eq!(
+            reader
+                .compare_with(0, &source, |_, _| {
+                    CompilerOutcome::Compiled(b"native".to_vec())
+                })
+                .kind,
+            OutcomeKind::Exact
+        );
+        fs::write(absent, b"appeared after loading").unwrap();
+        assert!(reader.finish(true).is_err());
+        assert!(!reader.directory.join("COMPLETE.json").exists());
     }
 
     #[test]

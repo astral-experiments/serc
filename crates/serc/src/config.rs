@@ -7,6 +7,10 @@ use crate::{CPYTHON_TARGET, CpythonTarget, InitialInternState, target};
 /// The Python language and bytecode version used for compilation.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum PythonVersion {
+    /// CPython 3.12.14.
+    Py312,
+    /// CPython 3.13.15.
+    Py313,
     /// CPython 3.14.5.
     #[default]
     Py314,
@@ -18,6 +22,20 @@ impl PythonVersion {
     /// Return the exact CPython release and bytecode format for this version.
     pub const fn target(self) -> CpythonTarget {
         match self {
+            Self::Py312 => CpythonTarget {
+                implementation: target::cpython_3_12_14::TARGET_IMPLEMENTATION,
+                version: target::cpython_3_12_14::TARGET_VERSION,
+                magic_number: target::cpython_3_12_14::TARGET_MAGIC_NUMBER,
+                tag: target::cpython_3_12_14::TARGET_TAG,
+                commit: target::cpython_3_12_14::TARGET_COMMIT,
+            },
+            Self::Py313 => CpythonTarget {
+                implementation: target::cpython_3_13_15::TARGET_IMPLEMENTATION,
+                version: target::cpython_3_13_15::TARGET_VERSION,
+                magic_number: target::cpython_3_13_15::TARGET_MAGIC_NUMBER,
+                tag: target::cpython_3_13_15::TARGET_TAG,
+                commit: target::cpython_3_13_15::TARGET_COMMIT,
+            },
             Self::Py314 => CPYTHON_TARGET,
             Self::Py315 => CpythonTarget {
                 implementation: target::cpython_3_15_0rc2::TARGET_IMPLEMENTATION,
@@ -33,6 +51,8 @@ impl PythonVersion {
 impl fmt::Display for PythonVersion {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::Py312 => "3.12",
+            Self::Py313 => "3.13",
             Self::Py314 => "3.14",
             Self::Py315 => "3.15",
         })
@@ -44,6 +64,8 @@ impl FromStr for PythonVersion {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
+            "3.12" => Ok(Self::Py312),
+            "3.13" => Ok(Self::Py313),
             "3.14" => Ok(Self::Py314),
             "3.15" => Ok(Self::Py315),
             _ => Err(ParsePythonVersionError(value.to_owned())),
@@ -59,7 +81,7 @@ impl fmt::Display for ParsePythonVersionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "unsupported Python version {:?}; expected 3.14 or 3.15",
+            "unsupported Python version {:?}; expected 3.12, 3.13, 3.14, or 3.15",
             self.0
         )
     }
@@ -72,7 +94,7 @@ impl Error for ParsePythonVersionError {}
 pub struct CompileOptions {
     /// The Python language and bytecode version to target. Defaults to Python 3.14.
     pub python_version: PythonVersion,
-    /// Canonical strings present before compiling, in addition to the target's startup state.
+    /// Canonical strings present before compiling. See [`InitialInternState`] for state modes.
     pub initial_intern_state: InitialInternState,
 }
 
@@ -103,7 +125,29 @@ mod tests {
         assert_eq!(PythonVersion::Py315.to_string(), "3.15");
         assert_eq!(PythonVersion::Py315.target().tag, "v3.15.0rc2");
         assert_eq!(PythonVersion::Py315.target().magic_hex(), "520e0d0a");
-        assert!("3.13".parse::<PythonVersion>().is_err());
+        for (version, spelling, tag, commit, magic) in [
+            (
+                PythonVersion::Py312,
+                "3.12",
+                "v3.12.14",
+                "2abcf904b8dac8c999d2b3aac76681abb333798a",
+                "cb0d0d0a",
+            ),
+            (
+                PythonVersion::Py313,
+                "3.13",
+                "v3.13.15",
+                "4061bc4c35f7c26f25264666d4ba083b93d2f6f9",
+                "f30d0d0a",
+            ),
+        ] {
+            assert_eq!(spelling.parse::<PythonVersion>().unwrap(), version);
+            assert_eq!(version.to_string(), spelling);
+            assert_eq!(version.target().tag, tag);
+            assert_eq!(version.target().commit, commit);
+            assert_eq!(version.target().magic_hex(), magic);
+        }
+        assert!("3.11".parse::<PythonVersion>().is_err());
         assert!("3.15.1".parse::<PythonVersion>().is_err());
     }
 
@@ -112,7 +156,12 @@ mod tests {
         let source = "answer = 42\n";
         let default = compile(source, "module.py").unwrap();
         let legacy = default.to_timestamp_pyc(123, 12);
-        for python_version in [PythonVersion::Py315, PythonVersion::Py314] {
+        for python_version in [
+            PythonVersion::Py315,
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+        ] {
             let options = CompileOptions {
                 python_version,
                 ..CompileOptions::default()
@@ -122,11 +171,11 @@ mod tests {
             assert_eq!(module.target(), python_version.target());
             let pyc = module.to_timestamp_pyc(123, 12);
             assert_eq!(&pyc[..4], &python_version.target().magic_number);
-            if python_version == PythonVersion::Py314 {
-                assert_eq!(&pyc[16..], module.marshal());
-            } else {
+            if python_version == PythonVersion::Py315 {
                 assert_eq!(pyc[16], b'c');
                 assert_eq!(module.marshal()[0], b'c' | 0x80);
+            } else {
+                assert_eq!(&pyc[16..], module.marshal());
             }
             assert_eq!(
                 compile_bytes_with_options(source.as_bytes(), "module.py", &options)

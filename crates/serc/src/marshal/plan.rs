@@ -41,6 +41,15 @@ pub(super) trait MarshalVisitor<'a> {
     fn locals(&mut self, code: &'a CodeObject) -> bool;
     fn local_kinds(&mut self, code: &'a CodeObject);
     fn metadata_string(&mut self, value: &'a str, metadata_id: Option<u32>);
+    fn code_filename(&mut self, code: &'a CodeObject, metadata_id: Option<u32>) {
+        self.metadata_string(&code.filename, metadata_id);
+    }
+    fn code_name(&mut self, code: &'a CodeObject, metadata_id: Option<u32>) {
+        self.metadata_string(&code.name, metadata_id);
+    }
+    fn code_qualified_name(&mut self, code: &'a CodeObject, metadata_id: Option<u32>) {
+        self.metadata_string(&code.qualified_name, metadata_id);
+    }
     fn first_line(&mut self, value: u32);
     fn bytes(&mut self, value: &'a [u8]);
     fn constant(&mut self, value: &'a Constant, reference_mode: ReferenceMode) -> bool;
@@ -92,12 +101,9 @@ pub(super) fn traverse_code_with_mode<'a, V>(
         );
     }
     visitor.local_kinds(code);
-    visitor.metadata_string(&code.filename, metadata_ids.map(|ids| ids.filename));
-    visitor.metadata_string(&code.name, metadata_ids.and_then(|ids| ids.name));
-    visitor.metadata_string(
-        &code.qualified_name,
-        metadata_ids.and_then(|ids| ids.qualified_name),
-    );
+    visitor.code_filename(code, metadata_ids.map(|ids| ids.filename));
+    visitor.code_name(code, metadata_ids.and_then(|ids| ids.name));
+    visitor.code_qualified_name(code, metadata_ids.and_then(|ids| ids.qualified_name));
     visitor.first_line(code.first_line_number);
     visitor.bytes(&code.line_table);
     visitor.bytes(&code.exception_table);

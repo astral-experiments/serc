@@ -2152,6 +2152,7 @@ impl OptimizationPipeline {
     pub(in crate::assembler) fn normalize_backward_conditionals(
         &mut self,
     ) -> Result<bool, crate::CompileError> {
+        let has_branch_markers = self.python_version >= crate::PythonVersion::Py314;
         let mut changed = false;
         let mut position = 0;
         while position < self.graph.order().len() {
@@ -2174,25 +2175,29 @@ impl OptimizationPipeline {
                     continue;
                 }
             };
-            // Code generation already emitted the forward form's marker. CPython
-            // instead creates it in the new backedge block at this late stage.
-            let marker = self.graph.order()[position + 1..].iter().find_map(|block| {
-                self.graph[*block].items().iter().enumerate().find_map(
-                    |(offset, item)| match item {
-                        Item::Instruction(marker) => {
-                            Some((*block, ItemPosition::new(*block, offset), marker.opcode))
-                        }
-                        Item::Label(_) => None,
-                    },
-                )
-            });
-            let Some((_marker_block, marker, NOT_TAKEN)) = marker else {
-                return Err(crate::CompileError::Internal(
-                    "backward conditional has no fallthrough marker".to_owned(),
-                ));
-            };
-            // Remove the marker before inserting a successor label can shift its offset.
-            self.graph.remove_item(marker);
+            if has_branch_markers {
+                // Code generation already emitted the forward form's marker. CPython
+                // instead creates it in the new backedge block at this late stage.
+                let marker = self.graph.order()[position + 1..].iter().find_map(|block| {
+                    self.graph[*block]
+                        .items()
+                        .iter()
+                        .enumerate()
+                        .find_map(|(offset, item)| match item {
+                            Item::Instruction(marker) => {
+                                Some((*block, ItemPosition::new(*block, offset), marker.opcode))
+                            }
+                            Item::Label(_) => None,
+                        })
+                });
+                let Some((_marker_block, marker, NOT_TAKEN)) = marker else {
+                    return Err(crate::CompileError::Internal(
+                        "backward conditional has no fallthrough marker".to_owned(),
+                    ));
+                };
+                // Remove the marker before inserting a successor label can shift its offset.
+                self.graph.remove_item(marker);
+            }
             changed = true;
             let successor = self.graph.block_at(position + 1);
             let fallthrough =
@@ -2207,30 +2212,38 @@ impl OptimizationPipeline {
             let conditional = self.graph.instructions_mut(block).next_back().unwrap();
             conditional.opcode = reversed;
             conditional.retarget(Operand::Forward(fallthrough));
-            let mut marker = Instruction::synthetic(
-                NOT_TAKEN,
-                Operand::Value(0),
-                instruction.location,
-                instruction.depth_after(),
-            );
+            let mut items = vec![Item::Label(fresh_entry)];
+            // Python 3.12 and 3.13 insert only the backedge, without a branch marker.
+            if has_branch_markers {
+                let mut marker = Instruction::synthetic(
+                    NOT_TAKEN,
+                    Operand::Value(0),
+                    instruction.location,
+                    instruction.depth_after(),
+                );
+                // The new CPython instruction array starts with null exception owners.
+                marker.set_exception_policy(ExceptionPolicy::AlwaysAbsent);
+                items.push(Item::Instruction(marker));
+            }
             let mut backedge = Instruction::synthetic(
                 JUMP_BACKWARD,
                 Operand::Backward(target),
                 instruction.location,
                 instruction.depth_after(),
             );
-            // The new CPython instruction array starts with null exception owners.
-            marker.set_exception_policy(ExceptionPolicy::AlwaysAbsent);
             backedge.set_exception_policy(ExceptionPolicy::AlwaysAbsent);
+            if let Some(native) = self.legacy_native_labels.as_mut()
+                && native.is_certified()
+            {
+                if let Some(argument) = native.target_label(&self.graph, target) {
+                    backedge.set_legacy_initial_jump_argument(argument);
+                } else {
+                    native.invalidate();
+                }
+            }
+            items.push(Item::Instruction(backedge));
             self.preserved_block_boundaries.insert(fresh_entry);
-            self.graph.insert_block(
-                position + 1,
-                vec![
-                    Item::Label(fresh_entry),
-                    Item::Instruction(marker),
-                    Item::Instruction(backedge),
-                ],
-            );
+            self.graph.insert_block(position + 1, items);
             position += 2;
         }
         Ok(changed)
@@ -2244,6 +2257,11 @@ impl OptimizationPipeline {
             normalize_unmoved_interruptible_jumps(&mut self.graph);
             return FxHashSet::default();
         }
+        // Range-only labels can split our physical graph without starting a
+        // native 3.13 instruction array. Keep that distinction when the label's
+        // empty block becomes the predecessor of a newly inserted cold bridge.
+        let legacy_arrays = (self.python_version == crate::PythonVersion::Py313)
+            .then(|| self.legacy_instruction_arrays());
         let graph = &mut self.graph;
         if graph.len() < 2 {
             normalize_unmoved_interruptible_jumps(graph);
@@ -2277,7 +2295,12 @@ impl OptimizationPipeline {
             .order()
             .iter()
             .enumerate()
-            .filter_map(|(position, block)| loop_anchor_targets.contains(block).then_some(position))
+            .filter_map(|(position, block)| {
+                // 3.12 erases this empty false-condition array before cold relocation.
+                (self.python_version != crate::PythonVersion::Py312
+                    && loop_anchor_targets.contains(block))
+                .then_some(position)
+            })
             .collect::<Vec<_>>();
         for position in loop_anchor_positions.into_iter().rev() {
             let anchor = Label(self.next_label);
@@ -2424,6 +2447,14 @@ impl OptimizationPipeline {
                     && temperatures[order[*position + 1].index()] == WARM_BLOCK
             })
             .collect::<Vec<_>>();
+        if let Some(native) = self.legacy_native_labels.as_mut()
+            && native.is_certified()
+        {
+            let mut next_native = native.next_cfg_label(graph);
+            for &position in &explicit_jumps {
+                native.allocate_for_block(order[position + 1], &mut next_native);
+            }
+        }
         for position in explicit_jumps.into_iter().rev() {
             let next = graph.block_at(position + 1);
             let target = if let Some(label) = graph[next].first_label() {
@@ -2452,7 +2483,7 @@ impl OptimizationPipeline {
                     marker.set_operand(Operand::Value(0));
                     graph[current].last_instruction() == Some(&marker)
                 });
-            let (location, exception_exclusion) = graph[current].last_instruction().map_or(
+            let (mut location, exception_exclusion) = graph[current].last_instruction().map_or(
                 (SourceLocation::NONE, ExceptionExclusion::None),
                 |instruction| {
                     let exclusion = if instruction.exception_policy().exclusion()
@@ -2465,6 +2496,22 @@ impl OptimizationPipeline {
                     (instruction.location, exclusion)
                 },
             );
+            if graph[current].last_instruction().is_none()
+                && let Some(arrays) = &legacy_arrays
+                && let Some(array) = arrays.get(&current)
+            {
+                // Native propagation sees the last instruction before an unused
+                // range label in this same array. An actual original empty array
+                // still stops inheritance, as does any intervening jump target.
+                if let Some(previous) = order[..position]
+                    .iter()
+                    .rev()
+                    .take_while(|block| arrays.get(*block) == Some(array))
+                    .find_map(|block| graph[*block].last_instruction())
+                {
+                    location = previous.location;
+                }
+            }
             let label = Label(self.next_label);
             self.next_label += 1;
             let mut bridge = Instruction::synthetic(
@@ -2474,6 +2521,18 @@ impl OptimizationPipeline {
                 None,
             );
             bridge.exclude_from_exception_table(exception_exclusion);
+            if self.python_version == crate::PythonVersion::Py312 {
+                // 3.12 creates an ordinary jump with no location and leaves its
+                // new block's predecessor count at zero, preventing line inheritance.
+                bridge.opcode = JUMP_BACKWARD;
+                bridge.location = SourceLocation::NONE;
+                bridge.no_location_policy.preserve_location();
+                if let Some(native) = self.legacy_native_labels.as_ref()
+                    && let Some(argument) = native.block_label(next)
+                {
+                    bridge.set_legacy_initial_jump_argument(argument);
+                }
+            }
             if empty_while_anchor {
                 // CPython's empty original anchor separates the authored break NOP
                 // from this new cold bridge. It cannot donate its line across that
@@ -2734,7 +2793,10 @@ impl OptimizationPipeline {
                 instruction.retarget(Operand::Backward(target));
                 if instruction.opcode == JUMP_FORWARD || instruction.jump_policy.is_interruptible()
                 {
-                    instruction.opcode = if instruction.fusion_policy.is_authored_break()
+                    // 3.12's ordinary JUMP retains its eval check after cold relocation.
+                    // Explicit SEND backedges already use JUMP_BACKWARD_NO_INTERRUPT.
+                    instruction.opcode = if self.python_version == crate::PythonVersion::Py312
+                        || instruction.fusion_policy.is_authored_break()
                         || instruction.jump_policy.is_interruptible()
                     {
                         JUMP_BACKWARD
@@ -2773,6 +2835,8 @@ impl OptimizationPipeline {
         if self.folded_predecessor_sources.is_empty() {
             return;
         }
+        let original_arrays = (self.python_version == crate::PythonVersion::Py313)
+            .then(|| self.legacy_instruction_arrays());
         let reachable = self.graph.reachable_blocks(&self.exception_regions);
         let order = self.graph.order();
         let positions = order
@@ -2825,7 +2889,21 @@ impl OptimizationPipeline {
                     && jump.pre_fold_extra_instructions() == 0
                     && jump.local_policy.hidden_exception_owner_slots() == 0
                     && jump.jump_policy.allows_threading_target()
-                    && !jump.jump_policy.retains_nop_for(jump.operand())
+                    // Legacy early copying also crosses a normal try exit whose
+                    // later direct-copy policy retains a NOP. The original folded
+                    // path still reaches its successor before line resolution.
+                    && (!jump.jump_policy.retains_nop_for(jump.operand())
+                        || (self.python_version == crate::PythonVersion::Py313
+                            && jump.jump_policy.retained_nop()
+                                == super::super::ir::RetainedJumpNop::DirectTarget
+                            && self.exception_owner_provenance.normal_try_exits.iter().any(
+                                |&(entry, target)| {
+                                    jump.operand() == Operand::Forward(target)
+                                        && items.iter().any(|item| {
+                                            matches!(item, Item::Label(label) if *label == entry)
+                                        })
+                                },
+                            )))
                     && !jump.jump_policy.preserves_nop_after_threading()
                     && !jump.jump_policy.is_interruptible()
                     && !jump.no_location_policy.preserves_location()
@@ -2869,9 +2947,20 @@ impl OptimizationPipeline {
             }
         }
         for block in joins {
-            let instructions = self.graph[block]
-                .items()
+            let order = self.graph.order();
+            // Exception-range endpoints split legacy POP_BLOCK from its located
+            // exit call without starting a new native instruction array. Test
+            // the complete array for early-copy eligibility and source lines.
+            let start = positions[&block];
+            let mut end = start + 1;
+            if let Some(arrays) = &original_arrays {
+                while end < order.len() && arrays[&order[end]] == arrays[&block] {
+                    end += 1;
+                }
+            }
+            let instructions = order[start..end]
                 .iter()
+                .flat_map(|block| self.graph[*block].items())
                 .filter_map(|item| match item {
                     Item::Instruction(instruction) => Some(instruction),
                     Item::Label(_) => None,

@@ -13,6 +13,8 @@ use serc::{
     compile_with_options,
 };
 
+#[path = "support/caller_intern_model.rs"]
+mod caller_intern_model;
 #[path = "support/initial_intern_profile.rs"]
 mod initial_intern_profile;
 #[path = "support/native_output_cache.rs"]
@@ -132,7 +134,7 @@ enum CompilerOutcome {
 struct Options {
     #[arg(long, default_value = "python3", value_name = "PATH")]
     python: String,
-    #[arg(long, default_value_t = PythonVersion::default(), value_name = "3.14|3.15")]
+    #[arg(long, default_value_t = PythonVersion::default(), value_name = "3.12|3.13|3.14|3.15")]
     python_version: PythonVersion,
     #[arg(value_name = "ROOT", default_values_os_t = default_roots())]
     roots: Vec<PathBuf>,
@@ -161,9 +163,23 @@ struct Options {
     source_bytes: bool,
     #[arg(long, value_name = "PROFILE.json")]
     initial_intern_state: Option<PathBuf>,
+    /// Reproduce a validated caller protocol from an independent pre-path baseline.
+    #[arg(long, value_name = "MODEL.json")]
+    caller_intern_model: Option<PathBuf>,
+    /// Diagnostic only: preserve known caller entries and assume every other entry absent.
+    #[arg(long, requires = "caller_intern_model")]
+    caller_intern_assume_absent: bool,
 }
 
 impl Options {
+    fn validate_assume_absent(&self, cache_read: bool) -> Result<(), String> {
+        if self.caller_intern_assume_absent && !cache_read {
+            Err("--caller-intern-assume-absent requires admitted native cache reading".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
     fn expected_outcome_counts(&self) -> Result<BTreeMap<OutcomeKind, usize>, String> {
         let mut outcomes = BTreeMap::new();
         for (kind, count) in self
@@ -192,7 +208,21 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if options.caller_intern_model.is_some()
+        && (!options.source_bytes
+            || options.initial_intern_state.is_none()
+            || env::var_os("SERC_NATIVE_CACHE_WRITE").is_some())
+    {
+        eprintln!(
+            "caller modeling requires byte sources and a native provenance profile, and cannot capture new native output"
+        );
+        return ExitCode::from(2);
+    }
     let read_config = env::var_os("SERC_NATIVE_CACHE_READ");
+    if let Err(message) = options.validate_assume_absent(read_config.is_some()) {
+        eprintln!("{message}");
+        return ExitCode::from(2);
+    }
     if read_config.is_some()
         && (env::var_os("SERC_NATIVE_CACHE_WRITE").is_some()
             || options.dump_mismatches.is_some()
@@ -229,11 +259,40 @@ fn main() -> ExitCode {
         }
     };
     if let Some(profile) = &profile {
+        let role = if options.caller_intern_model.is_some() {
+            "Native provenance snapshot"
+        } else {
+            "Initial intern-state snapshot"
+        };
         println!(
-            "Initial intern-state snapshot: {} ({} entries; captured process state)",
+            "{role}: {} ({} entries; captured process state)",
             profile.snapshot_sha256, profile.entries
         );
     }
+    let caller_model = match options
+        .caller_intern_model
+        .as_deref()
+        .map(|path| {
+            caller_intern_model::load(
+                path,
+                options
+                    .initial_intern_state
+                    .as_deref()
+                    .expect("caller profile checked"),
+                options.python_version,
+                options.source_bytes,
+                ORACLE,
+                options.caller_intern_assume_absent,
+            )
+        })
+        .transpose()
+    {
+        Ok(model) => model,
+        Err(error) => {
+            eprintln!("invalid caller intern-state model: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let compile_options = CompileOptions {
         python_version: options.python_version,
         initial_intern_state: profile.map(|profile| profile.state).unwrap_or_default(),
@@ -260,6 +319,17 @@ fn main() -> ExitCode {
     }
     if let Some(limit) = options.limit {
         paths.truncate(limit);
+    }
+    if caller_model.is_some() {
+        for path in &paths {
+            if let Err(error) = caller_intern_model::validate_filename(path) {
+                eprintln!(
+                    "unsupported caller-model filename {}: {error}",
+                    path.display()
+                );
+                return ExitCode::from(2);
+            }
+        }
     }
 
     let cache = match env::var_os("SERC_NATIVE_CACHE_WRITE") {
@@ -302,6 +372,7 @@ fn main() -> ExitCode {
             ORACLE,
             options.python_version,
             &paths,
+            caller_model.as_ref(),
         ) {
             Ok(reader) => {
                 println!(
@@ -335,7 +406,7 @@ fn main() -> ExitCode {
             .enumerate()
             .map(|(index, path)| {
                 if let Some(reader) = &reader {
-                    return reader.compare(index, path, &compile_options);
+                    return reader.compare(index, path, &compile_options, caller_model.as_ref());
                 }
                 let mut observation = cache.as_ref().map(|writer| writer.begin(index, path));
                 let outcome = compare(
@@ -343,6 +414,7 @@ fn main() -> ExitCode {
                     &options.python,
                     options.source_bytes,
                     &compile_options,
+                    caller_model.as_ref(),
                     observation.as_mut(),
                 );
                 if let Some(observation) = observation {
@@ -411,13 +483,16 @@ fn main() -> ExitCode {
     }
 
     if let Some(directory) = &options.dump_mismatches {
-        if let Err(error) = dump_mismatches(
-            &outcomes,
-            &options.python,
-            directory,
-            options.source_bytes,
-            &compile_options,
-        ) {
+        if let Err(error) = pool.install(|| {
+            dump_mismatches(
+                &outcomes,
+                &options.python,
+                directory,
+                options.source_bytes,
+                &compile_options,
+                caller_model.as_ref(),
+            )
+        }) {
             eprintln!("failed to dump mismatches: {error}");
             return ExitCode::FAILURE;
         }
@@ -545,7 +620,7 @@ impl PythonIdentity {
     fn matches(&self, version: PythonVersion) -> bool {
         let target = version.target();
         let (release_level, release_serial) = match version {
-            PythonVersion::Py314 => ("final", 0),
+            PythonVersion::Py312 | PythonVersion::Py313 | PythonVersion::Py314 => ("final", 0),
             PythonVersion::Py315 => ("candidate", 2),
         };
         self.implementation == target.implementation
@@ -630,20 +705,23 @@ fn dump_mismatches(
     directory: &Path,
     source_bytes: bool,
     options: &CompileOptions,
+    caller_model: Option<&caller_intern_model::LoadedModel>,
 ) -> Result<(), std::io::Error> {
     fs_err::create_dir_all(directory)?;
     outcomes
         .iter()
         .filter(|outcome| outcome.kind == OutcomeKind::ByteMismatch)
+        .collect::<Vec<_>>()
+        .into_par_iter()
         .enumerate()
-        .try_for_each(|(index, outcome)| {
+        .map(|(index, outcome)| {
             let source = if source_bytes {
                 CompilerInput::Bytes(fs_err::read(&outcome.path)?)
             } else {
                 CompilerInput::Text(fs_err::read_to_string(&outcome.path)?)
             };
             let filename = outcome.path.to_string_lossy();
-            let ours = compile_module_input(&source, &filename, options)
+            let ours = compile_module_input(&source, &filename, options, caller_model)
                 .expect("a mismatch compiled successfully in the first pass")
                 .marshal();
             let oracle = Command::new(python)
@@ -656,6 +734,9 @@ fn dump_mismatches(
             fs_err::write(directory.join(format!("{stem}.ours.marshal")), ours)?;
             fs_err::write(directory.join(format!("{stem}.cpython.marshal")), oracle)
         })
+        .collect::<Vec<Result<(), std::io::Error>>>()
+        .into_iter()
+        .collect()
 }
 
 fn discover(roots: &[PathBuf], extensions: &[String]) -> Result<Vec<PathBuf>, String> {
@@ -687,6 +768,7 @@ fn compare(
     python: &str,
     source_bytes: bool,
     options: &CompileOptions,
+    caller_model: Option<&caller_intern_model::LoadedModel>,
     mut observation: Option<&mut native_output_cache::Observation<'_>>,
 ) -> Outcome {
     let output = Command::new(python)
@@ -750,7 +832,7 @@ fn compare(
     };
 
     let filename = path.to_string_lossy();
-    let compiled = compile_input(&source, &filename, options);
+    let compiled = compile_input(&source, &filename, options, caller_model);
     if let Some(observation) = observation {
         observation.compiled(&source, &compiled);
     }
@@ -762,7 +844,22 @@ fn compile_module_input(
     source: &CompilerInput,
     filename: &str,
     options: &CompileOptions,
+    caller_model: Option<&caller_intern_model::LoadedModel>,
 ) -> Result<CompiledModule, CompileError> {
+    // Derive the per-input mask from the same in-memory bytes that the cache
+    // reader hashes and this invocation compiles. Never reread for the model.
+    let file_options = match (caller_model, source) {
+        (Some(model), CompilerInput::Bytes(bytes)) => {
+            Some(model.options_for(filename, bytes, options))
+        }
+        (Some(_), CompilerInput::Text(_)) => {
+            return Err(CompileError::Internal(
+                "caller model requires source-bytes input".to_string(),
+            ));
+        }
+        (None, _) => None,
+    };
+    let options = file_options.as_ref().unwrap_or(options);
     match source {
         CompilerInput::Bytes(source) => compile_bytes_with_options(source, filename, options),
         CompilerInput::Text(source) => compile_with_options(source, filename, options),
@@ -773,9 +870,10 @@ fn compile_input(
     source: &CompilerInput,
     filename: &str,
     options: &CompileOptions,
+    caller_model: Option<&caller_intern_model::LoadedModel>,
 ) -> CompilerOutcome {
     capture_compiler(|| {
-        compile_module_input(source, filename, options).map(|module| module.marshal())
+        compile_module_input(source, filename, options, caller_model).map(|module| module.marshal())
     })
 }
 
@@ -900,12 +998,42 @@ mod tests {
     }
 
     #[test]
+    fn assume_absent_is_opt_in_and_requires_a_model_and_cached_native_outputs() {
+        let defaults = Options::try_parse_from(["compare_cpython_corpus"]).unwrap();
+        assert!(!defaults.caller_intern_assume_absent);
+        assert!(defaults.validate_assume_absent(false).is_ok());
+        let error =
+            Options::try_parse_from(["compare_cpython_corpus", "--caller-intern-assume-absent"])
+                .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        let diagnostic = Options::try_parse_from([
+            "compare_cpython_corpus",
+            "--caller-intern-model",
+            "model.json",
+            "--caller-intern-assume-absent",
+        ])
+        .unwrap();
+        assert!(diagnostic.validate_assume_absent(false).is_err());
+        assert!(diagnostic.validate_assume_absent(true).is_ok());
+    }
+
+    #[test]
     fn selected_python_version_is_parsed_and_validated() {
-        let options =
-            Options::try_parse_from(["compare_cpython_corpus", "--python-version", "3.15"])
-                .unwrap();
-        assert_eq!(options.python_version, PythonVersion::Py315);
-        let error = Options::try_parse_from(["compare_cpython_corpus", "--python-version", "3.13"])
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let options = Options::try_parse_from([
+                "compare_cpython_corpus",
+                "--python-version",
+                &version.to_string(),
+            ])
+            .unwrap();
+            assert_eq!(options.python_version, version);
+        }
+        let error = Options::try_parse_from(["compare_cpython_corpus", "--python-version", "3.11"])
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::ValueValidation);
     }
@@ -991,10 +1119,15 @@ mod tests {
 
     #[test]
     fn oracle_identity_rejects_other_targets_and_release_candidates() {
-        for python_version in [PythonVersion::Py314, PythonVersion::Py315] {
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
             let target = python_version.target();
             let (release_level, release_serial) = match python_version {
-                PythonVersion::Py314 => ("final", 0),
+                PythonVersion::Py312 | PythonVersion::Py313 | PythonVersion::Py314 => ("final", 0),
                 PythonVersion::Py315 => ("candidate", 2),
             };
             let mut identity = PythonIdentity {
@@ -1005,11 +1138,14 @@ mod tests {
                 magic: target.magic_hex(),
             };
             assert!(identity.matches(python_version));
-            let other = match python_version {
-                PythonVersion::Py314 => PythonVersion::Py315,
-                PythonVersion::Py315 => PythonVersion::Py314,
-            };
-            assert!(!identity.matches(other));
+            for other in [
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ] {
+                assert_eq!(identity.matches(other), other == python_version);
+            }
             identity.release_serial += 1;
             assert!(!identity.matches(python_version));
             identity.release_serial = release_serial;
@@ -1033,7 +1169,12 @@ mod tests {
 
     #[test]
     fn selected_target_reaches_both_input_modes() {
-        for python_version in [PythonVersion::Py314, PythonVersion::Py315] {
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
             let options = CompileOptions {
                 python_version,
                 ..CompileOptions::default()
@@ -1042,7 +1183,7 @@ mod tests {
                 CompilerInput::Text("value = 1\n".to_string()),
                 CompilerInput::Bytes(b"value = 1\n".to_vec()),
             ] {
-                let module = compile_module_input(&input, "target.py", &options).unwrap();
+                let module = compile_module_input(&input, "target.py", &options, None).unwrap();
                 assert_eq!(module.python_version(), python_version);
                 assert_eq!(module.target(), python_version.target());
             }
@@ -1084,6 +1225,7 @@ mod tests {
                     initial_intern_state: state.clone(),
                     ..CompileOptions::default()
                 },
+                None,
             )
             .unwrap();
             assert_eq!(fs::read(dump.join("0000.ours.marshal")).unwrap(), expected);
@@ -1102,9 +1244,10 @@ mod tests {
             CompilerInput::Text(source.to_string()),
             CompilerInput::Bytes(source.as_bytes().to_vec()),
         ] {
-            let default = compile_module_input(&input, "profile.py", &CompileOptions::default())
-                .unwrap()
-                .marshal();
+            let default =
+                compile_module_input(&input, "profile.py", &CompileOptions::default(), None)
+                    .unwrap()
+                    .marshal();
             let supplied = compile_module_input(
                 &input,
                 "profile.py",
@@ -1112,6 +1255,7 @@ mod tests {
                     initial_intern_state: state.clone(),
                     ..CompileOptions::default()
                 },
+                None,
             )
             .unwrap()
             .marshal();
@@ -1185,7 +1329,7 @@ mod tests {
             CompilerInput::Text("if:\n".to_string()),
             CompilerInput::Bytes(b"if:\n".to_vec()),
         ] {
-            let compiled = compile_input(&source, "invalid.py", &CompileOptions::default());
+            let compiled = compile_input(&source, "invalid.py", &CompileOptions::default(), None);
             let outcome = classify(
                 Path::new("invalid.py"),
                 OracleOutcome::Rejected("SyntaxError: invalid syntax".to_string()),
@@ -1204,6 +1348,7 @@ mod tests {
             &CompilerInput::Text("return\n".to_string()),
             "invalid.py",
             &CompileOptions::default(),
+            None,
         );
         let outcome = classify(
             Path::new("invalid.py"),
@@ -1222,7 +1367,7 @@ mod tests {
             CompilerInput::Text("pass\n".to_string()),
             CompilerInput::Bytes(b"pass\n".to_vec()),
         ] {
-            let compiled = compile_input(&source, "valid.py", &CompileOptions::default());
+            let compiled = compile_input(&source, "valid.py", &CompileOptions::default(), None);
             let outcome = classify(
                 Path::new("valid.py"),
                 OracleOutcome::Rejected("SyntaxError: invalid syntax".to_string()),

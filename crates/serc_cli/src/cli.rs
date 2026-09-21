@@ -43,7 +43,7 @@ struct CompileCommand {
     #[arg(value_hint = ValueHint::AnyPath)]
     paths: Vec<PathBuf>,
 
-    /// Python language and bytecode version to target (3.14 or 3.15).
+    /// Python language and bytecode version to target (3.12, 3.13, 3.14, or 3.15).
     #[arg(long, default_value_t = PythonVersion::default())]
     python_version: PythonVersion,
 
@@ -318,6 +318,8 @@ mod tests {
 
     #[test]
     fn target_cache_tag() {
+        assert_eq!(cache_tag(PythonVersion::Py312), "cpython-312");
+        assert_eq!(cache_tag(PythonVersion::Py313), "cpython-313");
         assert_eq!(cache_tag(PythonVersion::Py314), "cpython-314");
         assert_eq!(cache_tag(PythonVersion::Py315), "cpython-315");
     }
@@ -340,6 +342,19 @@ mod tests {
             cache_path(Path::new("package/module"), PythonVersion::Py315).unwrap(),
             PathBuf::from("package/__pycache__/modulecpython-315.pyc")
         );
+        for (version, tag) in [
+            (PythonVersion::Py312, "cpython-312"),
+            (PythonVersion::Py313, "cpython-313"),
+        ] {
+            assert_eq!(
+                cache_path(Path::new("package/module.py"), version).unwrap(),
+                PathBuf::from(format!("package/__pycache__/module.{tag}.pyc")),
+            );
+            assert_eq!(
+                cache_path(Path::new("package/module"), version).unwrap(),
+                PathBuf::from(format!("package/__pycache__/module{tag}.pyc")),
+            );
+        }
         assert!(has_python_suffix(Path::new("package/.py")));
     }
 

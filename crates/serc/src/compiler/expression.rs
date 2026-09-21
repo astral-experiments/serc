@@ -12,16 +12,16 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use super::{
     BINARY_SLICE, BUILD_INTERPOLATION, BUILD_LIST, BUILD_MAP, BUILD_SET, BUILD_SLICE, BUILD_STRING,
     BUILD_TEMPLATE, BUILD_TUPLE, CALL, CALL_FUNCTION_EX, CALL_KW, CLEANUP_THROW, COMPARE_OP,
-    CONTAINS_OP, COPY, DELETE_ATTR, DELETE_SUBSCR, DICT_MERGE, DICT_UPDATE, END_ASYNC_FOR, END_FOR,
+    CONTAINS_OP, COPY, DELETE_ATTR, DELETE_SUBSCR, DICT_MERGE, DICT_UPDATE, END_ASYNC_FOR,
     END_SEND, FOR_ITER, FORMAT_SIMPLE, FORMAT_WITH_SPEC, GET_AITER, GET_ANEXT, GET_AWAITABLE,
     GET_ITER, GET_LEN, GET_YIELD_FROM_ITER, IS_OP, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT,
     JUMP_FORWARD, LIST_APPEND, LIST_EXTEND, LOAD_ATTR, LOAD_COMMON_CONSTANT, LOAD_CONST,
     LOAD_DEREF, LOAD_FAST, LOAD_FAST_AND_CLEAR, LOAD_GLOBAL, LOAD_SMALL_INT, LOAD_SUPER_ATTR,
-    MAKE_CELL, MAKE_FUNCTION, MAP_ADD, MATCH_CLASS, MATCH_KEYS, MATCH_MAPPING, MATCH_SEQUENCE, NOP,
-    NOT_TAKEN, POP_ITER, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE,
-    POP_JUMP_IF_TRUE, POP_TOP, PUSH_NULL, RETURN_VALUE, SEND, SET_ADD, SET_UPDATE, STORE_ATTR,
-    STORE_FAST, STORE_SLICE, STORE_SUBSCR, SWAP, TO_BOOL, UNARY_INVERT, UNARY_NEGATIVE, UNARY_NOT,
-    UNPACK_EX, UNPACK_SEQUENCE,
+    MAKE_CELL, MAP_ADD, MATCH_CLASS, MATCH_KEYS, MATCH_MAPPING, MATCH_SEQUENCE, NOP, NOT_TAKEN,
+    POP_ITER, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP,
+    PUSH_NULL, RETURN_VALUE, SEND, SET_ADD, SET_UPDATE, STORE_ATTR, STORE_FAST, STORE_SLICE,
+    STORE_SUBSCR, SWAP, TO_BOOL, UNARY_INVERT, UNARY_NEGATIVE, UNARY_NOT, UNPACK_EX,
+    UNPACK_SEQUENCE,
 };
 use crate::assembler::{ExceptionPolicy, Label, SourceLocation};
 use crate::code_object::Constant;
@@ -29,6 +29,7 @@ use crate::target::code_flags::{
     CO_ASYNC_GENERATOR, CO_COROUTINE, CO_GENERATOR, CO_METHOD, CO_NESTED, CO_VARARGS,
     CO_VARKEYWORDS,
 };
+use crate::target::opcodes::{BUILD_CONST_KEY_MAP, FORMAT_VALUE, KW_NAMES};
 use crate::target::operands::{
     BinaryOperation, CommonConstant, ComparisonOperation, Conversion, FunctionAttribute,
     ResumeLocation, UnaryIntrinsic,
@@ -47,6 +48,7 @@ use super::scope::{
     collect_self_iterated_nested_comprehension_targets, collect_target_names,
     comprehension_cell_names, comprehension_name_bindings, comprehension_temporary_names,
     generator_cellvars, generator_required_names, inlined_comprehension_cell_names_in_expression,
+    legacy_class_comprehension_names,
 };
 use super::source::{
     debug_text_range, first_expression_instruction_range, statement_execution_range,
@@ -75,6 +77,8 @@ struct ComprehensionLoop {
 struct MatchContext {
     stores: Vec<NameId>,
     fail_pop: Vec<Label>,
+    // Case or OR-alternative source identity; fail-pop indices belong to this context.
+    native_fail_owner: ruff_text_size::TextRange,
     direct_loop_failure: Option<Label>,
     on_top: usize,
     ownerless_markers_after_specialized_none: bool,
@@ -385,7 +389,12 @@ impl Compiler<'_> {
         &self,
         assignment: &ruff_python_ast::StmtAssign,
     ) -> bool {
-        if !expression_defers_async_comprehension_restore(&assignment.value) {
+        // Legacy CFG passes need the original restore/store order: 3.13 resolves
+        // successor locations before static swaps, and 3.12 counts the SWAP when
+        // deciding which cleanup blocks to inline. Let those passes exchange it.
+        if self.context.python_version <= PythonVersion::Py313
+            || !expression_defers_async_comprehension_restore(&assignment.value)
+        {
             return false;
         }
         let [Expr::Name(target)] = assignment.targets.as_slice() else {
@@ -467,7 +476,8 @@ impl Compiler<'_> {
         let base_depth = self.control.stack.depth;
         let match_has_following =
             !terminal && self.control.statements.current_statement_has_following;
-        if matches!(statement.subject.as_ref(), Expr::Tuple(_))
+        if self.context.python_version >= PythonVersion::Py314
+            && matches!(statement.subject.as_ref(), Expr::Tuple(_))
             && let Some(constant) = fold_constant(&statement.subject)
         {
             if self.output.constants.is_empty()
@@ -482,6 +492,10 @@ impl Compiler<'_> {
             self.compile_expression(&statement.subject)?;
         }
         let end = self.assembler.label();
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::MatchEnd(statement.range),
+            end,
+        );
         let has_default = statement.cases.len() > 1
             && statement
                 .cases
@@ -541,6 +555,7 @@ impl Compiler<'_> {
             let mut context = MatchContext {
                 stores: Vec::new(),
                 fail_pop: Vec::new(),
+                native_fail_owner: case.pattern.range(),
                 direct_loop_failure: (!copied_subject
                     && !has_default
                     && case.guard.is_none()
@@ -611,13 +626,18 @@ impl Compiler<'_> {
             }
             if !guard_always_false {
                 if copied_subject {
-                    self.assembler.set_location(
+                    let location = if self.context.python_version <= PythonVersion::Py313 {
+                        self.source_location(case.pattern.range())
+                    } else {
                         case.body.first().map_or(SourceLocation::NONE, |statement| {
                             self.source_location(statement_execution_range(statement))
-                        }),
-                    );
+                        })
+                    };
+                    self.assembler.set_location(location);
                     self.emit(POP_TOP, 0, -1)?;
-                    self.assembler.use_next_location_for_last_instruction();
+                    if self.context.python_version >= PythonVersion::Py314 {
+                        self.assembler.use_next_location_for_last_instruction();
+                    }
                 }
                 let body_previous_location = self.assembler.last_instruction_location();
                 let body_start = self.assembler.instruction_count();
@@ -702,6 +722,16 @@ impl Compiler<'_> {
                     )?;
                     false
                 };
+                if self.context.python_version <= PythonVersion::Py313
+                    && self.assembler.instruction_count() == body_start
+                    && let [Stmt::Pass(pass)] = case.body.as_slice()
+                {
+                    // Protected suites can omit a final Pass in favor of their cleanup.
+                    // Legacy case jumps start unlocated, so retain its original donor NOP.
+                    self.assembler
+                        .set_location(self.source_location(pass.range));
+                    self.emit(NOP, 0, 0)?;
+                }
                 if !context.empty_failure_jumps.is_empty()
                     && self
                         .assembler
@@ -743,6 +773,10 @@ impl Compiler<'_> {
                         self.set_branch_end_location(&case.body, body_start);
                     }
                     self.set_match_case_backedge_location(&case.body);
+                    if self.context.python_version <= crate::PythonVersion::Py313 {
+                        // Native case exits receive their span in the target CFG schedule.
+                        self.assembler.set_location(SourceLocation::NONE);
+                    }
                     if terminal {
                         self.emit_deferred_implicit_return()?;
                         // CPython copies the implicit return onto the original case-success
@@ -804,7 +838,9 @@ impl Compiler<'_> {
                             .emit_jump_forward_instruction_with_exception_policy(
                                 JUMP_FORWARD,
                                 end,
-                                if final_async_exhaustion {
+                                if final_async_exhaustion
+                                    && self.context.python_version != PythonVersion::Py312
+                                {
                                     // Cold ordering materializes the original fallthrough as a
                                     // new bridge; it has no original exception-owner slot.
                                     ExceptionPolicy::EXCLUDE_ALWAYS
@@ -1071,7 +1107,7 @@ impl Compiler<'_> {
                 self.assembler
                     .mark_borrow_empty_block_if_unretained_at(success_offset);
             }
-            if !terminal
+            if (!terminal || self.context.python_version <= PythonVersion::Py313)
                 && self.assembler.instruction_count() == body_start
                 && let [Stmt::Pass(pass)] = case.body.as_slice()
                 && case
@@ -1088,9 +1124,16 @@ impl Compiler<'_> {
             }
             if terminal && !suite_terminates(&case.body) && !emitted_fallthrough {
                 self.set_branch_end_location(&case.body, body_start);
+                if self.context.python_version <= crate::PythonVersion::Py313 {
+                    self.assembler.set_location(SourceLocation::NONE);
+                }
                 // The wildcard body falls through to the original match-end block.
                 // Keep its instructions outside the shared implicit-return copy budget.
                 let implicit_return = self.assembler.label();
+                if self.context.python_version <= crate::PythonVersion::Py313 {
+                    self.assembler
+                        .record_exception_owner_block_boundary(implicit_return);
+                }
                 self.assembler.mark(implicit_return);
                 self.emit_deferred_implicit_return()?;
                 failure_reaches_end = case.guard.is_some();
@@ -1116,6 +1159,11 @@ impl Compiler<'_> {
     ) -> Result<(), CompileError> {
         let base_depth = self.control.stack.depth;
         let false_exit = self.assembler.label();
+        // The no-else If's original End is its false edge, before the case exit.
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::IfEnd(statement.range),
+            false_exit,
+        );
         self.compile_jump_if(&statement.test, false, false_exit)?;
         self.mark_definitely_evaluated_locals(&statement.test);
 
@@ -1165,10 +1213,17 @@ impl Compiler<'_> {
             let unique_false_edge = terminating_body
                 .then(|| unique_condition_jump_target(&statement.test, false))
                 .flatten();
+            // 3.12 copies the following small return before resolving lines.
+            // Its original case-success jump is unlocated, so the replacement
+            // NOP must disappear before a unique false edge can donate a span.
             self.assembler
-                .set_location(unique_false_edge.map_or(SourceLocation::NONE, |test| {
-                    self.source_location(test.range())
-                }));
+                .set_location(if self.context.python_version == PythonVersion::Py312 {
+                    SourceLocation::NONE
+                } else {
+                    unique_false_edge.map_or(SourceLocation::NONE, |test| {
+                        self.source_location(test.range())
+                    })
+                });
             self.assembler.mark_conditional_threading_target(
                 false_exit,
                 self.source_location(synthetic_condition_exit_range(&statement.test)),
@@ -1181,7 +1236,7 @@ impl Compiler<'_> {
                 self.assembler
                     .preserve_redundant_jump_nop_after_threading(success_exit);
             }
-            if unique_false_edge.is_some() {
+            if unique_false_edge.is_some() && self.context.python_version != PythonVersion::Py313 {
                 // Only the false edge reaches this original empty block. Preserve its
                 // condition slot even when a containing match retargets the case exit
                 // before a small return replaces the jump.
@@ -1221,6 +1276,13 @@ impl Compiler<'_> {
     fn ensure_match_fail_pop(&mut self, context: &mut MatchContext, pops: usize) {
         while context.fail_pop.len() <= pops {
             let label = self.assembler.label();
+            self.bind_native_source_label(
+                super::legacy_native_labels::NativeRole::MatchFailPop(
+                    context.native_fail_owner,
+                    context.fail_pop.len(),
+                ),
+                label,
+            );
             context.fail_pop.push(label);
         }
     }
@@ -1296,6 +1358,12 @@ impl Compiler<'_> {
             self.assembler.set_location(location);
             self.emit(POP_TOP, 0, -1)?;
         }
+        // Native 3.12 cleanup falls through to a separate zero-pop block.
+        // Keep that original boundary even when no pattern jumps to it directly.
+        if self.context.python_version == crate::PythonVersion::Py312 {
+            self.assembler
+                .record_exception_owner_block_boundary(context.fail_pop[0]);
+        }
         self.assembler.mark(context.fail_pop[0]);
         self.set_depth(failure_depth);
         Ok(())
@@ -1333,10 +1401,12 @@ impl Compiler<'_> {
                     // consuming None jump. Register the constant before the specialization so
                     // its pool ordering follows the same source traversal. The removed
                     // LOAD_CONST and IS_OP leave a protected slot for the late NOT_TAKEN marker.
-                    // Swap optimization reconstructs rotations into those folded instruction
-                    // slots, retaining the None pattern's location on the surviving swaps.
-                    let preserve_swap_slots =
-                        self.assembler.current_block_ends_with_multiple_swaps();
+                    // From 3.13, the constant pass folds these slots before swap optimization,
+                    // which can reconstruct rotations into them with the None pattern's span.
+                    // In 3.12, swaps run first in the same left-to-right pass, so the still-real
+                    // identity test bounds the run and the capture's swap locations survive.
+                    let preserve_swap_slots = self.context.python_version >= PythonVersion::Py313
+                        && self.assembler.current_block_ends_with_multiple_swaps();
                     if preserve_swap_slots {
                         self.emit(NOP, 0, 0)?;
                         self.emit(NOP, 0, 0)?;
@@ -1433,6 +1503,10 @@ impl Compiler<'_> {
     ) -> Result<(), CompileError> {
         let entry_depth = self.control.stack.depth;
         let end = self.assembler.label();
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::MatchOrEnd(pattern.range),
+            end,
+        );
         let mut control: Option<Vec<NameId>> = None;
         let mut empty_success = false;
         for (index, alternative) in pattern.patterns.iter().enumerate() {
@@ -1442,6 +1516,7 @@ impl Compiler<'_> {
             let mut alternative_context = MatchContext {
                 stores: Vec::new(),
                 fail_pop: Vec::new(),
+                native_fail_owner: alternative.range(),
                 direct_loop_failure: None,
                 on_top: 0,
                 ownerless_markers_after_specialized_none: context
@@ -1716,8 +1791,10 @@ impl Compiler<'_> {
                 ExceptionPolicy::NoneDynamicConditionStrict,
             )?;
         }
-        // CPython's flowgraph only folds tuples with up to 30 stack operands.
-        if pattern.keys.len() <= 30
+        // Legacy CFG folding retains each key's source line as a NOP before
+        // building the tuple. Keep those loads until the target's folding pass.
+        if self.context.python_version >= crate::PythonVersion::Py314
+            && pattern.keys.len() <= 30
             && let Some(keys) = pattern
                 .keys
                 .iter()
@@ -1875,6 +1952,16 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    /// Return the expression span after the target's comparison-negation AST fold.
+    pub(super) fn expression_location(&self, expression: &Expr) -> SourceLocation {
+        if self.context.python_version <= PythonVersion::Py313
+            && let Some((comparison, _)) = legacy_not_comparison(expression)
+        {
+            return self.source_location(comparison.range);
+        }
+        self.source_location(expression.range())
+    }
+
     pub(super) fn compile_expression(&mut self, expression: &Expr) -> Result<(), CompileError> {
         self.compile_expression_with_boolean_continuation(expression, None)
     }
@@ -1885,6 +1972,11 @@ impl Compiler<'_> {
         expression: &Expr,
         continuation: Option<(BoolOp, SourceLocation)>,
     ) -> Result<(), CompileError> {
+        if self.context.python_version <= PythonVersion::Py313
+            && let Some(comparison) = legacy_folded_not_comparison(expression)
+        {
+            return self.compile_expression_with_boolean_continuation(&comparison, continuation);
+        }
         let previous = self.assembler.location();
         self.assembler
             .set_location(self.source_location(expression.range()));
@@ -1899,7 +1991,8 @@ impl Compiler<'_> {
         continuation: Option<(BoolOp, SourceLocation)>,
     ) -> Result<(), CompileError> {
         let starting_depth = self.control.stack.depth;
-        if let Expr::BoolOp(boolean) = expression
+        if self.context.python_version >= PythonVersion::Py314
+            && let Expr::BoolOp(boolean) = expression
             && let Some((origin, constant)) = folded_bool_operand(expression)
         {
             self.pre_register_expression_names(expression)?;
@@ -1973,7 +2066,8 @@ impl Compiler<'_> {
                         imag: *imag,
                     },
                 };
-                if let Number::Int(value) = &number.value
+                if self.context.python_version >= PythonVersion::Py314
+                    && let Number::Int(value) = &number.value
                     && let Some(value) = value.as_u8()
                 {
                     if self.output.constants.is_empty() {
@@ -2059,7 +2153,9 @@ impl Compiler<'_> {
                 if let Expr::Slice(slice) = subscript.slice.as_ref() {
                     let slice_location = self.source_location(slice.range);
                     let subscript_location = self.source_location(subscript.range);
-                    if let Some(constant) = constant_slice(slice) {
+                    if self.context.python_version >= PythonVersion::Py314
+                        && let Some(constant) = constant_slice(slice)
+                    {
                         let index = self.add_constant(constant)?;
                         self.assembler.set_location(slice_location);
                         self.emit(LOAD_CONST, index, 1)?;
@@ -2165,6 +2261,18 @@ impl Compiler<'_> {
                 let yielded = self.assembler.label();
                 let yielded_end = self.assembler.label();
                 let cleanup = self.assembler.label();
+                self.bind_native_source_label(
+                    super::legacy_native_labels::NativeRole::YieldFromSend(expression.range),
+                    send,
+                );
+                self.bind_native_source_label(
+                    super::legacy_native_labels::NativeRole::YieldFromFail(expression.range),
+                    cleanup,
+                );
+                self.bind_native_source_label(
+                    super::legacy_native_labels::NativeRole::YieldFromExit(expression.range),
+                    end,
+                );
                 self.assembler.mark(send);
                 self.emit_jump_forward(SEND, end, 0)?;
                 self.assembler.record_exception_setup(yielded, false);
@@ -2441,6 +2549,36 @@ impl Compiler<'_> {
         self.compile_expression(&interpolation.expression)?;
         self.assembler
             .set_location(self.source_location(interpolation.range));
+        if self.context.python_version == PythonVersion::Py312 {
+            use crate::target::operands312::FormatValue;
+            let mut argument = match interpolation.conversion {
+                ConversionFlag::None
+                    if interpolation.debug_text.is_some()
+                        && interpolation.format_spec.is_none() =>
+                {
+                    FormatValue::REPR.argument()
+                }
+                ConversionFlag::None => FormatValue::NONE.argument(),
+                ConversionFlag::Str => FormatValue::STR.argument(),
+                ConversionFlag::Repr => FormatValue::REPR.argument(),
+                ConversionFlag::Ascii => FormatValue::ASCII.argument(),
+            };
+            if let Some(format_spec) = &interpolation.format_spec {
+                self.compile_interpolated_elements(
+                    &format_spec.elements,
+                    format_spec.range,
+                    is_raw,
+                )?;
+                argument |= FormatValue::HAVE_SPEC.argument();
+            }
+            self.assembler
+                .set_location(self.source_location(interpolation.range));
+            return self.emit(
+                FORMAT_VALUE,
+                argument,
+                -i32::from(interpolation.format_spec.is_some()),
+            );
+        }
         match interpolation.conversion {
             ConversionFlag::None
                 if interpolation.debug_text.is_some() && interpolation.format_spec.is_none() =>
@@ -2466,6 +2604,13 @@ impl Compiler<'_> {
         &mut self,
         expression: &ExprBinOp,
     ) -> Result<SpecializedLowering, CompileError> {
+        if self.context.python_version <= PythonVersion::Py313
+            && self.return_value_is_constant(&expression.right)
+        {
+            // The legacy AST pass folds a constant RHS tuple before recognizing
+            // percent formatting, so it no longer has the required Tuple AST node.
+            return Ok(SpecializedLowering::NotApplicable);
+        }
         let Some(parts) = optimized_percent_format(expression) else {
             return Ok(SpecializedLowering::NotApplicable);
         };
@@ -2490,6 +2635,25 @@ impl Compiler<'_> {
                     self.compile_expression(expression)?;
                     let location = self.source_location(expression.range());
                     self.assembler.set_location(location);
+                    if self.context.python_version == PythonVersion::Py312 {
+                        use crate::target::operands312::FormatValue;
+                        let mut argument = if conversion == Conversion::STR {
+                            FormatValue::STR.argument()
+                        } else if conversion == Conversion::REPR {
+                            FormatValue::REPR.argument()
+                        } else {
+                            FormatValue::ASCII.argument()
+                        };
+                        let has_spec = format_spec.is_some();
+                        if let Some(format_spec) = format_spec {
+                            self.assembler.set_location(SourceLocation::NONE);
+                            self.load_string_constant(&format_spec)?;
+                            self.assembler.set_location(location);
+                            argument |= FormatValue::HAVE_SPEC.argument();
+                        }
+                        self.emit(FORMAT_VALUE, argument, -i32::from(has_spec))?;
+                        continue;
+                    }
                     self.emit_conversion(conversion)?;
                     if let Some(format_spec) = format_spec {
                         self.assembler.set_location(SourceLocation::NONE);
@@ -2527,6 +2691,9 @@ impl Compiler<'_> {
         description: &str,
     ) -> Result<(), CompileError> {
         match value_count {
+            0 if self.context.python_version == PythonVersion::Py312 => {
+                self.emit(BUILD_STRING, 0, 1)
+            }
             0 => self.load_string_constant(""),
             1 => Ok(()),
             count => self.emit(
@@ -2549,12 +2716,20 @@ impl Compiler<'_> {
         }
 
         self.compile_expression(&expression.value)?;
-        self.compile_awaitable_on_stack(0)
+        self.compile_awaitable_on_stack_with_native_roles(
+            0,
+            Some([
+                super::legacy_native_labels::NativeRole::AwaitSend(expression.range),
+                super::legacy_native_labels::NativeRole::AwaitFail(expression.range),
+                super::legacy_native_labels::NativeRole::AwaitExit(expression.range),
+            ]),
+        )
     }
 
-    pub(super) fn compile_awaitable_on_stack(
+    pub(super) fn compile_awaitable_on_stack_with_native_roles(
         &mut self,
         get_awaitable_argument: u32,
+        native_roles: Option<[super::legacy_native_labels::NativeRole; 3]>,
     ) -> Result<(), CompileError> {
         let base_depth = self.control.stack.depth - 1;
         let cleanup_location = self.assembler.location();
@@ -2570,6 +2745,11 @@ impl Compiler<'_> {
         let yielded = self.assembler.label();
         let yielded_end = self.assembler.label();
         let cleanup = self.assembler.label();
+        if let Some([send_role, fail_role, exit_role]) = native_roles {
+            self.bind_native_source_label(send_role, send);
+            self.bind_native_source_label(fail_role, cleanup);
+            self.bind_native_source_label(exit_role, end);
+        }
         self.assembler.mark(send);
         self.emit_jump_forward(SEND, end, 0)?;
         self.assembler.record_exception_setup(yielded, false);
@@ -2607,6 +2787,9 @@ impl Compiler<'_> {
     }
 
     fn compile_call(&mut self, call: &ruff_python_ast::ExprCall) -> Result<(), CompileError> {
+        if self.context.python_version <= PythonVersion::Py313 {
+            return self.compile_legacy_call(call);
+        }
         if let Some(callable) =
             optimized_generator_callable_for_target(call, self.context.python_version)
         {
@@ -2771,6 +2954,147 @@ impl Compiler<'_> {
         self.emit(CALL_FUNCTION_EX, 0, -3)
     }
 
+    /// Emits the 3.12/3.13 call protocols, including their optional keyword dictionary.
+    fn compile_legacy_call(
+        &mut self,
+        call: &ruff_python_ast::ExprCall,
+    ) -> Result<(), CompileError> {
+        let shape = self.call_shape(call);
+        let python312 = self.context.python_version == PythonVersion::Py312;
+        let direct_method = if let Some(attribute) = shape.direct_method {
+            if self.compile_super_attribute(attribute, SuperAttributeKind::Method)?
+                == SpecializedLowering::NotApplicable
+            {
+                self.compile_expression(&attribute.value)?;
+                let index = self.name_index(attribute.attr.as_str())?;
+                self.assembler
+                    .set_location(self.attribute_opcode_location(attribute));
+                self.emit(LOAD_ATTR, (index << 1) | 1, 1)?;
+            }
+            true
+        } else {
+            false
+        };
+        if !direct_method
+            && self.compile_direct_global_callable(&call.func)?
+                == SpecializedLowering::NotApplicable
+        {
+            self.assembler
+                .set_location(self.source_location(call.func.range()));
+            if python312 {
+                self.emit(PUSH_NULL, 0, 1)?;
+            }
+            if let Some(attribute) = shape.imported_module_callable {
+                self.compile_expression(&attribute.value)?;
+                let index = self.name_index(attribute.attr.as_str())?;
+                self.assembler
+                    .set_location(self.attribute_opcode_location(attribute));
+                self.emit(LOAD_ATTR, index << 1, 0)?;
+            } else {
+                self.compile_expression(&call.func)?;
+            }
+            self.assembler
+                .set_location(self.source_location(call.func.range()));
+            if !python312 {
+                self.emit(PUSH_NULL, 0, 1)?;
+            }
+        }
+        let call_location = self.call_opcode_location_with_method(call, shape.direct_method);
+        if !shape.has_starred
+            && !shape.has_keyword_unpack
+            && (direct_method || shape.positional_count + shape.keyword_count * 2 <= 30)
+        {
+            for argument in &call.arguments.args {
+                self.compile_expression(argument)?;
+            }
+            for keyword in &call.arguments.keywords {
+                self.compile_expression(&keyword.value)?;
+            }
+            let count = to_u32(
+                call.arguments.args.len() + call.arguments.keywords.len(),
+                "call argument count",
+            )?;
+            self.assembler.set_location(call_location);
+            if call.arguments.keywords.is_empty() {
+                return self.emit(CALL, count, -i32::try_from(count).unwrap() - 1);
+            }
+            let keys = call
+                .arguments
+                .keywords
+                .iter()
+                .map(|keyword| Constant::String(keyword.arg.as_ref().unwrap().as_str().to_owned()))
+                .collect();
+            let keys = self.add_interned_string_tuple(keys)?;
+            if let Some(attribute) = shape.direct_method {
+                self.assembler
+                    .set_location(self.attribute_opcode_location(attribute));
+            }
+            if python312 {
+                self.emit(KW_NAMES, keys, 0)?;
+                self.assembler.set_location(call_location);
+                self.emit(CALL, count, -i32::try_from(count).unwrap() - 1)
+            } else {
+                self.emit(LOAD_CONST, keys, 1)?;
+                self.assembler.set_location(call_location);
+                self.emit(CALL_KW, count, -i32::try_from(count).unwrap() - 2)
+            }
+        } else {
+            self.assembler.set_location(call_location);
+            match call.arguments.args.as_ref() {
+                [Expr::Starred(starred)] => self.compile_expression(&starred.value)?,
+                arguments if arguments.len() <= 2 && !shape.has_starred => {
+                    // Synthetic argument tuples bypass the AST constant folder. Native
+                    // code generation folds three or more constants; smaller tuples
+                    // are admitted by the CFG pass alongside annotation/default tuples.
+                    for argument in arguments {
+                        self.compile_expression(argument)?;
+                    }
+                    self.assembler.set_location(call_location);
+                    self.emit_build(BUILD_TUPLE, arguments.len())?;
+                }
+                arguments => self.compile_collection(arguments, CollectionKind::Tuple)?,
+            }
+            let mut have_dict = false;
+            let mut named_start = 0;
+            for (index, keyword) in call.arguments.keywords.iter().enumerate() {
+                if keyword.arg.is_some() {
+                    continue;
+                }
+                if named_start < index {
+                    self.compile_keyword_map(
+                        call_location,
+                        &call.arguments.keywords[named_start..index],
+                    )?;
+                    if have_dict {
+                        self.emit(DICT_MERGE, 1, -1)?;
+                    }
+                    have_dict = true;
+                }
+                if !have_dict {
+                    self.emit(BUILD_MAP, 0, 1)?;
+                    have_dict = true;
+                }
+                self.compile_expression(&keyword.value)?;
+                self.assembler.set_location(call_location);
+                self.emit(DICT_MERGE, 1, -1)?;
+                named_start = index + 1;
+            }
+            if named_start < call.arguments.keywords.len() {
+                self.compile_keyword_map(call_location, &call.arguments.keywords[named_start..])?;
+                if have_dict {
+                    self.emit(DICT_MERGE, 1, -1)?;
+                }
+            }
+            self.assembler.set_location(call_location);
+            let has_keywords = !call.arguments.keywords.is_empty();
+            self.emit(
+                CALL_FUNCTION_EX,
+                u32::from(has_keywords),
+                -2 - i32::from(has_keywords),
+            )
+        }
+    }
+
     fn compile_optimized_generator_call(
         &mut self,
         call: &ruff_python_ast::ExprCall,
@@ -2907,8 +3231,7 @@ impl Compiler<'_> {
         self.assembler.mark(exhausted);
         self.set_depth(iterator_depth + 1);
         self.assembler.set_location(callable_location);
-        self.emit(END_FOR, 0, -1)?;
-        self.emit(POP_ITER, 0, -self.iterator_slots())?;
+        self.emit_end_for_cleanup()?;
         self.assembler.set_location(callable_location);
         if callable == "tuple" {
             self.emit_unary_intrinsic(UnaryIntrinsic::LIST_TO_TUPLE)?;
@@ -2944,7 +3267,21 @@ impl Compiler<'_> {
         keywords: &[Keyword],
     ) -> Result<(), CompileError> {
         debug_assert!(!keywords.is_empty() && keywords.iter().all(|keyword| keyword.arg.is_some()));
-        if keywords.len() * 2 > 30 {
+        if self.context.python_version <= PythonVersion::Py313 && (2..=15).contains(&keywords.len())
+        {
+            let mut keys = Vec::with_capacity(keywords.len());
+            for keyword in keywords {
+                self.compile_expression(&keyword.value)?;
+                let name = keyword.arg.as_ref().unwrap().as_str();
+                self.context.record_constant_string_origin(name, true);
+                keys.push(Constant::String(name.to_owned()));
+            }
+            let keys = self.add_interned_string_tuple(keys)?;
+            self.assembler.set_location(call_location);
+            self.emit(LOAD_CONST, keys, 1)?;
+            let count = to_u32(keywords.len(), "keyword count")?;
+            self.emit(BUILD_CONST_KEY_MAP, count, -i32::try_from(count).unwrap())?;
+        } else if keywords.len() * 2 > 30 {
             self.assembler.set_location(SourceLocation::NONE);
             self.emit(BUILD_MAP, 0, 1)?;
             for keyword in keywords {
@@ -3195,7 +3532,9 @@ impl Compiler<'_> {
             .filter_map(|parameter| parameter.default.as_deref())
             .collect();
         if !positional_defaults.is_empty() {
-            let folded_defaults = if positional_defaults.len() <= CPYTHON_STACK_USE_GUIDELINE {
+            let folded_defaults = if self.has_deferred_annotations()
+                && positional_defaults.len() <= CPYTHON_STACK_USE_GUIDELINE
+            {
                 positional_defaults
                     .iter()
                     .map(|default| fold_constant(default))
@@ -3220,6 +3559,10 @@ impl Compiler<'_> {
                 for default in &positional_defaults {
                     self.compile_expression(default)?;
                 }
+                if !self.has_deferred_annotations() {
+                    self.assembler
+                        .set_location(self.source_location(lambda.range));
+                }
                 self.emit_build(BUILD_TUPLE, positional_defaults.len())?;
             }
         }
@@ -3233,7 +3576,20 @@ impl Compiler<'_> {
                     .map(|default| (parameter.name().as_str(), default))
             })
             .collect();
-        if !keyword_defaults.is_empty() {
+        if !keyword_defaults.is_empty() && self.context.python_version <= PythonVersion::Py313 {
+            let mut keys = Vec::with_capacity(keyword_defaults.len());
+            for (name, default) in &keyword_defaults {
+                self.compile_expression(default)?;
+                let mangled = self.mangled_name(name);
+                self.context
+                    .record_identifier_constant_origin(name, &mangled);
+                keys.push(Constant::String(mangled));
+            }
+            let keys = self.add_interned_string_tuple(keys)?;
+            self.emit(LOAD_CONST, keys, 1)?;
+            let count = to_u32(keyword_defaults.len(), "keyword default count")?;
+            self.emit(BUILD_CONST_KEY_MAP, count, -i32::try_from(count).unwrap())?;
+        } else if !keyword_defaults.is_empty() {
             for (name, default) in &keyword_defaults {
                 let mangled = self.mangled_name(name);
                 self.context
@@ -3295,12 +3651,15 @@ impl Compiler<'_> {
         {
             CO_NESTED
         } else if matches!(self.unit.scope, Scope::Class { .. }) {
-            CO_METHOD
-                | if self.unit.class_scope_is_nested {
-                    CO_NESTED
-                } else {
-                    0
-                }
+            (if self.context.python_version >= PythonVersion::Py314 {
+                CO_METHOD
+            } else {
+                0
+            }) | if self.unit.class_scope_is_nested {
+                CO_NESTED
+            } else {
+                0
+            }
         } else if !closure_names.is_empty() {
             CO_NESTED
         } else {
@@ -3333,12 +3692,15 @@ impl Compiler<'_> {
             .imported_scope_names
             .clone_from(&self.symbols.imported_scope_names);
         child.emit_function_prologue()?;
+        if self.context.python_version <= PythonVersion::Py313 {
+            child.add_constant(Constant::None)?;
+        }
         if parameter_flags & CO_GENERATOR != 0 {
             // CPython does not wrap generator lambdas in the stop-iteration
             // handler used by `def` generators and generator expressions.
             child.control.generators.generator_region_start = None;
         }
-        let return_location = child.source_location(lambda.body.range());
+        let return_location = child.expression_location(&lambda.body);
         child.compile_tail_return_expression(&lambda.body, return_location)?;
         let child = child.finish_inner(false)?;
 
@@ -3347,16 +3709,20 @@ impl Compiler<'_> {
         }
         let constant = self.add_constant(Constant::Code(Box::new(child)))?;
         self.emit(LOAD_CONST, constant, 1)?;
-        self.emit(MAKE_FUNCTION, 0, 0)?;
-        if !closure_names.is_empty() {
-            self.emit_function_attribute(FunctionAttribute::CLOSURE)?;
-        }
-        if !keyword_defaults.is_empty() {
-            self.emit_function_attribute(FunctionAttribute::KWDEFAULTS)?;
-        }
-        if !positional_defaults.is_empty() {
-            self.emit_function_attribute(FunctionAttribute::DEFAULTS)?;
-        }
+        let flags = if closure_names.is_empty() {
+            0
+        } else {
+            FunctionAttribute::CLOSURE.argument()
+        } | if keyword_defaults.is_empty() {
+            0
+        } else {
+            FunctionAttribute::KWDEFAULTS.argument()
+        } | if positional_defaults.is_empty() {
+            0
+        } else {
+            FunctionAttribute::DEFAULTS.argument()
+        };
+        self.emit_make_function(flags)?;
         Ok(())
     }
 
@@ -3377,12 +3743,16 @@ impl Compiler<'_> {
         let comprehension_cell_names = comprehension_cell_names(generators, key, value);
         let base_depth = self.control.stack.depth;
         let comprehension_location = self.assembler.location();
-        if generators[0].is_async || self.context.python_version == PythonVersion::Py315 {
+        // Legacy AST folding applies to every comprehension iterable, including
+        // async clauses; ordinary async-for statements follow a different rule.
+        if (generators[0].is_async && self.context.python_version >= PythonVersion::Py314)
+            || self.context.python_version == PythonVersion::Py315
+        {
             self.compile_expression(&generators[0].iter)?;
         } else {
             self.compile_iterable_expression(&generators[0].iter)?;
         }
-        if self.context.python_version == PythonVersion::Py314 {
+        if self.context.python_version <= PythonVersion::Py314 {
             self.assembler
                 .set_location(self.source_location(generators[0].iter.range()));
             self.emit_comprehension_iterator(generators[0].is_async)?;
@@ -3421,6 +3791,32 @@ impl Compiler<'_> {
             &mut self_iterated_nested_targets,
         );
         let mut active_temporary_names = temporary_names.clone();
+        let legacy_class_comprehension = self.context.python_version <= PythonVersion::Py313
+            && matches!(self.unit.scope, Scope::Class { .. })
+            && self
+                .control
+                .comprehensions
+                .active_comprehension_local_names
+                .is_empty();
+        if legacy_class_comprehension {
+            let Scope::Class { free_indices, .. } = &self.unit.scope else {
+                unreachable!("legacy class comprehension requires a class scope");
+            };
+            let mut seen = FxHashSet::default();
+            temporary_names = legacy_class_comprehension_names(generators, key, value)
+                .into_iter()
+                .filter(|(name, requires_free)| {
+                    (!requires_free
+                        || (self.scope_index(free_indices, name).is_some()
+                            && super::scope::legacy_class_comprehension_keeps_free_name(
+                                name,
+                                self.context.python_version,
+                            )))
+                        && seen.insert(name.clone())
+                })
+                .map(|(name, _)| name)
+                .collect();
+        }
         if matches!(self.unit.scope, Scope::Module) {
             // CPython assigns a hidden fast-local slot to module-scope walrus targets while
             // inlining a comprehension. Function-scope targets remain bindings in the
@@ -3476,11 +3872,13 @@ impl Compiler<'_> {
             .collect::<FxHashSet<_>>();
         active_temporary_names.retain(|name| !deferred_free_targets.contains(name));
         temporary_names.retain(|name| !deferred_free_targets.contains(name));
-        temporary_names.retain(|name| {
-            direct_temporary_names.contains(name)
-                || !self_iterated_nested_targets.contains(name)
-                || !self.is_initialized(name)
-        });
+        if !legacy_class_comprehension {
+            temporary_names.retain(|name| {
+                direct_temporary_names.contains(name)
+                    || !self_iterated_nested_targets.contains(name)
+                    || !self.is_initialized(name)
+            });
+        }
 
         let mut seen_temporaries = FxHashSet::default();
         temporary_names.retain(|name| seen_temporaries.insert(name.clone()));
@@ -3580,6 +3978,12 @@ impl Compiler<'_> {
         let protected_start = self.assembler.label();
         let protected_end = self.assembler.label();
         let cleanup = self.assembler.label();
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::ComprehensionCleanup(
+                generators[0].iter.range(),
+            ),
+            cleanup,
+        );
         let parent_cleanup = self
             .control
             .comprehensions
@@ -3746,6 +4150,10 @@ impl Compiler<'_> {
         }
 
         let normal_cleanup = self.assembler.label();
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::ComprehensionEnd(generators[0].iter.range()),
+            normal_cleanup,
+        );
         let normal_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, normal_cleanup)?;
         if discard_result && generators.iter().any(|generator| generator.is_async) {
             self.assembler.prevent_jump_inlining(normal_exit);
@@ -3798,7 +4206,11 @@ impl Compiler<'_> {
                 .pending_comprehension_restores
                 .push((temporary_restores, comprehension_location));
         } else {
-            if discard_result {
+            // Legacy targets count the original SWAP before copying small exit blocks.
+            // 3.12 also needs the unlocated discard until its later line resolution.
+            let discard_before_restore =
+                discard_result && self.context.python_version > crate::PythonVersion::Py313;
+            if discard_before_restore {
                 self.emit(POP_TOP, 0, -1)?;
             } else {
                 self.emit(
@@ -3807,7 +4219,7 @@ impl Compiler<'_> {
                     0,
                 )?;
             }
-            if discard_result {
+            if discard_before_restore {
                 let final_restore = temporary_restores.last();
                 let restores = temporary_restores[..temporary_restores.len().saturating_sub(1)]
                     .iter()
@@ -3833,6 +4245,10 @@ impl Compiler<'_> {
             }
             // CPython converts STORE_FAST_MAYBE_NULL only after inserting superinstructions.
             self.assembler.prevent_last_instruction_fusion();
+            if discard_result && !discard_before_restore {
+                self.assembler.set_location(SourceLocation::NONE);
+                self.emit(POP_TOP, 0, -1)?;
+            }
             if !discard_result {
                 self.assembler
                     .record_original_comprehension_normal_restores(normal_cleanup);
@@ -3948,20 +4364,22 @@ impl Compiler<'_> {
             .comprehensions
             .active_comprehension_local_names
             .is_empty();
-        let flags =
-            if is_async {
-                CO_ASYNC_GENERATOR
-            } else {
-                CO_GENERATOR
-            } | if self.child_function_is_nested() || inlined_comprehension_parent {
-                CO_NESTED
-            } else {
-                0
-            } | if matches!(self.unit.scope, Scope::Class { .. }) && !inlined_comprehension_parent {
-                CO_METHOD
-            } else {
-                0
-            } | (self.unit.flags & SUPPORTED_FUTURE_FLAGS);
+        let flags = if is_async {
+            CO_ASYNC_GENERATOR
+        } else {
+            CO_GENERATOR
+        } | if self.child_function_is_nested() || inlined_comprehension_parent {
+            CO_NESTED
+        } else {
+            0
+        } | if self.context.python_version >= PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Class { .. })
+            && !inlined_comprehension_parent
+        {
+            CO_METHOD
+        } else {
+            0
+        } | (self.unit.flags & SUPPORTED_FUTURE_FLAGS);
         let mut child = Self::function(
             Rc::clone(&self.context),
             "<genexpr>",
@@ -4013,16 +4431,19 @@ impl Compiler<'_> {
         }
         let code = self.add_constant(Constant::Code(Box::new(child)))?;
         self.emit(LOAD_CONST, code, 1)?;
-        self.emit(MAKE_FUNCTION, 0, 0)?;
-        if !closure_names.is_empty() {
-            self.emit_function_attribute(FunctionAttribute::CLOSURE)?;
-        }
-        if generator.generators[0].is_async || self.context.python_version == PythonVersion::Py315 {
+        self.emit_make_function(if closure_names.is_empty() {
+            0
+        } else {
+            FunctionAttribute::CLOSURE.argument()
+        })?;
+        if (generator.generators[0].is_async && self.context.python_version >= PythonVersion::Py314)
+            || self.context.python_version == PythonVersion::Py315
+        {
             self.compile_expression(&generator.generators[0].iter)?;
         } else {
             self.compile_iterable_expression(&generator.generators[0].iter)?;
         }
-        if self.context.python_version == PythonVersion::Py314 {
+        if self.context.python_version <= PythonVersion::Py314 {
             self.assembler
                 .set_location(self.source_location(generator.generators[0].iter.range()));
             self.emit_comprehension_iterator(generator.generators[0].is_async)?;
@@ -4048,8 +4469,18 @@ impl Compiler<'_> {
                 generator_location,
             );
         }
+        if self.context.python_version == PythonVersion::Py313 {
+            self.assembler
+                .set_location(self.source_location(generator.iter.range()));
+            self.emit_comprehension_iterator(false)?;
+        }
         let loop_depth = self.control.stack.depth;
         let start = self.assembler.label();
+        let filter_cleanup = if self.context.python_version <= PythonVersion::Py313 {
+            self.assembler.label()
+        } else {
+            start
+        };
         let cleanup = self.assembler.label();
         self.assembler.mark(start);
         self.assembler
@@ -4058,7 +4489,7 @@ impl Compiler<'_> {
         self.compile_store_target(&generator.target)?;
         for condition in &generator.ifs {
             let accepted = self.assembler.label();
-            self.compile_generator_filter(condition, element, accepted, start)?;
+            self.compile_generator_filter(condition, element, accepted, filter_cleanup)?;
             self.assembler.mark(accepted);
         }
         self.compile_generator_expression_tail(
@@ -4066,15 +4497,20 @@ impl Compiler<'_> {
             index,
             element,
             generator_location,
-            start,
+            filter_cleanup,
         )?;
+        if self.context.python_version <= PythonVersion::Py313 {
+            // Keep CPython's original rejection block until jump threading and
+            // backward-conditional normalization run in the assembler.
+            self.assembler.preserve_block_boundary(filter_cleanup);
+            self.assembler.mark(filter_cleanup);
+        }
         self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
         self.assembler.mark(cleanup);
         self.set_depth(loop_depth + 1);
         self.assembler
             .set_location(self.source_location(generator.iter.range()));
-        self.emit(END_FOR, 0, -1)?;
-        self.emit(POP_ITER, 0, -self.iterator_slots())?;
+        self.emit_end_for_cleanup()?;
         Ok(())
     }
 
@@ -4089,6 +4525,11 @@ impl Compiler<'_> {
         let loop_depth = self.control.stack.depth;
         let cleanup_location = generator_location;
         let start = self.assembler.label();
+        let filter_cleanup = if self.context.python_version <= PythonVersion::Py313 {
+            self.assembler.label()
+        } else {
+            start
+        };
         let protected_start = self.assembler.label();
         let yielded = self.assembler.label();
         let yielded_end = self.assembler.label();
@@ -4134,7 +4575,7 @@ impl Compiler<'_> {
 
         for condition in &generator.ifs {
             let accepted = self.assembler.label();
-            self.compile_generator_filter(condition, element, accepted, start)?;
+            self.compile_generator_filter(condition, element, accepted, filter_cleanup)?;
             self.assembler.mark(accepted);
         }
         self.compile_generator_expression_tail(
@@ -4142,8 +4583,14 @@ impl Compiler<'_> {
             index,
             element,
             generator_location,
-            start,
+            filter_cleanup,
         )?;
+        if self.context.python_version <= PythonVersion::Py313 {
+            // Keep CPython's original rejection block until jump threading and
+            // backward-conditional normalization run in the assembler.
+            self.assembler.preserve_block_boundary(filter_cleanup);
+            self.assembler.mark(filter_cleanup);
+        }
         self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
         self.assembler.set_location(cleanup_location);
 
@@ -4157,7 +4604,11 @@ impl Compiler<'_> {
         self.assembler.mark(async_cleanup);
         self.set_depth(loop_depth + 1);
         self.apply_compiler_stack_effect(END_ASYNC_FOR, 0, -2)?;
-        self.assembler.emit_backward(END_ASYNC_FOR, send);
+        if self.context.python_version <= PythonVersion::Py313 {
+            self.assembler.emit(END_ASYNC_FOR, 0);
+        } else {
+            self.assembler.emit_backward(END_ASYNC_FOR, send);
+        }
         self.assembler.add_exception_region(
             protected_start,
             protected_end,
@@ -4259,6 +4710,8 @@ impl Compiler<'_> {
             };
             if !nested.is_async
                 && let Some(singleton) = singleton
+                && (self.context.python_version >= PythonVersion::Py314
+                    || self.source_aware_fold_constant(singleton).is_none())
             {
                 // CPython treats `for value in [expression]` as an assignment. Filters on
                 // that clause continue the enclosing real loop when they reject the value.
@@ -4276,7 +4729,7 @@ impl Compiler<'_> {
                     restart,
                 )?;
             } else {
-                if nested.is_async {
+                if nested.is_async && self.context.python_version >= PythonVersion::Py314 {
                     self.compile_expression(&nested.iter)?;
                 } else {
                     self.compile_iterable_expression(&nested.iter)?;
@@ -4312,8 +4765,7 @@ impl Compiler<'_> {
             self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
             self.assembler.mark(end);
             self.set_depth(loop_depth + 1);
-            self.emit(END_FOR, 0, -1)?;
-            self.emit(POP_ITER, 0, -self.iterator_slots())?;
+            self.emit_end_for_cleanup()?;
         } else {
             self.compile_expression(element)?;
             self.assembler
@@ -4372,6 +4824,9 @@ impl Compiler<'_> {
         accepted: Label,
         restart: Label,
     ) -> Result<(), CompileError> {
+        if self.context.python_version <= PythonVersion::Py313 {
+            return self.compile_jump_if(condition, false, restart);
+        }
         if let Expr::If(conditional) = condition {
             return self.compile_conditional_filter(
                 conditional,
@@ -4949,6 +5404,9 @@ impl Compiler<'_> {
         include_with_region_exclusion: bool,
         include_protected_region_exclusion: bool,
     ) -> Result<(), CompileError> {
+        if self.context.python_version <= PythonVersion::Py313 {
+            return self.compile_jump_if(condition, false, restart);
+        }
         if let Expr::If(conditional) = condition {
             return self.compile_conditional_filter(
                 conditional,
@@ -5236,7 +5694,9 @@ impl Compiler<'_> {
             );
         }
         let comprehension_location = self.assembler.location();
-        if index == 0 && self.context.python_version == PythonVersion::Py315 {
+        if self.context.python_version == PythonVersion::Py313
+            || (index == 0 && self.context.python_version == PythonVersion::Py315)
+        {
             self.assembler
                 .set_location(self.source_location(generator.iter.range()));
             self.emit_comprehension_iterator(false)?;
@@ -5244,7 +5704,24 @@ impl Compiler<'_> {
         }
         let loop_depth = self.control.stack.depth;
         let start = self.assembler.label();
+        let filter_cleanup = if self.context.python_version <= PythonVersion::Py313 {
+            self.assembler.label()
+        } else {
+            start
+        };
         let cleanup = self.assembler.label();
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::ComprehensionStart(generator.iter.range()),
+            start,
+        );
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::ComprehensionIfCleanup(generator.iter.range()),
+            filter_cleanup,
+        );
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::ComprehensionAnchor(generator.iter.range()),
+            cleanup,
+        );
         self.assembler.mark(start);
         self.assembler
             .set_location(self.source_location(generator.iter.range()));
@@ -5267,7 +5744,7 @@ impl Compiler<'_> {
                 condition,
                 self.source_location(element_range),
                 accepted,
-                start,
+                filter_cleanup,
                 add_opcode == LIST_APPEND,
                 true,
             )?;
@@ -5281,18 +5758,23 @@ impl Compiler<'_> {
             value,
             add_opcode,
             ComprehensionLoop {
-                restart: start,
+                restart: filter_cleanup,
                 iterator_depth: iterator_depth + usize::try_from(self.iterator_slots()).unwrap(),
                 comprehension_location,
             },
         )?;
+        if self.context.python_version <= PythonVersion::Py313 {
+            // Keep CPython's original rejection block until jump threading and
+            // backward-conditional normalization run in the assembler.
+            self.assembler.preserve_block_boundary(filter_cleanup);
+            self.assembler.mark(filter_cleanup);
+        }
         self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
         self.assembler.mark(cleanup);
         self.set_depth(loop_depth + 1);
         self.assembler
             .set_location(self.source_location(generator.iter.range()));
-        self.emit(END_FOR, 0, -1)?;
-        self.emit(POP_ITER, 0, -self.iterator_slots())?;
+        self.emit_end_for_cleanup()?;
         Ok(())
     }
 
@@ -5320,6 +5802,8 @@ impl Compiler<'_> {
             };
             if !nested.is_async
                 && let Some(singleton) = singleton
+                && (self.context.python_version >= PythonVersion::Py314
+                    || self.source_aware_fold_constant(singleton).is_none())
             {
                 // A singleton clause is an assignment; rejected filters continue the
                 // enclosing real loop without adding an iterator or a cleanup block.
@@ -5345,7 +5829,7 @@ impl Compiler<'_> {
                     loop_context,
                 )?;
             } else {
-                if nested.is_async {
+                if nested.is_async && self.context.python_version >= PythonVersion::Py314 {
                     self.compile_expression(&nested.iter)?;
                 } else {
                     self.compile_iterable_expression(&nested.iter)?;
@@ -5447,6 +5931,11 @@ impl Compiler<'_> {
         }
         let loop_depth = self.control.stack.depth;
         let start = self.assembler.label();
+        let filter_cleanup = if self.context.python_version <= PythonVersion::Py313 {
+            self.assembler.label()
+        } else {
+            start
+        };
         let protected_start = self.assembler.label();
         let yielded = self.assembler.label();
         let yielded_end = self.assembler.label();
@@ -5504,7 +5993,7 @@ impl Compiler<'_> {
                 condition,
                 self.source_location(element_range),
                 accepted,
-                start,
+                filter_cleanup,
                 add_opcode == LIST_APPEND,
                 true,
             )?;
@@ -5522,11 +6011,17 @@ impl Compiler<'_> {
             value,
             add_opcode,
             ComprehensionLoop {
-                restart: start,
+                restart: filter_cleanup,
                 iterator_depth: iterator_depth + 1,
                 comprehension_location: cleanup_location,
             },
         )?;
+        if self.context.python_version <= PythonVersion::Py313 {
+            // Keep CPython's original rejection block until jump threading and
+            // backward-conditional normalization run in the assembler.
+            self.assembler.preserve_block_boundary(filter_cleanup);
+            self.assembler.mark(filter_cleanup);
+        }
         self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
         if let Some(exclusion_start) = filtered_element_exclusion_start {
             let exclusion_end = self.assembler.label();
@@ -5547,7 +6042,11 @@ impl Compiler<'_> {
         self.assembler.mark(async_cleanup);
         self.set_depth(loop_depth + 1);
         self.apply_compiler_stack_effect(END_ASYNC_FOR, 0, -2)?;
-        self.assembler.emit_backward(END_ASYNC_FOR, send);
+        if self.context.python_version <= PythonVersion::Py313 {
+            self.assembler.emit(END_ASYNC_FOR, 0);
+        } else {
+            self.assembler.emit_backward(END_ASYNC_FOR, send);
+        }
         let async_cleanup_end = self.assembler.label();
         self.assembler.mark(async_cleanup_end);
         self.control
@@ -5618,6 +6117,16 @@ impl Compiler<'_> {
         result
     }
 
+    /// Legacy code generation admits folded display constants before visiting later code.
+    fn emit_collection_constant(&mut self, constant: Constant) -> Result<(), CompileError> {
+        if self.context.python_version <= PythonVersion::Py313 {
+            let index = self.add_constant(constant)?;
+            self.emit(LOAD_CONST, index, 1)
+        } else {
+            self.emit_deferred_constant(constant)
+        }
+    }
+
     fn compile_collection(
         &mut self,
         elements: &[Expr],
@@ -5632,13 +6141,15 @@ impl Compiler<'_> {
                     .collect::<Option<Vec<_>>>()
             {
                 for element in elements {
-                    self.record_folded_value(element)?;
+                    if self.context.python_version >= PythonVersion::Py314 {
+                        self.record_folded_value(element)?;
+                    }
                 }
                 for element in elements {
                     self.emit_folded_tuple_not_nops(element)?;
                 }
                 self.assembler.set_location(collection_location);
-                self.emit_deferred_constant(Constant::Tuple(constants))?;
+                self.emit_collection_constant(Constant::Tuple(constants))?;
                 self.assembler
                     .add_last_constant_fold_slots(folded_elements_owner_slots(
                         elements,
@@ -5664,7 +6175,13 @@ impl Compiler<'_> {
                 }
                 return Ok(());
             }
-            if elements.len() > 30 {
+            if elements.len() > 30
+                && !(self.context.python_version <= PythonVersion::Py313
+                    && matches!(kind, CollectionKind::List | CollectionKind::Set)
+                    && elements
+                        .iter()
+                        .all(|element| self.source_aware_fold_constant(element).is_some()))
+            {
                 self.emit(kind.build_opcode_for_unpacking(), 0, 1)?;
                 for element in elements {
                     self.compile_expression(element)?;
@@ -5683,7 +6200,9 @@ impl Compiler<'_> {
                     .collect::<Option<Vec<_>>>()
             {
                 for element in elements {
-                    self.record_folded_value(element)?;
+                    if self.context.python_version >= PythonVersion::Py314 {
+                        self.record_folded_value(element)?;
+                    }
                 }
                 for element in elements {
                     self.emit_folded_tuple_not_nops(element)?;
@@ -5695,7 +6214,7 @@ impl Compiler<'_> {
                     Constant::Tuple(constants)
                 };
                 self.emit(kind.build_opcode_for_unpacking(), 0, 1)?;
-                self.emit_deferred_constant(constant)?;
+                self.emit_collection_constant(constant)?;
                 self.emit(
                     if kind == CollectionKind::List {
                         LIST_EXTEND
@@ -5749,14 +6268,17 @@ impl Compiler<'_> {
                 .position(Expr::is_starred_expr)
                 .unwrap_or(elements.len())
         };
-        if unpacking_start >= 3
+        if self.context.python_version >= PythonVersion::Py314
+            && unpacking_start >= 3
             && let Some(constants) = elements[..unpacking_start]
                 .iter()
                 .map(|element| self.source_aware_fold_constant(element))
                 .collect::<Option<Vec<_>>>()
         {
             for element in &elements[..unpacking_start] {
-                self.record_folded_value(element)?;
+                if self.context.python_version >= PythonVersion::Py314 {
+                    self.record_folded_value(element)?;
+                }
             }
             for element in &elements[..unpacking_start] {
                 self.emit_folded_tuple_not_nops(element)?;
@@ -5768,7 +6290,7 @@ impl Compiler<'_> {
                 Constant::Tuple(constants)
             };
             self.emit(kind.build_opcode_for_unpacking(), 0, 1)?;
-            self.emit_deferred_constant(constant)?;
+            self.emit_collection_constant(constant)?;
             self.emit(kind.extend_opcode(), 1, -1)?;
             self.assembler
                 .add_last_constant_fold_slots(folded_elements_owner_slots(
@@ -5809,7 +6331,8 @@ impl Compiler<'_> {
         self.assembler.set_location(expression_location);
         let result = match expression {
             Expr::Tuple(tuple)
-                if tuple.elts.iter().any(Expr::is_starred_expr) || tuple.elts.len() > 30 =>
+                if self.context.python_version >= PythonVersion::Py314
+                    && (tuple.elts.iter().any(Expr::is_starred_expr) || tuple.elts.len() > 30) =>
             {
                 // The 3.15 flowgraph folds constant append chains before removing this
                 // intrinsic, preserving the tuple's location on the folded load.
@@ -5820,7 +6343,7 @@ impl Compiler<'_> {
                 Ok(())
             }
             Expr::List(list) if !list.elts.iter().any(Expr::is_starred_expr) => {
-                if list.elts.len() <= 30
+                if (self.context.python_version <= PythonVersion::Py313 || list.elts.len() <= 30)
                     && let Some(constants) = list
                         .elts
                         .iter()
@@ -5828,13 +6351,15 @@ impl Compiler<'_> {
                         .collect::<Option<Vec<_>>>()
                 {
                     for element in &list.elts {
-                        self.record_folded_value(element)?;
+                        if self.context.python_version >= PythonVersion::Py314 {
+                            self.record_folded_value(element)?;
+                        }
                     }
                     for element in &list.elts {
                         self.emit_folded_tuple_not_nops(element)?;
                     }
                     self.assembler.set_location(expression_location);
-                    self.emit_deferred_constant(Constant::Tuple(constants))?;
+                    self.emit_collection_constant(Constant::Tuple(constants))?;
                     self.assembler
                         .add_last_constant_fold_slots(folded_elements_owner_slots(
                             &list.elts,
@@ -5848,7 +6373,9 @@ impl Compiler<'_> {
                 } else {
                     self.compile_collection(
                         &list.elts,
-                        if list.elts.len() > 30 {
+                        if self.context.python_version >= PythonVersion::Py314
+                            && list.elts.len() > 30
+                        {
                             CollectionKind::List
                         } else {
                             CollectionKind::Tuple
@@ -5857,7 +6384,8 @@ impl Compiler<'_> {
                 }
             }
             Expr::Set(set)
-                if set.elts.len() <= 30
+                if (self.context.python_version <= PythonVersion::Py313
+                    || set.elts.len() <= 30)
                     && !set.elts.iter().any(Expr::is_starred_expr)
                     && set
                         .elts
@@ -5866,7 +6394,9 @@ impl Compiler<'_> {
             {
                 let mut constants = Vec::with_capacity(set.elts.len());
                 for element in &set.elts {
-                    self.record_folded_value(element)?;
+                    if self.context.python_version >= PythonVersion::Py314 {
+                        self.record_folded_value(element)?;
+                    }
                     constants.push(self.source_aware_fold_constant(element).unwrap());
                 }
                 for element in &set.elts {
@@ -5874,7 +6404,7 @@ impl Compiler<'_> {
                 }
                 self.assembler.set_location(expression_location);
                 let constant = self.fold_frozenset_constant(constants);
-                self.emit_deferred_constant(constant)?;
+                self.emit_collection_constant(constant)?;
                 self.assembler
                     .add_last_constant_fold_slots(folded_elements_owner_slots(
                         &set.elts,
@@ -5932,6 +6462,26 @@ impl Compiler<'_> {
                 index += 1;
             }
             let group = &items[group_start..index];
+            if self.context.python_version <= PythonVersion::Py313
+                && (2..=15).contains(&group.len())
+                && let Some(keys) = group
+                    .iter()
+                    .map(|item| self.source_aware_fold_constant(item.key.as_ref().unwrap()))
+                    .collect::<Option<Vec<_>>>()
+            {
+                for item in group {
+                    self.compile_expression(&item.value)?;
+                }
+                let keys = self.add_constant(Constant::Tuple(keys))?;
+                self.emit(LOAD_CONST, keys, 1)?;
+                let count = to_u32(group.len(), "dictionary item count")?;
+                self.emit(BUILD_CONST_KEY_MAP, count, -i32::try_from(count).unwrap())?;
+                if have_dict {
+                    self.emit(DICT_UPDATE, 1, -1)?;
+                }
+                have_dict = true;
+                continue;
+            }
             let large = group.len() > 15;
             if large {
                 self.emit(BUILD_MAP, 0, 1)?;
@@ -5964,7 +6514,9 @@ impl Compiler<'_> {
 
     fn compile_slice(&mut self, slice: &ruff_python_ast::ExprSlice) -> Result<(), CompileError> {
         let slice_location = self.source_location(slice.range);
-        if let Some(constant) = constant_slice(slice) {
+        if self.context.python_version >= PythonVersion::Py314
+            && let Some(constant) = constant_slice(slice)
+        {
             let index = self.add_constant(constant)?;
             self.assembler.set_location(slice_location);
             return self.emit(LOAD_CONST, index, 1);
@@ -6063,6 +6615,14 @@ impl Compiler<'_> {
         let base_depth = self.control.stack.depth;
         let else_label = self.assembler.label();
         let end = self.assembler.label();
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::ValueIfEnd(expression.range),
+            end,
+        );
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::ValueIfElse(expression.range),
+            else_label,
+        );
         // CPython appends this repeated-attribute if-expression marker after
         // compacting an ordinary try inside an iterator loop. A fresh marker slot
         // is ownerless; a concrete protected fallthrough vacancy remains owned.
@@ -6264,9 +6824,15 @@ impl Compiler<'_> {
         // that conditional's actual fallthrough leaf rather than its whole source range.
         let preserve_nested_no_location = if let Expr::If(nested) = expression.body.as_ref() {
             let fallthrough = conditional_expression_fallthrough(nested);
-            let location = fallthrough.map_or(SourceLocation::NONE, |fallthrough| {
-                self.source_location(fallthrough.range())
-            });
+            let location = if self.context.python_version <= PythonVersion::Py313 {
+                // Native legacy joins stay unlocated through early exit copying;
+                // inheriting the else leaf now would thread away the donor owner.
+                SourceLocation::NONE
+            } else {
+                fallthrough.map_or(SourceLocation::NONE, |fallthrough| {
+                    self.source_location(fallthrough.range())
+                })
+            };
             self.assembler.set_location(location);
             fallthrough.is_none()
         } else {
@@ -6453,6 +7019,16 @@ impl Compiler<'_> {
         let base_depth = self.control.stack.depth;
         let otherwise = self.assembler.label();
         let end = defer_return.then(|| self.assembler.label());
+        if let Some(end) = end {
+            self.bind_native_source_label(
+                super::legacy_native_labels::NativeRole::ValueIfEnd(conditional.range),
+                end,
+            );
+            self.bind_native_source_label(
+                super::legacy_native_labels::NativeRole::ValueIfElse(conditional.range),
+                otherwise,
+            );
+        }
         if defer_return {
             self.compile_if_expression_condition(&conditional.test, otherwise)?;
         } else {
@@ -6492,7 +7068,39 @@ impl Compiler<'_> {
         expression: &ruff_python_ast::ExprBoolOp,
         continuation: Option<(BoolOp, SourceLocation)>,
     ) -> Result<(), CompileError> {
-        self.compile_bool_expression_at(expression, continuation, false)
+        if self.context.python_version <= PythonVersion::Py313 {
+            let end = self.assembler.label();
+            self.bind_native_source_label(
+                super::legacy_native_labels::NativeRole::ValueBoolEnd(expression.range),
+                end,
+            );
+            let location = self.source_location(expression.range);
+            let jump = if expression.op == BoolOp::And {
+                POP_JUMP_IF_FALSE
+            } else {
+                POP_JUMP_IF_TRUE
+            };
+            let Some((last, leading)) = expression.values.split_last() else {
+                return Err(CompileError::Internal(
+                    "Boolean expression has no operands".to_owned(),
+                ));
+            };
+            for value in leading {
+                self.compile_expression(value)?;
+                self.assembler.set_location(location);
+                self.emit(COPY, 1, 1)?;
+                if self.context.python_version == PythonVersion::Py313 {
+                    self.emit(TO_BOOL, 0, 0)?;
+                }
+                self.emit_jump_forward(jump, end, -1)?;
+                self.emit(POP_TOP, 0, -1)?;
+            }
+            self.compile_expression(last)?;
+            self.assembler.mark(end);
+            Ok(())
+        } else {
+            self.compile_bool_expression_at(expression, continuation, false)
+        }
     }
 
     fn compile_bool_expression_at(
@@ -6974,7 +7582,7 @@ impl Compiler<'_> {
     }
 
     pub(super) fn emit_boolean_comparison(&mut self, operator: CmpOp) -> Result<(), CompileError> {
-        let (opcode, argument) = comparison_operator_boolean(operator);
+        let (opcode, argument) = comparison_operator_boolean(operator, self.context.python_version);
         self.emit(opcode, argument, -1)?;
         if matches!(opcode, IS_OP | CONTAINS_OP) {
             // CPython folds the original comparison into its following TO_BOOL slot.
@@ -6990,12 +7598,17 @@ impl Compiler<'_> {
         self.compile_expression(&expression.left)?;
         if expression.ops.len() == 1 {
             self.compile_comparison_rhs(expression.ops[0], &expression.comparators[0])?;
-            let (opcode, argument) = comparison_operator(expression.ops[0]);
+            let (opcode, argument) =
+                comparison_operator(expression.ops[0], self.context.python_version);
             return self.emit(opcode, argument, -1);
         }
 
         let base_depth = self.control.stack.depth - 1;
         let cleanup = self.assembler.label();
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::ValueCompareCleanup(expression.range),
+            cleanup,
+        );
         for (operator, comparator) in expression
             .ops
             .iter()
@@ -7005,7 +7618,7 @@ impl Compiler<'_> {
             self.compile_expression(comparator)?;
             self.emit(SWAP, 2, 0)?;
             self.emit(COPY, 2, 1)?;
-            let (opcode, argument) = comparison_operator(*operator);
+            let (opcode, argument) = comparison_operator(*operator, self.context.python_version);
             self.emit(opcode, argument, -1)?;
             self.emit(COPY, 1, 1)?;
             self.emit(TO_BOOL, 0, 0)?;
@@ -7041,9 +7654,13 @@ impl Compiler<'_> {
         }
         let operator = *expression.ops.last().unwrap();
         self.compile_comparison_rhs(operator, expression.comparators.last().unwrap())?;
-        let (opcode, argument) = comparison_operator(operator);
+        let (opcode, argument) = comparison_operator(operator, self.context.python_version);
         self.emit(opcode, argument, -1)?;
         let end = self.assembler.label();
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::ValueCompareEnd(expression.range),
+            end,
+        );
         self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
 
         self.assembler.mark(cleanup);
@@ -7378,9 +7995,19 @@ impl Compiler<'_> {
     ) -> Result<(), CompileError> {
         let otherwise = self.assembler.label();
         let end = self.assembler.label();
+        if body_target == else_target {
+            self.bind_native_source_label(
+                super::legacy_native_labels::NativeRole::ConditionIfEnd(conditional.range),
+                end,
+            );
+            self.bind_native_source_label(
+                super::legacy_native_labels::NativeRole::ConditionIfElse(conditional.range),
+                otherwise,
+            );
+        }
         self.compile_jump_if(&conditional.test, false, otherwise)?;
         self.assembler.record_short_circuit_owner_continuation();
-        self.compile_jump_if(&conditional.body, jump_on, body_target)?;
+        self.compile_if_expression_arm_jump(&conditional.body, jump_on, body_target)?;
         self.assembler.set_location(SourceLocation::NONE);
         let body_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
         if self.control.conditions.retained_multiline_assert_ifexp_exit == Some(conditional.range) {
@@ -7405,10 +8032,16 @@ impl Compiler<'_> {
                         .terminal_try_condition_exception_exclusion_depth
                 },
                 None,
-                |compiler| compiler.compile_jump_if(&conditional.orelse, jump_on, else_target),
+                |compiler| {
+                    compiler.compile_if_expression_arm_jump(
+                        &conditional.orelse,
+                        jump_on,
+                        else_target,
+                    )
+                },
             )?;
         } else {
-            self.compile_jump_if(&conditional.orelse, jump_on, else_target)?;
+            self.compile_if_expression_arm_jump(&conditional.orelse, jump_on, else_target)?;
         }
         if body_target == else_target
             && jump_constant_truthiness(&conditional.orelse) == Some(jump_on)
@@ -7424,14 +8057,60 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    /// Keeps legacy constant arms conditional until after exit-block copying.
+    fn compile_if_expression_arm_jump(
+        &mut self,
+        expression: &Expr,
+        jump_on: bool,
+        label: Label,
+    ) -> Result<(), CompileError> {
+        if self.context.python_version <= PythonVersion::Py313
+            && self.return_value_is_constant(expression)
+        {
+            // CPython copies exits before folding these instructions. Emitting
+            // a jump early would copy the target's exception owner and remove
+            // the constant NOP that still blocks 3.12 jump threading.
+            self.compile_expression(expression)?;
+            self.assembler
+                .set_location(self.source_location(expression.range()));
+            self.emit(TO_BOOL, 0, 0)?;
+            self.emit_jump_forward(
+                if jump_on {
+                    POP_JUMP_IF_TRUE
+                } else {
+                    POP_JUMP_IF_FALSE
+                },
+                label,
+                -1,
+            )?;
+            self.emit(NOT_TAKEN, 0, 0)
+        } else {
+            self.compile_jump_if(expression, jump_on, label)
+        }
+    }
+
     pub(super) fn compile_jump_if(
         &mut self,
         expression: &Expr,
         jump_on: bool,
         label: Label,
     ) -> Result<(), CompileError> {
+        if self.context.python_version <= PythonVersion::Py313
+            && let Some(comparison) = legacy_folded_not_comparison(expression)
+        {
+            return self.compile_jump_if(&comparison, jump_on, label);
+        }
+        let legacy_constant = self.context.python_version <= PythonVersion::Py313
+            && self.return_value_is_constant(expression);
+        if legacy_constant {
+            // Keep the original constant and conditional until CFG optimization.
+            // An early unconditional jump would expose its target to exit copying
+            // and let incoming edges skip the constant's retained line marker.
+            return self.compile_if_expression_arm_jump(expression, jump_on, label);
+        }
         if let Expr::UnaryOp(unary) = expression
             && unary.op == UnaryOp::Not
+            && !legacy_constant
         {
             let defer_terminal_with_exclusion = self.control.withs.terminal_with_condition
                 == Some(expression.range())
@@ -7498,7 +8177,13 @@ impl Compiler<'_> {
             }
             return Ok(());
         }
-        let constant_truthiness = jump_constant_truthiness(expression);
+        let constant_truthiness = if legacy_constant {
+            self.source_aware_fold_constant(expression)
+                .as_ref()
+                .map(super::constant::constant_truthiness)
+        } else {
+            jump_constant_truthiness(expression)
+        };
         if let Some(truthiness) = constant_truthiness {
             let empty_folded_block = self.assembler.at_empty_borrow_block();
             self.record_folded_value(expression)?;
@@ -7582,6 +8267,10 @@ impl Compiler<'_> {
                 return self.compile_jump_if(last, jump_on, label);
             }
             let end = self.assembler.label();
+            self.bind_native_source_label(
+                super::legacy_native_labels::NativeRole::ConditionBoolEnd(boolean.range),
+                end,
+            );
             for (operand_index, value) in leading.iter().enumerate() {
                 if defer_terminal_with_exclusion {
                     self.with_control_override(
@@ -7616,6 +8305,10 @@ impl Compiler<'_> {
             let base_depth = self.control.stack.depth;
             let cleanup = self.assembler.label();
             let end = self.assembler.label();
+            self.bind_native_source_label(
+                super::legacy_native_labels::NativeRole::ConditionCompareCleanup(comparison.range),
+                cleanup,
+            );
             self.compile_expression(&comparison.left)?;
             for (operator, comparator) in comparison
                 .ops
@@ -7668,6 +8361,15 @@ impl Compiler<'_> {
                 )?;
             }
             self.emit(NOT_TAKEN, 0, 0)?;
+            if self.context.python_version <= PythonVersion::Py313 {
+                self.assembler.set_location(SourceLocation::NONE);
+            }
+            // Native reserves End here, after operand labels. Its source plan
+            // is independent of the earlier physical label allocation above.
+            self.bind_native_source_label(
+                super::legacy_native_labels::NativeRole::ConditionCompareEnd(comparison.range),
+                end,
+            );
             let comparison_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
             if self.control.conditions.retained_chained_comparison_exit == Some(comparison.range) {
                 // CPython retains this final comparison fallthrough jump as a NOP when its
@@ -7679,8 +8381,15 @@ impl Compiler<'_> {
 
             self.assembler.mark(cleanup);
             self.set_depth(base_depth + 1);
+            if self.context.python_version <= PythonVersion::Py313 {
+                self.assembler
+                    .set_location(self.source_location(comparison.range));
+            }
             self.emit(POP_TOP, 0, -1)?;
             if !jump_on {
+                if self.context.python_version <= PythonVersion::Py313 {
+                    self.assembler.set_location(SourceLocation::NONE);
+                }
                 let cleanup_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, label)?;
                 if self.control.statements.in_terminal_if_branch_suite
                     && self.control.conditions.retained_chained_comparison_exit
@@ -7979,7 +8688,7 @@ impl Compiler<'_> {
             Expr::Subscript(subscript) => {
                 self.compile_expression(&subscript.value)?;
                 if let Expr::Slice(slice) = subscript.slice.as_ref()
-                    && two_element_slice_optimization(slice)
+                    && two_element_slice_optimization(slice, self.context.python_version)
                 {
                     let slice_location = self.source_location(slice.range);
                     self.compile_optional_slice_bound(slice.lower.as_deref(), slice_location)?;
@@ -8087,6 +8796,45 @@ impl CollectionKind {
         }
     }
 }
+
+/// Mirrors the legacy AST optimizer, including the inner comparison's source range.
+fn legacy_folded_not_comparison(expression: &Expr) -> Option<Expr> {
+    let (comparison, operator) = legacy_not_comparison(expression)?;
+    let mut comparison = comparison.clone();
+    comparison.ops[0] = operator;
+    Some(Expr::Compare(comparison))
+}
+
+/// Identify the single comparison and operator left by legacy `not` folding.
+fn legacy_not_comparison(expression: &Expr) -> Option<(&ruff_python_ast::ExprCompare, CmpOp)> {
+    let Expr::UnaryOp(_) = expression else {
+        return None;
+    };
+    let mut operand = expression;
+    let mut negated = false;
+    while let Expr::UnaryOp(unary) = operand {
+        if unary.op != UnaryOp::Not {
+            return None;
+        }
+        negated = !negated;
+        operand = &unary.operand;
+    }
+    let Expr::Compare(comparison) = operand else {
+        return None;
+    };
+    let [operator] = comparison.ops.as_ref() else {
+        return None;
+    };
+    let inverse = match operator {
+        CmpOp::Is => CmpOp::IsNot,
+        CmpOp::IsNot => CmpOp::Is,
+        CmpOp::In => CmpOp::NotIn,
+        CmpOp::NotIn => CmpOp::In,
+        _ => return None,
+    };
+    Some((comparison, if negated { inverse } else { *operator }))
+}
+
 fn expression_contains_yield(expression: &Expr) -> bool {
     #[derive(Default)]
     struct Collector {
@@ -8202,6 +8950,9 @@ pub(super) fn optimized_generator_callable_for_target(
     call: &ruff_python_ast::ExprCall,
     python_version: PythonVersion,
 ) -> Option<&str> {
+    if python_version <= PythonVersion::Py313 {
+        return None;
+    }
     let Expr::Name(name) = call.func.as_ref() else {
         return None;
     };
@@ -8401,8 +9152,8 @@ pub(super) fn binary_operator(operator: Operator, inplace: bool) -> BinaryOperat
     }
 }
 
-pub(super) fn comparison_operator(operator: CmpOp) -> (Opcode, u32) {
-    match operator {
+pub(super) fn comparison_operator(operator: CmpOp, python_version: PythonVersion) -> (Opcode, u32) {
+    let (opcode, argument) = match operator {
         CmpOp::Lt => (COMPARE_OP, ComparisonOperation::LT.argument()),
         CmpOp::LtE => (COMPARE_OP, ComparisonOperation::LE.argument()),
         CmpOp::Eq => (COMPARE_OP, ComparisonOperation::EQ.argument()),
@@ -8413,15 +9164,27 @@ pub(super) fn comparison_operator(operator: CmpOp) -> (Opcode, u32) {
         CmpOp::IsNot => (IS_OP, 1),
         CmpOp::In => (CONTAINS_OP, 0),
         CmpOp::NotIn => (CONTAINS_OP, 1),
+    };
+    if opcode == COMPARE_OP && python_version == PythonVersion::Py312 {
+        // Python 3.12 stores the comparison index above four mask bits; later
+        // targets insert a fifth bit that requests a Boolean result.
+        (opcode, ((argument >> 5) << 4) | (argument & 15))
+    } else {
+        (opcode, argument)
     }
 }
 
-pub(super) fn comparison_operator_boolean(operator: CmpOp) -> (Opcode, u32) {
-    let (opcode, argument) = comparison_operator(operator);
-    if matches!(
-        operator,
-        CmpOp::Lt | CmpOp::LtE | CmpOp::Eq | CmpOp::NotEq | CmpOp::Gt | CmpOp::GtE
-    ) {
+pub(super) fn comparison_operator_boolean(
+    operator: CmpOp,
+    python_version: PythonVersion,
+) -> (Opcode, u32) {
+    let (opcode, argument) = comparison_operator(operator, python_version);
+    if python_version != PythonVersion::Py312
+        && matches!(
+            operator,
+            CmpOp::Lt | CmpOp::LtE | CmpOp::Eq | CmpOp::NotEq | CmpOp::Gt | CmpOp::GtE
+        )
+    {
         (opcode, ComparisonOperation::force_boolean(argument))
     } else {
         (opcode, argument)

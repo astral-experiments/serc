@@ -1,9 +1,9 @@
 # Serc
 
 Serc is an experimental Rust compiler from Python source to CPython bytecode. It defaults to
-CPython 3.14.5 and has an experimental CPython 3.15.0rc2 target. It uses Ruff's parser and does not
-embed or link a Python runtime. The selected CPython release is needed only to execute generated
-`.pyc` files and to serve as the compatibility oracle in tests.
+CPython 3.14.5 and has experimental CPython 3.12.14, 3.13.15, and 3.15.0rc2 targets. It uses Ruff's
+parser and does not embed or link a Python runtime. The selected CPython release is needed only
+to execute generated `.pyc` files and to serve as the compatibility oracle in tests.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the pipeline, ownership boundaries, assembler contracts,
 generated-target workflow, and required correctness gate.
@@ -28,14 +28,16 @@ The `serc` binary accepts Python files and directories, recursively compiles dir
 and writes standard timestamp-invalidated `.pyc` files under `__pycache__`:
 
 ```console
+cargo run --release -p serc-cli -- compile --python-version 3.12 path/to/package
+cargo run --release -p serc-cli -- compile --python-version 3.13 path/to/package
 cargo run --release -p serc-cli -- compile --python-version 3.14 path/to/package
 cargo run --release -p serc-cli -- compile --python-version 3.15 path/to/package
 ```
 
-`--python-version` accepts `3.14` (the default, pinned to CPython 3.14.5) and `3.15` (pinned to
-CPython 3.15.0rc2). Cache names use the selected version, such as `module.cpython-314.pyc` and
-`module.cpython-315.pyc`, and their headers carry the corresponding magic number. Python 3.15
-support remains experimental.
+`--python-version` accepts `3.12`, `3.13`, `3.14` (the default), and `3.15`, using the
+[exact pinned releases below](#updating-the-cpython-target). Cache names use the selected version,
+such as `module.cpython-312.pyc` and `module.cpython-315.pyc`, and their headers carry the
+corresponding magic number. Python 3.12, 3.13, and 3.15 support remains experimental.
 
 Paths default to the current directory. Pass `--check` to compile without writing cache files and
 `--quiet` to suppress the success summary. Compilation is sequential so the command can be
@@ -57,7 +59,8 @@ let source = b"# coding: utf-8\r\nanswer = 42\r\n";
 let pyc = serc::compile_bytes_to_pyc(source, "module.py", 1_700_000_000).unwrap();
 ```
 
-Use `CompileOptions` to select a target without changing the default for other compilations:
+Use `CompileOptions` with `PythonVersion::Py312`, `Py313`, `Py314`, or `Py315` to select a target
+without changing the default for other compilations:
 
 ```rust
 use serc::{CompileOptions, PythonVersion, compile_bytes_with_options};
@@ -91,17 +94,24 @@ with this crate's marshal output. For each CPython-rejected file it records whet
 the input, accepts it, or fails internally:
 
 ```console
+./scripts/check-cpython-compatibility /path/to/python3.12.14 3.12
+./scripts/check-cpython-compatibility /path/to/python3.13.15 3.13
 ./scripts/check-cpython-compatibility /path/to/cpython-3.14.5
 ./scripts/check-cpython-compatibility /path/to/cpython-3.15.0rc2 3.15
 ```
 
-The wrapper's optional second argument selects `3.14` (the default) or `3.15`. Each invocation
-uses its exact pinned oracle and frozen outcome counts; the 3.15 gate compares source bytes.
-When invoking the `compare_cpython_corpus` example directly, select the target with
-`--python-version 3.15` and the oracle executable with `--python /path/to/cpython-3.15.0rc2`.
-The comparator refuses any
-interpreter whose implementation, version, release candidate, or magic number does not exactly
-match the selected target. It also fails on a missing corpus root or an empty corpus.
+The wrapper's optional second argument selects `3.12`, `3.13`, `3.14` (the default), or `3.15`.
+Each invocation uses its exact pinned oracle and frozen outcome counts; the 3.12, 3.13, and 3.15
+gates compare source bytes. When invoking the `compare_cpython_corpus` example directly, select
+the target and matching oracle explicitly, for example:
+
+```console
+cargo run --release -p serc --example compare_cpython_corpus -- \
+  --python-version 3.12 --python /path/to/python3.12.14 --source-bytes path/to/corpus
+```
+
+The comparator refuses any interpreter whose implementation, version, release candidate, or magic
+number does not exactly match the selected target. It also fails on a missing corpus root or an empty corpus.
 Pass `--require-all` to return a failure status unless the corpus contains at least one exact match
 and every CPython-accepted file matches exactly. Pass `--require-rejection-parity` to additionally
 require clean Serc rejections for every CPython-rejected input. Rejection outcomes are reported
@@ -131,7 +141,14 @@ oracle failure:          0
 The CPython 3.15.0rc2 gate uses the same 2,451 pinned files and requires 2,249 exact matches.
 Its 202 CPython-rejected files are frozen as 133 matched rejections, 55 rejection mismatches,
 and 14 compiler failures. Every other failure category must remain zero, and `--require-all`
-independently rejects any failure on a CPython-accepted input. Both gates run in CI.
+independently rejects any failure on a CPython-accepted input.
+
+The Python 3.12.14 gate requires 2,174 exact matches from the same 2,451 files. Its 277
+CPython-rejected files are frozen as 210 matched rejections, 61 rejection mismatches, and
+6 compiler failures. Python 3.13.15 requires 2,193 exact matches; its 258 CPython-rejected
+files are frozen as 196 matched rejections, 55 rejection mismatches, and 7 compiler failures.
+Both require zero in every other failure category and reject any failure on a CPython-accepted
+input. All four gates run in CI.
 
 This exact-compatibility result is specific to the pinned oracle version and frozen corpus; it is
 not a claim about arbitrary CPython versions or Python inputs. The exact-output gate remains fully
@@ -146,12 +163,18 @@ these exact CPython releases:
 
 | Target | CPython tag | Commit | Magic number |
 | --- | --- | --- | --- |
+| `3.12` (experimental) | `v3.12.14` | `2abcf904b8dac8c999d2b3aac76681abb333798a` | `cb0d0d0a` |
+| `3.13` (experimental) | `v3.13.15` | `4061bc4c35f7c26f25264666d4ba083b93d2f6f9` | `f30d0d0a` |
 | `3.14` (default) | `v3.14.5` | `5607950ef232dad16d75c0cf53101d9649d89115` | `2b0e0d0a` |
 | `3.15` (experimental) | `v3.15.0rc2` | `435c9e5a798c99653e3ab64ce29baed0e4f3dfee` | `520e0d0a` |
 
 Regenerate each checked-in module from its pinned checkout, then verify that it is current:
 
 ```console
+python3 crates/serc/scripts/generate_cpython_target.py --cpython /path/to/cpython-3.12 --target-version 3.12
+python3 crates/serc/scripts/generate_cpython_target.py --cpython /path/to/cpython-3.12 --target-version 3.12 --check
+python3 crates/serc/scripts/generate_cpython_target.py --cpython /path/to/cpython-3.13 --target-version 3.13
+python3 crates/serc/scripts/generate_cpython_target.py --cpython /path/to/cpython-3.13 --target-version 3.13 --check
 python3 crates/serc/scripts/generate_cpython_target.py --cpython /path/to/cpython-3.14 --target-version 3.14
 python3 crates/serc/scripts/generate_cpython_target.py --cpython /path/to/cpython-3.14 --target-version 3.14 --check
 python3 crates/serc/scripts/generate_cpython_target.py --cpython /path/to/cpython-3.15 --target-version 3.15
@@ -169,9 +192,8 @@ published independently. From the workspace root, `./scripts/check-ruff-pin` ver
 Cargo manifest, lockfile, submodule gitlink, and initialized, clean submodule all select the same
 revision.
 
-From the workspace root, `./scripts/check-cpython-compatibility /path/to/python3.14.5` and
-`./scripts/check-cpython-compatibility /path/to/python3.15.0rc2 3.15` require the initialized matching
-Ruff submodule and run their complete frozen gates without mutating the checkout.
+From the workspace root, `./scripts/check-cpython-compatibility` requires the initialized matching
+Ruff submodule and runs the selected target's complete frozen gate without mutating the checkout.
 
 ## Benchmarks
 

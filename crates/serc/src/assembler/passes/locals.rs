@@ -22,7 +22,7 @@ use super::super::{
     block_jump_target, ends_scope, opcode_stack_counts, opcode_stack_effect,
 };
 use crate::assembler::OptimizationPipeline;
-use crate::assembler::block_graph::ItemMut;
+use crate::assembler::block_graph::{BasicBlockId, ItemMut};
 use crate::assembler::ir::{ThreadedBorrowEntries, ThreadedBorrowSnapshot};
 use crate::target::{
     is_conditional_jump, is_unconditional_jump,
@@ -2183,13 +2183,27 @@ impl OptimizationPipeline {
     ///
     /// CPython checks locals above index 63 within each block. Exception boundaries and
     /// copied exits can split that block physically without losing earlier initialization.
-    fn preserve_high_local_initialization(&mut self, local_count: usize) {
+    fn preserve_high_local_initialization(
+        &mut self,
+        local_count: usize,
+        original_arrays: Option<&FxHashMap<BasicBlockId, usize>>,
+    ) {
         if local_count <= 64 {
             return;
         }
         let mut block_labels = self.preserved_block_boundaries.clone();
         // Original source joins and jump targets stay distinct after their jumps disappear.
         block_labels.extend(&self.exception_owner_provenance.block_boundaries);
+        if self.python_version == crate::PythonVersion::Py312 {
+            // A native SETUP starts a new block even when its target is the handler.
+            // Its protected continuation is distinct from a synthetic range split.
+            block_labels.extend(
+                self.exception_owner_provenance
+                    .setups
+                    .iter()
+                    .map(|(label, _)| *label),
+            );
+        }
         for region in &self.exception_regions {
             block_labels.insert(region.target);
         }
@@ -2202,15 +2216,23 @@ impl OptimizationPipeline {
         }
         let mut initialized = vec![false; local_count - 64];
         let mut previous_has_fallthrough = false;
+        let mut previous_array = None;
         for block in self.graph.order().to_vec() {
+            let original_array = original_arrays.and_then(|arrays| arrays.get(&block).copied());
             let continues_region = previous_has_fallthrough
-                && self.graph[block]
-                    .items()
-                    .iter()
-                    .take_while(|item| matches!(item, Item::Label(_)))
-                    .all(
-                        |item| matches!(item, Item::Label(label) if !block_labels.contains(label)),
-                    );
+                && if original_arrays.is_some() {
+                    // Folding a conditional does not merge its native instruction arrays.
+                    original_array.is_some() && original_array == previous_array
+                } else {
+                    self.graph[block]
+                        .items()
+                        .iter()
+                        .take_while(|item| matches!(item, Item::Label(_)))
+                        .all(
+                            |item| matches!(item, Item::Label(label) if !block_labels.contains(label)),
+                        )
+                };
+            previous_array = original_array;
             if !continues_region {
                 initialized.fill(false);
             }
@@ -2344,11 +2366,34 @@ impl OptimizationPipeline {
         local_count: usize,
         parameter_count: usize,
     ) {
+        self.add_checks_for_uninitialized_loads_in_arrays(local_count, parameter_count, None);
+    }
+
+    /// Keeps legacy high-local checks scoped to instruction arrays captured before folding.
+    pub(super) fn add_legacy_checks_for_uninitialized_loads(
+        &mut self,
+        local_count: usize,
+        parameter_count: usize,
+        original_arrays: &FxHashMap<BasicBlockId, usize>,
+    ) {
+        self.add_checks_for_uninitialized_loads_in_arrays(
+            local_count,
+            parameter_count,
+            Some(original_arrays),
+        );
+    }
+
+    fn add_checks_for_uninitialized_loads_in_arrays(
+        &mut self,
+        local_count: usize,
+        parameter_count: usize,
+        original_arrays: Option<&FxHashMap<BasicBlockId, usize>>,
+    ) {
         if local_count == 0 {
             return;
         }
 
-        self.preserve_high_local_initialization(local_count);
+        self.preserve_high_local_initialization(local_count, original_arrays);
 
         let graph = &self.graph;
         if !graph.features().has_fast_load() {
@@ -2512,7 +2557,15 @@ impl OptimizationPipeline {
                 {
                     continue;
                 }
-                if let Some(target) = exception_successors[block_starts[block.index()] + offset] {
+                // Legacy exit copies preserve the donor's absent exception owner even
+                // inside a protected destination. Those instructions cannot contribute
+                // uncertainty to the destination's handler.
+                let ownerless_legacy_copy = self.python_version <= crate::PythonVersion::Py313
+                    && instruction.exception_policy().exclusion()
+                        == super::super::ExceptionExclusion::Always;
+                if !ownerless_legacy_copy
+                    && let Some(target) = exception_successors[block_starts[block.index()] + offset]
+                {
                     propagate(target, unsafe_locals);
                 }
                 let Operand::Value(argument) = instruction.operand() else {

@@ -4,13 +4,14 @@ use std::collections::BinaryHeap;
 use super::{
     EXTENDED_ARG, Item, LOAD_FAST_BORROW_LOAD_FAST_BORROW, LOAD_FAST_LOAD_FAST, LOAD_GLOBAL,
     NOT_TAKEN, Operand, POP_TOP, STORE_FAST, STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST,
-    ends_scope, is_conditional_jump,
+    ends_scope,
 };
 use crate::CompileError;
 use crate::assembler::{
     Instruction, Label, LayoutAssembler, NormalizedExceptionOwner, SourceLocation,
 };
-use crate::target::opcodes::END_ASYNC_FOR;
+use crate::target::is_conditional_jump_for;
+use crate::target::opcodes::{END_ASYNC_FOR, NOP};
 
 type FinalArtifacts = (Vec<u8>, Vec<u8>, u32);
 
@@ -235,7 +236,7 @@ impl LayoutAssembler {
                     instruction_index += 1;
                     block_has_instruction = true;
                     if instruction.opcode == NOT_TAKEN
-                        || (!is_conditional_jump(instruction.opcode)
+                        || (!is_conditional_jump_for(self.python_version, instruction.opcode)
                             && (!matches!(instruction.operand(), Operand::Value(_))
                                 || ends_scope(instruction.opcode)))
                     {
@@ -448,7 +449,11 @@ impl LayoutAssembler {
                 }
                 run = Some((instruction.location, size));
             }
-            max_depth = max_depth.max(instruction.maximum_stack_depth());
+            // Legacy folds preserve located NOPs for tracing, but their removed
+            // producers' recorded stack peaks do not belong to the final CFG.
+            if self.python_version >= crate::PythonVersion::Py314 || instruction.opcode != NOP {
+                max_depth = max_depth.max(instruction.maximum_stack_depth());
+            }
             instruction_index += 1;
         }
 
@@ -523,7 +528,11 @@ impl LayoutAssembler {
                 }
                 run = Some((instruction.location, size));
             }
-            max_depth = max_depth.max(instruction.maximum_stack_depth());
+            // Legacy folds preserve located NOPs for tracing, but their removed
+            // producers' recorded stack peaks do not belong to the final CFG.
+            if self.python_version >= crate::PythonVersion::Py314 || instruction.opcode != NOP {
+                max_depth = max_depth.max(instruction.maximum_stack_depth());
+            }
         }
 
         if let Some((location, length)) = run {
@@ -708,6 +717,22 @@ mod tests {
     use super::*;
     use crate::assembler::{ExceptionPolicy, ExceptionRegion, NOP};
 
+    #[test]
+    fn legacy_annotation_tuple_nops_do_not_contribute_stack_peaks() {
+        let compiled = crate::compile_with_options(
+            "from __future__ import annotations\ndef f(\n    a: A,\n    b: B,\n) -> C:\n    pass\n",
+            "legacy_stack.py",
+            &crate::CompileOptions {
+                python_version: crate::PythonVersion::Py313,
+                ..crate::CompileOptions::default()
+            },
+        )
+        .unwrap();
+        // Pinned CPython 3.13.15 keeps annotation-line NOPs, then loads the folded
+        // annotation tuple and function code. Those two values are the live peak.
+        assert_eq!(compiled.code.stack_size, 2);
+    }
+
     fn instruction(policy: ExceptionPolicy) -> Item {
         let mut instruction = Instruction::new(NOP, Operand::Value(0), SourceLocation::NONE, None);
         instruction.set_exception_policy(policy);
@@ -717,6 +742,7 @@ mod tests {
     fn layout(items: Vec<Item>, exception_regions: Vec<ExceptionRegion>) -> LayoutAssembler {
         LayoutAssembler {
             python_version: crate::PythonVersion::Py314,
+            legacy_uniform_jump_seed: false,
             items,
             exception_regions,
             exception_owner_provenance:

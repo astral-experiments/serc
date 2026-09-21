@@ -87,6 +87,11 @@ impl OptimizationPipeline {
             block_labels.extend([region.start, region.end, region.target]);
         }
         block_labels.extend(self.preserved_block_boundaries.iter().copied());
+        if self.python_version <= crate::PythonVersion::Py313 {
+            // Exit copying can remove the last jump into an original block. Native
+            // swaptimize still cannot move stores across that block's entry.
+            block_labels.extend(&self.exception_owner_provenance.block_boundaries);
+        }
         let blocks = graph.partition_positions(&block_labels, |instruction| {
             !matches!(instruction.operand(), Operand::Value(_)) || ends_scope(instruction.opcode)
         });
@@ -356,7 +361,8 @@ impl OptimizationPipeline {
                 };
                 let first_store = stored_local(&first_instruction);
                 let last_store = stored_local(&last_instruction);
-                if first_store.is_none()
+                if self.python_version >= crate::PythonVersion::Py314
+                    && first_store.is_none()
                     && last_store.is_none()
                     && !capture_cleanup_swaps.contains(&positions[index])
                 {
@@ -390,7 +396,10 @@ impl OptimizationPipeline {
                     }
                 }
 
-                if first_instruction.local_policy.may_store_null()
+                // 3.12 resolves lines after static swaps, so the exchanged restore
+                // supplies the successor's location instead of the original store.
+                if self.python_version >= crate::PythonVersion::Py313
+                    && first_instruction.local_policy.may_store_null()
                     && last_instruction.opcode == STORE_FAST
                     && !last_instruction.local_policy.may_store_null()
                 {
