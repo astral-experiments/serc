@@ -3222,12 +3222,10 @@ impl Compiler<'_> {
                 .any(|body| {
                     matches!(body.last(), Some(Stmt::While(_)))
                         || (self.context.python_version == crate::PythonVersion::Py312
-                            && (matches!(body.last(), Some(Stmt::Try(_) | Stmt::If(_) | Stmt::Match(_)))
+                            && (matches!(body.last(), Some(Stmt::Try(_) | Stmt::If(_) | Stmt::Match(_) | Stmt::For(_)))
                                 || matches!(body.last(), Some(Stmt::Expr(expression))
                                     if matches!(expression.value.as_ref(), Expr::Await(_)))
                                 || suite_has_cold_only_terminal_if_continuation(body)
-                                || matches!(body.last(), Some(Stmt::For(loop_statement))
-                                    if loop_statement.is_async)
                                 || body.iter().any(|statement| {
                                     matches!(statement, Stmt::Assign(assignment)
                                     if super::expression::expression_defers_async_comprehension_restore(
@@ -3239,7 +3237,7 @@ impl Compiler<'_> {
             // Keep each compound arm's original jump to the shared footer. 3.12
             // visits exit blocks in source order, so nested recovery exits cannot
             // copy a return that a later arm exit has not acquired yet. Async
-            // comprehension restoration, async-loop exhaustion, ordinary await cleanup,
+            // comprehension restoration, loop exhaustion, ordinary await cleanup,
             // and their continuations also stay cold until relocation inserts a bridge
             // to the shared warm return. Keeping that original footer also preserves the
             // terminal IfEnd label for native jump sizing.
@@ -3347,6 +3345,17 @@ impl Compiler<'_> {
         for (branch_index, (test, body)) in branches.into_iter().enumerate() {
             if let Some(test) = test {
                 let next = self.assembler.label();
+                if self.context.python_version == crate::PythonVersion::Py312
+                    && statement.elif_else_clauses.is_empty()
+                    && matches!(body.last(), Some(Stmt::Return(_) | Stmt::Raise(_)))
+                {
+                    // A terminating arm receives no eager implicit return. Its false
+                    // target is the original native IfEnd, before the shared footer.
+                    self.bind_native_source_label(
+                        super::legacy_native_labels::NativeRole::IfEnd(statement.range),
+                        next,
+                    );
+                }
                 let exclude_not_taken = self.control.conditions.exclude_terminal_if_not_taken
                     || (!self.control.withs.active_with_region_exclusions.is_empty()
                         && branch_index > 0
@@ -27894,6 +27903,17 @@ impl Compiler<'_> {
             self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
             if converted_pop_block {
                 self.assembler.mark_last_as_converted_pop_block();
+                if self.context.python_version == crate::PythonVersion::Py313
+                    && location == SourceLocation::NONE
+                    && !retain_nop
+                    && remaining.is_empty()
+                    && self.control.withs.active_with_exits.is_empty()
+                    && with_body_has_folded_while_predecessor(body)
+                {
+                    // Native resolves this shared POP_BLOCK before folding the
+                    // infinite loop's false exit. Neither arm is its sole donor.
+                    self.assembler.preserve_last_no_location();
+                }
             }
             if retain_nop {
                 // The original conditional join starts a separate block, so a preceding
@@ -29921,6 +29941,27 @@ fn with_body_continue_exit_donor(body: &[Stmt]) -> Option<(TextRange, u8)> {
         }
         _ => None,
     }
+}
+
+/// Recognizes the two original predecessors of a manager's folded while join.
+fn with_body_has_folded_while_predecessor(body: &[Stmt]) -> bool {
+    let Some(Stmt::If(statement)) = body.last() else {
+        return false;
+    };
+    let [otherwise] = statement.elif_else_clauses.as_slice() else {
+        return false;
+    };
+    if otherwise.test.is_some() || !condition_has_only_runtime_tests(&statement.test) {
+        return false;
+    }
+    let infinite_loop = |body: &[Stmt]| {
+        matches!(body, [Stmt::While(statement)]
+            if matches!(statement.test.as_ref(), Expr::BooleanLiteral(test) if test.value)
+                && statement.orelse.is_empty()
+                && suite_has_linear_borrow_fallthrough(&statement.body))
+    };
+    (infinite_loop(&statement.body) && suite_has_linear_borrow_fallthrough(&otherwise.body))
+        || (infinite_loop(&otherwise.body) && suite_has_linear_borrow_fallthrough(&statement.body))
 }
 
 // A complete conditional with one terminal arm leaves the other arm as the sole

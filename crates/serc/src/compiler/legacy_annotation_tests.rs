@@ -4315,3 +4315,46 @@ fn python312_for_break_keeps_original_native_jump_seed() {
         ]
     );
 }
+
+#[test]
+fn python313_manager_pop_stays_unlocated_until_infinite_loop_folding() {
+    // Captured from pinned CPython 3.13.15 using the source-bytes oracle.
+    // The loop's original false edge keeps this manager POP_BLOCK shared
+    // during line propagation, before constant folding removes that edge.
+    let source = "def f(manager, flag):\n    with manager:\n        if flag:\n            while True:\n                work()\n        else:\n            finish()\n";
+    let module = compile(source, PythonVersion::Py313);
+    let function = child(&module, "f");
+    assert_eq!(
+        function.bytecode,
+        [
+            149, 0, 85, 0, 2, 0, 32, 0, 85, 1, 40, 0, 0, 0, 0, 0, 0, 0, 97, 13, 0, 0, 30, 0, 91, 1,
+            0, 0, 0, 0, 0, 0, 0, 0, 53, 0, 0, 0, 0, 0, 0, 0, 32, 0, 77, 12, 0, 0, 91, 3, 0, 0, 0,
+            0, 0, 0, 0, 0, 53, 0, 0, 0, 0, 0, 0, 0, 32, 0, 83, 0, 83, 0, 83, 0, 53, 2, 0, 0, 0, 0,
+            0, 0, 32, 0, 103, 0, 33, 0, 44, 0, 40, 0, 0, 0, 0, 0, 0, 0, 100, 1, 0, 0, 102, 2, 32,
+            0, 31, 0, 32, 0, 32, 0, 103, 0, 61, 3, 31, 0, 102, 1,
+        ]
+    );
+    assert_eq!(
+        function.line_table,
+        [
+            128, 0, 218, 9, 16, 222, 11, 15, 216, 18, 22, 220, 16, 20, 148, 6, 241, 3, 0, 19, 23,
+            244, 6, 0, 13, 19, 140, 72, 247, 11, 0, 10, 17, 143, 23, 142, 23, 250,
+        ]
+    );
+    assert_eq!(function.exception_table, [131, 31, 43, 3, 171, 10, 57, 7,]);
+    assert_eq!(function.arg_count, 2);
+    assert_eq!(function.positional_only_arg_count, 0);
+    assert_eq!(function.keyword_only_arg_count, 0);
+    assert_eq!(function.stack_size, 6);
+    assert_eq!(function.flags, 3);
+    assert_eq!(function.names, ["work", "finish"]);
+    assert_eq!(function.locals, ["manager", "flag"]);
+    assert_eq!(
+        function.local_kinds,
+        [crate::target::local_kinds::CO_FAST_LOCAL; 2]
+    );
+    assert_eq!(function.first_line_number, 1);
+    assert_eq!(function.name, "f");
+    assert_eq!(function.qualified_name, "f");
+    assert!(matches!(function.constants.as_slice(), [Constant::None]));
+}
