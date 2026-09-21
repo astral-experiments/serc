@@ -4797,6 +4797,19 @@ impl OptimizationPipeline {
                             || (!membership.contains(&source_position)
                                 && !membership.contains(&target_position))
                     });
+            // RAISE_VARARGS also exits the scope. Append unprotected copies now so
+            // another small-exit round can see the expanded predecessor, just as
+            // CPython's basicblock_inline_small_or_no_lineno_blocks does.
+            let inline_unprotected_raise = inline_small_exit
+                && target_terminal_opcode == Some(RAISE_VARARGS)
+                && region_memberships
+                    .iter()
+                    .enumerate()
+                    .all(|(index, membership)| {
+                        self.exception_regions[index].is_scope_fallback
+                            || (!membership.contains(&source_position)
+                                && !membership.contains(&target_position))
+                    });
             let inline_no_location_block =
                 !source_has_fallthrough && target_is_no_location_no_fallthrough;
             if !planned_copy
@@ -5724,7 +5737,9 @@ impl OptimizationPipeline {
                         Item::Label(_) => None,
                     })
                     .eq([NOP, POP_TOP, POP_TOP, JUMP_FORWARD]);
-            if (inline_unprotected_return || inline_reraising_iterator_break)
+            if (inline_unprotected_return
+                || inline_unprotected_raise
+                || inline_reraising_iterator_break)
                 && !planned_copy
                 && let Some(instruction) = copied.iter_mut().find_map(|item| match item {
                     Item::Instruction(instruction) => Some(instruction),
@@ -6439,6 +6454,7 @@ impl OptimizationPipeline {
                 graph.append_to_block(source, copied);
             } else if inline_no_location_block
                 || inline_unprotected_return
+                || inline_unprotected_raise
                 || inline_comparison_return
                 || (inline_small_exit && target_terminal_opcode == Some(RERAISE))
                 || planned_copy
@@ -6518,8 +6534,8 @@ impl OptimizationPipeline {
                         sources.push(source);
                     }
                 }
-                // A completed return or reraising cleanup also makes earlier predecessors
-                // eligible for a small exit copy. Revisit them before conditional duplication.
+                // A completed scope exit also makes earlier predecessors eligible for a
+                // small exit copy. Revisit them before conditional duplication.
                 for predecessor in jump_sources[source.index()].iter().copied() {
                     if !planned_copy
                         && positions[predecessor.index()] < source_position

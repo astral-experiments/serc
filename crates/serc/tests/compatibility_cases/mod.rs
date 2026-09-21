@@ -17,6 +17,7 @@ mod chained_boolean_return_copies;
 mod chained_comparison_owner_slots;
 mod chained_conditional_expression_returns;
 mod chained_else_return_copies;
+mod chained_raise_copies;
 mod class_comprehension_cells;
 mod class_pattern_wildcard_locations;
 mod cleanup_interrupt_checks;
