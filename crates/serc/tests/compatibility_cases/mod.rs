@@ -710,3 +710,5 @@ mod tuple_store_join_locations;
 mod fractional_power_folding;
 mod literal_statement_spans;
 mod late_constant_boolean_folding;
+
+mod try_finally_return_exit_locations;
