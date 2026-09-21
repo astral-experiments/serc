@@ -219,6 +219,12 @@ impl Writer<'_, '_, '_> {
         let Some(flag) = self.begin_object(object, reference_mode) else {
             return;
         };
+        self.string_value(flag, value, interned);
+    }
+
+    /// Writes a UTF-8 string after reference registration.
+    /// `interned` describes this object's identity; fresh slice members pass false.
+    fn string_value(&mut self, flag: u8, value: &str, interned: bool) {
         let bytes = value.as_bytes();
         if value.is_ascii() && bytes.len() < 256 {
             self.output.extend_from_slice(&[
@@ -428,26 +434,7 @@ impl Writer<'_, '_, '_> {
                 self.byte_and_complex(TYPE_BINARY_COMPLEX | flag, *real, *imag);
             }
             Constant::String(value) => {
-                let bytes = value.as_bytes();
-                if value.is_ascii() && bytes.len() < 256 {
-                    self.output.extend_from_slice(&[
-                        TYPE_SHORT_ASCII | flag,
-                        u8::try_from(bytes.len()).expect("short ASCII string length fits in u8"),
-                    ]);
-                } else {
-                    self.byte_and_long(
-                        if value.is_ascii() {
-                            TYPE_ASCII | flag
-                        } else {
-                            TYPE_UNICODE | flag
-                        },
-                        bytes
-                            .len()
-                            .try_into()
-                            .expect("marshal string exceeds 4 GiB"),
-                    );
-                }
-                self.output.extend_from_slice(bytes);
+                self.string_value(flag, value, false);
             }
             Constant::SurrogateString(value) => {
                 self.byte_and_long(

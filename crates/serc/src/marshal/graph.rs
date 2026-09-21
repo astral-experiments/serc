@@ -391,6 +391,19 @@ impl<'a> ObjectGraph<'a> {
         first
     }
 
+    /// Records byte values using the empty-byte cache and, when enabled, the single-byte cache.
+    /// The occurrence kind distinguishes structural bytes from constant visits without splitting
+    /// their shared object identity.
+    fn record_bytes(&mut self, kind: OccurrenceKind, value: &'a [u8]) -> bool {
+        match value {
+            [] => self.record_cached_value(kind, CachedObject::EmptyBytes),
+            [value] if self.cache_scalars => {
+                self.record_cached_value(kind, CachedObject::Byte(*value))
+            }
+            _ => self.record_keyed(kind, ObjectKey::Bytes(value)),
+        }
+    }
+
     fn record_unique_value(&mut self, kind: OccurrenceKind, key: ObjectKey<'a>) -> bool {
         let id = self.record_unique(key);
         self.occurrences.push(Occurrence { object: id, kind });
@@ -2167,20 +2180,7 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
 
     #[inline]
     fn bytes(&mut self, value: &'code [u8]) {
-        match value {
-            [] => {
-                self.graph
-                    .record_cached_value(OccurrenceKind::Bytes, CachedObject::EmptyBytes);
-            }
-            [value] if self.graph.cache_scalars => {
-                self.graph
-                    .record_cached_value(OccurrenceKind::Bytes, CachedObject::Byte(*value));
-            }
-            _ => {
-                self.graph
-                    .record_keyed(OccurrenceKind::Bytes, ObjectKey::Bytes(value));
-            }
-        }
+        self.graph.record_bytes(OccurrenceKind::Bytes, value);
     }
 
     #[inline]
@@ -2258,17 +2258,7 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
                     ),
                 )
             }
-            Constant::Bytes(value) => match value.as_slice() {
-                [] => self
-                    .graph
-                    .record_cached_value(OccurrenceKind::Constant, CachedObject::EmptyBytes),
-                [value] if self.graph.cache_scalars => self
-                    .graph
-                    .record_cached_value(OccurrenceKind::Constant, CachedObject::Byte(*value)),
-                _ => self
-                    .graph
-                    .record_keyed(OccurrenceKind::Constant, ObjectKey::Bytes(value)),
-            },
+            Constant::Bytes(value) => self.graph.record_bytes(OccurrenceKind::Constant, value),
             _ => self
                 .graph
                 .record_keyed(OccurrenceKind::Constant, constant_key(value)),
