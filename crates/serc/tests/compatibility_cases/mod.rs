@@ -394,6 +394,7 @@ mod try_entry_import_owner;
 mod async_generator_builtin_calls;
 
 mod direct_manager_try_exit_borrows;
+mod direct_handler_break_owners;
 
 mod generator_expression_first_constant;
 

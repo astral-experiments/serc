@@ -21368,39 +21368,39 @@ impl Compiler<'_> {
                     CompileError::invalid_syntax("'break' outside loop", handler.body[0].range())
                 })?;
                 self.emit_iterator_cleanup(context.iterator_cleanup, false)?;
-                if context.break_policy.returns() {
-                    self.emit_implicit_return()?;
-                } else {
-                    // The handler has restored its exception state. A while break
-                    // now leaves only the ordinary tries entered inside that loop,
-                    // just as the direct continue path above does after POP_EXCEPT.
-                    let exclusion_start = (context.iterator_cleanup == IteratorCleanup::None
-                        && context.exception_region_depth
-                            < self
-                                .control
-                                .exceptions
-                                .active_exception_region_exclusions
-                                .len())
-                    .then(|| {
-                        let start = self.assembler.label();
-                        self.assembler.mark(start);
-                        start
-                    });
-                    let break_jump =
-                        self.emit_jump_forward_instruction(JUMP_BACKWARD, context.break_label)?;
-                    self.assembler.mark_jump_as_authored_break(break_jump);
-                    if let Some(start) = exclusion_start {
-                        let end = self.assembler.label();
-                        self.assembler.mark(end);
-                        for exclusions in self
+                // The handler has restored its exception state. Both the break
+                // jump and its copied terminal return leave the ordinary tries
+                // entered inside this loop; the preceding POP_EXCEPT does not.
+                let exclusion_start = (context.iterator_cleanup == IteratorCleanup::None
+                    && context.exception_region_depth
+                        < self
                             .control
                             .exceptions
                             .active_exception_region_exclusions
-                            .iter_mut()
-                            .skip(context.exception_region_depth)
-                        {
-                            exclusions.push((start, end));
-                        }
+                            .len())
+                .then(|| {
+                    let start = self.assembler.label();
+                    self.assembler.mark(start);
+                    start
+                });
+                if context.break_policy.returns() {
+                    self.emit_implicit_return()?;
+                } else {
+                    let break_jump =
+                        self.emit_jump_forward_instruction(JUMP_BACKWARD, context.break_label)?;
+                    self.assembler.mark_jump_as_authored_break(break_jump);
+                }
+                if let Some(start) = exclusion_start {
+                    let end = self.assembler.label();
+                    self.assembler.mark(end);
+                    for exclusions in self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .iter_mut()
+                        .skip(context.exception_region_depth)
+                    {
+                        exclusions.push((start, end));
                     }
                 }
                 self.set_depth(unreachable_depth);
