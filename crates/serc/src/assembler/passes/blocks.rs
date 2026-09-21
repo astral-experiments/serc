@@ -1816,8 +1816,11 @@ fn propagate_exit_block_locations(
                 .items()
                 .iter()
                 .find(|item| matches!(item, Item::Instruction(_)))
-            && first.opcode == NOP
-            && first.fusion_policy.is_converted_pop_block()
+            && ((first.opcode == POP_EXCEPT
+                && graph[target].items().iter().any(|item| {
+                    matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
+                }))
+                || (first.opcode == NOP && first.fusion_policy.is_converted_pop_block()))
             && first.location.line < 0
             && !first.no_location_policy.preserves_location()
             && let Some(location) = analysis.jump_predecessors[target.index()].and_then(|source| {
@@ -1827,6 +1830,8 @@ fn propagate_exit_block_locations(
             })
             && let Some(first) = graph.instructions_mut(target).next()
         {
+            // A sole jump locates the artificial cleanup entry even when later
+            // instructions in the same block already have authored locations.
             first.location = location;
             continue;
         }
@@ -7023,6 +7028,32 @@ impl OptimizationPipeline {
             if !copied_exit_needs_location && !graph[target].items().iter().all(|item| {
                 !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
             }) {
+                if remaining_predecessors[target.index()] == 1
+                    && let Some(Item::Instruction(first)) = graph[target]
+                        .items()
+                        .iter()
+                        .find(|item| matches!(item, Item::Instruction(_)))
+                    && first.opcode == POP_EXCEPT
+                    && first.location.line < 0
+                    && !first.no_location_policy.preserves_location()
+                    && let Some(location) = jump_sources[target.index()]
+                        .iter()
+                        .copied()
+                        .filter(|source| !drop_blocks[source.index()])
+                        .find_map(|source| {
+                            block_jump_target(graph[source].items())
+                                .and_then(|label| graph.label_block(label))
+                                .filter(|block| *block == target)
+                                .and_then(|_| graph[source].last_instruction())
+                                .filter(|instruction| instruction.location.line >= 0)
+                                .map(|instruction| instruction.location)
+                        })
+                    && let Some(first) = graph.instructions_mut(target).next()
+                {
+                    // Only the artificial prefix needs a line from its sole live jump.
+                    // Keep copied arrays on their existing internal-entry propagation path.
+                    first.location = location;
+                }
                 continue;
             }
             if preserve_shared_cleanup {

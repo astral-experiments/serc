@@ -250,3 +250,42 @@ fn matches_cpython_final_elif_for_exhaustion_cleanup() {
         common::assert_matches_cpython_marshal(&source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_nested_handler_cleanup_prefix_locations() {
+    let indent = |source: &str| {
+        source
+            .lines()
+            .map(|line| format!("    {line}\n"))
+            .collect::<String>()
+    };
+    for depth in 1..=4 {
+        for named in [false, true] {
+            for guarded in [false, true] {
+                let mut body = "pass\n".to_owned();
+                for level in 0..depth {
+                    let binding = if named {
+                        format!(" as error_{level}")
+                    } else {
+                        String::new()
+                    };
+                    body = format!(
+                        "try:\n    work()\nexcept Error{binding}:\n{}else:\n    return work()\n",
+                        indent(&body)
+                    );
+                }
+                if guarded {
+                    body = format!("if flag:\n{}", indent(&body));
+                }
+                let source = format!("def f(flag):\n{}    return fallback()\n", indent(&body));
+                common::assert_matches_cpython_marshal(&source, "nested_handler_cleanup_prefix.py");
+                if depth == 3 {
+                    common::assert_matches_cpython_marshal(
+                        &source.replace("return work()", "work()"),
+                        "shared_handler_cleanup_prefix_control.py",
+                    );
+                }
+            }
+        }
+    }
+}
