@@ -1,5 +1,6 @@
 mod common;
 
+use std::fmt::Write as _;
 use std::process::Command;
 use std::time::UNIX_EPOCH;
 
@@ -109,7 +110,8 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("module.py");
     // Equal ordinary and slice constants must keep their distinct ownership and string tags.
-    let scalar_source = [
+    let mut scalar_source = String::new();
+    for (index, value) in [
         "-2147483649",
         "-2147483648",
         "2147483647",
@@ -135,10 +137,9 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
     ]
     .into_iter()
     .enumerate()
-    .map(|(index, value)| {
-        format!("def scalar_{index}(a):\n    return {value}, a[{value}:{value}:{value}], a[{value}:{value}:{value}]\n")
-    })
-    .collect::<String>();
+    {
+        writeln!(scalar_source, "def scalar_{index}(a):\n    return {value}, a[{value}:{value}:{value}], a[{value}:{value}:{value}]").unwrap();
+    }
     for version in [
         serc::PythonVersion::Py312,
         serc::PythonVersion::Py313,
