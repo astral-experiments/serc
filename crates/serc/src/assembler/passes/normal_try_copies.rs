@@ -2734,6 +2734,112 @@ impl OptimizationPipeline {
                 }
             }
         }
+        if entry_returns.is_empty()
+            && (exits.is_empty()
+                || !returns
+                    .values()
+                    .any(|tail| matches!(tail, OriginalTail::LocalTupleReturn { .. })))
+        {
+            return;
+        }
+        let original_jump_targets = graph
+            .iter_items()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => match instruction.operand() {
+                    Operand::Forward(label) | Operand::Backward(label) => graph.label_block(label),
+                    Operand::Value(_) | Operand::Deferred(_) => None,
+                },
+                Item::Label(_) => None,
+            })
+            .collect::<FxHashSet<_>>();
+        // A private normal exit is part of its preceding runtime array. It can
+        // still enter original unlocated joins whose copy rounds determine the
+        // size of a later tuple exit, without becoming a standalone POP_BLOCK target.
+        let private_join_schedule = entry_returns.is_empty();
+        if private_join_schedule {
+            let mut private_joins = Vec::new();
+            for &exit in order {
+                let Some(&(_, join, pass)) = exits.get(&exit) else {
+                    continue;
+                };
+                if pass.is_some() || original_jump_targets.contains(&exit) {
+                    continue;
+                }
+                let items = graph[join].items();
+                let Some((Item::Instruction(jump), head)) = items.split_last() else {
+                    continue;
+                };
+                let Operand::Forward(target) = jump.operand() else {
+                    continue;
+                };
+                let Some(target) = graph.label_block(target) else {
+                    continue;
+                };
+                if head.is_empty()
+                    || !head.iter().all(|item| matches!(item, Item::Label(_)))
+                    || !head.iter().any(|item| matches!(item, Item::Label(label)
+                        if self.exception_owner_provenance.source_boundaries.contains(label)
+                            && !self.borrow_block_aliases.contains(label)))
+                    || head.iter().any(|item| matches!(item, Item::Label(label)
+                        if self.original_nop_targets.contains(label)
+                            || self.folded_original_predecessor_targets.contains(label)
+                            || self.folded_condition_exit_targets.contains(label)
+                            || self.exception_owner_provenance.omitted_nop_counts.contains_key(label)
+                            || self.exception_owner_provenance.omitted_nop_locations.contains_key(label)
+                            || self.exception_owner_provenance.setups.iter().any(|(entry, _)| entry == label)
+                            || self.exception_regions.iter().any(|region| region.target == *label)))
+                    || jump.opcode != JUMP_FORWARD
+                    || jump.location != SourceLocation::NONE
+                    || jump.pre_fold_extra_instructions() != 0
+                    || jump.local_policy.hidden_exception_owner_slots() != 0
+                    || jump.fusion_policy.is_converted_pop_block()
+                    || jump.fusion_policy.is_authored_break()
+                    || jump.no_location_policy != super::super::ir::NoLocationPolicy::default()
+                    || jump.exception_policy() != super::super::ExceptionPolicy::default()
+                    || !jump.jump_policy.inline_small_exit()
+                    || jump.jump_policy.retains_nop_for(jump.operand())
+                    || jump.jump_policy.defers_redundant_removal()
+                    || jump.jump_policy.is_interruptible()
+                    || positions[&exit] >= positions[&join]
+                    || positions[&join] >= positions[&target]
+                    || self.exception_regions.iter().any(|region| {
+                        !region.is_scope_fallback
+                            && match (graph.label_block(region.start), graph.label_block(region.end)) {
+                                (Some(start), Some(end)) => (positions[&start]..positions[&end])
+                                    .contains(&positions[&join]),
+                                _ => true,
+                            }
+                    })
+                {
+                    continue;
+                }
+                private_joins.push(join);
+                joins.insert(join, target);
+            }
+            for start in private_joins {
+                let mut current = start;
+                let mut seen = FxHashSet::default();
+                while let Some(&target) = joins.get(&current) {
+                    if !seen.insert(current) {
+                        break;
+                    }
+                    current = target;
+                    if matches!(
+                        returns.get(&current),
+                        Some(OriginalTail::LocalTupleReturn { .. })
+                    ) {
+                        entry_returns.insert(current);
+                        break;
+                    }
+                }
+            }
+        }
+        let successor = |block| {
+            exits
+                .get(&block)
+                .map(|(_, target, _)| *target)
+                .or_else(|| joins.get(&block).copied())
+        };
         let mut selected = FxHashSet::default();
         for start in order
             .iter()
@@ -2759,16 +2865,6 @@ impl OptimizationPipeline {
         }
         // A range end alone is not an original CFG entry. Every restored cleanup
         // array must also be entered by a real original jump target at this head.
-        let original_jump_targets = graph
-            .iter_items()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction) => match instruction.operand() {
-                    Operand::Forward(label) | Operand::Backward(label) => graph.label_block(label),
-                    Operand::Value(_) | Operand::Deferred(_) => None,
-                },
-                Item::Label(_) => None,
-            })
-            .collect::<FxHashSet<_>>();
         if selected
             .iter()
             .any(|block| !original_jump_targets.contains(block))
@@ -2803,9 +2899,12 @@ impl OptimizationPipeline {
                 return;
             }
             selected.retain(|block| original_jump_targets.contains(block));
-            if selected.is_empty() {
+            if selected.is_empty() && !private_join_schedule {
                 return;
             }
+        }
+        if private_join_schedule && !selected.is_empty() {
+            return;
         }
         let selected_returns = entry_returns;
         let mut targets = selected
@@ -2884,6 +2983,16 @@ impl OptimizationPipeline {
             }
         }
         if !selected.is_subset(&sources) || !selected_joins.is_subset(&sources) {
+            return;
+        }
+        // Widths of private range fragments need not reconstruct the preceding
+        // runtime array: no jump can enter them. Every actual copy target remains
+        // a certified singleton join or the intact four-slot tuple return.
+        if private_join_schedule
+            && sources.iter().any(|block| {
+                !selected_joins.contains(block) && original_jump_targets.contains(block)
+            })
+        {
             return;
         }
         // An excluded unconditional predecessor could change a target array before this
