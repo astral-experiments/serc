@@ -1980,12 +1980,9 @@ fn constant_reachability_prepares_the_optimization_graph() {
         .unwrap();
     let mut assembler = assembler_with_preserved_constant_boundary();
 
-    assert_eq!(
-        assembler.used_constant_indices(LOAD_CONST, 3),
-        [true, false, true]
-    );
+    assert_eq!(assembler.used_constant_indices(3), [true, false, true]);
     assert!(matches!(assembler.code, UnoptimizedCode::Prepared { .. }));
-    assembler.remap_constant_indices(LOAD_CONST, &[Some(0), Some(1), Some(2)]);
+    assembler.remap_constant_indices(&[Some(0), Some(1), Some(2)]);
 
     assert_eq!(assembler.finish().unwrap(), expected);
 }
@@ -1993,10 +1990,7 @@ fn constant_reachability_prepares_the_optimization_graph() {
 #[test]
 fn prepared_reachability_survives_preserved_boundary_removal() {
     let mut assembler = assembler_with_preserved_constant_boundary();
-    assert_eq!(
-        assembler.used_constant_indices(LOAD_CONST, 3),
-        [true, false, true]
-    );
+    assert_eq!(assembler.used_constant_indices(3), [true, false, true]);
     let UnoptimizedCode::Prepared { reachable, .. } = &assembler.code else {
         panic!("constant reachability should prepare the optimization graph");
     };
@@ -2020,10 +2014,7 @@ fn straight_line_constant_reachability_uses_dense_indices() {
         pass_instruction(RETURN_VALUE, 0, 1),
     ]);
 
-    assert_eq!(
-        assembler.used_constant_indices(LOAD_CONST, 3),
-        [true, false, true]
-    );
+    assert_eq!(assembler.used_constant_indices(3), [true, false, true]);
 }
 
 #[test]
@@ -2056,13 +2047,10 @@ fn assertion_constant_reachability_keeps_the_optimization_stream_linear() {
     let expected = assembler().finish().unwrap();
     let mut assembler = assembler();
 
-    assert_eq!(
-        assembler.used_constant_indices(LOAD_CONST, 3),
-        [true, false, true]
-    );
+    assert_eq!(assembler.used_constant_indices(3), [true, false, true]);
     assert!(matches!(assembler.code, UnoptimizedCode::Linear(_)));
     assert!(assembler.has_proven_linear_assertion_side_exits);
-    assembler.remap_constant_indices(LOAD_CONST, &[Some(0), Some(1), Some(2)]);
+    assembler.remap_constant_indices(&[Some(0), Some(1), Some(2)]);
 
     assert_eq!(assembler.finish().unwrap(), expected);
 }
@@ -2101,10 +2089,7 @@ fn assertion_constant_reachability_rejects_mixed_control_flow() {
     assembler.next_label = 2;
     assembler.has_assertion_side_exit_candidate = true;
 
-    assert_eq!(
-        assembler.used_constant_indices(LOAD_CONST, 3),
-        [true, false, true]
-    );
+    assert_eq!(assembler.used_constant_indices(3), [true, false, true]);
     assert!(matches!(assembler.code, UnoptimizedCode::Prepared { .. }));
 }
 
@@ -2146,10 +2131,7 @@ fn assertion_constant_reachability_keeps_swap_and_borrow_markers_off_the_linear_
         assembler.next_label = 1;
         assembler.has_assertion_side_exit_candidate = true;
 
-        assert_eq!(
-            assembler.used_constant_indices(LOAD_CONST, 3),
-            [true, false, true]
-        );
+        assert_eq!(assembler.used_constant_indices(3), [true, false, true]);
         assert!(matches!(assembler.code, UnoptimizedCode::Linear(_)));
         assert!(!assembler.has_proven_linear_assertion_side_exits);
         assert!(!assembler.has_only_linear_assertion_side_exits());
@@ -4930,13 +4912,13 @@ fn folded_borrow_entries_resolve_before_graph_preparation() {
     assembler.emit(LOAD_CONST, 2);
     assembler.emit(RETURN_VALUE, 0);
 
-    assembler.used_constant_indices(LOAD_CONST, 3);
+    assembler.used_constant_indices(3);
     assert!(matches!(assembler.code, UnoptimizedCode::Prepared { .. }));
     assert!(assembler.deferred_borrow_entries.is_empty());
     assert!(assembler.borrow_unreachable_blocks.contains(&target));
     assert!(assembler.borrow_jump_entry_labels.contains(&target));
     // A second consumer must not reinterpret the already prepared graph's offsets.
-    assembler.used_constant_indices(LOAD_CONST, 3);
+    assembler.used_constant_indices(3);
     let pipeline = assembler.into_optimization_pipeline();
     assert!(pipeline.borrow_jump_entry_labels.contains(&target));
 }
