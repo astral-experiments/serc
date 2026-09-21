@@ -687,3 +687,5 @@ mod protected_reraise_fixed_point;
 mod synthetic_range_entry_copy_budget;
 
 mod named_elif_cleanup_locations;
+
+mod shared_handler_cleanup_join_locations;

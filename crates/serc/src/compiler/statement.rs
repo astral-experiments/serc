@@ -22127,8 +22127,7 @@ impl Compiler<'_> {
                 || handler_ends_with_simple_unlocated_if_cleanup
                 // Earlier terminating arms leave the last elif's false edge and body
                 // fallthrough sharing the artificial cleanup before a continuation.
-                || (handler.name.is_some()
-                    && loop_tail.is_none()
+                || (loop_tail.is_none()
                     && !cleanup_has_small_return_successor
                     && (self.control.statements.current_statement_has_following
                         || self.control.statements.inherited_statement_has_following
@@ -22319,8 +22318,7 @@ impl Compiler<'_> {
                                     && condition_jump_target_count(&tail.test, false) > 1
                             }
                             [Stmt::Assert(assertion)] => {
-                                assertion.msg.is_none()
-                                    && early_condition_truthiness(&assertion.test).is_none()
+                                early_condition_truthiness(&assertion.test).is_none()
                                     && condition_jump_target_count(&tail.test, false) == 1
                                     && condition_jump_target_count(&assertion.test, true) == 1
                             }
@@ -22451,8 +22449,7 @@ impl Compiler<'_> {
                 {
                     self.assembler
                         .set_location(self.source_location(expression.range));
-                } else if self.control.in_synchronous_with()
-                    && self.control.generators.generator_region_start.is_none()
+                } else if self.control.generators.generator_region_start.is_none()
                     && let Some(Stmt::If(statement)) = handler.body.last()
                     && statement.elif_else_clauses.is_empty()
                     && matches!(
@@ -22460,8 +22457,14 @@ impl Compiler<'_> {
                         [Stmt::Assert(assertion)]
                             if early_condition_truthiness(&assertion.test) == Some(false)
                     )
+                    && (self.control.in_synchronous_with()
+                        || (condition_has_only_runtime_tests(&statement.test)
+                            && original_condition_has_unique_jump_target(&statement.test, false)
+                            && unique_condition_jump_target(&statement.test, false).is_some()))
                     && let Some(range) = unary_not_condition_exit_range(&statement.test)
                 {
+                    // The assertion always raises. Only the guard's false edge
+                    // reaches normal cleanup and can supply its source location.
                     self.assembler.set_location(self.source_location(range));
                 } else if handler_ends_with_terminating_unlocated_cleanup {
                     self.assembler.set_location(SourceLocation::NONE);
@@ -22499,8 +22502,7 @@ impl Compiler<'_> {
                 } else if let Some(Stmt::Pass(statement)) = handler.body.last() {
                     self.assembler
                         .set_location(self.source_location(statement.range));
-                } else if self.context.python_version <= crate::PythonVersion::Py313
-                    && !handler_body_has_instructions
+                } else if !handler_body_has_instructions
                     && matches!(handler.body.last(), Some(Stmt::AnnAssign(assignment))
                         if assignment.value.is_none())
                 {
@@ -34421,28 +34423,42 @@ fn handler_cleanup_has_runtime_exit_location(body: &[Stmt]) -> bool {
     }
 }
 
-// Nested runtime conditionals without an alternative retain their false edges into the
-// shared handler cleanup. No single predecessor can donate that cleanup's location.
+// A partial runtime conditional retains its false edge into the shared cleanup.
+// Nested runtime branches can add normal exits, but cannot remove that false edge.
 fn handler_cleanup_has_runtime_if_join(statement: &ruff_python_ast::StmtIf) -> bool {
     statement.elif_else_clauses.is_empty()
         && condition_has_only_runtime_tests(&statement.test)
-        && statement.body.iter().all(|statement| match statement {
-            Stmt::If(nested) => handler_cleanup_has_runtime_if_join(nested),
-            // These declarations emit no instruction in a function. The synthetic NOP
-            // for an otherwise empty arm must not survive against an unlocated cleanup.
-            Stmt::Global(_) | Stmt::Nonlocal(_) => false,
-            Stmt::AnnAssign(assignment)
-                if assignment.value.is_none()
-                    && matches!(assignment.target.as_ref(), Expr::Name(_)) =>
-            {
-                false
-            }
-            // Discarded constants can leave a NOP whose exception owner still depends
-            // on the cleanup retaining its inherited location.
-            Stmt::Expr(expression) if fold_constant(&expression.value).is_some() => false,
-            Stmt::Try(_) | Stmt::With(_) | Stmt::For(_) | Stmt::While(_) | Stmt::Match(_) => false,
-            _ => true,
-        })
+        && handler_cleanup_has_runtime_branch_body(&statement.body)
+}
+
+fn handler_cleanup_has_runtime_branch_body(body: &[Stmt]) -> bool {
+    body.iter().all(|statement| match statement {
+        Stmt::If(nested) => {
+            condition_has_only_runtime_tests(&nested.test)
+                && handler_cleanup_has_runtime_branch_body(&nested.body)
+                && nested.elif_else_clauses.iter().all(|clause| {
+                    clause
+                        .test
+                        .as_ref()
+                        .is_none_or(condition_has_only_runtime_tests)
+                        && handler_cleanup_has_runtime_branch_body(&clause.body)
+                })
+        }
+        // These declarations emit no instruction in a function. The synthetic NOP
+        // for an otherwise empty arm must not survive against an unlocated cleanup.
+        Stmt::Global(_) | Stmt::Nonlocal(_) => false,
+        Stmt::AnnAssign(assignment)
+            if assignment.value.is_none()
+                && matches!(assignment.target.as_ref(), Expr::Name(_)) =>
+        {
+            false
+        }
+        // Discarded constants can leave a NOP whose exception owner still depends
+        // on the cleanup retaining its inherited location.
+        Stmt::Expr(expression) if fold_constant(&expression.value).is_some() => false,
+        Stmt::Try(_) | Stmt::With(_) | Stmt::For(_) | Stmt::While(_) | Stmt::Match(_) => false,
+        _ => true,
+    })
 }
 
 // A complete runtime conditional with ordinary call or assignment arms has an
