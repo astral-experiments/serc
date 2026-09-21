@@ -1097,6 +1097,7 @@ impl Compiler<'_> {
     }
 
     pub(super) fn fstring_result_range(
+        &self,
         fstring: &ruff_python_ast::ExprFString,
     ) -> ruff_text_size::TextRange {
         let mut component_count = 0;
@@ -1134,7 +1135,7 @@ impl Compiler<'_> {
         }
         if component_count == 1 {
             only_interpolation.unwrap_or_else(|| {
-                fstring_literal_span(fstring)
+                fstring_literal_span(fstring, self.context.source)
                     .unwrap_or_else(|| interpolated_string_content_range(fstring.into()))
             })
         } else {
@@ -1259,8 +1260,37 @@ pub(super) fn debug_text_range(
     )
 }
 
+/// Exclude a final empty native f-string token from an otherwise nonempty literal.
+pub(super) fn fstring_literal_range(
+    source: &str,
+    range: ruff_text_size::TextRange,
+    is_raw: bool,
+) -> ruff_text_size::TextRange {
+    if is_raw {
+        return range;
+    }
+    let mut text = &source[usize::from(range.start())..usize::from(range.end())];
+    while let Some(prefix) = text
+        .strip_suffix("\\\r\n")
+        .or_else(|| text.strip_suffix("\\\n"))
+        .or_else(|| text.strip_suffix("\\\r"))
+    {
+        text = prefix;
+    }
+    // In a valid literal, a final brace ends either a doubled brace or a named Unicode
+    // escape. CPython's lexer ends FSTRING_MIDDLE there. The parser drops a following
+    // token made entirely of line continuations, whereas Ruff includes it in this range.
+    // Without that token boundary, the continuation belongs to the nonempty token.
+    if matches!(text.as_bytes().last(), Some(b'{' | b'}')) {
+        ruff_text_size::TextRange::at(range.start(), text.text_len())
+    } else {
+        range
+    }
+}
+
 fn fstring_literal_span(
     fstring: &ruff_python_ast::ExprFString,
+    source: &str,
 ) -> Option<ruff_text_size::TextRange> {
     let mut first = None;
     let mut last = None;
@@ -1274,7 +1304,13 @@ fn fstring_literal_span(
             FStringPart::FString(fstring) => {
                 for element in &fstring.elements {
                     match element {
-                        InterpolatedStringElement::Literal(literal) => include(literal.range),
+                        InterpolatedStringElement::Literal(literal) => {
+                            include(fstring_literal_range(
+                                source,
+                                literal.range,
+                                fstring.flags.prefix().is_raw(),
+                            ))
+                        }
                         InterpolatedStringElement::Interpolation(_) => return None,
                     }
                 }
@@ -1328,7 +1364,7 @@ pub(super) fn implicit_return_range(
                 last_store_target_range(compiler, target)
             }),
         Stmt::Expr(expression) => match expression.value.as_ref() {
-            Expr::FString(fstring) => Compiler::fstring_result_range(fstring),
+            Expr::FString(fstring) => compiler.fstring_result_range(fstring),
             expression
                 if compiler.context.python_version <= crate::PythonVersion::Py313
                     && compiler.return_value_is_constant(expression) =>

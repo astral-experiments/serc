@@ -1993,7 +1993,7 @@ impl Compiler<'_> {
                     }
                 }
                 let range = if let Expr::FString(fstring) = expression.value.as_ref() {
-                    Self::fstring_result_range(fstring)
+                    self.fstring_result_range(fstring)
                 } else {
                     statement.range()
                 };
@@ -4414,7 +4414,7 @@ impl Compiler<'_> {
                             Expr::Attribute(attribute) => self.attribute_opcode_location(attribute),
                             Expr::Call(call) => self.call_opcode_location(call),
                             Expr::FString(fstring) => {
-                                self.source_location(Self::fstring_result_range(fstring))
+                                self.source_location(self.fstring_result_range(fstring))
                             }
                             expression => self.source_location(expression.range()),
                         };
@@ -25795,7 +25795,7 @@ impl Compiler<'_> {
                         && compiler.assembler.last_instruction_is_nop()
                     {
                         let range = if let Expr::FString(fstring) = tail.value.as_ref() {
-                            Self::fstring_result_range(fstring)
+                            compiler.fstring_result_range(fstring)
                         } else {
                             tail.range
                         };

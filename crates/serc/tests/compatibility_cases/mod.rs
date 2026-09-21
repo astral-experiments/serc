@@ -122,6 +122,7 @@ mod frozenset_discarded_private_origins;
 mod frozenset_discarded_real_assembly;
 mod frozenset_soft_case_identifiers;
 mod frozenset_tuple_marshal_order;
+mod fstring_escaped_newline_locations;
 mod generator_break_constant_compatibility;
 mod generator_break_return_regions;
 mod generator_call_name_condition_owner_compatibility;

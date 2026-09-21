@@ -51,8 +51,8 @@ use super::scope::{
     legacy_class_comprehension_names,
 };
 use super::source::{
-    debug_text_range, first_expression_instruction_range, statement_execution_range,
-    strip_expression_comments, synthetic_condition_exit_range,
+    debug_text_range, first_expression_instruction_range, fstring_literal_range,
+    statement_execution_range, strip_expression_comments, synthetic_condition_exit_range,
 };
 use super::statement::{
     final_chained_comparison_jump, is_wildcard_pattern, suite_has_linear_borrow_fallthrough,
@@ -180,7 +180,11 @@ fn append_interpolated_elements<'ast>(
                     source,
                     &literal.value,
                     literal.range,
-                    literal.range,
+                    if discard_empty {
+                        fstring_literal_range(source, literal.range, is_raw)
+                    } else {
+                        literal.range
+                    },
                     is_raw,
                 );
             }
@@ -2352,7 +2356,7 @@ impl Compiler<'_> {
         let mut components = fstring_components(fstring, self.context.source);
         let value_count = components.len();
         if let [InterpolatedStringComponent::Literal(literal)] = components.as_mut_slice() {
-            literal.range = Self::fstring_result_range(fstring);
+            literal.range = self.fstring_result_range(fstring);
         }
         let large = value_count > 30;
         let outer_location = self.source_location(fstring.range);
@@ -2528,7 +2532,15 @@ impl Compiler<'_> {
         let value_count = components.len();
         for component in components {
             match component {
-                InterpolatedStringComponent::Literal(literal) => literal.load(self)?,
+                InterpolatedStringComponent::Literal(mut literal) => {
+                    // Python 3.12 retains adjacent empty format-spec tokens; later
+                    // parsers discard them before merging the nonempty constants.
+                    if self.context.python_version >= PythonVersion::Py313 {
+                        literal.range =
+                            fstring_literal_range(self.context.source, literal.range, is_raw);
+                    }
+                    literal.load(self)?;
+                }
                 InterpolatedStringComponent::Interpolation(interpolation, is_raw) => {
                     self.compile_interpolation(interpolation, is_raw)?;
                 }
