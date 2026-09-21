@@ -218,10 +218,11 @@ impl OptimizationPipeline {
             found
         };
 
-        // A complete original array has only head labels and no erased records.
+        // Exact original arrays have only head labels and no erased records.
+        // Folded-prefix admission below relaxes only their instruction-slot count.
         // Reject only concrete regions touching selected arrays: coroutine scope
         // fallback and unrelated SEND cleanup regions do not split these arrays.
-        let intact = |block: BasicBlockId, require_original_head: bool| {
+        let intact = |block: BasicBlockId, require_original_head: bool, folded_prefix: bool| {
             // A folded conditional predecessor does not change an intact located
             // return array. A separate original match-end alias certifies its head;
             // all four slots keep their own lines, so the removed edge cannot affect
@@ -283,7 +284,7 @@ impl OptimizationPipeline {
                     }
                     Item::Instruction(instruction) => {
                         seen_instruction = true;
-                        if instruction.pre_fold_extra_instructions() != 0
+                        if (!folded_prefix && instruction.pre_fold_extra_instructions() != 0)
                             || instruction.fusion_policy.is_converted_pop_block()
                             || instruction.fusion_policy.is_authored_break()
                         {
@@ -357,7 +358,7 @@ impl OptimizationPipeline {
             let Some((Item::Instruction(jump), prefix)) = items.split_last() else {
                 return false;
             };
-            if !intact(block, false)
+            if !intact(block, false, false)
                 || jump.opcode != JUMP_FORWARD
                 || !jump.jump_policy.is_original_match_success()
                 || jump.no_location_policy != super::super::ir::NoLocationPolicy::default()
@@ -387,9 +388,47 @@ impl OptimizationPipeline {
             }
             persistent_slots >= 4
         };
+        // A populated predecessor cannot itself become a small tuple exit: its
+        // replaced jump remains a NOP beside the four return slots. A located
+        // work prefix also excludes no-line copying. Preserve its entry and owner
+        // guards while allowing recorded folds in that prefix. The plan below
+        // treats its width as a lower bound and verifies it is never a copy target.
+        let is_opaque_folded_source = |block| {
+            let items = graph[block].items();
+            let Some((Item::Instruction(jump), prefix)) = items.split_last() else {
+                return false;
+            };
+            if !intact(block, true, true)
+                || jump.opcode != JUMP_FORWARD
+                || jump.pre_fold_extra_instructions() != 0
+                || jump.local_policy.hidden_exception_owner_slots() != 0
+                || jump.no_location_policy != super::super::ir::NoLocationPolicy::default()
+                || jump.exception_policy() != super::super::ExceptionPolicy::default()
+            {
+                return false;
+            }
+            let mut located_work = false;
+            for item in prefix {
+                let Item::Instruction(instruction) = item else {
+                    continue;
+                };
+                if instruction.no_location_policy != super::super::ir::NoLocationPolicy::default()
+                    || instruction.exception_policy() != super::super::ExceptionPolicy::default()
+                    || (instruction.local_policy.hidden_exception_owner_slots() != 0
+                        && (instruction.opcode != LOAD_CONST
+                            || instruction.local_policy.hidden_exception_owner_slots()
+                                != u16::from(instruction.pre_fold_extra_instructions())))
+                {
+                    return false;
+                }
+                located_work |= instruction.location.line >= 0
+                    && !matches!(instruction.opcode, NOP | NOT_TAKEN);
+            }
+            located_work
+        };
         let mut returns = FxHashMap::default();
         for &block in order {
-            if !intact(block, true) {
+            if !intact(block, true, false) {
                 continue;
             }
             if let Some(located) = original_local_tuple_return(graph[block].items()) {
@@ -408,7 +447,7 @@ impl OptimizationPipeline {
                     && matches!(instruction.operand(), Operand::Forward(label)
                         if graph.label_block(label).is_some_and(|target| {
                             target == *block
-                                || (intact(target, true)
+                                || (intact(target, true, false)
                                     && is_shared_join(target)
                                     && graph[target].last_instruction().is_some_and(|bridge| {
                                         bridge.opcode == JUMP_FORWARD
@@ -425,6 +464,7 @@ impl OptimizationPipeline {
         let mut sources = FxHashSet::default();
         let mut joins = FxHashSet::default();
         let mut shared_joins = FxHashSet::default();
+        let mut opaque_sources = FxHashSet::default();
         // Close over every original unconditional predecessor, including direct
         // tuple entries and predecessors of ordinary source arrays. Omission of
         // even a source whose final copy fails could change a later target's size.
@@ -446,7 +486,7 @@ impl OptimizationPipeline {
                 if !selected.contains(&target) {
                     continue;
                 }
-                if !intact(block, true)
+                if !intact(block, true, false)
                     && returns.contains_key(&target)
                     && matches!(jump.operand(), Operand::Forward(_))
                     && positions[&block] < positions[&target]
@@ -461,7 +501,8 @@ impl OptimizationPipeline {
                 // original jump unlocated, but private copies inherit their own lines.
                 // Require the producer's exact head, not an arbitrary unlocated jump.
                 let shared_join = is_shared_join(block);
-                if !intact(block, true)
+                let opaque_source = !intact(block, true, false) && is_opaque_folded_source(block);
+                if (!intact(block, true, false) && !opaque_source)
                     || jump.opcode != JUMP_FORWARD
                     || !matches!(jump.operand(), Operand::Forward(_))
                     || positions[&block] >= positions[&target]
@@ -489,6 +530,9 @@ impl OptimizationPipeline {
                         return;
                     }
                     joins.insert(block);
+                }
+                if opaque_source {
+                    opaque_sources.insert(block.index());
                 }
                 sources.insert(block);
                 selected.insert(block);
@@ -576,7 +620,12 @@ impl OptimizationPipeline {
         let Some(result) = plan_normal_try_copies(&nodes) else {
             return;
         };
-        if result.steps.is_empty() {
+        if result.steps.is_empty()
+            || result
+                .steps
+                .iter()
+                .any(|step| opaque_sources.contains(&step.target))
+        {
             return;
         }
         // Head-only admission above preserves every entry label. No POP_BLOCK,
