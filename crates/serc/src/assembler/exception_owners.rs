@@ -1092,19 +1092,19 @@ impl UniqueLabelPositions {
 
 impl ExceptionOwnerProvenance {
     /// Checks labels belonging to a captured normal-try copy, including its endpoints.
-    fn is_normal_try_copy_label(&self, label: &Label) -> bool {
-        self.normal_try_copy_blocks.contains(label)
-            || self.normal_try_copy_jump_nop_successors.contains(label)
-            || self.normal_try_copy_inline_labels.contains(label)
-            || self.normal_try_copy_internal_labels.contains(label)
+    fn is_normal_try_copy_label(&self, label: Label) -> bool {
+        self.normal_try_copy_blocks.contains(&label)
+            || self.normal_try_copy_jump_nop_successors.contains(&label)
+            || self.normal_try_copy_inline_labels.contains(&label)
+            || self.normal_try_copy_internal_labels.contains(&label)
             || self
                 .normal_try_copy_steps
                 .iter()
-                .any(|(start, end, _)| start == label || end == label)
+                .any(|(start, end, _)| *start == label || *end == label)
             || self
                 .normal_try_copy_pop_ranges
                 .iter()
-                .any(|(start, end)| start == label || end == label)
+                .any(|(start, end)| *start == label || *end == label)
     }
 
     /// Retires an async entry before erased labels can migrate to another live array.
@@ -1163,7 +1163,7 @@ impl ExceptionOwnerProvenance {
             .filter_map(|(entry, prefix)| {
                 if !self.value_jump_continuation_boundaries.contains(entry)
                     || self.retired_normal_try_copy_labels.contains(entry)
-                    || self.is_normal_try_copy_label(entry)
+                    || self.is_normal_try_copy_label(*entry)
                     || self
                         .original_value_jump_prefixes
                         .iter()
@@ -2410,7 +2410,7 @@ impl LayoutAssembler {
             {
                 continue;
             }
-            if provenance.is_normal_try_copy_label(&origin.entry)
+            if provenance.is_normal_try_copy_label(origin.entry)
                 || !provenance.block_boundaries.contains(&origin.entry)
                 || self
                     .items
@@ -2431,7 +2431,7 @@ impl LayoutAssembler {
                 .collect::<Vec<_>>();
             if labels.is_empty()
                 || labels.iter().any(|label| {
-                    provenance.is_normal_try_copy_label(label)
+                    provenance.is_normal_try_copy_label(*label)
                         || jump_targets.contains(label)
                         || provenance.block_boundaries.contains(label)
                         || provenance.source_boundaries.contains(label)
@@ -3350,12 +3350,12 @@ impl LayoutAssembler {
                     .iter()
                     .any(|region| region.target == *label)
                 || provenance.removed_pop_block_boundaries.contains(label)
-                || provenance.is_normal_try_copy_label(label)
+                || provenance.is_normal_try_copy_label(*label)
         };
         for origin in &provenance.source_none_conditions {
             if !provenance.source_boundaries.contains(&origin.entry)
                 || !provenance.block_boundaries.contains(&origin.entry)
-                || provenance.is_normal_try_copy_label(&origin.entry)
+                || provenance.is_normal_try_copy_label(origin.entry)
                 || provenance
                     .setups
                     .iter()
@@ -3422,7 +3422,7 @@ impl LayoutAssembler {
                     *end,
                     label_positions,
                     &boundary,
-                    &|label| provenance.is_normal_try_copy_label(label),
+                    &|label| provenance.is_normal_try_copy_label(*label),
                 )
                 .unwrap_or_default();
             let mut removed = Vec::new();
@@ -3646,7 +3646,7 @@ impl LayoutAssembler {
                         .count()
                         != 1
                         || provenance.retired_normal_try_copy_labels.contains(label)
-                        || provenance.is_normal_try_copy_label(label)
+                        || provenance.is_normal_try_copy_label(*label)
                         || provenance.removed_pop_block_boundaries.contains(label)
                         || provenance.omitted_nop_counts.contains_key(label)
                         || provenance.omitted_nop_locations.contains_key(label)
@@ -5380,7 +5380,7 @@ impl LayoutAssembler {
                             ]
                             .iter()
                             .any(|labels| labels.contains(label))
-                            && !provenance.is_normal_try_copy_label(label)
+                            && !provenance.is_normal_try_copy_label(*label)
                             && unique_labels
                                 .get_or_init(|| UniqueLabelPositions::new(&self.items))
                                 .get(*label)
@@ -6003,7 +6003,7 @@ impl LayoutAssembler {
                                     .filter(|candidate| ***candidate == expected)
                                     .count()
                                     == 1
-                                && !provenance.is_normal_try_copy_label(&origin.entry)
+                                && !provenance.is_normal_try_copy_label(origin.entry)
                                 && !provenance
                                     .retired_normal_try_copy_labels
                                     .contains(&origin.entry)
@@ -10713,7 +10713,7 @@ impl LayoutAssembler {
         let provenance = &self.exception_owner_provenance;
         let copied = |label: &Label| {
             provenance.retired_normal_try_copy_labels.contains(label)
-                || provenance.is_normal_try_copy_label(label)
+                || provenance.is_normal_try_copy_label(*label)
         };
         let mut matches = provenance
             .copied_return_membership_prefixes
