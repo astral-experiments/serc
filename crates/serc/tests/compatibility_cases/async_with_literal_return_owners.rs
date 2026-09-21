@@ -1,14 +1,5 @@
 use crate::common;
-
-fn indent(source: &str) -> String {
-    let mut indented = String::new();
-    for line in source.lines() {
-        indented.push_str("    ");
-        indented.push_str(line);
-        indented.push('\n');
-    }
-    indented
-}
+use crate::common::indent;
 
 fn protected(body: &str) -> String {
     format!("try:\n{}except Error:\n    fallback()\n", indent(body))

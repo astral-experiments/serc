@@ -1,20 +1,11 @@
 use crate::common;
+use crate::common::indent;
 
 fn consumers(member: &str) -> String {
     format!(
         "def first(value):\n    return value in {{'{member}', 'novel_marker'}}\n\
          def second(value):\n    'Distinct constants tuple.'\n    return value in {{'{member}', 'novel_marker'}}\n"
     )
-}
-
-fn indent(source: &str) -> String {
-    let mut result = String::new();
-    for line in source.lines() {
-        result.push_str("    ");
-        result.push_str(line);
-        result.push('\n');
-    }
-    result
 }
 
 #[test]

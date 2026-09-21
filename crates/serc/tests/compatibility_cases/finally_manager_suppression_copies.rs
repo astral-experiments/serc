@@ -1,14 +1,5 @@
 use crate::common;
-
-fn indent(source: &str) -> String {
-    let mut result = String::new();
-    for line in source.lines() {
-        result.push_str("    ");
-        result.push_str(line);
-        result.push('\n');
-    }
-    result
-}
+use crate::common::indent;
 
 fn assert_manager_suppression(kind: &str, outer: &str, body: &str, cleanup: &str) {
     let body = if body == "raise" {

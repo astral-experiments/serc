@@ -1,14 +1,5 @@
 use crate::common;
-
-fn indent(source: &str) -> String {
-    let mut result = String::new();
-    for line in source.lines() {
-        result.push_str("    ");
-        result.push_str(line);
-        result.push('\n');
-    }
-    result
-}
+use crate::common::indent;
 
 #[test]
 fn matches_cpython_parser_identifiers_in_discarded_code() {

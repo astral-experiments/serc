@@ -1,14 +1,5 @@
 use crate::common;
-
-fn indent(source: &str) -> String {
-    let mut result = String::new();
-    for line in source.lines() {
-        result.push_str("    ");
-        result.push_str(line);
-        result.push('\n');
-    }
-    result
-}
+use crate::common::indent;
 
 fn matched(condition: &str, body: &str) -> String {
     format!(

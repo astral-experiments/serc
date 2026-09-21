@@ -1,4 +1,5 @@
 use crate::common;
+use crate::common::indent;
 
 fn comprehension(kind: &str, element: &str, target: &str) -> String {
     match kind {
@@ -7,16 +8,6 @@ fn comprehension(kind: &str, element: &str, target: &str) -> String {
         "dict" => format!("{{{target}: {element} for {target} in values}}"),
         _ => unreachable!(),
     }
-}
-
-fn indent(source: &str) -> String {
-    let mut result = String::new();
-    for line in source.lines() {
-        result.push_str("    ");
-        result.push_str(line);
-        result.push('\n');
-    }
-    result
 }
 
 #[test]

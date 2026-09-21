@@ -1,14 +1,7 @@
 use std::fmt::Write as _;
 
 use crate::common;
-
-fn indent(source: &str) -> String {
-    let mut result = String::new();
-    for line in source.lines() {
-        writeln!(result, "    {line}").expect("writing to a String cannot fail");
-    }
-    result
-}
+use crate::common::indent;
 
 #[test]
 fn preserves_empty_while_headers_after_leading_boolean_folds() {
