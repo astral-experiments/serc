@@ -753,8 +753,10 @@ impl Compiler<'_> {
                     }
                 }
                 if !emitted_case_exit && !suite_terminates(&case.body) && !emitted_fallthrough {
-                    let nested_pattern_failure = self.control.falls_through_to_loop_backedge()
-                        && matches!(case.body.last(), Some(Stmt::Match(nested))
+                    // The final nested pattern's failure reaches this outer case exit;
+                    // successful inner cases have already copied or bypassed that exit.
+                    let nested_pattern_failure =
+                        matches!(case.body.last(), Some(Stmt::Match(nested))
                         if nested.cases.last().is_some_and(|case| {
                             case.guard.is_none()
                                 && matches!(case.pattern, Pattern::MatchValue(_))
