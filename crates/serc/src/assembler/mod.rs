@@ -4549,7 +4549,10 @@ impl Assembler {
     }
 
     /// Records the first erased ordinary-try POP before a return's remaining unwind.
-    pub(crate) fn record_name_return_pop_boundary(&mut self, boundary: Label) {
+    pub(crate) fn record_name_return_pop_boundary(&mut self, boundary: Label, pop_count: usize) {
+        if self.python_version <= crate::PythonVersion::Py313 {
+            self.legacy_return_pop_blocks.insert(boundary, pop_count);
+        }
         if !self.deferred_name_return_borrow_exits.is_empty() {
             self.name_return_pop_boundaries.insert(boundary);
         }
@@ -5158,6 +5161,31 @@ impl Assembler {
     pub(crate) fn add_last_inlined_jump_slot(&mut self) {
         self.required_last_instruction_mut("recording an inlined jump slot")
             .add_pre_fold_extra_instructions(1);
+        if self.python_version <= crate::PythonVersion::Py313 {
+            // Keep this exact producer separate from expression folds and POP_BLOCK
+            // counts in the general pre-fold metadata. The label is metadata only.
+            // The footer's LOAD_CONST/RETURN_VALUE must remain adjacent for
+            // native constant-return folding. Attach the certificate to its load.
+            let index = self
+                .linear_items()
+                .iter()
+                .enumerate()
+                .rev()
+                .filter_map(|(index, item)| matches!(item, Item::Instruction(_)).then_some(index))
+                .nth(1)
+                .expect("inlined exit contains a constant-return pair");
+            debug_assert!(matches!(self.linear_items()[index], Item::Instruction(load)
+                if load.opcode == crate::target::opcodes::LOAD_CONST));
+            debug_assert!(matches!(
+                self.linear_items().iter().rev().find(|item| matches!(item, Item::Instruction(_))),
+                Some(Item::Instruction(instruction)) if instruction.opcode == crate::target::opcodes::RETURN_VALUE
+            ));
+            let entry = self.label();
+            self.insert_label(index, entry);
+            self.exception_owner_provenance
+                .legacy_early_copy_slots
+                .insert(entry, 1);
+        }
     }
 
     /// Whether a return's first erased POP shares an original iterator-cleanup join.
@@ -8670,6 +8698,12 @@ impl Assembler {
                 .noop_finally_locations
                 .push(location);
         }
+    }
+
+    /// Excludes a surviving pseudo-op marker from every enclosing exception region.
+    pub(crate) fn exclude_last_from_exception_table(&mut self) {
+        self.required_last_instruction_mut("excluding a pseudo-op marker")
+            .set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
     }
 
     pub(crate) fn mark_last_as_converted_pop_block(&mut self) {
@@ -13913,7 +13947,9 @@ impl Assembler {
     /// Removes a side-effect-free constant whose value is immediately discarded.
     pub(crate) fn optimize_constant_pops(&mut self) {
         self.resolve_folded_condition_borrow_entries();
-        if !self.has_constant_pop_candidate {
+        // Legacy CFG optimization removes same-line body NOPs before folding
+        // constant/POP_TOP pairs. Keep the real POP_TOP as their location donor.
+        if self.python_version <= crate::PythonVersion::Py313 || !self.has_constant_pop_candidate {
             return;
         }
         let is_constant_load =

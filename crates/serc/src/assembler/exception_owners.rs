@@ -135,6 +135,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) populated_try_else_borrow_exits: Vec<(Label, Label)>,
     pub(super) omitted_nop_locations: FxHashMap<Label, SourceLocation>,
     pub(super) omitted_nop_counts: FxHashMap<Label, usize>,
+    // Native early-copy slots from eager footer jumps and copied omitted records.
+    pub(super) legacy_early_copy_slots: FxHashMap<Label, usize>,
     // One omitted fallthrough marker with no original label: item offset, location, count.
     pub(super) omitted_nop_tail: Option<(usize, SourceLocation, usize)>,
     // Original constant-expression/Pass pairs sharing only their fresh marker labels.

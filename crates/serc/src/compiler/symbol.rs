@@ -537,6 +537,23 @@ impl Compiler<'_> {
         {
             return Ok(self.active_temporary_index(name));
         }
+        if self.context.python_version <= PythonVersion::Py313
+            && let Scope::Class { free_indices, .. } = &self.unit.scope
+            && let Some(index) = free_indices.get(&name)
+            && !(self.is_cell_id(name)
+                && (matches!(self.resolve_name(name), "__class__" | "__classdict__")
+                    || self
+                        .control
+                        .comprehensions
+                        .active_comprehension_local_names
+                        .iter()
+                        .any(|locals| locals.contains(name))))
+        {
+            // Own class cells and active comprehension target cells take precedence.
+            // A saved free name can also have an inactive cell slot from an earlier
+            // comprehension; that slot does not supply the enclosing function's cell.
+            return Ok(*index);
+        }
         match &self.unit.scope {
             Scope::Module => self
                 .symbols
@@ -998,7 +1015,9 @@ impl Compiler<'_> {
                         return;
                     }
                     Stmt::AnnAssign(assignment) => {
-                        let build = self.legacy_compiler.is_some() && self.record_string_origins;
+                        let build = self.build_discarded
+                            && self.legacy_compiler.is_some()
+                            && self.record_string_origins;
                         if build {
                             self.flush_origins();
                             self.actions.push(SkippedAction::Statement(statement));
@@ -1271,8 +1290,12 @@ impl Compiler<'_> {
                     // is built. Replaying operands or delaying this action changes which
                     // object a later class-qualified-name constant finds in the cache.
                     if self.record_string_origins {
-                        self.flush_origins();
-                        self.actions.push(SkippedAction::Expression(expression));
+                        if self.build_discarded {
+                            self.flush_origins();
+                            self.actions.push(SkippedAction::Expression(expression));
+                        } else {
+                            self.string_origin_constants.push((constant.clone(), false));
+                        }
                     }
                     if self.register_literals {
                         self.constants.push(constant);
@@ -1541,11 +1564,8 @@ impl Compiler<'_> {
             record_string_origins: self.context.has_tracked_string_origins(),
             private_name: self.unit.private_name.clone(),
             future_annotations: self.unit.flags & CO_FUTURE_ANNOTATIONS != 0,
-            legacy_compiler: self
-                .context
-                .tracks_legacy_qualified_names()
-                .then_some(&*self),
-            legacy_annotated_scope: self.context.tracks_legacy_qualified_names()
+            legacy_compiler: (!self.has_deferred_annotations()).then_some(&*self),
+            legacy_annotated_scope: !self.has_deferred_annotations()
                 && matches!(self.unit.scope, Scope::Module | Scope::Class { .. }),
             source: self.context.source,
             ..Collector::default()
@@ -1717,13 +1737,48 @@ impl Compiler<'_> {
         expression: &Expr,
     ) -> Result<(), CompileError> {
         #[derive(Default)]
-        struct Collector {
+        struct Collector<'source> {
             constants: Vec<Constant>,
+            legacy_fstring_source: Option<&'source str>,
         }
 
-        impl<'ast> Visitor<'ast> for Collector {
+        impl Collector<'_> {
+            fn visit_interpolated_components(
+                &mut self,
+                components: Vec<InterpolatedStringComponent<'_>>,
+                source: &str,
+            ) {
+                if components.len() > 30 {
+                    self.constants.push(Constant::String(String::new()));
+                }
+                for component in components {
+                    match component {
+                        InterpolatedStringComponent::Literal(literal) => {
+                            self.constants.push(literal.into_constant());
+                        }
+                        InterpolatedStringComponent::Interpolation(interpolation, is_raw) => {
+                            self.visit_expr(&interpolation.expression);
+                            if let Some(specification) = &interpolation.format_spec {
+                                self.visit_interpolated_components(
+                                    format_spec_components(&specification.elements, is_raw, source),
+                                    source,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        impl<'ast> Visitor<'ast> for Collector<'_> {
             fn visit_expr(&mut self, expression: &'ast Expr) {
-                if let Some(constant) = literal_constant(expression) {
+                if let Expr::FString(fstring) = expression
+                    && let Some(source) = self.legacy_fstring_source
+                {
+                    // Ruff represents literal fragments outside Expr; the generic
+                    // visitor would miss constants reused after this message is removed.
+                    self.visit_interpolated_components(fstring_components(fstring, source), source);
+                } else if let Some(constant) = literal_constant(expression) {
                     self.constants.push(constant);
                 } else {
                     walk_expr(self, expression);
@@ -1731,7 +1786,11 @@ impl Compiler<'_> {
             }
         }
 
-        let mut collector = Collector::default();
+        let mut collector = Collector {
+            legacy_fstring_source: (self.context.python_version <= PythonVersion::Py313)
+                .then_some(self.context.source),
+            ..Collector::default()
+        };
         collector.visit_expr(expression);
         for constant in collector.constants {
             self.add_constant(constant)?;
@@ -2050,9 +2109,11 @@ impl Compiler<'_> {
         compact_trailing_nop: bool,
     ) -> Result<EmittedJump, CompileError> {
         self.control.clear_direct_comprehension_assignment_results();
-        let removed_nop = (compact_trailing_nop && is_unconditional_jump(opcode))
-            .then(|| self.take_trailing_nop_location())
-            .flatten();
+        let removed_nop = (compact_trailing_nop
+            && self.context.python_version != crate::PythonVersion::Py312
+            && is_unconditional_jump(opcode))
+        .then(|| self.take_trailing_nop_location())
+        .flatten();
         if !preserve_location && let Some((location, _)) = removed_nop {
             self.assembler.set_location(location);
         }
@@ -2077,9 +2138,10 @@ impl Compiler<'_> {
         exception_policy: ExceptionPolicy,
     ) -> Result<(), CompileError> {
         self.control.clear_direct_comprehension_assignment_results();
-        let removed_nop = is_unconditional_jump(opcode)
-            .then(|| self.take_trailing_nop_location())
-            .flatten();
+        let removed_nop = (self.context.python_version != crate::PythonVersion::Py312
+            && is_unconditional_jump(opcode))
+        .then(|| self.take_trailing_nop_location())
+        .flatten();
         if let Some((location, _)) = removed_nop {
             self.assembler.set_location(location);
         }
@@ -2116,9 +2178,10 @@ impl Compiler<'_> {
         label: Label,
     ) -> Result<EmittedJump, CompileError> {
         self.control.clear_direct_comprehension_assignment_results();
-        let removed_nop = is_unconditional_jump(opcode)
-            .then(|| self.take_trailing_nop_location())
-            .flatten();
+        let removed_nop = (self.context.python_version != crate::PythonVersion::Py312
+            && is_unconditional_jump(opcode))
+        .then(|| self.take_trailing_nop_location())
+        .flatten();
         if let Some((location, _)) = removed_nop {
             self.assembler.set_location(location);
         }
@@ -2145,9 +2208,10 @@ impl Compiler<'_> {
         exception_policy: ExceptionPolicy,
     ) -> Result<(), CompileError> {
         self.control.clear_direct_comprehension_assignment_results();
-        let removed_nop = is_unconditional_jump(opcode)
-            .then(|| self.take_trailing_nop_location())
-            .flatten();
+        let removed_nop = (self.context.python_version != crate::PythonVersion::Py312
+            && is_unconditional_jump(opcode))
+        .then(|| self.take_trailing_nop_location())
+        .flatten();
         if let Some((location, _)) = removed_nop {
             self.assembler.set_location(location);
         }

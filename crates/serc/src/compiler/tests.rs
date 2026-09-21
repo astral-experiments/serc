@@ -1192,10 +1192,10 @@ fn scope_body_facts_preserve_named_scope_and_annotation_boundaries() {
     let Stmt::ClassDef(definition) = &parsed.suite()[0] else {
         panic!("expected a class definition");
     };
-    let deferred = ScopeBodyFacts::for_class(&definition.body, true);
+    let deferred = ScopeBodyFacts::for_class(&definition.body, true, false);
     assert!(deferred.references.contains("value"));
     assert!(!deferred.references.contains("annotation"));
-    let eager = ScopeBodyFacts::for_class(&definition.body, false);
+    let eager = ScopeBodyFacts::for_class(&definition.body, false, false);
     assert!(eager.references.contains("value"));
     assert!(eager.references.contains("annotation"));
 }

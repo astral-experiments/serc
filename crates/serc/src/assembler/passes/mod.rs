@@ -496,6 +496,7 @@ impl Assembler {
             self.exception_owner_provenance
                 .capture_uncompacted_conditional_arrays(&graph.copy_items());
         }
+        Self::restore_legacy_return_pop_blocks(&mut graph, &self.legacy_return_pop_blocks);
         OptimizationPipeline {
             python_version: self.python_version,
             graph,

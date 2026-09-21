@@ -1514,6 +1514,8 @@ pub(crate) struct Assembler {
     pub(super) deferred_name_return_borrow_exits: Vec<super::NameReturnBorrowExit>,
     /// Exact omitted ordinary-try POP slots in pending local-return targets.
     pub(super) name_return_pop_boundaries: FxHashSet<Label>,
+    /// Ordinary-return `POP_BLOCK` records needed by the legacy CFG copy phases.
+    pub(super) legacy_return_pop_blocks: FxHashMap<Label, usize>,
     /// Iterator-region aliases immediately following an ordinary-return POP boundary.
     pub(super) name_return_iterator_region_aliases: FxHashMap<Label, Label>,
     /// Disconnected loop exits and the normal entries that remain reachable.
@@ -1751,6 +1753,7 @@ impl Default for Assembler {
             deferred_borrow_entries: Vec::new(),
             deferred_name_return_borrow_exits: Vec::new(),
             name_return_pop_boundaries: FxHashSet::default(),
+            legacy_return_pop_blocks: FxHashMap::default(),
             name_return_iterator_region_aliases: FxHashMap::default(),
             borrow_loop_exit_blocks: FxHashMap::default(),
             borrow_finally_entries: FxHashMap::default(),

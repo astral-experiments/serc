@@ -2,9 +2,9 @@ use std::cmp::Reverse;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::super::block_graph::{BasicBlockId, ItemPosition};
+use super::super::block_graph::{BasicBlockId, BlockGraph, ItemPosition};
 use super::super::{
-    Assembler, ConstantTable, ExceptionPolicy, ExceptionRegionPriority, Instruction, Item,
+    Assembler, ConstantTable, ExceptionPolicy, ExceptionRegionPriority, Instruction, Item, Label,
     LayoutAssembler, Operand, OptimizationPipeline, SourceLocation, block_has_fallthrough,
     block_jump_target,
 };
@@ -23,6 +23,43 @@ use crate::{CompileError, PythonVersion};
 const LEGACY_COPY_PRIORITY_START: usize = usize::MAX;
 
 impl Assembler {
+    /// Restores erased return `POP_BLOCK` records until each legacy target's native removal phase.
+    pub(super) fn restore_legacy_return_pop_blocks(
+        graph: &mut BlockGraph,
+        boundaries: &FxHashMap<Label, usize>,
+    ) {
+        if boundaries.is_empty() {
+            return;
+        }
+        let mut insertions = Vec::new();
+        let mut depth = None;
+        for &block in graph.order() {
+            for (offset, item) in graph[block].items().iter().enumerate() {
+                match item {
+                    Item::Instruction(instruction) => depth = instruction.depth_after(),
+                    Item::Label(label) => {
+                        if let Some(&count) = boundaries.get(label) {
+                            let mut marker = Instruction::synthetic(
+                                NOP,
+                                Operand::Value(0),
+                                SourceLocation::NONE,
+                                depth,
+                            );
+                            marker.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+                            marker.fusion_policy.mark_converted_pop_block();
+                            insertions.push((ItemPosition::new(block, offset + 1), marker, count));
+                        }
+                    }
+                }
+            }
+        }
+        for (position, marker, count) in insertions.into_iter().rev() {
+            for _ in 0..count {
+                graph.insert_item(position, Item::Instruction(marker));
+            }
+        }
+    }
+
     /// Captures 3.12's exception-stack operand before CFG copying changes protected ranges.
     pub(super) fn prepare_legacy_yield_arguments(&mut self) {
         if self.python_version != PythonVersion::Py312 {
@@ -100,7 +137,8 @@ impl OptimizationPipeline {
         loop {
             let before = self.graph.copy_items();
             self.remove_legacy_nops(&original_arrays, false);
-            self.remove_redundant_forward_jumps(false);
+            // Native redundant jumps leave a located NOP for the next cleanup.
+            self.remove_legacy_redundant_jumps();
             if self.python_version == PythonVersion::Py312 || self.graph.copy_items() == before {
                 break;
             }
@@ -232,6 +270,16 @@ impl OptimizationPipeline {
         let mut boundaries = self.preserved_block_boundaries.clone();
         boundaries.extend(&self.exception_owner_provenance.block_boundaries);
         boundaries.extend(&self.exception_owner_provenance.source_boundaries);
+        if self.python_version == PythonVersion::Py312 {
+            // 3.12 preserves every codegen label, including SETUP body entries.
+            // 3.13 starts arrays only at explicit jump/SETUP targets instead.
+            boundaries.extend(
+                self.exception_owner_provenance
+                    .setups
+                    .iter()
+                    .map(|(entry, _)| *entry),
+            );
+        }
         boundaries.extend(self.exception_regions.iter().map(|region| region.target));
         boundaries.extend(self.graph.iter_items().filter_map(|item| match item {
             Item::Instruction(instruction) => match instruction.operand() {
@@ -273,6 +321,9 @@ impl OptimizationPipeline {
         original_arrays: &FxHashMap<BasicBlockId, usize>,
         before_folding: bool,
     ) {
+        if before_folding {
+            self.freeze_legacy_omitted_copy_slots();
+        }
         loop {
             let mut changed = false;
             let order = self.graph.order().to_vec();
@@ -332,6 +383,19 @@ impl OptimizationPipeline {
                         )
                     })
                     .sum::<usize>();
+                let instruction_slots = instruction_slots
+                    + if before_folding {
+                        targets
+                            .iter()
+                            .map(|target| {
+                                self.legacy_omitted_copy_slots(*target)
+                                    .iter()
+                                    .sum::<usize>()
+                            })
+                            .sum::<usize>()
+                    } else {
+                        0
+                    };
                 let small_exit = crate::target::is_scope_exit_for(self.python_version, last.opcode)
                     && instruction_slots <= 4;
                 let unlocated_terminal = self.python_version == PythonVersion::Py313
@@ -381,7 +445,7 @@ impl OptimizationPipeline {
         destination: BasicBlockId,
     ) -> Vec<Item> {
         if self.exception_regions.is_empty() {
-            return self.graph[target]
+            let copied = self.graph[target]
                 .items()
                 .iter()
                 .filter_map(|item| match item {
@@ -389,6 +453,7 @@ impl OptimizationPipeline {
                     Item::Label(_) => None,
                 })
                 .collect();
+            return self.copy_legacy_omitted_slots(target, copied);
         }
         let positions = self
             .graph
@@ -511,7 +576,128 @@ impl OptimizationPipeline {
             }
             index = end;
         }
-        copied
+        self.copy_legacy_omitted_slots(target, copied)
+    }
+
+    /// Freezes omitted records before copied jumps become same-span `NOP`s.
+    fn freeze_legacy_omitted_copy_slots(&mut self) {
+        let mut certified = FxHashMap::default();
+        for &block in self.graph.order() {
+            let mut slots = self.initial_legacy_omitted_copy_slots(block).into_iter();
+            let mut entry = None;
+            for item in self.graph[block].items() {
+                match item {
+                    Item::Label(label) => {
+                        entry.get_or_insert(*label);
+                    }
+                    Item::Instruction(_) => {
+                        let count = slots.next().expect("one slot count per instruction");
+                        if count != 0 {
+                            certified.insert(
+                                entry.expect("omitted records have an original label"),
+                                count,
+                            );
+                        }
+                        entry = None;
+                    }
+                }
+            }
+        }
+        self.exception_owner_provenance.legacy_early_copy_slots = certified;
+    }
+
+    /// Reads frozen costs without mistaking a rewritten jump for an authored Pass.
+    fn legacy_omitted_copy_slots(&self, block: BasicBlockId) -> Vec<usize> {
+        let mut slots = Vec::new();
+        let mut pending = 0;
+        for item in self.graph[block].items() {
+            match item {
+                Item::Label(label) => {
+                    pending += self
+                        .exception_owner_provenance
+                        .legacy_early_copy_slots
+                        .get(label)
+                        .copied()
+                        .unwrap_or(0);
+                }
+                Item::Instruction(_) => {
+                    slots.push(pending);
+                    pending = 0;
+                }
+            }
+        }
+        slots
+    }
+
+    /// Counts initial omitted native records, coalescing aliases and materialized `NOP`s.
+    fn initial_legacy_omitted_copy_slots(&self, block: BasicBlockId) -> Vec<usize> {
+        let mut slots = Vec::new();
+        let mut omitted_nops = 0;
+        let mut omitted_location = None;
+        let mut certified = 0;
+        for item in self.graph[block].items() {
+            match item {
+                Item::Label(label) => {
+                    if let Some(&count) = self
+                        .exception_owner_provenance
+                        .omitted_nop_counts
+                        .get(label)
+                        && count >= omitted_nops
+                    {
+                        omitted_nops = count;
+                        omitted_location = self
+                            .exception_owner_provenance
+                            .omitted_nop_locations
+                            .get(label)
+                            .copied();
+                    }
+                    certified += self
+                        .exception_owner_provenance
+                        .legacy_early_copy_slots
+                        .get(label)
+                        .copied()
+                        .unwrap_or(0);
+                }
+                Item::Instruction(instruction) => {
+                    // Some try/else producers materialize an omitted body NOP
+                    // later. Its original location certifies the slot already present.
+                    let represented = usize::from(
+                        instruction.opcode == NOP
+                            && !instruction.fusion_policy.is_converted_pop_block()
+                            && Some(instruction.location) == omitted_location,
+                    );
+                    slots.push(omitted_nops.saturating_sub(represented) + certified);
+                    omitted_nops = 0;
+                    omitted_location = None;
+                    certified = 0;
+                }
+            }
+        }
+        slots
+    }
+
+    /// Carries exact omitted-slot costs with an early exit copy for transitive copying.
+    fn copy_legacy_omitted_slots(&mut self, target: BasicBlockId, copied: Vec<Item>) -> Vec<Item> {
+        let slots = self.legacy_omitted_copy_slots(target);
+        if slots.iter().all(|count| *count == 0) {
+            return copied;
+        }
+        let mut slots = slots.into_iter();
+        let mut result = Vec::with_capacity(copied.len());
+        for item in copied {
+            if matches!(item, Item::Instruction(_)) {
+                let count = slots.next().expect("copy preserves source instructions");
+                if count != 0 {
+                    let entry = self.label();
+                    self.exception_owner_provenance
+                        .legacy_early_copy_slots
+                        .insert(entry, count);
+                    result.push(Item::Label(entry));
+                }
+            }
+            result.push(item);
+        }
+        result
     }
 
     fn optimize_legacy_adjacent_instructions(&mut self) {
@@ -828,8 +1014,24 @@ impl OptimizationPipeline {
                     let mut remove =
                         instruction.location.line < 0 || instruction.location.line == previous_line;
                     if !remove {
-                        if let Some(next) = positions.get(index + 1) {
-                            let next = self.graph.instruction_mut(*next).unwrap();
+                        // Metadata labels split physical blocks without ending the native
+                        // instruction array. A NOP can still donate its location to the
+                        // next original instruction across those fragments.
+                        let next = positions.get(index + 1).copied().or_else(|| {
+                            array?;
+                            order[block_index + 1..]
+                                .iter()
+                                .take_while(|next| original_arrays.get(next).copied() == array)
+                                .find_map(|next| {
+                                    self.graph[*next]
+                                        .items()
+                                        .iter()
+                                        .position(|item| matches!(item, Item::Instruction(_)))
+                                        .map(|offset| ItemPosition::new(*next, offset))
+                                })
+                        });
+                        if let Some(next) = next {
+                            let next = self.graph.instruction_mut(next).unwrap();
                             if next.location.line < 0 {
                                 next.location = instruction.location;
                                 remove = true;
@@ -888,7 +1090,13 @@ impl OptimizationPipeline {
 
     fn legacy_predecessors(&self) -> FxHashMap<BasicBlockId, usize> {
         let mut predecessors = FxHashMap::default();
+        let reachable = self.graph.reachable_blocks(&self.exception_regions);
         for (index, block) in self.graph.order().iter().copied().enumerate() {
+            // Erasing dead instructions can leave an unreachable label-only block.
+            // Its apparent fallthrough is not a native predecessor of the next exit.
+            if self.graph[block].last_instruction().is_none() && !reachable[block.index()] {
+                continue;
+            }
             if block_has_fallthrough(self.graph[block].items())
                 && let Some(next) = self.graph.order().get(index + 1)
             {
@@ -2012,5 +2220,345 @@ mod tests {
                 .unwrap();
             assert_eq!(function.exception_table, expected, "{version:?}");
         }
+    }
+
+    #[test]
+    fn legacy_return_pop_blocks_count_toward_exit_copy_limit() {
+        use crate::code_object::Constant;
+        use crate::{CompileOptions, compile_with_options};
+
+        let source = "def iterator_try_with(items, manager, work, Error):\n    for item in items:\n        try:\n            with manager:\n                work(item)\n            return item\n        except Error:\n            pass\n";
+        // Exact pinned native bytes: the return array has five original slots,
+        // including POP_BLOCK, so manager suppression cannot copy its four wire ops.
+        let cases: &[(PythonVersion, &[u8], &[u8])] = &[
+            (
+                PythonVersion::Py312,
+                &[
+                    151, 0, 124, 0, 68, 0, 93, 25, 0, 0, 125, 4, 9, 0, 124, 1, 53, 0, 1, 0, 2, 0,
+                    124, 2, 124, 4, 171, 1, 0, 0, 0, 0, 0, 0, 1, 0, 100, 0, 100, 0, 100, 0, 171, 2,
+                    0, 0, 0, 0, 0, 0, 1, 0, 124, 4, 99, 2, 1, 0, 83, 0, 4, 0, 121, 0, 35, 0, 49, 0,
+                    115, 1, 119, 2, 1, 0, 89, 0, 1, 0, 1, 0, 140, 15, 120, 3, 89, 0, 119, 1, 35, 0,
+                    124, 3, 36, 0, 114, 3, 1, 0, 89, 0, 140, 48, 119, 0, 120, 3, 89, 0, 119, 1,
+                ],
+                &[
+                    135, 2, 44, 2, 137, 9, 32, 5, 146, 9, 44, 2, 160, 5, 41, 9, 165, 7, 44, 2, 172,
+                    5, 52, 5, 179, 1, 52, 5,
+                ],
+            ),
+            (
+                PythonVersion::Py313,
+                &[
+                    149, 0, 85, 0, 19, 0, 72, 25, 0, 0, 110, 4, 30, 0, 85, 1, 2, 0, 32, 0, 85, 2,
+                    34, 0, 85, 4, 53, 1, 0, 0, 0, 0, 0, 0, 32, 0, 83, 0, 83, 0, 83, 0, 53, 2, 0, 0,
+                    0, 0, 0, 0, 32, 0, 85, 4, 115, 2, 32, 0, 36, 0, 11, 0, 32, 0, 103, 0, 33, 0,
+                    44, 0, 40, 0, 0, 0, 0, 0, 0, 0, 100, 1, 0, 0, 102, 2, 32, 0, 31, 0, 32, 0, 32,
+                    0, 78, 21, 61, 3, 31, 0, 102, 1, 33, 0, 85, 3, 7, 0, 97, 4, 0, 0, 32, 0, 31, 0,
+                    77, 56, 0, 0, 102, 0, 61, 3, 31, 0, 102, 1,
+                ],
+                &[
+                    135, 2, 50, 2, 137, 9, 33, 5, 146, 9, 50, 2, 161, 10, 47, 9, 171, 7, 50, 2,
+                    178, 6, 60, 5, 187, 1, 60, 5,
+                ],
+            ),
+        ];
+        for &(version, bytecode, table) in cases {
+            let module = compile_with_options(
+                source,
+                "legacy_return_copy_budget.py",
+                &CompileOptions {
+                    python_version: version,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .code;
+            let function = module
+                .constants
+                .iter()
+                .find_map(|constant| match constant {
+                    Constant::Code(code) => Some(code),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(function.bytecode, bytecode, "{version:?}");
+            assert_eq!(function.exception_table, table, "{version:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_discarded_comprehensions_keep_original_restore_slots() {
+        use crate::code_object::Constant;
+        use crate::{CompileOptions, compile_with_options};
+
+        // Pinned native bytes: 3.12 keeps SWAP until late line propagation;
+        // 3.13 counts it before early exit copying, then eliminates it later.
+        let cases: &[(PythonVersion, &str, &[u8], &[u8])] = &[
+            (
+                PythonVersion::Py312,
+                "def discarded(items):\n    [item for item in items]\n    return items\n",
+                &[
+                    151, 0, 124, 0, 68, 0, 143, 1, 99, 2, 103, 0, 99, 2, 93, 4, 0, 0, 125, 1, 124,
+                    1, 145, 2, 140, 6, 4, 0, 99, 2, 125, 1, 1, 0, 124, 0, 83, 0, 99, 2, 1, 0, 99,
+                    2, 125, 1, 119, 0,
+                ],
+                &[133, 9, 19, 4],
+            ),
+            (
+                PythonVersion::Py313,
+                "async def discarded(items):\n    [item async for item in items]\n",
+                &[
+                    35, 0, 32, 0, 149, 0, 85, 0, 16, 0, 86, 1, 115, 2, 47, 0, 115, 2, 18, 0, 83, 0,
+                    104, 3, 0, 0, 118, 1, 149, 3, 78, 5, 12, 0, 111, 17, 80, 2, 77, 12, 0, 0, 8, 0,
+                    78, 7, 10, 0, 79, 5, 115, 2, 32, 0, 115, 2, 110, 1, 102, 0, 32, 0, 110, 1, 103,
+                    0, 55, 3, 102, 1,
+                ],
+                &[
+                    130, 5, 33, 1, 135, 2, 25, 4, 137, 4, 23, 6, 141, 1, 21, 10, 142, 3, 23, 6,
+                    145, 4, 25, 4, 149, 1, 23, 6, 151, 1, 25, 4, 152, 9, 33, 1,
+                ],
+            ),
+        ];
+        for &(version, source, bytecode, table) in cases {
+            let module = compile_with_options(
+                source,
+                "legacy_comprehension_discard.py",
+                &CompileOptions {
+                    python_version: version,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .code;
+            let function = module
+                .constants
+                .iter()
+                .find_map(|constant| match constant {
+                    Constant::Code(code) => Some(code),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(function.bytecode, bytecode, "{version:?}");
+            assert_eq!(function.exception_table, table, "{version:?}");
+        }
+    }
+
+    #[test]
+    fn python_312_authored_exits_keep_the_enclosing_try_owner() {
+        use crate::{CompileOptions, compile_with_options};
+
+        // Pinned native tables for an in-try break and an empty nested try.
+        let cases: &[(&str, &[u8])] = &[
+            (
+                "try:\n    for item in items:\n        consume(item)\n        break\nexcept Error:\n    recover()\nfinish()\n",
+                &[130, 16, 26, 0, 154, 12, 41, 3, 168, 1, 41, 3],
+            ),
+            (
+                "try:\n    try:\n        pass\n    except (TypeError, RuntimeError):\n        pass\nexcept ValueError:\n    pass\nfinish()\n",
+                &[
+                    131, 1, 25, 0, 140, 7, 22, 3, 147, 2, 25, 0, 149, 1, 22, 3, 150, 3, 25, 0, 153,
+                    5, 33, 3, 160, 1, 33, 3,
+                ],
+            ),
+        ];
+        for &(source, table) in cases {
+            let module = compile_with_options(
+                source,
+                "legacy_enclosing_owner.py",
+                &CompileOptions {
+                    python_version: PythonVersion::Py312,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .code;
+            assert_eq!(module.exception_table, table, "{source}");
+        }
+    }
+
+    #[test]
+    fn python_313_folded_guard_keeps_original_finally_predecessor() {
+        use crate::code_object::Constant;
+        use crate::{CompileOptions, compile_with_options};
+
+        let source = "def folded_guard(flag):\n    while flag:\n        try:\n            while ():\n                if 3:\n                    break\n        finally:\n            return\n";
+        let module = compile_with_options(
+            source,
+            "legacy_folded_finally_owner.py",
+            &CompileOptions {
+                python_version: PythonVersion::Py313,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap()
+        .code;
+        let function = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) => Some(code),
+                _ => None,
+            })
+            .unwrap();
+        // Pinned native 3.13 bytes: the inner guard's original false edge keeps
+        // the shared POP_BLOCK unlocated until the constant condition folds.
+        assert_eq!(
+            function.bytecode,
+            [
+                149, 0, 85, 0, 40, 0, 0, 0, 0, 0, 0, 0, 97, 3, 0, 0, 30, 0, 30, 0, 103, 0, 103, 0,
+                33, 0, 32, 0, 31, 0, 103, 0, 61, 3, 31, 0, 102, 1,
+            ]
+        );
+        assert_eq!(function.exception_table, [137, 1, 12, 0, 140, 2, 16, 3]);
+    }
+
+    #[test]
+    fn legacy_exception_joins_match_native_blocks_and_locations() {
+        use crate::{CompileOptions, compile_with_options};
+
+        // Pinned CPython 3.12.14/3.13.15. Shared except-star joins stay
+        // unlocated, SETUP bodies stop exit copying, and authored passes survive.
+        type NativeCase<'a> = (PythonVersion, &'a str, &'a [u8], &'a [u8], &'a [u8]);
+        let cases: &[NativeCase<'_>] = &[
+            (
+                PythonVersion::Py312,
+                "try:\n    value = 1\nexcept* Error:\n    value = 2\nfinish()\n",
+                &[
+                    151, 0, 9, 0, 100, 0, 90, 0, 2, 0, 101, 2, 171, 0, 0, 0, 0, 0, 0, 0, 1, 0, 121,
+                    2, 35, 0, 103, 0, 120, 2, 101, 1, 37, 0, 120, 1, 129, 8, 1, 0, 100, 1, 90, 0,
+                    110, 3, 145, 3, 1, 0, 110, 2, 110, 1, 1, 0, 145, 1, 174, 1, 120, 1, 128, 3, 1,
+                    0, 89, 0, 140, 31, 99, 2, 89, 0, 119, 0, 120, 3, 89, 0, 119, 1,
+                ],
+                &[130, 2, 12, 0, 140, 8, 38, 3, 148, 2, 23, 9, 150, 11, 38, 3],
+                &[
+                    240, 3, 1, 1, 1, 240, 2, 3, 1, 14, 216, 12, 13, 128, 69, 241, 6, 0, 1, 7, 133,
+                    8, 248, 241, 5, 1, 1, 14, 136, 5, 243, 0, 1, 1, 14, 216, 12, 13, 129, 69, 250,
+                    128, 69, 240, 3, 1, 1, 14, 255, 252,
+                ],
+            ),
+            (
+                PythonVersion::Py312,
+                "try:\n    pass\nexcept Error:\n    pass\n\ntry:\n    pass\nexcept OtherError:\n    pass\n",
+                &[
+                    151, 0, 9, 0, 9, 0, 9, 0, 121, 0, 35, 0, 101, 0, 36, 0, 114, 3, 1, 0, 89, 0,
+                    140, 9, 119, 0, 120, 3, 89, 0, 119, 1, 35, 0, 101, 1, 36, 0, 114, 3, 1, 0, 89,
+                    0, 121, 0, 119, 0, 120, 3, 89, 0, 119, 1,
+                ],
+                &[133, 5, 13, 3, 140, 1, 13, 3, 144, 5, 24, 3, 151, 1, 24, 3],
+                &[
+                    240, 3, 1, 1, 1, 240, 2, 3, 1, 9, 216, 4, 8, 240, 8, 3, 1, 9, 216, 4, 8, 248,
+                    240, 9, 0, 8, 13, 242, 0, 1, 1, 9, 217, 4, 8, 240, 3, 1, 1, 9, 251, 240, 10, 0,
+                    8, 18, 242, 0, 1, 1, 9, 217, 4, 8, 240, 3, 1, 1, 9, 250,
+                ],
+            ),
+            (
+                PythonVersion::Py313,
+                "try:\n    value = 1\nexcept* Error:\n    value = 2\nfinish()\n",
+                &[
+                    149, 0, 30, 0, 83, 0, 114, 0, 92, 2, 34, 0, 53, 0, 0, 0, 0, 0, 0, 0, 32, 0,
+                    103, 2, 33, 0, 47, 0, 61, 2, 92, 1, 6, 0, 61, 1, 98, 9, 0, 0, 32, 0, 83, 1,
+                    114, 0, 80, 1, 79, 6, 80, 3, 32, 0, 80, 1, 79, 2, 32, 0, 80, 1, 56, 1, 61, 1,
+                    99, 3, 0, 0, 32, 0, 31, 0, 78, 34, 115, 2, 31, 0, 102, 0, 61, 3, 31, 0, 102, 1,
+                ],
+                &[130, 2, 12, 0, 140, 9, 41, 3, 149, 2, 25, 9, 151, 13, 41, 3],
+                &[
+                    240, 3, 1, 1, 1, 240, 2, 3, 1, 14, 216, 12, 13, 128, 69, 241, 6, 0, 1, 7, 133,
+                    8, 248, 241, 5, 1, 1, 14, 136, 5, 244, 0, 1, 1, 14, 216, 12, 13, 130, 69, 251,
+                    241, 3, 1, 1, 14, 255, 252,
+                ],
+            ),
+            (
+                PythonVersion::Py313,
+                "try:\n    pass\nexcept Error:\n    pass\n\ntry:\n    pass\nexcept OtherError:\n    pass\n",
+                &[
+                    149, 0, 30, 0, 30, 0, 30, 0, 103, 0, 33, 0, 92, 0, 7, 0, 97, 3, 0, 0, 32, 0,
+                    31, 0, 78, 10, 102, 0, 61, 3, 31, 0, 102, 1, 33, 0, 92, 1, 7, 0, 97, 3, 0, 0,
+                    32, 0, 31, 0, 103, 0, 102, 0, 61, 3, 31, 0, 102, 1,
+                ],
+                &[133, 6, 14, 3, 141, 1, 14, 3, 145, 6, 26, 3, 153, 1, 26, 3],
+                &[
+                    240, 3, 1, 1, 1, 240, 2, 3, 1, 9, 216, 4, 8, 240, 8, 3, 1, 9, 216, 4, 8, 248,
+                    240, 9, 0, 8, 13, 243, 0, 1, 1, 9, 217, 4, 8, 240, 3, 1, 1, 9, 251, 240, 10, 0,
+                    8, 18, 243, 0, 1, 1, 9, 217, 4, 8, 240, 3, 1, 1, 9, 250,
+                ],
+            ),
+            (
+                PythonVersion::Py313,
+                "try:\n    value = 1\n    pass\nexcept Error:\n    pass\nfinish()\n",
+                &[
+                    149, 0, 30, 0, 83, 0, 114, 0, 30, 0, 92, 2, 34, 0, 53, 0, 0, 0, 0, 0, 0, 0, 32,
+                    0, 103, 1, 33, 0, 92, 1, 7, 0, 97, 3, 0, 0, 32, 0, 31, 0, 78, 16, 102, 0, 61,
+                    3, 31, 0, 102, 1,
+                ],
+                &[130, 2, 13, 0, 141, 6, 22, 3, 149, 1, 22, 3],
+                &[
+                    240, 3, 1, 1, 1, 240, 2, 4, 1, 9, 216, 12, 13, 128, 69, 216, 4, 8, 241, 6, 0,
+                    1, 7, 133, 8, 248, 240, 5, 0, 8, 13, 243, 0, 1, 1, 9, 217, 4, 8, 240, 3, 1, 1,
+                    9, 250,
+                ],
+            ),
+        ];
+        for &(version, source, bytecode, exceptions, lines) in cases {
+            let module = compile_with_options(
+                source,
+                "legacy_exception_joins.py",
+                &CompileOptions {
+                    python_version: version,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .code;
+            assert_eq!(module.bytecode, bytecode, "{version:?}: {source}");
+            assert_eq!(module.exception_table, exceptions, "{version:?}: {source}");
+            assert_eq!(module.line_table, lines, "{version:?}: {source}");
+        }
+    }
+
+    #[test]
+    fn python_312_noop_finally_retains_ownerless_original_pop_block() {
+        use crate::code_object::Constant;
+        use crate::{CompileOptions, compile_with_options};
+
+        // Pinned CPython 3.12.14: the else Pass's location moves to the
+        // copied original POP_BLOCK, which has no exception handler.
+        let module = compile_with_options(
+            "def f():\n    try: pass\n    except ZeroDivisionError: pass\n    else: pass\n    finally: pass\n",
+            "noop_finally_owner.py",
+            &CompileOptions {
+                python_version: PythonVersion::Py312,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap()
+        .code;
+        let function = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) if code.name == "f" => Some(code),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            function.bytecode,
+            [
+                151, 0, 9, 0, 9, 0, 121, 0, 35, 0, 116, 0, 0, 0, 0, 0, 0, 0, 0, 0, 36, 0, 114, 3,
+                1, 0, 89, 0, 121, 0, 119, 0, 120, 3, 89, 0, 119, 1, 35, 0, 119, 0, 120, 3, 89, 0,
+                119, 1
+            ]
+        );
+        assert_eq!(
+            function.exception_table,
+            [
+                132, 9, 16, 3, 141, 1, 19, 0, 143, 1, 16, 3, 144, 3, 19, 0, 147, 2, 21, 3
+            ]
+        );
+        assert_eq!(
+            function.line_table,
+            [
+                128, 0, 216, 9, 13, 224, 10, 14, 216, 13, 17, 248, 244, 5, 0, 12, 29, 210, 4, 34,
+                152, 100, 224, 13, 17, 240, 5, 0, 5, 35, 251, 224, 13, 17, 250
+            ]
+        );
     }
 }

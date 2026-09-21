@@ -72,28 +72,30 @@ runs per compiler; all 505 generated `.pyc` files matched byte for byte.
 
 ## CPython compatibility
 
-Clone the repository with submodules, then run the frozen Python 3.14 and 3.15 gates:
+Clone the repository with submodules, then run the frozen gates for each target:
 
 ```console
 git clone --recurse-submodules https://github.com/astral-sh/serc
 cd serc
+./scripts/check-cpython-compatibility /path/to/python3.12.14 3.12
+./scripts/check-cpython-compatibility /path/to/python3.13.15 3.13
 ./scripts/check-cpython-compatibility /path/to/python3.14.5
 ./scripts/check-cpython-compatibility /path/to/python3.15.0rc2 3.15
 ```
 
 The script requires the pinned submodule corpus and runs the exact CPython
-oracle over 2,451 Python fixtures. For the 2,230 inputs accepted by CPython, it
+oracle over 2,451 Python fixtures. The Python 3.14 gate accepts 2,230 inputs and
 requires Serc's marshal output to match `marshal.dumps(compile(...))`
 exactly. The frozen baseline separately records 221 CPython-rejected inputs: 151 matched Serc
 rejections, 56 inputs accepted by Serc, and 14 internal compiler failures. CI freezes each
 outcome category against the exact supported CPython release on every pull request and every push
 to `main`.
 
-The optional second argument selects the target and defaults to `3.14`. The Python 3.15 gate
+The optional second argument selects `3.12`, `3.13`, `3.14` (the default), or `3.15`. The Python 3.15 gate
 uses the same 2,451 files and passes source bytes to both compilers. It requires all 2,249
 CPython-accepted files to match exactly, and freezes the 202 CPython-rejected inputs as
 133 matched rejections, 55 rejection mismatches, and 14 compiler failures. Compiler failures
-on accepted inputs always fail either gate.
+on accepted inputs always fail any gate.
 
 For broader diagnostics, Serc also has a separately pinned corpus derived
 from [`mypy_primer`](https://github.com/hauntsaninja/mypy_primer). The frozen

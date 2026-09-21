@@ -356,7 +356,8 @@ impl OptimizationPipeline {
                 };
                 let first_store = stored_local(&first_instruction);
                 let last_store = stored_local(&last_instruction);
-                if first_store.is_none()
+                if self.python_version >= crate::PythonVersion::Py314
+                    && first_store.is_none()
                     && last_store.is_none()
                     && !capture_cleanup_swaps.contains(&positions[index])
                 {

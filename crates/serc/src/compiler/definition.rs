@@ -801,10 +801,16 @@ impl Compiler<'_> {
         let mut freevars = Vec::new();
         for name in required_names
             .iter()
-            .chain(&wrapper_requirements)
-            .filter(|name| !type_names.contains(*name))
-            .filter(|name| self.can_provide_closure_id(**name))
-            .copied()
+            .map(|name| {
+                class_plan
+                    .enclosing_names
+                    .get(name)
+                    .copied()
+                    .unwrap_or(*name)
+            })
+            .chain(wrapper_requirements.iter().copied())
+            .filter(|name| !type_names.contains(name))
+            .filter(|name| self.can_provide_closure_id(*name))
         {
             self.insert_lexical_name(&mut freevars, name);
         }
@@ -931,25 +937,56 @@ impl Compiler<'_> {
 
         let (scope_id, class_plan) = self.class_plan(definition)?;
         let mut freevars = Vec::new();
-        for name in class_plan
-            .required
-            .iter()
-            .copied()
-            .filter(|name| match &self.unit.scope {
+        for name in class_plan.required.iter().copied().filter(|name| {
+            let enclosing = class_plan
+                .enclosing_names
+                .get(name)
+                .copied()
+                .unwrap_or(*name);
+            match &self.unit.scope {
                 Scope::Module => false,
                 Scope::Class { free_indices, .. } => {
-                    self.symbols.cell_names.contains(*name) || free_indices.contains_key(name)
+                    self.symbols.cell_names.contains(enclosing)
+                        || free_indices.contains_key(&enclosing)
                 }
-                Scope::Function { .. } => self.can_provide_closure_id(*name),
-            })
-        {
+                Scope::Function { .. } => self.can_provide_closure_id(enclosing),
+            }
+        }) {
             self.insert_lexical_name(&mut freevars, name);
         }
         if is_generic {
             let type_params = self.required_name_id(".type_params");
             self.insert_lexical_name(&mut freevars, type_params);
         }
-        let closure_names = freevars.clone();
+        let mut free_aliases = Vec::new();
+        if self.context.python_version <= PythonVersion::Py313 {
+            let canonical_name = |name| {
+                super::symbol::mangle_name(self.resolve_name(name), Some(definition.name.as_str()))
+            };
+            freevars.sort_unstable_by(|left, right| {
+                canonical_name(*left)
+                    .cmp(&canonical_name(*right))
+                    .then_with(|| self.resolve_name(*left).cmp(self.resolve_name(*right)))
+            });
+            freevars.dedup_by(|alias, original| {
+                if canonical_name(*alias) == canonical_name(*original) {
+                    free_aliases.push((*alias, *original));
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+        let closure_names = freevars
+            .iter()
+            .map(|name| {
+                class_plan
+                    .enclosing_names
+                    .get(name)
+                    .copied()
+                    .unwrap_or(*name)
+            })
+            .collect::<Vec<_>>();
         let qualified_name = self
             .unit
             .generic_target_qualified_name
@@ -967,6 +1004,20 @@ impl Compiler<'_> {
                 definition.range.start()
             }));
         let class_scope_is_nested = self.child_function_is_nested();
+        let mut comprehension_targets = Vec::with_capacity(class_plan.comprehension_targets.len());
+        for &(name, requires_free) in &class_plan.comprehension_targets {
+            if (!requires_free
+                || ((freevars.contains(&name)
+                    || free_aliases.iter().any(|(alias, _)| *alias == name))
+                    && super::scope::legacy_class_comprehension_keeps_free_name(
+                        self.resolve_name(name),
+                        self.context.python_version,
+                    )))
+                && !comprehension_targets.contains(&name)
+            {
+                comprehension_targets.push(name);
+            }
+        }
         let mut child = Self::class(
             Arc::clone(&self.context),
             definition.name.as_str(),
@@ -976,7 +1027,7 @@ impl Compiler<'_> {
             class_plan.globals,
             class_plan.nonlocals,
             &freevars,
-            &class_plan.comprehension_targets,
+            &comprehension_targets,
             &class_plan.comprehension_cells,
             class_plan.bound_names,
             class_plan.needs_class_closure,
@@ -984,6 +1035,11 @@ impl Compiler<'_> {
             class_plan.has_conditional_annotations,
             self.unit.flags & SUPPORTED_FUTURE_FLAGS,
         );
+        if let Scope::Class { free_indices, .. } = &mut child.unit.scope {
+            for (alias, original) in free_aliases {
+                free_indices.insert(alias, free_indices[&original]);
+            }
+        }
         child.unit.class_scope_is_nested = class_scope_is_nested;
         child
             .symbols
@@ -1442,7 +1498,11 @@ impl Compiler<'_> {
             .symbols
             .imported_scope_names
             .clone_from(&self.symbols.imported_scope_names);
-        child.unit.child_qualified_name_parent = Some(child_qualified_name_parent);
+        // Before 3.14, type alias values use ordinary function scopes, so
+        // definitions within them include the alias and `<locals>`.
+        if !type_alias || self.has_deferred_annotations() {
+            child.unit.child_qualified_name_parent = Some(child_qualified_name_parent);
+        }
         if can_see_class_scope {
             child.unit.annotation_classdict_index = Some(child.closure_index("__classdict__")?);
         }
@@ -2081,6 +2141,28 @@ mod tests {
             Constant::Code(child) => find_code(child, name),
             _ => None,
         })
+    }
+
+    #[test]
+    fn legacy_type_aliases_qualify_nested_lambdas() {
+        for python_version in [PythonVersion::Py312, PythonVersion::Py313] {
+            for source in ["type Alias = lambda: None", "type Alias[T] = lambda: T"] {
+                let module = compile_with_options(
+                    source,
+                    "type_alias.py",
+                    &CompileOptions {
+                        python_version,
+                        ..CompileOptions::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    find_code(&module.code, "<lambda>").unwrap().qualified_name,
+                    "Alias.<locals>.<lambda>",
+                    "{python_version:?}: {source}",
+                );
+            }
+        }
     }
 
     #[test]

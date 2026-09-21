@@ -759,9 +759,10 @@ struct ClassPlan {
     globals: FxHashSet<NameId>,
     nonlocals: FxHashSet<NameId>,
     bound_names: FxHashSet<NameId>,
-    comprehension_targets: Vec<NameId>,
+    comprehension_targets: Vec<(NameId, bool)>,
     comprehension_cells: FxHashSet<NameId>,
     required: FxHashSet<NameId>,
+    enclosing_names: FxHashMap<NameId, NameId>,
     needs_class_closure: bool,
     needs_classdict: bool,
     has_conditional_annotations: bool,
@@ -772,9 +773,10 @@ pub(super) struct LoweringClassPlan {
     pub(super) globals: FxHashSet<NameId>,
     pub(super) nonlocals: FxHashSet<NameId>,
     pub(super) bound_names: FxHashSet<NameId>,
-    pub(super) comprehension_targets: Vec<NameId>,
+    pub(super) comprehension_targets: Vec<(NameId, bool)>,
     pub(super) comprehension_cells: FxHashSet<NameId>,
     pub(super) required: FxHashSet<NameId>,
+    pub(super) enclosing_names: FxHashMap<NameId, NameId>,
     pub(super) needs_class_closure: bool,
     pub(super) needs_classdict: bool,
     pub(super) has_conditional_annotations: bool,
@@ -805,6 +807,7 @@ impl ClassPlan {
             references,
             explicit_dunder_class_reference,
             nested_lambda_requirements,
+            nested_generator_requirements,
             nested_annotation_scope_requirements: annotation_scope_requirements,
             has_function_definition,
             has_generic_definition,
@@ -819,30 +822,72 @@ impl ClassPlan {
             ignore_generator_body_comprehension_targets: true,
             eager_function_annotations: !deferred_annotations && !future_annotations,
             eager_statement_annotations: !deferred_annotations && !future_annotations,
+            legacy_class_comprehension_symbols: (!deferred_annotations).then(Vec::new),
             ..LocalCollector::default()
         };
         locals.collect_suite(&definition.body);
 
+        // Symbol analysis compares the canonical spelling of private aliases before
+        // deciding whether a direct class reference can escape to an enclosing scope.
+        let private_name = (!deferred_annotations).then_some(definition.name.as_str());
+        let bound_names = private_name.map(|_| {
+            locals
+                .seen
+                .iter()
+                .map(|name| mangle_name(name.as_str(), private_name))
+                .collect::<FxHashSet<_>>()
+        });
+        let global_names = private_name.map(|_| {
+            locals
+                .globals
+                .iter()
+                .map(|name| mangle_name(name, private_name))
+                .collect::<FxHashSet<_>>()
+        });
+        let nonlocal_names = private_name.map(|_| {
+            locals
+                .nonlocals
+                .iter()
+                .map(|name| mangle_name(name, private_name))
+                .collect::<FxHashSet<_>>()
+        });
+        let is_bound = |name: &str| {
+            bound_names.as_ref().map_or_else(
+                || locals.seen.contains(name),
+                |names| names.contains(mangle_name(name, private_name).as_ref()),
+            )
+        };
+        let is_global = |name: &str| {
+            global_names.as_ref().map_or_else(
+                || locals.globals.contains(name),
+                |names| names.contains(mangle_name(name, private_name).as_ref()),
+            )
+        };
+        let is_nonlocal = |name: &str| {
+            nonlocal_names.as_ref().map_or_else(
+                || locals.nonlocals.contains(name),
+                |names| names.contains(mangle_name(name, private_name).as_ref()),
+            )
+        };
         let mut body_explicitly_references_dunder_class = explicit_dunder_class_reference;
         let mut required = references
             .into_iter()
-            .filter(|name| {
-                locals.nonlocals.contains(name)
-                    || (!locals.globals.contains(name) && !locals.seen.contains(name.as_str()))
-            })
+            .filter(|name| is_nonlocal(name) || (!is_global(name) && !is_bound(name)))
             .collect::<BTreeSet<_>>();
         required.extend(locals.nonlocals.iter().cloned());
+        let body_requires_classdict = !deferred_annotations && required.contains("__classdict__");
         body_explicitly_references_dunder_class |=
             annotation_scope_requirements.contains("__class__");
         required.extend(
-            annotation_scope_requirements.into_iter().filter(|name| {
-                !locals.seen.contains(name.as_str()) && !locals.globals.contains(name)
-            }),
+            annotation_scope_requirements
+                .into_iter()
+                .filter(|name| !is_bound(name) && !is_global(name)),
         );
         let body_requires_dunder_class =
             body_explicitly_references_dunder_class && required.contains("__class__");
 
         required.extend(nested_lambda_requirements.iter().cloned());
+        required.extend(nested_generator_requirements);
         required.extend(
             method_requirements
                 .iter()
@@ -853,7 +898,7 @@ impl ClassPlan {
                 method_annotation_references
                     .iter()
                     .map(|name| names.resolve(*name))
-                    .filter(|name| !locals.seen.contains(*name) && !locals.globals.contains(*name))
+                    .filter(|name| !is_bound(name) && !is_global(name))
                     .map(str::to_string),
             );
         }
@@ -865,7 +910,9 @@ impl ClassPlan {
         if !body_requires_dunder_class && !locals.nonlocals.contains("__class__") {
             required.remove("__class__");
         }
-        required.remove("__classdict__");
+        if !body_requires_classdict {
+            required.remove("__classdict__");
+        }
         required.remove("__conditional_annotations__");
 
         let needs_class_closure =
@@ -875,9 +922,17 @@ impl ClassPlan {
             || deferred_annotations
                 && !future_annotations
                 && (has_function_definition || has_simple_annotations);
-        let comprehension_targets = std::mem::take(&mut locals.comprehension_targets)
+        let comprehension_targets = locals
+            .legacy_class_comprehension_symbols
+            .take()
+            .unwrap_or_else(|| {
+                std::mem::take(&mut locals.comprehension_targets)
+                    .into_iter()
+                    .map(|name| (name, false))
+                    .collect()
+            })
             .into_iter()
-            .map(|name| names.intern(name.as_str()))
+            .map(|(name, requires_free)| (names.intern(name.as_str()), requires_free))
             .collect();
         Self {
             globals: names.intern_set(locals.globals),
@@ -890,6 +945,7 @@ impl ClassPlan {
             comprehension_targets,
             comprehension_cells: names.intern_set(inlined_comprehension_cellvars),
             required: names.intern_set(required),
+            enclosing_names: FxHashMap::default(),
             needs_class_closure,
             needs_classdict,
             has_conditional_annotations,
@@ -904,6 +960,7 @@ impl ClassPlan {
             comprehension_targets: self.comprehension_targets.clone(),
             comprehension_cells: self.comprehension_cells.clone(),
             required: self.required.clone(),
+            enclosing_names: self.enclosing_names.clone(),
             needs_class_closure: self.needs_class_closure,
             needs_classdict: self.needs_classdict,
             has_conditional_annotations: self.has_conditional_annotations,
@@ -1101,7 +1158,7 @@ impl ScopeArena {
                     ScopeOrigin::function(definition),
                     ScopePlan::Function(FunctionPlan::default()),
                 ),
-                ScopeDefinition::Class(definition) => (
+                ScopeDefinition::Class(definition, _) => (
                     ScopeOrigin::class(definition),
                     ScopePlan::Class(ClassPlan::default()),
                 ),
@@ -1116,8 +1173,13 @@ impl ScopeArena {
                 ScopeDefinition::Function(definition, flat) => {
                     self.build_function(id, input.parent, definition, flat, future_annotations);
                 }
-                ScopeDefinition::Class(definition) => {
-                    self.build_class(id, definition, future_annotations);
+                ScopeDefinition::Class(definition, enclosing_private_name) => {
+                    self.build_class(
+                        id,
+                        definition,
+                        future_annotations,
+                        enclosing_private_name.as_deref(),
+                    );
                 }
             }
         }
@@ -1165,7 +1227,12 @@ impl ScopeArena {
 
         let eager_annotations = !self.deferred_annotations && !future_annotations;
         let facts = if eager_annotations {
-            ScopeBodyFactsCollector::collect(&definition.body, true, true, true)
+            ScopeBodyFactsCollector::collect(
+                &definition.body,
+                true,
+                ScopeBodyContext::Function,
+                true,
+            )
         } else {
             ScopeBodyFacts::for_function(&definition.body)
         };
@@ -1186,11 +1253,26 @@ impl ScopeArena {
         self.nodes[id.0].plan = ScopePlan::Function(plan);
     }
 
-    fn build_class(&mut self, id: ScopeId, definition: &StmtClassDef, future_annotations: bool) {
+    fn build_class(
+        &mut self,
+        id: ScopeId,
+        definition: &StmtClassDef,
+        future_annotations: bool,
+        enclosing_private_name: Option<&str>,
+    ) {
         let facts = if !self.deferred_annotations && !future_annotations {
-            ScopeBodyFactsCollector::collect(&definition.body, false, false, true)
+            ScopeBodyFactsCollector::collect(
+                &definition.body,
+                false,
+                ScopeBodyContext::LegacyClass,
+                true,
+            )
         } else {
-            ScopeBodyFacts::for_class(&definition.body, future_annotations)
+            ScopeBodyFacts::for_class(
+                &definition.body,
+                future_annotations,
+                !self.deferred_annotations,
+            )
         };
         let (method_requirements, method_annotation_references) =
             self.nested_function_requirements(id);
@@ -1203,7 +1285,7 @@ impl ScopeArena {
                 ScopePlan::Module => false,
             })
         });
-        let plan = ClassPlan::build(
+        let mut plan = ClassPlan::build(
             &mut self.names,
             definition,
             future_annotations,
@@ -1214,6 +1296,36 @@ impl ScopeArena {
             &nested_class_requirements,
             child_needs_class_closure,
         );
+        if !self.deferred_annotations
+            && enclosing_private_name.map(|name| name.trim_start_matches('_'))
+                != Some(definition.name.as_str().trim_start_matches('_'))
+        {
+            // Keep raw identifiers inside the class, but resolve its private requirements
+            // in the enclosing scope using the spelling established by this class.
+            plan.enclosing_names = plan
+                .required
+                .iter()
+                .filter_map(|&name| {
+                    let spelling = self.names.resolve(name);
+                    if definition.type_params.as_ref().is_some_and(|parameters| {
+                        parameters
+                            .iter()
+                            .any(|parameter| parameter.name().as_str() == spelling)
+                    }) {
+                        return None;
+                    }
+                    let Cow::Owned(mangled) = mangle_name(spelling, Some(definition.name.as_str()))
+                    else {
+                        return None;
+                    };
+                    let enclosing = self
+                        .names
+                        .get(&mangled)
+                        .expect("class name collection interns mangled requirements");
+                    Some((name, enclosing))
+                })
+                .collect();
+        }
         self.nodes[id.0].plan = ScopePlan::Class(plan);
     }
 
@@ -1250,11 +1362,14 @@ impl ScopeArena {
             .children
             .iter()
             .filter_map(|child| match &self.nodes[child.0].plan {
-                ScopePlan::Class(plan) => Some(&plan.required),
+                ScopePlan::Class(plan) => Some(plan),
                 ScopePlan::Module | ScopePlan::Function(_) => None,
             })
-            .flatten()
-            .copied()
+            .flat_map(|plan| {
+                plan.required
+                    .iter()
+                    .map(|name| plan.enclosing_names.get(name).copied().unwrap_or(*name))
+            })
             .collect()
     }
 
@@ -1284,7 +1399,7 @@ struct ScopeBuildInput<'ast> {
 
 enum ScopeDefinition<'ast> {
     Function(&'ast StmtFunctionDef, Option<FlatFunctionInputs>),
-    Class(&'ast StmtClassDef),
+    Class(&'ast StmtClassDef, Option<String>),
 }
 
 struct ModuleNameCollector<'a, 'ast> {
@@ -1577,7 +1692,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                 self.current_scope = ScopeId(self.definitions.len() + 1);
                 self.definitions.push(ScopeBuildInput {
                     parent,
-                    definition: ScopeDefinition::Class(definition),
+                    definition: ScopeDefinition::Class(definition, self.private_name.clone()),
                 });
                 self.nested_scope_depth += 1;
                 let outer_header = self.in_module_header;
@@ -1924,6 +2039,7 @@ struct LocalCollector {
     ignore_generator_body_comprehension_targets: bool,
     eager_function_annotations: bool,
     eager_statement_annotations: bool,
+    legacy_class_comprehension_symbols: Option<Vec<(Name, bool)>>,
 }
 
 fn reorder_comprehension_fast_cells<T>(
@@ -2617,6 +2733,18 @@ impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
                 }
                 _ => unreachable!(),
             };
+            if !self.in_inlined_comprehension
+                && let Some(symbols) = &mut self.collector.legacy_class_comprehension_symbols
+            {
+                for (name, requires_free) in
+                    legacy_class_comprehension_names(generators, key, value)
+                {
+                    let symbol = (Name::from(name), requires_free);
+                    if !symbols.contains(&symbol) {
+                        symbols.push(symbol);
+                    }
+                }
+            }
             let deferred_nonlocal_names = self
                 .collector
                 .deferred_nonlocal_comprehension_names(generators, key, value);
@@ -2668,12 +2796,28 @@ impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
 
 impl ScopeBodyFacts {
     pub(super) fn for_function(body: &[Stmt]) -> Self {
-        ScopeBodyFactsCollector::collect(body, true, true, false)
+        ScopeBodyFactsCollector::collect(body, true, ScopeBodyContext::Function, false)
     }
 
-    pub(super) fn for_class(body: &[Stmt], future_annotations: bool) -> Self {
-        ScopeBodyFactsCollector::collect(body, future_annotations, false, false)
+    pub(super) fn for_class(
+        body: &[Stmt],
+        future_annotations: bool,
+        legacy_class_scope: bool,
+    ) -> Self {
+        let context = if legacy_class_scope {
+            ScopeBodyContext::LegacyClass
+        } else {
+            ScopeBodyContext::Class
+        };
+        ScopeBodyFactsCollector::collect(body, future_annotations, context, false)
     }
+}
+
+#[derive(Clone, Copy)]
+enum ScopeBodyContext {
+    Function,
+    Class,
+    LegacyClass,
 }
 
 struct ScopeBodyFactsCollector<'ast> {
@@ -2683,6 +2827,7 @@ struct ScopeBodyFactsCollector<'ast> {
     skip_annotations: bool,
     collect_function_scope_facts: bool,
     eager_function_annotations: bool,
+    legacy_class_scope: bool,
     generator_depth: usize,
     inlined_comprehension_depth: usize,
     seen_inlined_comprehension_targets: FxHashSet<String>,
@@ -2711,9 +2856,11 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
     fn collect(
         body: &'ast [Stmt],
         skip_annotations: bool,
-        collect_function_scope_facts: bool,
+        context: ScopeBodyContext,
         eager_function_annotations: bool,
     ) -> ScopeBodyFacts {
+        let collect_function_scope_facts = matches!(context, ScopeBodyContext::Function);
+        let legacy_class_scope = matches!(context, ScopeBodyContext::LegacyClass);
         let mut collector = Self {
             facts: ScopeBodyFacts::default(),
             references: FxHashSet::default(),
@@ -2721,6 +2868,7 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
             skip_annotations,
             collect_function_scope_facts,
             eager_function_annotations,
+            legacy_class_scope,
             generator_depth: 0,
             inlined_comprehension_depth: 0,
             seen_inlined_comprehension_targets: FxHashSet::default(),
@@ -2980,6 +3128,21 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
                     .into_iter()
                     .filter(|name| !self.class_comprehension_targets.contains(name)),
             );
+            return;
+        }
+        if self.legacy_class_scope
+            && let Expr::Generator(generator) = expression
+        {
+            // A generator owns its iteration targets. Only its free references escape
+            // into the class, and enclosing comprehension targets provide their own cells.
+            self.facts.nested_generator_requirements.extend(
+                generator_required_names(generator)
+                    .into_iter()
+                    .filter(|name| !self.class_comprehension_targets.contains(name)),
+            );
+            if let Some(first) = generator.generators.first() {
+                self.visit_expr(&first.iter);
+            }
             return;
         }
         if self.collect_function_scope_facts
@@ -3547,11 +3710,46 @@ pub(super) fn comprehension_temporary_names(
     key: Option<&Expr>,
     value: &Expr,
 ) -> Vec<String> {
+    comprehension_symbol_names(generators, key, value, false)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// Return legacy class save candidates; `true` entries require an enclosing free binding.
+pub(super) fn legacy_class_comprehension_names(
+    generators: &[ruff_python_ast::Comprehension],
+    key: Option<&Expr>,
+    value: &Expr,
+) -> Vec<(String, bool)> {
+    let mut names = vec![(".0".to_string(), false)];
+    names.extend(comprehension_symbol_names(generators, key, value, true));
+    names
+}
+
+/// Match names that may propagate through a legacy class comprehension as free variables.
+pub(super) fn legacy_class_comprehension_keeps_free_name(
+    name: &str,
+    version: PythonVersion,
+) -> bool {
+    name != "__class__"
+        && !(version == PythonVersion::Py313
+            && matches!(name, "__classdict__" | "__conditional_annotations__"))
+}
+
+fn comprehension_symbol_names(
+    generators: &[ruff_python_ast::Comprehension],
+    key: Option<&Expr>,
+    value: &Expr,
+    all_symbols: bool,
+) -> Vec<(String, bool)> {
     #[derive(Default)]
     struct Collector {
-        names: Vec<String>,
-        nested_names: Vec<String>,
+        names: Vec<(String, bool)>,
+        nested_names: Vec<(String, bool)>,
+        closure_references: BTreeSet<String>,
         targets: FxHashSet<String>,
+        all_symbols: bool,
     }
 
     impl Collector {
@@ -3559,8 +3757,12 @@ pub(super) fn comprehension_temporary_names(
             generators: &[ruff_python_ast::Comprehension],
             key: Option<&Expr>,
             value: &Expr,
+            all_symbols: bool,
         ) -> Self {
-            let mut collector = Self::default();
+            let mut collector = Self {
+                all_symbols,
+                ..Self::default()
+            };
             for (index, generator) in generators.iter().enumerate() {
                 let mut targets = Vec::new();
                 collect_target_names(&generator.target, &mut targets);
@@ -3579,6 +3781,18 @@ pub(super) fn comprehension_temporary_names(
                 collector.visit_expr(key);
             }
             collector.names.append(&mut collector.nested_names);
+            if all_symbols {
+                // Native update_symbols adds propagated child free names after direct and
+                // inlined symbols. More than one new name follows CPython's hash-set order.
+                // Keep a stable candidate order; eligibility is resolved by the class parent.
+                collector.names.extend(
+                    collector
+                        .closure_references
+                        .iter()
+                        .cloned()
+                        .map(|name| (name, true)),
+                );
+            }
             collector
         }
     }
@@ -3601,14 +3815,36 @@ pub(super) fn comprehension_temporary_names(
                     if let Some(first) = generator.generators.first() {
                         self.visit_expr(&first.iter);
                     }
+                    if self.all_symbols {
+                        self.closure_references
+                            .extend(generator_required_names(generator));
+                    }
                     return;
                 }
                 Expr::Lambda(lambda) => {
                     visit_lambda_defaults(self, lambda);
+                    if self.all_symbols {
+                        self.closure_references
+                            .extend(analyze_lambda_scope(lambda).required);
+                    }
                     return;
                 }
                 Expr::Name(name) => {
-                    self.names.push(name.id.as_str().to_string());
+                    self.names.push((name.id.as_str().to_string(), false));
+                    if self.all_symbols && name.id.as_str() == "super" {
+                        self.names.push(("__class__".to_string(), false));
+                    }
+                    return;
+                }
+                Expr::Dict(dictionary) if self.all_symbols => {
+                    for item in &dictionary.items {
+                        if let Some(key) = &item.key {
+                            self.visit_expr(key);
+                        }
+                    }
+                    for item in &dictionary.items {
+                        self.visit_expr(&item.value);
+                    }
                     return;
                 }
                 _ => {
@@ -3619,16 +3855,21 @@ pub(super) fn comprehension_temporary_names(
             if let Some(first) = generators.first() {
                 self.visit_expr(&first.iter);
             }
-            let child = Self::comprehension(generators, key, value);
+            let child = Self::comprehension(generators, key, value, self.all_symbols);
             self.targets.extend(child.targets);
             self.nested_names.extend(child.names);
         }
     }
 
-    let mut collector = Collector::comprehension(generators, key, value);
-    collector
-        .names
-        .retain(|name| collector.targets.remove(name));
+    let mut collector = Collector::comprehension(generators, key, value, all_symbols);
+    if all_symbols {
+        let mut seen = FxHashSet::default();
+        collector.names.retain(|name| seen.insert(name.clone()));
+    } else {
+        collector
+            .names
+            .retain(|(name, _)| collector.targets.remove(name));
+    }
     collector.names
 }
 
@@ -4506,7 +4747,7 @@ mod tests {
                         ScopeDefinition::Function(definition, flat) => {
                             (definition.name.as_str(), flat.is_some())
                         }
-                        ScopeDefinition::Class(definition) => (definition.name.as_str(), false),
+                        ScopeDefinition::Class(definition, _) => (definition.name.as_str(), false),
                     };
                     (input.parent, name, flat)
                 })

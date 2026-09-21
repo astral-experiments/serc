@@ -48,6 +48,7 @@ use super::scope::{
     collect_self_iterated_nested_comprehension_targets, collect_target_names,
     comprehension_cell_names, comprehension_name_bindings, comprehension_temporary_names,
     generator_cellvars, generator_required_names, inlined_comprehension_cell_names_in_expression,
+    legacy_class_comprehension_names,
 };
 use super::source::{
     debug_text_range, first_expression_instruction_range, statement_execution_range,
@@ -468,7 +469,8 @@ impl Compiler<'_> {
         let base_depth = self.control.stack.depth;
         let match_has_following =
             !terminal && self.control.statements.current_statement_has_following;
-        if matches!(statement.subject.as_ref(), Expr::Tuple(_))
+        if self.context.python_version >= PythonVersion::Py314
+            && matches!(statement.subject.as_ref(), Expr::Tuple(_))
             && let Some(constant) = fold_constant(&statement.subject)
         {
             if self.output.constants.is_empty()
@@ -749,6 +751,10 @@ impl Compiler<'_> {
                         self.set_branch_end_location(&case.body, body_start);
                     }
                     self.set_match_case_backedge_location(&case.body);
+                    if self.context.python_version <= crate::PythonVersion::Py313 {
+                        // Native case exits receive their span in the target CFG schedule.
+                        self.assembler.set_location(SourceLocation::NONE);
+                    }
                     if terminal {
                         self.emit_deferred_implicit_return()?;
                         // CPython copies the implicit return onto the original case-success
@@ -1094,6 +1100,9 @@ impl Compiler<'_> {
             }
             if terminal && !suite_terminates(&case.body) && !emitted_fallthrough {
                 self.set_branch_end_location(&case.body, body_start);
+                if self.context.python_version <= crate::PythonVersion::Py313 {
+                    self.assembler.set_location(SourceLocation::NONE);
+                }
                 // The wildcard body falls through to the original match-end block.
                 // Keep its instructions outside the shared implicit-return copy budget.
                 let implicit_return = self.assembler.label();
@@ -1881,6 +1890,16 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    /// Return the expression span after the target's comparison-negation AST fold.
+    pub(super) fn expression_location(&self, expression: &Expr) -> SourceLocation {
+        if self.context.python_version <= PythonVersion::Py313
+            && let Some((comparison, _)) = legacy_not_comparison(expression)
+        {
+            return self.source_location(comparison.range);
+        }
+        self.source_location(expression.range())
+    }
+
     pub(super) fn compile_expression(&mut self, expression: &Expr) -> Result<(), CompileError> {
         self.compile_expression_with_boolean_continuation(expression, None)
     }
@@ -1891,6 +1910,11 @@ impl Compiler<'_> {
         expression: &Expr,
         continuation: Option<(BoolOp, SourceLocation)>,
     ) -> Result<(), CompileError> {
+        if self.context.python_version <= PythonVersion::Py313
+            && let Some(comparison) = legacy_folded_not_comparison(expression)
+        {
+            return self.compile_expression_with_boolean_continuation(&comparison, continuation);
+        }
         let previous = self.assembler.location();
         self.assembler
             .set_location(self.source_location(expression.range()));
@@ -1905,7 +1929,8 @@ impl Compiler<'_> {
         continuation: Option<(BoolOp, SourceLocation)>,
     ) -> Result<(), CompileError> {
         let starting_depth = self.control.stack.depth;
-        if let Expr::BoolOp(boolean) = expression
+        if self.context.python_version >= PythonVersion::Py314
+            && let Expr::BoolOp(boolean) = expression
             && let Some((origin, constant)) = folded_bool_operand(expression)
         {
             self.pre_register_expression_names(expression)?;
@@ -2505,6 +2530,13 @@ impl Compiler<'_> {
         &mut self,
         expression: &ExprBinOp,
     ) -> Result<SpecializedLowering, CompileError> {
+        if self.context.python_version <= PythonVersion::Py313
+            && self.return_value_is_constant(&expression.right)
+        {
+            // The legacy AST pass folds a constant RHS tuple before recognizing
+            // percent formatting, so it no longer has the required Tuple AST node.
+            return Ok(SpecializedLowering::NotApplicable);
+        }
         let Some(parts) = optimized_percent_format(expression) else {
             return Ok(SpecializedLowering::NotApplicable);
         };
@@ -2585,6 +2617,9 @@ impl Compiler<'_> {
         description: &str,
     ) -> Result<(), CompileError> {
         match value_count {
+            0 if self.context.python_version == PythonVersion::Py312 => {
+                self.emit(BUILD_STRING, 0, 1)
+            }
             0 => self.load_string_constant(""),
             1 => Ok(()),
             count => self.emit(
@@ -3578,7 +3613,7 @@ impl Compiler<'_> {
             // handler used by `def` generators and generator expressions.
             child.control.generators.generator_region_start = None;
         }
-        let return_location = child.source_location(lambda.body.range());
+        let return_location = child.expression_location(&lambda.body);
         child.compile_tail_return_expression(&lambda.body, return_location)?;
         let child = child.finish_inner(false)?;
 
@@ -3665,6 +3700,32 @@ impl Compiler<'_> {
             &mut self_iterated_nested_targets,
         );
         let mut active_temporary_names = temporary_names.clone();
+        let legacy_class_comprehension = self.context.python_version <= PythonVersion::Py313
+            && matches!(self.unit.scope, Scope::Class { .. })
+            && self
+                .control
+                .comprehensions
+                .active_comprehension_local_names
+                .is_empty();
+        if legacy_class_comprehension {
+            let Scope::Class { free_indices, .. } = &self.unit.scope else {
+                unreachable!("legacy class comprehension requires a class scope");
+            };
+            let mut seen = FxHashSet::default();
+            temporary_names = legacy_class_comprehension_names(generators, key, value)
+                .into_iter()
+                .filter(|(name, requires_free)| {
+                    (!requires_free
+                        || (self.scope_index(free_indices, name).is_some()
+                            && super::scope::legacy_class_comprehension_keeps_free_name(
+                                name,
+                                self.context.python_version,
+                            )))
+                        && seen.insert(name.clone())
+                })
+                .map(|(name, _)| name)
+                .collect();
+        }
         if matches!(self.unit.scope, Scope::Module) {
             // CPython assigns a hidden fast-local slot to module-scope walrus targets while
             // inlining a comprehension. Function-scope targets remain bindings in the
@@ -3720,11 +3781,13 @@ impl Compiler<'_> {
             .collect::<FxHashSet<_>>();
         active_temporary_names.retain(|name| !deferred_free_targets.contains(name));
         temporary_names.retain(|name| !deferred_free_targets.contains(name));
-        temporary_names.retain(|name| {
-            direct_temporary_names.contains(name)
-                || !self_iterated_nested_targets.contains(name)
-                || !self.is_initialized(name)
-        });
+        if !legacy_class_comprehension {
+            temporary_names.retain(|name| {
+                direct_temporary_names.contains(name)
+                    || !self_iterated_nested_targets.contains(name)
+                    || !self.is_initialized(name)
+            });
+        }
 
         let mut seen_temporaries = FxHashSet::default();
         temporary_names.retain(|name| seen_temporaries.insert(name.clone()));
@@ -4042,7 +4105,11 @@ impl Compiler<'_> {
                 .pending_comprehension_restores
                 .push((temporary_restores, comprehension_location));
         } else {
-            if discard_result {
+            // Legacy targets count the original SWAP before copying small exit blocks.
+            // 3.12 also needs the unlocated discard until its later line resolution.
+            let discard_before_restore =
+                discard_result && self.context.python_version > crate::PythonVersion::Py313;
+            if discard_before_restore {
                 self.emit(POP_TOP, 0, -1)?;
             } else {
                 self.emit(
@@ -4051,7 +4118,7 @@ impl Compiler<'_> {
                     0,
                 )?;
             }
-            if discard_result {
+            if discard_before_restore {
                 let final_restore = temporary_restores.last();
                 let restores = temporary_restores[..temporary_restores.len().saturating_sub(1)]
                     .iter()
@@ -4077,6 +4144,10 @@ impl Compiler<'_> {
             }
             // CPython converts STORE_FAST_MAYBE_NULL only after inserting superinstructions.
             self.assembler.prevent_last_instruction_fusion();
+            if discard_result && !discard_before_restore {
+                self.assembler.set_location(SourceLocation::NONE);
+                self.emit(POP_TOP, 0, -1)?;
+            }
             if !discard_result {
                 self.assembler
                     .record_original_comprehension_normal_restores(normal_cleanup);
@@ -7862,8 +7933,19 @@ impl Compiler<'_> {
         jump_on: bool,
         label: Label,
     ) -> Result<(), CompileError> {
+        if self.context.python_version <= PythonVersion::Py313
+            && let Some(comparison) = legacy_folded_not_comparison(expression)
+        {
+            return self.compile_jump_if(&comparison, jump_on, label);
+        }
         let legacy_constant = self.context.python_version <= PythonVersion::Py313
             && self.return_value_is_constant(expression);
+        if legacy_constant {
+            // Keep the original constant and conditional until CFG optimization.
+            // An early unconditional jump would expose its target to exit copying
+            // and let incoming edges skip the constant's retained line marker.
+            return self.compile_if_expression_arm_jump(expression, jump_on, label);
+        }
         if let Expr::UnaryOp(unary) = expression
             && unary.op == UnaryOp::Not
             && !legacy_constant
@@ -8538,6 +8620,45 @@ impl CollectionKind {
         }
     }
 }
+
+/// Mirrors the legacy AST optimizer, including the inner comparison's source range.
+fn legacy_folded_not_comparison(expression: &Expr) -> Option<Expr> {
+    let (comparison, operator) = legacy_not_comparison(expression)?;
+    let mut comparison = comparison.clone();
+    comparison.ops[0] = operator;
+    Some(Expr::Compare(comparison))
+}
+
+/// Identify the single comparison and operator left by legacy `not` folding.
+fn legacy_not_comparison(expression: &Expr) -> Option<(&ruff_python_ast::ExprCompare, CmpOp)> {
+    let Expr::UnaryOp(_) = expression else {
+        return None;
+    };
+    let mut operand = expression;
+    let mut negated = false;
+    while let Expr::UnaryOp(unary) = operand {
+        if unary.op != UnaryOp::Not {
+            return None;
+        }
+        negated = !negated;
+        operand = &unary.operand;
+    }
+    let Expr::Compare(comparison) = operand else {
+        return None;
+    };
+    let [operator] = comparison.ops.as_ref() else {
+        return None;
+    };
+    let inverse = match operator {
+        CmpOp::Is => CmpOp::IsNot,
+        CmpOp::IsNot => CmpOp::Is,
+        CmpOp::In => CmpOp::NotIn,
+        CmpOp::NotIn => CmpOp::In,
+        _ => return None,
+    };
+    Some((comparison, if negated { inverse } else { *operator }))
+}
+
 fn expression_contains_yield(expression: &Expr) -> bool {
     #[derive(Default)]
     struct Collector {

@@ -94,15 +94,16 @@ with this crate's marshal output. For each CPython-rejected file it records whet
 the input, accepts it, or fails internally:
 
 ```console
+./scripts/check-cpython-compatibility /path/to/python3.12.14 3.12
+./scripts/check-cpython-compatibility /path/to/python3.13.15 3.13
 ./scripts/check-cpython-compatibility /path/to/cpython-3.14.5
 ./scripts/check-cpython-compatibility /path/to/cpython-3.15.0rc2 3.15
 ```
 
-The wrapper's optional second argument selects `3.14` (the default) or `3.15`. Each invocation
-uses its exact pinned oracle and frozen outcome counts; the 3.15 gate compares source bytes.
-When invoking the `compare_cpython_corpus` example directly, select the target with
-`--python-version 3.15` and the oracle executable with `--python /path/to/cpython-3.15.0rc2`.
-Python 3.12 and 3.13 can also be measured directly with their pinned oracles, for example:
+The wrapper's optional second argument selects `3.12`, `3.13`, `3.14` (the default), or `3.15`.
+Each invocation uses its exact pinned oracle and frozen outcome counts; the 3.12, 3.13, and 3.15
+gates compare source bytes. When invoking the `compare_cpython_corpus` example directly, select
+the target and matching oracle explicitly, for example:
 
 ```console
 cargo run --release -p serc --example compare_cpython_corpus -- \
@@ -140,7 +141,14 @@ oracle failure:          0
 The CPython 3.15.0rc2 gate uses the same 2,451 pinned files and requires 2,249 exact matches.
 Its 202 CPython-rejected files are frozen as 133 matched rejections, 55 rejection mismatches,
 and 14 compiler failures. Every other failure category must remain zero, and `--require-all`
-independently rejects any failure on a CPython-accepted input. Both gates run in CI.
+independently rejects any failure on a CPython-accepted input.
+
+The Python 3.12.14 gate requires 2,174 exact matches from the same 2,451 files. Its 277
+CPython-rejected files are frozen as 210 matched rejections, 61 rejection mismatches, and
+6 compiler failures. Python 3.13.15 requires 2,193 exact matches; its 258 CPython-rejected
+files are frozen as 196 matched rejections, 55 rejection mismatches, and 7 compiler failures.
+Both require zero in every other failure category and reject any failure on a CPython-accepted
+input. All four gates run in CI.
 
 This exact-compatibility result is specific to the pinned oracle version and frozen corpus; it is
 not a claim about arbitrary CPython versions or Python inputs. The exact-output gate remains fully
@@ -184,9 +192,8 @@ published independently. From the workspace root, `./scripts/check-ruff-pin` ver
 Cargo manifest, lockfile, submodule gitlink, and initialized, clean submodule all select the same
 revision.
 
-From the workspace root, `./scripts/check-cpython-compatibility /path/to/python3.14.5` and
-`./scripts/check-cpython-compatibility /path/to/python3.15.0rc2 3.15` require the initialized matching
-Ruff submodule and run their complete frozen gates without mutating the checkout.
+From the workspace root, `./scripts/check-cpython-compatibility` requires the initialized matching
+Ruff submodule and runs the selected target's complete frozen gate without mutating the checkout.
 
 ## Benchmarks
 

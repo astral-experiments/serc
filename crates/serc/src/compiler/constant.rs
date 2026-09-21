@@ -2732,6 +2732,14 @@ fn first_constant(
             if self.is_complete() {
                 return;
             }
+            if self.compiler.context.python_version <= PythonVersion::Py313
+                && matches!(statement, Stmt::Expr(expression)
+                    if self.compiler.return_value_is_constant(&expression.value))
+            {
+                // A Constant expression statement is discarded by code generation,
+                // before it can reserve the first entry in the legacy constant table.
+                return;
+            }
             if matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
                 // This statement allocates a code object in the enclosing pool. Leave
                 // that allocation to code generation instead of reserving a later literal.
@@ -2853,6 +2861,38 @@ fn first_constant(
                             }
                             Expr::Attribute(attribute) => self.visit_expr(&attribute.value),
                             _ => {}
+                        }
+                    }
+                    if self.compiler.context.python_version <= PythonVersion::Py313
+                        && matches!(
+                            self.compiler.unit.scope,
+                            super::Scope::Module | super::Scope::Class { .. }
+                        )
+                        && !self.is_complete()
+                    {
+                        // Legacy module/class annotations execute after their target.
+                        // Their first constant survives dead-code compaction at slot zero.
+                        if self.compiler.unit.flags
+                            & crate::target::code_flags::CO_FUTURE_ANNOTATIONS
+                            != 0
+                        {
+                            if assignment.simple {
+                                self.constant =
+                                    Some(Constant::String(super::source::unparse_annotation(
+                                        &assignment.annotation,
+                                        self.compiler.context.source,
+                                    )));
+                            }
+                        } else {
+                            self.visit_expr(&assignment.annotation);
+                        }
+                        if assignment.simple
+                            && !self.is_complete()
+                            && let Expr::Name(name) = assignment.target.as_ref()
+                        {
+                            self.constant = Some(Constant::String(
+                                self.compiler.mangled_name(name.id.as_str()),
+                            ));
                         }
                     }
                     return;

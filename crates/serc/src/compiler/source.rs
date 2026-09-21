@@ -895,11 +895,11 @@ impl Compiler<'_> {
     /// Folds constants while preserving surrogate escapes that Ruff represents as U+FFFD.
     pub(super) fn source_aware_fold_constant(&self, expression: &Expr) -> Option<Constant> {
         #[derive(Default)]
-        struct ContainsSlice(bool);
+        struct RequiresRuntimeConstruction(bool);
 
-        impl<'a> Visitor<'a> for ContainsSlice {
+        impl<'a> Visitor<'a> for RequiresRuntimeConstruction {
             fn visit_expr(&mut self, expression: &'a Expr) {
-                if matches!(expression, Expr::Slice(_)) {
+                if matches!(expression, Expr::Slice(_) | Expr::FString(_)) {
                     self.0 = true;
                 } else if !self.0 {
                     walk_expr(self, expression);
@@ -908,11 +908,11 @@ impl Compiler<'_> {
         }
 
         if !self.has_deferred_annotations() {
-            // These targets construct slices at runtime, including when the indexed
-            // object is a literal and the slice sits inside another folded expression.
-            let mut slices = ContainsSlice::default();
-            slices.visit_expr(expression);
-            if slices.0 {
+            // The legacy AST optimizer keeps slices and joined strings as runtime
+            // expressions, including when nested inside an otherwise constant value.
+            let mut runtime = RequiresRuntimeConstruction::default();
+            runtime.visit_expr(expression);
+            if runtime.0 {
                 return None;
             }
             if let Expr::UnaryOp(unary) = expression
@@ -1242,6 +1242,12 @@ pub(super) fn implicit_return_range(
             }),
         Stmt::Expr(expression) => match expression.value.as_ref() {
             Expr::FString(fstring) => Compiler::fstring_result_range(fstring),
+            expression
+                if compiler.context.python_version <= crate::PythonVersion::Py313
+                    && compiler.return_value_is_constant(expression) =>
+            {
+                statement.range()
+            }
             expression => expression.range(),
         },
         Stmt::AnnAssign(assignment) => {

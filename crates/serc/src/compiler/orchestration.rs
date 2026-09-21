@@ -482,6 +482,8 @@ impl<'source> Compiler<'source> {
             }
         }
 
+        let has_docstring = matches!(body.first(), Some(Stmt::Expr(expression))
+            if expression.value.is_string_literal_expr());
         let body = if let Some(Stmt::Expr(expression)) = body.first() {
             if let Expr::StringLiteral(string) = expression.value.as_ref() {
                 let constant = self.add_constant(Constant::String(
@@ -494,6 +496,9 @@ impl<'source> Compiler<'source> {
                 self.assembler
                     .set_location(self.source_location(expression.range));
                 self.emit(LOAD_CONST, constant, 1)?;
+                if self.context.python_version == PythonVersion::Py312 {
+                    self.assembler.set_location(SourceLocation::NONE);
+                }
                 self.store_name("__doc__")?;
                 &body[1..]
             } else if deferred_annotations
@@ -510,7 +515,7 @@ impl<'source> Compiler<'source> {
 
         let body_start = self.assembler.instruction_count();
         let add_implicit_return = !suite_terminates(body);
-        self.compile_suite_inner(body, add_implicit_return)?;
+        self.compile_scope_suite(body, add_implicit_return, has_docstring)?;
         if let Some((instruction, constant_position, annotation_body)) = deferred_module_annotations
         {
             // CPython lowers the deferred annotation thunk after the entire module body,
@@ -528,6 +533,7 @@ impl<'source> Compiler<'source> {
                 terminal_statement_uses_implicit_return_location(
                     statement,
                     self.context.python_version,
+                    self.unit.flags & CO_FUTURE_ANNOTATIONS == 0,
                 )
             })
         {
@@ -566,6 +572,8 @@ impl<'source> Compiler<'source> {
             self.add_constant(Constant::None)?;
         }
 
+        let has_docstring = matches!(body.first(), Some(Stmt::Expr(expression))
+            if expression.value.is_string_literal_expr());
         let body = if let Some(Stmt::Expr(expression)) = body.first() {
             if let Expr::StringLiteral(string) = expression.value.as_ref() {
                 self.add_constant(Constant::String(
@@ -588,7 +596,7 @@ impl<'source> Compiler<'source> {
 
         let body_start = self.assembler.instruction_count();
         let add_implicit_return = !suite_terminates(body);
-        self.compile_suite_inner(body, add_implicit_return)?;
+        self.compile_scope_suite(body, add_implicit_return, has_docstring)?;
         let add_implicit_return =
             add_implicit_return && !self.control.statements.emitted_fallthrough_return;
         if add_implicit_return
@@ -596,6 +604,7 @@ impl<'source> Compiler<'source> {
                 terminal_statement_uses_implicit_return_location(
                     statement,
                     self.context.python_version,
+                    false,
                 )
             })
         {
@@ -705,6 +714,8 @@ impl<'source> Compiler<'source> {
             self.emit(SETUP_ANNOTATIONS, 0, 0)?;
         }
 
+        let has_docstring = matches!(body.first(), Some(Stmt::Expr(expression))
+            if expression.value.is_string_literal_expr());
         let body = if let Some(Stmt::Expr(expression)) = body.first() {
             if let Expr::StringLiteral(string) = expression.value.as_ref() {
                 let docstring = self.add_constant(Constant::String(
@@ -717,6 +728,11 @@ impl<'source> Compiler<'source> {
                 self.assembler
                     .set_location(self.source_location(expression.range));
                 self.emit(LOAD_CONST, docstring, 1)?;
+                if self.context.python_version == PythonVersion::Py312 {
+                    // Native leaves the artificial docstring store unlocated until
+                    // after NOP removal, so a same-line trailing Pass can donate.
+                    self.assembler.set_location(SourceLocation::NONE);
+                }
                 self.store_name("__doc__")?;
                 &body[1..]
             } else {
@@ -727,7 +743,7 @@ impl<'source> Compiler<'source> {
         };
         let body_start = self.assembler.instruction_count();
         let mut footer_location = SourceLocation::NONE;
-        self.compile_suite(body)?;
+        self.compile_scope_suite(body, false, has_docstring)?;
         debug_assert!(self.unit.class_conditional_annotations.is_empty());
         if let Some(Stmt::Expr(expression)) = body.last()
             && fold_constant(&expression.value).is_some()

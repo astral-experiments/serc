@@ -27,6 +27,161 @@ fn child<'a>(code: &'a CodeObject, name: &str) -> &'a CodeObject {
 }
 
 #[test]
+fn legacy_class_comprehensions_reserve_nested_free_captures() {
+    for version in [PythonVersion::Py312, PythonVersion::Py313] {
+        for (source, expected) in [
+            (
+                "def outer(offset):\n    class C:\n        values = [lambda: offset for x in data]\n    return C\n",
+                &[".0", "x", "offset"][..],
+            ),
+            (
+                "def outer(offset):\n    class C:\n        values = [(offset for y in more) for x in data]\n    return C\n",
+                &[".0", "x", "more", "offset"][..],
+            ),
+            (
+                "def outer(offset):\n    class C:\n        values = [lambda offset: offset for x in data]\n    return C\n",
+                &[".0", "x"][..],
+            ),
+            (
+                "def outer(offset):\n    class C:\n        values = [(offset for offset in more) for x in data]\n    return C\n",
+                &[".0", "x", "more"][..],
+            ),
+        ] {
+            let module = compile(source, version);
+            let class = child(child(&module, "outer"), "C");
+            let fast_names = class
+                .locals
+                .iter()
+                .zip(&class.local_kinds)
+                .filter(|(_, kind)| **kind & crate::target::local_kinds::CO_FAST_LOCAL != 0)
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(fast_names, expected, "{version:?}: {source}");
+        }
+    }
+}
+
+#[test]
+fn legacy_not_comparison_exits_use_the_folded_inner_span() {
+    for (version, lambda_lines, assertion_lines) in [
+        (
+            PythonVersion::Py312,
+            &[128, 0, 168, 49, 176, 1, 169, 54][..],
+            &[
+                128, 0, 216, 14, 15, 136, 105, 216, 19, 20, 152, 2, 145, 55, 208, 8, 26, 144, 55,
+                216, 19, 20, 144, 57, 216, 12, 17, 224, 11, 12, 128, 72, 244, 3, 0, 13, 17, 144,
+                18, 139, 72, 136, 1, 240, 9, 0, 15, 16, 137, 105, 240, 10, 0, 12, 13, 128, 72,
+            ][..],
+        ),
+        (
+            PythonVersion::Py313,
+            &[128, 0, 168, 49, 170, 54][..],
+            &[
+                128, 0, 216, 14, 15, 137, 105, 216, 19, 20, 147, 55, 208, 8, 26, 144, 55, 216, 19,
+                20, 145, 57, 216, 12, 17, 224, 11, 12, 128, 72, 244, 3, 0, 13, 17, 144, 18, 139,
+                72, 136, 1, 240, 9, 0, 15, 16, 139, 105, 240, 10, 0, 12, 13, 128, 72,
+            ][..],
+        ),
+    ] {
+        let module = compile(
+            "type Alias = (not A is B, lambda x, y: not x in y)\n",
+            version,
+        );
+        assert_eq!(
+            child(child(&module, "Alias"), "<lambda>").line_table,
+            lambda_lines,
+            "{version:?}"
+        );
+        let module = compile(
+            "def f(x, xs):\n    while not x is None:\n        assert not x in xs\n        if not not x is None:\n            break\n        x = next(xs)\n    return x\n",
+            version,
+        );
+        assert_eq!(
+            child(&module, "f").line_table,
+            assertion_lines,
+            "{version:?}"
+        );
+    }
+}
+
+#[test]
+fn legacy_not_comparisons_match_native_opcode_polarity_and_inner_locations() {
+    // Captured from the pinned CPython 3.12.14 and 3.13.15 compilers.
+    for (version, source, bytecode, line_table) in [
+        (
+            PythonVersion::Py312,
+            "def f(x, y):\n    return (not x is y, not x is not y, not x in y, not x not in y)\n",
+            &[
+                151, 0, 124, 0, 124, 1, 117, 1, 124, 0, 124, 1, 117, 0, 124, 0, 124, 1, 118, 1,
+                124, 0, 124, 1, 118, 0, 102, 4, 83, 0,
+            ][..],
+            &[
+                128, 0, 216, 16, 17, 144, 81, 144, 6, 152, 65, 160, 81, 152, 74, 168, 65, 176, 17,
+                168, 70, 184, 1, 192, 17, 184, 10, 208, 11, 67, 208, 4, 67,
+            ][..],
+        ),
+        (
+            PythonVersion::Py312,
+            "def f(x, y):\n    if not (\n        x\n        in y\n    ):\n        return not (\n            x is\n            y\n        )\n    return not not (\n        x is not None\n    )\n",
+            &[
+                151, 0, 124, 0, 124, 1, 118, 1, 114, 4, 124, 0, 124, 1, 117, 1, 83, 0, 124, 0, 100,
+                0, 117, 1, 83, 0,
+            ][..],
+            &[
+                128, 0, 224, 8, 9, 216, 11, 12, 241, 3, 1, 9, 13, 240, 8, 0, 13, 14, 216, 12, 13,
+                240, 3, 1, 13, 14, 240, 3, 3, 9, 10, 240, 10, 0, 9, 10, 144, 20, 136, 13, 240, 3,
+                2, 5, 6,
+            ][..],
+        ),
+        (
+            PythonVersion::Py313,
+            "def f(x, y):\n    return (not x is y, not x is not y, not x in y, not x not in y)\n",
+            &[
+                149, 0, 88, 1, 76, 1, 88, 1, 76, 0, 88, 1, 59, 1, 0, 0, 88, 1, 59, 0, 0, 0, 52, 4,
+                36, 0,
+            ][..],
+            &[
+                128, 0, 216, 16, 17, 144, 6, 152, 65, 152, 74, 168, 65, 169, 70, 184, 1, 185, 10,
+                208, 11, 67, 208, 4, 67,
+            ][..],
+        ),
+        (
+            PythonVersion::Py313,
+            "def f(x, y):\n    if not (\n        x\n        in y\n    ):\n        return not (\n            x is\n            y\n        )\n    return not not (\n        x is not None\n    )\n",
+            &[
+                149, 0, 85, 0, 85, 1, 59, 1, 0, 0, 97, 4, 0, 0, 85, 0, 85, 1, 76, 1, 36, 0, 85, 0,
+                83, 0, 76, 1, 36, 0,
+            ][..],
+            &[
+                128, 0, 224, 8, 9, 216, 11, 12, 243, 3, 1, 9, 13, 240, 8, 0, 13, 14, 216, 12, 13,
+                240, 3, 1, 13, 14, 240, 3, 3, 9, 10, 240, 10, 0, 9, 10, 144, 20, 136, 13, 240, 3,
+                2, 5, 6,
+            ][..],
+        ),
+    ] {
+        let module = compile(source, version);
+        let function = child(&module, "f");
+        assert_eq!(function.bytecode, bytecode, "{version:?}: {source}");
+        assert_eq!(function.line_table, line_table, "{version:?}: {source}");
+    }
+}
+
+#[test]
+fn legacy_unreachable_module_annotations_retain_names_without_class_scopes() {
+    for version in [PythonVersion::Py312, PythonVersion::Py313] {
+        let module = compile("raise Exception\nx: \"T\"\nafter\n", version);
+        assert_eq!(module.names, ["Exception", "__annotations__", "after"]);
+        assert!(matches!(module.constants.as_slice(), [Constant::String(value)] if value == "T"));
+        for source in [
+            "raise Exception\nobj.x: \"T\"\n",
+            "raise Exception\nobj[1]: \"T\"\n",
+        ] {
+            assert_eq!(compile(source, version).names, ["Exception", "obj"]);
+        }
+    }
+}
+
+#[test]
 fn legacy_function_payloads_match_native_attribute_order_and_admission() {
     let source = "def outer():\n    x = 1\n    def f(a: A = 2, *, b: B = 3) -> R:\n        return x\n    return f\n";
     for version in [PythonVersion::Py312, PythonVersion::Py313] {
@@ -482,5 +637,284 @@ fn legacy_dynamic_while_breaks_retest_before_the_backedge() {
         assert_eq!(function.bytecode, bytecode, "{source}");
         assert_eq!(function.line_table, line_table, "{source}");
         assert_eq!(function.exception_table, exception_table, "{source}");
+    }
+}
+
+#[test]
+fn legacy_class_comprehensions_save_the_iterator_parameter_and_external_symbols() {
+    for (source, expected) in [
+        (
+            "class C:\n    value = [x for x in data]\n",
+            &[".0", "x"][..],
+        ),
+        (
+            "class C:\n    value = [x + offset for x in data]\n",
+            &[".0", "x", "offset"][..],
+        ),
+        (
+            "class C:\n    value = [x for x in [y for y in data]]\n",
+            &[".0", "y", "x"][..],
+        ),
+    ] {
+        for version in [PythonVersion::Py312, PythonVersion::Py313] {
+            let module = compile(source, version);
+            assert_eq!(
+                child(&module, "C").locals,
+                expected,
+                "{version:?}: {source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_match_success_copy_counts_its_original_jump() {
+    // Pinned CPython 3.12.14/3.13.15: the copied case-success JUMP still
+    // occupies a NOP slot before OR-success edges consider the four-slot limit.
+    let source = "def f(value):\n    match value:\n        case (\"a\"\n            | \"b\"\n            | \"c\"):\n            pass\n        case _:\n            if value != \"d\":\n                pass\n            elif value == \"d\":\n                pass\n";
+    for (version, bytecode, line_table) in [
+        (
+            PythonVersion::Py312,
+            &[
+                151, 0, 124, 0, 120, 1, 100, 1, 107, 40, 0, 0, 114, 2, 1, 0, 121, 0, 120, 1, 100,
+                2, 107, 40, 0, 0, 114, 3, 9, 0, 1, 0, 121, 0, 120, 1, 100, 3, 107, 40, 0, 0, 114,
+                3, 9, 0, 1, 0, 121, 0, 1, 0, 9, 0, 124, 0, 100, 4, 107, 55, 0, 0, 114, 1, 121, 0,
+                124, 0, 100, 4, 107, 40, 0, 0, 114, 1, 121, 0, 121, 0,
+            ][..],
+            &[
+                128, 0, 216, 10, 15, 220, 14, 17, 240, 0, 2, 15, 18, 240, 6, 0, 13, 17, 245, 5, 0,
+                15, 18, 240, 3, 2, 15, 18, 240, 6, 0, 13, 17, 245, 3, 0, 15, 18, 240, 5, 2, 15, 18,
+                240, 6, 0, 13, 17, 240, 7, 2, 15, 18, 240, 8, 0, 14, 15, 216, 15, 20, 152, 3, 138,
+                124, 216, 16, 20, 216, 17, 22, 152, 35, 146, 28, 216, 16, 20, 240, 3, 0, 18, 30,
+            ][..],
+        ),
+        (
+            PythonVersion::Py313,
+            &[
+                149, 0, 85, 0, 61, 1, 83, 1, 58, 88, 0, 0, 97, 1, 0, 0, 79, 16, 61, 1, 83, 2, 58,
+                88, 0, 0, 97, 1, 0, 0, 79, 9, 61, 1, 83, 3, 58, 88, 0, 0, 97, 1, 0, 0, 79, 2, 32,
+                0, 79, 2, 32, 0, 103, 0, 30, 0, 85, 0, 83, 4, 58, 119, 0, 0, 97, 1, 0, 0, 103, 0,
+                85, 0, 83, 4, 58, 88, 0, 0, 97, 1, 0, 0, 103, 0, 103, 0,
+            ][..],
+            &[
+                128, 0, 216, 10, 15, 222, 14, 17, 222, 14, 17, 222, 14, 17, 242, 5, 2, 15, 18, 240,
+                6, 0, 13, 17, 216, 13, 14, 216, 15, 20, 152, 3, 139, 124, 216, 16, 20, 216, 17, 22,
+                152, 35, 147, 28, 216, 16, 20, 240, 3, 0, 18, 30,
+            ][..],
+        ),
+    ] {
+        let module = compile(source, version);
+        let function = child(&module, "f");
+        assert_eq!(function.bytecode, bytecode, "{version:?}");
+        assert_eq!(function.line_table, line_table, "{version:?}");
+        assert!(function.exception_table.is_empty());
+    }
+}
+
+#[test]
+fn legacy_class_generators_propagate_only_free_references() {
+    use crate::target::local_kinds::{CO_FAST_CELL, CO_FAST_FREE};
+
+    for version in [PythonVersion::Py312, PythonVersion::Py313] {
+        for (source, expected) in [
+            (
+                "def outer(offset):\n    class C:\n        values = [(offset for offset in more) for x in data]\n    return C\n",
+                &[][..],
+            ),
+            (
+                "def outer(offset):\n    class C:\n        values = [(offset for y in more) for x in data]\n    return C\n",
+                &["offset"][..],
+            ),
+        ] {
+            let module = compile(source, version);
+            let outer = child(&module, "outer");
+            let class = child(outer, "C");
+            for (code, kind) in [(outer, CO_FAST_CELL), (class, CO_FAST_FREE)] {
+                let captures = code
+                    .locals
+                    .iter()
+                    .zip(&code.local_kinds)
+                    .filter(|(_, flags)| **flags & kind != 0)
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(captures, expected, "{version:?}: {}: {source}", code.name);
+            }
+        }
+    }
+}
+
+#[test]
+fn python_312_exception_cleanup_matches_native_copy_phases() {
+    // Pinned CPython 3.12.14: shared named-handler cleanup duplicates late,
+    // while except-star POP_BLOCK prevents early assertion-success threading.
+    type NativeCase<'a> = (&'a str, Option<&'a str>, &'a [u8], &'a [u8], &'a [u8]);
+    let cases: &[NativeCase<'_>] = &[
+        (
+            "def f(flag):\n    try:\n        start()\n    except Error as error:\n        if flag:\n            for value in values:\n                use(error, value)\n",
+            Some("f"),
+            &[
+                151, 0, 9, 0, 116, 1, 0, 0, 0, 0, 0, 0, 0, 0, 171, 0, 0, 0, 0, 0, 0, 0, 1, 0, 121,
+                0, 35, 0, 116, 2, 0, 0, 0, 0, 0, 0, 0, 0, 36, 0, 114, 40, 125, 1, 124, 0, 114, 28,
+                116, 4, 0, 0, 0, 0, 0, 0, 0, 0, 68, 0, 93, 14, 0, 0, 125, 2, 116, 7, 0, 0, 0, 0, 0,
+                0, 0, 0, 124, 1, 124, 2, 171, 2, 0, 0, 0, 0, 0, 0, 1, 0, 140, 16, 4, 0, 89, 0, 100,
+                0, 125, 1, 126, 1, 121, 0, 89, 0, 100, 0, 125, 1, 126, 1, 121, 0, 100, 0, 125, 1,
+                126, 1, 119, 1, 119, 0, 120, 3, 89, 0, 119, 1,
+            ],
+            &[130, 10, 13, 0, 141, 9, 62, 3, 150, 25, 57, 3, 185, 5, 62, 3],
+            &[
+                128, 0, 240, 2, 5, 5, 34, 220, 8, 13, 141, 7, 248, 220, 11, 16, 242, 0, 3, 5, 34,
+                217, 11, 15, 223, 25, 31, 144, 5, 220, 16, 19, 144, 69, 152, 53, 213, 16, 33, 245,
+                3, 0, 26, 32, 244, 3, 0, 12, 16, 251, 240, 3, 3, 5, 34, 250,
+            ],
+        ),
+        (
+            "try:\n    pass\nexcept* Error:\n    assert flag\n",
+            None,
+            &[
+                151, 0, 9, 0, 121, 0, 35, 0, 103, 0, 120, 2, 101, 0, 37, 0, 120, 1, 129, 10, 1, 0,
+                101, 1, 115, 2, 74, 0, 130, 1, 110, 3, 145, 3, 1, 0, 110, 2, 110, 1, 1, 0, 145, 1,
+                174, 1, 120, 1, 128, 3, 1, 0, 89, 0, 121, 0, 99, 2, 89, 0, 119, 0, 120, 3, 89, 0,
+                119, 1,
+            ],
+            &[131, 8, 31, 3, 139, 4, 16, 9, 143, 11, 31, 3],
+            &[
+                240, 3, 1, 1, 1, 240, 2, 3, 1, 16, 216, 4, 8, 248, 241, 2, 1, 1, 16, 136, 5, 243,
+                0, 1, 1, 16, 217, 11, 15, 128, 75, 137, 52, 250, 136, 52, 240, 3, 1, 1, 16, 255,
+                252,
+            ],
+        ),
+    ];
+    for &(source, name, bytecode, exceptions, line_table) in cases {
+        let module = compile(source, PythonVersion::Py312);
+        let code = name.map_or(&module, |name| child(&module, name));
+        assert_eq!(code.bytecode, bytecode, "{source}");
+        assert_eq!(code.exception_table, exceptions, "{source}");
+        assert_eq!(code.line_table, line_table, "{source}");
+    }
+}
+
+#[test]
+fn legacy_dead_terminal_body_has_no_exit_predecessor() {
+    // Exact pinned CPython 3.12.14 output for this public reducer.
+    let module = compile(
+        "if (a == b or a == c) and None:\n    d\n",
+        PythonVersion::Py312,
+    );
+    let code = &module;
+    assert_eq!(
+        code.bytecode,
+        &[
+            151, 0, 101, 0, 101, 1, 107, 40, 0, 0, 115, 5, 101, 0, 101, 2, 107, 40, 0, 0, 114, 1,
+            121, 0, 121, 0,
+        ]
+    );
+    assert_eq!(
+        code.line_table,
+        &[
+            240, 3, 1, 1, 1, 216, 4, 5, 136, 17, 130, 70, 136, 97, 144, 49, 138, 102, 152, 36, 136,
+            102,
+        ]
+    );
+    assert!(code.exception_table.is_empty());
+}
+
+#[test]
+fn legacy_metadata_labels_do_not_block_nop_donation() {
+    // Exact pinned CPython 3.12.14 output for this public reducer.
+    let module = compile(
+        "match x:\n    case {0: 0 | 1 | 2}:\n        pass\n",
+        PythonVersion::Py312,
+    );
+    let code = &module;
+    assert_eq!(
+        code.bytecode,
+        &[
+            151, 0, 101, 0, 31, 0, 114, 42, 30, 0, 100, 0, 107, 92, 0, 0, 114, 37, 100, 4, 33, 0,
+            120, 1, 129, 31, 92, 1, 0, 0, 120, 1, 100, 1, 107, 40, 0, 0, 114, 4, 1, 0, 1, 0, 1, 0,
+            121, 2, 120, 1, 100, 0, 107, 40, 0, 0, 114, 4, 1, 0, 1, 0, 1, 0, 121, 2, 120, 1, 100,
+            3, 107, 40, 0, 0, 114, 4, 1, 0, 1, 0, 1, 0, 121, 2, 1, 0, 110, 1, 1, 0, 1, 0, 1, 0,
+            121, 2,
+        ]
+    );
+    assert_eq!(
+        code.line_table,
+        &[
+            240, 3, 1, 1, 1, 216, 6, 7, 223, 9, 23, 140, 30, 140, 81, 136, 89, 137, 30, 216, 8, 12,
+            244, 3, 0, 18, 19, 136, 89, 137, 30, 216, 8, 12, 244, 3, 0, 22, 23, 136, 89, 137, 30,
+            216, 8, 12, 241, 3, 0, 14, 23, 139, 30,
+        ]
+    );
+    assert!(code.exception_table.is_empty());
+}
+
+#[test]
+fn legacy_nested_assignment_preserves_original_join() {
+    // Exact pinned CPython 3.13.15 output for this public reducer.
+    let module = compile(
+        "def f():\n    target.value = (\n        (first\n         if inner\n         else second)\n        if outer\n        else third\n    )\n",
+        PythonVersion::Py313,
+    );
+    let code = child(&module, "f");
+    assert_eq!(
+        code.bytecode,
+        &[
+            149, 0, 91, 0, 0, 0, 0, 0, 0, 0, 0, 0, 40, 0, 0, 0, 0, 0, 0, 0, 97, 44, 0, 0, 91, 2, 0,
+            0, 0, 0, 0, 0, 0, 0, 40, 0, 0, 0, 0, 0, 0, 0, 97, 16, 0, 0, 91, 4, 0, 0, 0, 0, 0, 0, 0,
+            0, 91, 10, 0, 0, 0, 0, 0, 0, 0, 0, 108, 6, 0, 0, 0, 0, 0, 0, 0, 0, 103, 0, 91, 6, 0, 0,
+            0, 0, 0, 0, 0, 0, 30, 0, 91, 10, 0, 0, 0, 0, 0, 0, 0, 0, 108, 6, 0, 0, 0, 0, 0, 0, 0,
+            0, 103, 0, 91, 8, 0, 0, 0, 0, 0, 0, 0, 0, 91, 10, 0, 0, 0, 0, 0, 0, 0, 0, 108, 6, 0, 0,
+            0, 0, 0, 0, 0, 0, 103, 0,
+        ]
+    );
+    assert_eq!(
+        code.line_table,
+        &[
+            128, 0, 247, 10, 0, 12, 17, 138, 53, 247, 5, 0, 13, 18, 138, 69, 244, 3, 0, 10, 15,
+            244, 3, 0, 5, 11, 133, 76, 245, 6, 0, 15, 21, 244, 7, 0, 5, 11, 133, 76, 244, 10, 0,
+            14, 19, 244, 11, 0, 5, 11, 133, 76,
+        ]
+    );
+    assert!(code.exception_table.is_empty());
+}
+
+#[test]
+fn legacy_private_class_capture_preserves_target_and_enclosing_cells() {
+    use crate::target::local_kinds::{CO_FAST_CELL, CO_FAST_FREE};
+    use crate::target::opcodes::{BUILD_TUPLE, LOAD_CLOSURE, LOAD_FAST};
+
+    for version in [PythonVersion::Py312, PythonVersion::Py313] {
+        let module = compile(
+            "def outer(_C__offset):\n    class C:\n        a = [lambda: __offset for __offset in data]\n        b = [lambda: __offset for x in data]\n    return C\n",
+            version,
+        );
+        let outer = child(&module, "outer");
+        let class = child(outer, "C");
+        for (code, kind) in [(outer, CO_FAST_CELL), (class, CO_FAST_FREE)] {
+            let captures = code
+                .locals
+                .iter()
+                .zip(&code.local_kinds)
+                .filter(|(_, flags)| **flags & kind != 0)
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(captures, ["_C__offset"], "{version:?}: {}", code.name);
+        }
+        let closure_load = if version == PythonVersion::Py312 {
+            LOAD_CLOSURE
+        } else {
+            LOAD_FAST
+        };
+        let slots = class
+            .bytecode
+            .as_chunks::<2>()
+            .0
+            .windows(2)
+            .filter(|pair| {
+                pair[0][0] == closure_load.code_for(version)
+                    && pair[1] == [BUILD_TUPLE.code_for(version), 1]
+            })
+            .map(|pair| pair[0][1])
+            .collect::<Vec<_>>();
+        assert_eq!(slots, [1, 3], "{version:?}");
     }
 }
