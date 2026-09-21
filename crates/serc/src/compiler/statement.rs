@@ -20321,6 +20321,9 @@ impl Compiler<'_> {
                 handler.as_except_handler().is_some_and(|handler| {
                     suite_terminates(&handler.body)
                         || suite_contains_partial_terminal_handler_if(&handler.body)
+                        || (!statement.is_star
+                            && statement.finalbody.is_empty()
+                            && suite_ends_in_partial_terminal_handler_match(&handler.body))
                         || (match_recovery_scope
                             && handler.name.is_some()
                             && suite_has_linear_borrow_fallthrough(&statement.body)
@@ -32473,6 +32476,39 @@ fn suite_contains_partial_terminal_handler_if(body: &[Stmt]) -> bool {
                                 || suite_contains_partial_terminal_handler_if(&clause.body))
                     })))
     })
+}
+
+// Codegen emits a case-success jump even after a terminal non-default arm.
+// Its emptied array stays behind when reachable handler blocks move to the end,
+// just like the orphan after a terminal arm of a complete handler if.
+fn suite_ends_in_partial_terminal_handler_match(body: &[Stmt]) -> bool {
+    fn terminal_arm(body: &[Stmt]) -> bool {
+        body.split_last().is_some_and(|(last, prefix)| {
+            matches!(last, Stmt::Return(_) | Stmt::Raise(_))
+                && (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
+        })
+    }
+
+    let Some((Stmt::Match(statement), prefix)) = body.split_last() else {
+        return false;
+    };
+    let Some((last, earlier)) = statement.cases.split_last() else {
+        return false;
+    };
+    (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
+        && !expression_contains_inline_branch(&statement.subject)
+        && !expression_suspends_current_scope(&statement.subject)
+        && matches!(&last.pattern, Pattern::MatchAs(pattern)
+            if pattern.pattern.is_none() && pattern.name.is_none())
+        && last.guard.is_none()
+        && (matches!(last.body.as_slice(), [Stmt::Pass(_)])
+            || suite_has_linear_borrow_fallthrough(&last.body))
+        && earlier.iter().all(|case| {
+            case.guard.is_none()
+                && matches!(case.pattern, Pattern::MatchValue(_))
+                && (terminal_arm(&case.body) || suite_has_linear_borrow_fallthrough(&case.body))
+        })
+        && earlier.iter().any(|case| terminal_arm(&case.body))
 }
 
 // An exhaustive literal match with terminal arms leaves the same cold handler

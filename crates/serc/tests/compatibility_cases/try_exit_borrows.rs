@@ -5134,3 +5134,38 @@ fn matches_cpython_terminal_assertion_handler_borrow_entries() {
         common::assert_matches_cpython_marshal(&source, "terminal_assert_handler_small_exit.py");
     }
 }
+
+#[test]
+fn matches_cpython_partial_terminal_match_handler_borrow_entries() {
+    for (definition, operation) in [
+        ("def", "work(value)"),
+        ("def", "yield value"),
+        ("async def", "await work(value)"),
+        ("async def", "yield value"),
+    ] {
+        for handler in ["except Exception:", "except Exception as error:"] {
+            for terminal in ["raise", "return", "report(value)"] {
+                let source = format!(
+                    "{definition} f(value, action, flag):
+    try:
+        {operation}
+    {handler}
+        match action:
+            case Mode.WARNING:
+                report(value)
+            case Mode.ERROR:
+                {terminal}
+            case _:
+                pass
+    if flag:
+        report(value)
+"
+                );
+                common::assert_matches_cpython_marshal(
+                    &source,
+                    "partial_terminal_match_handler.py",
+                );
+            }
+        }
+    }
+}
