@@ -299,14 +299,16 @@ jobs:
       - name: "Build CPython 3.12.14 (Windows)"
         if: runner.os == 'Windows'
         id: python312-windows
-        shell: cmd
+        shell: pwsh
         working-directory: .cpython-3.12-build
         env:
           PYTHON: ${{ steps.python313.outputs.python-path }}
         run: |
-          call PCbuild\build.bat -p x64 -c Release -E --no-ctypes "/p:IncludeTests=false"
-          if errorlevel 1 exit /b %errorlevel%
-          echo python-path=%CD%\PCbuild\amd64\python.exe>> "%GITHUB_OUTPUT%"
+          # Preserve the quotes build.bat requires around MSBuild properties.
+          & .\PCbuild\build.bat --% -p x64 -c Release -E --no-ctypes "/p:IncludeTests=false" "/p:PlatformToolset=v143"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $python312Path = Join-Path $PWD "PCbuild\amd64\python.exe"
+          "python-path=$python312Path" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
       - name: "Verify CPython 3.12.14 oracle"
         id: python312
         shell: bash
