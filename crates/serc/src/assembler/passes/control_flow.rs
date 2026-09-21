@@ -1354,10 +1354,52 @@ impl OptimizationPipeline {
                             );
                             instruction == original
                         })();
+                        // A nested source join can contain an authored Pass followed only by
+                        // its enclosing branch's jump. CPython still sees that NOP when it
+                        // visits the earlier incoming jump; compaction transfers the Pass's
+                        // location to the branch jump only after all blocks were optimized.
+                        let original_forward_pass_head = (|| {
+                            if self.python_version < crate::PythonVersion::Py314
+                                || !self.original_nop_targets.contains(label)
+                                || instruction.opcode != JUMP_FORWARD
+                                || instruction.location.line < 0
+                            {
+                                return false;
+                            }
+                            let (Some(depth), Operand::Forward(target)) =
+                                (instruction.depth_after(), instruction.operand())
+                            else {
+                                return false;
+                            };
+                            let Some((Item::Instruction(tail), labels)) =
+                                graph[block].items().split_last()
+                            else {
+                                return false;
+                            };
+                            if *tail != instruction
+                                || !labels.iter().any(|item| matches!(item, Item::Label(entry)
+                                    if self.exception_owner_provenance.source_boundaries.contains(entry)
+                                        && self.exception_owner_provenance.block_boundaries.contains(entry)))
+                                || !labels.iter().all(|item| matches!(item, Item::Label(entry)
+                                    if self.original_nop_targets.contains(entry)
+                                        && self.exception_owner_provenance.omitted_nop_counts.get(entry) == Some(&1)
+                                        && self.exception_owner_provenance.omitted_nop_locations.get(entry) == Some(&instruction.location)))
+                            {
+                                return false;
+                            }
+                            instruction
+                                == Instruction::new(
+                                    JUMP_FORWARD,
+                                    Operand::Forward(target),
+                                    instruction.location,
+                                    Some(depth),
+                                )
+                        })();
                         // A jump retained as a source-position NOP remains a CFG boundary.
                         if instruction.jump_policy.allows_threading_target()
                             && !instruction.jump_policy.always_retains_nop()
                             && !original_loop_tail_nop
+                            && !original_forward_pass_head
                             // This alias enters an authored Pass before the inner try/except's
                             // POP_BLOCK/JUMP pair. Its later try-end alias still enters the
                             // pair itself; only that alias can copy the cleanup's owner.

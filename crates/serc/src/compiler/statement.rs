@@ -608,6 +608,8 @@ pub(super) struct StatementState {
     // This exact statement reaches a source successor without crossing a compound
     // statement's cleanup. Only conditional arms inherit that continuation.
     same_region_continuation: Option<TextRange>,
+    // The final conditional arm's Pass falls through to a separate original join array.
+    retained_branch_pass: Option<TextRange>,
     // Whether an enclosing statement has a sibling successor after its nested suite.
     pub(super) inherited_statement_has_following: bool,
     // Whether that inherited continuation is a small name or literal return.
@@ -1916,6 +1918,11 @@ impl Compiler<'_> {
                 && (self.control.exceptions.active_exception_region_exclusions.is_empty()
                     || self.control.finally.active_finally_end_blocks > 0
                     || protected_async_with_pass
+                    || (self.control.statements.retained_branch_pass == Some(statement.range)
+                        && self.assembler.current_block_last_instruction_location().is_some_and(
+                            |previous| previous.line >= 0
+                                && previous.line != self.source_location(statement.range).line,
+                        ))
                     // A direct synchronous manager tail transfers its authored
                     // Pass location to the following converted POP_BLOCK.
                     || (self.context.python_version <= crate::PythonVersion::Py313
@@ -12756,6 +12763,18 @@ impl Compiler<'_> {
         statement: &ruff_python_ast::StmtIf,
         body: &[Stmt],
     ) -> Result<(), CompileError> {
+        let fallthrough_body = statement
+            .elif_else_clauses
+            .last()
+            .map_or(statement.body.as_slice(), |clause| clause.body.as_slice());
+        let retained_branch_pass = (self.context.python_version >= crate::PythonVersion::Py314
+            && body.len() > 1
+            && body.last().map(Ranged::range) == fallthrough_body.last().map(Ranged::range))
+        .then(|| match body.last() {
+            Some(Stmt::Pass(pass)) => Some(pass.range),
+            _ => None,
+        })
+        .flatten();
         let same_region_continuation = if self.control.statements.same_region_continuation
             == Some(statement.range)
             || self.control.loops.split_loop_tail_prefix_end == Some(statement.range)
@@ -12782,7 +12801,13 @@ impl Compiler<'_> {
                 compiler.with_control_override(
                     |control| &mut control.statements.same_region_continuation,
                     same_region_continuation,
-                    |compiler| compiler.compile_suite(body),
+                    |compiler| {
+                        compiler.with_control_override(
+                            |control| &mut control.statements.retained_branch_pass,
+                            retained_branch_pass,
+                            |compiler| compiler.compile_suite(body),
+                        )
+                    },
                 )
             },
         )

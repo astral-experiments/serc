@@ -296,3 +296,238 @@ fn matches_cpython_declaration_only_conditional_suites() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_final_conditional_arm_pass_before_cleanup() {
+    for (filename, source) in [
+        (
+            "both_pass.py",
+            r"def f(flag):
+    try:
+        if flag == 1:
+            first()
+            pass
+        elif flag == 2:
+            last()
+            pass
+    except Error as error:
+        recover(error)
+    finally:
+        cleanup()
+    return flag
+",
+        ),
+        (
+            "else_both.py",
+            r"def f(flag):
+    try:
+        if flag == 1:
+            first()
+            pass
+        else:
+            last()
+            pass
+    except Error as error:
+        recover(error)
+    finally:
+        cleanup()
+    return flag
+",
+        ),
+        (
+            "finally_pass.py",
+            r"def f(flag):
+    try:
+        if flag == 1:
+            first()
+            pass
+        elif flag == 2:
+            last()
+            pass
+    finally:
+        cleanup()
+    return flag
+",
+        ),
+        (
+            "same_line.py",
+            r"def f(flag):
+    try:
+        if flag == 1:
+            first(); pass
+        elif flag == 2:
+            last(); pass
+    except Error as error:
+        recover(error)
+    finally:
+        cleanup()
+    return flag
+",
+        ),
+        (
+            "await_arm.py",
+            r"async def f(flag):
+    try:
+        if flag == 1:
+            first()
+            pass
+        elif flag == 2:
+            await last()
+            pass
+    except Error as error:
+        recover(error)
+    finally:
+        cleanup()
+    return flag
+",
+        ),
+        (
+            "generator_both.py",
+            r"def f(flag):
+    yield flag
+    try:
+        if flag == 1:
+            first()
+            pass
+        elif flag == 2:
+            last()
+            pass
+    except Error as error:
+        recover(error)
+    finally:
+        cleanup()
+    return flag
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_omitted_pass_before_nested_branch_jump() {
+    for (filename, source) in [
+        (
+            "nested_join_before_pass.py",
+            r"def f(flag, inner, other):
+    try:
+        if flag == 1:
+            first()
+            if inner:
+                if other:
+                    recover()
+                else:
+                    accept()
+            pass
+        elif flag == 2:
+            last()
+            pass
+        else:
+            raise Error()
+    except Error as error:
+        caught(error)
+    finally:
+        cleanup()
+    return flag
+",
+        ),
+        (
+            "head_async.py",
+            r"async def f(flag, inner, other):
+    try:
+        if flag == 1:
+            first()
+            if inner:
+                if other:
+                    recover()
+                else:
+                    accept()
+            pass
+        elif flag == 2:
+            last()
+            pass
+        else:
+            raise Error()
+    except Error as error:
+        caught(error)
+    finally:
+        cleanup()
+    return flag
+",
+        ),
+        (
+            "head_no_pass.py",
+            r"def f(flag, inner, other):
+    try:
+        if flag == 1:
+            first()
+            if inner:
+                if other:
+                    recover()
+                else:
+                    accept()
+        elif flag == 2:
+            last()
+        else:
+            raise Error()
+    except Error as error:
+        caught(error)
+    finally:
+        cleanup()
+    return flag
+",
+        ),
+        (
+            "head_following_call.py",
+            r"def f(flag, inner, other):
+    try:
+        if flag == 1:
+            first()
+            if inner:
+                if other:
+                    recover()
+                else:
+                    accept()
+            pass
+            observe()
+        elif flag == 2:
+            last()
+            pass
+            observe()
+        else:
+            raise Error()
+    except Error as error:
+        caught(error)
+    finally:
+        cleanup()
+    return flag
+",
+        ),
+        (
+            "head_single_return.py",
+            r"def f(flag, inner, other):
+    try:
+        if flag == 1:
+            first()
+            if inner:
+                if other:
+                    recover()
+                else:
+                    accept()
+            pass
+        elif flag == 2:
+            last()
+            pass
+        else:
+            raise Error()
+    except Error as error:
+        caught(error)
+    finally:
+        cleanup()
+    return None
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
