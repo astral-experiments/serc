@@ -149,3 +149,46 @@ fn matches_cpython_handler_cleanup_donor_locations() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_named_shared_false_cleanup_contexts() {
+    for asynchronous in [false, true] {
+        for context in ["plain", "with", "finally"] {
+            for raises in [false, true] {
+                for following in [false, true] {
+                    let function = if asynchronous { "async def" } else { "def" };
+                    let prefix = if context == "with" {
+                        "        "
+                    } else {
+                        "    "
+                    };
+                    let exit = if raises {
+                        "raise"
+                    } else if asynchronous {
+                        "return await work()"
+                    } else {
+                        "return work()"
+                    };
+                    let manager = if context == "with" {
+                        "    with manager:\n"
+                    } else {
+                        ""
+                    };
+                    let cleanup = if context == "finally" {
+                        "    finally:\n        finish()\n"
+                    } else {
+                        ""
+                    };
+                    let after = if following { "    after()\n" } else { "" };
+                    let source = format!(
+                        "{function} f(a, b, manager):\n{manager}{prefix}try:\n{prefix}    work()\n{prefix}except Exception as error:\n{prefix}    prepare()\n{prefix}    if a and b:\n{prefix}        {exit}\n{cleanup}{after}"
+                    );
+                    common::assert_matches_cpython_marshal(
+                        &source,
+                        "named_false_cleanup_context.py",
+                    );
+                }
+            }
+        }
+    }
+}

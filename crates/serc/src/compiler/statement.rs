@@ -22296,12 +22296,15 @@ impl Compiler<'_> {
                 self.assembler.record_unlocated_cleanup_targets();
                 // Multiple false edges share one original artificial cleanup, whether or not
                 // the handler binds the exception. Keep it unlocated until exit duplication.
-                let handler_has_shared_terminal_false_cleanup = terminal
+                let handler_has_shared_terminating_false_cleanup = (terminal
+                    || handler.name.is_some())
                     && matches!(
                         handler.body.last(),
                         Some(Stmt::If(tail))
                             if tail.elif_else_clauses.is_empty()
-                                && matches!(tail.body.last(), Some(Stmt::Raise(_)))
+                                && (matches!(tail.body.last(), Some(Stmt::Raise(_)))
+                                    || (handler.name.is_some()
+                                        && matches!(tail.body.last(), Some(Stmt::Return(_)))))
                                 && condition_has_linear_runtime_leaves(&tail.test)
                                 && condition_jump_target_count(&tail.test, false) > 1
                     );
@@ -22460,7 +22463,7 @@ impl Compiler<'_> {
                     || handler_cleanup_from_original_join
                     || handler_has_shared_normal_finally_cleanup
                     || handler_ends_with_unlocated_bare_raise_branch_cleanup
-                    || handler_has_shared_terminal_false_cleanup
+                    || handler_has_shared_terminating_false_cleanup
                     || handler_has_original_terminal_false_join
                 {
                     self.assembler.set_location(SourceLocation::NONE);
