@@ -5283,3 +5283,30 @@ fn preserves_empty_try_exit_after_returning_elif_arms() {
         }
     }
 }
+
+#[test]
+fn borrows_through_named_recovery_inside_normal_finally() {
+    for protected in [
+        "file = owner.file\nowner.file = None\nfile.close()\n",
+        "file = owner.file\nowner.file = None\nif file is not None:\n    file.close()\n",
+    ] {
+        for test in [
+            "owner.flag",
+            "owner.flag and getattr(owner, 'other', 0) != 2",
+        ] {
+            let cleanup = format!(
+                "sock = owner.sock\nowner.sock = None\nif sock is not None:\n    try:\n        sock.shutdown(2)\n    except Error as error:\n        if {test}:\n            raise\n    finally:\n        sock.close()\n",
+            );
+            let body = format!(
+                "try:\n{}finally:\n{}",
+                indent_finally_borrow_case(protected),
+                indent_finally_borrow_case(&cleanup),
+            );
+            let source = format!(
+                "def function(owner):\n{}",
+                indent_finally_borrow_case(&body)
+            );
+            common::assert_matches_cpython_marshal(&source, "normal_finally_named_recovery.py");
+        }
+    }
+}

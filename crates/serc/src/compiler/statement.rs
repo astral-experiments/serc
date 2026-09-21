@@ -25151,6 +25151,38 @@ impl Compiler<'_> {
                 && named_handler_break_has_guarded_linear_cleanup(statement)
                 && matches!(statement.finalbody.as_slice(), [Stmt::If(cleanup)]
                 if self.suite_has_nonempty_borrow_entry(&cleanup.body));
+        // A guarded named recovery keeps its own normal cleanup reachable inside
+        // one normal finalizer. Exceptional and copied finalizers retain their barriers.
+        let nested_normal_handler_cleanup = synchronous_recovery
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.control.finally.active_normal_finally_bodies == 1
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && statement.orelse.is_empty()
+            && matches!(statement.body.as_slice(), [Stmt::Expr(work)]
+                if matches!(work.value.as_ref(), Expr::Call(_))
+                    && !expression_contains_inline_branch(&work.value)
+                    && !expression_suspends_current_scope(&work.value))
+            && matches!(statement.handlers.as_slice(), [handler]
+            if handler.as_except_handler().is_some_and(|handler| {
+                handler.type_.is_some()
+                    && handler.name.is_some()
+                    && suite_has_linear_reraise_guards(&handler.body)
+            }))
+            && matches!(statement.finalbody.as_slice(), [Stmt::Expr(cleanup)]
+                if matches!(cleanup.value.as_ref(), Expr::Call(_))
+                    && !expression_contains_inline_branch(&cleanup.value)
+                    && !expression_suspends_current_scope(&cleanup.value));
         let conditional_handler_reaches_finally = !statement.is_star
             && (statement.orelse.is_empty()
                 || (suite_has_linear_borrow_fallthrough(&statement.orelse)
@@ -25176,7 +25208,8 @@ impl Compiler<'_> {
                             && matches!(cleanup.value.as_ref(), Expr::Call(call)
                                 if matches!(call.func.as_ref(), Expr::Attribute(attribute)
                                     if matches!(attribute.value.as_ref(), Expr::Name(_)))))))
-            && self.control.finally.active_normal_finally_bodies == 0
+            && (self.control.finally.active_normal_finally_bodies == 0
+                || nested_normal_handler_cleanup)
             && self.control.finally.active_finally_end_blocks == 0
             && !suite_contains_loop_break(&statement.body)
             && !matches!(
