@@ -333,6 +333,7 @@ pub(super) struct ScopeBodyFacts {
     pub(super) nested_lambda_requirements: BTreeSet<String>,
     pub(super) nested_generator_requirements: BTreeSet<String>,
     pub(super) nested_annotation_scope_requirements: BTreeSet<String>,
+    nested_annotation_class_closure: bool,
     pub(super) generator_named_targets: FxHashSet<String>,
     pub(super) inlined_comprehension_cellvars: FxHashSet<String>,
     pub(super) has_function_definition: bool,
@@ -762,6 +763,7 @@ struct ClassPlan {
     comprehension_targets: Vec<(NameId, bool)>,
     comprehension_cells: FxHashSet<NameId>,
     required: FxHashSet<NameId>,
+    type_parameter_names: FxHashSet<NameId>,
     enclosing_names: FxHashMap<NameId, NameId>,
     needs_class_closure: bool,
     needs_classdict: bool,
@@ -809,6 +811,7 @@ impl ClassPlan {
             nested_lambda_requirements,
             nested_generator_requirements,
             nested_annotation_scope_requirements: annotation_scope_requirements,
+            nested_annotation_class_closure,
             has_function_definition,
             has_generic_definition,
             has_type_alias,
@@ -915,8 +918,9 @@ impl ClassPlan {
         }
         required.remove("__conditional_annotations__");
 
-        let needs_class_closure =
-            child_needs_class_closure || nested_lambda_requirements.contains("__class__");
+        let needs_class_closure = child_needs_class_closure
+            || nested_lambda_requirements.contains("__class__")
+            || nested_annotation_class_closure;
         let needs_classdict = has_type_alias
             || has_generic_definition
             || deferred_annotations
@@ -945,6 +949,12 @@ impl ClassPlan {
             comprehension_targets,
             comprehension_cells: names.intern_set(inlined_comprehension_cellvars),
             required: names.intern_set(required),
+            type_parameter_names: definition
+                .type_params
+                .iter()
+                .flat_map(|parameters| parameters.iter())
+                .map(|parameter| names.intern(parameter.name().as_str()))
+                .collect(),
             enclosing_names: FxHashMap::default(),
             needs_class_closure,
             needs_classdict,
@@ -1365,6 +1375,8 @@ impl ScopeArena {
             .flat_map(|plan| {
                 plan.required
                     .iter()
+                    // The synthetic generic scope provides these cells to the class.
+                    .filter(|name| !plan.type_parameter_names.contains(*name))
                     .map(|name| plan.enclosing_names.get(name).copied().unwrap_or(*name))
             })
             .collect()
@@ -2371,7 +2383,8 @@ impl LocalCollector {
                     if let Expr::Name(name) = statement.name.as_ref() {
                         self.insert(name.id.as_str());
                     }
-                    self.collect_expression(&statement.value);
+                    // The value executes in its own annotation scope, so its
+                    // comprehension targets cannot claim enclosing local slots.
                 }
                 Stmt::For(statement) => {
                     self.collect_expression(&statement.iter);
@@ -2997,6 +3010,32 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
 
     fn collect_type_alias(&mut self, statement: &'ast ruff_python_ast::StmtTypeAlias) {
         self.facts.has_type_alias = true;
+        if self.class_scope
+            && !statement.type_params.iter().any(|parameters| {
+                parameters
+                    .iter()
+                    .any(|parameter| parameter.name().as_str() == "__class__")
+            })
+        {
+            let bounds_and_defaults = statement
+                .type_params
+                .iter()
+                .flat_map(|parameters| parameters.iter())
+                .flat_map(|parameter| {
+                    let bound = match parameter {
+                        TypeParam::TypeVar(parameter) => parameter.bound.as_deref(),
+                        TypeParam::TypeVarTuple(_) | TypeParam::ParamSpec(_) => None,
+                    };
+                    bound.into_iter().chain(parameter.default())
+                });
+            // Nested functions bypass the class namespace and still need its
+            // synthetic cell, even when a class attribute shadows `__class__`.
+            self.facts.nested_annotation_class_closure |= std::iter::once(statement.value.as_ref())
+                .chain(bounds_and_defaults)
+                .any(|expression| {
+                    nested_expression_required_names(expression).contains("__class__")
+                });
+        }
         let mut required = expression_required_names(&statement.value);
         if let Some(type_params) = statement.type_params.as_deref() {
             let type_names: BTreeSet<_> = type_params
@@ -3042,7 +3081,12 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
                 self.collect_class_header(definition);
                 return;
             }
-            Stmt::TypeAlias(statement) => self.collect_type_alias(statement),
+            Stmt::TypeAlias(statement) => {
+                // The alias value and type parameters own annotation scopes. Their
+                // free requirements were collected after filtering bound parameters.
+                self.collect_type_alias(statement);
+                return;
+            }
             Stmt::Assign(assignment) if self.collect_function_scope_facts => {
                 for target in &assignment.targets {
                     self.visit_expr(target);
