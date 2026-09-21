@@ -192,3 +192,61 @@ fn matches_cpython_named_shared_false_cleanup_contexts() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_final_elif_for_exhaustion_cleanup() {
+    const SOURCE: &str = r#"def f(first, second, items):
+    try:
+        work()
+    except Error as error:
+        if first:
+            return first
+        elif second:
+            for item in items:
+                value = work(item)
+                if value is not None:
+                    return value
+    raise Error()
+"#;
+
+    for (filename, source) in [
+        ("named_for_return.py", SOURCE.to_owned()),
+        (
+            "unnamed_for_return.py",
+            SOURCE.replace("except Error as error:", "except Error:"),
+        ),
+        ("async_function_for_return.py", format!("async {SOURCE}")),
+        (
+            "for_continue.py",
+            SOURCE.replace("return value", "continue"),
+        ),
+        (
+            "prefix_call.py",
+            SOURCE.replace(
+                "            for item",
+                "            before()\n            for item",
+            ),
+        ),
+        (
+            "for_break_control.py",
+            SOURCE.replace("return value", "break"),
+        ),
+        (
+            "loop_else_return_control.py",
+            SOURCE.replace(
+                "    raise Error()",
+                "            else:\n                return fallback()\n    raise Error()",
+            ),
+        ),
+        (
+            "folded_elif_control.py",
+            SOURCE.replace("elif second:", "elif True:"),
+        ),
+        (
+            "nonterminating_first_control.py",
+            SOURCE.replace("return first", "work(first)"),
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(&source, filename);
+    }
+}

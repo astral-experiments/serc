@@ -34667,7 +34667,7 @@ fn handler_cleanup_has_complete_runtime_join(statement: &ruff_python_ast::StmtIf
         })
 }
 
-// A final elif has a false edge and a linear fallthrough into the handler cleanup.
+// A final elif has a false edge and a normal fallthrough into the handler cleanup.
 // When all earlier arms terminate, neither normal edge has an unconditional jump
 // that can receive a copied cleanup. CPython leaves their shared entry unlocated.
 fn handler_cleanup_has_runtime_elif_join(statement: &ruff_python_ast::StmtIf) -> bool {
@@ -34687,8 +34687,45 @@ fn handler_cleanup_has_runtime_elif_join(statement: &ruff_python_ast::StmtIf) ->
             .test
             .as_ref()
             .is_some_and(condition_has_only_runtime_tests)
-        && suite_has_linear_borrow_fallthrough(&last.body)
+        && (suite_has_linear_borrow_fallthrough(&last.body)
+            || handler_cleanup_has_for_exhaustion_join(&last.body))
         && !suite_contains_yield(&last.body)
+}
+
+// END_FOR/POP_ITER falls through into the same cleanup reached by the final elif's
+// false jump. Neither predecessor is an unconditional jump that can copy the
+// cleanup away. Breaks, loop else suites, and nested cleanup retain their old path.
+fn handler_cleanup_has_for_exhaustion_join(body: &[Stmt]) -> bool {
+    let Some((Stmt::For(tail), prefix)) = body.split_last() else {
+        return false;
+    };
+    if tail.is_async
+        || !tail.orelse.is_empty()
+        || !matches!(tail.target.as_ref(), Expr::Name(_))
+        || (!prefix.is_empty() && !suite_has_linear_borrow_fallthrough(prefix))
+        || expression_contains_inline_branch(&tail.iter)
+        || suite_contains_loop_break(&tail.body)
+        || !handler_cleanup_has_runtime_branch_body(&tail.body)
+        || suite_contains_yield_with_headers(body, true, true)
+    {
+        return false;
+    }
+
+    // Suspension introduces additional resume/cleanup blocks. Keep those outside
+    // this certificate, including yields in function defaults and annotations.
+    struct SuspensionDetector(bool);
+
+    impl<'ast> Visitor<'ast> for SuspensionDetector {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            self.0 |= expression_suspends_current_scope(expression);
+        }
+    }
+
+    let mut detector = SuspensionDetector(false);
+    for statement in body {
+        detector.visit_stmt(statement);
+    }
+    !detector.0
 }
 
 // Earlier terminating arms bypass cleanup; a final else's partial runtime conditional
