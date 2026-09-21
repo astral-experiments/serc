@@ -486,10 +486,11 @@ mod tests {
     #[test]
     fn contract_rejects_unreviewed_target_baseline_or_implementation() {
         let oracle = super::super::ORACLE;
-        assert!(
+        assert_eq!(
             descriptor()
                 .validate_contract(PythonVersion::Py312, true, oracle)
-                .is_ok()
+                .is_ok(),
+            cfg!(target_os = "linux")
         );
         for target in [
             PythonVersion::Py313,
