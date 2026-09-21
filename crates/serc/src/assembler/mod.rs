@@ -1371,10 +1371,10 @@ impl Assembler {
 
     /// Keeps a cleanup-free while break until the shared handler exit can be copied.
     ///
-    /// The caller certifies an unnamed handler ending in a runtime while without else.
+    /// The caller certifies a handler ending in a runtime while without else.
     /// Its single false edge enters a source boundary beside the distinct break target.
     /// Removing the break first would merge those two original cleanup predecessors.
-    pub(crate) fn defer_original_while_break_cleanup_edges(&mut self) {
+    pub(crate) fn defer_original_while_break_cleanup_edges(&mut self) -> bool {
         let items = self.linear_items();
         let labels = items
             .iter()
@@ -1391,7 +1391,7 @@ impl Assembler {
                     || self.folded_away_loop_else_targets.contains(label)
             })
         {
-            return;
+            return false;
         }
         let mut false_edge = None;
         let mut breaks = Vec::new();
@@ -1409,7 +1409,7 @@ impl Assembler {
                 || instruction.local_policy.hidden_exception_owner_slots() != 0
                 || instruction.no_location_policy.preserves_location()
             {
-                return;
+                return false;
             }
             if matches!(
                 instruction.opcode,
@@ -1424,7 +1424,7 @@ impl Assembler {
                     .replace((target, instruction.depth_after()))
                     .is_some()
                 {
-                    return;
+                    return false;
                 }
             } else if instruction.opcode == JUMP_FORWARD
                 && instruction.fusion_policy.is_authored_break()
@@ -1434,18 +1434,18 @@ impl Assembler {
             {
                 breaks.push((index, target, instruction.depth_after()));
             } else {
-                return;
+                return false;
             }
         }
         let Some((false_target, depth)) = false_edge else {
-            return;
+            return false;
         };
         if breaks.is_empty()
             || breaks
                 .iter()
                 .any(|(_, target, break_depth)| *target == false_target || *break_depth != depth)
         {
-            return;
+            return false;
         }
         for (index, _, _) in breaks {
             let Item::Instruction(jump) = &mut self.linear_items_mut()[index] else {
@@ -1453,6 +1453,7 @@ impl Assembler {
             };
             jump.jump_policy.defer_removal();
         }
+        true
     }
 
     /// Certifies a guard-false donor beside a separate normal-finally exit.

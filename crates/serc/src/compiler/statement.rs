@@ -21740,8 +21740,17 @@ impl Compiler<'_> {
                     || self.control.finally.active_finally_end_blocks > 0)
                 && handler_has_guarded_linear_conditional_cleanup(&handler.body)
                 && self.assembler.at_original_guarded_finally_handler_join();
+            // Multiple original false edges have no unique location donor, even
+            // when the named cleanup immediately returns from the function.
+            let handler_has_original_terminal_false_join = handler.name.is_some()
+                && terminal
+                && self.assembler.at_original_jump_only_conditional_join();
+            let handler_has_named_while_break_join = handler.name.is_some()
+                && matches!(handler.body.last(), Some(Stmt::While(tail)) if tail.orelse.is_empty())
+                && self.assembler.defer_original_while_break_cleanup_edges();
             let handler_ends_with_inlineable_cleanup = handler_ends_with_preordered_cleanup
                 || handler_has_guarded_finally_cleanup
+                || handler_has_named_while_break_join
                 || handler_has_original_conditional_loop_join
                 || handler_has_nested_else_loop_cleanup
                 || handler_ends_with_named_conditional_cleanup
@@ -22452,6 +22461,7 @@ impl Compiler<'_> {
                     || handler_has_shared_normal_finally_cleanup
                     || handler_ends_with_unlocated_bare_raise_branch_cleanup
                     || handler_has_shared_terminal_false_cleanup
+                    || handler_has_original_terminal_false_join
                 {
                     self.assembler.set_location(SourceLocation::NONE);
                 } else if let Some(location) = handler_match_failure_location {
