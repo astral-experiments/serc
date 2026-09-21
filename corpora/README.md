@@ -85,15 +85,19 @@ Then run the frozen CPython 3.14.5 outcome comparison:
 ```
 
 The check first rejects missing files, content-identity drift, tracked
-modifications, and untracked files. The current outcome baseline requires 67,850
-byte-identical files, 5,527 failures, and 160 files rejected by CPython. That is
-92.47% of the 73,377 CPython-accepted inputs. All 5,527 failures are byte
-mismatches; there are no unsupported inputs, compiler panics, parse/decode
-mismatches, or oracle failures.
+modifications, and untracked files. The September 21, 2026 outcome baseline requires 73,097
+byte-identical files, 280 accepted-input failures, and 160 files rejected by CPython. That is
+99.62% of the 73,377 CPython-accepted inputs. The accepted-input failures comprise 278 byte
+mismatches and 2 compiler panics. Among the 160 CPython-rejected inputs, Serc matches
+123 rejections, accepts 29, and reports 8 compiler failures, for 10 compiler failures in total.
+There are no unsupported inputs, parse/decode mismatches, non-UTF-8 inputs, or oracle failures.
+See the [measurement summary](results/compatibility-2026-09-21.json) for the compiler and corpus
+revisions and all outcome counts.
 
-A full run exits unsuccessfully when either exact matches or CPython rejections
-change, so improvements and regressions both require an intentional baseline
-update. Failure categories remain diagnostic; the baseline freezes their aggregate.
+A full run exits unsuccessfully when any outcome category or the independent CPython rejection
+count changes, so improvements and regressions both require an intentional baseline update.
+Every category is frozen separately; a byte mismatch becoming a compiler failure cannot pass
+unnoticed.
 
 For a faster local smoke diagnostic, limit the sorted corpus prefix explicitly:
 
