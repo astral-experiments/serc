@@ -8194,7 +8194,10 @@ impl Compiler<'_> {
             self.assembler
                 .set_location(self.source_location(expression.range()));
             if truthiness == jump_on {
-                let exit = self.emit_jump_forward_instruction(JUMP_FORWARD, label)?;
+                // The folded conditional keeps its own operand span. A preceding
+                // same-line constant NOP is removed without donating its columns.
+                let exit =
+                    self.emit_jump_forward_instruction_preserving_location(JUMP_FORWARD, label)?;
                 self.assembler.preserve_inlined_jump_nop(exit);
                 self.assembler
                     .mark_folded_jump_borrow_fallthrough(exit, empty_folded_block);

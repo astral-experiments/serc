@@ -4328,9 +4328,16 @@ impl OptimizationPipeline {
                         let Item::Instruction(instruction) = *graph.item(previous) else {
                             unreachable!();
                         };
-                        // A raising predecessor cannot supply the line for another path's
-                        // exit. Keep ordinary jump and copied-return location handling.
-                        (!matches!(instruction.opcode, RAISE_VARARGS | RERAISE))
+                        // CPython compacts an empty block's removable NOP before
+                        // redundant jumps. Its same-line successor keeps its own
+                        // span, including an authored Pass donor.
+                        let removable_empty_block_nop = instruction.opcode == NOP
+                            && instruction.no_location_policy.borrow_fallthrough()
+                                == BorrowFallthrough::BarrierIfRemoved
+                            && !instruction.jump_policy.preserves_explicit_nop();
+                        // A raising predecessor cannot supply another path's line.
+                        (!matches!(instruction.opcode, RAISE_VARARGS | RERAISE)
+                            && !removable_empty_block_nop)
                             .then_some(instruction.location.line)
                     });
                     let next_line = next.map(|next| {

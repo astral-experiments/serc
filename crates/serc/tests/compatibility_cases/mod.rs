@@ -344,6 +344,7 @@ mod try_exit_borrows;
 mod constant_assertion_try_star_locations;
 mod copied_finally_intervening_manager;
 mod copied_finally_manager_return;
+mod folded_boolean_condition_locations;
 mod folded_conditional_borrow_entries;
 mod folded_statement_borrow_entries;
 mod handler_exit_width_owners;
