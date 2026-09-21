@@ -2012,18 +2012,24 @@ impl Compiler<'_> {
                         && matches!(body.get(index.wrapping_sub(1)), Some(Stmt::With(previous))
                             if !previous.is_async))
                 {
-                    // A trailing constant in a synchronous with body donates its location
-                    // to the following POP_BLOCK. The retained NOP is that ownerless
-                    // POP_BLOCK cell, rather than the authored constant's owned cell.
-                    let constant_with_body = self
-                        .control
-                        .withs
-                        .active_with_exits
-                        .last()
-                        .is_some_and(|context| {
-                            !context.is_async
-                                && context.terminal_statement_range == Some(statement.range())
-                        });
+                    // An authored constant NOP donates its line to the ownerless
+                    // POP_BLOCK. From 3.14, CFG-folded expressions keep a load/pop pair
+                    // through line resolution. NOP cleanup removes POP_BLOCK before
+                    // eliminating that pair, so its surviving cell retains its owner.
+                    let constant_with_body = (self.context.python_version
+                        <= crate::PythonVersion::Py313
+                        || is_literal_constant(&expression.value)
+                        || matches!(expression.value.as_ref(), Expr::Name(name)
+                            if name.id.as_str() == "__debug__"))
+                        && self
+                            .control
+                            .withs
+                            .active_with_exits
+                            .last()
+                            .is_some_and(|context| {
+                                !context.is_async
+                                    && context.terminal_statement_range == Some(statement.range())
+                            });
                     if constant_with_body {
                         let noop_start = self.assembler.label();
                         self.assembler.mark(noop_start);
