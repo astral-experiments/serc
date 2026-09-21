@@ -6321,8 +6321,27 @@ impl LayoutAssembler {
                                                 && nop.pre_fold_extra_instructions() == 0
                                         })
                                 });
-                            has_owner &= !fused_retained_setup_cell;
-                            proven_unprotected_slot |= fused_retained_setup_cell;
+                            // More prefix fusions can place the append before SETUP,
+                            // inside the same original entry's entirely NULL prefix.
+                            // No suffix rewrite may change the fusion-stage coordinates.
+                            let fused_unprotected_prefix = instruction.opcode == NOT_TAKEN
+                                && instruction.exception_policy().owner()
+                                    == NormalizedExceptionOwner::DynamicCondition
+                                && original_array_start == 0
+                                && owner_history_exact
+                                && pop_slot_epoch_known
+                                && tail.insertions == 0
+                                && tail.post_compaction_fusions
+                                    == setup_tail.post_compaction_fusions
+                                && tail.early_removals == setup_tail.early_removals
+                                && tail
+                                    .post_compaction_fusions
+                                    .checked_sub(instruction_index - start)
+                                    .is_some_and(|before_suffix| before_suffix > 1)
+                                && null_original_entry_prefix(start, setup_label, &owners);
+                            has_owner &= !(fused_retained_setup_cell || fused_unprotected_prefix);
+                            proven_unprotected_slot |=
+                                fused_retained_setup_cell || fused_unprotected_prefix;
                         }
                         // Entry prologue insertion consumes the exact early-compaction
                         // tail before jump normalization appends this marker. With no
