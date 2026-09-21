@@ -17772,6 +17772,8 @@ impl Compiler<'_> {
         statement: &ruff_python_ast::StmtTry,
         options: TryCompileOptions,
     ) -> Result<(), CompileError> {
+        use super::legacy_native_labels::NativeRole;
+
         let TryCompileOptions {
             terminal,
             emit_statement_nop,
@@ -17787,6 +17789,17 @@ impl Compiler<'_> {
         if statement.handlers.is_empty() {
             return Err(unsupported("try statement without handlers"));
         }
+        // Only this ordinary source route preserves the native shared joins.
+        // Unsupported lowering leaves its planned roles unconsumed, cancelling
+        // the complete certificate without guessing transformed label aliases.
+        let native_try_labels = self.context.python_version == crate::PythonVersion::Py312
+            && !terminal
+            && emit_statement_nop
+            && !exclude_terminal_body_not_taken
+            && !retained_else_break_exit
+            && loop_tail.is_none()
+            && else_loop_tail.is_none()
+            && else_match_tail.is_none();
 
         let base_depth = self.control.stack.depth;
         let direct_return_handler_try_with_depth = (self
@@ -17860,6 +17873,12 @@ impl Compiler<'_> {
         let handler_start = self.assembler.label();
         let common_cleanup = self.assembler.label();
         let end = self.assembler.label();
+        if native_try_labels {
+            self.bind_native_source_label(NativeRole::TryBody(statement.range), try_start);
+            self.bind_native_source_label(NativeRole::TryExcept(statement.range), handler_start);
+            self.bind_native_source_label(NativeRole::TryEnd(statement.range), end);
+            self.bind_native_source_label(NativeRole::TryCleanup(statement.range), common_cleanup);
+        }
         let body_ends_with_break_loop = statement.orelse.is_empty()
             && matches!(
                 statement.body.last(),
@@ -20856,6 +20875,9 @@ impl Compiler<'_> {
                 CompileError::Internal("invalid exception handler node".to_string())
             })?;
             let next_handler = self.assembler.label();
+            if native_try_labels {
+                self.bind_native_source_label(NativeRole::HandlerNext(handler.range), next_handler);
+            }
             let handler_location = self.source_location_including_trailing_semicolon(handler.range);
             final_handler_location = handler_location;
             self.set_depth(base_depth + 2);
@@ -20948,6 +20970,18 @@ impl Compiler<'_> {
             let body_start = self.assembler.label();
             let body_end = self.assembler.label();
             let name_cleanup = self.assembler.label();
+            if native_try_labels {
+                self.bind_native_source_label(
+                    NativeRole::HandlerCleanupBody(handler.range),
+                    body_start,
+                );
+                if handler.name.is_some() {
+                    self.bind_native_source_label(
+                        NativeRole::HandlerCleanupEnd(handler.range),
+                        name_cleanup,
+                    );
+                }
+            }
             if handler.name.is_some() {
                 self.assembler.record_exception_setup(body_start, false);
             } else {

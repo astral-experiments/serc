@@ -20,6 +20,13 @@ pub(super) enum NativeRole {
     IfEnd(TextRange),
     IfElse(TextRange),
     AssertEnd(TextRange),
+    TryBody(TextRange),
+    TryExcept(TextRange),
+    TryEnd(TextRange),
+    TryCleanup(TextRange),
+    HandlerNext(TextRange),
+    HandlerCleanupBody(TextRange),
+    HandlerCleanupEnd(TextRange),
     ValueBoolEnd(TextRange),
     ConditionBoolEnd(TextRange),
     ValueIfEnd(TextRange),
@@ -80,6 +87,7 @@ struct Builder {
     boundary: usize,
     labels: Vec<(NativeRole, Option<usize>)>,
     manager_depth: usize,
+    handler_depth: usize,
     for_manager_depths: Vec<usize>,
     inside_comprehension: bool,
 }
@@ -186,7 +194,7 @@ impl Builder {
                     self.instruction(); // POP_TOP, or the constant statement's NOP
                 }
                 Stmt::Return(statement) => {
-                    if self.manager_depth != 0 {
+                    if self.manager_depth != 0 || self.handler_depth != 0 {
                         return None;
                     }
                     if let Some(value) = &statement.value {
@@ -253,6 +261,7 @@ impl Builder {
                     self.mark(end);
                 }
                 Stmt::With(statement) => self.manager(statement)?,
+                Stmt::Try(statement) => self.try_except(statement)?,
                 Stmt::FunctionDef(definition) => {
                     if definition.type_params.is_some() {
                         return None;
@@ -317,6 +326,63 @@ impl Builder {
                 _ => return None,
             }
         }
+        Some(())
+    }
+
+    /// Mirrors typed `compiler_try_except` handlers with their original shared join.
+    fn try_except(&mut self, statement: &ruff_python_ast::StmtTry) -> Option<()> {
+        if statement.is_star
+            || statement.handlers.is_empty()
+            || !statement.finalbody.is_empty()
+            || !statement.orelse.is_empty()
+        {
+            return None;
+        }
+        // Native reserves all four before visiting the protected suite. The
+        // setup instruction separates Body from any preceding original mark.
+        let body = self.allocate(NativeRole::TryBody(statement.range));
+        let except = self.allocate(NativeRole::TryExcept(statement.range));
+        let end = self.allocate(NativeRole::TryEnd(statement.range));
+        let cleanup = self.allocate(NativeRole::TryCleanup(statement.range));
+        self.instruction(); // SETUP_FINALLY
+        self.mark(body);
+        self.suite(&statement.body)?;
+        self.instruction(); // original POP_BLOCK and JUMP End, even after an exit
+        self.mark(except);
+        self.instruction(); // SETUP_CLEANUP and PUSH_EXC_INFO
+        for handler in &statement.handlers {
+            let handler = handler.as_except_handler()?;
+            // Bare handlers omit a dead RERAISE boundary in Serc. They need
+            // a separate unreferenced-label proof before sharing this route.
+            let exception_type = handler.type_.as_deref()?;
+            Self::label_free_expression(exception_type)?;
+            let next = self.allocate(NativeRole::HandlerNext(handler.range));
+            self.expression(exception_type)?;
+            self.instruction(); // CHECK_EXC_MATCH and POP_JUMP_IF_FALSE
+            let name_cleanup = handler
+                .name
+                .as_ref()
+                .map(|_| self.allocate(NativeRole::HandlerCleanupEnd(handler.range)));
+            let handler_body = self.allocate(NativeRole::HandlerCleanupBody(handler.range));
+            self.instruction(); // STORE / SETUP_CLEANUP, or unnamed POP_TOP
+            self.mark(handler_body);
+            self.handler_depth += 1;
+            self.suite(&handler.body)?;
+            self.handler_depth -= 1;
+            // Ordinary try/handler Break and Continue unwinding allocates no
+            // labels. Keep these original cleanup/join boundaries even when
+            // an abrupt exit makes the normal records unreachable.
+            self.instruction(); // POP_BLOCK / POP_EXCEPT / optional clear / JUMP End
+            if let Some(name_cleanup) = name_cleanup {
+                self.mark(name_cleanup);
+                self.instruction(); // LOAD_CONST / STORE / DELETE / RERAISE
+            }
+            self.mark(next);
+        }
+        self.instruction(); // final typed mismatch RERAISE
+        self.mark(cleanup);
+        self.instruction(); // COPY / POP_EXCEPT / RERAISE
+        self.mark(end);
         Some(())
     }
 
@@ -1697,5 +1763,140 @@ mod manager_tests {
                 "{source}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod ordinary_except_tests {
+    use super::{NativeLabelPlan, NativeRole};
+    use ruff_python_ast::{Expr, Stmt};
+    use ruff_python_parser::parse_module;
+
+    #[test]
+    fn typed_handler_labels_interleave_with_authored_awaits() {
+        let parsed = parse_module("async def f(flag):\n    try:\n        await action()\n    except First as error:\n        if flag:\n            await recover(error)\n    except (Second, Third):\n        pass\n    await done()\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::Try(statement), Stmt::Expr(after)] = function.body.as_slice() else {
+            panic!()
+        };
+        let first = statement.handlers[0].as_except_handler().unwrap();
+        let second = statement.handlers[1].as_except_handler().unwrap();
+        let [Stmt::If(branch)] = first.body.as_slice() else {
+            panic!()
+        };
+        let Expr::Await(after) = after.value.as_ref() else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        assert_eq!(plan.remaining[&NativeRole::TryBody(statement.range)], 2);
+        assert_eq!(plan.remaining[&NativeRole::TryExcept(statement.range)], 3);
+        assert_eq!(plan.remaining[&NativeRole::TryEnd(statement.range)], 4);
+        assert_eq!(plan.remaining[&NativeRole::TryCleanup(statement.range)], 5);
+        assert_eq!(plan.remaining[&NativeRole::HandlerNext(first.range)], 9);
+        // Native allocates named cleanup before body, regardless of Serc's
+        // physical label allocation order. The handler If and Await follow.
+        assert_eq!(
+            plan.remaining[&NativeRole::HandlerCleanupEnd(first.range)],
+            10
+        );
+        assert_eq!(
+            plan.remaining[&NativeRole::HandlerCleanupBody(first.range)],
+            11
+        );
+        assert_eq!(plan.remaining[&NativeRole::IfEnd(branch.range)], 12);
+        assert_eq!(plan.remaining[&NativeRole::HandlerNext(second.range)], 16);
+        assert_eq!(
+            plan.remaining[&NativeRole::HandlerCleanupBody(second.range)],
+            17
+        );
+        assert!(
+            !plan
+                .remaining
+                .contains_key(&NativeRole::HandlerCleanupEnd(second.range))
+        );
+        assert_eq!(plan.remaining[&NativeRole::AwaitSend(after.range)], 18);
+        assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 21);
+    }
+
+    #[test]
+    fn original_handler_cleanup_separates_dead_branch_end_from_next_handler() {
+        let parsed = parse_module("def f(flag):\n    if flag:\n        try:\n            pass\n        except Error:\n            if flag:\n                raise Error\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::If(outer)] = function.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::Try(statement)] = outer.body.as_slice() else {
+            panic!()
+        };
+        let handler = statement.handlers[0].as_except_handler().unwrap();
+        let [Stmt::If(inner)] = handler.body.as_slice() else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+        // TryEnd and the enclosing IfEnd mark the same original boundary.
+        // The later native allocation wins, while dead normal cleanup keeps
+        // the handler's authored IfEnd distinct from HandlerNext.
+        assert_eq!(plan.remaining[&NativeRole::IfEnd(outer.range)], 5);
+        assert_eq!(plan.remaining[&NativeRole::TryEnd(statement.range)], 5);
+        assert_eq!(plan.remaining[&NativeRole::IfEnd(inner.range)], 9);
+        assert_eq!(plan.remaining[&NativeRole::HandlerNext(handler.range)], 7);
+        assert_eq!(plan.remaining[&NativeRole::TryCleanup(statement.range)], 6);
+    }
+
+    #[test]
+    fn ordinary_handler_loop_exits_need_no_new_native_labels() {
+        for transfer in ["break", "continue"] {
+            for binding in ["Error", "Error as error"] {
+                let source = format!(
+                    "def f(items):\n    for item in items:\n        try:\n            action(item)\n        except {binding}:\n            {transfer}\n    done()\n"
+                );
+                let parsed = parse_module(&source).unwrap();
+                let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                    panic!()
+                };
+                assert!(
+                    NativeLabelPlan::function(&function.body, false).is_some(),
+                    "{source}"
+                );
+            }
+        }
+        let source = "def f(items, manager):\n    for item in items:\n        try:\n            action(item)\n        except Error:\n            with manager:\n                continue\n";
+        let parsed = parse_module(source).unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        assert!(NativeLabelPlan::function(&function.body, false).is_none());
+    }
+
+    #[test]
+    fn unsupported_handlers_reject_the_entire_native_label_plan() {
+        for source in [
+            "def f():\n    try:\n        action()\n    except:\n        pass\n",
+            "def f():\n    try:\n        action()\n    except Error:\n        pass\n    else:\n        done()\n",
+            "def f():\n    try:\n        action()\n    except Error:\n        pass\n    finally:\n        done()\n",
+            "def f():\n    try:\n        action()\n    except* Error:\n        pass\n",
+            "def f():\n    try:\n        action()\n    except Error:\n        if flag:\n            return value\n",
+            "def f():\n    try:\n        action()\n    except Error:\n        try:\n            return value\n        except Other:\n            pass\n",
+            "def f():\n    try:\n        action()\n    except (Error if flag else Other):\n        pass\n",
+        ] {
+            let parsed = parse_module(source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(
+                NativeLabelPlan::function(&function.body, false).is_none(),
+                "{source}"
+            );
+        }
+        // A child function owns a separate counter and handler stack.
+        let parsed = parse_module("def f():\n    try:\n        action()\n    except Error:\n        def child():\n            return value\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        assert!(NativeLabelPlan::function(&function.body, false).is_some());
     }
 }
