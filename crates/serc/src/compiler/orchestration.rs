@@ -497,13 +497,9 @@ impl<'source> Compiler<'source> {
                     } else {
                         Constant::String(clean_doc(string.value.to_str()))
                     })?;
-                let location = if self.context.python_version <= PythonVersion::Py313 {
-                    // Native docstring loads use the literal expression, excluding
-                    // parentheses belonging to the enclosing expression statement.
-                    self.source_location(string.range)
-                } else {
-                    self.source_location(expression.range)
-                };
+                // Native docstring loads use the literal expression, excluding
+                // parentheses belonging to the enclosing expression statement.
+                let location = self.source_location(string.range);
                 self.assembler.set_location(location);
                 self.emit(LOAD_CONST, constant, 1)?;
                 if self.context.python_version == PythonVersion::Py312 {
@@ -755,13 +751,9 @@ impl<'source> Compiler<'source> {
                     } else {
                         Constant::String(clean_doc(string.value.to_str()))
                     })?;
-                let location = if self.context.python_version <= PythonVersion::Py313 {
-                    // Native docstring loads use the literal expression, excluding
-                    // parentheses belonging to the enclosing expression statement.
-                    self.source_location(string.range)
-                } else {
-                    self.source_location(expression.range)
-                };
+                // Native docstring loads use the literal expression, excluding
+                // parentheses belonging to the enclosing expression statement.
+                let location = self.source_location(string.range);
                 self.assembler.set_location(location);
                 self.emit(LOAD_CONST, docstring, 1)?;
                 if self.context.python_version == PythonVersion::Py312 {
@@ -786,6 +778,10 @@ impl<'source> Compiler<'source> {
         {
             let range = if let Expr::FString(fstring) = expression.value.as_ref() {
                 self.fstring_result_range(fstring)
+            } else if self.context.python_version >= PythonVersion::Py314
+                && matches!(expression.value.as_ref(), Expr::BinOp(_) | Expr::UnaryOp(_))
+            {
+                expression.value.range()
             } else {
                 expression.range
             };

@@ -17,7 +17,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::assembler::SourceLocation;
 use crate::code_object::{CodeInterningSummary, CodeObject, CompilationInterningEvent, Constant};
 
-use super::constant::{explicit_surrogate_string, fold_constant};
+use super::constant::{explicit_surrogate_string, fold_constant, is_literal_constant};
 use super::scope::{ModulePlan, ScopeArena};
 use super::symbol::mangle_name;
 use super::{CachedSourceLine, Compiler};
@@ -1375,8 +1375,9 @@ pub(super) fn implicit_return_range(
         Stmt::Expr(expression) => match expression.value.as_ref() {
             Expr::FString(fstring) => compiler.fstring_result_range(fstring),
             expression
-                if compiler.context.python_version <= crate::PythonVersion::Py313
-                    && compiler.return_value_is_constant(expression) =>
+                if is_literal_constant(expression)
+                    || (compiler.context.python_version <= crate::PythonVersion::Py313
+                        && compiler.return_value_is_constant(expression)) =>
             {
                 statement.range()
             }

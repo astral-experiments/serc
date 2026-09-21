@@ -551,6 +551,8 @@ mod named_elif_cleanup_locations;
 mod class_and_percent_constant_origins;
 mod class_annotation_captures;
 mod shared_handler_cleanup_join_locations;
+
+mod literal_statement_spans;
 mod nested_or_sequence_pop_locations;
 mod with_folded_constant_owner;
 mod with_pass_finally_owner;

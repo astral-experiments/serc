@@ -1994,6 +1994,12 @@ impl Compiler<'_> {
                 }
                 let range = if let Expr::FString(fstring) = expression.value.as_ref() {
                     self.fstring_result_range(fstring)
+                } else if self.context.python_version >= crate::PythonVersion::Py314
+                    && matches!(expression.value.as_ref(), Expr::BinOp(_) | Expr::UnaryOp(_))
+                {
+                    // CFG folding replaces the operation with a load at its own
+                    // expression span; removing LOAD_CONST/POP_TOP preserves it.
+                    expression.value.range()
                 } else {
                     statement.range()
                 };
