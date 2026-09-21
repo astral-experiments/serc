@@ -135,3 +135,20 @@ fn matches_cpython_located_conditional_loop_backedges() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_normal_try_loop_exit_after_recorded_none_guards() {
+    for condition in [
+        "values is not None and value not in values",
+        "values is None and ready(value)",
+        "value not in values and values is not None",
+        "values is not None and values is not None",
+        "values is not None or ready(value)",
+        "values is not None and True",
+    ] {
+        let source = format!(
+            "def collect(items, output):\n    for item in items:\n        try:\n            try:\n                value = lookup(item)\n            except LookupError as error:\n                raise ValueError(str(error))\n            values = output.setdefault(item, [])\n            if {condition}:\n                values.append(value)\n        except ValueError:\n            recover(item)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "normal_try_none_guard_loop_exit.py");
+    }
+}

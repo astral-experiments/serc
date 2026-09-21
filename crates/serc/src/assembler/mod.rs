@@ -1863,6 +1863,10 @@ impl Assembler {
 
     /// Certifies an empty source join with multiple original conditional exits.
     pub(crate) fn at_original_shared_conditional_join(&self) -> bool {
+        self.original_shared_conditional_join(false)
+    }
+
+    fn original_shared_conditional_join(&self, allow_recorded_none_guard: bool) -> bool {
         let items = self.linear_items();
         let labels = items
             .iter()
@@ -1905,7 +1909,17 @@ impl Assembler {
                 || !matches!(instruction.operand(), Operand::Forward(_))
                 || instruction.location.line < 0
                 || instruction.pre_fold_extra_instructions() != 0
-                || instruction.local_policy.hidden_exception_owner_slots() != 0
+                || (instruction.local_policy.hidden_exception_owner_slots() != 0
+                    && !(allow_recorded_none_guard
+                        && matches!(instruction.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                        && instruction.local_policy.hidden_exception_owner_slots() == 3
+                        && self
+                            .exception_owner_provenance
+                            .source_none_conditions
+                            .iter()
+                            .filter(|origin| origin.instruction == *instruction)
+                            .count()
+                            == 1))
                 || !self
                     .exception_owner_provenance
                     .source_boundaries
@@ -1924,7 +1938,9 @@ impl Assembler {
 
     /// Certifies a shared conditional source join without a physical fallthrough donor.
     pub(crate) fn at_original_jump_only_conditional_join(&self) -> bool {
-        self.at_original_shared_conditional_join()
+        // Specializing a recorded None guard removes LOAD_CONST, IS_OP, and
+        // TO_BOOL inside its predecessor. It does not locate this empty join.
+        self.original_shared_conditional_join(true)
             && self
                 .linear_items()
                 .iter()
