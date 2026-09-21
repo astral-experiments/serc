@@ -6596,7 +6596,9 @@ impl Compiler<'_> {
                 // handler has restored the exception state. Give each collector its
                 // own unwind start instead of ending both at POP_EXCEPT. An ordinary
                 // try entered before every discarded iterator also retains its owner
-                // until those iterators have been removed.
+                // until those iterators have been removed. A chain of enclosing finalizers
+                // uses the innermost saved depth; each outer collector then retires
+                // separately when its own copied finalizer begins.
                 let tracks_handler_finally_iterator_unwinds = self
                     .control
                     .withs
@@ -6619,8 +6621,9 @@ impl Compiler<'_> {
                             self.control.exceptions.active_exception_handlers.as_slice(),
                             self.control.finally.active_return_finally_contexts.as_slice(),
                         ),
-                        ([handler], [finally])
-                            if finally.handler_depth == 0
+                        ([handler], [.., finally])
+                            if self.control.finally.active_return_finally_contexts.iter()
+                                .all(|context| context.handler_depth == 0)
                                 && handler.loop_depth == self.control.loops.contexts.len()
                                 && finally.loop_depth < handler.loop_depth
                                 && (handler.exception_region_depth
@@ -6645,11 +6648,16 @@ impl Compiler<'_> {
                     );
                 let tracks_handler_outer_try_iterator_unwinds =
                     tracks_handler_finally_iterator_unwinds
-                        && self.control.exceptions.active_exception_handlers[0]
-                            .exception_region_depth
-                            == self.control.finally.active_return_finally_contexts[0]
-                                .exception_region_depth
-                                + 2;
+                        && self
+                            .control
+                            .finally
+                            .active_return_finally_contexts
+                            .last()
+                            .is_some_and(|finally| {
+                                self.control.exceptions.active_exception_handlers[0]
+                                    .exception_region_depth
+                                    == finally.exception_region_depth + 2
+                            });
                 // A named handler inside a synchronous iterator can return through
                 // an outer ordinary try and finally. Preserve both handler POPs
                 // before iterator disposal, then that ordinary try's separate POP.

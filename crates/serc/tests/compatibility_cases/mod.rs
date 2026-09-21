@@ -202,6 +202,7 @@ mod negated_signed_constants;
 mod nested_boolean_continuation_locations;
 mod nested_finally_entry_markers;
 mod nested_finally_exit_copies;
+mod nested_finally_iterator_return_owners;
 mod nested_generator_dispatch_owners;
 mod nested_handler_loop_transfers;
 mod nested_handler_return_swap_owner_compatibility;
@@ -393,8 +394,8 @@ mod try_entry_import_owner;
 
 mod async_generator_builtin_calls;
 
-mod direct_manager_try_exit_borrows;
 mod direct_handler_break_owners;
+mod direct_manager_try_exit_borrows;
 
 mod generator_expression_first_constant;
 
@@ -698,8 +699,8 @@ mod named_elif_cleanup_locations;
 
 mod class_and_percent_constant_origins;
 mod class_annotation_captures;
-mod shared_handler_cleanup_join_locations;
 mod shared_exit_target_owners;
+mod shared_handler_cleanup_join_locations;
 
 mod finally_boolean_discard_locations;
 mod nested_or_sequence_pop_locations;
