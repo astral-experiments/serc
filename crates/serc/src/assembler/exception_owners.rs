@@ -5950,7 +5950,11 @@ impl LayoutAssembler {
                         && owner_history_exact)
                         .then_some(source_owned_prefix.or(retained_setup_prefix))
                         .flatten()
-                        .map(|(start, start_tail)| (start, instruction_index, start_tail, tail));
+                        .map(|(start, start_tail)| (start, instruction_index, start_tail, tail))
+                        // This exact POP/SETUP pair also retains the earlier cleanup's
+                        // donor span. The SETUP cell itself remains unowned and lies
+                        // outside that span; its exclusion does not erase history.
+                        .or(transferred_pop_setup.and(ended_owned_prefix));
                     // A NOP can stand for a folded source branch whose original join
                     // starts a different instruction array. Without its source identity,
                     // earlier slot counts cannot locate a later POP_BLOCK exactly.
