@@ -975,28 +975,23 @@ def render(sources: dict[str, str]) -> str:
         lookup[0] = "fn is_preinterned_static_string(value: &str) -> bool {"
         lines.extend(lookup)
     if TARGET_MINOR == "3.14":
-        lines.extend(["", "#[allow(dead_code)]", "impl Opcode {"])
-        for method, flag in (
-            ("has_argument", "HAS_ARG_FLAG"),
-            ("has_constant", "HAS_CONST_FLAG"),
-            ("has_name", "HAS_NAME_FLAG"),
-            ("has_jump", "HAS_JUMP_FLAG"),
-            ("has_free", "HAS_FREE_FLAG"),
-            ("has_local", "HAS_LOCAL_FLAG"),
-        ):
-            names = {name for name in opcode_names if flag in opcode_flags[name]}
-            expression = opcode_match_expression(opcodes, names).replace(
-                "opcode", "self", 1
-            )
-            lines.extend(
-                [
-                    f"    pub(crate) const fn {method}(self) -> bool {{",
-                    f"        {expression}",
-                    "    }",
-                    "",
-                ]
-            )
-        lines.extend(["}", ""])
+        jump_opcodes = {
+            name for name in opcode_names if "HAS_JUMP_FLAG" in opcode_flags[name]
+        }
+        expression = opcode_match_expression(opcodes, jump_opcodes).replace(
+            "opcode", "self", 1
+        )
+        lines.extend(
+            [
+                "",
+                "impl Opcode {",
+                "    pub(crate) const fn has_jump(self) -> bool {",
+                f"        {expression}",
+                "    }",
+                "}",
+                "",
+            ]
+        )
     for name, names in predicates.items():
         lines.extend(
             [
