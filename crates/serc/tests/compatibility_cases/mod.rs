@@ -702,7 +702,6 @@ mod nested_or_sequence_pop_locations;
 mod with_folded_constant_owner;
 
 mod with_pass_finally_owner;
-
 mod numeric_remainder_folding;
 mod signed_integer_folding;
 mod type_parameter_scope_boundaries;
@@ -710,5 +709,5 @@ mod tuple_store_join_locations;
 mod fractional_power_folding;
 mod literal_statement_spans;
 mod late_constant_boolean_folding;
-
 mod try_finally_return_exit_locations;
+mod terminal_try_else_donor_locations;

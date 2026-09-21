@@ -19271,16 +19271,16 @@ impl Compiler<'_> {
                 && let Some(location) = body_noop_location
             {
                 self.assembler.set_location(location);
-            } else if statement.orelse.is_empty()
-                && let Some(range) = suite_assert_success_fallthrough_range(&statement.body)
+            } else if (statement.orelse.is_empty()
+                || matches!(statement.orelse.last(), Some(Stmt::Assert(assertion))
+                    if assertion_has_only_runtime_tests(&assertion.test)))
+                && let Some(range) = suite_assert_success_fallthrough_range(normal_exit_suite)
             {
                 self.assembler.set_location(self.source_location(range));
-            } else if (statement.orelse.is_empty()
-                || self.context.python_version <= crate::PythonVersion::Py313)
-                && terminal_for_break_exit_inherits_predecessor(normal_exit_suite)
-            {
-                // A legacy try-else footer is copied onto breaks from that else
-                // suite too; each copy inherits its own authored break span.
+            } else if terminal_for_break_exit_inherits_predecessor(normal_exit_suite) {
+                // The try's terminal footer is shared by loop exhaustion and break
+                // edges, including loops in its else suite. Copies inherit each
+                // predecessor's own authored location.
                 self.assembler.set_location(SourceLocation::NONE);
             } else if statement.orelse.is_empty()
                 && let Some(Stmt::While(loop_statement)) = statement.body.last()
