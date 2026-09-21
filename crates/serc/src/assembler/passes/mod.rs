@@ -621,10 +621,10 @@ impl OptimizationPipeline {
         self.prepare_conditional_normal_try_joins();
         original_owners.retain_pipeline(&self);
         let original_location_absence = self.capture_original_location_absence();
-        let synthesized_fallthrough_locations = if self.has_synthesized_percent_target_locations {
+        let synthesized_predecessor_locations = if self.has_synthesized_percent_target_locations {
             self.resolve_synthesized_percent_locations();
             original_owners.retain_pipeline(&self);
-            let locations = self.defer_synthesized_fallthrough_locations();
+            let locations = self.defer_synthesized_predecessor_locations();
             original_owners.retain_pipeline(&self);
             locations
         } else {
@@ -1119,10 +1119,10 @@ impl OptimizationPipeline {
             None,
             AssemblerStage::OptimizeLoadFast,
         )?;
-        Self::resolve_deferred_fallthrough_locations(
+        Self::resolve_deferred_percent_locations(
             &mut items,
             self.has_synthesized_percent_target_locations,
-            &synthesized_fallthrough_locations,
+            &synthesized_predecessor_locations,
         );
         if !self.deferred_shared_jump_blocks.is_empty() {
             let mut shared_jump = false;

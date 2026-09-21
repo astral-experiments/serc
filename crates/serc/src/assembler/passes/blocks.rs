@@ -2046,12 +2046,12 @@ impl OptimizationPipeline {
         }
     }
 
-    /// Defers synthesized percent literals that begin a sole fallthrough target.
+    /// Defers synthesized percent literals that begin a sole predecessor's target.
     ///
-    /// CPython's early line-number propagation gives the target's leading unlocated
-    /// instruction the last located instruction from its only predecessor. Handler and
-    /// try-else body labels create this shape before later CFG optimization.
-    pub(in crate::assembler) fn defer_synthesized_fallthrough_locations(
+    /// CPython's early line-number propagation follows both fallthrough and jump edges.
+    /// Retain the last located instruction from the sole predecessor before optimization
+    /// removes the jump or places an exception handler between the two blocks.
+    pub(in crate::assembler) fn defer_synthesized_predecessor_locations(
         &mut self,
     ) -> Vec<SourceLocation> {
         if !self.has_synthesized_percent_target_locations {
@@ -2077,17 +2077,14 @@ impl OptimizationPipeline {
         }
 
         let mut locations = Vec::new();
-        for blocks in order.windows(2) {
-            let [source, target] = blocks else {
-                unreachable!();
-            };
-            if predecessors[target.index()] != 1
-                || !block_has_fallthrough(self.graph[*source].items())
-            {
-                continue;
-            }
+        for (position, source) in order.iter().copied().enumerate() {
+            let fallthrough = block_has_fallthrough(self.graph[source].items())
+                .then(|| order.get(position + 1).copied())
+                .flatten();
+            let jump_target = block_jump_target(self.graph[source].items())
+                .and_then(|label| self.graph.label_block(label));
             let Some(location) =
-                self.graph[*source]
+                self.graph[source]
                     .items()
                     .iter()
                     .rev()
@@ -2100,31 +2097,36 @@ impl OptimizationPipeline {
             else {
                 continue;
             };
-            let Some(first) = self.graph.instructions_mut(*target).next() else {
-                continue;
-            };
-            if first.location.line >= 0
-                || first.no_location_policy.percent_target_location != u8::MAX
-            {
-                continue;
+            for target in fallthrough.into_iter().chain(jump_target) {
+                if predecessors[target.index()] != 1 {
+                    continue;
+                }
+                let Some(first) = self.graph.instructions_mut(target).next() else {
+                    continue;
+                };
+                if first.location.line >= 0
+                    || first.no_location_policy.percent_target_location != u8::MAX
+                {
+                    continue;
+                }
+                let Ok(id) = u8::try_from(locations.len() + 1) else {
+                    continue;
+                };
+                // Keep the all-ones value as the unresolved marker. If a single code object
+                // contains more candidates than the compact side table can represent, leaving
+                // the remainder unlocated preserves the compiler's existing behavior.
+                if id == u8::MAX {
+                    continue;
+                }
+                locations.push(location);
+                first.no_location_policy.percent_target_location = id;
             }
-            let Ok(id) = u8::try_from(locations.len() + 1) else {
-                continue;
-            };
-            // Keep the all-ones value as the unresolved marker. If a single code object
-            // contains more candidates than the compact side table can represent, leaving
-            // the remainder unlocated preserves the compiler's existing behavior.
-            if id == u8::MAX {
-                continue;
-            }
-            locations.push(location);
-            first.no_location_policy.percent_target_location = id;
         }
         locations
     }
 
     /// Applies locations selected before CFG optimization without affecting opcode transforms.
-    pub(in crate::assembler) fn resolve_deferred_fallthrough_locations(
+    pub(in crate::assembler) fn resolve_deferred_percent_locations(
         items: &mut [Item],
         has_synthesized_percent_target_locations: bool,
         locations: &[SourceLocation],
