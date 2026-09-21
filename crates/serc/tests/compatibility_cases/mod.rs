@@ -37,6 +37,7 @@ mod conditional_generator_join_nops;
 mod conditional_handler_cleanup_compatibility;
 mod conditional_handler_cleanup_order;
 mod conditional_handler_none_admission;
+mod conditional_handler_return_borrow;
 mod conditional_jump_join_locations;
 mod conditional_nested_recovery_else_borrow;
 mod conditional_recovery_suffix_long_continuation;

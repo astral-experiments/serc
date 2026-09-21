@@ -25114,6 +25114,21 @@ impl Compiler<'_> {
                                     && conditional.elif_else_clauses.is_empty()
                                     && ((!expression_contains_inline_branch(&conditional.test)
                                         && matches!(conditional.body.as_slice(), [Stmt::Raise(_)]))
+                                        // The false successor still performs the linear recovery
+                                        // and POP_EXCEPT before entering normal finally cleanup.
+                                        // Copying cleanup into the bare-return arm does not empty it.
+                                        || (synchronous_recovery
+                                            && !expression_contains_inline_branch(&conditional.test)
+                                            && !trailing.is_empty()
+                                            && conditional.body.split_last().is_some_and(|(last, leading)| {
+                                                matches!(last, Stmt::Return(return_) if return_.value.is_none())
+                                                    && leading.iter().all(|statement| {
+                                                        suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                                                            || matches!(statement, Stmt::Assert(assertion)
+                                                                if condition_has_linear_runtime_leaves(&assertion.test)
+                                                                    && assertion.msg.is_none())
+                                                    })
+                                            }))
                                         || ((!trailing.is_empty()
                                             || !expression_contains_inline_branch(&conditional.test))
                                             && !self.control.loops.contexts.is_empty()
