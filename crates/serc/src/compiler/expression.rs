@@ -755,12 +755,11 @@ impl Compiler<'_> {
                 if !emitted_case_exit && !suite_terminates(&case.body) && !emitted_fallthrough {
                     // The final nested pattern's failure reaches this outer case exit;
                     // successful inner cases have already copied or bypassed that exit.
-                    let nested_pattern_failure =
-                        matches!(case.body.last(), Some(Stmt::Match(nested))
-                        if nested.cases.last().is_some_and(|case| {
-                            case.guard.is_none()
-                                && matches!(case.pattern, Pattern::MatchValue(_))
-                        }));
+                    let nested_pattern_failure = matches!(case.body.last(), Some(Stmt::Match(nested))
+                    if nested.cases.last().is_some_and(|case| {
+                        case.guard.is_none()
+                            && matches!(case.pattern, Pattern::MatchValue(_))
+                    }));
                     if !terminal
                         && index + 1 == matched_cases
                         && !has_default

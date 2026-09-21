@@ -117,7 +117,10 @@ fn matches_cpython_nested_match_exits_before_live_continuations() {
 #[test]
 fn matches_cpython_final_nested_match_failure_before_return() {
     for function in ["def", "async def"] {
-        for body in ["value = inner", "if value:\n                        return inner"] {
+        for body in [
+            "value = inner",
+            "if value:\n                        return inner",
+        ] {
             for return_value in ["value", "(value, outer)"] {
                 let source = format!(
                     "{function} f(outer, inner, value):\n    match outer:\n        case 0:\n            return 0\n        case 1:\n            match inner:\n                case 0:\n                    return 1\n                case 1:\n                    {body}\n    return {return_value}\n"
