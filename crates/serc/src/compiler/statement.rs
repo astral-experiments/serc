@@ -26,9 +26,9 @@ use crate::target::operands::{
 };
 
 use super::constant::{
-    FirstConstant, constant_truthiness, first_expression_constant, first_literal_constant,
-    first_suite_constant, first_suite_literal_constant, fold_constant, folded_bool_operand,
-    folded_constant_owner_slots, is_literal_constant, literal_constant, optimized_percent_format,
+    FirstConstant, first_expression_constant, first_literal_constant, first_suite_constant,
+    first_suite_literal_constant, fold_constant, folded_bool_operand, folded_constant_owner_slots,
+    is_literal_constant, literal_constant, optimized_percent_format,
     two_element_slice_optimization,
 };
 use super::expression::{
@@ -2951,17 +2951,16 @@ impl Compiler<'_> {
                 compiler.compile_jump_if(&statement.test, false, condition_false)
             })?;
         }
-        let body_entry = if fold_constant(&statement.test)
-            .is_some_and(|constant| constant_truthiness(&constant))
-        {
-            // The folded test and authored body retain separate original instruction arrays.
-            let body = self.assembler.label();
-            self.assembler.record_exception_owner_block_boundary(body);
-            self.assembler.mark(body);
-            Some(body)
-        } else {
-            None
-        };
+        let body_entry =
+            if fold_constant(&statement.test).is_some_and(|constant| constant.is_truthy()) {
+                // The folded test and authored body retain separate original instruction arrays.
+                let body = self.assembler.label();
+                self.assembler.record_exception_owner_block_boundary(body);
+                self.assembler.mark(body);
+                Some(body)
+            } else {
+                None
+            };
         if self.output.constants.is_empty()
             && let Some(FirstConstant::Literal(constant)) =
                 first_suite_constant(self, &statement.body)
@@ -16575,7 +16574,7 @@ impl Compiler<'_> {
                     .retain_last_not_taken_structural_exception_owner();
             }
         }
-        if fold_constant(&statement.test).is_some_and(|constant| constant_truthiness(&constant)) {
+        if fold_constant(&statement.test).is_some_and(|constant| constant.is_truthy()) {
             // The authored body starts a separate original array after the constant test.
             let body = self.assembler.label();
             self.assembler.record_exception_owner_block_boundary(body);

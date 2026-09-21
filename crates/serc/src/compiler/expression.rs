@@ -8180,7 +8180,7 @@ impl Compiler<'_> {
         let constant_truthiness = if legacy_constant {
             self.source_aware_fold_constant(expression)
                 .as_ref()
-                .map(super::constant::constant_truthiness)
+                .map(Constant::is_truthy)
         } else {
             jump_constant_truthiness(expression)
         };
