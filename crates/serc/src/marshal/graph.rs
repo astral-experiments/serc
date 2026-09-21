@@ -4,7 +4,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::code_object::{CodeInterningSummary, CodeObject, CompilationInterningEvent, Constant};
 use crate::target::{is_preinterned_string_for, small_int_bounds_for};
-use crate::{InitialInternState, PythonVersion};
+use crate::{CompileError, InitialInternState, PythonVersion};
 
 use super::key::{
     FrozenSetMembers, HashedObjectKey, ObjectKey, code_bytes_key, code_key, constant_key,
@@ -227,7 +227,8 @@ impl<'a> ObjectGraph<'a> {
             python_version,
             initial_intern_state,
             &mut recreated_frozensets,
-        );
+        )
+        .expect("compiled module must have resolved byte-relevant intern state");
         let explicitly_interned = (!explicitly_interned.is_empty()).then_some(&explicitly_interned);
         let recreated_frozensets =
             (!recreated_frozensets.is_empty()).then_some(&recreated_frozensets);
@@ -952,25 +953,85 @@ enum FrozensetRecreationNeed {
     IdentifierDependent,
 }
 
+#[derive(Clone, Copy)]
+enum Replacement<'code> {
+    Never,
+    Always,
+    Unknown(&'code str),
+}
+
+impl Replacement<'_> {
+    fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Always, _) | (_, Self::Always) => Self::Always,
+            (Self::Never, value) | (value, Self::Never) => value,
+            (Self::Unknown(left), Self::Unknown(right)) => Self::Unknown(left.min(right)),
+        }
+    }
+}
+
+struct PartialInternDependencies<'code> {
+    strings: FxHashSet<&'code str>,
+    sensitive_frozensets: FxHashSet<usize>,
+}
+
 /// Compilation-local additions layered over the immutable initial state. Keeping
 /// these separate avoids copying a complete bootstrap profile for every module.
 struct InternedStrings<'code, 'state> {
     initial: &'state InitialInternState,
     python_version: PythonVersion,
     added: FxHashSet<&'code str>,
+    possibly_added: FxHashSet<&'code str>,
+    partial: Option<PartialInternDependencies<'code>>,
+    uncertain_origins: FxHashSet<&'code str>,
+    unresolved_frozenset: Option<&'code str>,
 }
 
 impl<'code, 'state> InternedStrings<'code, 'state> {
-    fn new(initial: &'state InitialInternState, python_version: PythonVersion) -> Self {
+    fn new(
+        initial: &'state InitialInternState,
+        python_version: PythonVersion,
+        partial: Option<PartialInternDependencies<'code>>,
+    ) -> Self {
         Self {
             initial,
             python_version,
             added: FxHashSet::default(),
+            possibly_added: FxHashSet::default(),
+            partial,
+            uncertain_origins: FxHashSet::default(),
+            unresolved_frozenset: None,
         }
     }
 
-    fn contains(&self, value: &str) -> bool {
-        self.initial.contains_for(self.python_version, value) || self.added.contains(value)
+    fn contains(&self, value: &str) -> Option<bool> {
+        if self.added.contains(value) {
+            Some(true)
+        } else {
+            match self.initial.membership_for(self.python_version, value) {
+                Some(false) if self.possibly_added.contains(value) => None,
+                membership => membership,
+            }
+        }
+    }
+
+    fn tracks_origin(&self, value: &str) -> bool {
+        self.partial
+            .as_ref()
+            .is_none_or(|partial| partial.strings.contains(value))
+    }
+
+    fn record_unresolved_frozenset(&mut self, constant: &Constant, value: &'code str) {
+        if self.partial.as_ref().is_some_and(|partial| {
+            partial
+                .sensitive_frozensets
+                .contains(&std::ptr::from_ref(constant).addr())
+        }) {
+            self.unresolved_frozenset = Some(
+                self.unresolved_frozenset
+                    .map_or(value, |previous| previous.min(value)),
+            );
+        }
     }
 
     fn insert(&mut self, value: &'code str) {
@@ -982,22 +1043,235 @@ impl<'code, 'state> InternedStrings<'code, 'state> {
     }
 }
 
+/// Reject unresolved canonical origins before exposing an infallibly serializable module.
+pub(crate) fn validate_initial_intern_state(
+    code: &CodeObject,
+    python_version: PythonVersion,
+    initial_intern_state: &InitialInternState,
+) -> Result<(), CompileError> {
+    if !initial_intern_state.has_unknown_entries() {
+        return Ok(());
+    }
+    collect_recreated_frozensets(
+        code,
+        frozenset_recreation_need(code, python_version),
+        python_version,
+        initial_intern_state,
+        &mut FxHashSet::default(),
+    )
+}
+
+/// Initial canonical identity matters for direct frozen-set string members unless
+/// reconstruction preserves a container with one physical owner slot. Dependencies
+/// remain global: an earlier independent set can affect a later set's origins.
+fn frozenset_intern_dependencies(
+    code: &CodeObject,
+    python_version: PythonVersion,
+) -> PartialInternDependencies<'_> {
+    #[derive(PartialEq, Eq)]
+    enum OwnerSlot<'a> {
+        Tuple(HashedObjectKey<'a>, usize),
+        Occurrence(usize),
+    }
+
+    struct Owners<'a> {
+        first: OwnerSlot<'a>,
+        multiple: bool,
+        inside_frozenset: bool,
+    }
+
+    fn safe_tuple_member(constant: &Constant) -> bool {
+        match constant {
+            Constant::None
+            | Constant::Bool(_)
+            | Constant::Ellipsis
+            | Constant::Int(_)
+            | Constant::SignedInt(_)
+            | Constant::BigInt { .. }
+            | Constant::String(_)
+            | Constant::SurrogateString(_)
+            | Constant::Bytes(_) => true,
+            Constant::Tuple(members) | Constant::FrozenSet(members) => {
+                members.iter().all(safe_tuple_member)
+            }
+            Constant::Float(_)
+            | Constant::Complex { .. }
+            | Constant::Slice { .. }
+            | Constant::Code(_) => false,
+        }
+    }
+
+    fn count_tuple<'a>(
+        constants: &'a [Constant],
+        inside_frozenset: bool,
+        share_tuple_slots: bool,
+        owners: &mut FxHashMap<HashedObjectKey<'a>, Owners<'a>>,
+    ) {
+        // Ordinary tuples and co_consts use the same compiler cache. Restrict
+        // value-based owner merging to keys without code equality, slices, or
+        // floating-point ambiguities, including anywhere in the parent value.
+        let key: Option<HashedObjectKey<'a>> = (share_tuple_slots
+            && constants.iter().all(safe_tuple_member))
+        .then(|| constants_tuple_key(constants).into());
+        for (index, constant) in constants.iter().enumerate() {
+            let owner = key.as_ref().map_or_else(
+                || OwnerSlot::Occurrence(std::ptr::from_ref(constant).addr()),
+                |key| OwnerSlot::Tuple(key.clone(), index),
+            );
+            count(constant, owner, inside_frozenset, share_tuple_slots, owners);
+        }
+    }
+
+    fn count<'a>(
+        constant: &'a Constant,
+        owner: OwnerSlot<'a>,
+        inside_frozenset: bool,
+        share_tuple_slots: bool,
+        owners: &mut FxHashMap<HashedObjectKey<'a>, Owners<'a>>,
+    ) {
+        match constant {
+            Constant::FrozenSet(members) => {
+                match owners.entry(constant_key(constant).into()) {
+                    Entry::Occupied(mut entry) => {
+                        let prior = entry.get_mut();
+                        prior.multiple |= prior.first != owner;
+                        prior.inside_frozenset |= inside_frozenset;
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(Owners {
+                            first: owner,
+                            multiple: false,
+                            inside_frozenset,
+                        });
+                    }
+                }
+                for member in members {
+                    count(
+                        member,
+                        OwnerSlot::Occurrence(std::ptr::from_ref(member).addr()),
+                        true,
+                        share_tuple_slots,
+                        owners,
+                    );
+                }
+            }
+            Constant::Tuple(constants) => {
+                count_tuple(constants, inside_frozenset, share_tuple_slots, owners);
+            }
+            Constant::Code(code) => {
+                count_tuple(&code.constants, inside_frozenset, share_tuple_slots, owners);
+            }
+            Constant::Slice { lower, upper, step } => {
+                // Slice children do not participate in recursive tuple merging.
+                for member in [lower.as_ref(), upper.as_ref(), step.as_ref()] {
+                    count(
+                        member,
+                        OwnerSlot::Occurrence(std::ptr::from_ref(member).addr()),
+                        inside_frozenset,
+                        false,
+                        owners,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect<'a>(
+        constant: &'a Constant,
+        owners: &FxHashMap<HashedObjectKey<'a>, Owners<'a>>,
+        dependencies: &mut PartialInternDependencies<'a>,
+    ) {
+        match constant {
+            Constant::FrozenSet(members) => {
+                // One physical tuple slot can appear through many equal raw
+                // parents. Replacing its set preserves an unshared identity.
+                // Unsafe parents still admit the original raw-singleton proof.
+                // Exclude all frozen ancestors and floating scalar members whose
+                // NaN-like sort-key ties could make reconstruction order matter.
+                let independent = owners
+                    .get(&constant_key(constant).into())
+                    .is_some_and(|owners| !owners.multiple && !owners.inside_frozenset)
+                    && members.iter().all(|member| {
+                        matches!(
+                            member,
+                            Constant::None
+                                | Constant::Bool(_)
+                                | Constant::Ellipsis
+                                | Constant::Int(_)
+                                | Constant::SignedInt(_)
+                                | Constant::BigInt { .. }
+                                | Constant::String(_)
+                                | Constant::SurrogateString(_)
+                                | Constant::Bytes(_)
+                        )
+                    });
+                if !independent {
+                    dependencies
+                        .sensitive_frozensets
+                        .insert(std::ptr::from_ref(constant).addr());
+                }
+                for member in members {
+                    if !independent
+                        && let Constant::String(value) = member
+                        && should_intern(value)
+                        && !value.is_empty()
+                        && !is_cached_character(value)
+                    {
+                        dependencies.strings.insert(value);
+                    }
+                    collect(member, owners, dependencies);
+                }
+            }
+            Constant::Tuple(constants) => {
+                for constant in constants {
+                    collect(constant, owners, dependencies);
+                }
+            }
+            Constant::Code(code) => {
+                for constant in &code.constants {
+                    collect(constant, owners, dependencies);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut owners = FxHashMap::default();
+    // The tuple-cache and in-place slot mutation proof is pinned to Python 3.13.
+    count_tuple(
+        &code.constants,
+        false,
+        python_version == PythonVersion::Py313,
+        &mut owners,
+    );
+    let mut dependencies = PartialInternDependencies {
+        strings: FxHashSet::default(),
+        sensitive_frozensets: FxHashSet::default(),
+    };
+    for constant in &code.constants {
+        collect(constant, &owners, &mut dependencies);
+    }
+    dependencies
+}
+
 fn collect_recreated_frozensets(
     code: &CodeObject,
     need: FrozensetRecreationNeed,
     python_version: PythonVersion,
     initial_intern_state: &InitialInternState,
     values: &mut FxHashSet<usize>,
-) {
+) -> Result<(), CompileError> {
     // A complete state may omit built-in entries whose later identifier interning
     // still matters. Keep the existing shortcuts for supplemental states.
-    let need = if initial_intern_state.is_complete() && need != FrozensetRecreationNeed::None {
-        FrozensetRecreationNeed::IdentifierDependent
-    } else {
-        need
-    };
+    let need =
+        if !initial_intern_state.uses_startup_state() && need != FrozensetRecreationNeed::None {
+            FrozensetRecreationNeed::IdentifierDependent
+        } else {
+            need
+        };
     match need {
-        FrozensetRecreationNeed::None => return,
+        FrozensetRecreationNeed::None => return Ok(()),
         FrozensetRecreationNeed::PreinternedOnly
             if code.marshal_provenance.interning_events.is_empty()
                 && !has_explicit_interns(code)
@@ -1012,14 +1286,14 @@ fn collect_recreated_frozensets(
                 initial_intern_state,
                 values,
             );
-            return;
+            return Ok(());
         }
         FrozensetRecreationNeed::PreinternedOnly | FrozensetRecreationNeed::IdentifierDependent => {
         }
     }
 
     if need == FrozensetRecreationNeed::IdentifierDependent
-        && !initial_intern_state.is_complete()
+        && initial_intern_state.uses_startup_state()
         && code.marshal_provenance.interning_events.is_empty()
         && !has_identifier_or_explicit_dependent_frozenset(code, python_version)
         && code
@@ -1033,10 +1307,13 @@ fn collect_recreated_frozensets(
             initial_intern_state,
             values,
         );
-        return;
+        return Ok(());
     }
 
-    let mut interned_strings = InternedStrings::new(initial_intern_state, python_version);
+    let partial = initial_intern_state
+        .has_unknown_entries()
+        .then(|| frozenset_intern_dependencies(code, python_version));
+    let mut interned_strings = InternedStrings::new(initial_intern_state, python_version, partial);
     let mut interned_constant_strings = code
         .marshal_provenance
         .canonical_constant_strings
@@ -1065,6 +1342,13 @@ fn collect_recreated_frozensets(
             &mut interned_strings,
             &mut interned_constant_strings,
         );
+    }
+    if let Some(value) = interned_strings.unresolved_frozenset {
+        Err(CompileError::UnresolvedInternState {
+            value: value.to_string(),
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -1497,6 +1781,30 @@ fn intern_explicit_constants<'a>(
     interned_strings: &mut InternedStrings<'a, '_>,
     interned_constant_strings: &mut FxHashSet<&'a str>,
 ) {
+    if interned_strings.initial.has_unknown_entries() {
+        let mut values: Vec<_> = explicitly_interned.iter().collect();
+        values.sort_unstable();
+        for value in values {
+            if tracked_string_origins.contains(value) {
+                interned_strings.insert(value);
+            } else if interned_strings.tracks_origin(value)
+                && should_intern(value)
+                && !value.is_empty()
+                && !is_cached_character(value)
+                && !interned_constant_strings.contains(value.as_str())
+                && interned_strings.contains(value) != Some(true)
+            {
+                // This aggregate hook does not prove when a generated name was
+                // interned or which object it used. Initial absence cannot prove
+                // compiler ownership before the real metadata/constant phases.
+                interned_strings.uncertain_origins.insert(value);
+                interned_strings.possibly_added.insert(value);
+            } else {
+                intern_constant_string(value, interned_strings, interned_constant_strings);
+            }
+        }
+        return;
+    }
     #[expect(
         clippy::iter_over_hash_type,
         reason = "These sets are only queried for membership after all explicit constants are interned."
@@ -1595,10 +1903,18 @@ fn intern_code_summary<'a>(
         interned_strings,
         interned_constant_strings,
     );
+    // Discarded code may release these mortal owners. In partial states, this
+    // invalidates initial absence without establishing retained presence.
     if interned_strings.python_version >= PythonVersion::Py313 {
-        interned_strings.insert(&summary.filename);
-        interned_strings.insert(&summary.name);
-        interned_strings.insert(&summary.qualified_name);
+        for value in [&summary.filename, &summary.name, &summary.qualified_name] {
+            if interned_strings.initial.has_unknown_entries() {
+                if interned_strings.tracks_origin(value) {
+                    interned_strings.possibly_added.insert(value);
+                }
+            } else {
+                interned_strings.insert(value);
+            }
+        }
     }
 }
 
@@ -1608,23 +1924,29 @@ fn intern_code_constant<'a>(
     recreated_frozensets: &mut FxHashSet<usize>,
     interned_strings: &mut InternedStrings<'a, '_>,
     interned_constant_strings: &mut FxHashSet<&'a str>,
-) -> bool {
+) -> Replacement<'a> {
     match constant {
         Constant::String(value) => {
             intern_constant_string(value, interned_strings, interned_constant_strings)
         }
         Constant::FrozenSet(members) => {
-            let mut recreated = false;
+            let mut recreated = Replacement::Never;
             for member in members {
-                recreated |= intern_code_constant(
+                recreated = recreated.or(intern_code_constant(
                     member,
                     recreated_frozensets,
                     interned_strings,
                     interned_constant_strings,
-                );
+                ));
             }
-            if recreated {
-                recreated_frozensets.insert(std::ptr::from_ref(constant).addr());
+            match recreated {
+                Replacement::Always => {
+                    recreated_frozensets.insert(std::ptr::from_ref(constant).addr());
+                }
+                Replacement::Unknown(value) => {
+                    interned_strings.record_unresolved_frozenset(constant, value);
+                }
+                Replacement::Never => {}
             }
             recreated
         }
@@ -1638,7 +1960,7 @@ fn intern_code_constant<'a>(
                 );
             }
             // Tuples are updated in place, so replacing an item does not replace the tuple.
-            false
+            Replacement::Never
         }
         Constant::Code(_)
         | Constant::None
@@ -1651,7 +1973,7 @@ fn intern_code_constant<'a>(
         | Constant::Complex { .. }
         | Constant::SurrogateString(_)
         | Constant::Bytes(_)
-        | Constant::Slice { .. } => false,
+        | Constant::Slice { .. } => Replacement::Never,
     }
 }
 
@@ -1659,25 +1981,41 @@ fn intern_constant_string<'a>(
     value: &'a str,
     interned_strings: &mut InternedStrings<'a, '_>,
     interned_constant_strings: &mut FxHashSet<&'a str>,
-) -> bool {
+) -> Replacement<'a> {
     if value.is_empty() || is_cached_character(value) {
         interned_strings.insert(value);
         interned_constant_strings.insert(value);
-        return false;
+        return Replacement::Never;
     }
-    if !should_intern(value) || interned_constant_strings.contains(value) {
-        return false;
+    if !should_intern(value)
+        || interned_constant_strings.contains(value)
+        || !interned_strings.tracks_origin(value)
+    {
+        return Replacement::Never;
     }
 
-    let replaced = interned_strings.contains(value);
+    // Membership can become known without resolving whether the compiler's
+    // original constant was canonical. Keep that uncertainty across every later
+    // interning event, including metadata and discarded-code transitions.
+    let replaced = if interned_strings.uncertain_origins.contains(value) {
+        Replacement::Unknown(value)
+    } else {
+        match interned_strings.contains(value) {
+            Some(true) => Replacement::Always,
+            Some(false) => {
+                interned_constant_strings.insert(value);
+                Replacement::Never
+            }
+            None => {
+                interned_strings.uncertain_origins.insert(value);
+                Replacement::Unknown(value)
+            }
+        }
+    };
     interned_strings.insert(value);
-    if !replaced {
-        // With no earlier canonical string, CPython interns the compiler constant-cache object
-        // itself. Later equal constants therefore already have the canonical identity.
-        interned_constant_strings.insert(value);
-    }
     replaced
 }
+
 struct GraphVisitor<'graph, 'code> {
     graph: &'graph mut ObjectGraph<'code>,
     explicitly_interned: Option<&'graph FxHashSet<&'code str>>,

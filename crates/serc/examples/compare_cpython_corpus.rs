@@ -389,22 +389,16 @@ fn main() -> ExitCode {
             .par_iter()
             .enumerate()
             .map(|(index, path)| {
-                let file_options = caller_model.as_ref().map(|model| {
-                    model.options_for(
-                        path.to_str().expect("caller filename checked"),
-                        &compile_options,
-                    )
-                });
-                let compile_options = file_options.as_ref().unwrap_or(&compile_options);
                 if let Some(reader) = &reader {
-                    return reader.compare(index, path, compile_options);
+                    return reader.compare(index, path, &compile_options, caller_model.as_ref());
                 }
                 let mut observation = cache.as_ref().map(|writer| writer.begin(index, path));
                 let outcome = compare(
                     path,
                     &options.python,
                     options.source_bytes,
-                    compile_options,
+                    &compile_options,
+                    caller_model.as_ref(),
                     observation.as_mut(),
                 );
                 if let Some(observation) = observation {
@@ -711,9 +705,7 @@ fn dump_mismatches(
                 CompilerInput::Text(fs_err::read_to_string(&outcome.path)?)
             };
             let filename = outcome.path.to_string_lossy();
-            let file_options = caller_model.map(|model| model.options_for(&filename, options));
-            let options = file_options.as_ref().unwrap_or(options);
-            let ours = compile_module_input(&source, &filename, options)
+            let ours = compile_module_input(&source, &filename, options, caller_model)
                 .expect("a mismatch compiled successfully in the first pass")
                 .marshal();
             let oracle = Command::new(python)
@@ -760,6 +752,7 @@ fn compare(
     python: &str,
     source_bytes: bool,
     options: &CompileOptions,
+    caller_model: Option<&caller_intern_model::LoadedModel>,
     mut observation: Option<&mut native_output_cache::Observation<'_>>,
 ) -> Outcome {
     let output = Command::new(python)
@@ -823,7 +816,7 @@ fn compare(
     };
 
     let filename = path.to_string_lossy();
-    let compiled = compile_input(&source, &filename, options);
+    let compiled = compile_input(&source, &filename, options, caller_model);
     if let Some(observation) = observation {
         observation.compiled(&source, &compiled);
     }
@@ -835,7 +828,22 @@ fn compile_module_input(
     source: &CompilerInput,
     filename: &str,
     options: &CompileOptions,
+    caller_model: Option<&caller_intern_model::LoadedModel>,
 ) -> Result<CompiledModule, CompileError> {
+    // Derive the per-input mask from the same in-memory bytes that the cache
+    // reader hashes and this invocation compiles. Never reread for the model.
+    let file_options = match (caller_model, source) {
+        (Some(model), CompilerInput::Bytes(bytes)) => {
+            Some(model.options_for(filename, bytes, options))
+        }
+        (Some(_), CompilerInput::Text(_)) => {
+            return Err(CompileError::Internal(
+                "caller model requires source-bytes input".to_string(),
+            ));
+        }
+        (None, _) => None,
+    };
+    let options = file_options.as_ref().unwrap_or(options);
     match source {
         CompilerInput::Bytes(source) => compile_bytes_with_options(source, filename, options),
         CompilerInput::Text(source) => compile_with_options(source, filename, options),
@@ -846,9 +854,10 @@ fn compile_input(
     source: &CompilerInput,
     filename: &str,
     options: &CompileOptions,
+    caller_model: Option<&caller_intern_model::LoadedModel>,
 ) -> CompilerOutcome {
     capture_compiler(|| {
-        compile_module_input(source, filename, options).map(|module| module.marshal())
+        compile_module_input(source, filename, options, caller_model).map(|module| module.marshal())
     })
 }
 
@@ -1138,7 +1147,7 @@ mod tests {
                 CompilerInput::Text("value = 1\n".to_string()),
                 CompilerInput::Bytes(b"value = 1\n".to_vec()),
             ] {
-                let module = compile_module_input(&input, "target.py", &options).unwrap();
+                let module = compile_module_input(&input, "target.py", &options, None).unwrap();
                 assert_eq!(module.python_version(), python_version);
                 assert_eq!(module.target(), python_version.target());
             }
@@ -1199,9 +1208,10 @@ mod tests {
             CompilerInput::Text(source.to_string()),
             CompilerInput::Bytes(source.as_bytes().to_vec()),
         ] {
-            let default = compile_module_input(&input, "profile.py", &CompileOptions::default())
-                .unwrap()
-                .marshal();
+            let default =
+                compile_module_input(&input, "profile.py", &CompileOptions::default(), None)
+                    .unwrap()
+                    .marshal();
             let supplied = compile_module_input(
                 &input,
                 "profile.py",
@@ -1209,6 +1219,7 @@ mod tests {
                     initial_intern_state: state.clone(),
                     ..CompileOptions::default()
                 },
+                None,
             )
             .unwrap()
             .marshal();
@@ -1282,7 +1293,7 @@ mod tests {
             CompilerInput::Text("if:\n".to_string()),
             CompilerInput::Bytes(b"if:\n".to_vec()),
         ] {
-            let compiled = compile_input(&source, "invalid.py", &CompileOptions::default());
+            let compiled = compile_input(&source, "invalid.py", &CompileOptions::default(), None);
             let outcome = classify(
                 Path::new("invalid.py"),
                 OracleOutcome::Rejected("SyntaxError: invalid syntax".to_string()),
@@ -1301,6 +1312,7 @@ mod tests {
             &CompilerInput::Text("return\n".to_string()),
             "invalid.py",
             &CompileOptions::default(),
+            None,
         );
         let outcome = classify(
             Path::new("invalid.py"),
@@ -1319,7 +1331,7 @@ mod tests {
             CompilerInput::Text("pass\n".to_string()),
             CompilerInput::Bytes(b"pass\n".to_vec()),
         ] {
-            let compiled = compile_input(&source, "valid.py", &CompileOptions::default());
+            let compiled = compile_input(&source, "valid.py", &CompileOptions::default(), None);
             let outcome = classify(
                 Path::new("valid.py"),
                 OracleOutcome::Rejected("SyntaxError: invalid syntax".to_string()),

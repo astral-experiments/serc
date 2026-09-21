@@ -1,3 +1,4 @@
+use std::fmt;
 use std::sync::Arc;
 
 use rustc_hash::FxHashSet;
@@ -11,17 +12,43 @@ use crate::target::is_preinterned_string_for;
 /// assembles code objects. This can affect marshal object sharing even when code
 /// fields compare equal. The default preserves Serc's isolated CPython startup
 /// model. [`Self::new`] supplements that model with existing canonical strings;
-/// [`Self::from_complete`] uses exactly the supplied entries.
+/// [`Self::from_complete`] uses exactly the supplied entries. [`Self::from_partial`]
+/// leaves every unproved entry unknown and rejects byte-relevant uncertainty.
+/// [`Self::from_partial_with_absence`] also accepts an immutable absence proof.
 ///
 /// Entries describe canonical strings retained throughout compilation. This models
 /// a fixed bootstrap, not a long-lived interpreter session in which mortal interned
 /// strings may disappear. Compiling an import statement does not execute the import
 /// or change this state. Clones share the immutable entries.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct InitialInternState {
     strings: Option<Arc<FxHashSet<Box<str>>>>,
     additional_strings: Option<Arc<FxHashSet<Box<str>>>>,
-    complete: bool,
+    absence_predicate: Option<Arc<AbsencePredicate>>,
+    absence_exceptions: Option<Arc<FxHashSet<Box<str>>>>,
+    mode: InitialInternMode,
+}
+
+type AbsencePredicate = dyn Fn(PythonVersion, &str) -> bool + Send + Sync;
+
+impl fmt::Debug for InitialInternState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InitialInternState")
+            .field("strings", &self.strings)
+            .field("additional_strings", &self.additional_strings)
+            .field("has_absence_predicate", &self.absence_predicate.is_some())
+            .field("absence_exceptions", &self.absence_exceptions)
+            .field("mode", &self.mode)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum InitialInternMode {
+    #[default]
+    Supplemental,
+    Complete,
+    Partial,
 }
 
 impl InitialInternState {
@@ -44,15 +71,74 @@ impl InitialInternState {
     /// Compilation still applies the target's normal interning rules.
     pub fn from_complete(strings: impl IntoIterator<Item = impl Into<Box<str>>>) -> Self {
         Self {
-            complete: true,
+            mode: InitialInternMode::Complete,
             ..Self::new(strings)
+        }
+    }
+
+    /// Record proven retained canonical strings, leaving every other entry unknown.
+    ///
+    /// No static or startup entries are implicit. Compilation fails if an unknown
+    /// entry can affect serialized object identity. Supplied strings must have a
+    /// canonical owner retained throughout compilation, independent of its literals.
+    pub fn from_partial(strings: impl IntoIterator<Item = impl Into<Box<str>>>) -> Self {
+        Self {
+            mode: InitialInternMode::Partial,
+            ..Self::new(strings)
+        }
+    }
+
+    /// Record retained strings and a proof of absence for other initial entries.
+    ///
+    /// The predicate returns `true` only when the spelling is proven absent for
+    /// the selected target; `false` leaves it unknown. Retained strings, including
+    /// later additions, take precedence. No static or startup entries are implicit.
+    ///
+    /// The predicate must be pure and depend only on the target, spelling, and
+    /// immutable captured facts. Its answers must remain identical across calls,
+    /// clones, compilation, and later serialization of every compiled module.
+    /// It must perform no I/O. Compilation and serialization may call it repeatedly.
+    pub fn from_partial_with_absence(
+        strings: impl IntoIterator<Item = impl Into<Box<str>>>,
+        predicate: impl Fn(PythonVersion, &str) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            absence_predicate: Some(Arc::new(predicate)),
+            ..Self::from_partial(strings)
+        }
+    }
+
+    /// Leave these spellings unknown instead of applying the absence predicate.
+    ///
+    /// Proven retained strings still take precedence. This only masks the optional
+    /// predicate; it does not change supplemental or complete states. The baseline
+    /// and predicate stay shared; repeated calls copy only earlier exceptions.
+    #[must_use]
+    pub fn with_absence_exceptions(
+        &self,
+        strings: impl IntoIterator<Item = impl Into<Box<str>>>,
+    ) -> Self {
+        if self.absence_predicate.is_none() {
+            return self.clone();
+        }
+        let mut absence_exceptions: FxHashSet<_> =
+            strings.into_iter().map(Into::<Box<str>>::into).collect();
+        if absence_exceptions.is_empty() {
+            return self.clone();
+        }
+        if let Some(existing) = &self.absence_exceptions {
+            absence_exceptions.extend(existing.iter().cloned());
+        }
+        Self {
+            absence_exceptions: Some(Arc::new(absence_exceptions)),
+            ..self.clone()
         }
     }
 
     /// Return an independent state retaining additional canonical strings.
     ///
     /// The original entries stay shared. Extending again copies only earlier additions.
-    /// The state's complete or supplemental mode is preserved.
+    /// The state's complete, partial, or supplemental mode is preserved.
     #[must_use]
     pub fn with_additional_strings(
         &self,
@@ -67,18 +153,26 @@ impl InitialInternState {
             additional_strings.extend(existing.iter().cloned());
         }
         Self {
-            strings: self.strings.clone(),
             additional_strings: Some(Arc::new(additional_strings)),
-            complete: self.complete,
+            ..self.clone()
         }
     }
 
-    pub(crate) fn is_complete(&self) -> bool {
-        self.complete
+    pub(crate) fn uses_startup_state(&self) -> bool {
+        self.mode == InitialInternMode::Supplemental
     }
 
-    pub(crate) fn contains_for(&self, python_version: PythonVersion, value: &str) -> bool {
-        (!self.complete && is_preinterned_string_for(python_version, value))
+    pub(crate) fn has_unknown_entries(&self) -> bool {
+        self.mode == InitialInternMode::Partial
+    }
+
+    /// Return known presence or absence, or `None` for an unresolved entry.
+    pub(crate) fn membership_for(
+        &self,
+        python_version: PythonVersion,
+        value: &str,
+    ) -> Option<bool> {
+        if (self.uses_startup_state() && is_preinterned_string_for(python_version, value))
             || self
                 .strings
                 .as_ref()
@@ -87,6 +181,29 @@ impl InitialInternState {
                 .additional_strings
                 .as_ref()
                 .is_some_and(|strings| strings.contains(value))
+        {
+            Some(true)
+        } else if self.has_unknown_entries() {
+            if self
+                .absence_exceptions
+                .as_ref()
+                .is_some_and(|strings| strings.contains(value))
+            {
+                None
+            } else {
+                self.absence_predicate
+                    .as_ref()
+                    .is_some_and(|predicate| predicate(python_version, value))
+                    .then_some(false)
+            }
+        } else {
+            Some(false)
+        }
+    }
+
+    pub(crate) fn contains_for(&self, python_version: PythonVersion, value: &str) -> bool {
+        self.membership_for(python_version, value)
+            .expect("initial intern-state membership must be known")
     }
 }
 
@@ -165,7 +282,8 @@ mod tests {
         let repeated = first.with_additional_strings(["second_filename_918"]);
         let unchanged = repeated.with_additional_strings(std::iter::empty::<&str>());
         for state in [&base, &first, &repeated, &unchanged] {
-            assert!(state.is_complete());
+            assert!(!state.uses_startup_state());
+            assert!(!state.has_unknown_entries());
             assert!(Arc::ptr_eq(
                 base.strings.as_ref().unwrap(),
                 state.strings.as_ref().unwrap()
@@ -182,6 +300,155 @@ mod tests {
         }
         assert!(unchanged.contains_for(PythonVersion::Py314, "first_filename_918"));
         assert!(unchanged.contains_for(PythonVersion::Py314, "second_filename_918"));
+    }
+
+    #[test]
+    fn partial_states_preserve_unknown_entries_and_shared_positive_facts() {
+        let base = InitialInternState::from_partial(["known_owner_973"]);
+        let extended = base.with_additional_strings(["path_owner_973"]);
+        let unchanged = extended.with_additional_strings(std::iter::empty::<&str>());
+        for state in [&base, &extended, &unchanged] {
+            assert!(state.has_unknown_entries());
+            assert!(!state.uses_startup_state());
+            assert!(Arc::ptr_eq(
+                base.strings.as_ref().unwrap(),
+                state.strings.as_ref().unwrap()
+            ));
+            assert_eq!(
+                state.membership_for(PythonVersion::Py313, "known_owner_973"),
+                Some(true)
+            );
+            assert_eq!(
+                state.membership_for(PythonVersion::Py314, "aggregate_class"),
+                None
+            );
+        }
+        assert_eq!(
+            base.membership_for(PythonVersion::Py313, "path_owner_973"),
+            None
+        );
+        assert_eq!(
+            unchanged.membership_for(PythonVersion::Py313, "path_owner_973"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn absence_predicates_preserve_unknowns_and_target_boundaries() {
+        let state =
+            InitialInternState::from_partial_with_absence(["proof_retained"], |version, value| {
+                version == PythonVersion::Py313 && value.starts_with("proof_")
+            });
+        assert!(state.has_unknown_entries());
+        assert!(!state.uses_startup_state());
+        assert_eq!(
+            state.membership_for(PythonVersion::Py313, "proof_absent"),
+            Some(false)
+        );
+        assert_eq!(
+            state.membership_for(PythonVersion::Py313, "proof_retained"),
+            Some(true)
+        );
+        assert_eq!(
+            state.membership_for(PythonVersion::Py313, "outside_domain"),
+            None
+        );
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            assert_eq!(state.membership_for(version, "proof_absent"), None);
+            assert_eq!(state.membership_for(version, "proof_retained"), Some(true));
+        }
+    }
+
+    #[test]
+    fn absence_exceptions_share_proofs_and_preserve_retained_owners() {
+        let base = InitialInternState::from_partial_with_absence(["proof_retained"], |_, value| {
+            value.starts_with("proof_")
+        });
+        let first = base.with_absence_exceptions(["proof_first", "proof_retained"]);
+        let sibling = base.with_absence_exceptions(["proof_second"]);
+        let repeated = first.with_absence_exceptions(["proof_second", "proof_first"]);
+        let extended = repeated.with_additional_strings(["proof_first"]);
+        let unchanged = extended.with_absence_exceptions(std::iter::empty::<&str>());
+        for state in [&first, &sibling, &repeated, &extended, &unchanged] {
+            assert!(Arc::ptr_eq(
+                base.strings.as_ref().unwrap(),
+                state.strings.as_ref().unwrap()
+            ));
+            assert!(Arc::ptr_eq(
+                base.absence_predicate.as_ref().unwrap(),
+                state.absence_predicate.as_ref().unwrap()
+            ));
+            assert_eq!(
+                state.membership_for(PythonVersion::Py313, "proof_retained"),
+                Some(true)
+            );
+        }
+        assert!(Arc::ptr_eq(
+            extended.absence_exceptions.as_ref().unwrap(),
+            unchanged.absence_exceptions.as_ref().unwrap()
+        ));
+        assert_eq!(
+            base.membership_for(PythonVersion::Py313, "proof_first"),
+            Some(false)
+        );
+        assert_eq!(
+            first.membership_for(PythonVersion::Py313, "proof_first"),
+            None
+        );
+        assert_eq!(
+            first.membership_for(PythonVersion::Py313, "proof_second"),
+            Some(false)
+        );
+        assert_eq!(
+            sibling.membership_for(PythonVersion::Py313, "proof_first"),
+            Some(false)
+        );
+        assert_eq!(
+            sibling.membership_for(PythonVersion::Py313, "proof_second"),
+            None
+        );
+        assert_eq!(repeated.absence_exceptions.as_ref().unwrap().len(), 3);
+        assert_eq!(
+            unchanged.membership_for(PythonVersion::Py313, "proof_first"),
+            Some(true)
+        );
+        assert_eq!(
+            unchanged.membership_for(PythonVersion::Py313, "proof_second"),
+            None
+        );
+        assert_eq!(
+            unchanged.membership_for(PythonVersion::Py313, "proof_other"),
+            Some(false)
+        );
+        assert_eq!(
+            unchanged.membership_for(PythonVersion::Py313, "outside_domain"),
+            None
+        );
+    }
+
+    #[test]
+    fn absence_exceptions_only_mask_a_predicate_and_debug_does_not_evaluate_it() {
+        for state in [
+            InitialInternState::default(),
+            InitialInternState::from_complete(std::iter::empty::<&str>()),
+            InitialInternState::from_partial(std::iter::empty::<&str>()),
+        ] {
+            let extended = state.with_absence_exceptions(["proof_absent"]);
+            assert_eq!(extended.mode, state.mode);
+            assert_eq!(
+                extended.membership_for(PythonVersion::Py313, "proof_absent"),
+                state.membership_for(PythonVersion::Py313, "proof_absent")
+            );
+        }
+        let state =
+            InitialInternState::from_partial_with_absence(std::iter::empty::<&str>(), |_, _| {
+                panic!("Debug must not evaluate an absence predicate")
+            });
+        assert!(format!("{state:?}").contains("has_absence_predicate: true"));
     }
 
     #[test]

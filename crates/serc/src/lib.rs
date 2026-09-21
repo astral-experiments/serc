@@ -146,6 +146,11 @@ pub enum CompileError {
     },
     /// The source uses valid Python syntax that this backend does not support yet.
     Unsupported(String),
+    /// Initial intern-state uncertainty can affect serialized object identity.
+    UnresolvedInternState {
+        /// The string whose prior canonical identity is unknown.
+        value: String,
+    },
     /// The compiler violated one of its own invariants.
     Internal(String),
 }
@@ -156,7 +161,10 @@ impl CompileError {
         match self {
             Self::Parse(error) => Some(error.location),
             Self::InvalidPattern { range, .. } | Self::InvalidSyntax { range, .. } => Some(*range),
-            Self::Decode(_) | Self::Unsupported(_) | Self::Internal(_) => None,
+            Self::Decode(_)
+            | Self::Unsupported(_)
+            | Self::UnresolvedInternState { .. }
+            | Self::Internal(_) => None,
         }
     }
 
@@ -177,6 +185,9 @@ impl fmt::Display for CompileError {
                 write!(formatter, "failed to parse Python source: {message}")
             }
             Self::Unsupported(message) => formatter.write_str(message),
+            Self::UnresolvedInternState { value } => {
+                write!(formatter, "unresolved initial intern state for {value:?}")
+            }
             Self::Internal(message) => write!(formatter, "internal compiler error: {message}"),
         }
     }
@@ -190,6 +201,7 @@ impl Error for CompileError {
             Self::InvalidPattern { .. }
             | Self::InvalidSyntax { .. }
             | Self::Unsupported(_)
+            | Self::UnresolvedInternState { .. }
             | Self::Internal(_) => None,
         }
     }
@@ -303,6 +315,11 @@ fn compile_normalized(
         options.python_version,
     )
     .compile_module(parsed.suite())?;
+    marshal::validate_initial_intern_state(
+        &code,
+        options.python_version,
+        &options.initial_intern_state,
+    )?;
     Ok(CompiledModule {
         code,
         python_version: options.python_version,

@@ -68,6 +68,7 @@ pub(super) struct Reader {
     native_identity_sha256: String,
     index: BTreeMap<String, IndexRow>,
     inputs: Vec<Artifact>,
+    required_absent_paths: Vec<PathBuf>,
     context: Artifact,
     selected: Vec<PathBuf>,
     records: Mutex<BTreeMap<usize, (Artifact, String)>>,
@@ -296,6 +297,8 @@ impl Reader {
             native_identity_sha256: digest(&serde_json::to_vec(&native_identity)?),
             index,
             inputs,
+            required_absent_paths: caller_model
+                .map_or_else(Vec::new, |model| model.required_absent_paths.clone()),
             context: artifact(&context_path, &context_bytes),
             selected: paths.to_vec(),
             records: Mutex::new(BTreeMap::new()),
@@ -398,9 +401,15 @@ impl Reader {
         Ok(artifact(&path, bytes))
     }
 
-    pub(super) fn compare(&self, index: usize, path: &Path, options: &CompileOptions) -> Outcome {
+    pub(super) fn compare(
+        &self,
+        index: usize,
+        path: &Path,
+        options: &CompileOptions,
+        caller_model: Option<&super::caller_intern_model::LoadedModel>,
+    ) -> Outcome {
         self.compare_with(index, path, |input, filename| {
-            super::compile_input(input, filename, options)
+            super::compile_input(input, filename, options, caller_model)
         })
     }
 
@@ -491,6 +500,8 @@ impl Reader {
         for input in &self.inputs {
             input.read()?;
         }
+        super::caller_intern_model::validate_absent_paths(&self.required_absent_paths)
+            .map_err(io::Error::other)?;
         let records = self
             .records
             .lock()
@@ -618,6 +629,7 @@ mod tests {
             native_identity_sha256: identity,
             index: BTreeMap::from([(filename, row)]),
             inputs: Vec::new(),
+            required_absent_paths: Vec::new(),
             context: artifact(&context_path, b"synthetic unit context"),
             selected: vec![source.clone()],
             records: Mutex::new(BTreeMap::new()),
@@ -647,6 +659,24 @@ mod tests {
             entry["cached_native"]["fresh_native_process_executed"],
             false
         );
+    }
+
+    #[test]
+    fn completion_rechecks_required_absence() {
+        let (directory, mut reader, source) = fixture(false);
+        let absent = directory.path().join("runtime.zip");
+        reader.required_absent_paths.push(absent.clone());
+        assert_eq!(
+            reader
+                .compare_with(0, &source, |_, _| {
+                    CompilerOutcome::Compiled(b"native".to_vec())
+                })
+                .kind,
+            OutcomeKind::Exact
+        );
+        fs::write(absent, b"appeared after loading").unwrap();
+        assert!(reader.finish(true).is_err());
+        assert!(!reader.directory.join("COMPLETE.json").exists());
     }
 
     #[test]
