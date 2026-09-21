@@ -643,6 +643,13 @@ impl<'source> Compiler<'source> {
             self.assembler
                 .set_location(self.source_location(statement.range()));
         }
+        // Native 3.12's StopIteration wrapper appends an unlocated return even
+        // after a terminating source suite, separating its final source joins
+        // from the handler. Keep the suite's location selection above unchanged.
+        let add_implicit_return = add_implicit_return
+            || (self.context.python_version == PythonVersion::Py312
+                && self.control.generators.generator_region_start.is_some()
+                && !self.control.statements.emitted_fallthrough_return);
         self.finish_inner(add_implicit_return)
     }
 

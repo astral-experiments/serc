@@ -1159,6 +1159,11 @@ impl Compiler<'_> {
     ) -> Result<(), CompileError> {
         let base_depth = self.control.stack.depth;
         let false_exit = self.assembler.label();
+        // The no-else If's original End is its false edge, before the case exit.
+        self.bind_native_source_label(
+            super::legacy_native_labels::NativeRole::IfEnd(statement.range),
+            false_exit,
+        );
         self.compile_jump_if(&statement.test, false, false_exit)?;
         self.mark_definitely_evaluated_locals(&statement.test);
 

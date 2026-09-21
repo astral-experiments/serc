@@ -141,12 +141,13 @@ struct Builder<'ast> {
     context: EmissionContext,
     contexts: FxHashMap<FinallyContext, EmissionContext>,
     finally_depth: usize,
-    finally_sources: Vec<&'ast ruff_python_ast::StmtTry>,
+    finally_sources: Vec<(&'ast ruff_python_ast::StmtTry, usize)>,
     loop_finally_depths: Vec<usize>,
     manager_depth: usize,
     async_manager_items: Vec<(usize, TextRange)>,
     loop_manager_depths: Vec<usize>,
     inside_comprehension_body: bool,
+    inside_comprehension_result: bool,
     // None means local annotations emit no suffix. Modules always store simple
     // annotations; the bool selects future stringification over eager evaluation.
     module_annotations: Option<bool>,
@@ -299,12 +300,13 @@ impl<'ast> Builder<'ast> {
                     match assignment.target.as_ref() {
                         Expr::Name(_) => {}
                         target @ (Expr::Attribute(_) | Expr::Subscript(_)) => {
-                            Self::label_free_expression(target)?;
+                            self.expression(target)?;
                         }
                         _ => return None,
                     }
-                    // The original target evaluation and COPY/load prefix are
-                    // nonempty and label-free. RHS labels retain their own order.
+                    // Target components allocate before the RHS. Their final
+                    // load and the native COPY/load prefix separate target joins
+                    // from subsequent RHS labels without allocating new labels.
                     self.instruction();
                     self.expression(&assignment.value)?;
                     self.instruction();
@@ -317,22 +319,22 @@ impl<'ast> Builder<'ast> {
                     let finalizer = if self.finally_depth == 0 {
                         None
                     } else {
-                        // Initially admit one allocating cleanup and no crossed
-                        // manager. Broader unwind needs their lexical ordering.
-                        let [finalizer] = self.finally_sources.as_slice() else {
+                        // One finalizer may precede outer managers. Equality
+                        // with its entry depth excludes managers inside it.
+                        let [(finalizer, manager_depth)] = self.finally_sources.as_slice() else {
                             return None;
                         };
-                        if self.manager_depth != 0
+                        if self.manager_depth != *manager_depth
                             || !Self::supports_return_finalbody(&finalizer.finalbody)
                         {
                             return None;
                         }
-                        Some(*finalizer)
+                        Some((*finalizer, *manager_depth))
                     };
                     if let Some(value) = &statement.value {
                         self.expression(value)?;
                     }
-                    if let Some(finalizer) = finalizer {
+                    if let Some((finalizer, manager_depth)) = finalizer {
                         // Nonconstant values precede cleanup; for constants the
                         // label-free visit above represents the authored NOP,
                         // not the deferred LOAD_CONST. Native POP_BLOCK keeps
@@ -343,7 +345,7 @@ impl<'ast> Builder<'ast> {
                         let result =
                             self.finally_copy(finalizer, FinallyCopy::Return(statement.range));
                         self.finally_depth += 1;
-                        self.finally_sources.push(finalizer);
+                        self.finally_sources.push((finalizer, manager_depth));
                         result?;
                     }
                     // Only async manager unwind allocates labels. Label-free
@@ -576,14 +578,34 @@ impl<'ast> Builder<'ast> {
     fn supports_finalbody(body: &[Stmt]) -> bool {
         use ruff_python_ast::statement_visitor::{StatementVisitor, walk_stmt};
 
-        struct ExitDetector(bool);
+        #[derive(Default)]
+        struct ExitDetector {
+            nonlocal_exit: bool,
+            local_loop_depth: usize,
+        }
         impl<'ast> StatementVisitor<'ast> for ExitDetector {
             fn visit_stmt(&mut self, statement: &'ast Stmt) {
-                if self.0 {
+                if self.nonlocal_exit {
                     return;
                 }
                 match statement {
-                    Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_) => self.0 = true,
+                    Stmt::Return(_) => self.nonlocal_exit = true,
+                    Stmt::Break(_) | Stmt::Continue(_) => {
+                        self.nonlocal_exit = self.local_loop_depth == 0;
+                    }
+                    Stmt::For(statement) => {
+                        self.local_loop_depth += 1;
+                        self.visit_body(&statement.body);
+                        self.local_loop_depth -= 1;
+                        // Native pops this loop frame before compiling else.
+                        self.visit_body(&statement.orelse);
+                    }
+                    Stmt::While(statement) => {
+                        self.local_loop_depth += 1;
+                        self.visit_body(&statement.body);
+                        self.local_loop_depth -= 1;
+                        self.visit_body(&statement.orelse);
+                    }
                     Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
                     _ => walk_stmt(self, statement),
                 }
@@ -596,12 +618,12 @@ impl<'ast> Builder<'ast> {
         if super::statement::legacy_suite_contains_yield(body, false) {
             return false;
         }
-        let mut exits = ExitDetector(false);
+        let mut exits = ExitDetector::default();
         exits.visit_body(body);
-        !exits.0
+        !exits.nonlocal_exit
     }
 
-    /// Bounds authored Return copies to cleanup without manager or loop unwind.
+    /// Bounds authored Return copies to cleanup without nested manager unwind.
     fn supports_return_finalbody(body: &[Stmt]) -> bool {
         body.iter().all(|statement| match statement {
             Stmt::If(branch) => {
@@ -621,7 +643,15 @@ impl<'ast> Builder<'ast> {
                     && Self::supports_return_finalbody(&statement.orelse)
                     && Self::supports_return_finalbody(&statement.finalbody)
             }
-            Stmt::For(_) | Stmt::While(_) | Stmt::With(_) | Stmt::Match(_) => false,
+            Stmt::For(statement) if !statement.is_async => {
+                Self::supports_return_finalbody(&statement.body)
+                    && Self::supports_return_finalbody(&statement.orelse)
+            }
+            Stmt::While(statement) => {
+                Self::supports_return_finalbody(&statement.body)
+                    && Self::supports_return_finalbody(&statement.orelse)
+            }
+            Stmt::For(_) | Stmt::With(_) | Stmt::Match(_) => false,
             // The ordinary finalbody gate already rejects nonlocal control and
             // eager Yield. Independent child bodies retain their own compiler.
             _ => true,
@@ -642,7 +672,7 @@ impl<'ast> Builder<'ast> {
         self.instruction(); // SETUP_FINALLY separates the protected entry
         self.mark(body);
         self.finally_depth += 1;
-        self.finally_sources.push(statement);
+        self.finally_sources.push((statement, self.manager_depth));
         if statement.handlers.is_empty() {
             if !statement.orelse.is_empty() {
                 return None;
@@ -766,7 +796,7 @@ impl<'ast> Builder<'ast> {
         Some(())
     }
 
-    /// Mirrors strings, flat alternatives and shallow single-capture class patterns.
+    /// Mirrors strings, flat alternatives and shallow zero/one-capture class patterns.
     fn match_statement(&mut self, statement: &'ast ruff_python_ast::StmtMatch) -> Option<()> {
         let wildcard = |pattern: &Pattern| {
             matches!(pattern, Pattern::MatchAs(pattern)
@@ -870,9 +900,10 @@ impl<'ast> Builder<'ast> {
             Pattern::MatchClass(class)
                 if matches!(class.cls.as_ref(), Expr::Name(_) | Expr::Attribute(_))
                     && class.arguments.patterns.is_empty()
-                    && matches!(class.arguments.keywords.as_slice(), [keyword]
-                        if matches!(&keyword.pattern, Pattern::MatchAs(capture)
-                            if capture.pattern.is_none() && capture.name.is_some())) =>
+                    && (class.arguments.keywords.is_empty()
+                        || matches!(class.arguments.keywords.as_slice(), [keyword]
+                            if matches!(&keyword.pattern, Pattern::MatchAs(capture)
+                                if capture.pattern.is_none() && capture.name.is_some()))) =>
             {
                 Self::label_free_expression(&class.cls)?;
                 self.expression(&class.cls)?;
@@ -880,8 +911,8 @@ impl<'ast> Builder<'ast> {
                 let zero = self.allocate(NativeRole::MatchFailPop(owner, 0));
                 let one = self.allocate(NativeRole::MatchFailPop(owner, 1));
                 self.instruction(); // conditional failure targets the one-pop slot
-                // UNPACK_SEQUENCE(1) and the case-level capture STORE have no
-                // intervening label. The capture itself needs no rotations.
+                // UNPACK_SEQUENCE(0 or 1) and an optional capture STORE have no
+                // intervening label. A sole capture needs no rotations.
                 self.instruction();
                 Some((zero, Some(one)))
             }
@@ -910,8 +941,10 @@ impl<'ast> Builder<'ast> {
         {
             return None;
         }
-        // An inner comprehension's outer iterable still belongs to the enclosing
-        // body. Preserve that suspension restriction across recursive scopes.
+        // Clauses retain their suspension restriction even when a nested
+        // comprehension is evaluated inside an enclosing result expression.
+        let previous_result = self.inside_comprehension_result;
+        self.inside_comprehension_result = false;
         let previous_body = self.inside_comprehension_body;
         self.expression(&first.iter)?;
         self.instruction(); // GET_ITER / LOAD_FAST_AND_CLEAR / SWAP
@@ -929,6 +962,7 @@ impl<'ast> Builder<'ast> {
         self.mark(end);
         self.instruction(); // normal SWAP / STORE_FAST_MAYBE_NULL
         self.inside_comprehension_body = previous_body;
+        self.inside_comprehension_result = previous_result;
         Some(())
     }
 
@@ -961,10 +995,15 @@ impl<'ast> Builder<'ast> {
         if index + 1 < generators.len() {
             self.comprehension_generator(generators, index + 1, key, value)?;
         } else {
+            // Native visits keys/results in the parent code unit. Their explicit
+            // awaits use the ordinary Send/Fail/Exit roles before the append.
+            let previous_result = self.inside_comprehension_result;
+            self.inside_comprehension_result = true;
             if let Some(key) = key {
                 self.expression(key)?;
             }
             self.expression(value)?;
+            self.inside_comprehension_result = previous_result;
             self.instruction(); // LIST_APPEND / SET_ADD / MAP_ADD
         }
         self.mark(if_cleanup);
@@ -1392,7 +1431,9 @@ impl<'ast> Builder<'ast> {
                 self.instruction(); // CLEANUP_THROW
                 self.mark(exit);
             }
-            Expr::Await(awaited) if !self.inside_comprehension_body => {
+            Expr::Await(awaited)
+                if !self.inside_comprehension_body || self.inside_comprehension_result =>
+            {
                 self.expression(&awaited.value)?;
                 self.instruction(); // GET_AWAITABLE / LOAD_CONST before send
                 let send = self.allocate(NativeRole::AwaitSend(awaited.range));
@@ -2151,13 +2192,13 @@ mod manager_tests {
     }
 
     #[test]
-    fn finally_crossing_manager_return_rejects_the_whole_plan() {
+    fn outer_manager_finally_return_is_admitted() {
         let source = "def f():\n    with manager():\n        try:\n            return value\n        finally:\n            finish()\n";
         let parsed = parse_module(source).unwrap();
         let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
             panic!()
         };
-        assert!(NativeLabelPlan::function(&function.body, false).is_none());
+        assert!(NativeLabelPlan::function(&function.body, false).is_some());
     }
     #[test]
     fn unpacked_for_continue_reuses_the_existing_native_loop_labels() {
@@ -2265,8 +2306,9 @@ mod manager_tests {
     fn inlined_comprehension_subset_rejects_additional_control_routes() {
         for expression in [
             "[item async for item in xs]",
-            "[await action(item) for item in xs]",
             "[item for item in xs for other in await ys()]",
+            "[[value for value in await ys()] for item in xs]",
+            "[[value for value in ys if await allowed(value)] for item in xs]",
             "[item for item in xs for other in [value]]",
             "[item for item in xs for other in (value,)]",
             "[item for item in xs for other in [1]]",
@@ -2406,13 +2448,92 @@ mod manager_tests {
     }
 
     #[test]
-    fn augmented_targets_keep_label_bearing_evaluation_outside_the_subset() {
+    fn augmented_targets_visit_supported_label_bearing_evaluation() {
         for target in [
             "(await holder()).value",
             "(left or right).value",
             "items[(left if flag else right)]",
             "items[await index()]",
             "[item for item in values][0]",
+        ] {
+            let source = format!("async def f():\n    {target} += value\n");
+            let parsed = parse_module(&source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(NativeLabelPlan::function(&function.body, true).is_some());
+        }
+    }
+
+    #[test]
+    fn augmented_target_labels_precede_rhs_await_and_later_labels() {
+        let parsed = parse_module(
+            "async def f():\n    (first or second)[index or fallback] += await rhs()\n    await done()\n",
+        )
+        .unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::AugAssign(assignment), Stmt::Expr(after)] = function.body.as_slice() else {
+            panic!()
+        };
+        let ruff_python_ast::Expr::Subscript(target) = assignment.target.as_ref() else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        for (role, ordinal) in [
+            (NativeRole::ValueBoolEnd(target.value.range()), 2),
+            (NativeRole::ValueBoolEnd(target.slice.range()), 3),
+            (NativeRole::AwaitSend(assignment.value.range()), 4),
+            (NativeRole::AwaitExit(assignment.value.range()), 6),
+            (NativeRole::AwaitSend(after.value.range()), 7),
+            (NativeRole::StopIterationHandler, 10),
+        ] {
+            assert_eq!(plan.remaining[&role], ordinal, "{role:?}");
+        }
+        assert_eq!(plan.remaining.len(), 10);
+    }
+
+    #[test]
+    fn augmented_target_preserves_nested_boolean_join_aliases() {
+        for target in [
+            "(first or (second and third)).value",
+            "items[first or (second and third)]",
+        ] {
+            let source = format!("async def f():\n    {target} += await rhs()\n");
+            let parsed = parse_module(&source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            let [Stmt::AugAssign(assignment)] = function.body.as_slice() else {
+                panic!()
+            };
+            let value = match assignment.target.as_ref() {
+                ruff_python_ast::Expr::Attribute(target) => &target.value,
+                ruff_python_ast::Expr::Subscript(target) => &target.slice,
+                _ => panic!(),
+            };
+            let ruff_python_ast::Expr::BoolOp(outer) = value.as_ref() else {
+                panic!()
+            };
+            let inner = outer.values.last().unwrap();
+            let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+            assert_eq!(plan.remaining[&NativeRole::ValueBoolEnd(outer.range)], 3);
+            assert_eq!(plan.remaining[&NativeRole::ValueBoolEnd(inner.range())], 3);
+            assert_eq!(
+                plan.remaining[&NativeRole::AwaitSend(assignment.value.range())],
+                4
+            );
+            assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 7);
+        }
+    }
+
+    #[test]
+    fn augmented_targets_keep_unsupported_nested_evaluation_outside_the_subset() {
+        for target in [
+            "(lambda value=left or right: value)().field",
+            "items[[item for item in values if True][0]]",
+            "items[[item for item in values if await predicate(item)][0]]",
         ] {
             let source = format!("async def f():\n    {target} += value\n");
             let parsed = parse_module(&source).unwrap();
@@ -3039,6 +3160,18 @@ mod expression_family_tests {
         for expression in [
             "[[y for y in ys] or await action() for x in xs]",
             "[([y for y in ys], await action()) for x in xs]",
+        ] {
+            let source = format!("async def f():\n    values = {expression}\n");
+            let parsed = parse_module(&source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(
+                NativeLabelPlan::function(&function.body, true).is_some(),
+                "{source}"
+            );
+        }
+        for expression in [
             "[[y for y in await items()] for x in xs]",
             "[[y for y in ys for z in [item]] for x in xs]",
             "[[y async for y in ys] for x in xs]",
@@ -3490,8 +3623,6 @@ mod finally_occurrence_tests {
     fn cleanup_exit_guard_recurses_through_statement_containers() {
         for cleanup in [
             "        before()\n        if flag:\n            return value\n",
-            "        for item in items:\n            break\n",
-            "        while flag:\n            continue\n",
             "        with manager():\n            return value\n",
             "        try:\n            close()\n        except Error:\n            return value\n",
             "        match value:\n            case None:\n                return result\n",
@@ -3919,6 +4050,48 @@ mod match_native_label_tests {
     }
 
     #[test]
+    fn empty_class_without_default_preserves_both_failure_slots() {
+        let parsed = parse_module("def f(value):\n    match value:\n        case Item():\n            work()\n    finish()\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let Stmt::Match(statement) = &function.body[0] else {
+            panic!()
+        };
+        let range = statement.cases[0].pattern.range();
+        let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+        assert_eq!(plan.remaining[&NativeRole::MatchEnd(statement.range)], 3);
+        assert_eq!(plan.remaining[&NativeRole::MatchFailPop(range, 0)], 3);
+        assert_eq!(plan.remaining[&NativeRole::MatchFailPop(range, 1)], 4);
+        assert_eq!(plan.remaining.len(), 4);
+    }
+
+    #[test]
+    fn nested_loop_case_tail_if_ends_keep_their_original_alias() {
+        let parsed = parse_module("def f(value, first, second):\n    while first:\n        match value:\n            case Item():\n                if first:\n                    if second:\n                        work()\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::While(loop_)] = function.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::Match(statement)] = loop_.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::If(outer)] = statement.cases[0].body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::If(inner)] = outer.body.as_slice() else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+        assert_eq!(plan.remaining[&NativeRole::MatchEnd(statement.range)], 7);
+        assert_eq!(plan.remaining[&NativeRole::IfEnd(outer.range)], 10);
+        assert_eq!(plan.remaining[&NativeRole::IfEnd(inner.range)], 10);
+        assert_eq!(plan.remaining.len(), 10);
+    }
+
+    #[test]
     fn final_named_captures_need_no_failure_labels() {
         for pattern in ["captured", "_ as captured"] {
             let source = format!(
@@ -4315,9 +4488,7 @@ mod protected_finally_return_tests {
     fn protected_return_rejects_multiple_frames_and_nested_cleanup_scopes() {
         for source in [
             "def f():\n    try:\n        try:\n            return value\n        finally:\n            inner()\n    finally:\n        outer()\n",
-            "def f():\n    with manager():\n        try:\n            return value\n        finally:\n            finish()\n",
             "def f():\n    try:\n        with manager():\n            return value\n    finally:\n        finish()\n",
-            "def f():\n    try:\n        return value\n    finally:\n        for item in items:\n            finish(item)\n",
             "def f():\n    try:\n        return value\n    finally:\n        before()\n        if flag:\n            return other\n",
         ] {
             let parsed = parse_module(source).unwrap();
@@ -4473,7 +4644,6 @@ mod nested_return_cleanup_tests {
     fn nested_cleanup_containers_do_not_hide_unsupported_unwind() {
         for cleanup in [
             "        try:\n            with manager():\n                finish()\n        except Error:\n            recover()\n",
-            "        try:\n            finish()\n        except Error:\n            for item in items:\n                consume(item)\n",
             "        try:\n            finish()\n        finally:\n            return other\n",
             "        try:\n            finish()\n        except Error:\n            return other\n",
         ] {
@@ -4559,5 +4729,308 @@ mod yield_from_native_label_tests {
             panic!()
         };
         assert!(NativeLabelPlan::function(&function.body, true).is_none());
+    }
+}
+
+#[cfg(test)]
+mod ordered_finally_manager_tests {
+    use super::{
+        EmissionContext, FinallyContext, FinallyCopy, NativeLabelPlan, NativeRole, WithAwait,
+    };
+    use ruff_python_ast::{Expr, Stmt};
+    use ruff_python_parser::parse_module;
+    use ruff_text_size::Ranged;
+
+    #[test]
+    fn return_value_and_copied_loop_precede_outer_async_manager_unwind() {
+        let parsed = parse_module("async def f(manager, items):\n    async with manager:\n        try:\n            return await value()\n        finally:\n            for item in items:\n                await finish()\n                continue\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::With(manager)] = function.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::Try(finalizer)] = manager.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::Return(returned)] = finalizer.body.as_slice() else {
+            panic!()
+        };
+        let Expr::Await(value) = returned.value.as_deref().unwrap() else {
+            panic!()
+        };
+        let [Stmt::For(loop_)] = finalizer.finalbody.as_slice() else {
+            panic!()
+        };
+        let Stmt::Expr(cleanup) = &loop_.body[0] else {
+            panic!()
+        };
+        let Expr::Await(cleanup) = cleanup.value.as_ref() else {
+            panic!()
+        };
+        let manager = manager.items[0].context_expr.range();
+        let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        assert_eq!(plan.remaining[&NativeRole::AwaitSend(value.range)], 13);
+        for (copy, first) in [
+            (FinallyCopy::Return(returned.range), 16),
+            (FinallyCopy::Normal, 26),
+            (FinallyCopy::Exceptional, 33),
+        ] {
+            let context = plan.contexts[&FinallyContext {
+                parent: EmissionContext::default(),
+                owner: finalizer.range,
+                copy,
+            }];
+            assert_eq!(
+                plan.copied_remaining[&(context, NativeRole::ForStart(loop_.range))],
+                first
+            );
+            assert_eq!(
+                plan.copied_remaining[&(context, NativeRole::ForBody(loop_.range))],
+                first + 1
+            );
+            assert_eq!(
+                plan.copied_remaining[&(context, NativeRole::ForCleanup(loop_.range))],
+                first + 2
+            );
+            assert_eq!(
+                plan.copied_remaining[&(context, NativeRole::ForEnd(loop_.range))],
+                first + 3
+            );
+            assert_eq!(
+                plan.copied_remaining[&(context, NativeRole::AwaitSend(cleanup.range))],
+                first + 4
+            );
+        }
+        for (phase, send) in [
+            (WithAwait::Enter, 6),
+            (WithAwait::Return(returned.range), 23),
+            (WithAwait::NormalExit, 40),
+            (WithAwait::ExceptionalExit, 43),
+        ] {
+            assert_eq!(
+                plan.remaining[&NativeRole::WithAwaitSend(manager, phase)],
+                send
+            );
+        }
+        assert_eq!(plan.remaining[&NativeRole::WithExit(manager)], 47);
+        assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 48);
+        assert_eq!(plan.remaining_contexts.len(), 3);
+        assert_eq!(plan.copied_remaining.len(), 21);
+    }
+
+    #[test]
+    fn finalizer_copy_precedes_reverse_ordered_outer_manager_copies() {
+        let parsed = parse_module("async def f(first, second):\n    async with first, second:\n        try:\n            return 42\n        finally:\n            await finish()\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::With(manager)] = function.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::Try(finalizer)] = manager.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::Return(returned)] = finalizer.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::Expr(cleanup)] = finalizer.finalbody.as_slice() else {
+            panic!()
+        };
+        let Expr::Await(cleanup) = cleanup.value.as_ref() else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        let context = plan.contexts[&FinallyContext {
+            parent: EmissionContext::default(),
+            owner: finalizer.range,
+            copy: FinallyCopy::Return(returned.range),
+        }];
+        assert_eq!(
+            plan.copied_remaining[&(context, NativeRole::AwaitSend(cleanup.range))],
+            20
+        );
+        let phase = WithAwait::Return(returned.range);
+        assert_eq!(
+            plan.remaining
+                [&NativeRole::WithAwaitSend(manager.items[1].context_expr.range(), phase)],
+            23
+        );
+        assert_eq!(
+            plan.remaining
+                [&NativeRole::WithAwaitSend(manager.items[0].context_expr.range(), phase)],
+            26
+        );
+        assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 51);
+    }
+
+    #[test]
+    fn ordinary_handler_return_visits_a_synchronous_cleanup_loop() {
+        let parsed = parse_module("def f(items):\n    try:\n        work()\n    except Error:\n        return value\n    finally:\n        for item in items:\n            finish(item)\n").unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let [Stmt::Try(finalizer)] = function.body.as_slice() else {
+            panic!()
+        };
+        let handler = finalizer.handlers[0].as_except_handler().unwrap();
+        let [Stmt::Return(returned)] = handler.body.as_slice() else {
+            panic!()
+        };
+        let [Stmt::For(loop_)] = finalizer.finalbody.as_slice() else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, false).unwrap();
+        for (copy, first) in [
+            (FinallyCopy::Return(returned.range), 12),
+            (FinallyCopy::Normal, 16),
+            (FinallyCopy::Exceptional, 20),
+        ] {
+            let context = plan.contexts[&FinallyContext {
+                parent: EmissionContext::default(),
+                owner: finalizer.range,
+                copy,
+            }];
+            assert_eq!(
+                plan.copied_remaining[&(context, NativeRole::ForStart(loop_.range))],
+                first
+            );
+            assert_eq!(
+                plan.copied_remaining[&(context, NativeRole::ForEnd(loop_.range))],
+                first + 3
+            );
+        }
+        assert_eq!(plan.remaining_contexts.len(), 3);
+        assert_eq!(plan.copied_remaining.len(), 12);
+    }
+
+    #[test]
+    fn cleanup_local_loops_keep_body_and_else_targets_distinct() {
+        for source in [
+            "def f():\n    try:\n        work()\n    finally:\n        for item in items:\n            break\n",
+            "def f():\n    try:\n        work()\n    finally:\n        while flag:\n            continue\n",
+            "def f():\n    try:\n        return value\n    finally:\n        for item in items:\n            for other in item:\n                consume(other)\n            else:\n                continue\n",
+            "def f():\n    try:\n        return value\n    finally:\n        try:\n            work()\n        except Error:\n            for item in items:\n                consume(item)\n",
+            "async def f():\n    try:\n        work()\n    finally:\n        async for item in items:\n            break\n",
+        ] {
+            let parsed = parse_module(source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(
+                NativeLabelPlan::function(&function.body, function.is_async).is_some(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn inner_managers_and_nonlocal_cleanup_loop_exits_remain_rejected() {
+        for source in [
+            "async def f():\n    try:\n        async with manager():\n            return value\n    finally:\n        finish()\n",
+            "def f():\n    for item in items:\n        try:\n            return value\n        finally:\n            continue\n",
+            "def f():\n    for item in items:\n        try:\n            return value\n        finally:\n            for other in item:\n                consume(other)\n            else:\n                continue\n",
+            "def f():\n    try:\n        return value\n    finally:\n        for item in items:\n            try:\n                break\n            finally:\n                finish()\n",
+            "async def f():\n    try:\n        return value\n    finally:\n        async for item in items:\n            consume(item)\n",
+        ] {
+            let parsed = parse_module(source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(
+                NativeLabelPlan::function(&function.body, function.is_async).is_none(),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod comprehension_result_await_tests {
+    use ruff_python_ast::{Expr, Stmt};
+    use ruff_python_parser::parse_module;
+    use ruff_text_size::Ranged;
+
+    use super::{NativeLabelPlan, NativeRole};
+
+    #[test]
+    fn result_awaits_follow_loop_labels_and_precede_the_parent_handler() {
+        for expression in [
+            "[await action(item) for item in await items()]",
+            "{await action(item) for item in await items()}",
+            "{await key(item): await value(item) for item in await items()}",
+        ] {
+            let source = format!("async def f():\n    values = {expression}\n    await done()\n");
+            let parsed = parse_module(&source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            let [Stmt::Assign(assignment), Stmt::Expr(after)] = function.body.as_slice() else {
+                panic!()
+            };
+            let (generators, values) = match assignment.value.as_ref() {
+                Expr::ListComp(comprehension) => {
+                    (&comprehension.generators, vec![comprehension.elt.as_ref()])
+                }
+                Expr::SetComp(comprehension) => {
+                    (&comprehension.generators, vec![comprehension.elt.as_ref()])
+                }
+                Expr::DictComp(comprehension) => (
+                    &comprehension.generators,
+                    vec![
+                        comprehension.key.as_deref().unwrap(),
+                        comprehension.value.as_ref(),
+                    ],
+                ),
+                _ => panic!(),
+            };
+            let range = generators[0].iter.range();
+            let Expr::Await(after) = after.value.as_ref() else {
+                panic!()
+            };
+            let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+            assert_eq!(plan.remaining[&NativeRole::FunctionStart], 1);
+            assert_eq!(plan.remaining[&NativeRole::ComprehensionCleanup(range)], 5);
+            assert_eq!(plan.remaining[&NativeRole::ComprehensionEnd(range)], 6);
+            assert_eq!(plan.remaining[&NativeRole::ComprehensionStart(range)], 7);
+            assert_eq!(
+                plan.remaining[&NativeRole::ComprehensionIfCleanup(range)],
+                8
+            );
+            assert_eq!(plan.remaining[&NativeRole::ComprehensionAnchor(range)], 9);
+            let mut next = 10;
+            for value in values {
+                let Expr::Await(awaited) = value else {
+                    panic!()
+                };
+                assert_eq!(plan.remaining[&NativeRole::AwaitSend(awaited.range)], next);
+                assert_eq!(
+                    plan.remaining[&NativeRole::AwaitFail(awaited.range)],
+                    next + 1
+                );
+                assert_eq!(
+                    plan.remaining[&NativeRole::AwaitExit(awaited.range)],
+                    next + 2
+                );
+                next += 3;
+            }
+            assert_eq!(plan.remaining[&NativeRole::AwaitSend(after.range)], next);
+            assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], next + 3);
+            assert_eq!(plan.remaining.len(), usize::try_from(next + 3).unwrap());
+        }
+    }
+
+    #[test]
+    fn nested_results_restore_the_enclosing_await_context() {
+        let parsed = parse_module(
+            "async def f(xs, ys):\n    values = [(await before(item), [await inner(value) for value in ys], await after(item)) for item in xs]\n",
+        )
+        .unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 21);
+        assert_eq!(plan.remaining.len(), 21);
     }
 }
