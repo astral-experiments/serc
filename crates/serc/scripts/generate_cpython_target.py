@@ -1055,56 +1055,35 @@ def render(sources: dict[str, str]) -> str:
         )
         lookup[0] = "fn is_preinterned_static_string(value: &str) -> bool {"
         lines.extend(lookup)
+    jumps = {name for name in opcode_names if "HAS_JUMP_FLAG" in opcode_flags[name]}
+    expression = opcode_match_expression(opcodes, jumps)
     if TARGET_MINOR == "3.14":
-        lines.extend(["", "impl Opcode {"])
-        for method, flag in (
-            ("has_argument", "HAS_ARG_FLAG"),
-            ("has_constant", "HAS_CONST_FLAG"),
-            ("has_name", "HAS_NAME_FLAG"),
-            ("has_jump", "HAS_JUMP_FLAG"),
-            ("has_free", "HAS_FREE_FLAG"),
-            ("has_local", "HAS_LOCAL_FLAG"),
-        ):
-            names = {name for name in opcode_names if flag in opcode_flags[name]}
-            expression = opcode_match_expression(opcodes, names).replace(
-                "opcode", "self", 1
-            )
-            lines.extend(
-                [
-                    f"    pub(crate) const fn {method}(self) -> bool {{",
-                    f"        {expression} || super::legacy_opcodes::{method}(self)",
-                    "    }",
-                    "",
-                ]
-            )
-        lines.extend(["}", ""])
-    else:
-        for method, flag in (
-            ("has_argument", "HAS_ARG_FLAG"),
-            ("has_constant", "HAS_CONST_FLAG"),
-            ("has_name", "HAS_NAME_FLAG"),
-            ("has_jump", "HAS_JUMP_FLAG"),
-            ("has_free", "HAS_FREE_FLAG"),
-            ("has_local", "HAS_LOCAL_FLAG"),
-        ):
-            names = {name for name in opcode_names if flag in opcode_flags[name]}
-            if "GET_ITER" in names:
-                names.add("GET_YIELD_FROM_ITER")
-            semantic_opcodes = [*opcodes, ("GET_YIELD_FROM_ITER", 0)]
-            expression = opcode_match_expression(semantic_opcodes, names)
-            lines.extend(
-                [
-                    "#[allow(dead_code)]",
-                    f"pub(crate) const fn {method}(opcode: Opcode) -> bool {{",
-                    f"    {expression}",
-                    "}",
-                    "",
-                ]
-            )
-    for name, names in predicates.items():
+        expression = expression.replace("opcode", "self", 1)
         lines.extend(
             [
-                "#[allow(dead_code)]",
+                "",
+                "impl Opcode {",
+                "    pub(crate) const fn has_jump(self) -> bool {",
+                f"        {expression}",
+                "    }",
+                "}",
+                "",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "pub(crate) const fn has_jump(opcode: Opcode) -> bool {",
+                f"    {expression}",
+                "}",
+                "",
+            ]
+        )
+    for name, names in predicates.items():
+        if name == "is_unconditional_jump" and TARGET_MINOR != "3.14":
+            continue
+        lines.extend(
+            [
                 f"pub(crate) const fn {name}(opcode: Opcode) -> bool {{",
                 f"    {opcode_match_expression(opcodes, names)}",
                 "}",

@@ -180,114 +180,6 @@ pub(crate) const fn caches(opcode: Opcode) -> u8 {
     }
 }
 
-#[allow(dead_code)]
-pub(crate) const fn has_argument(opcode: Opcode) -> bool {
-    matches!(
-        opcode,
-        opcodes::BINARY_OP
-            | opcodes::BUILD_CONST_KEY_MAP
-            | opcodes::BUILD_LIST
-            | opcodes::BUILD_MAP
-            | opcodes::BUILD_SET
-            | opcodes::BUILD_SLICE
-            | opcodes::BUILD_STRING
-            | opcodes::BUILD_TUPLE
-            | opcodes::CALL
-            | opcodes::CALL_FUNCTION_EX
-            | opcodes::CALL_INTRINSIC_1
-            | opcodes::CALL_INTRINSIC_2
-            | opcodes::CALL_KW
-            | opcodes::COMPARE_OP
-            | opcodes::CONTAINS_OP
-            | opcodes::CONVERT_VALUE
-            | opcodes::COPY
-            | opcodes::COPY_FREE_VARS
-            | opcodes::DELETE_ATTR
-            | opcodes::DELETE_DEREF
-            | opcodes::DELETE_FAST
-            | opcodes::DELETE_GLOBAL
-            | opcodes::DELETE_NAME
-            | opcodes::DICT_MERGE
-            | opcodes::DICT_UPDATE
-            | opcodes::ENTER_EXECUTOR
-            | opcodes::EXTENDED_ARG
-            | opcodes::FOR_ITER
-            | opcodes::GET_AWAITABLE
-            | opcodes::IMPORT_FROM
-            | opcodes::IMPORT_NAME
-            | opcodes::IS_OP
-            | opcodes::JUMP_BACKWARD
-            | opcodes::JUMP_BACKWARD_NO_INTERRUPT
-            | opcodes::JUMP_FORWARD
-            | opcodes::LIST_APPEND
-            | opcodes::LIST_EXTEND
-            | opcodes::LOAD_ATTR
-            | opcodes::LOAD_CONST
-            | opcodes::LOAD_DEREF
-            | opcodes::LOAD_FAST
-            | opcodes::LOAD_FAST_AND_CLEAR
-            | opcodes::LOAD_FAST_CHECK
-            | opcodes::LOAD_FAST_LOAD_FAST
-            | opcodes::LOAD_FROM_DICT_OR_DEREF
-            | opcodes::LOAD_FROM_DICT_OR_GLOBALS
-            | opcodes::LOAD_GLOBAL
-            | opcodes::LOAD_NAME
-            | opcodes::LOAD_SUPER_ATTR
-            | opcodes::MAKE_CELL
-            | opcodes::MAP_ADD
-            | opcodes::MATCH_CLASS
-            | opcodes::POP_JUMP_IF_FALSE
-            | opcodes::POP_JUMP_IF_NONE
-            | opcodes::POP_JUMP_IF_NOT_NONE
-            | opcodes::POP_JUMP_IF_TRUE
-            | opcodes::RAISE_VARARGS
-            | opcodes::RERAISE
-            | opcodes::RETURN_CONST
-            | opcodes::SEND
-            | opcodes::SET_ADD
-            | opcodes::SET_FUNCTION_ATTRIBUTE
-            | opcodes::SET_UPDATE
-            | opcodes::STORE_ATTR
-            | opcodes::STORE_DEREF
-            | opcodes::STORE_FAST
-            | opcodes::STORE_FAST_LOAD_FAST
-            | opcodes::STORE_FAST_STORE_FAST
-            | opcodes::STORE_GLOBAL
-            | opcodes::STORE_NAME
-            | opcodes::SWAP
-            | opcodes::UNPACK_EX
-            | opcodes::UNPACK_SEQUENCE
-            | opcodes::YIELD_VALUE
-            | opcodes::RESUME
-    )
-}
-
-#[allow(dead_code)]
-pub(crate) const fn has_constant(opcode: Opcode) -> bool {
-    matches!(opcode, opcodes::LOAD_CONST | opcodes::RETURN_CONST)
-}
-
-#[allow(dead_code)]
-pub(crate) const fn has_name(opcode: Opcode) -> bool {
-    matches!(
-        opcode,
-        opcodes::DELETE_ATTR
-            | opcodes::DELETE_GLOBAL
-            | opcodes::DELETE_NAME
-            | opcodes::IMPORT_FROM
-            | opcodes::IMPORT_NAME
-            | opcodes::LOAD_ATTR
-            | opcodes::LOAD_FROM_DICT_OR_GLOBALS
-            | opcodes::LOAD_GLOBAL
-            | opcodes::LOAD_NAME
-            | opcodes::LOAD_SUPER_ATTR
-            | opcodes::STORE_ATTR
-            | opcodes::STORE_GLOBAL
-            | opcodes::STORE_NAME
-    )
-}
-
-#[allow(dead_code)]
 pub(crate) const fn has_jump(opcode: Opcode) -> bool {
     matches!(
         opcode,
@@ -303,34 +195,6 @@ pub(crate) const fn has_jump(opcode: Opcode) -> bool {
     )
 }
 
-#[allow(dead_code)]
-pub(crate) const fn has_free(opcode: Opcode) -> bool {
-    matches!(
-        opcode,
-        opcodes::DELETE_DEREF
-            | opcodes::LOAD_DEREF
-            | opcodes::LOAD_FROM_DICT_OR_DEREF
-            | opcodes::MAKE_CELL
-            | opcodes::STORE_DEREF
-    )
-}
-
-#[allow(dead_code)]
-pub(crate) const fn has_local(opcode: Opcode) -> bool {
-    matches!(
-        opcode,
-        opcodes::DELETE_FAST
-            | opcodes::LOAD_FAST
-            | opcodes::LOAD_FAST_AND_CLEAR
-            | opcodes::LOAD_FAST_CHECK
-            | opcodes::LOAD_FAST_LOAD_FAST
-            | opcodes::STORE_FAST
-            | opcodes::STORE_FAST_LOAD_FAST
-            | opcodes::STORE_FAST_STORE_FAST
-    )
-}
-
-#[allow(dead_code)]
 pub(crate) const fn is_scope_exit(opcode: Opcode) -> bool {
     matches!(
         opcode,
@@ -338,15 +202,6 @@ pub(crate) const fn is_scope_exit(opcode: Opcode) -> bool {
     )
 }
 
-#[allow(dead_code)]
-pub(crate) const fn is_unconditional_jump(opcode: Opcode) -> bool {
-    matches!(
-        opcode,
-        opcodes::JUMP_BACKWARD | opcodes::JUMP_BACKWARD_NO_INTERRUPT | opcodes::JUMP_FORWARD
-    )
-}
-
-#[allow(dead_code)]
 pub(crate) const fn is_conditional_jump(opcode: Opcode) -> bool {
     matches!(
         opcode,
