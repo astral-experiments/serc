@@ -55,9 +55,7 @@ impl OptimizationPipeline {
 
         let graph = &mut self.graph;
         let changed = !redundant.is_empty();
-        for position in redundant.into_iter().rev() {
-            graph.remove_item(position);
-        }
+        graph.remove_ordered_instructions(&redundant);
         changed
     }
 
