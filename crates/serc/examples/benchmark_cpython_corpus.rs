@@ -87,6 +87,7 @@ while True:
                 )
             except Exception:
                 rejected += 1
+                print(f"REJECT\t{index}", flush=True)
                 continue
             accepted.append((filename, source))
             precompiled.append(code)
@@ -593,7 +594,9 @@ impl PythonRunner {
     fn initialize(&mut self, sources: &[SourceFile]) -> Result<PythonManifest, String> {
         writeln!(self.stdin, "INIT\t{}", sources.len())
             .map_err(|error| format!("failed to initialize CPython: {error}"))?;
-        for source in sources {
+        let mut accepted_indices = Vec::new();
+        let mut marshaled = Vec::new();
+        for (index, source) in sources.iter().enumerate() {
             writeln!(
                 self.stdin,
                 "FILE\t{}\t{}",
@@ -602,24 +605,17 @@ impl PythonRunner {
             )
             .and_then(|()| self.stdin.write_all(source.filename.as_bytes()))
             .and_then(|()| self.stdin.write_all(source.source.as_bytes()))
+            .and_then(|()| self.stdin.flush())
             .map_err(|error| format!("failed to send {}: {error}", source.path.display()))?;
-        }
-        self.stdin
-            .flush()
-            .map_err(|error| format!("failed to flush CPython input: {error}"))?;
 
-        let mut accepted_indices = Vec::new();
-        let mut marshaled = Vec::new();
-        loop {
+            // Drain this file's response before sending the next source: both pipe
+            // buffers can fill when CPython returns a large marshal payload.
             let line = self.read_line()?;
             let fields = line.split('\t').collect::<Vec<_>>();
             match fields.as_slice() {
-                ["ACCEPT", index, length] => {
-                    accepted_indices.push(
-                        index
-                            .parse::<usize>()
-                            .map_err(|_| format!("invalid accepted index: {line}"))?,
-                    );
+                ["ACCEPT", accepted_index, length]
+                    if accepted_index.parse::<usize>() == Ok(index) =>
+                {
                     let length = length
                         .parse::<usize>()
                         .map_err(|_| format!("invalid marshal length: {line}"))?;
@@ -627,32 +623,42 @@ impl PythonRunner {
                     self.stdout.read_exact(&mut bytes).map_err(|error| {
                         format!("failed to read CPython marshal output: {error}")
                     })?;
+                    accepted_indices.push(index);
                     marshaled.push(bytes);
                 }
-                ["MANIFEST", accepted, rejected, source_bytes] => {
-                    let accepted = accepted
-                        .parse::<usize>()
-                        .map_err(|_| format!("invalid manifest: {line}"))?;
-                    if accepted != accepted_indices.len() {
-                        return Err(format!(
-                            "CPython reported {accepted} accepted files but sent {} indices",
-                            accepted_indices.len()
-                        ));
-                    }
-                    return Ok(PythonManifest {
-                        accepted_indices,
-                        marshaled,
-                        rejected: rejected
-                            .parse::<usize>()
-                            .map_err(|_| format!("invalid manifest: {line}"))?,
-                        source_bytes: source_bytes
-                            .parse::<usize>()
-                            .map_err(|_| format!("invalid manifest: {line}"))?,
-                    });
+                ["REJECT", rejected_index] if rejected_index.parse::<usize>() == Ok(index) => {}
+                _ => {
+                    return Err(format!(
+                        "invalid CPython file response for index {index}: {line}"
+                    ));
                 }
-                _ => return Err(format!("invalid CPython manifest response: {line}")),
             }
         }
+
+        let line = self.read_line()?;
+        let fields = line.split('\t').collect::<Vec<_>>();
+        let ["MANIFEST", accepted, rejected, source_bytes] = fields.as_slice() else {
+            return Err(format!("invalid CPython manifest response: {line}"));
+        };
+        let accepted = accepted
+            .parse::<usize>()
+            .map_err(|_| format!("invalid manifest: {line}"))?;
+        if accepted != accepted_indices.len() {
+            return Err(format!(
+                "CPython reported {accepted} accepted files but sent {} indices",
+                accepted_indices.len()
+            ));
+        }
+        Ok(PythonManifest {
+            accepted_indices,
+            marshaled,
+            rejected: rejected
+                .parse::<usize>()
+                .map_err(|_| format!("invalid manifest: {line}"))?,
+            source_bytes: source_bytes
+                .parse::<usize>()
+                .map_err(|_| format!("invalid manifest: {line}"))?,
+        })
     }
 
     fn run_phase(&mut self, phase: Phase) -> Result<SampleResult, String> {
@@ -1519,21 +1525,55 @@ mod tests {
 
     #[test]
     fn python_helper_benchmarks_only_accepted_sources() {
+        const CHILD: &str = "SERC_BENCHMARK_PROTOCOL_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Isolate the pipe exchange so a regression fails within a deadline
+            // instead of hanging the entire test suite.
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::python_helper_benchmarks_only_accepted_sources",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "CPython protocol test failed: {status}");
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("CPython protocol test exceeded 30 seconds");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
         let python =
             std::env::var("SERC_TEST_PYTHON").unwrap_or_else(|_| "python3.14".to_string());
         let sources = [
-            ("accepted.py", "answer = 'caf\u{e9}'\n"),
-            ("syntax.py", "if:\n"),
-            ("semantic.py", "return\n"),
+            (
+                "accepted.py",
+                format!("answer = '{}'\n", "caf\u{e9}".repeat(65_536)),
+            ),
+            ("syntax.py", "if:\n".to_string()),
+            ("semantic.py", "return\n".to_string()),
             (
                 "after_rejections.py",
-                "raise RuntimeError('compiled, never executed')\n",
+                format!(
+                    "raise RuntimeError('{}')\n",
+                    "compiled, never executed".repeat(8_192)
+                ),
             ),
         ]
         .map(|(filename, source)| SourceFile {
             path: PathBuf::from(filename),
             filename: filename.to_string(),
-            source: source.to_string(),
+            source,
         });
         let mut runner = PythonRunner::start(&python).unwrap();
         let manifest = runner.initialize(&sources).unwrap();
