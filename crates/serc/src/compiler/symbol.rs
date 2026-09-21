@@ -1223,6 +1223,17 @@ impl Compiler<'_> {
                         self.visit_body(&statement.orelse);
                         return;
                     }
+                    Stmt::Try(statement) if !statement.is_star => {
+                        // Ordinary try codegen visits the else suite before handlers.
+                        // Except-star keeps the AST order: handlers before else.
+                        self.visit_body(&statement.body);
+                        self.visit_body(&statement.orelse);
+                        for handler in &statement.handlers {
+                            self.visit_except_handler(handler);
+                        }
+                        self.visit_body(&statement.finalbody);
+                        return;
+                    }
                     Stmt::FunctionDef(definition) => {
                         let build = self.build_discarded && self.record_string_origins;
                         if build {

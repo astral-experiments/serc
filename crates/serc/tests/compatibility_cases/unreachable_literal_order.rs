@@ -71,3 +71,15 @@ fn matches_cpython_constants_first_visited_in_discarded_suites() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_names_in_unreachable_try_suites() {
+    for handler in ["except", "except*"] {
+        for terminal in ["raise NotImplementedError", "return"] {
+            let source = format!(
+                "def f(obj):\n    {terminal}\n    try:\n        obj.body_name('body-value')\n    {handler} HandlerError:\n        obj.handler_name('handler-value')\n    else:\n        obj.else_name('else-value')\n    finally:\n        obj.final_name('final-value')\n"
+            );
+            common::assert_matches_cpython_marshal(&source, "unreachable_try_names.py");
+        }
+    }
+}
