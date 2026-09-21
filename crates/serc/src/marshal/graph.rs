@@ -2326,15 +2326,20 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     }
 
     fn cached_slice_string(&mut self, value: &'code Constant) {
-        let Constant::String(value) = value else {
-            unreachable!("cached slice string callback requires a string")
-        };
-        // Slice members bypass the compiler's scalar constant cache. Their parsed
-        // Latin-1 characters remain singletons even if a fresh equal scalar won earlier.
-        self.graph.record_cached_value(
-            OccurrenceKind::Constant,
-            CachedObject::character(value).expect("cached slice string is a Latin-1 character"),
-        );
+        if self.graph.uncached_percent_constant
+            && matches!(value, Constant::String(value) if value == "%")
+        {
+            // Slice members bypass the scalar constant cache. The parsed percent
+            // singleton stays distinct from a fresh PyUnicode_Replace winner.
+            self.graph.record_cached_value(
+                OccurrenceKind::Constant,
+                CachedObject::character("%").expect("percent is a Latin-1 character"),
+            );
+        } else {
+            // Other characters retain ordinary canonical interning and can alias
+            // previously emitted names, literals, and other slice members.
+            self.constant(value, ReferenceMode::IfShared);
+        }
     }
 
     #[inline]
