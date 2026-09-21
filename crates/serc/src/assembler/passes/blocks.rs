@@ -5681,7 +5681,13 @@ impl OptimizationPipeline {
                 if let Some(location) = original_donor {
                     // Keep every copy round unlocated. The unique copied successor
                     // identifies this original marker after the schedule finishes.
-                    original_join_marker_donors.push((source, copied_label, marker, location));
+                    original_join_marker_donors.push((
+                        source,
+                        copied_label,
+                        marker,
+                        location,
+                        true,
+                    ));
                 }
                 graph.insert_item(
                     ItemPosition::new(source, position),
@@ -5703,7 +5709,7 @@ impl OptimizationPipeline {
                     original.depth_after(),
                 );
                 marker.set_exception_policy(original.exception_policy());
-                original_join_marker_donors.push((source, copied_label, marker, location));
+                original_join_marker_donors.push((source, copied_label, marker, location, false));
                 graph.insert_item(
                     ItemPosition::new(source, position),
                     Item::Instruction(marker),
@@ -6615,7 +6621,12 @@ impl OptimizationPipeline {
         // Location restoration must follow every copy round: locating a join's NOP
         // earlier can change the eligibility of a later original-array copy. Copies
         // receive new labels, so this seam certifies only the original jump marker.
-        for (source, successor, mut expected, location) in original_join_marker_donors {
+        for (source, successor, mut expected, location, store_donor) in original_join_marker_donors
+        {
+            // A surviving shared original cannot inherit this fallthrough store's line.
+            if store_donor && remaining_predecessors[source.index()] != 1 {
+                continue;
+            }
             let items = graph[source].items();
             let Some(successor_position) = items
                 .iter()

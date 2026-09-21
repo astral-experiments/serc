@@ -408,10 +408,9 @@ impl OptimizationPipeline {
                     }
                 }
 
-                // 3.12 resolves lines after static swaps, so the exchanged restore
+                // 3.12 resolves lines after static swaps, so the exchanged store
                 // supplies the successor's location instead of the original store.
                 if self.python_version >= crate::PythonVersion::Py313
-                    && first_instruction.local_policy.may_store_null()
                     && last_instruction.opcode == STORE_FAST
                     && !last_instruction.local_policy.may_store_null()
                 {
@@ -429,6 +428,12 @@ impl OptimizationPipeline {
                             .normal_try_copy_join_donors
                             .insert(*label, (origin.jump, last_instruction.location));
                     }
+                }
+                if self.python_version >= crate::PythonVersion::Py313
+                    && first_instruction.local_policy.may_store_null()
+                    && last_instruction.opcode == STORE_FAST
+                    && !last_instruction.local_policy.may_store_null()
+                {
                     // Native resolves unlocated successors before exchanging the target
                     // store with a comprehension restore. Retain that original origin.
                     for position in &positions[last + 1..] {

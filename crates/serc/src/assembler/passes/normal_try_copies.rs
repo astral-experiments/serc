@@ -646,7 +646,7 @@ impl OptimizationPipeline {
             jump.no_location_policy.allow_block_inlining();
             if let Some((predecessor, store)) = origin {
                 // This is only an original adjacency record. A successful static
-                // comprehension-restore exchange must certify the donor later.
+                // store exchange must certify the donor later.
                 join_origins.insert(
                     labels[&block.index()],
                     TupleJoinLocationOrigin {
