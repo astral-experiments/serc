@@ -419,6 +419,16 @@ impl BlockGraph {
         debug_assert_eq!(previous, UNBOUND_BLOCK, "label is bound more than once");
     }
 
+    /// Binds labels in a newly added block suffix in item order.
+    /// Labels in the suffix must be unbound; earlier bindings remain unchanged.
+    fn bind_block_labels(&mut self, block: BasicBlockId, start: usize) {
+        for index in start..self[block].items.len() {
+            if let Item::Label(label) = self[block].items[index] {
+                self.bind_label(label, block);
+            }
+        }
+    }
+
     fn unbind_label(&mut self, label: Label) {
         let index = usize::try_from(label.0).unwrap();
         if let Some(block) = self.label_blocks.get_mut(index) {
@@ -439,17 +449,7 @@ impl BlockGraph {
     pub(super) fn allocate_block(&mut self, items: Vec<Item>) -> BasicBlockId {
         let block = BasicBlockId(self.blocks.len());
         self.blocks.push(BasicBlock::new(items));
-        let labels = self[block]
-            .items()
-            .iter()
-            .filter_map(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
-        for label in labels {
-            self.bind_label(label, block);
-        }
+        self.bind_block_labels(block, 0);
         block
     }
 
@@ -612,16 +612,7 @@ impl BlockGraph {
         debug_assert!(self.order.contains(&block));
         let start = self[block].items.len();
         self.blocks[block.index()].items.extend(items);
-        let labels = self[block].items[start..]
-            .iter()
-            .filter_map(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
-        for label in labels {
-            self.bind_label(label, block);
-        }
+        self.bind_block_labels(block, start);
     }
 
     pub(super) fn insert_label(&mut self, block: BasicBlockId, position: usize, label: Label) {

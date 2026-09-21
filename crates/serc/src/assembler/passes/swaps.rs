@@ -67,9 +67,7 @@ impl OptimizationPipeline {
             graph.instruction_mut(first).unwrap().location = last_location;
             graph.instruction_mut(last).unwrap().location = first_location;
         }
-        for position in redundant.into_iter().rev() {
-            graph.remove_item(position);
-        }
+        graph.remove_ordered_instructions(&redundant);
         changed
     }
 
