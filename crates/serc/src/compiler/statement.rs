@@ -25611,6 +25611,17 @@ impl Compiler<'_> {
             [Stmt::Pass(statement)] => Some(self.source_location(statement.range)),
             _ => None,
         };
+        // At a synchronous manager's direct tail, the pass and normal-finally
+        // jump disappear into the following POP_BLOCK. Its surviving line marker
+        // has no exception owner, including in suspending scopes.
+        let pass_finally_leaves_manager =
+            self.control
+                .withs
+                .active_with_exits
+                .last()
+                .is_some_and(|manager| {
+                    !manager.is_async && manager.terminal_statement_range == Some(statement.range)
+                });
         let overriding_return = matches!(statement.finalbody.last(), Some(Stmt::Return(_)));
         if overriding_return
             && self.control.withs.active_with_region_exclusions.is_empty()
@@ -26236,6 +26247,7 @@ impl Compiler<'_> {
                     .control
                     .exceptions.active_exception_region_exclusions
                     .is_empty()
+                    && !pass_finally_leaves_manager
                 {
                     compiler.emit(NOP, 0, 0)?;
                 } else {
@@ -26568,11 +26580,12 @@ impl Compiler<'_> {
                 && !drop_shared_manager_exit_nop
                 && conditional_exit.is_none();
             let exception_policy = if pass_finally_location.is_some()
-                && !self
-                    .control
-                    .exceptions
-                    .active_exception_region_exclusions
-                    .is_empty()
+                && (pass_finally_leaves_manager
+                    || !self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty())
             {
                 ExceptionPolicy::EXCLUDE_ALWAYS
             } else {
