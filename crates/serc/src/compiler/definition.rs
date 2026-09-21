@@ -1684,14 +1684,15 @@ impl Compiler<'_> {
         }
         let mut local_names = vec!["format".to_string()];
         let mut references = ReferenceCollector::default();
-        if self.unit.flags & CO_FUTURE_ANNOTATIONS == 0
-            && !can_see_class_scope
-            && !freevars.is_empty()
-        {
+        let mut inlined_cellvars = FxHashSet::default();
+        if self.unit.flags & CO_FUTURE_ANNOTATIONS == 0 && !can_see_class_scope {
             // Reserve comprehension locals before assigning the annotation thunk's free slots.
             for (_, annotation) in &annotations {
-                references.visit_expr(annotation);
+                if !freevars.is_empty() {
+                    references.visit_expr(annotation);
+                }
                 local_names.extend(inlined_comprehension_local_names_in_expression(annotation));
+                inlined_cellvars.extend(inlined_comprehension_cell_names_in_expression(annotation));
             }
         }
         let mut seen = FxHashSet::default();
@@ -1702,9 +1703,12 @@ impl Compiler<'_> {
             .map(|name| self.required_name_id(name))
             .filter(|name| !freevars.contains(name))
             .collect();
+        let cellvars = self.name_id_set(inlined_cellvars);
         let plan = LoweringFunctionPlan {
             locals: self.name_ids(&local_names),
             freevars,
+            inlined_comprehension_cellvars: cellvars.clone(),
+            cellvars,
             ..LoweringFunctionPlan::default()
         };
         let parameter_flags = (if self.child_function_is_nested() {
@@ -1752,7 +1756,9 @@ impl Compiler<'_> {
             0,
             parameter_flags,
         )?;
-        if self.context.python_version == PythonVersion::Py315 {
+        if self.context.python_version == PythonVersion::Py315
+            || self.unit.generic_target_qualified_name.is_some()
+        {
             // Lambdas and generators inside annotations are qualified against
             // the enclosing scope, independently of the annotation owner's name.
             child.unit.child_qualified_name_parent =
@@ -1765,8 +1771,6 @@ impl Compiler<'_> {
                         .to_string()
                 });
         }
-        // Comprehension slots are synthetic locals, as when they were appended during lowering.
-        child.symbols.fast_local_count = 1;
         child.unit.private_name.clone_from(&self.unit.private_name);
         child
             .unit
@@ -1988,8 +1992,23 @@ impl Compiler<'_> {
         let first = annotations.first().ok_or_else(|| {
             CompileError::Internal("module annotation thunk has no annotations".to_string())
         })?;
+        let mut local_names = vec!["format".to_string()];
+        let mut inlined_cellvars = FxHashSet::default();
+        for annotation in &annotations {
+            local_names.extend(inlined_comprehension_local_names_in_expression(
+                &annotation.annotation,
+            ));
+            inlined_cellvars.extend(inlined_comprehension_cell_names_in_expression(
+                &annotation.annotation,
+            ));
+        }
+        let mut seen = FxHashSet::default();
+        local_names.retain(|name| seen.insert(name.clone()));
+        let cellvars = self.name_id_set(inlined_cellvars);
         let plan = LoweringFunctionPlan {
-            locals: vec![self.required_name_id("format")],
+            locals: self.name_ids(&local_names),
+            inlined_comprehension_cellvars: cellvars.clone(),
+            cellvars,
             ..LoweringFunctionPlan::default()
         };
         let mut child = Self::function(
