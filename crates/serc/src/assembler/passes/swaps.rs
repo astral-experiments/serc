@@ -25,29 +25,32 @@ impl OptimizationPipeline {
             .collect::<Vec<_>>();
         let mut previous = None;
         let mut redundant = Vec::new();
+        let mut pop_location_swaps = Vec::new();
         for (index, (position, instruction)) in instructions.iter().copied().enumerate() {
-            let remove = if instruction.opcode == SWAP
+            let removable_pops = if instruction.opcode == SWAP
                 && let Operand::Value(depth) = instruction.operand()
+                && previous.is_some_and(|previous: Instruction| previous.opcode == SWAP)
             {
-                let pop_count = usize::try_from(depth).unwrap_or(usize::MAX);
-                previous.is_some_and(|previous: Instruction| previous.opcode == SWAP)
-                    && instructions[index + 1..]
-                        .get(..pop_count)
-                        .is_some_and(|following| {
-                            // CPython cannot fold a rotation across distinct line events.
-                            let line = following
-                                .first()
-                                .map_or(-1, |(_, instruction)| instruction.location.line);
-                            following.iter().all(|(_, instruction)| {
-                                instruction.opcode == POP_TOP
-                                    && (line < 0 || instruction.location.line == line)
-                            })
+                instructions[index + 1..]
+                    .get(..usize::try_from(depth).unwrap_or(usize::MAX))
+                    .filter(|following| {
+                        // CPython cannot fold a rotation across distinct line events.
+                        let line = following
+                            .first()
+                            .map_or(-1, |(_, instruction)| instruction.location.line);
+                        following.iter().all(|(_, instruction)| {
+                            instruction.opcode == POP_TOP
+                                && (line < 0 || instruction.location.line == line)
                         })
+                    })
             } else {
-                false
+                None
             };
-            if remove {
+            if let Some(pops) = removable_pops {
                 redundant.push(position);
+                if let Some((first, last)) = pops.first().zip(pops.last()) {
+                    pop_location_swaps.push((first.0, last.0));
+                }
             } else {
                 previous = Some(instruction);
             }
@@ -55,6 +58,15 @@ impl OptimizationPipeline {
 
         let graph = &mut self.graph;
         let changed = !redundant.is_empty();
+        // Native static swapping exchanges the pop records from right to left.
+        // These identical opcodes keep their slot-derived depth and owner metadata,
+        // but their source spans must follow the removed stack permutation.
+        for (first, last) in pop_location_swaps.into_iter().rev() {
+            let first_location = graph.instruction_mut(first).unwrap().location;
+            let last_location = graph.instruction_mut(last).unwrap().location;
+            graph.instruction_mut(first).unwrap().location = last_location;
+            graph.instruction_mut(last).unwrap().location = first_location;
+        }
         for position in redundant.into_iter().rev() {
             graph.remove_item(position);
         }
