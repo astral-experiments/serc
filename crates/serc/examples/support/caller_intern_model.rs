@@ -36,6 +36,8 @@ const PARTIAL_MODE: &str = "pathlib-posix-source-bytes-partial-v2";
 const PARTIAL_BASELINE_SEMANTICS: &str = "guaranteed-positive";
 const UNKNOWN_DEFAULT: &str = "unknown";
 const DEPENDENCY_POLICY: &str = "fail-if-marshal-depends-on-unknown";
+const RETAINED_NATIVE_POSITIVE_SHA256: Option<&str> =
+    Some("7c4035bbc11d5b0de867d7ac53cd11b1848287134fcf6e3c2ca7aad5da575486");
 const ABSENCE_MODE: &str = "pathlib-posix-source-bytes-partial-v3";
 const EXACT_ABSENCE_MODE: &str = "pathlib-posix-source-bytes-partial-v4";
 const COOKIE_EVIDENCE_SHA256: &str =
@@ -174,6 +176,7 @@ struct Descriptor {
     dependency_policy: Option<String>,
     positive_baseline_evidence: Option<Artifact>,
     absence_evidence: Option<Artifact>,
+    retained_native_positive_evidence: Option<Artifact>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -226,10 +229,17 @@ pub(super) fn load(
     python_version: PythonVersion,
     source_bytes: bool,
     oracle: &str,
+    assume_absent: bool,
 ) -> Result<LoadedModel, String> {
     let descriptor_bytes = regular_bytes(path).map_err(|error| error.to_string())?;
     let descriptor: Descriptor = read_json(&descriptor_bytes)?;
     descriptor.validate_contract(python_version, source_bytes, oracle)?;
+    require(
+        !assume_absent
+            || (python_version == PythonVersion::Py313
+                && descriptor.positive_baseline_evidence.is_some()),
+        "assume-absent diagnostic requires a Python 3.13 guaranteed-positive caller model",
+    )?;
     let reviewed = reviewed_model(python_version)?;
     require(
         descriptor.sealed_profile.path == sealed_profile_path,
@@ -256,7 +266,7 @@ pub(super) fn load(
     }
     read_artifact(&descriptor.model.pathlib, &mut inputs)?;
     read_artifact(&descriptor.model.posixpath, &mut inputs)?;
-    let baseline = read_entries(&read_artifact(&descriptor.baseline, &mut inputs)?)?;
+    let mut baseline = read_entries(&read_artifact(&descriptor.baseline, &mut inputs)?)?;
     require(
         baseline.len() == reviewed.baseline_entries
             && baseline.contains("")
@@ -304,26 +314,30 @@ pub(super) fn load(
             read_artifact(item, &mut inputs)?;
         }
     }
+    if let Some(item) = &descriptor.retained_native_positive_evidence {
+        baseline.extend(load_retained_native_positives(
+            item,
+            &descriptor,
+            &mut inputs,
+        )?);
+    }
     let absence = descriptor
         .absence_evidence
         .as_ref()
         .map(|item| load_absence(item, &descriptor.target, &descriptor.mode, &mut inputs))
         .transpose()?;
-    let source_cookie_masks = absence.is_some();
+    let has_absence_evidence = absence.is_some();
     let required_absent_paths = absence
         .as_ref()
         .map_or_else(Vec::new, |(_, paths)| paths.clone());
     let entries = baseline.into_iter().chain(phase);
     let partial = descriptor.positive_baseline_evidence.is_some();
-    let state = if let Some((possible_names, _)) = absence {
-        InitialInternState::from_partial_with_absence(entries, move |version, value| {
-            possible_names.proves_absence(version, value)
-        })
-    } else if partial {
-        InitialInternState::from_partial(entries)
-    } else {
-        InitialInternState::from_complete(entries)
-    };
+    let (state, source_cookie_masks) = initial_state(
+        entries,
+        absence.map(|(names, _)| names),
+        partial,
+        assume_absent,
+    );
     let mut evidence = json!({
         "mode": descriptor.mode,
         "descriptor": artifact(path, &descriptor_bytes),
@@ -347,7 +361,7 @@ pub(super) fn load(
         evidence["effective_state"] =
             json!("guaranteed-positive-baseline-plus-fixed-phase-plus-retained-path-components");
     }
-    if source_cookie_masks {
+    if has_absence_evidence {
         evidence["absence_evidence"] = json!(descriptor.absence_evidence);
         evidence["positive_component_contract"] = json!({
             "schema_version": 2, "mode": PARTIAL_MODE,
@@ -356,6 +370,12 @@ pub(super) fn load(
             "guaranteed-positive-baseline-plus-fixed-phase-plus-retained-path-components-with-proved-absence-and-source-cookie-unknown-masks"
         );
     }
+    if let Some(item) = &descriptor.retained_native_positive_evidence {
+        evidence["retained_native_positive_evidence"] = json!(item);
+    }
+    if assume_absent {
+        mark_assume_absent(&mut evidence);
+    }
     Ok(LoadedModel {
         state,
         source_cookie_masks,
@@ -363,6 +383,43 @@ pub(super) fn load(
         evidence,
         inputs,
     })
+}
+
+fn initial_state(
+    entries: impl IntoIterator<Item = String>,
+    possible_names: Option<PossibleNames>,
+    partial: bool,
+    assume_absent: bool,
+) -> (InitialInternState, bool) {
+    if assume_absent {
+        // Explicit diagnostic assumption: only supplied positives are retained.
+        // No predicate, source cookie, or per-file result selects additional facts.
+        (InitialInternState::from_complete(entries), false)
+    } else if let Some(possible_names) = possible_names {
+        (
+            InitialInternState::from_partial_with_absence(entries, move |version, value| {
+                possible_names.proves_absence(version, value)
+            }),
+            true,
+        )
+    } else if partial {
+        (InitialInternState::from_partial(entries), false)
+    } else {
+        (InitialInternState::from_complete(entries), false)
+    }
+}
+
+fn mark_assume_absent(evidence: &mut Value) {
+    // Keep the admitted descriptor and its evidence as provenance. Neither an
+    // absent table entry nor the retained absence proof justifies this heuristic.
+    evidence["initial_unknown_assumption"] = json!("absent");
+    evidence["assumption_status"] = json!("heuristic-not-source-proved");
+    evidence["source_cookie_unknown_masks"] = json!(false);
+    evidence["unknown_default"] = json!("assumed-absent");
+    evidence["dependency_policy"] = json!("diagnostic-assume-absent");
+    evidence["effective_state"] = json!(
+        "guaranteed-positive-baseline-plus-fixed-phase-plus-retained-path-components-with-heuristic-assume-absent-default"
+    );
 }
 
 impl Descriptor {
@@ -453,6 +510,16 @@ impl Descriptor {
             },
             "caller state semantics or guaranteed-positive evidence differs from the reviewed contract",
         )?;
+        if let Some(item) = &self.retained_native_positive_evidence {
+            require(
+                python_version == PythonVersion::Py313 && self.positive_baseline_evidence.is_some(),
+                "retained native positives require a Python 3.13 guaranteed-positive caller model",
+            )?;
+            require(
+                RETAINED_NATIVE_POSITIVE_SHA256.is_some_and(|expected| item.sha256 == expected),
+                "unadmitted retained native positive evidence",
+            )?;
+        }
         if let Some(rule) = AbsenceRule::for_mode(&self.mode) {
             let pins = rule.pins()?;
             require(
@@ -582,6 +649,64 @@ fn canonical_filename(filename: &str) -> String {
     } else {
         format!("{root}{tail}")
     }
+}
+
+// Family and review metadata is bound by the admitted aggregate hash. Its
+// canonical names supplement the immutable baseline without rewriting it.
+#[derive(Deserialize)]
+struct RetainedNativePositiveEvidence {
+    schema_version: u32,
+    kind: String,
+    target: Value,
+    compiler_input_mode: String,
+    oracle_sha256: String,
+    sealed_profile_sha256: String,
+    executable_sha256: String,
+    runtime_inputs_sha256: String,
+    names: Artifact,
+    artifacts: Vec<Artifact>,
+}
+
+impl RetainedNativePositiveEvidence {
+    fn validate(&self, descriptor: &Descriptor) -> Result<(), String> {
+        require(
+            self.schema_version == 1
+                && self.kind == "retained-native-positive-v1"
+                && self.target == descriptor.target
+                && self.compiler_input_mode == descriptor.compiler_input_mode
+                && self.oracle_sha256 == descriptor.oracle_sha256
+                && self.sealed_profile_sha256 == descriptor.sealed_profile.sha256
+                && self.executable_sha256 == descriptor.executable.sha256
+                && self.runtime_inputs_sha256 == descriptor.runtime_inputs.sha256
+                && !self.artifacts.is_empty(),
+            "retained native positives differ from the admitted caller protocol",
+        )
+    }
+}
+
+fn load_retained_native_positives(
+    item: &Artifact,
+    descriptor: &Descriptor,
+    inputs: &mut Vec<Artifact>,
+) -> Result<Vec<String>, String> {
+    let evidence: RetainedNativePositiveEvidence = read_json(&read_artifact(item, inputs)?)?;
+    evidence.validate(descriptor)?;
+    let names = read_retained_native_names(&read_artifact(&evidence.names, inputs)?)?;
+    for artifact in &evidence.artifacts {
+        read_artifact(artifact, inputs)?;
+    }
+    Ok(names)
+}
+
+fn read_retained_native_names(bytes: &[u8]) -> Result<Vec<String>, String> {
+    let names: Vec<String> = read_json(bytes)?;
+    require(
+        !names.is_empty()
+            && names.iter().all(|name| !name.is_empty())
+            && names.windows(2).all(|pair| pair[0] < pair[1]),
+        "retained native names must be sorted unique nonempty strings",
+    )?;
+    Ok(names)
 }
 
 // Additional review metadata is allowed: the independently admitted aggregate
@@ -1294,6 +1419,212 @@ mod tests {
             compile(&CompilerInput::Text(source.to_string()), "absence.py"),
             Err(CompileError::Internal(_))
         ));
+    }
+
+    #[test]
+    fn assume_absent_diagnostic_preserves_positive_facts_and_resets_each_filename() {
+        use super::super::{CompilerInput, compile_module_input};
+        use serc::CompileError;
+
+        let baseline = "diagnostic_baseline_105";
+        let phase = "diagnostic_phase_105";
+        let unknown = "diagnostic_unknown_105";
+        let make_model = |assume_absent| {
+            let (state, source_cookie_masks) = initial_state(
+                [baseline.to_string()]
+                    .into_iter()
+                    .chain([phase.to_string()]),
+                Some(PossibleNames::Exact(BTreeSet::from([unknown.to_string()]))),
+                true,
+                assume_absent,
+            );
+            LoadedModel {
+                state,
+                source_cookie_masks,
+                required_absent_paths: Vec::new(),
+                evidence: Value::Null,
+                inputs: Vec::new(),
+            }
+        };
+        let diagnostic = make_model(true);
+        let proved = make_model(false);
+        assert!(!diagnostic.source_cookie_masks);
+        assert!(proved.source_cookie_masks);
+        let options = CompileOptions {
+            python_version: PythonVersion::Py313,
+            ..CompileOptions::default()
+        };
+        for marker in [baseline, phase, unknown] {
+            let source = format!(
+                "# line one\n# line two\n# coding:{marker}\ndef first(x):\n    return x in {{'{marker}'}}\ndef second(x):\n    'different tuple'\n    return x in {{'{marker}'}}\n"
+            );
+            let input = CompilerInput::Bytes(source.as_bytes().to_vec());
+            let compile = |filename, model: &LoadedModel| {
+                compile_module_input(&input, filename, &options, Some(model))
+            };
+            let bytes = compile("diagnostic.py", &diagnostic).unwrap().marshal();
+            let reference = |filename, entries: Vec<&str>| {
+                serc::compile_with_options(
+                    &source,
+                    filename,
+                    &CompileOptions {
+                        python_version: PythonVersion::Py313,
+                        initial_intern_state: InitialInternState::from_complete(entries),
+                    },
+                )
+                .unwrap()
+                .marshal()
+            };
+            assert_eq!(
+                bytes,
+                reference("diagnostic.py", vec![baseline, phase, "diagnostic.py"])
+            );
+            if marker == unknown {
+                assert_eq!(
+                    compile("diagnostic.py", &proved).unwrap_err(),
+                    CompileError::UnresolvedInternState {
+                        value: unknown.to_string()
+                    }
+                );
+                let filename = "diagnostic_unknown_105/diagnostic.py";
+                assert_eq!(
+                    compile(filename, &diagnostic).unwrap().marshal(),
+                    reference(filename, vec![baseline, phase, unknown, "diagnostic.py"])
+                );
+                assert_eq!(
+                    compile("diagnostic.py", &diagnostic).unwrap().marshal(),
+                    bytes
+                );
+            } else {
+                assert_eq!(compile("diagnostic.py", &proved).unwrap().marshal(), bytes);
+                assert_ne!(
+                    bytes,
+                    reference(
+                        "diagnostic.py",
+                        vec![
+                            if marker == baseline { phase } else { baseline },
+                            "diagnostic.py"
+                        ]
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn assume_absent_evidence_labels_the_heuristic_and_retains_provenance() {
+        let mut evidence = json!({"mode": EXACT_ABSENCE_MODE, "absence_evidence": {"sha256": "original proof provenance"}});
+        mark_assume_absent(&mut evidence);
+        assert_eq!(evidence["mode"], EXACT_ABSENCE_MODE);
+        assert_eq!(
+            evidence["absence_evidence"]["sha256"],
+            "original proof provenance"
+        );
+        assert_eq!(evidence["assumption_status"], "heuristic-not-source-proved");
+        assert_eq!(evidence["initial_unknown_assumption"], "absent");
+        assert_eq!(evidence["unknown_default"], "assumed-absent");
+        assert_eq!(evidence["dependency_policy"], "diagnostic-assume-absent");
+        assert_eq!(evidence["source_cookie_unknown_masks"], false);
+    }
+
+    #[test]
+    fn retained_native_evidence_requires_admission_without_retagging_observations() {
+        let mut descriptor = partial_descriptor();
+        assert!(descriptor.retained_native_positive_evidence.is_none());
+        let prior = observation(&descriptor);
+        let mut unadmitted = descriptor.baseline.clone();
+        unadmitted.sha256 = "unadmitted".to_string();
+        descriptor.retained_native_positive_evidence = Some(unadmitted.clone());
+        assert!(
+            descriptor
+                .validate_contract(PythonVersion::Py313, true, super::super::ORACLE)
+                .is_err()
+        );
+        assert!(prior.validate(&descriptor).is_ok());
+        let mut older = self::descriptor();
+        older.retained_native_positive_evidence = Some(unadmitted);
+        assert!(
+            older
+                .validate_contract(PythonVersion::Py312, true, super::super::ORACLE)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn retained_native_evidence_binds_target_protocol_and_canonical_names() {
+        let descriptor = partial_descriptor();
+        let value = json!({
+            "schema_version": 1, "kind": "retained-native-positive-v1",
+            "target": descriptor.target, "compiler_input_mode": descriptor.compiler_input_mode,
+            "oracle_sha256": descriptor.oracle_sha256,
+            "sealed_profile_sha256": descriptor.sealed_profile.sha256,
+            "executable_sha256": descriptor.executable.sha256,
+            "runtime_inputs_sha256": descriptor.runtime_inputs.sha256,
+            "names": descriptor.baseline, "artifacts": [descriptor.model.pathlib],
+        });
+        let check = |value| {
+            serde_json::from_value::<RetainedNativePositiveEvidence>(value)
+                .unwrap()
+                .validate(&descriptor)
+        };
+        assert!(check(value.clone()).is_ok());
+        for (key, replacement) in [
+            ("target", json!({})),
+            ("compiler_input_mode", json!("text")),
+            ("runtime_inputs_sha256", json!("changed")),
+            ("artifacts", json!([])),
+        ] {
+            let mut changed = value.clone();
+            changed[key] = replacement;
+            assert!(check(changed).is_err(), "{key}");
+        }
+        assert_eq!(
+            read_retained_native_names(br#"["native_owner_106"]"#).unwrap(),
+            ["native_owner_106"]
+        );
+        for invalid in [
+            r#"[]"#,
+            r#"[""]"#,
+            r#"["a","a"]"#,
+            r#"["b","a"]"#,
+            r#"[null]"#,
+        ] {
+            assert!(
+                read_retained_native_names(invalid.as_bytes()).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_native_positives_change_shared_set_identity_in_both_modes() {
+        use serc::CompileError;
+        let marker = "native_owner_106";
+        let source = "def first(x):\n    return x in {'native_owner_106'}\ndef second(x):\n    'different tuple'\n    return x in {'native_owner_106'}\n";
+        let compile = |names: Vec<String>, assume_absent| {
+            let (state, _) = initial_state(names, None, true, assume_absent);
+            serc::compile_with_options(
+                source,
+                "native.py",
+                &CompileOptions {
+                    python_version: PythonVersion::Py313,
+                    initial_intern_state: state,
+                },
+            )
+            .map(|module| module.marshal())
+        };
+        assert_eq!(
+            compile(Vec::new(), false).unwrap_err(),
+            CompileError::UnresolvedInternState {
+                value: marker.to_string()
+            }
+        );
+        let absent = compile(Vec::new(), true).unwrap();
+        let names = read_retained_native_names(br#"["native_owner_106"]"#).unwrap();
+        let retained = compile(names.clone(), false).unwrap();
+        assert_ne!(retained, absent);
+        assert_eq!(compile(names, true).unwrap(), retained);
+        assert_eq!(compile(Vec::new(), true).unwrap(), absent);
     }
 
     #[test]

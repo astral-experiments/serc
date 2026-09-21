@@ -166,9 +166,20 @@ struct Options {
     /// Reproduce a validated caller protocol from an independent pre-path baseline.
     #[arg(long, value_name = "MODEL.json")]
     caller_intern_model: Option<PathBuf>,
+    /// Diagnostic only: preserve known caller entries and assume every other entry absent.
+    #[arg(long, requires = "caller_intern_model")]
+    caller_intern_assume_absent: bool,
 }
 
 impl Options {
+    fn validate_assume_absent(&self, cache_read: bool) -> Result<(), String> {
+        if self.caller_intern_assume_absent && !cache_read {
+            Err("--caller-intern-assume-absent requires admitted native cache reading".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
     fn expected_outcome_counts(&self) -> Result<BTreeMap<OutcomeKind, usize>, String> {
         let mut outcomes = BTreeMap::new();
         for (kind, count) in self
@@ -208,6 +219,10 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     let read_config = env::var_os("SERC_NATIVE_CACHE_READ");
+    if let Err(message) = options.validate_assume_absent(read_config.is_some()) {
+        eprintln!("{message}");
+        return ExitCode::from(2);
+    }
     if read_config.is_some()
         && (env::var_os("SERC_NATIVE_CACHE_WRITE").is_some()
             || options.dump_mismatches.is_some()
@@ -267,6 +282,7 @@ fn main() -> ExitCode {
                 options.python_version,
                 options.source_bytes,
                 ORACLE,
+                options.caller_intern_assume_absent,
             )
         })
         .transpose()
@@ -979,6 +995,26 @@ mod tests {
         assert_eq!(options.examples, 10);
         let options = Options::try_parse_from(["compare_cpython_corpus", "corpus"]).unwrap();
         assert_eq!(options.roots, [Path::new("corpus")]);
+    }
+
+    #[test]
+    fn assume_absent_is_opt_in_and_requires_a_model_and_cached_native_outputs() {
+        let defaults = Options::try_parse_from(["compare_cpython_corpus"]).unwrap();
+        assert!(!defaults.caller_intern_assume_absent);
+        assert!(defaults.validate_assume_absent(false).is_ok());
+        let error =
+            Options::try_parse_from(["compare_cpython_corpus", "--caller-intern-assume-absent"])
+                .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        let diagnostic = Options::try_parse_from([
+            "compare_cpython_corpus",
+            "--caller-intern-model",
+            "model.json",
+            "--caller-intern-assume-absent",
+        ])
+        .unwrap();
+        assert!(diagnostic.validate_assume_absent(false).is_err());
+        assert!(diagnostic.validate_assume_absent(true).is_ok());
     }
 
     #[test]
