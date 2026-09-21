@@ -688,3 +688,19 @@ fn normal_finally_comparisons_reuse_their_original_owned_slots() {
         }
     }
 }
+
+#[test]
+fn preserves_pass_finalizer_before_copied_return() {
+    for (definition, body) in [
+        ("def", "work()"),
+        ("def", "yield work()"),
+        ("async def", "await work()"),
+    ] {
+        for returned in ["None", "value", "42", "work()"] {
+            let source = format!(
+                "{definition} f(value):\n    try:\n        {body}\n    finally:\n        pass\n    return {returned}\n",
+            );
+            common::assert_matches_cpython_marshal(&source, "pass_finalizer_copied_return.py");
+        }
+    }
+}

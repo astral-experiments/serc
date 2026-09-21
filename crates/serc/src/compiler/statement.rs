@@ -27257,6 +27257,25 @@ impl Compiler<'_> {
                 // shared join and stops borrowed-load traversal at its continuation.
                 self.assembler.defer_jump_removal(normal_exit);
                 self.assembler.prevent_borrow_reachability(end);
+            } else if self.context.python_version >= crate::PythonVersion::Py314
+                && pass_finally_location.is_some()
+                && pass_finally_location == self.assembler.last_instruction_location()
+                && statement.handlers.is_empty()
+                && statement.orelse.is_empty()
+                && suite_has_linear_borrow_fallthrough(&statement.body)
+                && self
+                    .assembler
+                    .instruction_location_at(normal_finally_pop_block)
+                    == Some(SourceLocation::NONE)
+                && !pass_finally_leaves_manager
+                && exception_policy == ExceptionPolicy::default()
+            {
+                // A populated linear body leaves the original POP_BLOCK unlocated;
+                // folded or shared joins can carry a separate donor into that slot.
+                // Early NOP compaction moves this authored Pass onto the normal
+                // exit, whose line native small-exit copying retains before appending
+                // a differently located return.
+                self.assembler.preserve_authored_pass_jump_nop(normal_exit);
             } else if !preserve_exit_nop
                 && (matches!(conditional_exit, Some(NestedIfExitLocation::Located(_)))
                     || matches!(statement.finalbody.last(), Some(Stmt::If(tail))
