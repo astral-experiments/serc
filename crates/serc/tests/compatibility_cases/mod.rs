@@ -164,6 +164,7 @@ mod loop_tail_chained_compare_compatibility;
 mod loop_tail_handler_backedges;
 mod loop_tail_value_patterns;
 mod looped_sync_with_handler_return_compatibility;
+mod manager_cleanup_delete_donors;
 mod manager_finally_borrow_blocks;
 mod manager_while_continuations;
 mod mapping_bare_capture_compatibility;

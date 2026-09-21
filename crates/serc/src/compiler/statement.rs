@@ -27694,8 +27694,9 @@ impl Compiler<'_> {
                     // A linear finalbody tail can inherit the manager POP_BLOCK from a
                     // handler or else exit. Conditional tails retain their own join owner.
                     || (statement.finalbody.last().is_some_and(|last| {
-                        matches!(last, Stmt::Expr(_) | Stmt::Assign(_))
-                            && suite_has_linear_borrow_fallthrough(std::slice::from_ref(last))
+                        (matches!(last, Stmt::Expr(_) | Stmt::Assign(_))
+                            && suite_has_linear_borrow_fallthrough(std::slice::from_ref(last)))
+                            || is_linear_delete(last)
                     }) && try_normal_exit_predecessors(statement) > 0))
                 && !suite_terminates(&statement.finalbody)
                 && !suite_terminates(leading)
@@ -30269,6 +30270,10 @@ fn with_body_conditional_exit_location(
         statement @ (Stmt::Expr(_) | Stmt::Assign(_) | Stmt::Pass(_)) => {
             Some(implicit_return_range(compiler, statement))
         }
+        Stmt::Delete(deletion) => deletion
+            .targets
+            .last()
+            .and_then(|target| delete_exit_range(compiler, target)),
         Stmt::Assert(assertion)
             if condition_has_only_runtime_tests(&assertion.test)
                 && original_condition_has_unique_jump_target(&assertion.test, true) =>
@@ -30329,7 +30334,36 @@ fn with_body_suppression_exit_location(body: &[Stmt]) -> Option<TextRange> {
     }
 }
 
-// Direct exits in the other arms leave one call or suppressed inner manager as the
+/// Deletion with branch-free targets leaves one populated normal cleanup block.
+fn is_linear_delete(statement: &Stmt) -> bool {
+    matches!(statement, Stmt::Delete(deletion)
+    if !deletion.targets.is_empty()
+        && deletion.targets.iter().all(|target| {
+            last_delete_leaf(target).is_some()
+                && !expression_contains_inline_branch(target)
+                && !expression_suspends_current_scope(target)
+        }))
+}
+
+/// Finds the last emitted deletion target without inventing a donor for an empty target.
+fn last_delete_leaf(expression: &Expr) -> Option<&Expr> {
+    match expression {
+        Expr::Tuple(tuple) => tuple.elts.last().and_then(last_delete_leaf),
+        Expr::List(list) => list.elts.last().and_then(last_delete_leaf),
+        Expr::Name(_) | Expr::Attribute(_) | Expr::Subscript(_) => Some(expression),
+        _ => None,
+    }
+}
+
+/// Uses the DELETE opcode's span, including multiline attribute-name adjustment.
+fn delete_exit_range(compiler: &Compiler<'_>, expression: &Expr) -> Option<TextRange> {
+    Some(match last_delete_leaf(expression)? {
+        Expr::Attribute(attribute) => compiler.attribute_opcode_range(attribute),
+        target => target.range(),
+    })
+}
+
+// Direct exits in the other arms leave one populated arm or suppressed inner manager as the
 // only normal predecessor of the enclosing manager's converted POP_BLOCK.
 fn with_chained_manager_exit_location(
     compiler: &Compiler<'_>,
@@ -30372,17 +30406,26 @@ fn with_chained_manager_exit_location(
             {
                 manager.items[0].context_expr.range()
             }
-            fallthrough @ Stmt::Expr(expression)
-                if matches!(expression.value.as_ref(), Expr::Call(_))
-                    && condition_has_only_runtime_tests(&statement.test)
+            fallthrough @ (Stmt::Expr(_) | Stmt::Assign(_) | Stmt::Delete(_))
+                if condition_has_only_runtime_tests(&statement.test)
                     && statement.elif_else_clauses.iter().all(|clause| {
                         clause
                             .test
                             .as_ref()
                             .is_none_or(condition_has_only_runtime_tests)
-                    }) =>
+                    })
+                    && (matches!(fallthrough, Stmt::Expr(expression)
+                        if matches!(expression.value.as_ref(), Expr::Call(_)))
+                        || matches!(fallthrough, Stmt::Assign(_) | Stmt::Delete(_))) =>
             {
-                implicit_return_range(compiler, fallthrough)
+                if let Stmt::Delete(deletion) = fallthrough {
+                    deletion
+                        .targets
+                        .last()
+                        .and_then(|target| delete_exit_range(compiler, target))?
+                } else {
+                    implicit_return_range(compiler, fallthrough)
+                }
             }
             _ => return None,
         };
@@ -32030,6 +32073,10 @@ fn suite_has_linear_raise_exit(body: &[Stmt]) -> bool {
 // A leading runtime raising guard adds an exceptional exit without changing that donor.
 fn suite_has_located_finally_arm(body: &[Stmt]) -> bool {
     suite_has_linear_borrow_fallthrough(body)
+        || body.split_last().is_some_and(|(last, prefix)| {
+            is_linear_delete(last)
+                && (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
+        })
         || matches!(body, [Stmt::If(guard), rest @ ..]
             if guard.elif_else_clauses.is_empty()
                 && condition_has_only_runtime_tests(&guard.test)
