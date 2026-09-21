@@ -683,3 +683,5 @@ mod except_star_finally_source_boundary;
 mod protected_loop_surviving_break;
 mod protected_reraise_fixed_point;
 mod synthetic_range_entry_copy_budget;
+
+mod named_elif_cleanup_locations;

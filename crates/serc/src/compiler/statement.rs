@@ -22120,6 +22120,22 @@ impl Compiler<'_> {
                         })
             )
                 || handler_ends_with_simple_unlocated_if_cleanup
+                // Earlier terminating arms leave the last elif's false edge and body
+                // fallthrough sharing the artificial cleanup before a continuation.
+                || (handler.name.is_some()
+                    && loop_tail.is_none()
+                    && !cleanup_has_small_return_successor
+                    && (self.control.statements.current_statement_has_following
+                        || self.control.statements.inherited_statement_has_following
+                        || has_lowered_loop_condition_successor
+                        // A final nested try in the prefix's else suite reaches the
+                        // same separately lowered condition as its enclosing try.
+                        || self.control.loops.split_loop_tail_prefix_end.is_some_and(|prefix| {
+                            prefix.contains_range(statement.range)
+                                && prefix.end() == statement.range.end()
+                        }))
+                    && matches!(handler.body.last(), Some(Stmt::If(tail))
+                        if handler_cleanup_has_runtime_elif_join(tail)))
                 || (loop_tail.is_none()
                     && has_enclosing_cleanup_continuation
                     && matches!(handler.body.last(), Some(Stmt::If(tail))
@@ -34449,6 +34465,30 @@ fn handler_cleanup_has_complete_runtime_join(statement: &ruff_python_ast::StmtIf
                     _ => false,
                 })
         })
+}
+
+// A final elif has a false edge and a linear fallthrough into the handler cleanup.
+// When all earlier arms terminate, neither normal edge has an unconditional jump
+// that can receive a copied cleanup. CPython leaves their shared entry unlocated.
+fn handler_cleanup_has_runtime_elif_join(statement: &ruff_python_ast::StmtIf) -> bool {
+    let Some((last, earlier)) = statement.elif_else_clauses.split_last() else {
+        return false;
+    };
+    condition_has_only_runtime_tests(&statement.test)
+        && suite_terminates_before_constant_folding(&statement.body)
+        && earlier.iter().all(|clause| {
+            clause
+                .test
+                .as_ref()
+                .is_some_and(condition_has_only_runtime_tests)
+                && suite_terminates_before_constant_folding(&clause.body)
+        })
+        && last
+            .test
+            .as_ref()
+            .is_some_and(condition_has_only_runtime_tests)
+        && suite_has_linear_borrow_fallthrough(&last.body)
+        && !suite_contains_yield(&last.body)
 }
 
 // Earlier terminating arms bypass cleanup; a final else's partial runtime conditional
