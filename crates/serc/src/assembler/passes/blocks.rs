@@ -7198,6 +7198,18 @@ impl OptimizationPipeline {
             ));
         }
 
+        // Copying and splitting protected regions can introduce boundaries in an
+        // original block after the initial boundary snapshot. Retain those labels
+        // even when every instruction in the original block has been copied away.
+        for block in self
+            .exception_regions
+            .iter()
+            .flat_map(|region| [region.start, region.end, region.target])
+            .filter_map(|label| graph.label_block(label))
+        {
+            exception_boundary_blocks[block.index()] = true;
+        }
+
         // Dropped originals may retain labels for exception accounting. They cannot
         // certify the identity of the next surviving NOP after normalization.
         let shared_pop_block_heads = shared_pop_block_heads
