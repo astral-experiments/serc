@@ -6891,6 +6891,15 @@ impl Compiler<'_> {
         self.assembler
             .record_exception_owner_block_boundary(else_label);
         self.assembler.mark(else_label);
+        if self.context.python_version == PythonVersion::Py314
+            && matches!(expression.test.as_ref(), Expr::UnaryOp(unary)
+                if unary.op == UnaryOp::Not
+                    && jump_constant_truthiness(&unary.operand) == Some(true))
+        {
+            // Negating a true constant discards the first arm and its exit array.
+            // CPython's borrow traversal stops there before the selected else arm.
+            self.assembler.prevent_borrow_reachability(else_label);
+        }
         self.set_depth(base_depth);
         if enter_filtered_comprehension_conditional {
             self.with_control_override(
