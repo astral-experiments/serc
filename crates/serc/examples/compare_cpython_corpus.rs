@@ -13,6 +13,8 @@ use serc::{
     compile_with_options,
 };
 
+#[path = "support/caller_intern_model.rs"]
+mod caller_intern_model;
 #[path = "support/initial_intern_profile.rs"]
 mod initial_intern_profile;
 #[path = "support/native_output_cache.rs"]
@@ -161,6 +163,9 @@ struct Options {
     source_bytes: bool,
     #[arg(long, value_name = "PROFILE.json")]
     initial_intern_state: Option<PathBuf>,
+    /// Reproduce a validated caller protocol from an independent pre-path baseline.
+    #[arg(long, value_name = "MODEL.json")]
+    caller_intern_model: Option<PathBuf>,
 }
 
 impl Options {
@@ -192,6 +197,16 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if options.caller_intern_model.is_some()
+        && (!options.source_bytes
+            || options.initial_intern_state.is_none()
+            || env::var_os("SERC_NATIVE_CACHE_WRITE").is_some())
+    {
+        eprintln!(
+            "caller modeling requires byte sources and a native provenance profile, and cannot capture new native output"
+        );
+        return ExitCode::from(2);
+    }
     let read_config = env::var_os("SERC_NATIVE_CACHE_READ");
     if read_config.is_some()
         && (env::var_os("SERC_NATIVE_CACHE_WRITE").is_some()
@@ -229,11 +244,39 @@ fn main() -> ExitCode {
         }
     };
     if let Some(profile) = &profile {
+        let role = if options.caller_intern_model.is_some() {
+            "Native provenance snapshot"
+        } else {
+            "Initial intern-state snapshot"
+        };
         println!(
-            "Initial intern-state snapshot: {} ({} entries; captured process state)",
+            "{role}: {} ({} entries; captured process state)",
             profile.snapshot_sha256, profile.entries
         );
     }
+    let caller_model = match options
+        .caller_intern_model
+        .as_deref()
+        .map(|path| {
+            caller_intern_model::load(
+                path,
+                options
+                    .initial_intern_state
+                    .as_deref()
+                    .expect("caller profile checked"),
+                options.python_version,
+                options.source_bytes,
+                ORACLE,
+            )
+        })
+        .transpose()
+    {
+        Ok(model) => model,
+        Err(error) => {
+            eprintln!("invalid caller intern-state model: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let compile_options = CompileOptions {
         python_version: options.python_version,
         initial_intern_state: profile.map(|profile| profile.state).unwrap_or_default(),
@@ -260,6 +303,17 @@ fn main() -> ExitCode {
     }
     if let Some(limit) = options.limit {
         paths.truncate(limit);
+    }
+    if caller_model.is_some() {
+        for path in &paths {
+            if let Err(error) = caller_intern_model::validate_filename(path) {
+                eprintln!(
+                    "unsupported caller-model filename {}: {error}",
+                    path.display()
+                );
+                return ExitCode::from(2);
+            }
+        }
     }
 
     let cache = match env::var_os("SERC_NATIVE_CACHE_WRITE") {
@@ -302,6 +356,7 @@ fn main() -> ExitCode {
             ORACLE,
             options.python_version,
             &paths,
+            caller_model.as_ref(),
         ) {
             Ok(reader) => {
                 println!(
@@ -334,15 +389,22 @@ fn main() -> ExitCode {
             .par_iter()
             .enumerate()
             .map(|(index, path)| {
+                let file_options = caller_model.as_ref().map(|model| {
+                    model.options_for(
+                        path.to_str().expect("caller filename checked"),
+                        &compile_options,
+                    )
+                });
+                let compile_options = file_options.as_ref().unwrap_or(&compile_options);
                 if let Some(reader) = &reader {
-                    return reader.compare(index, path, &compile_options);
+                    return reader.compare(index, path, compile_options);
                 }
                 let mut observation = cache.as_ref().map(|writer| writer.begin(index, path));
                 let outcome = compare(
                     path,
                     &options.python,
                     options.source_bytes,
-                    &compile_options,
+                    compile_options,
                     observation.as_mut(),
                 );
                 if let Some(observation) = observation {
@@ -418,6 +480,7 @@ fn main() -> ExitCode {
                 directory,
                 options.source_bytes,
                 &compile_options,
+                caller_model.as_ref(),
             )
         }) {
             eprintln!("failed to dump mismatches: {error}");
@@ -632,6 +695,7 @@ fn dump_mismatches(
     directory: &Path,
     source_bytes: bool,
     options: &CompileOptions,
+    caller_model: Option<&caller_intern_model::LoadedModel>,
 ) -> Result<(), std::io::Error> {
     fs_err::create_dir_all(directory)?;
     outcomes
@@ -647,6 +711,8 @@ fn dump_mismatches(
                 CompilerInput::Text(fs_err::read_to_string(&outcome.path)?)
             };
             let filename = outcome.path.to_string_lossy();
+            let file_options = caller_model.map(|model| model.options_for(&filename, options));
+            let options = file_options.as_ref().unwrap_or(options);
             let ours = compile_module_input(&source, &filename, options)
                 .expect("a mismatch compiled successfully in the first pass")
                 .marshal();
@@ -1114,6 +1180,7 @@ mod tests {
                     initial_intern_state: state.clone(),
                     ..CompileOptions::default()
                 },
+                None,
             )
             .unwrap();
             assert_eq!(fs::read(dump.join("0000.ours.marshal")).unwrap(), expected);

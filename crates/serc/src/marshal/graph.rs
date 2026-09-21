@@ -989,6 +989,13 @@ fn collect_recreated_frozensets(
     initial_intern_state: &InitialInternState,
     values: &mut FxHashSet<usize>,
 ) {
+    // A complete state may omit built-in entries whose later identifier interning
+    // still matters. Keep the existing shortcuts for supplemental states.
+    let need = if initial_intern_state.is_complete() && need != FrozensetRecreationNeed::None {
+        FrozensetRecreationNeed::IdentifierDependent
+    } else {
+        need
+    };
     match need {
         FrozensetRecreationNeed::None => return,
         FrozensetRecreationNeed::PreinternedOnly
@@ -1012,6 +1019,7 @@ fn collect_recreated_frozensets(
     }
 
     if need == FrozensetRecreationNeed::IdentifierDependent
+        && !initial_intern_state.is_complete()
         && code.marshal_provenance.interning_events.is_empty()
         && !has_identifier_or_explicit_dependent_frozenset(code, python_version)
         && code

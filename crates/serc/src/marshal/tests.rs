@@ -800,6 +800,41 @@ fn frozenset_recreation_uses_selected_target_intern_state() {
 }
 
 #[test]
+fn complete_intern_state_preserves_identifier_dependent_frozenset_recreation() {
+    use super::writer::encode_code_with_options;
+    use crate::{InitialInternState, PythonVersion};
+
+    let marker = "aggregate_class";
+    let empty = InitialInternState::from_complete(std::iter::empty::<&str>());
+    let retained = InitialInternState::from_complete([marker]);
+    for mixed in [false, true] {
+        let mut members = vec![Constant::String(marker.to_string())];
+        if mixed {
+            members.push(Constant::String("__serc_not_interned__".to_string()));
+        }
+        let mut code = code_object(vec![
+            Constant::FrozenSet(members.clone()),
+            Constant::Code(Box::new(code_object(vec![Constant::FrozenSet(members)]))),
+        ]);
+        let graph = ObjectGraph::for_code_with_options(&code, PythonVersion::Py314, &empty);
+        assert!(graph.is_shared(&constant_key(&code.constants[0]), false));
+        let graph = ObjectGraph::for_code_with_options(&code, PythonVersion::Py314, &retained);
+        assert!(!graph.is_shared(&constant_key(&code.constants[0]), false));
+
+        code.marshal_provenance
+            .parser_interned_strings
+            .insert(marker.to_string());
+        let graph = ObjectGraph::for_code_with_options(&code, PythonVersion::Py314, &empty);
+        assert!(!graph.is_shared(&constant_key(&code.constants[0]), false));
+        assert_eq!(
+            encode_code_with_options(&code, PythonVersion::Py314, &empty),
+            encode_code_with_options(&code, PythonVersion::Py314, &retained),
+            "identifier interning must apply with mixed members: {mixed}"
+        );
+    }
+}
+
+#[test]
 fn python_315_small_integer_cache_preserves_all_scalar_slot_boundaries() {
     use crate::{InitialInternState, PythonVersion};
     let mut constants = Vec::new();

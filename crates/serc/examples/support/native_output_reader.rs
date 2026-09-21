@@ -116,6 +116,7 @@ impl Reader {
         oracle: &str,
         python_version: PythonVersion,
         paths: &[PathBuf],
+        caller_model: Option<&super::caller_intern_model::LoadedModel>,
     ) -> io::Result<Self> {
         let config_bytes = regular_bytes(config_path)?;
         let config: Config = serde_json::from_slice(&config_bytes)?;
@@ -165,6 +166,12 @@ impl Reader {
         ]) {
             item.read()?;
             inputs.push(item.clone());
+        }
+        if let Some(model) = caller_model {
+            for item in &model.inputs {
+                item.read()?;
+                inputs.push(item.clone());
+            }
         }
         let profile_bytes = regular_bytes(profile_path)?;
         let profile: Value = serde_json::from_slice(&profile_bytes)?;
@@ -263,7 +270,7 @@ impl Reader {
             std::env::current_dir()? == cwd,
             "reader cwd changed while loading",
         )?;
-        let context = json!({
+        let mut context = json!({
             "schema": 1, "cache_read_enabled": true, "admission": config.admission,
             "admission_actual": config.admission_actual, "native_identity": native_identity,
             "compiler": compiler, "compiler_source_manifest": config.compiler_source_manifest,
@@ -274,6 +281,9 @@ impl Reader {
             "native_provenance": "historical admitted capture; no per-file native process executed",
             "external_admission_authenticity_and_current_runtime_guards_required": true,
         });
+        if let Some(model) = caller_model {
+            context["compiler_caller_context"] = model.evidence.clone();
+        }
         fs::create_dir(&config.output_directory)?;
         fs::create_dir(config.output_directory.join("blobs"))?;
         fs::create_dir(config.output_directory.join("entries"))?;

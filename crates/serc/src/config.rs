@@ -94,7 +94,7 @@ impl Error for ParsePythonVersionError {}
 pub struct CompileOptions {
     /// The Python language and bytecode version to target. Defaults to Python 3.14.
     pub python_version: PythonVersion,
-    /// Canonical strings present before compiling, in addition to the target's startup state.
+    /// Canonical strings present before compiling. See [`InitialInternState`] for state modes.
     pub initial_intern_state: InitialInternState,
 }
 
