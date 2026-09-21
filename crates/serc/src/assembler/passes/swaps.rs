@@ -1,11 +1,58 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::{
-    Instruction, Item, NOP, NOT_TAKEN, Operand, POP_TOP, STORE_FAST, SWAP, UNPACK_EX,
-    UNPACK_SEQUENCE, capture_cleanup_rotation, ends_scope, single_capture_cleanup_vacancies,
+    Instruction, Item, NOP, NOT_TAKEN, Operand, POP_TOP, STORE_FAST, SWAP, SourceLocation,
+    UNPACK_EX, UNPACK_SEQUENCE, capture_cleanup_rotation, ends_scope,
+    single_capture_cleanup_vacancies,
 };
 use crate::assembler::OptimizationPipeline;
 use crate::assembler::block_graph::{BlockGraph, ItemPosition};
+
+/// Pass-local positions from the existing swap partition; labels still delimit source arrays.
+pub(in crate::assembler) struct SwapBlock {
+    positions: Vec<ItemPosition>,
+    rewritten_nops: FxHashSet<ItemPosition>,
+    original_donors: FxHashMap<ItemPosition, Instruction>,
+}
+
+/// Retires a rewritten swap's line only when a surviving record in the same array has it.
+fn clear_redundant_swap_nop_locations(
+    graph: &mut BlockGraph,
+    positions: &[ItemPosition],
+    rewritten: &FxHashSet<ItemPosition>,
+    original_donors: &FxHashMap<ItemPosition, Instruction>,
+) {
+    if rewritten.is_empty() {
+        return;
+    }
+    let mut previous_line = None;
+    for &position in positions {
+        let Some(instruction) = graph.instruction_mut(position) else {
+            previous_line = None;
+            continue;
+        };
+        if instruction.opcode == NOP {
+            if rewritten.contains(&position)
+                && instruction.location.line >= 0
+                && previous_line == Some(instruction.location.line)
+            {
+                // CPython compacts these slots after both swap phases, before later
+                // copying and fusion. A later donor rewrite cannot revive this NOP.
+                // Keep the original slot for owner accounting, but never restore its line.
+                instruction.location = SourceLocation::NONE;
+                instruction.no_location_policy.preserve_location();
+            } else {
+                previous_line = None;
+            }
+        } else {
+            // Capture unpack/discard records precede their rotations in the native
+            // array. Stores and other donors can move across later copy seams.
+            previous_line = (matches!(instruction.opcode, UNPACK_SEQUENCE | POP_TOP)
+                && original_donors.get(&position) == Some(instruction))
+            .then_some(instruction.location.line);
+        }
+    }
+}
 
 impl OptimizationPipeline {
     pub(in crate::assembler) fn remove_redundant_swaps_before_pops(&mut self) -> bool {
@@ -78,7 +125,7 @@ impl OptimizationPipeline {
     /// in the original instruction slots. Reports whether any original slot changed.
     pub(in crate::assembler) fn optimize_swap_runs(
         &mut self,
-    ) -> (Vec<Vec<ItemPosition>>, FxHashSet<ItemPosition>, bool) {
+    ) -> (Vec<SwapBlock>, FxHashSet<ItemPosition>, bool) {
         const VISITED: usize = usize::MAX;
 
         let graph = &self.graph;
@@ -144,7 +191,9 @@ impl OptimizationPipeline {
         }
         let graph = &mut self.graph;
         let mut changed = false;
-        for block in &blocks {
+        let mut rewritten_blocks = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            let mut rewritten = FxHashSet::default();
             let instruction_positions = block
                 .iter()
                 .copied()
@@ -238,13 +287,41 @@ impl OptimizationPipeline {
                     };
                     changed |=
                         instruction.opcode != NOP || instruction.operand() != Operand::Value(0);
+                    if self.python_version >= crate::PythonVersion::Py314
+                        && instruction.opcode == SWAP
+                    {
+                        rewritten.insert(instruction_positions[current]);
+                    }
                     instruction.opcode = NOP;
                     instruction.set_operand(Operand::Value(0));
                 }
                 position = run_end;
             }
+            // Rotation simplification only writes SWAP/NOP slots. Snapshot the
+            // untouched capture donors before static swaps can reorder any POP_TOP.
+            let original_donors = if self.python_version >= crate::PythonVersion::Py314
+                && (!rewritten.is_empty() || instruction_positions.iter().any(|&position| {
+                    matches!(graph.item(position), Item::Instruction(instruction) if instruction.opcode == SWAP)
+                }))
+            {
+                block.iter().filter_map(|&position| match graph.item(position) {
+                    Item::Instruction(instruction)
+                        if matches!(instruction.opcode, UNPACK_SEQUENCE | POP_TOP) =>
+                    {
+                        Some((position, *instruction))
+                    }
+                    _ => None,
+                }).collect()
+            } else {
+                FxHashMap::default()
+            };
+            rewritten_blocks.push(SwapBlock {
+                positions: block,
+                rewritten_nops: rewritten,
+                original_donors,
+            });
         }
-        (blocks, capture_cleanup_swaps, changed)
+        (rewritten_blocks, capture_cleanup_swaps, changed)
     }
 
     /// Applies stack swaps statically by reordering local stores and pops.
@@ -254,7 +331,7 @@ impl OptimizationPipeline {
     /// consecutive swaps from right to left, matching CPython's per-run handoff.
     pub(in crate::assembler) fn apply_static_swaps(
         &mut self,
-        blocks: (Vec<Vec<ItemPosition>>, FxHashSet<ItemPosition>),
+        blocks: (Vec<SwapBlock>, FxHashSet<ItemPosition>),
     ) {
         fn swappable(instruction: &Instruction) -> bool {
             matches!(instruction.opcode, POP_TOP | STORE_FAST)
@@ -326,7 +403,12 @@ impl OptimizationPipeline {
                 Some((ItemPosition::new(pair[0], offset), (label, origin)))
             })
             .collect::<FxHashMap<_, _>>();
-        for positions in blocks {
+        for SwapBlock {
+            positions,
+            rewritten_nops: mut rewritten,
+            original_donors,
+        } in blocks
+        {
             let mut index = positions.len();
             while index > 0 {
                 index -= 1;
@@ -453,6 +535,9 @@ impl OptimizationPipeline {
                 };
                 swap.opcode = NOP;
                 swap.set_operand(Operand::Value(0));
+                if self.python_version >= crate::PythonVersion::Py314 {
+                    rewritten.insert(positions[index]);
+                }
                 *graph
                     .instruction_mut(positions[first])
                     .expect("swappable item is an instruction") = last_instruction;
@@ -460,6 +545,94 @@ impl OptimizationPipeline {
                     .instruction_mut(positions[last])
                     .expect("swappable item is an instruction") = first_instruction;
             }
+            clear_redundant_swap_nop_locations(graph, &positions, &rewritten, &original_donors);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::assembler::Label;
+
+    #[test]
+    fn rewritten_swap_line_rejects_a_replaced_donor() {
+        let donor = Instruction::new(
+            POP_TOP,
+            Operand::Value(0),
+            SourceLocation::new(5, 5, 0, 1),
+            None,
+        );
+        let nop = Instruction::new(
+            NOP,
+            Operand::Value(0),
+            SourceLocation::new(5, 5, 2, 3),
+            None,
+        );
+        let mut graph = BlockGraph::from_items(
+            vec![Item::Instruction(donor), Item::Instruction(nop)],
+            &FxHashSet::default(),
+        );
+        let positions = graph.item_positions();
+        let original_donors = FxHashMap::from_iter([(positions[0], donor)]);
+        graph.instruction_mut(positions[0]).unwrap().location.column = 1;
+        clear_redundant_swap_nop_locations(
+            &mut graph,
+            &positions,
+            &FxHashSet::from_iter([positions[1]]),
+            &original_donors,
+        );
+        assert_eq!(*graph.instruction_mut(positions[1]).unwrap(), nop);
+    }
+
+    #[test]
+    fn rewritten_swap_lines_require_a_same_array_surviving_donor() {
+        for (donor, donor_line, boundary, rewritten, removed) in [
+            (POP_TOP, 5, false, true, true),
+            (UNPACK_SEQUENCE, 5, false, true, true),
+            (POP_TOP, 4, false, true, false),
+            (POP_TOP, 5, true, true, false),
+            (POP_TOP, 5, false, false, false),
+            (NOP, 5, false, true, false),
+            (SWAP, 5, false, true, false),
+            (NOT_TAKEN, 5, false, true, false),
+            (STORE_FAST, 5, false, true, false),
+        ] {
+            let instruction = |opcode, line| {
+                Item::Instruction(Instruction::new(
+                    opcode,
+                    Operand::Value(0),
+                    SourceLocation::new(line, line, 0, 1),
+                    None,
+                ))
+            };
+            let mut items = vec![instruction(donor, donor_line)];
+            if boundary {
+                items.push(Item::Label(Label(0)));
+            }
+            items.push(instruction(NOP, 5));
+            let mut graph = BlockGraph::from_items(items, &FxHashSet::default());
+            let positions = graph.item_positions();
+            let position = *positions.last().unwrap();
+            let rewritten = if rewritten {
+                FxHashSet::from_iter([position])
+            } else {
+                FxHashSet::default()
+            };
+            let original_donors = FxHashMap::from_iter([(
+                positions[0],
+                *graph.instruction_mut(positions[0]).unwrap(),
+            )]);
+            clear_redundant_swap_nop_locations(
+                &mut graph,
+                &positions,
+                &rewritten,
+                &original_donors,
+            );
+            let instruction = graph.instruction_mut(position).unwrap();
+            assert_eq!(instruction.location.line, if removed { -1 } else { 5 });
+            assert_eq!(instruction.no_location_policy.preserves_location(), removed);
+            assert_eq!(instruction.opcode, NOP);
         }
     }
 }
