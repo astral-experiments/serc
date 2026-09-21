@@ -62,7 +62,10 @@ fn class_constant_does_not_alias_an_equal_interned_filename() {
 
 #[test]
 fn slice_characters_keep_canonical_aliases_beside_fresh_percent_constants() {
-    for prefix in ["", "def format_value(value):\n    return '%%%s' % (value,)\n"] {
+    for prefix in [
+        "",
+        "def format_value(value):\n    return '%%%s' % (value,)\n",
+    ] {
         for body in [
             "def f(a):\n    return items['a':]\n",
             "a = 'a'\nresult = items['a':'b']\nother = items['a':'b']\n",
