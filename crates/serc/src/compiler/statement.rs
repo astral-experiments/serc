@@ -33968,8 +33968,20 @@ fn conditional_for_else_cleanup_exit(statement: &ruff_python_ast::StmtIf) -> boo
 // A following authored statement supplies fallthrough instead and stops this walk.
 fn suite_has_unconditional_cleanup_exit(body: &[Stmt]) -> bool {
     match body.last() {
-        Some(Stmt::Try(statement)) => statement.finalbody.is_empty(),
+        Some(Stmt::Try(statement)) => {
+            statement.finalbody.is_empty()
+                || (suite_has_linear_borrow_fallthrough(&statement.finalbody)
+                    && !suite_contains_yield(&statement.finalbody))
+        }
         Some(Stmt::With(_)) => true,
+        // Refutable successes all jump to the match end. A terminating default
+        // leaves no physical fallthrough into the enclosing condition's exit.
+        Some(Stmt::Match(statement)) => {
+            statement.cases.iter().all(|case| case.guard.is_none())
+                && statement.cases.last().is_some_and(|case| {
+                    is_wildcard_pattern(&case.pattern) && suite_terminates(&case.body)
+                })
+        }
         Some(Stmt::If(statement))
             if early_condition_truthiness(&statement.test).is_none()
                 && statement.elif_else_clauses.iter().all(|clause| {
