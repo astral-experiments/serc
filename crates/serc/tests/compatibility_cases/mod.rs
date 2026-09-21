@@ -120,6 +120,7 @@ mod frozenset_discarded_real_assembly;
 mod frozenset_soft_case_identifiers;
 mod frozenset_tuple_marshal_order;
 mod generator_break_constant_compatibility;
+mod generator_break_return_regions;
 mod generator_call_name_condition_owner_compatibility;
 mod generator_dispatch_region_slots;
 mod generator_handler_finally_nop_owner_compatibility;

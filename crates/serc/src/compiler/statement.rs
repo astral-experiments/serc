@@ -4751,9 +4751,18 @@ impl Compiler<'_> {
                         }
                     }
                     if self.unit.flags & CO_GENERATOR != 0 {
+                        // This copied implicit return leaves the terminal try just as an
+                        // ordinary fallthrough does; its preceding handler cleanup does not.
+                        let return_exclusion =
+                            self.begin_implicit_return_exception_exclusion(false);
                         self.output.has_deferred_break_none = true;
                         self.emit(LOAD_CONST, u32::MAX, 1)?;
                         self.emit(RETURN_VALUE, 0, -1)?;
+                        self.finish_implicit_return_exception_exclusion(
+                            return_exclusion,
+                            false,
+                            None,
+                        );
                     } else if finally_end_unwind_start.is_none()
                         && exclusion_start.is_none()
                         && with_unwind_starts.is_empty()
