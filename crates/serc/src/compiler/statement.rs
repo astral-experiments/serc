@@ -12742,6 +12742,8 @@ impl Compiler<'_> {
             }
             if let Some(range) = suite_assert_success_fallthrough_range(final_else_body) {
                 self.assembler.set_location(self.source_location(range));
+            } else if let Some(range) = loop_false_fallthrough_range(final_else_body) {
+                self.assembler.set_location(self.source_location(range));
             } else if descended_else
                 && let Some(Stmt::If(statement)) = final_else_body.last()
                 && let Some(test) = final_terminating_arm_fallthrough_test(statement)
@@ -19444,7 +19446,8 @@ impl Compiler<'_> {
                     }
                     _ => None,
                 })
-                .flatten();
+                .flatten()
+                .or_else(|| loop_false_fallthrough_range(normal_exit_suite));
             let nested_else_while_exit_location = if !statement.is_star
                 && statement.orelse.is_empty()
                 && let Some(Stmt::If(branch)) = statement.body.last()
@@ -29112,6 +29115,30 @@ pub(super) fn while_condition_exit_range(expression: &Expr) -> TextRange {
     // The false edge of a short-circuit condition inherits its final evaluated operand.
     unique_condition_jump_target(expression, false)
         .map_or_else(|| condition_exit_range(expression), Ranged::range)
+}
+
+/// Finds the sole condition edge that reaches a loop's original empty exit.
+fn loop_false_fallthrough_range(body: &[Stmt]) -> Option<TextRange> {
+    let test = match body.last()? {
+        Stmt::For(statement) if !statement.is_async => {
+            let Stmt::If(tail) = statement.orelse.last()? else {
+                return None;
+            };
+            terminating_if_fallthrough_test(tail)?
+        }
+        Stmt::While(statement)
+            if statement.orelse.is_empty() && !suite_contains_loop_break(&statement.body) =>
+        {
+            &statement.test
+        }
+        _ => return None,
+    };
+    // Other loop exits jump past this original branch exit during native threading.
+    // Folded or shared condition edges cannot supply a unique location here.
+    (condition_has_only_runtime_tests(test)
+        && condition_jump_target_count(test, false) == 1
+        && original_condition_has_unique_jump_target(test, false))
+    .then(|| condition_fallthrough_range(test))
 }
 
 fn condition_fallthrough_range(expression: &Expr) -> TextRange {
