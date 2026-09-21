@@ -219,8 +219,10 @@ pub(crate) struct MarshalProvenance {
     pub(crate) canonical_constant_strings: FxHashSet<String>,
     /// The class-body constant loaded into `__qualname__`, when present.
     pub(crate) qualified_name_constant_index: Option<u32>,
-    /// Legacy qualified-name ownership recorded before discarded constants are pruned.
+    /// Qualified-name ownership recorded before discarded constants are pruned.
     pub(crate) qualified_name_is_canonical: Option<bool>,
+    /// Whether `%` first entered the compiler cache as a fresh `PyUnicode_Replace` result.
+    pub(crate) uncached_percent_constant: bool,
     pub(crate) metadata_ids: MarshalMetadataIds,
     /// Whether this code tree can contain a frozenset constant.
     pub(crate) subtree_has_frozenset_constants: bool,

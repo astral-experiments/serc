@@ -807,10 +807,13 @@ impl Compiler<'_> {
             _ => None,
         }) {
             self.context.record_constant_string_origin(value, true);
-            if !self
-                .output
-                .interned_constant_strings
-                .contains(value.as_str())
+            // Recursive constant-cache insertion can replace a parser-interned name
+            // with an earlier equal literal. Preserve the winning object's identity.
+            if self.context.constant_string_origin_is_interned(value)
+                && !self
+                    .output
+                    .interned_constant_strings
+                    .contains(value.as_str())
             {
                 self.output.interned_constant_strings.insert(value.clone());
             }

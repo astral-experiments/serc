@@ -54,6 +54,9 @@ pub(super) trait MarshalVisitor<'a> {
     fn bytes(&mut self, value: &'a [u8]);
     fn constant(&mut self, value: &'a Constant, reference_mode: ReferenceMode) -> bool;
     fn slice_member(&mut self, value: &'a Constant);
+    fn cached_slice_string(&mut self, value: &'a Constant) {
+        self.constant(value, ReferenceMode::IfShared);
+    }
 
     fn frozen_set_members(&self, values: &'a [Constant]) -> FrozenSetMembers<'a> {
         frozen_set_members_in_wire_order(values)
@@ -181,6 +184,8 @@ where
 {
     if slice_member_uses_identity_for(value, visitor.python_version()) {
         visitor.slice_member(value);
+    } else if matches!(value, Constant::String(_)) {
+        visitor.cached_slice_string(value);
     } else {
         traverse_constant(value, ReferenceMode::IfShared, visitor);
     }

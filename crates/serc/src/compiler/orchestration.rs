@@ -1144,6 +1144,7 @@ impl<'source> Compiler<'source> {
                 canonical_constant_strings,
                 qualified_name_constant_index: self.output.qualified_name_constant_index,
                 qualified_name_is_canonical: self.output.qualified_name_is_canonical,
+                uncached_percent_constant: self.context.has_uncached_percent_constant(),
                 metadata_ids,
                 subtree_has_frozenset_constants: self.output.has_frozenset_constants,
             },

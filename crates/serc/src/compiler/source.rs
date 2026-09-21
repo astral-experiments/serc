@@ -23,21 +23,27 @@ use super::symbol::mangle_name;
 use super::{CachedSourceLine, Compiler};
 
 #[derive(Debug, Default)]
-struct LegacyConstantOrigins {
+struct ConstantOrigins {
+    all_strings: bool,
+    interned_qualified_names: FxHashSet<String>,
     strings: FxHashMap<String, bool>,
     string_tuples: FxHashSet<Vec<String>>,
 }
 
-impl LegacyConstantOrigins {
+impl ConstantOrigins {
+    fn tracks(&self, value: &str) -> bool {
+        self.all_strings || value.contains('.') || value == "%"
+    }
+
     fn record_constant(&mut self, constant: &Constant) {
         match constant {
-            Constant::String(value) => {
+            Constant::String(value) if self.tracks(value) => {
                 self.strings.entry(value.clone()).or_insert(false);
             }
             Constant::Tuple(values) => {
                 // Metadata tuples enter the native cache without admitting their members.
                 // Reusing one as a literal must not create scalar cache entries afterwards.
-                if let Some(strings) = Self::string_tuple(values)
+                if let Some(strings) = self.string_tuple(values)
                     && !self.string_tuples.insert(strings)
                 {
                     return;
@@ -56,7 +62,14 @@ impl LegacyConstantOrigins {
         }
     }
 
-    fn string_tuple(values: &[Constant]) -> Option<Vec<String>> {
+    fn string_tuple(&self, values: &[Constant]) -> Option<Vec<String>> {
+        if !self.all_strings
+            && !values
+                .iter()
+                .any(|value| matches!(value, Constant::String(value) if self.tracks(value)))
+        {
+            return None;
+        }
         values
             .iter()
             .map(|value| match value {
@@ -67,11 +80,15 @@ impl LegacyConstantOrigins {
     }
 
     fn record_code_assembly(&mut self, code: &CodeObject) {
-        self.string_tuples.insert(code.names.clone());
-        if let Some(strings) = Self::string_tuple(&code.constants) {
+        if code.names.iter().any(|value| self.tracks(value)) {
+            self.string_tuples.insert(code.names.clone());
+        }
+        if let Some(strings) = self.string_tuple(&code.constants) {
             self.string_tuples.insert(strings);
         }
-        if code.marshal_provenance.locals_identity == crate::code_object::LocalsIdentity::ByValue {
+        if code.marshal_provenance.locals_identity == crate::code_object::LocalsIdentity::ByValue
+            && code.locals.iter().any(|value| self.tracks(value))
+        {
             self.string_tuples.insert(code.locals.clone());
         }
     }
@@ -86,9 +103,9 @@ pub(super) struct CompilationContext<'source> {
     line_index: LineIndex,
     pub(super) scopes: ScopeArena,
     constant_string_origins: FxHashMap<String, Cell<u8>>,
-    // Legacy class qualified-name identity depends on the first scalar cache admission,
+    // Class qualified-name and synthesized character identity depend on the first cache admission,
     // even when that constant or the defining class is later removed as unreachable.
-    legacy_constant_string_origins: Option<RefCell<LegacyConstantOrigins>>,
+    constant_origins: Option<RefCell<ConstantOrigins>>,
     static_attribute_names: FxHashSet<String>,
     active_class_static_attributes: RefCell<Vec<BTreeSet<String>>>,
     cached_static_attribute_tuples: RefCell<FxHashSet<Vec<String>>>,
@@ -132,17 +149,28 @@ impl<'source> CompilationContext<'source> {
             ScopeArena::analyze_with_python_version(body, python_version)
         };
         let mut generated_mangled_strings = FxHashSet::default();
-        let legacy_constant_string_origins = (python_version <= crate::PythonVersion::Py313
-            && scopes.has_class_scopes())
-        .then(RefCell::default);
         let mut requires_interning_trace = false;
         let mut static_attribute_names = FxHashSet::default();
+        let mut has_percent_replacement = false;
         let constant_string_origins = parser_interned_strings(
             body,
             &mut generated_mangled_strings,
             &mut requires_interning_trace,
             &mut static_attribute_names,
+            &mut has_percent_replacement,
         );
+        let legacy = python_version <= crate::PythonVersion::Py313;
+        let has_relevant_class = if legacy {
+            scopes.has_class_scopes()
+        } else {
+            scopes.has_nested_class_scopes()
+        };
+        let constant_origins = (has_relevant_class || has_percent_replacement).then(|| {
+            RefCell::new(ConstantOrigins {
+                all_strings: legacy,
+                ..ConstantOrigins::default()
+            })
+        });
         Self {
             python_version,
             filename: filename.to_string(),
@@ -151,7 +179,7 @@ impl<'source> CompilationContext<'source> {
             line_index: LineIndex::from_source_text(source),
             scopes,
             constant_string_origins,
-            legacy_constant_string_origins,
+            constant_origins,
             static_attribute_names,
             active_class_static_attributes: RefCell::default(),
             cached_static_attribute_tuples: RefCell::new(FxHashSet::default()),
@@ -176,6 +204,12 @@ impl<'source> CompilationContext<'source> {
         }
     }
 
+    pub(super) fn constant_string_origin_is_interned(&self, value: &str) -> bool {
+        self.constant_string_origins
+            .get(value)
+            .is_some_and(|origin| origin.get() == 2)
+    }
+
     pub(super) fn record_identifier_constant_origin(&self, raw: &str, mangled: &str) {
         // `_Py_Mangle` returns a fresh string when the spelling changes, even if an equal
         // identifier was already interned by the parser.
@@ -183,7 +217,7 @@ impl<'source> CompilationContext<'source> {
     }
 
     pub(super) fn record_constant_string_origins(&self, constant: &Constant, interned: bool) {
-        if let Some(origins) = &self.legacy_constant_string_origins {
+        if let Some(origins) = &self.constant_origins {
             origins.borrow_mut().record_constant(constant);
         }
         self.record_interned_constant_string_origins(constant, interned);
@@ -318,8 +352,16 @@ impl<'source> CompilationContext<'source> {
     }
 
     pub(super) fn record_code_assembly(&self, code: &CodeObject) -> Option<usize> {
-        if let Some(origins) = &self.legacy_constant_string_origins {
-            origins.borrow_mut().record_code_assembly(code);
+        if let Some(origins) = &self.constant_origins {
+            let mut origins = origins.borrow_mut();
+            origins.record_code_assembly(code);
+            if self.python_version != crate::PythonVersion::Py312
+                && origins.tracks(&code.qualified_name)
+            {
+                origins
+                    .interned_qualified_names
+                    .insert(code.qualified_name.clone());
+            }
         }
         // Assembly merges these tuples without recursively admitting their members.
         self.record_static_attribute_tuple_cache(
@@ -352,40 +394,64 @@ impl<'source> CompilationContext<'source> {
     }
 
     pub(super) fn has_tracked_string_origins(&self) -> bool {
-        !self.constant_string_origins.is_empty() || self.tracks_legacy_qualified_names()
+        !self.constant_string_origins.is_empty() || self.tracks_constant_origins()
     }
 
-    pub(super) fn tracks_legacy_qualified_names(&self) -> bool {
-        self.legacy_constant_string_origins.is_some()
+    pub(super) fn tracks_constant_origins(&self) -> bool {
+        self.constant_origins.is_some()
     }
 
     pub(super) fn requires_discarded_builders(&self) -> bool {
         self.requires_interning_trace
-            || self.tracks_legacy_qualified_names()
+            || self.tracks_constant_origins()
             || !self.active_class_static_attributes.borrow().is_empty()
     }
 
     /// Records the class body's actual qualified-name constant admission.
     ///
     /// Python 3.12 aliases metadata only for the winning class definition. Python
-    /// 3.13 interns that winner, so later equal class names can share its identity.
+    /// 3.13 and newer intern that winner, so later equal class names can share its identity.
     pub(super) fn record_class_qualified_name(&self, value: &str) -> Option<bool> {
-        let origins = self.legacy_constant_string_origins.as_ref()?;
+        let origins = self.constant_origins.as_ref()?;
         let mut origins = origins.borrow_mut();
+        if !origins.tracks(value) {
+            return None;
+        }
+        let metadata_already_interned =
+            value == self.filename || origins.interned_qualified_names.contains(value);
         match origins.strings.entry(value.to_string()) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 // A dotted import interns its complete spelling while parsing. In 3.13,
                 // code construction reuses that object for the qualified-name metadata,
                 // leaving the class's newly cached scalar constant distinct.
                 let canonical = self.python_version == crate::PythonVersion::Py312
-                    || !self.constant_string_origins.contains_key(value);
+                    || (!self.constant_string_origins.contains_key(value)
+                        && !metadata_already_interned);
                 entry.insert(canonical);
                 Some(canonical)
             }
             std::collections::hash_map::Entry::Occupied(entry) => {
-                Some(self.python_version == crate::PythonVersion::Py313 && *entry.get())
+                Some(self.python_version != crate::PythonVersion::Py312 && *entry.get())
             }
         }
+    }
+
+    /// Records the fresh one-character result of replacing `%%` with `%` during AST preprocessing.
+    /// `PyUnicode_Replace` allocates this result directly instead of using the Latin-1 singleton.
+    pub(super) fn record_percent_replacement(&self) {
+        if let Some(origins) = &self.constant_origins {
+            origins
+                .borrow_mut()
+                .strings
+                .entry("%".to_string())
+                .or_insert(true);
+        }
+    }
+
+    pub(super) fn has_uncached_percent_constant(&self) -> bool {
+        self.constant_origins
+            .as_ref()
+            .is_some_and(|origins| origins.borrow().strings.get("%") == Some(&true))
     }
 
     /// Takes the completed module's string keys after all child compilers have been consumed.
@@ -429,6 +495,7 @@ fn parser_interned_strings(
     generated_mangled_strings: &mut FxHashSet<String>,
     requires_interning_trace: &mut bool,
     static_attribute_names: &mut FxHashSet<String>,
+    has_percent_replacement: &mut bool,
 ) -> FxHashMap<String, Cell<u8>> {
     #[derive(Default)]
     struct ConstantIdentifiers {
@@ -439,6 +506,7 @@ fn parser_interned_strings(
         raw_private_identifiers: FxHashSet<String>,
         restricted_private_identifier: bool,
         static_attribute_names: FxHashSet<String>,
+        has_percent_replacement: bool,
     }
 
     impl ConstantIdentifiers {
@@ -572,6 +640,11 @@ fn parser_interned_strings(
 
         fn visit_expr(&mut self, expression: &'a Expr) {
             match expression {
+                Expr::BinOp(binary) if binary.op == Operator::Mod => {
+                    if let Expr::StringLiteral(format) = binary.left.as_ref() {
+                        self.has_percent_replacement |= format.value.to_str().contains("%%");
+                    }
+                }
                 Expr::Name(name) => self.record_raw_name(name.id.as_str()),
                 Expr::Attribute(attribute) => {
                     self.record_raw_name(attribute.attr.as_str());
@@ -656,6 +729,7 @@ fn parser_interned_strings(
         visitor.restricted_private_identifier || !visitor.generated_mangled_strings.is_empty();
     *generated_mangled_strings = visitor.generated_mangled_strings;
     *static_attribute_names = visitor.static_attribute_names;
+    *has_percent_replacement = visitor.has_percent_replacement;
     visitor.origins
 }
 

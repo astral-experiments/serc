@@ -2622,6 +2622,9 @@ impl Compiler<'_> {
         for part in parts {
             match part {
                 PercentFormatPart::Literal(value) => {
+                    if value == "%" {
+                        self.context.record_percent_replacement();
+                    }
                     // The preprocessing pass synthesizes these constants without
                     // source locations.
                     self.assembler.set_location(SourceLocation::NONE);

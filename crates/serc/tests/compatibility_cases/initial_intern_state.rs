@@ -115,3 +115,26 @@ fn initial_state_does_not_force_noninternable_or_cached_constants() {
         );
     }
 }
+
+#[test]
+fn class_qualified_name_constants_respect_initial_canonical_objects() {
+    let source = "class BootstrapOuter827:\n    class Nested:\n        pass\n";
+    let marker = "BootstrapOuter827.Nested";
+    let filename = "initial_class_qualified_name.py";
+    for state in [
+        InitialInternState::new([marker]),
+        InitialInternState::from_complete([marker]),
+    ] {
+        assert_eq!(
+            compile_with_intern_state(source, filename, &state)
+                .unwrap()
+                .marshal(),
+            cpython_in_context(source, filename, &[marker]),
+        );
+    }
+    let unknown = InitialInternState::from_partial(std::iter::empty::<&str>());
+    assert!(matches!(
+        compile_with_intern_state(source, filename, &unknown),
+        Err(serc::CompileError::UnresolvedInternState { value }) if value == marker
+    ));
+}
