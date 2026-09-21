@@ -691,6 +691,7 @@ mod synthetic_range_entry_copy_budget;
 mod named_elif_cleanup_locations;
 
 mod class_and_percent_constant_origins;
+mod class_annotation_captures;
 mod shared_handler_cleanup_join_locations;
 
 mod with_folded_constant_owner;

@@ -1270,15 +1270,11 @@ impl ScopeArena {
             ScopeBodyFactsCollector::collect(
                 &definition.body,
                 false,
-                ScopeBodyContext::LegacyClass,
+                ScopeBodyContext::Class,
                 true,
             )
         } else {
-            ScopeBodyFacts::for_class(
-                &definition.body,
-                future_annotations,
-                !self.deferred_annotations,
-            )
+            ScopeBodyFacts::for_class(&definition.body, future_annotations)
         };
         let (method_requirements, method_annotation_references) =
             self.nested_function_requirements(id);
@@ -2808,14 +2804,8 @@ impl ScopeBodyFacts {
     pub(super) fn for_class(
         body: &[Stmt],
         future_annotations: bool,
-        legacy_class_scope: bool,
     ) -> Self {
-        let context = if legacy_class_scope {
-            ScopeBodyContext::LegacyClass
-        } else {
-            ScopeBodyContext::Class
-        };
-        ScopeBodyFactsCollector::collect(body, future_annotations, context, false)
+        ScopeBodyFactsCollector::collect(body, future_annotations, ScopeBodyContext::Class, false)
     }
 }
 
@@ -2823,7 +2813,6 @@ impl ScopeBodyFacts {
 enum ScopeBodyContext {
     Function,
     Class,
-    LegacyClass,
 }
 
 struct ScopeBodyFactsCollector<'ast> {
@@ -2833,7 +2822,7 @@ struct ScopeBodyFactsCollector<'ast> {
     skip_annotations: bool,
     collect_function_scope_facts: bool,
     eager_function_annotations: bool,
-    legacy_class_scope: bool,
+    class_scope: bool,
     generator_depth: usize,
     inlined_comprehension_depth: usize,
     seen_inlined_comprehension_targets: FxHashSet<String>,
@@ -2866,7 +2855,7 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
         eager_function_annotations: bool,
     ) -> ScopeBodyFacts {
         let collect_function_scope_facts = matches!(context, ScopeBodyContext::Function);
-        let legacy_class_scope = matches!(context, ScopeBodyContext::LegacyClass);
+        let class_scope = matches!(context, ScopeBodyContext::Class);
         let mut collector = Self {
             facts: ScopeBodyFacts::default(),
             references: FxHashSet::default(),
@@ -2874,7 +2863,7 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
             skip_annotations,
             collect_function_scope_facts,
             eager_function_annotations,
-            legacy_class_scope,
+            class_scope,
             generator_depth: 0,
             inlined_comprehension_depth: 0,
             seen_inlined_comprehension_targets: FxHashSet::default(),
@@ -3136,7 +3125,7 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
             );
             return;
         }
-        if self.legacy_class_scope
+        if self.class_scope
             && let Expr::Generator(generator) = expression
         {
             // A generator owns its iteration targets. Only its free references escape
