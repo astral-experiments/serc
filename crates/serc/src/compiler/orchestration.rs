@@ -807,10 +807,14 @@ impl<'source> Compiler<'source> {
         {
             self.assembler.set_location(location);
         } else if let Some(statement) = body.last() {
-            if !matches!(
-                statement,
-                Stmt::AnnAssign(annotation) if annotation.simple && annotation.value.is_none()
-            ) {
+            // Declarations emit no instruction and cannot donate a new location
+            // to the artificial class epilogue.
+            if !matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))
+                && !matches!(
+                    statement,
+                    Stmt::AnnAssign(annotation) if annotation.simple && annotation.value.is_none()
+                )
+            {
                 self.assembler
                     .set_location(self.source_location(statement.range()));
                 self.emit(NOP, 0, 0)?;

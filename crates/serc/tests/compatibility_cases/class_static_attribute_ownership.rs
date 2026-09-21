@@ -51,3 +51,33 @@ fn matches_cpython_static_attribute_tuple_cache_for_nested_stores() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_class_declarations_preserve_prior_location() {
+    for prefix in ["", "@decorate\n"] {
+        for body in [
+            "global value\n",
+            "global __firstlineno__\n",
+            "global first, second\nglobal third\n",
+            "\"class documentation\"\nglobal value\n",
+            "pass\nglobal value\n",
+            "value = 1\nglobal other\n",
+        ] {
+            let source = format!("{prefix}class C:\n{}", common::indent(body));
+            common::assert_matches_cpython_marshal(&source, "class_declaration_location.py");
+        }
+    }
+    for body in [
+        "nonlocal value\n",
+        "nonlocal __firstlineno__\n",
+        "nonlocal value\nglobal other\n",
+        "\"class documentation\"\nnonlocal value\n",
+        "pass\nnonlocal value\n",
+    ] {
+        let source = format!(
+            "def outer():\n    value = __firstlineno__ = 1\n    class C:\n{}    return C\n",
+            common::indent(&common::indent(body))
+        );
+        common::assert_matches_cpython_marshal(&source, "class_declaration_location.py");
+    }
+}
