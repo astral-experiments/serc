@@ -5,7 +5,7 @@ use ruff_python_ast::token::{TokenKind, Tokens};
 use ruff_python_ast::visitor::transformer::{Transformer, walk_expr as transform_expr};
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
 use ruff_python_ast::{
-    Expr, ExprContext, FStringPart, InterpolatedStringElement, Operator, Stmt, StringLiteralFlags,
+    Expr, FStringPart, InterpolatedStringElement, Operator, Stmt, StringLiteralFlags,
     StringLiteralValue, Suite,
 };
 use ruff_python_codegen::{Generator, Indentation, Mode as CodegenMode};
@@ -16,7 +16,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::assembler::SourceLocation;
 use crate::code_object::{CodeInterningSummary, CodeObject, CompilationInterningEvent, Constant};
 
-use super::constant::{explicit_surrogate_string, fold_constant};
+use super::constant::{
+    constant_slice_with_literals, explicit_surrogate_string, fold_constant,
+    fold_constant_with_literals, literal_constant,
+};
 use super::scope::{ModulePlan, ScopeArena, class_static_attributes};
 use super::symbol::mangle_name;
 use super::{CachedSourceLine, Compiler};
@@ -887,62 +890,46 @@ impl Compiler<'_> {
             if runtime.0 {
                 return None;
             }
-            if let Expr::UnaryOp(unary) = expression
-                && unary.op == ruff_python_ast::UnaryOp::Invert
-                && let Some(Constant::Bool(value)) = fold_constant(&unary.operand)
+        }
+        fold_constant_with_literals(expression, &|expression| match expression {
+            Expr::UnaryOp(unary)
+                if !self.has_deferred_annotations()
+                    && unary.op == ruff_python_ast::UnaryOp::Invert =>
             {
-                return Some(Constant::SignedInt(-i64::from(value) - 1));
+                if let Some(Constant::Bool(value)) = fold_constant(&unary.operand) {
+                    return Some(Constant::SignedInt(-i64::from(value) - 1));
+                }
+                None
             }
-        }
-        match expression {
             Expr::StringLiteral(string) => Some(self.string_literal_constant(string)),
-            Expr::Tuple(tuple) if tuple.ctx == ExprContext::Load => tuple
-                .elts
-                .iter()
-                .map(|element| self.source_aware_fold_constant(element))
-                .collect::<Option<Vec<_>>>()
-                .map(Constant::Tuple),
-            Expr::BinOp(binary) if matches!(binary.op, Operator::Add | Operator::Mult) => {
-                let folded = fold_constant(expression)?;
-                if !matches!(&folded, Constant::String(value) if value.contains('\u{fffd}')) {
-                    return Some(folded);
-                }
-                let left = self.source_aware_fold_constant(&binary.left)?;
-                let right = self.source_aware_fold_constant(&binary.right)?;
-                match (left, binary.op, right) {
-                    (
-                        Constant::SurrogateString(mut left),
-                        Operator::Add,
-                        Constant::String(right),
-                    ) => {
-                        left.extend_from_slice(right.as_bytes());
-                        Some(Constant::SurrogateString(left))
+            Expr::FString(fstring) => {
+                // Preserve the existing literal-only f-string folding gate.
+                fold_constant(expression)?;
+                match super::expression::fstring_components(fstring, self.context.source)
+                    .into_iter()
+                    .next()
+                {
+                    Some(super::expression::InterpolatedStringComponent::Literal(literal)) => {
+                        Some(literal.into_constant())
                     }
-                    (Constant::String(left), Operator::Add, Constant::SurrogateString(right)) => {
-                        let mut bytes = left.into_bytes();
-                        bytes.extend(right);
-                        Some(Constant::SurrogateString(bytes))
+                    None => Some(Constant::String(String::new())),
+                    Some(super::expression::InterpolatedStringComponent::Interpolation(_, _)) => {
+                        unreachable!("a folded f-string has no interpolated expressions")
                     }
-                    (
-                        Constant::SurrogateString(mut left),
-                        Operator::Add,
-                        Constant::SurrogateString(right),
-                    ) => {
-                        left.extend(right);
-                        Some(Constant::SurrogateString(left))
-                    }
-                    (Constant::SurrogateString(value), Operator::Mult, Constant::Int(times))
-                    | (Constant::Int(times), Operator::Mult, Constant::SurrogateString(value)) => {
-                        let length = value.iter().filter(|byte| **byte & 0xc0 != 0x80).count();
-                        let max_times = 4096_usize.checked_div(length).unwrap_or(usize::MAX);
-                        let times = usize::try_from(times).ok()?;
-                        (times <= max_times).then(|| Constant::SurrogateString(value.repeat(times)))
-                    }
-                    _ => Some(folded),
                 }
             }
-            _ => fold_constant(expression),
-        }
+            _ => literal_constant(expression),
+        })
+    }
+
+    pub(super) fn source_aware_constant_slice(
+        &self,
+        slice: &ruff_python_ast::ExprSlice,
+    ) -> Option<Constant> {
+        constant_slice_with_literals(slice, &|expression| match expression {
+            Expr::StringLiteral(string) => Some(self.string_literal_constant(string)),
+            _ => literal_constant(expression),
+        })
     }
 
     pub(super) fn generator_expression_range(
