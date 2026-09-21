@@ -641,3 +641,20 @@ fn matches_cpython_async_generator_and_nested_raising_manager_join_owners() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn preserves_trailing_pass_after_compound_try_body() {
+    for definition in ["def", "async def"] {
+        for body in [
+            "if flag:\n    work()",
+            "with manager():\n    work()",
+            "try:\n    work()\nexcept Error:\n    other()",
+        ] {
+            let source = format!(
+                "{definition} f(flag):\n    try:\n        {}\n        pass\n    finally:\n        cleanup()\n",
+                body.replace('\n', "\n        "),
+            );
+            common::assert_matches_cpython_marshal(&source, "compound_try_body_trailing_pass.py");
+        }
+    }
+}

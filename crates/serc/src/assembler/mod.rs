@@ -4106,6 +4106,47 @@ impl Assembler {
         self.original_nop_targets.extend(labels);
     }
 
+    /// Checks one omitted authored Pass at an otherwise empty original source join.
+    pub(crate) fn has_single_omitted_pass_at_source_join(&self, location: SourceLocation) -> bool {
+        if location.line < 0 {
+            return false;
+        }
+        let mut has_original_boundary = false;
+        for label in self
+            .linear_items()
+            .iter()
+            .rev()
+            .map_while(|item| match item {
+                Item::Label(label) => Some(label),
+                Item::Instruction(_) => None,
+            })
+        {
+            if !self.original_nop_targets.contains(label)
+                || self
+                    .exception_owner_provenance
+                    .omitted_nop_counts
+                    .get(label)
+                    != Some(&1)
+                || self
+                    .exception_owner_provenance
+                    .omitted_nop_locations
+                    .get(label)
+                    != Some(&location)
+            {
+                return false;
+            }
+            has_original_boundary |= self
+                .exception_owner_provenance
+                .source_boundaries
+                .contains(label)
+                && self
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .contains(label);
+        }
+        has_original_boundary
+    }
+
     /// Checks an omitted fallthrough Pass immediately before its normal try-end label.
     pub(crate) fn has_single_omitted_fallthrough_nop_before_label(
         &self,

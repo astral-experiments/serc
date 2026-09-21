@@ -26066,7 +26066,11 @@ impl Compiler<'_> {
                     }
                     if has_instructions
                         && let Some(Stmt::Pass(pass)) = statement.body.last()
-                        && suite_has_linear_borrow_fallthrough(&statement.body)
+                        && (suite_has_linear_borrow_fallthrough(&statement.body)
+                            || (compiler.context.python_version >= crate::PythonVersion::Py314
+                                && compiler.assembler.has_single_omitted_pass_at_source_join(
+                                    compiler.source_location(pass.range),
+                                )))
                     {
                         // The authored pass locates the following POP_BLOCK before NOP
                         // removal. Keep both original slots so the surviving marker has
