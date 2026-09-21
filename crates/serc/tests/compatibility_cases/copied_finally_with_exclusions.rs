@@ -153,3 +153,18 @@ fn matches_cpython_iterator_return_suppressed_finally_owners() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_copied_finally_setup_nop_owners() {
+    for (prefix, action) in [
+        ("", "work()"),
+        ("async ", "await work()"),
+        ("", "yield work()"),
+        ("async ", "yield work()"),
+    ] {
+        let source = format!(
+            "{prefix}def f(flag, work):\n    try:\n        try:\n            {action}\n            return\n        finally:\n            if flag:\n                try:\n                    raise flag\n                finally:\n                    flag = None\n    except Error:\n        recover()\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "copied_finally_setup_nop_owner.py");
+    }
+}

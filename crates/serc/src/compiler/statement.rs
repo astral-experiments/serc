@@ -25684,7 +25684,9 @@ impl Compiler<'_> {
             self.assembler
                 .set_location(self.source_location(statement.range));
         }
-        self.emit(NOP, 0, 0)?;
+        // SETUP_FINALLY retains its absent owner when a copied finalizer later
+        // adds another enclosing exception region around this original record.
+        self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
         let statement_nop_end = self.assembler.label();
         self.assembler.mark(statement_nop_end);
         self.assembler
