@@ -294,3 +294,26 @@ fn matches_cpython_named_iterator_break_guarded_recovery_borrow() {
         "named_iterator_terminal_break_guarded_recovery_borrow.py",
     );
 }
+
+#[test]
+fn preserves_direct_nested_pass_return_borrow_boundaries() {
+    for otherwise in ["pass", "value = update(other)"] {
+        for returned in ["value", "42"] {
+            let source = format!(
+                "def f(value, other, outer, first, second):
+    if outer:
+        if first:
+            value = update(value)
+        elif second:
+            value = update(other)
+        else:
+            {otherwise}
+    else:
+        value = update(other)
+    return {returned}
+"
+            );
+            common::assert_matches_cpython_marshal(&source, "direct_nested_pass_return.py");
+        }
+    }
+}

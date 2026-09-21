@@ -5283,10 +5283,17 @@ impl OptimizationPipeline {
                     .count()
                     == 2
                 && graph[source].last_instruction().is_some_and(|jump| {
-                    jump.pre_fold_extra_instructions() == 1
+                    // A direct copy keeps the original join policy and has no
+                    // threaded-away jump slot. Retargeting clears that policy
+                    // while recording the one bypassed slot; both retain the same
+                    // pass array followed by the original empty join.
+                    ((jump.pre_fold_extra_instructions() == 1
+                        && !jump.jump_policy.retains_nop_for(jump.operand()))
+                        || (jump.pre_fold_extra_instructions() == 0
+                            && jump.jump_policy.retained_nop()
+                                == super::super::ir::RetainedJumpNop::DirectTarget))
                         && jump.local_policy.hidden_exception_owner_slots() == 0
                         && !jump.fusion_policy.is_authored_break()
-                        && !jump.jump_policy.retains_nop_for(jump.operand())
                         && !jump.jump_policy.borrow_empty_block()
                 });
             // Match-success jumps are originally unlocated. A located replacement
