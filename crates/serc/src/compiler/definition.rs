@@ -13,7 +13,6 @@ use super::{
     LOAD_SMALL_INT, MAKE_FUNCTION, MAP_ADD, NOT_TAKEN, POP_JUMP_IF_FALSE, PUSH_NULL, RAISE_VARARGS,
     RETURN_VALUE, STORE_SUBSCR, SWAP, UNPACK_SEQUENCE,
 };
-use crate::CompileError;
 use crate::assembler::SourceLocation;
 use crate::code_object::{CodeObject, Constant};
 use crate::target::code_flags::{
@@ -23,6 +22,7 @@ use crate::target::code_flags::{
 use crate::target::operands::{
     BinaryIntrinsic, CommonConstant, ComparisonOperation, FunctionAttribute, UnaryIntrinsic,
 };
+use crate::{CompileError, PythonVersion};
 
 use super::constant::{fold_constant, folded_constant_owner_slots};
 use super::scope::{
@@ -1331,7 +1331,12 @@ impl Compiler<'_> {
     ) -> Result<Option<(CodeObject, Vec<NameId>)>, CompileError> {
         let parameters = &definition.parameters;
         let mut annotations = Vec::<(String, &Expr)>::new();
-        for parameter in parameters.args.iter().chain(&parameters.posonlyargs) {
+        let positional_groups = if self.context.python_version == PythonVersion::Py315 {
+            [&parameters.posonlyargs, &parameters.args]
+        } else {
+            [&parameters.args, &parameters.posonlyargs]
+        };
+        for parameter in positional_groups.into_iter().flatten() {
             if let Some(annotation) = parameter.parameter.annotation.as_deref() {
                 annotations.push((parameter.name().as_str().to_string(), annotation));
             }
@@ -1409,9 +1414,21 @@ impl Compiler<'_> {
         } else {
             0
         }) | (self.unit.flags & SUPPORTED_FUTURE_FLAGS);
-        let mut child = Self::function(
-            Arc::clone(&self.context),
-            "__annotate__",
+        let annotation_qualified_name = if self.context.python_version == PythonVersion::Py315 {
+            if self.unit.generic_target_qualified_name.is_some() {
+                // A generic wrapper is an annotation scope. CPython skips it,
+                // including an early return when its parent is the module.
+                self.unit.qualified_name.rsplit_once('.').map_or_else(
+                    || "__annotate__".to_string(),
+                    |(parent, _)| format!("{parent}.{}.__annotate__", definition.name),
+                )
+            } else {
+                format!(
+                    "{}.__annotate__",
+                    self.annotation_child_qualified_name(definition.name.as_str())
+                )
+            }
+        } else {
             self.unit
                 .generic_target_qualified_name
                 .as_ref()
@@ -1423,7 +1440,12 @@ impl Compiler<'_> {
                             |(parent, _)| format!("{parent}.__annotate__"),
                         )
                     },
-                ),
+                )
+        };
+        let mut child = Self::function(
+            Arc::clone(&self.context),
+            "__annotate__",
+            annotation_qualified_name,
             self.line_number(u32::from(definition.name.range().start())),
             &plan,
             self.unit.scope_id,
@@ -1432,6 +1454,19 @@ impl Compiler<'_> {
             0,
             parameter_flags,
         )?;
+        if self.context.python_version == PythonVersion::Py315 {
+            // Lambdas and generators inside annotations are qualified against
+            // the enclosing scope, independently of the annotation owner's name.
+            child.unit.child_qualified_name_parent =
+                Some(if self.unit.generic_target_qualified_name.is_some() {
+                    self.unit.qualified_name.clone()
+                } else {
+                    self.annotation_child_qualified_name("__annotate__")
+                        .strip_suffix(".__annotate__")
+                        .unwrap_or("")
+                        .to_string()
+                });
+        }
         // Comprehension slots are synthetic locals, as when they were appended during lowering.
         child.symbols.fast_local_count = 1;
         child.unit.private_name.clone_from(&self.unit.private_name);
@@ -1793,4 +1828,109 @@ pub(super) fn clean_doc(docstring: &str) -> String {
         cleaned.push_str(&line[indentation.min(margin)..]);
     }
     cleaned
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::code_object::{CodeObject, Constant};
+    use crate::{CompileOptions, PythonVersion, compile_with_options};
+
+    fn find_code<'a>(code: &'a CodeObject, name: &str) -> Option<&'a CodeObject> {
+        if code.name == name {
+            return Some(code);
+        }
+        code.constants.iter().find_map(|constant| match constant {
+            Constant::Code(child) => find_code(child, name),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn annotation_parameter_order_matches_selected_python_version() {
+        let source =
+            "def f(p:int, /, q:str, *args:float, kw:bool, **kwargs:bytes) -> object:\n pass\n";
+        for (python_version, expected) in [
+            (
+                PythonVersion::Py314,
+                ["q", "p", "args", "kw", "kwargs", "return"],
+            ),
+            (
+                PythonVersion::Py315,
+                ["p", "q", "args", "kw", "kwargs", "return"],
+            ),
+        ] {
+            let module = compile_with_options(
+                source,
+                "annotations.py",
+                &CompileOptions {
+                    python_version,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap();
+            let annotations = find_code(&module.code, "__annotate__").unwrap();
+            let names = annotations
+                .constants
+                .iter()
+                .filter_map(|constant| match constant {
+                    Constant::String(name) => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(names, expected);
+        }
+    }
+
+    #[test]
+    fn python315_annotation_qualified_names_preserve_enclosing_scope() {
+        for (source, annotation, lambda) in [
+            (
+                "def f(x: (lambda: None)): pass",
+                "f.__annotate__",
+                "<lambda>",
+            ),
+            (
+                "def outer():\n def f(x: (lambda: None)): pass",
+                "outer.<locals>.f.__annotate__",
+                "outer.<locals>.<lambda>",
+            ),
+            (
+                "def f[T](x: (lambda: None)): pass",
+                "__annotate__",
+                "<generic parameters of f>.<lambda>",
+            ),
+            (
+                "def outer():\n global f\n def f[T](x: (lambda: None)): pass",
+                "outer.<locals>.f.__annotate__",
+                "outer.<locals>.<generic parameters of f>.<lambda>",
+            ),
+            (
+                "class C:\n def f[T](x: (lambda: None)): pass",
+                "C.f.__annotate__",
+                "C.<generic parameters of f>.<lambda>",
+            ),
+        ] {
+            let module = compile_with_options(
+                source,
+                "annotations.py",
+                &CompileOptions {
+                    python_version: PythonVersion::Py315,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                find_code(&module.code, "__annotate__")
+                    .unwrap()
+                    .qualified_name,
+                annotation,
+                "{source}",
+            );
+            assert_eq!(
+                find_code(&module.code, "<lambda>").unwrap().qualified_name,
+                lambda,
+                "{source}",
+            );
+        }
+    }
 }

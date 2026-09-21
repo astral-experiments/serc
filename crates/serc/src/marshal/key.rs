@@ -4,7 +4,9 @@ use std::hash::{Hash, Hasher};
 use rustc_hash::{FxHashMap, FxHasher};
 use smallvec::SmallVec;
 
+use crate::PythonVersion;
 use crate::code_object::{CodeObject, Constant, LocalsIdentity};
+use crate::target::small_int_bounds_for;
 
 use super::v5::{
     FLAG_REF, TYPE_ASCII, TYPE_ASCII_INTERNED, TYPE_BINARY_COMPLEX, TYPE_BINARY_FLOAT, TYPE_CODE,
@@ -379,10 +381,19 @@ pub(super) fn local_kinds_key(code: &CodeObject) -> ObjectKey<'_> {
 }
 
 /// Returns whether CPython gives a scalar slice member fresh identity instead of using its cache.
+#[cfg(test)]
 pub(super) fn slice_member_uses_identity(value: &Constant) -> bool {
+    slice_member_uses_identity_for(value, PythonVersion::Py314)
+}
+
+pub(super) fn slice_member_uses_identity_for(
+    value: &Constant,
+    python_version: PythonVersion,
+) -> bool {
+    let (minimum, maximum) = small_int_bounds_for(python_version);
     match value {
-        Constant::Int(value) => *value > 256,
-        Constant::SignedInt(value) => !(-5..=256).contains(value),
+        Constant::Int(value) => *value > maximum.cast_unsigned(),
+        Constant::SignedInt(value) => !(minimum..=maximum).contains(value),
         Constant::BigInt { .. } | Constant::Float(_) | Constant::Complex { .. } => true,
         Constant::String(value) => !is_cached_character(value),
         Constant::SurrogateString(_) => true,

@@ -1266,6 +1266,338 @@ fn emits_extended_arguments() {
 }
 
 #[test]
+fn target_caches_and_extended_arguments_share_the_same_layout() {
+    use crate::PythonVersion::{Py314, Py315};
+
+    for version in [Py314, Py315] {
+        let mut assembler = Assembler::with_python_version(version);
+        assembler.emit(RESUME, ResumeLocation::AT_FUNC_START.argument());
+        assembler.emit(IMPORT_NAME, if version == Py314 { 64 } else { 256 });
+        assembler.emit(RETURN_VALUE, 0);
+        let expected = if version == Py314 {
+            vec![
+                RESUME.code(),
+                0,
+                IMPORT_NAME.code(),
+                64,
+                RETURN_VALUE.code(),
+                0,
+            ]
+        } else {
+            vec![
+                RESUME.code_for(Py315),
+                0,
+                0,
+                0,
+                EXTENDED_ARG.code_for(Py315),
+                1,
+                IMPORT_NAME.code_for(Py315),
+                0,
+                RETURN_VALUE.code_for(Py315),
+                0,
+            ]
+        };
+        assert_eq!(assembler.finish().unwrap(), expected);
+    }
+}
+
+#[test]
+fn manager_finally_break_donor_requires_every_target_iterator_pop() {
+    use crate::PythonVersion::{Py314, Py315};
+
+    for (version, slots) in [(Py314, 1), (Py315, 2)] {
+        for mutation in ["intact", "missing pop", "wrong depth", "located pop"] {
+            let mut assembler = Assembler::with_python_version(version);
+            let entry = assembler.label();
+            let protected_end = assembler.label();
+            let location = SourceLocation::new(10, 10, 16, 32);
+            let mut items = vec![Item::Instruction(Instruction::new(
+                STORE_FAST,
+                Operand::Value(3),
+                location,
+                Some(2 + slots),
+            ))];
+            for index in 0..slots {
+                items.push(Item::Instruction(Instruction::new(
+                    POP_TOP,
+                    Operand::Value(0),
+                    SourceLocation::NONE,
+                    Some(1 + slots - index),
+                )));
+            }
+            match mutation {
+                "missing pop" => {
+                    items.pop();
+                }
+                "wrong depth" | "located pop" => {
+                    let Item::Instruction(pop) = &mut items[1] else {
+                        unreachable!();
+                    };
+                    if mutation == "wrong depth" {
+                        *pop = Instruction::new(
+                            POP_TOP,
+                            Operand::Value(0),
+                            SourceLocation::NONE,
+                            Some(2 + slots),
+                        );
+                    } else {
+                        pop.location = location;
+                    }
+                }
+                _ => {}
+            }
+            let mut jump = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(entry),
+                SourceLocation::NONE,
+                Some(2),
+            );
+            jump.fusion_policy.mark_authored_break();
+            items.extend([
+                Item::Instruction(jump),
+                Item::Instruction(Instruction::new(
+                    RAISE_VARARGS,
+                    Operand::Value(1),
+                    SourceLocation::new(12, 12, 12, 28),
+                    Some(2),
+                )),
+                Item::Label(entry),
+                Item::Label(protected_end),
+            ]);
+            for item in items {
+                assembler.push_linear_item(item);
+            }
+            assembler.record_exception_owner_block_boundary(entry);
+            assert_eq!(
+                assembler.original_manager_copied_finally_break_join(protected_end),
+                (mutation == "intact").then_some((entry, location)),
+                "{version:?}, {mutation}"
+            );
+        }
+    }
+}
+
+#[test]
+fn iterator_conditional_return_counts_the_original_try_unwind_slot() {
+    use crate::code_object::Constant;
+    use crate::{CompileOptions, PythonVersion, compile_with_options};
+
+    let source = "def choose(items, value, flag):\n    for item in items:\n        try:\n            return value if flag else {}\n        except ValueError:\n            pass\n";
+    for version in [PythonVersion::Py314, PythonVersion::Py315] {
+        let module = compile_with_options(
+            source,
+            "iterator_return.py",
+            &CompileOptions {
+                python_version: version,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap();
+        let code = module
+            .code
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) => Some(code),
+                _ => None,
+            })
+            .unwrap();
+        let returns = code
+            .bytecode
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .filter(|instruction| instruction[0] == RETURN_VALUE.code_for(version))
+            .count();
+        // CPython's four-slot copy limit includes the erased POP_BLOCK. The
+        // second iterator slot makes 3.15's conditional cleanup too large to copy.
+        assert_eq!(
+            returns,
+            if version == PythonVersion::Py315 {
+                2
+            } else {
+                3
+            }
+        );
+        let borrowed_value = [LOAD_FAST_BORROW.code_for(version), 1];
+        assert_eq!(
+            code.bytecode.as_chunks::<2>().0.contains(&borrowed_value),
+            version == PythonVersion::Py314
+        );
+    }
+}
+
+#[test]
+fn builtin_iterable_return_retains_the_original_try_unwind_slot() {
+    use crate::code_object::Constant;
+    use crate::{CompileOptions, PythonVersion, compile_with_options};
+
+    for callable in ["tuple", "list"] {
+        let source = format!(
+            "def choose(items, values):\n    for item in items:\n        try:\n            return {callable}(value for value in values)\n        except ValueError:\n            pass\n"
+        );
+        for version in [PythonVersion::Py314, PythonVersion::Py315] {
+            let module = compile_with_options(
+                &source,
+                "builtin_iterator_return.py",
+                &CompileOptions {
+                    python_version: version,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap();
+            let code = module
+                .code
+                .constants
+                .iter()
+                .find_map(|constant| match constant {
+                    Constant::Code(code) => Some(code),
+                    _ => None,
+                })
+                .unwrap();
+            let returns = code
+                .bytecode
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .filter(|instruction| instruction[0] == RETURN_VALUE.code_for(version))
+                .count();
+            // The located optimized-path jump and its normal-call fallback join
+            // before the try POP_BLOCK and the iterator's shared return cleanup.
+            assert_eq!(
+                returns,
+                if version == PythonVersion::Py314 && callable == "tuple" {
+                    3
+                } else {
+                    2
+                },
+                "{version:?}: {callable}"
+            );
+        }
+    }
+}
+
+#[test]
+fn python315_resume_entry_and_depth_have_distinct_encodings() {
+    use crate::PythonVersion::Py315;
+    use crate::target::GENEXPR_RESUME_ARGUMENT;
+
+    for (argument, expected) in [
+        (ResumeLocation::AFTER_YIELD.at_depth(true), 9),
+        (ResumeLocation::AFTER_AWAIT.at_depth(true), 11),
+        (GENEXPR_RESUME_ARGUMENT, 4),
+    ] {
+        let mut assembler = Assembler::with_python_version(Py315);
+        assembler.emit(RESUME, argument);
+        assert_eq!(
+            assembler.finish().unwrap(),
+            [RESUME.code_for(Py315), expected, 0, 0]
+        );
+    }
+}
+
+#[test]
+fn python315_yield_from_uses_quickened_get_iter_and_cache() {
+    use crate::PythonVersion::Py315;
+
+    let mut assembler = Assembler::with_python_version(Py315);
+    assembler.emit(GET_YIELD_FROM_ITER, 0);
+    assert_eq!(
+        assembler.finish().unwrap(),
+        [GET_ITER.code_for(Py315), 3, 0, 0]
+    );
+}
+
+#[test]
+fn python315_borrow_traversal_crosses_removed_constant_branches() {
+    use crate::PythonVersion::{Py314, Py315};
+    use crate::code_object::Constant;
+    use crate::{CompileOptions, compile_with_options};
+
+    for source in [
+        "def f(x):\n    if False:\n        pass\n    return x\n",
+        "def f(x):\n    while False:\n        pass\n    return x\n",
+        "def f(x):\n    if flag:\n        return\n    assert False, x.value\n",
+        "def f(x):\n    if flag:\n        pass\n    else:\n        assert False, f'bad: {x}'\n",
+    ] {
+        for version in [Py314, Py315] {
+            let module = compile_with_options(
+                source,
+                "borrow.py",
+                &CompileOptions {
+                    python_version: version,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap();
+            let code = module
+                .code
+                .constants
+                .iter()
+                .find_map(|constant| {
+                    if let Constant::Code(code) = constant {
+                        Some(code)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            let expected = if version == Py314 {
+                LOAD_FAST
+            } else {
+                LOAD_FAST_BORROW
+            };
+            assert!(
+                code.bytecode
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .any(|word| *word == [expected.code_for(version), 0]),
+                "{version:?}: {source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn terminal_assignment_fallthrough_keeps_value_owned() {
+    use crate::code_object::Constant;
+    use crate::{CompileOptions, PythonVersion, compile_with_options};
+
+    for version in [PythonVersion::Py314, PythonVersion::Py315] {
+        let module = compile_with_options(
+            "def f(self, value):\n    self.value = {} if value is None else value\n",
+            "tail.py",
+            &CompileOptions {
+                python_version: version,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap();
+        let code = module
+            .code
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) => Some(code),
+                _ => None,
+            })
+            .unwrap();
+        assert!(code.bytecode.windows(6).any(|window| {
+            window
+                == [
+                    LOAD_FAST.code_for(version),
+                    1,
+                    LOAD_FAST_BORROW.code_for(version),
+                    0,
+                    STORE_ATTR.code_for(version),
+                    0,
+                ]
+        }));
+    }
+}
+
+#[test]
 fn emits_full_width_extended_arguments_and_zeroed_inline_caches() {
     let mut assembler = Assembler::default();
     assembler.emit(LOAD_GLOBAL, 0x1234_5678);
@@ -1297,6 +1629,7 @@ fn fused_final_artifacts_preserve_cache_extended_argument_location_and_depth_sem
     let first_location = SourceLocation::new(7, 7, 0, 1);
     let second_location = SourceLocation::new(8, 8, 2, 4);
     let assembler = super::LayoutAssembler {
+        python_version: crate::PythonVersion::Py314,
         items: vec![
             Item::Instruction(Instruction::new(
                 LOAD_GLOBAL,
@@ -1374,6 +1707,7 @@ fn unextended_final_artifacts_preserve_jump_cache_location_and_depth_semantics()
     let second_location = SourceLocation::new(8, 8, 2, 4);
     let target = super::Label(0);
     let assembler = super::LayoutAssembler {
+        python_version: crate::PythonVersion::Py314,
         items: vec![
             Item::Instruction(Instruction::new(
                 LOAD_GLOBAL,
@@ -1509,6 +1843,35 @@ fn constant_pop_candidates_are_recorded_during_emission() {
             if load.opcode == LOAD_CONST
                 && matches!(load.operand(), Operand::Value(1))
                 && return_value.opcode == RETURN_VALUE
+    ));
+}
+
+#[test]
+fn discarded_constant_precedes_late_sequence_admission() {
+    use crate::code_object::Constant;
+    use crate::{CompileOptions, PythonVersion, compile_with_options};
+
+    let values = (0..31)
+        .map(|index| format!("'item_{index}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = format!("()\nfor item in [{values}]:\n    use(item)\nother = (1, 2)\nf(**kw)\n");
+    let module = compile_with_options(
+        &source,
+        "discarded_before_sequence.py",
+        &CompileOptions {
+            python_version: PythonVersion::Py315,
+            ..CompileOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        module.code.constants.as_slice(),
+        [Constant::String(first), Constant::Tuple(empty), Constant::Tuple(sequence), Constant::Tuple(pair)]
+            if first == "item_0"
+                && empty.is_empty()
+                && sequence.len() == 31
+                && matches!(pair.as_slice(), [Constant::Int(1), Constant::Int(2)])
     ));
 }
 
@@ -3847,6 +4210,7 @@ fn retained_setup_nop_identity_survives_consecutive_labels_without_aliasing_remo
             }
         }
         let assembler = super::LayoutAssembler {
+            python_version: crate::PythonVersion::Py314,
             items,
             exception_regions: Vec::new(),
             exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance {
@@ -4878,6 +5242,75 @@ fn split_return_condition_transports_only_a_unique_exact_source_witness() {
                     "{change}"
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn iterator_break_finalizers_copy_every_target_iterator_cell() {
+    use crate::code_object::Constant;
+    use crate::{CompileOptions, PythonVersion, compile_with_options};
+
+    let shared_return = "def choose(items, resource):\n    for item in items:\n        try:\n            if item:\n                break\n        finally:\n            try:\n                resource.close()\n            except OSError:\n                pass\n    return items\n";
+    let guarded_handler = "def choose(items, resource, visit):\n    for item in items:\n        try:\n            visit(item)\n            break\n        except Exception as error:\n            if item:\n                break\n        finally:\n            if resource is not None:\n                try:\n                    resource.close()\n                except OSError:\n                    pass\n    visit(resource)\n";
+    for (source, guarded) in [(shared_return, false), (guarded_handler, true)] {
+        for version in [PythonVersion::Py314, PythonVersion::Py315] {
+            let module = compile_with_options(
+                source,
+                "iterator_break_finalizer.py",
+                &CompileOptions {
+                    python_version: version,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap();
+            let code = module
+                .code
+                .constants
+                .iter()
+                .find_map(|constant| match constant {
+                    Constant::Code(code) => Some(code),
+                    _ => None,
+                })
+                .unwrap();
+            let instructions = code.bytecode.as_chunks::<2>().0;
+            let iterator_width = if version == PythonVersion::Py315 {
+                2
+            } else {
+                1
+            };
+            let copied_disposals = if guarded {
+                instructions
+                    .windows(iterator_width + 1)
+                    .filter(|window| {
+                        window[..iterator_width]
+                            .iter()
+                            .all(|instruction| *instruction == [POP_TOP.code_for(version), 0])
+                            && window[iterator_width][0] == JUMP_FORWARD.code_for(version)
+                    })
+                    .count()
+            } else {
+                let returns = instructions
+                    .iter()
+                    .filter(|instruction| instruction[0] == RETURN_VALUE.code_for(version))
+                    .count();
+                assert_eq!(returns, 3, "{version:?}");
+                instructions
+                    .windows(iterator_width + 2)
+                    .filter(|window| {
+                        window[..iterator_width]
+                            .iter()
+                            .all(|instruction| *instruction == [POP_TOP.code_for(version), 0])
+                            && matches!(window[iterator_width][0], opcode
+                                if opcode == LOAD_FAST.code_for(version)
+                                    || opcode == LOAD_FAST_BORROW.code_for(version))
+                            && window[iterator_width + 1][0] == RETURN_VALUE.code_for(version)
+                    })
+                    .count()
+            };
+            // Both predecessors receive the complete target-specific iterator cleanup,
+            // whether they then copy a return or jump to an ordinary continuation.
+            assert_eq!(copied_disposals, 2, "{version:?}, guarded={guarded}");
         }
     }
 }

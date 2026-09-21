@@ -8,13 +8,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serc::{CPYTHON_TARGET, InitialInternState};
+use serc::{InitialInternState, PythonVersion};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
-const BOUNDARY: &str = "Py_CompileStringObject:entry-after-argument-and-AST-init-before-parser";
+fn capture_boundary(python_version: PythonVersion) -> &'static str {
+    match python_version {
+        PythonVersion::Py314 => {
+            "Py_CompileStringObject:entry-after-argument-and-AST-init-before-parser"
+        }
+        PythonVersion::Py315 => "_Py_CompileString:entry-after-argument-and-AST-init-before-parser",
+    }
+}
 
 pub(super) struct LoadedProfile {
     pub(super) state: InitialInternState,
@@ -123,11 +130,12 @@ struct RuntimeCapture {
 pub(super) fn load(
     path: &Path,
     python: &str,
+    python_version: PythonVersion,
     source_bytes: bool,
     oracle: &str,
 ) -> Result<LoadedProfile, String> {
     let profile: Profile = read_json(&read(path)?)?;
-    profile.validate_contract(source_bytes, oracle)?;
+    profile.validate_contract(python_version, source_bytes, oracle)?;
     let executable = profile.executable.read()?;
     let snapshot = profile.snapshot.read()?;
     let capture: Value = read_json(&profile.capture.read()?)?;
@@ -179,17 +187,23 @@ pub(super) fn load(
 }
 
 impl Profile {
-    fn validate_contract(&self, source_bytes: bool, oracle: &str) -> Result<(), String> {
+    fn validate_contract(
+        &self,
+        python_version: PythonVersion,
+        source_bytes: bool,
+        oracle: &str,
+    ) -> Result<(), String> {
+        let target = python_version.target();
         require(
             self.schema_version == 1,
             "unsupported profile schema version",
         )?;
         require(
-            self.target.implementation == CPYTHON_TARGET.implementation
-                && self.target.version == CPYTHON_TARGET.version_string()
-                && self.target.tag == CPYTHON_TARGET.tag
-                && self.target.commit == CPYTHON_TARGET.commit
-                && self.target.magic_hex == CPYTHON_TARGET.magic_hex(),
+            self.target.implementation == target.implementation
+                && self.target.version == target.version_string()
+                && self.target.tag == target.tag
+                && self.target.commit == target.commit
+                && self.target.magic_hex == target.magic_hex(),
             "profile CPython target differs from the compiler target",
         )?;
         let mode = if source_bytes {
@@ -208,7 +222,7 @@ impl Profile {
                 && self.oracle.compile_mode == "exec"
                 && self.oracle.dont_inherit
                 && self.oracle.optimize == 0
-                && self.oracle.capture_boundary == BOUNDARY,
+                && self.oracle.capture_boundary == capture_boundary(python_version),
             "profile oracle script, invocation, or capture boundary differs",
         )
     }
@@ -461,12 +475,13 @@ mod tests {
     use serde_json::json;
 
     fn contract() -> Value {
+        let target = PythonVersion::Py314.target();
         let artifact = json!({"path": "/profile/artifact", "sha256": "unused"});
         json!({
             "schema_version": 1,
-            "target": {"implementation": CPYTHON_TARGET.implementation, "version": CPYTHON_TARGET.version_string(), "tag": CPYTHON_TARGET.tag, "commit": CPYTHON_TARGET.commit, "magic_hex": CPYTHON_TARGET.magic_hex()},
+            "target": {"implementation": target.implementation, "version": target.version_string(), "tag": target.tag, "commit": target.commit, "magic_hex": target.magic_hex()},
             "compiler_input_mode": "source-bytes",
-            "oracle": {"script_sha256": digest(b"oracle"), "arguments": ["-I", "-S", "-c"], "source_input": "bytes", "compile_mode": "exec", "dont_inherit": true, "optimize": 0, "capture_boundary": BOUNDARY},
+            "oracle": {"script_sha256": digest(b"oracle"), "arguments": ["-I", "-S", "-c"], "source_input": "bytes", "compile_mode": "exec", "dont_inherit": true, "optimize": 0, "capture_boundary": capture_boundary(PythonVersion::Py314)},
             "executable": artifact, "snapshot": artifact, "capture": artifact,
             "observer": artifact, "layout": artifact, "headers": artifact,
             "runtime_inputs": artifact, "process_maps": artifact, "runtime_capture": artifact
@@ -477,11 +492,23 @@ mod tests {
     fn binds_exact_target_oracle_boundary_and_compiler_mode() {
         let mut value = contract();
         let profile: Profile = serde_json::from_value(value.clone()).unwrap();
-        assert!(profile.validate_contract(true, "oracle").is_ok());
-        assert!(profile.validate_contract(false, "oracle").is_err());
+        assert!(
+            profile
+                .validate_contract(PythonVersion::Py314, true, "oracle")
+                .is_ok()
+        );
+        assert!(
+            profile
+                .validate_contract(PythonVersion::Py314, false, "oracle")
+                .is_err()
+        );
         value["compiler_input_mode"] = json!("utf8-text");
         let profile: Profile = serde_json::from_value(value).unwrap();
-        assert!(profile.validate_contract(false, "oracle").is_ok());
+        assert!(
+            profile
+                .validate_contract(PythonVersion::Py314, false, "oracle")
+                .is_ok()
+        );
         for (pointer, replacement) in [
             ("/schema_version", json!(2)),
             ("/target/commit", json!("different")),
@@ -497,7 +524,9 @@ mod tests {
             *value.pointer_mut(pointer).unwrap() = replacement;
             let profile: Profile = serde_json::from_value(value).unwrap();
             assert!(
-                profile.validate_contract(true, "oracle").is_err(),
+                profile
+                    .validate_contract(PythonVersion::Py314, true, "oracle")
+                    .is_err(),
                 "{pointer}"
             );
         }
@@ -514,6 +543,45 @@ mod tests {
         entries.push(json!({"pool":"dynamic", "state":1, "codepoints":[97,98]}));
         let capture = json!({"snapshot":{"states":{"1":1,"2":0,"3":257},"total":258,"static_count":257,"dynamic_count":1}});
         (entries, capture)
+    }
+
+    #[test]
+    fn profiles_are_bound_to_the_selected_python_target() {
+        for python_version in [PythonVersion::Py314, PythonVersion::Py315] {
+            let target = python_version.target();
+            let mut value = contract();
+            value["target"] = json!({
+                "implementation": target.implementation,
+                "version": target.version_string(),
+                "tag": target.tag,
+                "commit": target.commit,
+                "magic_hex": target.magic_hex(),
+            });
+            value["oracle"]["capture_boundary"] = json!(capture_boundary(python_version));
+            let profile: Profile = serde_json::from_value(value.clone()).unwrap();
+            assert!(
+                profile
+                    .validate_contract(python_version, true, "oracle")
+                    .is_ok()
+            );
+            let other = match python_version {
+                PythonVersion::Py314 => PythonVersion::Py315,
+                PythonVersion::Py315 => PythonVersion::Py314,
+            };
+            assert!(profile.validate_contract(other, true, "oracle").is_err());
+            assert!(
+                profile
+                    .validate_contract(python_version, true, "other oracle")
+                    .is_err()
+            );
+            value["target"]["tag"] = json!("v3.15.0rc1");
+            let profile: Profile = serde_json::from_value(value).unwrap();
+            assert!(
+                profile
+                    .validate_contract(python_version, true, "oracle")
+                    .is_err()
+            );
+        }
     }
 
     #[test]

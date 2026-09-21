@@ -2,11 +2,11 @@ use std::collections::hash_map::Entry;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::InitialInternState;
 use crate::code_object::{
     CodeInterningSummary, CodeObject, CompilationInterningEventKind, Constant,
 };
-use crate::target::is_preinterned_string;
+use crate::target::{is_preinterned_string_for, small_int_bounds_for};
+use crate::{InitialInternState, PythonVersion};
 
 use super::key::{
     FrozenSetMembers, HashedObjectKey, ObjectKey, code_bytes_key, code_key, constant_key,
@@ -93,12 +93,20 @@ fn mismatched_occurrence(index: usize, expected: OccurrenceKind, recorded: Occur
 }
 
 const CODE_OBJECT_CHILDREN: usize = 10;
-const CACHED_INT_SLOTS: usize = 257;
-const CACHED_SIGNED_INT_SLOTS: usize = 262;
 const CACHED_BYTE_SLOTS: usize = 256;
 const CACHED_CHARACTER_SLOTS: usize = 256;
-const CACHED_SCALAR_SLOTS: usize =
-    CACHED_INT_SLOTS + CACHED_SIGNED_INT_SLOTS + CACHED_BYTE_SLOTS + CACHED_CHARACTER_SLOTS;
+fn cached_integer_slots(python_version: PythonVersion) -> (usize, usize) {
+    let (minimum, maximum) = small_int_bounds_for(python_version);
+    (
+        usize::try_from(maximum + 1).expect("positive small-int cache size fits"),
+        usize::try_from(maximum - minimum + 1).expect("signed small-int cache size fits"),
+    )
+}
+
+fn cached_scalar_slots(python_version: PythonVersion) -> usize {
+    let (positive, signed) = cached_integer_slots(python_version);
+    positive + signed + CACHED_BYTE_SLOTS + CACHED_CHARACTER_SLOTS
+}
 const UNSEEN_CACHED_OBJECT: u32 = u32::MAX;
 const MIN_CACHED_SCALAR_CONSTANTS: usize = 32;
 const MAX_DENSE_METADATA_SLOTS: usize = 1 << 20;
@@ -124,32 +132,34 @@ impl CachedObject {
         }
     }
 
-    fn scalar_index(self) -> usize {
+    fn scalar_index(self, python_version: PythonVersion) -> usize {
+        let (positive, signed) = cached_integer_slots(python_version);
         match self {
             Self::EmptyBytes | Self::EmptyTuple => {
                 unreachable!("empty cached object does not have a scalar index")
             }
             Self::Int(value) => usize::from(value),
-            Self::SignedInt(value) => CACHED_INT_SLOTS + usize::from(value),
-            Self::Byte(value) => CACHED_INT_SLOTS + CACHED_SIGNED_INT_SLOTS + usize::from(value),
-            Self::Character(value) => {
-                CACHED_INT_SLOTS + CACHED_SIGNED_INT_SLOTS + CACHED_BYTE_SLOTS + usize::from(value)
-            }
+            Self::SignedInt(value) => positive + usize::from(value),
+            Self::Byte(value) => positive + signed + usize::from(value),
+            Self::Character(value) => positive + signed + CACHED_BYTE_SLOTS + usize::from(value),
         }
     }
 
     #[cfg(test)]
-    fn for_key(key: &ObjectKey<'_>) -> Option<Self> {
+    fn for_key(key: &ObjectKey<'_>, python_version: PythonVersion) -> Option<Self> {
+        let (minimum, maximum) = small_int_bounds_for(python_version);
         match key {
             ObjectKey::Bytes([]) => Some(Self::EmptyBytes),
             ObjectKey::Bytes([value]) => Some(Self::Byte(*value)),
             ObjectKey::EmptyTuple => Some(Self::EmptyTuple),
-            ObjectKey::Int(value) if *value <= 256 => {
+            ObjectKey::Int(value) if *value <= maximum.cast_unsigned() => {
                 Some(Self::Int(u16::try_from(*value).expect("cached int fits")))
             }
-            ObjectKey::SignedInt(value) if (-5..=256).contains(value) => Some(Self::SignedInt(
-                u16::try_from(*value + 5).expect("cached signed int index fits"),
-            )),
+            ObjectKey::SignedInt(value) if (minimum..=maximum).contains(value) => {
+                Some(Self::SignedInt(
+                    u16::try_from(*value - minimum).expect("cached signed int index fits"),
+                ))
+            }
             ObjectKey::String(value) => Self::character(value),
             _ => None,
         }
@@ -158,8 +168,10 @@ impl CachedObject {
 
 #[derive(Debug, Default)]
 pub(super) struct ObjectGraph<'a> {
+    python_version: PythonVersion,
     objects: FxHashMap<HashedObjectKey<'a>, ObjectId>,
     interned_strings: FxHashMap<&'a str, ObjectId>,
+    metadata_aliased_constants: FxHashSet<usize>,
     metadata_slots: Box<[Option<(&'a str, ObjectId)>]>,
     cached_empty_bytes: Option<ObjectId>,
     cached_empty_tuple: Option<ObjectId>,
@@ -175,19 +187,20 @@ pub(super) struct ObjectGraph<'a> {
 impl<'a> ObjectGraph<'a> {
     #[cfg(test)]
     pub(super) fn for_code(code: &'a CodeObject) -> Self {
-        Self::for_code_with_intern_state(code, &InitialInternState::default())
+        Self::for_code_with_options(code, PythonVersion::Py314, &InitialInternState::default())
     }
 
-    pub(super) fn for_code_with_intern_state(
+    pub(super) fn for_code_with_options(
         code: &'a CodeObject,
+        python_version: PythonVersion,
         initial_intern_state: &InitialInternState,
     ) -> Self {
-        let graph = Self::build_for_code(code, initial_intern_state, None);
+        let graph = Self::build_for_code(code, python_version, initial_intern_state, None);
         if graph.needs_reference_sorting {
             // Tuple members sort by complete marshal streams: their descendants' reference flags
             // depend on sharing across the entire code graph. Resolve that sharing before recording
             // occurrences in the final member order. Scalar-only sets do not need this extra pass.
-            Self::build_for_code(code, initial_intern_state, Some(&graph))
+            Self::build_for_code(code, python_version, initial_intern_state, Some(&graph))
         } else {
             graph
         }
@@ -195,15 +208,23 @@ impl<'a> ObjectGraph<'a> {
 
     fn build_for_code(
         code: &'a CodeObject,
+        python_version: PythonVersion,
         initial_intern_state: &InitialInternState,
         sort_graph: Option<&Self>,
     ) -> Self {
         let mut explicitly_interned = FxHashSet::default();
-        let frozenset_recreation_need = collect_explicitly_interned(code, &mut explicitly_interned);
+        let mut metadata_tuples = FxHashSet::default();
+        let frozenset_recreation_need = collect_explicitly_interned(
+            code,
+            python_version,
+            &mut explicitly_interned,
+            &mut metadata_tuples,
+        );
         let mut recreated_frozensets = FxHashSet::default();
         collect_recreated_frozensets(
             code,
             frozenset_recreation_need,
+            python_version,
             initial_intern_state,
             &mut recreated_frozensets,
         );
@@ -219,6 +240,8 @@ impl<'a> ObjectGraph<'a> {
             .map(|len| vec![None; len].into_boxed_slice())
             .unwrap_or_default();
         let mut graph = Self {
+            python_version,
+            metadata_aliased_constants: collect_metadata_aliased_constants(code, &metadata_tuples),
             cache_scalars: code.constants.len() >= MIN_CACHED_SCALAR_CONSTANTS,
             metadata_slots,
             ..Self::default()
@@ -245,6 +268,12 @@ impl<'a> ObjectGraph<'a> {
 
     fn sort_key_properties(&self, value: &'a Constant) -> (bool, bool) {
         if let Constant::String(value) = value {
+            if self
+                .metadata_aliased_constants
+                .contains(&std::ptr::from_ref(value).addr())
+            {
+                return (true, true);
+            }
             if let Some(id) = self.objects.get(&ObjectKey::ConstantString(value).into()) {
                 return (self.is_shared_object(*id), false);
             }
@@ -254,7 +283,7 @@ impl<'a> ObjectGraph<'a> {
             );
         }
         let key = constant_key(value);
-        let shared = Self::is_cached(&key)
+        let shared = Self::is_cached(&key, self.python_version)
             || self
                 .objects
                 .get(&key.into())
@@ -361,7 +390,7 @@ impl<'a> ObjectGraph<'a> {
 
     #[cfg(test)]
     pub(super) fn record(&mut self, key: ObjectKey<'a>) -> bool {
-        if let Some(cached) = CachedObject::for_key(&key) {
+        if let Some(cached) = CachedObject::for_key(&key, self.python_version) {
             self.record_cached(cached).1
         } else {
             self.record_object(key.into()).1
@@ -407,8 +436,8 @@ impl<'a> ObjectGraph<'a> {
         }
 
         let slot = &mut self.cached_scalar_ids.get_or_insert_with(|| {
-            vec![UNSEEN_CACHED_OBJECT; CACHED_SCALAR_SLOTS].into_boxed_slice()
-        })[cached.scalar_index()];
+            vec![UNSEEN_CACHED_OBJECT; cached_scalar_slots(self.python_version)].into_boxed_slice()
+        })[cached.scalar_index(self.python_version)];
         if *slot != UNSEEN_CACHED_OBJECT {
             let id = ObjectId::from_index(*slot as usize);
             self.objects_by_id[id.index()].shared = true;
@@ -430,7 +459,7 @@ impl<'a> ObjectGraph<'a> {
         let next_id = ObjectId::from_index(self.objects_by_id.len());
         match self.objects.entry(key) {
             Entry::Occupied(entry) => {
-                let cached = Self::is_cached(entry.key().key());
+                let cached = Self::is_cached(entry.key().key(), self.python_version);
                 let id = *entry.get();
                 let object = &mut self.objects_by_id[id.index()];
                 object.shared = true;
@@ -438,7 +467,7 @@ impl<'a> ObjectGraph<'a> {
                 (id, false)
             }
             Entry::Vacant(entry) => {
-                let cached = Self::is_cached(entry.key().key());
+                let cached = Self::is_cached(entry.key().key(), self.python_version);
                 entry.insert(next_id);
                 self.objects_by_id.push(Object {
                     shared: false,
@@ -468,13 +497,14 @@ impl<'a> ObjectGraph<'a> {
         {
             return true;
         }
-        Self::is_cached(key)
+        Self::is_cached(key, self.python_version)
     }
 
-    fn is_cached(key: &ObjectKey<'_>) -> bool {
+    fn is_cached(key: &ObjectKey<'_>, python_version: PythonVersion) -> bool {
+        let (minimum, maximum) = small_int_bounds_for(python_version);
         match key {
-            ObjectKey::Int(value) => *value <= 256,
-            ObjectKey::SignedInt(value) => (-5..=256).contains(value),
+            ObjectKey::Int(value) => *value <= maximum.cast_unsigned(),
+            ObjectKey::SignedInt(value) => (minimum..=maximum).contains(value),
             ObjectKey::Bytes(value) => value.len() <= 1,
             ObjectKey::String(value) => is_cached_character(value),
             ObjectKey::EmptyTuple => true,
@@ -485,6 +515,10 @@ impl<'a> ObjectGraph<'a> {
     pub(super) fn is_shared_object(&self, id: ObjectId) -> bool {
         let object = &self.objects_by_id[id.index()];
         object.shared || object.cached
+    }
+
+    pub(super) fn python_version(&self) -> PythonVersion {
+        self.python_version
     }
 
     pub(super) fn object_count(&self) -> usize {
@@ -524,7 +558,7 @@ impl<'a> ObjectGraph<'a> {
     #[cfg(test)]
     pub(super) fn is_interned(&self, value: &str) -> bool {
         if CachedObject::character(value)
-            .map(CachedObject::scalar_index)
+            .map(|cached| cached.scalar_index(self.python_version))
             .is_some_and(|index| {
                 self.cached_scalar_ids
                     .as_deref()
@@ -576,9 +610,86 @@ pub(super) fn metadata_values_equal(left: &str, right: &str) -> bool {
     }
 }
 
+/// Finds constant tuple elements replaced by metadata-string interning. CPython's
+/// constant cache can share an all-string tuple with `co_names` or `co_varnames` before
+/// interning metadata, including tuples from a different nested code object. Only
+/// those tuple slots change; an equal standalone non-ASCII constant stays distinct.
+fn collect_metadata_aliased_constants<'a>(
+    code: &'a CodeObject,
+    keys: &FxHashSet<HashedObjectKey<'a>>,
+) -> FxHashSet<usize> {
+    fn constants<'a>(
+        values: &'a [Constant],
+        keys: &FxHashSet<HashedObjectKey<'a>>,
+        interned: &mut FxHashSet<usize>,
+    ) {
+        if !values.is_empty()
+            && values
+                .iter()
+                .all(|value| matches!(value, Constant::String(_)))
+            && keys.contains(&constants_tuple_key(values).into())
+        {
+            for value in values {
+                let Constant::String(value) = value else {
+                    unreachable!("all-string tuple")
+                };
+                if !should_intern(value) {
+                    interned.insert(std::ptr::from_ref(value).addr());
+                }
+            }
+            return;
+        }
+        for value in values {
+            constant(value, keys, interned);
+        }
+    }
+
+    fn constant<'a>(
+        value: &'a Constant,
+        keys: &FxHashSet<HashedObjectKey<'a>>,
+        interned: &mut FxHashSet<usize>,
+    ) {
+        match value {
+            Constant::Tuple(values) => constants(values, keys, interned),
+            Constant::FrozenSet(values) => {
+                for value in values {
+                    constant(value, keys, interned);
+                }
+            }
+            Constant::Code(child) => constants(&child.constants, keys, interned),
+            Constant::Slice { lower, upper, step } => {
+                for value in [lower.as_ref(), upper.as_ref(), step.as_ref()] {
+                    constant(value, keys, interned);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut interned = FxHashSet::default();
+    if !keys.is_empty() {
+        constants(&code.constants, keys, &mut interned);
+    }
+    interned
+}
+
+fn collect_metadata_tuple_keys<'a>(
+    code: &'a CodeObject,
+    keys: &mut FxHashSet<HashedObjectKey<'a>>,
+) {
+    if code.names.iter().any(|value| !should_intern(value)) {
+        keys.insert(strings_tuple_key(&code.names).into());
+    }
+    if code.locals.iter().any(|value| !should_intern(value)) {
+        keys.insert(locals_tuple_key(code).into());
+    }
+}
+
 fn collect_explicitly_interned<'a>(
     code: &'a CodeObject,
+    python_version: PythonVersion,
     values: &mut FxHashSet<&'a str>,
+    metadata_tuples: &mut FxHashSet<HashedObjectKey<'a>>,
 ) -> FrozensetRecreationNeed {
     // Identifier objects can enter the compilation-wide constant cache before an equal
     // ordinary string. Preserve that recorded origin when sharing constant and metadata strings.
@@ -591,11 +702,11 @@ fn collect_explicitly_interned<'a>(
     let (has_qualified_name_constant, frozenset_recreation_need) =
         if code.marshal_provenance.subtree_has_frozenset_constants == Some(false) {
             (
-                collect_interning_provenance_without_frozensets(code, values),
+                collect_interning_provenance_without_frozensets(code, values, metadata_tuples),
                 FrozensetRecreationNeed::None,
             )
         } else {
-            collect_interning_provenance(code, values)
+            collect_interning_provenance(code, python_version, values, metadata_tuples)
         };
     if !has_qualified_name_constant {
         return frozenset_recreation_need;
@@ -627,7 +738,9 @@ fn collect_explicitly_interned<'a>(
 fn collect_interning_provenance_without_frozensets<'a>(
     code: &'a CodeObject,
     values: &mut FxHashSet<&'a str>,
+    metadata_tuples: &mut FxHashSet<HashedObjectKey<'a>>,
 ) -> bool {
+    collect_metadata_tuple_keys(code, metadata_tuples);
     values.extend(
         code.marshal_provenance
             .explicitly_interned_strings
@@ -641,7 +754,7 @@ fn collect_interning_provenance_without_frozensets<'a>(
     for constant in &code.constants {
         if let Constant::Code(code) = constant {
             has_qualified_name_constant |=
-                collect_interning_provenance_without_frozensets(code, values);
+                collect_interning_provenance_without_frozensets(code, values, metadata_tuples);
         }
     }
     has_qualified_name_constant
@@ -649,8 +762,11 @@ fn collect_interning_provenance_without_frozensets<'a>(
 
 fn collect_interning_provenance<'a>(
     code: &'a CodeObject,
+    python_version: PythonVersion,
     values: &mut FxHashSet<&'a str>,
+    metadata_tuples: &mut FxHashSet<HashedObjectKey<'a>>,
 ) -> (bool, FrozensetRecreationNeed) {
+    collect_metadata_tuple_keys(code, metadata_tuples);
     values.extend(
         code.marshal_provenance
             .explicitly_interned_strings
@@ -666,12 +782,13 @@ fn collect_interning_provenance<'a>(
     let mut frozenset_recreation_need = FrozensetRecreationNeed::None;
     for constant in &code.constants {
         if let Constant::Code(code) = constant {
-            let (has_qualified_name, recreation_need) = collect_interning_provenance(code, values);
+            let (has_qualified_name, recreation_need) =
+                collect_interning_provenance(code, python_version, values, metadata_tuples);
             has_qualified_name_constant |= has_qualified_name;
             frozenset_recreation_need = frozenset_recreation_need.max(recreation_need);
         } else {
-            frozenset_recreation_need =
-                frozenset_recreation_need.max(constant_frozenset_recreation_need(constant));
+            frozenset_recreation_need = frozenset_recreation_need
+                .max(constant_frozenset_recreation_need(constant, python_version));
         }
     }
     (has_qualified_name_constant, frozenset_recreation_need)
@@ -784,19 +901,21 @@ enum FrozensetRecreationNeed {
 /// these separate avoids copying a complete bootstrap profile for every module.
 struct InternedStrings<'code, 'state> {
     initial: &'state InitialInternState,
+    python_version: PythonVersion,
     added: FxHashSet<&'code str>,
 }
 
 impl<'code, 'state> InternedStrings<'code, 'state> {
-    fn new(initial: &'state InitialInternState) -> Self {
+    fn new(initial: &'state InitialInternState, python_version: PythonVersion) -> Self {
         Self {
             initial,
+            python_version,
             added: FxHashSet::default(),
         }
     }
 
     fn contains(&self, value: &str) -> bool {
-        self.initial.contains(value) || self.added.contains(value)
+        self.initial.contains_for(self.python_version, value) || self.added.contains(value)
     }
 
     fn insert(&mut self, value: &'code str) {
@@ -811,6 +930,7 @@ impl<'code, 'state> InternedStrings<'code, 'state> {
 fn collect_recreated_frozensets(
     code: &CodeObject,
     need: FrozensetRecreationNeed,
+    python_version: PythonVersion,
     initial_intern_state: &InitialInternState,
     values: &mut FxHashSet<usize>,
 ) {
@@ -824,7 +944,12 @@ fn collect_recreated_frozensets(
                     .canonical_constant_strings
                     .is_empty() =>
         {
-            collect_preinterned_recreated_frozensets(code, initial_intern_state, values);
+            collect_preinterned_recreated_frozensets(
+                code,
+                python_version,
+                initial_intern_state,
+                values,
+            );
             return;
         }
         FrozensetRecreationNeed::PreinternedOnly | FrozensetRecreationNeed::IdentifierDependent => {
@@ -833,17 +958,22 @@ fn collect_recreated_frozensets(
 
     if need == FrozensetRecreationNeed::IdentifierDependent
         && code.marshal_provenance.interning_events.is_empty()
-        && !has_identifier_or_explicit_dependent_frozenset(code)
+        && !has_identifier_or_explicit_dependent_frozenset(code, python_version)
         && code
             .marshal_provenance
             .canonical_constant_strings
             .is_empty()
     {
-        collect_preinterned_recreated_frozensets(code, initial_intern_state, values);
+        collect_preinterned_recreated_frozensets(
+            code,
+            python_version,
+            initial_intern_state,
+            values,
+        );
         return;
     }
 
-    let mut interned_strings = InternedStrings::new(initial_intern_state);
+    let mut interned_strings = InternedStrings::new(initial_intern_state, python_version);
     let mut interned_constant_strings = code
         .marshal_provenance
         .canonical_constant_strings
@@ -886,32 +1016,38 @@ fn has_explicit_interns(code: &CodeObject) -> bool {
         })
 }
 
-fn frozenset_recreation_need(code: &CodeObject) -> FrozensetRecreationNeed {
+fn frozenset_recreation_need(
+    code: &CodeObject,
+    python_version: PythonVersion,
+) -> FrozensetRecreationNeed {
     code.constants
         .iter()
-        .map(constant_frozenset_recreation_need)
+        .map(|constant| constant_frozenset_recreation_need(constant, python_version))
         .max()
         .unwrap_or(FrozensetRecreationNeed::None)
 }
 
-fn constant_frozenset_recreation_need(constant: &Constant) -> FrozensetRecreationNeed {
+fn constant_frozenset_recreation_need(
+    constant: &Constant,
+    python_version: PythonVersion,
+) -> FrozensetRecreationNeed {
     match constant {
         Constant::FrozenSet(members) => members
             .iter()
-            .map(constant_string_recreation_need)
+            .map(|constant| constant_string_recreation_need(constant, python_version))
             .max()
             .unwrap_or(FrozensetRecreationNeed::None),
         Constant::Tuple(constants) => constants
             .iter()
-            .map(constant_frozenset_recreation_need)
+            .map(|constant| constant_frozenset_recreation_need(constant, python_version))
             .max()
             .unwrap_or(FrozensetRecreationNeed::None),
         Constant::Slice { lower, upper, step } => [lower.as_ref(), upper.as_ref(), step.as_ref()]
             .into_iter()
-            .map(constant_frozenset_recreation_need)
+            .map(|constant| constant_frozenset_recreation_need(constant, python_version))
             .max()
             .unwrap_or(FrozensetRecreationNeed::None),
-        Constant::Code(code) => frozenset_recreation_need(code),
+        Constant::Code(code) => frozenset_recreation_need(code, python_version),
         Constant::None
         | Constant::Bool(_)
         | Constant::Ellipsis
@@ -929,12 +1065,15 @@ fn constant_frozenset_recreation_need(constant: &Constant) -> FrozensetRecreatio
 // The isolated baseline is a conservative upper bound for supplemental profiles:
 // None covers only ineligible or cached strings. Newly preinterned members remain
 // IdentifierDependent, and both fast fallbacks and chronology consult the profile.
-fn constant_string_recreation_need(constant: &Constant) -> FrozensetRecreationNeed {
+fn constant_string_recreation_need(
+    constant: &Constant,
+    python_version: PythonVersion,
+) -> FrozensetRecreationNeed {
     match constant {
         Constant::String(value) => {
             if !should_intern(value) || value.is_empty() || is_cached_character(value) {
                 FrozensetRecreationNeed::None
-            } else if is_preinterned_string(value) {
+            } else if is_preinterned_string_for(python_version, value) {
                 FrozensetRecreationNeed::PreinternedOnly
             } else {
                 FrozensetRecreationNeed::IdentifierDependent
@@ -942,12 +1081,12 @@ fn constant_string_recreation_need(constant: &Constant) -> FrozensetRecreationNe
         }
         Constant::Tuple(constants) | Constant::FrozenSet(constants) => constants
             .iter()
-            .map(constant_string_recreation_need)
+            .map(|constant| constant_string_recreation_need(constant, python_version))
             .max()
             .unwrap_or(FrozensetRecreationNeed::None),
         Constant::Slice { lower, upper, step } => [lower.as_ref(), upper.as_ref(), step.as_ref()]
             .into_iter()
-            .map(constant_string_recreation_need)
+            .map(|constant| constant_string_recreation_need(constant, python_version))
             .max()
             .unwrap_or(FrozensetRecreationNeed::None),
         Constant::Code(_)
@@ -966,38 +1105,52 @@ fn constant_string_recreation_need(constant: &Constant) -> FrozensetRecreationNe
 
 fn collect_preinterned_recreated_frozensets(
     code: &CodeObject,
+    python_version: PythonVersion,
     initial_intern_state: &InitialInternState,
     values: &mut FxHashSet<usize>,
 ) {
     for constant in &code.constants {
-        collect_preinterned_recreated_constant(constant, initial_intern_state, values);
+        collect_preinterned_recreated_constant(
+            constant,
+            python_version,
+            initial_intern_state,
+            values,
+        );
     }
 }
 
-fn has_identifier_or_explicit_dependent_frozenset(code: &CodeObject) -> bool {
-    code.constants
-        .iter()
-        .any(|constant| constant_has_identifier_or_explicit_dependent_frozenset(constant, code))
+fn has_identifier_or_explicit_dependent_frozenset(
+    code: &CodeObject,
+    python_version: PythonVersion,
+) -> bool {
+    code.constants.iter().any(|constant| {
+        constant_has_identifier_or_explicit_dependent_frozenset(constant, code, python_version)
+    })
 }
 
 fn constant_has_identifier_or_explicit_dependent_frozenset(
     constant: &Constant,
     root: &CodeObject,
+    python_version: PythonVersion,
 ) -> bool {
     match constant {
-        Constant::FrozenSet(members) => members
-            .iter()
-            .any(|member| constant_contains_identifier_or_explicit_dependent_string(member, root)),
+        Constant::FrozenSet(members) => members.iter().any(|member| {
+            constant_contains_identifier_or_explicit_dependent_string(member, root, python_version)
+        }),
         Constant::Tuple(constants) => constants.iter().any(|constant| {
-            constant_has_identifier_or_explicit_dependent_frozenset(constant, root)
+            constant_has_identifier_or_explicit_dependent_frozenset(constant, root, python_version)
         }),
         Constant::Slice { lower, upper, step } => [lower.as_ref(), upper.as_ref(), step.as_ref()]
             .into_iter()
             .any(|constant| {
-                constant_has_identifier_or_explicit_dependent_frozenset(constant, root)
+                constant_has_identifier_or_explicit_dependent_frozenset(
+                    constant,
+                    root,
+                    python_version,
+                )
             }),
         Constant::Code(code) => code.constants.iter().any(|constant| {
-            constant_has_identifier_or_explicit_dependent_frozenset(constant, root)
+            constant_has_identifier_or_explicit_dependent_frozenset(constant, root, python_version)
         }),
         Constant::None
         | Constant::Bool(_)
@@ -1016,24 +1169,33 @@ fn constant_has_identifier_or_explicit_dependent_frozenset(
 fn constant_contains_identifier_or_explicit_dependent_string(
     constant: &Constant,
     root: &CodeObject,
+    python_version: PythonVersion,
 ) -> bool {
     match constant {
         Constant::String(value) => {
             should_intern(value)
                 && !value.is_empty()
                 && !is_cached_character(value)
-                && !is_preinterned_string(value)
+                && !is_preinterned_string_for(python_version, value)
                 && code_tree_interns_string(root, value)
         }
         Constant::Tuple(constants) | Constant::FrozenSet(constants) => {
             constants.iter().any(|constant| {
-                constant_contains_identifier_or_explicit_dependent_string(constant, root)
+                constant_contains_identifier_or_explicit_dependent_string(
+                    constant,
+                    root,
+                    python_version,
+                )
             })
         }
         Constant::Slice { lower, upper, step } => [lower.as_ref(), upper.as_ref(), step.as_ref()]
             .into_iter()
             .any(|constant| {
-                constant_contains_identifier_or_explicit_dependent_string(constant, root)
+                constant_contains_identifier_or_explicit_dependent_string(
+                    constant,
+                    root,
+                    python_version,
+                )
             }),
         Constant::Code(_)
         | Constant::None
@@ -1069,6 +1231,7 @@ fn code_tree_interns_string(code: &CodeObject, value: &str) -> bool {
 
 fn collect_preinterned_recreated_constant(
     constant: &Constant,
+    python_version: PythonVersion,
     initial_intern_state: &InitialInternState,
     recreated_frozensets: &mut FxHashSet<usize>,
 ) -> bool {
@@ -1077,12 +1240,13 @@ fn collect_preinterned_recreated_constant(
             should_intern(value)
                 && !value.is_empty()
                 && !is_cached_character(value)
-                && initial_intern_state.contains(value)
+                && initial_intern_state.contains_for(python_version, value)
         }
         Constant::FrozenSet(members) => {
             let recreated = members.iter().any(|member| {
                 collect_preinterned_recreated_constant(
                     member,
+                    python_version,
                     initial_intern_state,
                     recreated_frozensets,
                 )
@@ -1096,6 +1260,7 @@ fn collect_preinterned_recreated_constant(
             for constant in constants.iter().rev() {
                 collect_preinterned_recreated_constant(
                     constant,
+                    python_version,
                     initial_intern_state,
                     recreated_frozensets,
                 );
@@ -1105,6 +1270,7 @@ fn collect_preinterned_recreated_constant(
         Constant::Code(code) => {
             collect_preinterned_recreated_frozensets(
                 code,
+                python_version,
                 initial_intern_state,
                 recreated_frozensets,
             );
@@ -1457,6 +1623,10 @@ struct GraphVisitor<'graph, 'code> {
 impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     const USES_METADATA_IDS: bool = true;
 
+    fn python_version(&self) -> PythonVersion {
+        self.graph.python_version
+    }
+
     #[inline]
     fn code(&mut self, code: &'code CodeObject, _reference_mode: ReferenceMode) -> bool {
         self.graph.reserve_for_code(code);
@@ -1582,6 +1752,10 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
                 }
                 let interned = should_intern(value)
                     || self
+                        .graph
+                        .metadata_aliased_constants
+                        .contains(&std::ptr::from_ref(value).addr())
+                    || self
                         .explicitly_interned
                         .is_some_and(|values| values.contains(value.as_str()));
                 if interned {
@@ -1603,19 +1777,29 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
                     ObjectKey::RecreatedFrozenSet(address),
                 )
             }
-            Constant::Int(value) if self.graph.cache_scalars && *value <= 256 => {
+            Constant::Int(value)
+                if self.graph.cache_scalars
+                    && *value
+                        <= small_int_bounds_for(self.graph.python_version)
+                            .1
+                            .cast_unsigned() =>
+            {
                 self.graph.record_cached_value(
                     OccurrenceKind::Constant,
                     CachedObject::Int(u16::try_from(*value).expect("cached int fits")),
                 )
             }
             Constant::SignedInt(value)
-                if self.graph.cache_scalars && (-5..=256).contains(value) =>
+                if self.graph.cache_scalars && {
+                    let (minimum, maximum) = small_int_bounds_for(self.graph.python_version);
+                    (minimum..=maximum).contains(value)
+                } =>
             {
                 self.graph.record_cached_value(
                     OccurrenceKind::Constant,
                     CachedObject::SignedInt(
-                        u16::try_from(*value + 5).expect("cached signed int index fits"),
+                        u16::try_from(*value - small_int_bounds_for(self.graph.python_version).0)
+                            .expect("cached signed int index fits"),
                     ),
                 )
             }

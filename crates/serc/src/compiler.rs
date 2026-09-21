@@ -76,6 +76,17 @@ struct CachedSourceLine {
     is_last: bool,
 }
 
+impl Compiler<'_> {
+    /// CPython 3.15 keeps an index slot alongside each synchronous iterator.
+    fn iterator_extra_slots(&self) -> i32 {
+        i32::from(self.context.python_version == crate::PythonVersion::Py315)
+    }
+
+    fn iterator_slots(&self) -> i32 {
+        1 + self.iterator_extra_slots()
+    }
+}
+
 impl CachedSourceLine {
     fn contains(self, offset: TextSize) -> bool {
         self.start <= offset && (offset < self.end || self.is_last && offset == self.end)

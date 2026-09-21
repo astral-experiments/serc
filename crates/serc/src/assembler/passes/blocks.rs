@@ -137,9 +137,10 @@ fn normalize_unmoved_interruptible_jumps(graph: &mut BlockGraph) {
     }
 }
 
-// Preserve a pending value while discarding the item below it. Deferred source locations
-// must resolve through their own writers, which do not all honor PRESERVE.
-fn is_unlocated_value_cleanup_prefix(items: &[Item]) -> bool {
+// Dispose of a shared cleanup's stack values, optionally preserving a pending value.
+// Deferred source locations must resolve through their own writers, which do not all
+// honor PRESERVE.
+fn is_unlocated_value_cleanup_prefix(items: &[Item], python_version: crate::PythonVersion) -> bool {
     let mut instructions = items.iter().filter_map(|item| match item {
         Item::Instruction(instruction) => Some(instruction),
         Item::Label(_) => None,
@@ -147,18 +148,31 @@ fn is_unlocated_value_cleanup_prefix(items: &[Item]) -> bool {
     let Some(first) = instructions.next() else {
         return false;
     };
-    let Some(second) = instructions.next() else {
-        return false;
+    let slots = match (first.opcode, first.operand()) {
+        (SWAP, Operand::Value(2)) => 1,
+        // Python 3.15 keeps an iterator index beside the iterator itself.
+        (SWAP, Operand::Value(3)) if python_version == crate::PythonVersion::Py315 => 2,
+        // A literal return has no pending value to preserve across those two pops.
+        (POP_TOP, Operand::Value(0)) if python_version == crate::PythonVersion::Py315 => 1,
+        _ => return false,
     };
-    first.opcode == SWAP
-        && first.operand() == Operand::Value(2)
-        && second.opcode == POP_TOP
-        && instructions.next().is_none()
-        && [first, second].iter().all(|instruction| {
-            instruction.location.line < 0
-                && !instruction.fusion_policy.location_from_next()
-                && instruction.no_location_policy.percent_target_location == 0
-        })
+    let unlocated = |instruction: &Instruction| {
+        instruction.location.line < 0
+            && !instruction.fusion_policy.location_from_next()
+            && instruction.no_location_policy.percent_target_location == 0
+    };
+    if !unlocated(first) {
+        return false;
+    }
+    for _ in 0..slots {
+        let Some(discard) = instructions.next() else {
+            return false;
+        };
+        if discard.opcode != POP_TOP || !unlocated(discard) {
+            return false;
+        }
+    }
+    instructions.next().is_none()
 }
 
 // Labels created by later copies have no certificate. Every original alias at an entry must
@@ -590,6 +604,30 @@ fn represented_setup_nops(
         .collect()
 }
 
+/// Reconstructs one original exit array across exception-table-only splits.
+fn metadata_split_exit_chain<'a>(
+    graph: &BlockGraph,
+    order: &'a [BasicBlockId],
+    start: usize,
+    predecessors: &[usize],
+    exception_split_labels: &FxHashSet<Label>,
+) -> &'a [BasicBlockId] {
+    let mut end = start;
+    while end + 1 < order.len()
+        && block_has_fallthrough(graph[order[end]].items())
+        // A conditional jump ends the original array even when its fallthrough
+        // also starts an exception-table range.
+        && block_jump_target(graph[order[end]].items()).is_none()
+        && predecessors[order[end + 1].index()] == 1
+        && graph[order[end + 1]].items().iter().any(
+            |item| matches!(item, Item::Label(label) if exception_split_labels.contains(label)),
+        )
+    {
+        end += 1;
+    }
+    &order[start..=end]
+}
+
 struct ExitBlockAnalysis {
     positions: Vec<usize>,
     predecessors: Vec<usize>,
@@ -731,18 +769,14 @@ fn exit_block_analysis(
             continue;
         };
         let target_position = positions[target.index()];
-        let mut target_chain_end = target_position;
-        while target_chain_end + 1 < order.len()
-            && block_has_fallthrough(graph[order[target_chain_end]].items())
-            && block_jump_target(graph[order[target_chain_end]].items()).is_none()
-            && predecessors[order[target_chain_end + 1].index()] == 1
-            && graph[order[target_chain_end + 1]].items().iter().any(
-                |item| matches!(item, Item::Label(label) if exception_split_labels.contains(label)),
-            )
-        {
-            target_chain_end += 1;
-        }
-        let target_blocks = &order[target_position..=target_chain_end];
+        let target_blocks = metadata_split_exit_chain(
+            graph,
+            order,
+            target_position,
+            &predecessors,
+            &exception_split_labels,
+        );
+        let target_chain_end = target_position + target_blocks.len() - 1;
         let target_exit = *target_blocks.last().expect("target chain is nonempty");
         let Some(target_last) = graph[target_exit].last_instruction() else {
             continue;
@@ -1170,6 +1204,37 @@ fn restore_pop_block_head_locations(
     restore_copied_pop_block_locations(graph, exception_regions, copied_heads);
 }
 
+/// Recognizes a retained, located SETUP record in its exact original one-slot range.
+/// Its exclusion labels can survive after the surrounding exception range disappears.
+fn block_is_original_setup_nop(
+    graph: &BlockGraph,
+    order: &[BasicBlockId],
+    positions: &[usize],
+    block: BasicBlockId,
+    provenance: &ExceptionOwnerProvenance,
+) -> bool {
+    let mut instructions = graph[block].items().iter().filter_map(|item| match item {
+        Item::Instruction(instruction) => Some(instruction),
+        Item::Label(_) => None,
+    });
+    let Some(nop) = instructions.next() else {
+        return false;
+    };
+    if nop.opcode != NOP || nop.location.line < 0 || instructions.next().is_some() {
+        return false;
+    }
+    let position = positions[block.index()];
+    let Some(&next) = order.get(position + 1) else {
+        return false;
+    };
+    let setups = represented_setup_nops(graph, &order[position..=position + 1], provenance);
+    graph[next]
+        .items()
+        .iter()
+        .take_while(|item| matches!(item, Item::Label(_)))
+        .any(|item| matches!(item, Item::Label(label) if setups.contains(label)))
+}
+
 // Exception accounting can split an original block before a located cleanup suffix.
 // A shared artificial prefix has no unique location donor in that original block.
 fn unlocated_prefix_has_located_continuation(
@@ -1179,6 +1244,7 @@ fn unlocated_prefix_has_located_continuation(
     predecessors: &[usize],
     exception_regions: &[ExceptionRegion],
     original_boundaries: &FxHashSet<Label>,
+    setup_nop_provenance: Option<&ExceptionOwnerProvenance>,
     mut block: BasicBlockId,
 ) -> bool {
     loop {
@@ -1213,7 +1279,9 @@ fn unlocated_prefix_has_located_continuation(
                 }
                 Item::Instruction(instruction) => {
                     if !bookkeeping_boundary {
-                        return false;
+                        return setup_nop_provenance.is_some_and(|provenance| {
+                            block_is_original_setup_nop(graph, order, positions, next, provenance)
+                        });
                     }
                     if instruction.location.line >= 0 {
                         return true;
@@ -1688,6 +1756,8 @@ fn propagate_exit_block_locations(
     preserved_boundaries: &FxHashSet<Label>,
     source_boundaries: &FxHashSet<Label>,
     setups: &[(Label, Option<SourceLocation>)],
+    python_version: crate::PythonVersion,
+    provenance: &ExceptionOwnerProvenance,
 ) {
     for target in order.iter().copied() {
         if analysis.exception_handler_blocks[target.index()] {
@@ -1701,9 +1771,32 @@ fn propagate_exit_block_locations(
         ) {
             continue;
         }
+        let literal_cleanup = python_version == crate::PythonVersion::Py315
+            && graph[target].items().iter().find_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction.opcode),
+                Item::Label(_) => None,
+            }) == Some(POP_TOP);
+        let preserve_shared_cleanup = analysis.predecessors[target.index()] > 1
+            && is_unlocated_value_cleanup_prefix(graph[target].items(), python_version)
+            && original_entry_has_no_location_donor(
+                graph[target].items(),
+                original_location_absence,
+            )
+            && unlocated_prefix_has_located_continuation(
+                graph,
+                order,
+                &analysis.positions,
+                &analysis.predecessors,
+                exception_regions,
+                original_boundaries,
+                literal_cleanup.then_some(provenance),
+                target,
+            );
+        let preserve_literal_cleanup = literal_cleanup && preserve_shared_cleanup;
         // A shared discard or conditional cleanup join has no unique source. Exit copies
         // acquire their branch's location separately when the continuation can be copied.
         if analysis.predecessors[target.index()] > 1
+            && !preserve_literal_cleanup
             && matches!(
                 graph[target].items().iter().find(|item| matches!(item, Item::Instruction(_))),
                 Some(Item::Instruction(instruction))
@@ -1742,22 +1835,7 @@ fn propagate_exit_block_locations(
         }) {
             continue;
         }
-        if analysis.predecessors[target.index()] > 1
-            && is_unlocated_value_cleanup_prefix(graph[target].items())
-            && original_entry_has_no_location_donor(
-                graph[target].items(),
-                original_location_absence,
-            )
-            && unlocated_prefix_has_located_continuation(
-                graph,
-                order,
-                &analysis.positions,
-                &analysis.predecessors,
-                exception_regions,
-                original_boundaries,
-                target,
-            )
-        {
+        if preserve_shared_cleanup {
             // Copying is complete. Keep the proven unlocated prefix through later writers.
             for instruction in graph.instructions_mut(target) {
                 instruction.no_location_policy.preserve_location();
@@ -3696,6 +3774,8 @@ impl OptimizationPipeline {
                 &self.preserved_block_boundaries,
                 &self.exception_owner_provenance.source_boundaries,
                 &self.exception_owner_provenance.setups,
+                self.python_version,
+                &self.exception_owner_provenance,
             );
             let heads = shared_pop_block_heads
                 .iter()
@@ -4177,14 +4257,29 @@ impl OptimizationPipeline {
         }
         let mut exit_without_unique_predecessor = vec![false; positions.len()];
         for block in order.iter().copied() {
-            let unlocated_scope_exit = graph[block].items().iter().all(|item| {
-                        !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
-                    })
-                    && graph[block]
-                        .last_instruction()
-                        .is_some_and(|instruction| {
-                            ends_scope(instruction.opcode) || has_jump_eval_check(instruction)
-                        });
+            // The 3.15 iterator cleanup can exceed the small-copy limit. Classify
+            // its complete original array, as the early copy analysis does, even
+            // when an outer try splits the cleanup from RETURN_VALUE.
+            let exit_blocks = if self.python_version == crate::PythonVersion::Py315 {
+                metadata_split_exit_chain(
+                    graph,
+                    &order,
+                    positions[block.index()],
+                    &predecessors,
+                    &exception_split_labels,
+                )
+            } else {
+                std::slice::from_ref(&block)
+            };
+            let unlocated_scope_exit = exit_blocks.iter().all(|block| {
+                graph[*block].items().iter().all(|item| {
+                    !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
+                })
+            }) && graph[*exit_blocks.last().expect("nonempty exit array")]
+                .last_instruction()
+                .is_some_and(|instruction| {
+                    ends_scope(instruction.opcode) || has_jump_eval_check(instruction)
+                });
             let mut original_unlocated_discard = false;
             let artificial_eval_break =
                 graph[block].last_instruction().is_some_and(|instruction| {
@@ -4442,23 +4537,14 @@ impl OptimizationPipeline {
                 && shared_match_cleanup_copies
                     .get(&target)
                     .is_some_and(|items| graph[target].items() == items);
-            let mut target_chain_end = target_position;
-            while target_chain_end + 1 < order.len()
-                && block_has_fallthrough(graph[order[target_chain_end]].items())
-                // Exception-table splits can divide one original block, but a
-                // conditional jump always ends it and must not be copied with its fallthrough.
-                && block_jump_target(graph[order[target_chain_end]].items()).is_none()
-                && predecessors[order[target_chain_end + 1].index()] == 1
-                && graph[order[target_chain_end + 1]]
-                    .items()
-                    .iter()
-                    .any(|item| {
-                        matches!(item, Item::Label(label) if exception_split_labels.contains(label))
-                    })
-            {
-                target_chain_end += 1;
-            }
-            let target_blocks = &order[target_position..=target_chain_end];
+            let target_blocks = metadata_split_exit_chain(
+                graph,
+                &order,
+                target_position,
+                &predecessors,
+                &exception_split_labels,
+            );
+            let target_chain_end = target_position + target_blocks.len() - 1;
             let target_exit = *target_blocks.last().expect("target chain is nonempty");
             let represented_setups =
                 represented_setup_nops(graph, target_blocks, &self.exception_owner_provenance);
@@ -4685,7 +4771,28 @@ impl OptimizationPipeline {
                 && target_is_small_exit
                 && remaining_predecessors[target.index()] > 1
                 && !exception_handler_blocks[target.index()];
+            // A two-cell iterator return split at an outer POP_BLOCK is cleanup,
+            // not a large footer whose copy order follows cold-block relocation.
+            let split_iterator_return = self.python_version == crate::PythonVersion::Py315
+                && target_chain_end > target_position
+                && target_has_no_location
+                && target_blocks
+                    .iter()
+                    .flat_map(|block| graph[*block].items())
+                    .filter_map(|item| match item {
+                        Item::Instruction(instruction) => {
+                            Some((instruction.opcode, instruction.operand()))
+                        }
+                        Item::Label(_) => None,
+                    })
+                    .eq([
+                        (SWAP, Operand::Value(3)),
+                        (POP_TOP, Operand::Value(0)),
+                        (POP_TOP, Operand::Value(0)),
+                        (RETURN_VALUE, Operand::Value(0)),
+                    ]);
             if exit_without_unique_predecessor[target.index()]
+                && !split_iterator_return
                 && target_pre_fusion_size > 4
                 && !target_blocks.iter().any(|block| {
                     graph[*block].items().iter().any(|item| {
@@ -5511,7 +5618,24 @@ impl OptimizationPipeline {
                 }
                 copied.insert(position, Item::Instruction(marker));
             }
-            if inline_unprotected_return
+            let inline_reraising_iterator_break = self.python_version
+                == crate::PythonVersion::Py315
+                && inline_small_exit
+                && target_terminal_opcode == Some(RERAISE)
+                && target_pre_fusion_size == 1
+                && target_chain_end == target_position
+                && graph[source]
+                    .last_instruction()
+                    .is_some_and(|jump| jump.fusion_policy.is_authored_break())
+                && graph[source]
+                    .items()
+                    .iter()
+                    .filter_map(|item| match item {
+                        Item::Instruction(instruction) => Some(instruction.opcode),
+                        Item::Label(_) => None,
+                    })
+                    .eq([NOP, POP_TOP, POP_TOP, JUMP_FORWARD]);
+            if (inline_unprotected_return || inline_reraising_iterator_break)
                 && !planned_copy
                 && let Some(instruction) = copied.iter_mut().find_map(|item| match item {
                     Item::Instruction(instruction) => Some(instruction),
@@ -5519,7 +5643,9 @@ impl OptimizationPipeline {
                 })
             {
                 // CPython retains the replaced jump and any jumps bypassed by our earlier
-                // threading as NOPs until after the repeated small-exit copy pass.
+                // threading as NOPs until after the repeated small-exit copy pass. A 3.15
+                // iterator break's marker and two POPs then make its copied RERAISE
+                // five original slots, preventing another small-exit copy.
                 let jump_extra = graph[source]
                     .last_instruction()
                     .map_or(0, Instruction::pre_fold_extra_instructions);
@@ -5655,7 +5781,7 @@ impl OptimizationPipeline {
                 }
             }
             original_return_locations.extend(copied_return_locations);
-            if inline_small_exit || inline_no_location_block {
+            if inline_small_exit || inline_no_location_block || split_iterator_return {
                 if planned_copy
                     || (inline_no_location_block && target_chain_end > target_position)
                     || comparison_return_revisit.is_some()
@@ -6605,8 +6731,31 @@ impl OptimizationPipeline {
             ) {
                 continue;
             }
+            let literal_cleanup = self.python_version == crate::PythonVersion::Py315
+                && graph[target].items().iter().find_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction.opcode),
+                    Item::Label(_) => None,
+                }) == Some(POP_TOP);
+            let preserve_shared_cleanup = remaining_predecessors[target.index()] > 1
+                && is_unlocated_value_cleanup_prefix(graph[target].items(), self.python_version)
+                && original_entry_has_no_location_donor(
+                    graph[target].items(),
+                    original_location_absence,
+                )
+                && unlocated_prefix_has_located_continuation(
+                    graph,
+                    &order,
+                    &positions,
+                    &remaining_predecessors,
+                    &self.exception_regions,
+                    &self.exception_owner_provenance.block_boundaries,
+                    literal_cleanup.then_some(&self.exception_owner_provenance),
+                    target,
+                );
+            let preserve_literal_cleanup = literal_cleanup && preserve_shared_cleanup;
             if planned_blocks.contains(&target)
                 && remaining_predecessors[target.index()] > 1
+                && !preserve_literal_cleanup
                 && original_entry_has_no_location_donor(
                     graph[target].items(),
                     original_location_absence,
@@ -6632,6 +6781,7 @@ impl OptimizationPipeline {
                 continue;
             }
             if remaining_predecessors[target.index()] > 1
+                && !preserve_literal_cleanup
                 && matches!(
                     graph[target].items().iter().find(|item| matches!(item, Item::Instruction(_))),
                     Some(Item::Instruction(instruction))
@@ -6757,22 +6907,7 @@ impl OptimizationPipeline {
             }) {
                 continue;
             }
-            if remaining_predecessors[target.index()] > 1
-                && is_unlocated_value_cleanup_prefix(graph[target].items())
-                && original_entry_has_no_location_donor(
-                    graph[target].items(),
-                    original_location_absence,
-                )
-                && unlocated_prefix_has_located_continuation(
-                    graph,
-                    &order,
-                    &positions,
-                    &remaining_predecessors,
-                    &self.exception_regions,
-                    &self.exception_owner_provenance.block_boundaries,
-                    target,
-                )
-            {
+            if preserve_shared_cleanup {
                 // Copying is complete. Keep the proven unlocated prefix through later writers.
                 for instruction in graph.instructions_mut(target) {
                     instruction.no_location_policy.preserve_location();

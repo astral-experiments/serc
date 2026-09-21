@@ -501,6 +501,7 @@ impl OptimizationPipeline {
         &mut self,
         constants: Option<&dyn ConstantTable>,
     ) {
+        let retain_contains = self.python_version == crate::PythonVersion::Py315;
         let graph = &mut self.graph;
         if !graph.features().has_boolean_conversion() {
             return;
@@ -550,6 +551,9 @@ impl OptimizationPipeline {
                         return;
                     };
                     let opcode = current.opcode;
+                    if retain_contains && opcode == CONTAINS_OP {
+                        current.mark_retired_contains();
+                    }
                     current.opcode = NOP;
                     current.set_operand(Operand::Value(0));
                     next.opcode = opcode;
@@ -573,6 +577,9 @@ impl OptimizationPipeline {
             let Some((opcode, argument)) = replacement else {
                 return;
             };
+            if retain_contains && opcode == CONTAINS_OP {
+                current.mark_retired_contains();
+            }
             current.opcode = NOP;
             current.set_operand(Operand::Value(0));
             next.opcode = opcode;
@@ -843,23 +850,34 @@ impl OptimizationPipeline {
         // Preserve its copy permission only while the complete original array,
         // including every label and instruction field, still survives unchanged.
         // Only the earlier pass's exact initial-borrow tag can extend its jump.
+        let iterator_extra_slot = usize::from(self.python_version == crate::PythonVersion::Py315);
         let mut copied_finally_iterator_breaks =
             std::mem::take(&mut self.copied_finally_iterator_break_origins)
                 .into_iter()
                 .filter_map(|mut origin| {
-                    let guarded_try = matches!(origin.len(), 39 | 42 | 44 | 47);
+                    let original_len = origin.len().checked_sub(iterator_extra_slot)?;
+                    let guarded_try = matches!(original_len, 39 | 42 | 44 | 47);
                     // Thirty records are the separately certified named-handler await.
-                    let guarded_manager = origin.len() == 65;
-                    if !matches!(origin.len(), 12 | 17 | 30) && !guarded_try && !guarded_manager {
+                    let guarded_manager = original_len == 65 + iterator_extra_slot;
+                    let awaited_handler = original_len == 30 + iterator_extra_slot;
+                    if !matches!(original_len, 12 | 17)
+                        && !awaited_handler
+                        && !guarded_try
+                        && !guarded_manager
+                    {
                         return None;
                     }
                     let last = origin.len() - 1;
-                    let (Item::Label(start), Item::Label(join), Item::Instruction(mut jump)) =
-                        (origin[0], origin[last - 2], origin[last])
-                    else {
+                    let (Item::Label(start), Item::Label(join), Item::Instruction(mut jump)) = (
+                        origin[0],
+                        origin[last - 2 - iterator_extra_slot],
+                        origin[last],
+                    ) else {
                         return None;
                     };
-                    let jump_index = label_offsets.get(&join)?.checked_add(1)?;
+                    let jump_index = label_offsets
+                        .get(&join)?
+                        .checked_add(1 + iterator_extra_slot)?;
                     let &(block, offset) = instruction_positions.get(jump_index)?;
                     let Item::Instruction(current) = graph[block].items()[offset] else {
                         return None;
@@ -877,9 +895,12 @@ impl OptimizationPipeline {
                         // Both internal cleanup exits receive the same initial-borrow tag
                         // as the final break. Preserve every other original field.
                         let exits = if guarded_manager {
-                            [41, 56]
+                            [41 + iterator_extra_slot, 56 + iterator_extra_slot]
                         } else {
-                            [last - 24, last - 11]
+                            [
+                                last - 24 - iterator_extra_slot,
+                                last - 11 - iterator_extra_slot,
+                            ]
                         };
                         for offset in exits {
                             let Item::Instruction(mut original) = origin[offset] else {
@@ -922,14 +943,16 @@ impl OptimizationPipeline {
                 continue;
             }
             let last = origin.len() - 1;
-            let (Item::Label(start), Item::Label(join), Item::Instruction(mut jump)) =
-                (origin[0], origin[last - 2], origin[last])
-            else {
+            let (Item::Label(start), Item::Label(join), Item::Instruction(mut jump)) = (
+                origin[0],
+                origin[last - 2 - iterator_extra_slot],
+                origin[last],
+            ) else {
                 continue;
             };
             let Some(jump_index) = label_offsets
                 .get(&join)
-                .and_then(|index| index.checked_add(1))
+                .and_then(|index| index.checked_add(1 + iterator_extra_slot))
             else {
                 continue;
             };
@@ -963,14 +986,16 @@ impl OptimizationPipeline {
                 continue;
             }
             let last = origin.len() - 1;
-            let (Item::Label(start), Item::Label(join), Item::Instruction(_)) =
-                (origin[0], origin[last - 2], origin[last])
-            else {
+            let (Item::Label(start), Item::Label(join), Item::Instruction(_)) = (
+                origin[0],
+                origin[last - 2 - iterator_extra_slot],
+                origin[last],
+            ) else {
                 continue;
             };
             let Some(jump_index) = label_offsets
                 .get(&join)
-                .and_then(|index| index.checked_add(1))
+                .and_then(|index| index.checked_add(1 + iterator_extra_slot))
             else {
                 continue;
             };

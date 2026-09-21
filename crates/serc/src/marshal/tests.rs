@@ -746,3 +746,225 @@ fn marshal_traversal_preserves_reference_mode_and_slice_member_identity() {
         RecordedValue::Constant(_)
     ));
 }
+
+#[test]
+fn frozenset_recreation_uses_selected_target_intern_state() {
+    use super::writer::encode_code_with_options;
+    use crate::{InitialInternState, PythonVersion};
+
+    let members = vec![Constant::String("aggregate_class".to_string())];
+    let code = code_object(vec![
+        Constant::FrozenSet(members.clone()),
+        Constant::Code(Box::new(code_object(vec![Constant::FrozenSet(members)]))),
+    ]);
+    let isolated = InitialInternState::default();
+    let py314 = encode_code_with_options(&code, PythonVersion::Py314, &isolated);
+    let py315 = encode_code_with_options(&code, PythonVersion::Py315, &isolated);
+    assert_ne!(py314, py315);
+
+    let explicit = InitialInternState::new(["aggregate_class"]);
+    assert_eq!(
+        encode_code_with_options(&code, PythonVersion::Py315, &explicit),
+        py314
+    );
+    assert_eq!(
+        encode_code_with_options(&code, PythonVersion::Py314, &explicit),
+        py314
+    );
+}
+
+#[test]
+fn python_315_small_integer_cache_preserves_all_scalar_slot_boundaries() {
+    use crate::{InitialInternState, PythonVersion};
+    let mut constants = Vec::new();
+    for value in 250..=1030 {
+        constants.push(Constant::Int(value));
+        constants.push(Constant::SignedInt(i64::try_from(value).unwrap()));
+    }
+    constants.extend([
+        Constant::SignedInt(-6),
+        Constant::SignedInt(-5),
+        Constant::Bytes(vec![0]),
+        Constant::Bytes(vec![255]),
+        Constant::String("é".to_string()),
+        Constant::String("ÿ".to_string()),
+    ]);
+    let code = code_object(constants);
+    for version in [PythonVersion::Py314, PythonVersion::Py315] {
+        let mut graph =
+            ObjectGraph::for_code_with_options(&code, version, &InitialInternState::default());
+        let maximum = if version == PythonVersion::Py314 {
+            256
+        } else {
+            1024
+        };
+        for value in [256, 257, 1000, 1024, 1025] {
+            assert_eq!(
+                graph.is_shared(&ObjectKey::Int(value), false),
+                value <= maximum
+            );
+            assert_eq!(
+                graph.is_shared(&ObjectKey::SignedInt(i64::try_from(value).unwrap()), false),
+                value <= maximum
+            );
+        }
+        for key in [
+            ObjectKey::Int(maximum),
+            ObjectKey::SignedInt(i64::try_from(maximum).unwrap()),
+            ObjectKey::SignedInt(-5),
+            ObjectKey::Bytes(&[0]),
+            ObjectKey::Bytes(&[255]),
+            ObjectKey::String("é"),
+            ObjectKey::String("ÿ"),
+        ] {
+            assert!(
+                !graph.record(key),
+                "cached scalar slot was lost for {version}"
+            );
+        }
+    }
+}
+
+#[test]
+fn python_315_slice_members_use_the_selected_small_integer_cache() {
+    use super::key::slice_member_uses_identity_for;
+    use crate::PythonVersion;
+    for value in [
+        Constant::Int(257),
+        Constant::Int(1024),
+        Constant::SignedInt(1000),
+    ] {
+        assert!(slice_member_uses_identity_for(&value, PythonVersion::Py314));
+        assert!(!slice_member_uses_identity_for(
+            &value,
+            PythonVersion::Py315
+        ));
+    }
+    for value in [Constant::Int(1025), Constant::SignedInt(-6)] {
+        assert!(slice_member_uses_identity_for(&value, PythonVersion::Py314));
+        assert!(slice_member_uses_identity_for(&value, PythonVersion::Py315));
+    }
+}
+
+#[test]
+fn metadata_tuple_aliases_intern_only_the_shared_constant_slots() {
+    use super::writer::encode_code_with_options;
+    use crate::{InitialInternState, PythonVersion};
+    let mut child = code_object(vec![Constant::None]);
+    child.names = vec!["café".to_string()];
+    let code = code_object(vec![
+        Constant::String("café".to_string()),
+        Constant::Code(Box::new(child)),
+        Constant::Tuple(vec![Constant::String("café".to_string())]),
+    ]);
+    let plain = [b'u', 5, 0, 0, 0, b'c', b'a', b'f', 0xc3, 0xa9];
+    let interned = [b't' | 0x80, 5, 0, 0, 0, b'c', b'a', b'f', 0xc3, 0xa9];
+    for version in [PythonVersion::Py314, PythonVersion::Py315] {
+        let bytes = encode_code_with_options(&code, version, &InitialInternState::default());
+        assert_eq!(
+            bytes
+                .windows(plain.len())
+                .filter(|window| *window == plain)
+                .count(),
+            1
+        );
+        assert_eq!(
+            bytes
+                .windows(interned.len())
+                .filter(|window| *window == interned)
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn metadata_tuple_aliases_do_not_intern_equal_frozenset_members() {
+    use super::writer::encode_code_with_options;
+    use crate::{InitialInternState, PythonVersion};
+    let mut code = code_object(vec![Constant::FrozenSet(vec![Constant::String(
+        "café".to_string(),
+    )])]);
+    code.names = vec!["café".to_string()];
+    for version in [PythonVersion::Py314, PythonVersion::Py315] {
+        let bytes = encode_code_with_options(&code, version, &InitialInternState::default());
+        let plain_member = [b'u' | 0x80, 5, 0, 0, 0, b'c', b'a', b'f', 0xc3, 0xa9];
+        assert!(
+            bytes
+                .windows(plain_member.len())
+                .any(|window| window == plain_member)
+        );
+    }
+}
+
+#[test]
+fn static_attribute_cache_admission_controls_frozenset_identity() {
+    use crate::{CompileOptions, PythonVersion, compile_with_options};
+
+    // A metadata tuple hit skips recursive scalar admission. A cache miss admits the
+    // parser's existing identifier, so later sets retain the cached frozenset identity.
+    let cases = [
+        (
+            "class C:\n    def __init__(self):\n        self.exec = factory()\n",
+            "exec",
+            true,
+        ),
+        (
+            "class C:\n    def __init__(self):\n        self.exec = 1\n",
+            "exec",
+            false,
+        ),
+        (
+            "ordinary = 'exec'\nclass C:\n    def __init__(self):\n        self.exec = factory()\n",
+            "exec",
+            false,
+        ),
+        (
+            "class C:\n    def __init__(self):\n        self.__exec = factory()\n",
+            "__exec",
+            true,
+        ),
+        (
+            "def prior(x: int):\n    pass\nclass C:\n    def __init__(self):\n        self.format = factory()\n",
+            "format",
+            true,
+        ),
+    ];
+    for python_version in [PythonVersion::Py314, PythonVersion::Py315] {
+        for (prefix, member, shared) in cases {
+            // Distinct tags prevent whole co_consts tuples from masking the set identity.
+            let source = format!(
+                "{prefix}def first(item):\n    return 'tag A', item in {{'{member}', 'x', 'y', 'z'}}\ndef second(item):\n    return 'tag B', item in {{'{member}', 'x', 'y', 'z'}}\n"
+            );
+            let options = CompileOptions {
+                python_version,
+                ..CompileOptions::default()
+            };
+            let module = compile_with_options(&source, "static_attributes.py", &options).unwrap();
+            let first = module
+                .code
+                .constants
+                .iter()
+                .find_map(|constant| match constant {
+                    Constant::Code(code) if code.name == "first" => Some(code),
+                    _ => None,
+                })
+                .unwrap();
+            let set = first
+                .constants
+                .iter()
+                .find(|constant| matches!(constant, Constant::FrozenSet(_)))
+                .unwrap();
+            let graph = ObjectGraph::for_code_with_options(
+                &module.code,
+                python_version,
+                &options.initial_intern_state,
+            );
+            assert_eq!(
+                graph.is_shared(&constant_key(set), false),
+                shared,
+                "{python_version}: {prefix}"
+            );
+        }
+    }
+}

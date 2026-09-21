@@ -65,7 +65,23 @@ jobs:
             Include
             Python/codegen.c
             Python/flowgraph.c
+            Python/Python-ast.c
             Python/marshal.c
+          sparse-checkout-cone-mode: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: python/cpython
+          ref: 435c9e5a798c99653e3ab64ce29baed0e4f3dfee
+          path: target/cpython-3.15
+          persist-credentials: false
+          sparse-checkout: |
+            Include
+            Python/assemble.c
+            Python/codegen.c
+            Python/flowgraph.c
+            Python/Python-ast.c
+            Python/marshal.c
+            Python/specialize.c
           sparse-checkout-cone-mode: false
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -85,8 +101,10 @@ jobs:
         run: python scripts/mypy_primer_corpus.py check-catalog --primer-checkout target/mypy_primer
       - name: "Test target generator"
         run: python -m unittest discover -s crates/serc/scripts -p 'test_*.py'
-      - name: "Check generated target"
-        run: python crates/serc/scripts/generate_cpython_target.py --cpython target/cpython --check
+      - name: "Check generated Python 3.14 target"
+        run: python crates/serc/scripts/generate_cpython_target.py --cpython target/cpython --target-version 3.14 --check
+      - name: "Check generated Python 3.15 target"
+        run: python crates/serc/scripts/generate_cpython_target.py --cpython target/cpython-3.15 --target-version 3.15 --check
 
   check-lint:
     name: "clippy on linux"
@@ -156,19 +174,27 @@ jobs:
       CARGO_INCREMENTAL: 0
       CARGO_NET_RETRY: 10
       CARGO_TERM_COLOR: always
-      SERC_TEST_PYTHON: python
       RUSTUP_MAX_RETRIES: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        id: python314
         with:
           python-version: "3.14.5"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        id: python315
+        with:
+          python-version: "3.15.0-rc.2"
+          update-environment: false
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: "Install Rust toolchain"
         run: rustup show
       - name: "Cargo test"
+        env:
+          SERC_TEST_PYTHON: ${{ steps.python314.outputs.python-path }}
+          SERC_TEST_PYTHON_315: ${{ steps.python315.outputs.python-path }}
         run: cargo test --workspace --all-targets --all-features --locked
 
   test-other:
@@ -185,29 +211,46 @@ jobs:
       CARGO_INCREMENTAL: 0
       CARGO_NET_RETRY: 10
       CARGO_TERM_COLOR: always
-      SERC_TEST_PYTHON: python
       RUSTUP_MAX_RETRIES: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        id: python314
         with:
           python-version: "3.14.5"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        id: python315
+        with:
+          python-version: "3.15.0-rc.2"
+          update-environment: false
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-bin: false
       - name: "Install Rust toolchain"
         run: rustup show
       - name: "Test core library and binary"
+        env:
+          SERC_TEST_PYTHON: ${{ steps.python314.outputs.python-path }}
+          SERC_TEST_PYTHON_315: ${{ steps.python315.outputs.python-path }}
         run: cargo test --workspace --lib --bins --all-features --locked
       # The benchmark_scripts integration target remains Linux-only because it exercises
       # Bash-specific tooling.
       - name: "Test CPython compatibility"
+        env:
+          SERC_TEST_PYTHON: ${{ steps.python314.outputs.python-path }}
+          SERC_TEST_PYTHON_315: ${{ steps.python315.outputs.python-path }}
         run: cargo test -p serc --test compatibility --all-features --locked
       - name: "Test pinned inputs"
+        env:
+          SERC_TEST_PYTHON: ${{ steps.python314.outputs.python-path }}
+          SERC_TEST_PYTHON_315: ${{ steps.python315.outputs.python-path }}
         run: cargo test -p serc --test pinned_inputs --all-features --locked
       - name: "Test CLI"
+        env:
+          SERC_TEST_PYTHON: ${{ steps.python314.outputs.python-path }}
+          SERC_TEST_PYTHON_315: ${{ steps.python315.outputs.python-path }}
         run: cargo test -p serc-cli --test cli --all-features --locked
 
   compatibility:
@@ -227,13 +270,25 @@ jobs:
           persist-credentials: false
           submodules: true
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        id: python314
         with:
           python-version: "3.14.5"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        id: python315
+        with:
+          python-version: "3.15.0-rc.2"
+          update-environment: false
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: "Install Rust toolchain"
         run: rustup show
-      - name: "Compare with CPython"
-        run: ./scripts/check-cpython-compatibility python
+      - name: "Compare with CPython 3.14"
+        env:
+          CPYTHON: ${{ steps.python314.outputs.python-path }}
+        run: ./scripts/check-cpython-compatibility "$CPYTHON"
+      - name: "Compare with CPython 3.15"
+        env:
+          CPYTHON: ${{ steps.python315.outputs.python-path }}
+        run: ./scripts/check-cpython-compatibility "$CPYTHON" 3.15
 
   benchmark:
     name: "CodSpeed benchmarks"

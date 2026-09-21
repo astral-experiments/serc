@@ -1,6 +1,9 @@
+use crate::PythonVersion;
 use crate::code_object::{CodeObject, Constant};
 
-use super::key::{FrozenSetMembers, frozen_set_members_in_wire_order, slice_member_uses_identity};
+use super::key::{
+    FrozenSetMembers, frozen_set_members_in_wire_order, slice_member_uses_identity_for,
+};
 
 // Equal value keys share an ID; identity-based keys remain distinct exactly as `ObjectKey` does.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,6 +29,10 @@ pub(super) enum ReferenceMode {
 /// Returning `false` skips children when the object has already been handled as a reference.
 pub(super) trait MarshalVisitor<'a> {
     const USES_METADATA_IDS: bool;
+
+    fn python_version(&self) -> PythonVersion {
+        PythonVersion::Py314
+    }
 
     fn code(&mut self, code: &'a CodeObject, reference_mode: ReferenceMode) -> bool;
     fn code_bytes(&mut self, code: &'a CodeObject);
@@ -57,7 +64,7 @@ where
 }
 
 #[inline]
-fn traverse_code_with_mode<'a, V>(
+pub(super) fn traverse_code_with_mode<'a, V>(
     code: &'a CodeObject,
     reference_mode: ReferenceMode,
     visitor: &mut V,
@@ -169,7 +176,7 @@ fn traverse_slice_member<'a, V>(value: &'a Constant, visitor: &mut V)
 where
     V: MarshalVisitor<'a>,
 {
-    if slice_member_uses_identity(value) {
+    if slice_member_uses_identity_for(value, visitor.python_version()) {
         visitor.slice_member(value);
     } else {
         traverse_constant(value, ReferenceMode::IfShared, visitor);
