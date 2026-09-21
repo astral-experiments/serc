@@ -4310,11 +4310,24 @@ impl Compiler<'_> {
                             let newly_owned = if assignment
                                 .targets
                                 .iter()
-                                // Cell stores consume the value without transferring it to
-                                // another fast local, including through a chained COPY.
+                                // Fast-local stores mark the producer STORED_AS_LOCAL. Global,
+                                // name and cell stores consume copies without setting that flag.
                                 .any(|target| {
-                                    matches!(target, Expr::Name(name)
-                                        if !compiler.is_cell(name.id.as_str()))
+                                    let Expr::Name(name) = target else {
+                                        return false;
+                                    };
+                                    let name = compiler.required_name_id(name.id.as_str());
+                                    if compiler.symbols.active_temporaries.contains(name) {
+                                        !compiler.symbols.cell_names.contains(name)
+                                            || compiler.symbols.active_temporary_fast_cells.contains(name)
+                                    } else {
+                                        matches!(&compiler.unit.scope,
+                                            Scope::Function { indices, free_indices, cells, globals }
+                                                if indices.contains_key(&name)
+                                                    && !globals.contains(name)
+                                                    && !free_indices.contains_key(&name)
+                                                    && !cells.contains(name))
+                                    }
                                 })
                                 && let Expr::Name(name) = assignment.value.as_ref()
                             {

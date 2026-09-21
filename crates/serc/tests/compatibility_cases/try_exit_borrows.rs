@@ -5312,3 +5312,42 @@ fn borrows_through_named_recovery_inside_normal_finally() {
         }
     }
 }
+
+#[test]
+fn borrows_chained_stores_only_without_fast_local_transfers() {
+    for binding in ["local", "global", "nonlocal", "cell"] {
+        for assignment in ["owner.slot = output = value", "output = owner.slot = value"] {
+            let prefix = match binding {
+                "global" => "global output\n",
+                "nonlocal" => "nonlocal output\n",
+                "cell" => "output = None\ndef capture():\n    return output\n",
+                _ => "",
+            };
+            let body = format!("{prefix}{assignment}\nreturn value\n");
+            let function = format!(
+                "def function(value, owner):\n{}",
+                indent_finally_borrow_case(&body),
+            );
+            let source = if binding == "nonlocal" {
+                format!(
+                    "def outer():\n    output = None\n{}",
+                    indent_finally_borrow_case(&function)
+                )
+            } else {
+                function
+            };
+            common::assert_matches_cpython_marshal(&source, "chained_name_store.py");
+        }
+    }
+    for assignment in [
+        "owner.slot = output = alias = value",
+        "alias = output = owner.slot = value",
+        "(owner if flag else replacement).slot = output = value",
+        "output = (owner if flag else replacement).slot = value",
+    ] {
+        let source = format!(
+            "def function(value, owner, flag, replacement):\n    global output\n    {assignment}\n    return value\n",
+        );
+        common::assert_matches_cpython_marshal(&source, "chained_store_owned_control.py");
+    }
+}
