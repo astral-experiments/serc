@@ -26518,7 +26518,10 @@ impl Compiler<'_> {
                 && !statement.is_star
                 && statement.handlers.is_empty()
                 && statement.orelse.is_empty()
-                && matches!(conditional_exit, Some(NestedIfExitLocation::Unlocated))
+                // A certified cleanup can already have supplied the false-edge
+                // location. Its original jump still precedes the manager POP_BLOCK
+                // and keeps the manager owner, just like an unlocated join.
+                && conditional_exit.is_some()
                 && self.assembler.current_original_block_location().is_none()
                 && self
                     .assembler
