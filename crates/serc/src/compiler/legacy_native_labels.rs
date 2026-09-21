@@ -167,10 +167,17 @@ impl Builder {
                         self.store_target(target)?;
                     }
                 }
-                Stmt::AugAssign(assignment)
-                    if matches!(assignment.target.as_ref(), Expr::Name(_)) =>
-                {
-                    self.instruction(); // original load of the augmented target
+                Stmt::AugAssign(assignment) => {
+                    match assignment.target.as_ref() {
+                        Expr::Name(_) => {}
+                        target @ (Expr::Attribute(_) | Expr::Subscript(_)) => {
+                            Self::label_free_expression(target)?;
+                        }
+                        _ => return None,
+                    }
+                    // The original target evaluation and COPY/load prefix are
+                    // nonempty and label-free. RHS labels retain their own order.
+                    self.instruction();
                     self.expression(&assignment.value)?;
                     self.instruction();
                 }
@@ -222,6 +229,11 @@ impl Builder {
                     self.for_manager_depths.pop();
                     self.suite(&statement.orelse)?;
                     self.mark(end);
+                }
+                Stmt::Break(_) if self.for_manager_depths.last() == Some(&self.manager_depth) => {
+                    self.instruction(); // original break NOP
+                    self.instruction(); // POP_TOP unwinds the nearest For iterator
+                    self.instruction(); // JUMP to the existing ForEnd, after else
                 }
                 Stmt::Continue(_)
                     if self.for_manager_depths.last() == Some(&self.manager_depth) =>
@@ -346,7 +358,7 @@ impl Builder {
         Some(())
     }
 
-    /// Mirrors one inlined synchronous Name-target comprehension.
+    /// Mirrors one inlined synchronous comprehension with local Name stores.
     fn comprehension(
         &mut self,
         generators: &[ruff_python_ast::Comprehension],
@@ -358,7 +370,7 @@ impl Builder {
         };
         if self.inside_comprehension
             || generator.is_async
-            || !matches!(&generator.target, Expr::Name(_))
+            || !Self::name_unpack_target(&generator.target)
         {
             return None;
         }
@@ -382,8 +394,9 @@ impl Builder {
         self.expression(&generator.iter)?;
         self.instruction(); // GET_ITER / LOAD_FAST_AND_CLEAR / SWAP
         let range = generator.iter.range();
-        // A Name target is a local in the native comprehension, even when the
-        // enclosing name is a cell or free variable, so its save set is nonempty.
+        // Every nonempty Name-unpack target binds a native local, even when an
+        // enclosing name is a cell or free variable. The save set is nonempty;
+        // additional names change loads/stores but allocate no further labels.
         let cleanup = self.allocate(NativeRole::ComprehensionCleanup(range));
         let end = self.allocate(NativeRole::ComprehensionEnd(range));
         self.instruction(); // SETUP_FINALLY / BUILD_LIST, SET or MAP / SWAP
@@ -1080,7 +1093,7 @@ mod tests {
     fn unsupported_for_routes_reject_the_whole_scope() {
         for source in [
             "async def f(xs):\n    async for item in xs:\n        pass\n",
-            "def f(xs):\n    for item in xs:\n        break\n",
+            "def f(xs):\n    while xs:\n        break\n",
         ] {
             let parsed = parse_module(source).unwrap();
             let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
@@ -1345,7 +1358,6 @@ mod manager_tests {
         for source in [
             "def f(items, cm):\n    for first, second in items:\n        with cm:\n            continue\n",
             "def f(items):\n    for first, second in items:\n        pass\n    else:\n        continue\n",
-            "def f(items):\n    for first, second in items:\n        break\n",
             "def f(items):\n    while items:\n        continue\n",
         ] {
             let parsed = parse_module(source).unwrap();
@@ -1416,7 +1428,6 @@ mod manager_tests {
         for expression in [
             "[item for item in xs for other in ys]",
             "[item async for item in xs]",
-            "[item for item, other in xs]",
             "[[other for other in ys] for item in xs]",
             "[item for item in [other for other in ys]]",
             "[await action(item) for item in xs]",
@@ -1514,6 +1525,175 @@ mod manager_tests {
             };
             assert!(
                 NativeLabelPlan::function(&function.body, true).is_none(),
+                "{source}"
+            );
+        }
+    }
+    #[test]
+    fn augmented_attribute_and_subscript_targets_add_no_native_labels() {
+        for target in [
+            "obj.value",
+            "items[index]",
+            "obj.items[index, other.index]",
+            "items[start:stop]",
+            "items[start:stop:step]",
+        ] {
+            let source = format!(
+                "async def f(flag):\n    if flag:\n        pass\n    {target} += await rhs()\n    await done()\n"
+            );
+            let parsed = parse_module(&source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            let [
+                Stmt::If(condition),
+                Stmt::AugAssign(assignment),
+                Stmt::Expr(after),
+            ] = function.body.as_slice()
+            else {
+                panic!()
+            };
+            let ruff_python_ast::Expr::Await(value) = assignment.value.as_ref() else {
+                panic!()
+            };
+            let ruff_python_ast::Expr::Await(after) = after.value.as_ref() else {
+                panic!()
+            };
+            let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+            assert_eq!(plan.remaining[&NativeRole::IfEnd(condition.range)], 2);
+            assert_eq!(plan.remaining[&NativeRole::AwaitSend(value.range)], 3);
+            assert_eq!(plan.remaining[&NativeRole::AwaitExit(value.range)], 5);
+            assert_eq!(plan.remaining[&NativeRole::AwaitSend(after.range)], 6);
+            assert_eq!(plan.remaining[&NativeRole::StopIterationHandler], 9);
+        }
+    }
+
+    #[test]
+    fn augmented_targets_keep_label_bearing_evaluation_outside_the_subset() {
+        for target in [
+            "(await holder()).value",
+            "(left or right).value",
+            "items[(left if flag else right)]",
+            "items[await index()]",
+            "[item for item in values][0]",
+        ] {
+            let source = format!("async def f():\n    {target} += value\n");
+            let parsed = parse_module(&source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(NativeLabelPlan::function(&function.body, true).is_none());
+        }
+    }
+
+    #[test]
+    fn for_break_and_comprehension_unpacking_keep_existing_native_ordinals() {
+        let parsed = parse_module(
+            "async def f(items, flag):\n    for first, second in items:\n        if flag:\n            break\n    else:\n        fallback()\n    values = {first: second for first, [second, third] in await source() if keep(first)}\n    await done()\n",
+        )
+        .unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!()
+        };
+        let Stmt::For(loop_) = &function.body[0] else {
+            panic!()
+        };
+        let Stmt::If(conditional) = &loop_.body[0] else {
+            panic!()
+        };
+        let Stmt::Assign(assignment) = &function.body[1] else {
+            panic!()
+        };
+        let ruff_python_ast::Expr::DictComp(comprehension) = assignment.value.as_ref() else {
+            panic!()
+        };
+        let range = comprehension.generators[0].iter.range();
+        let plan = NativeLabelPlan::function(&function.body, true).unwrap();
+        // Break targets ForEnd and allocates no labels. All three saved names
+        // share the same comprehension cleanup/end pair after iterable Await.
+        for (role, ordinal) in [
+            (NativeRole::ForStart(loop_.range), 2),
+            (NativeRole::ForBody(loop_.range), 3),
+            (NativeRole::ForCleanup(loop_.range), 4),
+            (NativeRole::ForEnd(loop_.range), 5),
+            (NativeRole::IfEnd(conditional.range), 6),
+            (NativeRole::ComprehensionCleanup(range), 10),
+            (NativeRole::ComprehensionEnd(range), 11),
+            (NativeRole::ComprehensionStart(range), 12),
+            (NativeRole::ComprehensionIfCleanup(range), 13),
+            (NativeRole::ComprehensionAnchor(range), 14),
+            (NativeRole::StopIterationHandler, 18),
+        ] {
+            assert_eq!(plan.remaining[&role], ordinal);
+        }
+        assert_eq!(plan.remaining.len(), 18);
+    }
+
+    #[test]
+    fn for_break_stops_at_the_nearest_loop_before_manager_cleanup() {
+        for source in [
+            "def f(items, cm):\n    with cm:\n        for item in items:\n            break\n",
+            "def f(items, cm):\n    for item in items:\n        with cm:\n            for other in items:\n                break\n",
+            "def f(items):\n    for item in items:\n        for other in items:\n            pass\n        else:\n            break\n",
+        ] {
+            let parsed = parse_module(source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(
+                NativeLabelPlan::function(&function.body, false).is_some(),
+                "{source}"
+            );
+        }
+        for source in [
+            "def f(items, cm):\n    for item in items:\n        with cm:\n            break\n",
+            "def f(items):\n    for item in items:\n        pass\n    else:\n        break\n",
+            "def f(items):\n    while items:\n        break\n",
+            "async def f(items):\n    async for item in items:\n        break\n",
+        ] {
+            let parsed = parse_module(source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(
+                NativeLabelPlan::function(&function.body, function.is_async).is_none(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn comprehension_unpacking_keeps_a_nonempty_native_save_set() {
+        for target in [
+            "first, second",
+            "[first, second]",
+            "first, [second, third]",
+            "first, first",
+        ] {
+            let source = format!("def f(items):\n    values = [first for {target} in items]\n");
+            let parsed = parse_module(&source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(
+                NativeLabelPlan::function(&function.body, false).is_some(),
+                "{source}"
+            );
+        }
+        for target in [
+            "()",
+            "first, ()",
+            "first, *rest",
+            "holder.item",
+            "holder[index]",
+        ] {
+            let source = format!("def f(items):\n    values = [value for {target} in items]\n");
+            let parsed = parse_module(&source).unwrap();
+            let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+                panic!()
+            };
+            assert!(
+                NativeLabelPlan::function(&function.body, false).is_none(),
                 "{source}"
             );
         }

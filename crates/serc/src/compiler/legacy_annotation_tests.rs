@@ -4286,3 +4286,32 @@ fn legacy_exceptional_inner_return_runs_the_outer_finalizer() {
         assert_eq!(function.stack_size, 4, "{version:?}");
     }
 }
+
+#[test]
+fn python312_for_break_keeps_original_native_jump_seed() {
+    // Captured from CPython 3.12.14. The source bound is 271, so this exercises
+    // exact source labels at the cold await bridge's one-byte width boundary.
+    let mut source = String::from("async def f(items, flag, work):\n");
+    source.push_str(&"    if flag:\n        value = 0\n".repeat(60));
+    source.push_str("    for item in items:\n        if flag:\n            break\n        use(item)\n    await work()\n");
+    source.push_str(&"    value = 0\n".repeat(125));
+    source.push_str("    return None\n");
+    let module = compile(&source, PythonVersion::Py312);
+    let function = child(&module, "f");
+    let mut bytecode = vec![75, 0, 1, 0, 151, 0];
+    bytecode.extend([124, 1, 114, 2, 100, 1, 125, 3].repeat(60));
+    bytecode.extend([
+        124, 0, 68, 0, 93, 17, 0, 0, 125, 4, 124, 1, 114, 2, 1, 0, 110, 13, 116, 1, 0, 0, 0, 0, 0,
+        0, 0, 0, 124, 4, 171, 1, 0, 0, 0, 0, 0, 0, 1, 0, 140, 19, 4, 0, 2, 0, 124, 2, 171, 0, 0, 0,
+        0, 0, 0, 0, 131, 0, 100, 0, 123, 3, 0, 0, 150, 2, 151, 3, 134, 5, 5, 0, 1, 0,
+    ]);
+    bytecode.extend([100, 1, 125, 3].repeat(125));
+    bytecode.extend([121, 0, 55, 0, 140, 255, 173, 3, 119, 1]);
+    assert_eq!(function.bytecode, bytecode);
+    assert_eq!(
+        function.exception_table,
+        [
+            130, 68, 17, 72, 21, 1, 196, 19, 1, 72, 19, 4, 196, 20, 68, 0, 72, 21, 1,
+        ]
+    );
+}
