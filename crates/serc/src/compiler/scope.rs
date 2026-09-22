@@ -4434,12 +4434,14 @@ pub(super) fn generator_required_names(
         expression: &Expr,
         local_names: &mut FxHashSet<String>,
         references: &mut ReferenceCollector,
+        outside_references: &mut ReferenceCollector,
         nested_requirements: &mut BTreeSet<String>,
     ) {
         let mut names = Vec::new();
         collect_nested_comprehension_target_names(expression, &mut names);
         local_names.extend(names);
         references.visit_expr(expression);
+        outside_references.visit_expr(expression);
         nested_requirements.extend(nested_expression_required_names(expression));
     }
 
@@ -4450,8 +4452,14 @@ pub(super) fn generator_required_names(
         local_names.extend(names);
     }
 
+    let generator_targets = local_names.clone();
     let mut references = ReferenceCollector {
         skip_generator_bodies: true,
+        ..ReferenceCollector::default()
+    };
+    let mut outside_references = ReferenceCollector {
+        skip_generator_bodies: true,
+        skip_inlined_comprehension_bodies: true,
         ..ReferenceCollector::default()
     };
     let mut nested_requirements = BTreeSet::new();
@@ -4459,6 +4467,7 @@ pub(super) fn generator_required_names(
         &generator.elt,
         &mut local_names,
         &mut references,
+        &mut outside_references,
         &mut nested_requirements,
     );
     for (index, comprehension) in generator.generators.iter().enumerate() {
@@ -4466,6 +4475,7 @@ pub(super) fn generator_required_names(
             &comprehension.target,
             &mut local_names,
             &mut references,
+            &mut outside_references,
             &mut nested_requirements,
         );
         // The outermost iterable is evaluated by the enclosing scope and passed
@@ -4475,6 +4485,7 @@ pub(super) fn generator_required_names(
                 &comprehension.iter,
                 &mut local_names,
                 &mut references,
+                &mut outside_references,
                 &mut nested_requirements,
             );
         }
@@ -4483,6 +4494,7 @@ pub(super) fn generator_required_names(
                 condition,
                 &mut local_names,
                 &mut references,
+                &mut outside_references,
                 &mut nested_requirements,
             );
         }
@@ -4491,10 +4503,16 @@ pub(super) fn generator_required_names(
         .references
         .extend(generator_named_targets(generator));
     references.references.extend(nested_requirements);
+    // Inlined targets need temporary local slots without hiding reads in the generator body
+    // or in the comprehension's first iterable.
     references
         .references
         .into_iter()
-        .filter(|name| !local_names.contains(name))
+        .filter(|name| {
+            !local_names.contains(name)
+                || (outside_references.references.contains(name)
+                    && !generator_targets.contains(name))
+        })
         .collect()
 }
 

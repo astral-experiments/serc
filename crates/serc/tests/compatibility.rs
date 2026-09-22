@@ -1040,6 +1040,13 @@ def default_parameter_name_control():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_generator_nested_comprehension_captures() {
+        let source = include_str!("fixtures/generator_nested_comprehension_captures.py");
+        assert_matches_cpython_marshal(source, "generator_nested_comprehension_captures.py");
+        assert_executes(&format!("{source}\nprint(list(empty()))\n"), "[(42, [])]\n");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_generator_targets_shadowing_enclosing_freevars() {
         let source = r"def lambda_parent(all_elements, element):
     return lambda owner: all(owner.contains(element) for element in all_elements)
