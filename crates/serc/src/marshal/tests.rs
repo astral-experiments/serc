@@ -372,11 +372,11 @@ fn bypasses_value_lookup_for_structurally_unique_objects() {
 
 #[test]
 fn borrowed_string_tuple_keys_compare_across_sources() {
-    let constants = vec![
+    let constants = [
         Constant::String("alpha".to_string()),
         Constant::String("beta".to_string()),
     ];
-    let strings = vec!["alpha".to_string(), "beta".to_string()];
+    let strings = ["alpha".to_string(), "beta".to_string()];
     let keys = [0..1, 0..2, 1..2].map(|range| {
         [
             constants_tuple_key(&constants[range.clone()]),
