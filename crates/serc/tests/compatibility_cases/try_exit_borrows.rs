@@ -5410,3 +5410,23 @@ fn borrows_linear_else_cleanup_with_returning_and_plain_handlers() {
         }
     }
 }
+
+#[test]
+fn nested_raise_handler_suffix_keeps_borrow_boundary() {
+    for named in ["", " as error"] {
+        for function in [false, true] {
+            let body = format!(
+                "try:\n    work()\nexcept Error:\n    try:\n        raise Other\n    except Other{named}:\n        value = recover()\n    result = value\nprepare()\nresult = [n for n in items if not check(n)]\n"
+            );
+            let source = if function {
+                format!(
+                    "def run(items, check):\n    {}",
+                    body.replace('\n', "\n    ")
+                )
+            } else {
+                body
+            };
+            common::assert_matches_cpython_marshal(&source, "nested_raise_handler_suffix.py");
+        }
+    }
+}

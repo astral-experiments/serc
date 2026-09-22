@@ -21246,6 +21246,42 @@ impl Compiler<'_> {
                 // it only after its exact target and location survive cold ordering.
                 self.assembler.record_guarded_try_else_exit(normal_exit);
             }
+            if self.context.python_version == crate::PythonVersion::Py314
+                && !statement.is_star
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty()
+                && borrow_exit_has_source_successor
+                && body_noop_location.is_none()
+                && !body_ends_in_nop
+                && matches!(self.unit.scope, Scope::Module | Scope::Function { .. })
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && self.control.loops.contexts.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && statement.body.iter().all(|statement| {
+                    suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                        || matches!(statement, Stmt::Import(_) | Stmt::ImportFrom(_))
+                })
+                && matches!(statement.handlers.as_slice(), [handler]
+                if handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.is_some()
+                        && handler_has_raised_try_before_linear_suffix(&handler.body)
+                }))
+            {
+                // The nested raise leaves an unreachable normal POP_BLOCK/JUMP array.
+                // Cold relocation leaves it in the outer normal exit's fallthrough,
+                // even when more handler work follows the nested recovery.
+                self.assembler.record_noncopyable_borrow_exit(normal_exit);
+            }
         }
         if deferred_try_pop_block && !removed_shared_try_pop_block {
             // The emitted normal block now proves whether pre-line exit copying
@@ -32958,6 +32994,32 @@ fn suite_ends_in_value_match_recovery_loop(body: &[Stmt]) -> bool {
                     if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
                         && is_literal_constant(&assignment.value))
         })
+}
+
+/// Finds a direct nested raise whose empty normal array survives a linear handler suffix.
+fn handler_has_raised_try_before_linear_suffix(body: &[Stmt]) -> bool {
+    body.iter().enumerate().any(|(index, statement)| {
+        let Stmt::Try(nested) = statement else {
+            return false;
+        };
+        !nested.is_star
+            && nested.orelse.is_empty()
+            && nested.finalbody.is_empty()
+            && matches!(nested.body.as_slice(), [Stmt::Raise(_)])
+            && matches!(nested.handlers.as_slice(), [handler]
+            if handler.as_except_handler().is_some_and(|handler| {
+                handler.type_.as_deref().is_some_and(|test| {
+                    !expression_contains_inline_branch(test)
+                        && !expression_suspends_current_scope(test)
+                }) && suite_has_linear_borrow_fallthrough(&handler.body)
+            }))
+            && index + 1 < body.len()
+            && body[index + 1..].iter().all(|statement| {
+                suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                    || matches!(statement, Stmt::Delete(deletion)
+                        if deletion.targets.iter().all(|target| matches!(target, Expr::Name(_))))
+            })
+    })
 }
 
 // Unreachable cleanup blocks can remain empty when cold handler blocks move. A final with
