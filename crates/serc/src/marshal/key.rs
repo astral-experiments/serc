@@ -169,19 +169,13 @@ impl PartialEq for StringTupleKey<'_> {
                         .zip(right)
                         .all(|(left, right)| constant_string(left) == constant_string(right))
             }
-            (StringTupleKind::Constants(left), StringTupleKind::Strings(right)) => {
+            (StringTupleKind::Constants(left), StringTupleKind::Strings(right))
+            | (StringTupleKind::Strings(right), StringTupleKind::Constants(left)) => {
                 left.len() == right.len()
                     && left
                         .iter()
                         .zip(right)
                         .all(|(left, right)| constant_string(left) == right)
-            }
-            (StringTupleKind::Strings(left), StringTupleKind::Constants(right)) => {
-                left.len() == right.len()
-                    && left
-                        .iter()
-                        .zip(right)
-                        .all(|(left, right)| left == constant_string(right))
             }
             (StringTupleKind::Strings(left), StringTupleKind::Strings(right)) => left == right,
         }
@@ -272,11 +266,7 @@ fn constants_equal(left: &Constant, right: &Constant) -> bool {
         (Constant::SurrogateString(left), Constant::SurrogateString(right)) => left == right,
         (Constant::Bytes(left), Constant::Bytes(right)) => left == right,
         (Constant::Tuple(left), Constant::Tuple(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right)
-                    .all(|(left, right)| constants_equal(left, right))
+            ConstantTupleKey(left) == ConstantTupleKey(right)
         }
         (Constant::FrozenSet(_), Constant::FrozenSet(_)) => {
             constant_key(left) == constant_key(right)
@@ -352,10 +342,7 @@ fn hash_constant<H: Hasher>(value: &Constant, state: &mut H) {
         }
         Constant::Tuple(values) => {
             11_u8.hash(state);
-            values.len().hash(state);
-            for value in values {
-                hash_constant(value, state);
-            }
+            ConstantTupleKey(values).hash(state);
         }
         Constant::FrozenSet(_) => {
             12_u8.hash(state);

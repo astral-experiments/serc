@@ -38,9 +38,9 @@ use crate::target::{Opcode, is_scope_exit};
 use crate::{CompileError, PythonVersion};
 
 use super::constant::{
-    PercentFormatPart, big_integer_digits, explicit_surrogate_string, first_literal_constant,
-    fold_constant, folded_bool_operand, folded_constant_owner_slots,
-    is_small_literal_tuple_element, optimized_percent_format, python_constant_values_equal,
+    PercentFormatPart, explicit_surrogate_string, first_literal_constant, fold_constant,
+    folded_bool_operand, folded_constant_owner_slots, is_small_literal_tuple_element,
+    number_constant, optimized_percent_format, python_constant_values_equal,
     two_element_slice_optimization,
 };
 use super::scope::{
@@ -2120,20 +2120,7 @@ impl Compiler<'_> {
                 self.emit(LOAD_CONST, index, 1)?;
             }
             Expr::NumberLiteral(number) => {
-                let constant = match &number.value {
-                    Number::Int(value) => value.as_u64().map_or_else(
-                        || Constant::BigInt {
-                            negative: false,
-                            digits: big_integer_digits(&value.to_string()),
-                        },
-                        Constant::Int,
-                    ),
-                    Number::Float(value) => Constant::Float(*value),
-                    Number::Complex { real, imag } => Constant::Complex {
-                        real: *real,
-                        imag: *imag,
-                    },
-                };
+                let constant = number_constant(&number.value);
                 if self.context.python_version >= PythonVersion::Py314
                     && let Number::Int(value) = &number.value
                     && let Some(value) = value.as_u8()
