@@ -17504,6 +17504,10 @@ impl Compiler<'_> {
                 // An emitted break targets a separate original array after END_FOR
                 // and POP_ITER. Its cleanup conditions cannot borrow earlier slots.
                 self.assembler.record_exception_owner_block_boundary(end);
+                if !statement.orelse.is_empty() {
+                    self.assembler
+                        .record_sync_for_else_end(end, base_depth.cast_unsigned());
+                }
             }
             self.assembler.mark(end);
         }
@@ -24952,7 +24956,11 @@ impl Compiler<'_> {
                             && context.finally_end_depth == 0
                             && context.exception_region_depth == 0
                     })
-                    && supports_direct_terminating_finally_returns(statement)))
+                    && (supports_direct_terminating_finally_returns(statement)
+                        || (matches!(self.unit.scope, Scope::Function { .. })
+                            && matches!(self.control.loops.contexts.as_slice(), [iterator]
+                                if iterator.iterator_cleanup == IteratorCleanup::Sync)
+                            && supports_loop_break_terminating_finally_returns(statement)))))
         {
             return self.with_control_override(
                 |control| &mut control.finally.copies_terminating_finally_returns,
@@ -28631,6 +28639,61 @@ impl Compiler<'_> {
                     exception_policy,
                 )?
             };
+            if self.context.python_version >= crate::PythonVersion::Py314
+                && !preserve_exit_nop
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && !statement.is_star
+                && statement.handlers.is_empty()
+                && statement.orelse.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && self.control.finally.active_overriding_finally_returns == 0
+                && let [Stmt::For(tail)] = statement.finalbody.as_slice()
+                && !tail.is_async
+                && !expression_contains_inline_branch(&tail.iter)
+                && !expression_suspends_current_scope(&tail.iter)
+                && !expression_contains_inline_branch(&tail.target)
+                && !expression_suspends_current_scope(&tail.target)
+                && let Some(Stmt::Expr(discard)) = tail.orelse.last()
+                && let Expr::Call(call) = discard.value.as_ref()
+                && !expression_contains_inline_branch(&discard.value)
+                && !expression_suspends_current_scope(&discard.value)
+            {
+                let authored_break = match tail.body.as_slice() {
+                    [Stmt::Break(authored)] => Some(authored),
+                    [Stmt::If(branch)]
+                        if branch.elif_else_clauses.is_empty()
+                            && early_condition_truthiness(&branch.test) != Some(false)
+                            && !expression_contains_inline_branch(&branch.test)
+                            && !expression_suspends_current_scope(&branch.test) =>
+                    {
+                        match branch.body.as_slice() {
+                            [Stmt::Break(authored)] => Some(authored),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(authored_break) = authored_break {
+                    self.assembler.preserve_sync_for_else_finally_exit(
+                        normal_exit,
+                        self.source_location(authored_break.range),
+                        self.call_opcode_location(call),
+                    );
+                }
+            }
             if copied_loop_exit.is_some() {
                 self.assembler.preserve_direct_inlined_jump_nop(normal_exit);
             }
@@ -33429,6 +33492,64 @@ fn supports_direct_terminating_finally_returns(statement: &ruff_python_ast::Stmt
                     && !expression_suspends_current_scope(value)
             })
         })
+}
+
+/// Keeps a pending return live until a finalizer's conditional break or return.
+/// Both exits cross the same enclosing iterator, with no newly entered cleanup.
+fn supports_loop_break_terminating_finally_returns(statement: &ruff_python_ast::StmtTry) -> bool {
+    fn linear_value(value: &Expr) -> bool {
+        !expression_contains_inline_branch(value) && !expression_suspends_current_scope(value)
+    }
+
+    fn runtime_break(statement: &Stmt) -> bool {
+        matches!(statement, Stmt::If(branch)
+            if branch.elif_else_clauses.is_empty()
+                && matches!(branch.body.as_slice(), [Stmt::Break(_)])
+                && condition_has_only_runtime_tests(&branch.test)
+                && condition_has_linear_runtime_leaves(&branch.test)
+                && linear_value(&branch.test))
+    }
+
+    fn linear_work(statement: &Stmt) -> bool {
+        match statement {
+            Stmt::Assign(assignment) => {
+                assignment
+                    .targets
+                    .iter()
+                    .all(|target| matches!(target, Expr::Name(_)))
+                    && linear_value(&assignment.value)
+            }
+            Stmt::AugAssign(assignment) => {
+                matches!(assignment.target.as_ref(), Expr::Name(_))
+                    && linear_value(&assignment.value)
+            }
+            Stmt::Expr(expression) => {
+                matches!(expression.value.as_ref(), Expr::Call(_))
+                    && linear_value(&expression.value)
+            }
+            _ => false,
+        }
+    }
+
+    let Some((Stmt::Return(body), leading)) = statement.body.split_last() else {
+        return false;
+    };
+    let [branch, Stmt::Return(finalizer)] = statement.finalbody.as_slice() else {
+        return false;
+    };
+    let leading = if leading.last().is_some_and(runtime_break) {
+        &leading[..leading.len() - 1]
+    } else {
+        leading
+    };
+    !statement.is_star
+        && statement.handlers.is_empty()
+        && statement.orelse.is_empty()
+        && runtime_break(branch)
+        && leading.iter().all(linear_work)
+        && [body, finalizer]
+            .iter()
+            .all(|returned| returned.value.as_deref().is_none_or(linear_value))
 }
 
 /// Certifies the two adjacent finally frames covered by the existing return

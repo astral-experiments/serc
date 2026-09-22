@@ -1184,3 +1184,16 @@ fn matches_cpython_guarded_finally_original_normal_exits() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_original_for_else_normal_finally_exit() {
+    for (filename, condition) in [
+        ("folded_for_else_finally_exit.py", "True"),
+        ("runtime_for_else_finally_exit.py", "enabled"),
+    ] {
+        let source = format!(
+            "def f(items, value, enabled):\n    for outer in items:\n        try:\n            value += outer\n        finally:\n            for item in items:\n                if {condition}:\n                    break\n            else:\n                consume(value)\n        consume(value)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, filename);
+    }
+}
