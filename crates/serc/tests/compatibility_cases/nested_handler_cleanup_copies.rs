@@ -194,6 +194,18 @@ fn matches_cpython_shared_unnamed_handler_local_return_copies() {
 }
 
 #[test]
+fn matches_cpython_nested_handler_shared_global_return_copies() {
+    for returned in ["value", "other"] {
+        for prefix in ["", "                    notify()\n"] {
+            let source = format!(
+                "def f():\n    global value\n    if value is None:\n        try:\n            value = first()\n        except Error:\n            try:\n                with manager():\n{prefix}                    value = second()\n            except Error:\n                value = third()\n                done(value)\n    return {returned}\n"
+            );
+            common::assert_matches_cpython_marshal(&source, "nested_handler_global_return.py");
+        }
+    }
+}
+
+#[test]
 fn matches_cpython_nested_manager_terminating_handler_return_copies() {
     for (filename, source) in [
         (
@@ -478,4 +490,16 @@ def bare_return(primary, secondary, finish):
         source,
         "interleaved_unnamed_handler_literal_returns.py",
     );
+}
+
+#[test]
+fn matches_cpython_shared_handler_nested_join_borrow_return_copies() {
+    for alternative in ["elif d", "else"] {
+        for returned in ["value", "42"] {
+            let source = format!(
+                "def f(value, a, b, c, d):\n    try:\n        work()\n    except Error:\n        if a:\n            if b:\n                if c:\n                    value = update(value)\n            else:\n                raise\n        {alternative}:\n            value = update(value)\n    return {returned}\n"
+            );
+            common::assert_matches_cpython_marshal(&source, "shared_handler_nested_join_return.py");
+        }
+    }
 }

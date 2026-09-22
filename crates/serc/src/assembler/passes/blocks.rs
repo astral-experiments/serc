@@ -421,6 +421,39 @@ fn named_cleanup_has_short_return(graph: &BlockGraph, target: BasicBlockId) -> b
         })
 }
 
+/// Authenticates a shared unlocated jump after exactly one original jump was threaded.
+fn is_shared_threaded_handler_jump(
+    items: &[Item],
+    shared_jumps: &FxHashSet<Label>,
+    original_nops: &FxHashSet<Label>,
+    provenance: &ExceptionOwnerProvenance,
+) -> bool {
+    let entry_len = items
+        .iter()
+        .take_while(|item| matches!(item, Item::Label(_)))
+        .count();
+    let [Item::Instruction(jump)] = &items[entry_len..] else {
+        return false;
+    };
+    items[..entry_len]
+        .iter()
+        .any(|item| matches!(item, Item::Label(label) if shared_jumps.contains(label)))
+        && items[..entry_len].iter().all(|item| {
+            matches!(item, Item::Label(label)
+                if !original_nops.contains(label)
+                    && !provenance.omitted_nop_counts.contains_key(label)
+                    && !provenance.omitted_nop_locations.contains_key(label))
+        })
+        && jump.opcode == JUMP_FORWARD
+        && jump.location == SourceLocation::NONE
+        && jump.no_location_policy.preserves_location()
+        && !jump.no_location_policy.is_artificial_eval_break()
+        && !jump.jump_policy.is_interruptible()
+        && jump.pre_fold_extra_instructions() == 1
+        && jump.local_policy.hidden_exception_owner_slots() == 0
+        && jump.exception_policy() == ExceptionPolicy::default()
+}
+
 /// Recognizes a recorded unnamed cleanup whose original `POP_BLOCK` survives in its width.
 fn unnamed_cleanup_has_short_return(
     graph: &BlockGraph,
@@ -471,7 +504,11 @@ fn unnamed_cleanup_has_short_return(
     let [Item::Instruction(value), Item::Instruction(exit)] = &returned[entry_len..] else {
         return false;
     };
-    matches!(value.opcode, LOAD_FAST | LOAD_CONST)
+    // A bare global load occupies one original slot. The low-bit NULL form
+    // also represents PUSH_NULL and cannot use this two-record certificate.
+    (matches!(value.opcode, LOAD_FAST | LOAD_CONST)
+        || (value.opcode == LOAD_GLOBAL
+            && matches!(value.operand(), Operand::Value(argument) if argument & 1 == 0)))
         && exit.opcode == RETURN_VALUE
         && [value, exit].iter().all(|instruction| {
             instruction.location.line >= 0
@@ -4934,14 +4971,32 @@ impl OptimizationPipeline {
                     });
             let inline_no_location_block =
                 !source_has_fallthrough && target_is_no_location_no_fallthrough;
+            let shared_unnamed_cleanup_source = !planned_copy
+                && inline_no_location_block
+                && target_chain_end == target_position
+                && source_position < target_position
+                && !self.shared_jump_copy_location_blocks.is_empty()
+                && is_shared_threaded_handler_jump(
+                    graph[source].items(),
+                    &self.shared_jump_copy_location_blocks,
+                    &self.original_nop_targets,
+                    &self.exception_owner_provenance,
+                )
+                && unnamed_cleanup_has_short_return(
+                    graph,
+                    target,
+                    &self
+                        .exception_owner_provenance
+                        .original_handler_cleanup_join_exits,
+                );
             if !planned_copy
                 && inline_no_location_block
                 && target_chain_end == target_position
                 && graph[source].last_instruction().is_some_and(|jump| {
                     jump.opcode == JUMP_FORWARD
-                        // Unlocated cleanup continuations retain their original copy order
-                        // so removing one predecessor can still locate the shared cleanup.
-                        && jump.location.line >= 0
+                        // A recorded shared jump waits for its unnamed cleanup's return.
+                        // Other unlocated cleanup continuations retain their copy order.
+                        && (jump.location.line >= 0 || shared_unnamed_cleanup_source)
                         // Retained authored line slots keep their original copy order.
                         && !jump.jump_policy.retains_nop_for(jump.operand())
                         && jump.pre_fold_extra_instructions() > 0

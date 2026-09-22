@@ -91,3 +91,19 @@ fn empty_try_nop_retains_enclosing_finally_owner() {
         }
     }
 }
+
+#[test]
+fn empty_try_markers_do_not_add_uninitialized_local_exception_edges() {
+    for body in ["pass", "work()"] {
+        for source in [
+            format!(
+                "def function():\n    try:\n        {body}\n    except Error:\n        value = None\n    else:\n        return\n    finally:\n        consume(value)\n"
+            ),
+            format!(
+                "def function():\n    try:\n        first = 1\n    finally:\n        try:\n            {body}\n        finally:\n            try:\n                second = 1\n            finally:\n                consume(second)\n"
+            ),
+        ] {
+            common::assert_matches_cpython_marshal(&source, "empty_try_local_exception_edges.py");
+        }
+    }
+}

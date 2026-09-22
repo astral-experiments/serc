@@ -3083,7 +3083,7 @@ fn uninitialized_load_analysis_follows_single_block_backedges() {
         )),
     ]);
 
-    assembler.add_checks_for_uninitialized_loads(1, 1);
+    assembler.add_checks_for_uninitialized_loads(1, 1, &rustc_hash::FxHashSet::default());
 
     assert_eq!(
         graph_opcodes(&assembler),
@@ -3109,7 +3109,7 @@ fn uninitialized_load_analysis_resets_locals_above_the_fast_mask_at_block_entry(
         pass_instruction(LOAD_FAST, 64, 2),
     ]);
 
-    assembler.add_checks_for_uninitialized_loads(65, 0);
+    assembler.add_checks_for_uninitialized_loads(65, 0, &rustc_hash::FxHashSet::default());
 
     assert_eq!(
         graph_opcodes(&assembler),
@@ -3366,7 +3366,7 @@ fn maybe_null_comprehension_restore_checks_only_the_first_later_load() {
         pass_instruction(LOAD_FAST, 0, 1),
     ]);
 
-    assembler.add_checks_for_uninitialized_loads(1, 1);
+    assembler.add_checks_for_uninitialized_loads(1, 1, &rustc_hash::FxHashSet::default());
 
     assert_eq!(
         graph_opcodes(&assembler),
@@ -4637,7 +4637,11 @@ fn uninitialized_load_analysis_preserves_original_exception_region_priority() {
                         priority: priority(if fallback { fragment } else { outer }),
                     },
                 ]);
-                assembler.add_checks_for_uninitialized_loads(1, 0);
+                assembler.add_checks_for_uninitialized_loads(
+                    1,
+                    0,
+                    &rustc_hash::FxHashSet::default(),
+                );
                 let block = assembler.graph.label_block(handler).unwrap();
                 let load = assembler.graph[block]
                     .items()

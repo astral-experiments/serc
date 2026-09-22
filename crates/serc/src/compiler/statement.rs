@@ -32,7 +32,7 @@ use super::constant::{
     two_element_slice_optimization,
 };
 use super::expression::{
-    binary_operator, comparison_operator, early_condition_truthiness,
+    binary_operator, comparison_operator, early_condition_truthiness, expression_contains_yield,
     expression_suspends_current_scope, jump_constant_truthiness, optimized_generator_callable,
     optimized_generator_callable_for_target,
 };
@@ -458,8 +458,8 @@ pub(super) struct ExceptionState {
 
 #[derive(Debug, Default)]
 pub(super) struct FinallyState {
-    // A complete two-level source certificate uses recursive native return
-    // unwinding even when both finalizers replace the pending return.
+    // Certified direct and nested finalizers use recursive native return
+    // unwinding even when cleanup replaces the pending return.
     copies_terminating_finally_returns: bool,
     // The direct tail statement is followed by the copied lexical unwind.
     copied_finally_tail: Option<TextRange>,
@@ -5916,6 +5916,66 @@ impl Compiler<'_> {
                         .is_empty()
                     && self.control.withs.active_with_exits.is_empty()
                     && self.control.loops.contexts.is_empty();
+                // Iterators entered by an exceptional finally sit above its saved
+                // exception state. Unwind that inner suffix before FINALLY_END, then
+                // leave older iterators for the later return cleanup.
+                let loops_before_finally_end = (!return_is_overridden
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && self.control.finally.active_finally_end_blocks == 1
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self
+                        .control
+                        .finally
+                        .active_return_finally_contexts
+                        .is_empty()
+                    && self
+                        .control
+                        .finally
+                        .preserved_return_value_contexts
+                        .is_empty()
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.exceptions.active_try_marker_slots.is_empty()
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+                        == 1
+                    && self.control.withs.active_with_exits.is_empty())
+                .then(|| {
+                    self.control
+                        .loops
+                        .contexts
+                        .iter()
+                        .position(|context| context.finally_end_depth == 1)
+                })
+                .flatten()
+                .filter(|&depth| {
+                    self.control.loops.contexts[..depth].iter().all(|context| {
+                        context.finally_end_depth == 0
+                            && context.exception_region_depth == 0
+                            && context.with_depth == 0
+                    }) && self.control.loops.contexts[depth..]
+                        .iter()
+                        .any(|context| context.iterator_cleanup == IteratorCleanup::Sync)
+                        && self.control.loops.contexts[depth..].iter().all(|context| {
+                            matches!(
+                                context.iterator_cleanup,
+                                IteratorCleanup::None | IteratorCleanup::Sync
+                            ) && context.finally_end_depth == 1
+                                && context.exception_region_depth == 1
+                                && context.with_depth == 0
+                        })
+                });
+                if let Some(depth) = loops_before_finally_end {
+                    self.emit_loop_iterator_cleanup(
+                        depth,
+                        self.control.loops.contexts.len(),
+                        preserve_tos,
+                    )?;
+                }
                 let nested_finally_region_unwind_start = (!handler_before_finally_end
                     && self.control.finally.active_finally_end_blocks > 0
                     && self
@@ -6529,7 +6589,8 @@ impl Compiler<'_> {
                     && !tracks_two_handlers_inside_ordinary_try
                     && self.plain_handler_chain_has_outer_try();
                 let mut protected_outer_pop_except_start = None;
-                let mut next_loop = self.control.loops.contexts.len();
+                let mut next_loop =
+                    loops_before_finally_end.unwrap_or(self.control.loops.contexts.len());
                 let mut next_with = self.control.withs.active_with_exits.len();
                 let mut with_unwind_starts = Vec::new();
                 let mut with_unwind_before_exception_start = 0;
@@ -14713,10 +14774,21 @@ impl Compiler<'_> {
                     if unary.op == UnaryOp::Not
                         && matches!(unary.operand.as_ref(), Expr::BoolOp(boolean)
                             if boolean.op == BoolOp::And));
+        // A conditional expression also has one authored success edge per runtime arm.
+        // Keep its shared unlocated exit until each edge receives a located backedge copy.
+        let success_conditional = non_final_branch
+            && statement.msg.is_none()
+            && matches!(statement.test.as_ref(), Expr::If(conditional)
+                if [&conditional.test, &conditional.body, &conditional.orelse]
+                    .into_iter()
+                    .all(|operand| condition_has_only_runtime_tests(operand)
+                        && !expression_contains_inline_branch(operand)
+                        && !expression_suspends_current_scope(operand)
+                        && !expression_contains_yield(operand)));
         let copy_success_backedge = non_final_branch
-            && success_disjunction
             && condition_jump_target_count(&statement.test, true) > 1
-            && condition_has_linear_runtime_leaves(&statement.test);
+            && (success_conditional
+                || (success_disjunction && condition_has_linear_runtime_leaves(&statement.test)));
         let original_try_exit = statement.msg.is_none()
             && self.preserves_original_try_loop_tail_exit(&statement.test, restart, false);
         if (non_final_branch || original_try_exit)
@@ -19256,7 +19328,15 @@ impl Compiler<'_> {
                 .then(|| {
                     statement
                         .body
-                        .last()
+                        .iter()
+                        .rev()
+                        // Zero-record declarations do not donate a line to POP_BLOCK.
+                        .find(|statement| {
+                            !matches!(
+                                statement,
+                                Stmt::AnnAssign(_) | Stmt::Global(_) | Stmt::Nonlocal(_)
+                            )
+                        })
                         .map(|statement| self.source_location(statement.range()))
                 })
                 .flatten();
@@ -19649,7 +19729,16 @@ impl Compiler<'_> {
             .then(|| {
                 statement
                     .orelse
-                    .last()
+                    .iter()
+                    .rev()
+                    // A declaration can emit no native record at all. Only an omitted
+                    // instruction can donate a location to the unlocated normal exit.
+                    .find(|statement| {
+                        !matches!(
+                            statement,
+                            Stmt::AnnAssign(_) | Stmt::Global(_) | Stmt::Nonlocal(_)
+                        )
+                    })
                     .map(|statement| self.source_location(statement.range()))
             })
             .flatten();
@@ -24276,10 +24365,8 @@ impl Compiler<'_> {
         terminal: bool,
     ) -> Result<(), CompileError> {
         let finally = &self.control.finally;
-        if self.context.python_version <= crate::PythonVersion::Py313
-            && !finally.copies_terminating_finally_returns
+        if !finally.copies_terminating_finally_returns
             && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
-            && self.control.loops.contexts.is_empty()
             && self.control.withs.active_with_exits.is_empty()
             && self.control.withs.active_with_region_exclusions.is_empty()
             && self.control.exceptions.active_exception_handlers.is_empty()
@@ -24300,7 +24387,17 @@ impl Compiler<'_> {
             && finally.active_copied_finally_bodies == 0
             && finally.active_finally_end_blocks == 0
             && finally.active_overriding_finally_returns == 0
-            && supports_nested_terminating_finally_returns(statement)
+            && ((self.context.python_version <= crate::PythonVersion::Py313
+                && self.control.loops.contexts.is_empty()
+                && supports_nested_terminating_finally_returns(statement))
+                || (self.unit.flags & CO_COROUTINE == 0
+                    && self.control.loops.contexts.iter().all(|context| {
+                        context.iterator_cleanup != IteratorCleanup::Async
+                            && context.with_depth == 0
+                            && context.finally_end_depth == 0
+                            && context.exception_region_depth == 0
+                    })
+                    && supports_direct_terminating_finally_returns(statement)))
         {
             return self.with_control_override(
                 |control| &mut control.finally.copies_terminating_finally_returns,
@@ -26586,7 +26683,7 @@ impl Compiler<'_> {
                 [Stmt::Delete(delete)] if matches!(delete.targets.as_slice(), [Expr::Name(_)])
             );
         // Native FINALLY_TRY visits the cleanup before any overriding Return
-        // discards the pending value. The certified chain uses the existing
+        // discards the pending value. The certified forms use the existing
         // copied-return contexts for terminating and falling-through cleanup.
         let copy_finally_on_exit = self.control.finally.copies_terminating_finally_returns
             || !suite_terminates(&statement.finalbody);
@@ -32510,6 +32607,26 @@ fn finalizer_tail_has_matching_linear_copies(body: &[Stmt]) -> bool {
             let mut suspensions = SuspensionFinder::default();
             suspensions.visit_expr(&assignment.value);
             !suspensions.found
+        })
+}
+
+/// A direct finalizer return unwinds the pending value before enclosing iterators.
+/// Both expressions stay in one block, with no newly entered cleanup scope.
+fn supports_direct_terminating_finally_returns(statement: &ruff_python_ast::StmtTry) -> bool {
+    let [Stmt::Return(body)] = statement.body.as_slice() else {
+        return false;
+    };
+    let [Stmt::Return(finalizer)] = statement.finalbody.as_slice() else {
+        return false;
+    };
+    !statement.is_star
+        && statement.handlers.is_empty()
+        && statement.orelse.is_empty()
+        && [body, finalizer].iter().all(|statement| {
+            statement.value.as_deref().is_none_or(|value| {
+                !expression_contains_inline_branch(value)
+                    && !expression_suspends_current_scope(value)
+            })
         })
 }
 

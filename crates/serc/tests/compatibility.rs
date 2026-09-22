@@ -14609,3 +14609,87 @@ fn matches_cpython_located_conditional_finally_owner_boundaries() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_exceptional_finally_inner_iterator_returns() {
+    for value in [
+        "item",
+        "convert(item)",
+        r#"f"item {item}""#,
+        "42",
+        "None",
+        "",
+    ] {
+        let source = format!(
+            "def run(source, inner, enabled):\n    for outer in source:\n        try:\n            return outer\n        finally:\n            if enabled:\n                for item in inner:\n                    return {value}\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "exceptional_finally_inner_iterator.py");
+    }
+}
+
+#[test]
+fn matches_cpython_exceptional_finally_iterator_depth_boundaries() {
+    for (source, filename) in [
+        (
+            r"def run(source, enabled, pending):
+    try:
+        return pending
+    finally:
+        if enabled:
+            for item in source:
+                return item
+",
+            "exceptional_finally_no_outer.py",
+        ),
+        (
+            r"def run(source, inner, enabled):
+    for outer in source:
+        try:
+            return outer
+        finally:
+            if enabled:
+                for group in inner:
+                    for item in group:
+                        return item
+",
+            "exceptional_finally_two_inner.py",
+        ),
+        (
+            r"def run(source, inner, enabled):
+    for outer in source:
+        try:
+            return outer
+        finally:
+            while enabled:
+                for item in inner:
+                    return item
+                break
+",
+            "exceptional_finally_while_around_inner.py",
+        ),
+        (
+            r"def run(source, enabled):
+    for outer in source:
+        try:
+            return outer
+        finally:
+            while enabled:
+                return outer
+",
+            "exceptional_finally_while_only.py",
+        ),
+        (
+            r"def run(source, enabled):
+    for outer in source:
+        try:
+            return outer
+        finally:
+            if enabled:
+                return convert(outer)
+",
+            "exceptional_finally_outer_only.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

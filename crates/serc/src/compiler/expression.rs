@@ -8831,7 +8831,7 @@ fn legacy_not_comparison(expression: &Expr) -> Option<(&ruff_python_ast::ExprCom
     Some((comparison, if negated { inverse } else { *operator }))
 }
 
-fn expression_contains_yield(expression: &Expr) -> bool {
+pub(super) fn expression_contains_yield(expression: &Expr) -> bool {
     #[derive(Default)]
     struct Collector {
         found: bool,

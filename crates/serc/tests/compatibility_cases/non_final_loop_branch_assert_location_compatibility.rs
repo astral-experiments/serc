@@ -230,3 +230,44 @@ fn matches_cpython_marshal_for_non_final_loop_negated_and_assertion() {
         "nonfinal_loop_negated_and_assertion_target.py",
     );
 }
+
+#[test]
+fn matches_cpython_non_final_loop_conditional_assertion_successes() {
+    for loop_header in ["for item in items", "while items"] {
+        for condition in [
+            "left if selector else right",
+            "left == expected if check(selector) else right",
+            "left == expected if selector is expected else RIGHT",
+            "left is None if selector else right is not None",
+            "not left if selector else not right",
+            "left if True else right",
+        ] {
+            let source = format!(
+                "def f(items, selector, left, right, expected, branch):\n    {loop_header}:\n        if branch:\n            assert {condition}\n        else:\n            consume(left)\n"
+            );
+            common::assert_matches_cpython_marshal(&source, "loop_conditional_assertion.py");
+        }
+    }
+}
+
+#[test]
+fn matches_cpython_protected_multiline_loop_conditional_assertion() {
+    common::assert_matches_cpython_marshal(
+        r"async def check(values, selector, left, right, manager):
+    with manager:
+        await prepare()
+        for value in values:
+            if value:
+                assert (
+                    left == expected
+                    if selector is expected
+                    else RIGHT
+                )
+            elif left is None:
+                assert right is None
+            else:
+                consume(left)
+",
+        "protected_multiline_loop_conditional_assertion.py",
+    );
+}
