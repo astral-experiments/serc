@@ -45,11 +45,12 @@ use super::constant::{
 };
 use super::scope::{
     LoweringFunctionPlan, NameId, NameSet, analyze_lambda_scope,
-    collect_named_expression_target_names, collect_nested_comprehension_target_names,
-    collect_self_iterated_nested_comprehension_targets, collect_target_names,
-    comprehension_cell_names, comprehension_name_bindings, comprehension_temporary_names,
-    generator_cellvars, generator_required_names, inlined_comprehension_cell_names_in_expression,
-    legacy_class_comprehension_names, parameter_default_expressions,
+    collect_nested_comprehension_target_names, collect_self_iterated_nested_comprehension_targets,
+    collect_target_names, comprehension_cell_names, comprehension_name_bindings,
+    comprehension_scope_facts, comprehension_temporary_names, generator_cellvars,
+    generator_required_names, inlined_comprehension_cell_names_in_expression,
+    legacy_class_comprehension_names, module_comprehension_temporary_names,
+    parameter_default_expressions,
 };
 use super::source::{
     debug_text_range, first_expression_instruction_range, fstring_literal_range,
@@ -273,85 +274,6 @@ enum CollectionKind {
 enum SpecializedLowering {
     Applied,
     NotApplicable,
-}
-
-#[derive(Default)]
-struct ComprehensionScopeFacts {
-    names: BTreeSet<String>,
-    walrus_targets: BTreeSet<String>,
-}
-
-impl ComprehensionScopeFacts {
-    fn visit_nested_comprehension(&mut self, generators: &[ruff_python_ast::Comprehension]) {
-        // The first iterable is evaluated in the containing scope; the remaining
-        // expressions enter the nested comprehension's own inlined scope.
-        if let Some(generator) = generators.first() {
-            self.visit_expr(&generator.iter);
-        }
-    }
-}
-
-impl<'ast> Visitor<'ast> for ComprehensionScopeFacts {
-    fn visit_expr(&mut self, expression: &'ast Expr) {
-        match expression {
-            Expr::Name(name) => {
-                self.names.insert(name.id.as_str().to_string());
-            }
-            Expr::Named(named) => {
-                if let Expr::Name(name) = named.target.as_ref() {
-                    self.walrus_targets.insert(name.id.as_str().to_string());
-                }
-            }
-            Expr::Generator(generator) => {
-                self.visit_nested_comprehension(&generator.generators);
-                return;
-            }
-            Expr::ListComp(comprehension) => {
-                self.visit_nested_comprehension(&comprehension.generators);
-                return;
-            }
-            Expr::SetComp(comprehension) => {
-                self.visit_nested_comprehension(&comprehension.generators);
-                return;
-            }
-            Expr::DictComp(comprehension) => {
-                self.visit_nested_comprehension(&comprehension.generators);
-                return;
-            }
-            Expr::Lambda(lambda) => {
-                if let Some(parameters) = lambda.parameters.as_deref() {
-                    for default in parameter_default_expressions(parameters) {
-                        self.visit_expr(default);
-                    }
-                }
-                return;
-            }
-            _ => {}
-        }
-        walk_expr(self, expression);
-    }
-}
-
-fn comprehension_scope_facts(
-    generators: &[ruff_python_ast::Comprehension],
-    key: Option<&Expr>,
-    value: &Expr,
-) -> ComprehensionScopeFacts {
-    let mut facts = ComprehensionScopeFacts::default();
-    for generator in generators {
-        facts.visit_expr(&generator.target);
-        for condition in &generator.ifs {
-            facts.visit_expr(condition);
-        }
-    }
-    for generator in generators.iter().skip(1) {
-        facts.visit_expr(&generator.iter);
-    }
-    if let Some(key) = key {
-        facts.visit_expr(key);
-    }
-    facts.visit_expr(value);
-    facts
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3864,29 +3786,12 @@ impl Compiler<'_> {
                 .map(|(name, _)| name)
                 .collect();
         }
-        if matches!(self.unit.scope, Scope::Module) {
-            // CPython assigns a hidden fast-local slot to module-scope walrus targets while
-            // inlining a comprehension. Function-scope targets remain bindings in the
-            // containing function and are not part of the comprehension's save set.
-            let mut walrus_targets = Vec::new();
-            if let Some(key) = key {
-                collect_named_expression_target_names(key, &mut walrus_targets);
-            }
-            collect_named_expression_target_names(value, &mut walrus_targets);
-            for generator in generators {
-                for condition in &generator.ifs {
-                    collect_named_expression_target_names(condition, &mut walrus_targets);
-                }
-            }
-            if !walrus_targets.is_empty() {
-                let facts = comprehension_scope_facts(generators, key, value);
-                // Inlining a child copies its binding flags only for names absent
-                // from this scope. An existing outer read does not become a local
-                // merely because a nested comprehension assigns that name.
-                temporary_names.extend(walrus_targets.into_iter().filter(|name| {
-                    !facts.names.contains(name) || facts.walrus_targets.contains(name)
-                }));
-            }
+        if matches!(self.unit.scope, Scope::Module)
+            && let Some(module_saves) = module_comprehension_temporary_names(generators, key, value)
+        {
+            // Save module walrus slots in symbol order, but keep their accesses global.
+            // Only iteration targets belong in active_temporary_names above.
+            temporary_names = module_saves;
         }
         // An inner target read by its own iterable must keep the enclosing value live until the
         // inner comprehension starts and takes ownership of its save/restore.

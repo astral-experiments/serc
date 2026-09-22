@@ -182,6 +182,7 @@ mod match_tail_if_original_join_locations;
 mod membership_literal_construction;
 mod middle_singleton_comprehensions;
 mod module_annotation_indices;
+mod module_comprehension_walrus_order;
 mod module_handler_iterator_condition_compatibility;
 mod module_super_symbols;
 mod multi_with_compatibility;
