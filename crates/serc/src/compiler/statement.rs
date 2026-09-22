@@ -26146,6 +26146,25 @@ impl Compiler<'_> {
                             && suite_has_linear_borrow_fallthrough(&handler.body[index + 1..])
                     })
             }));
+        // Runtime raise/break guards retain their false path through ordinary
+        // handler cleanup. A populated normal source reaches the same finalizer,
+        // including alongside plain handlers and linear try-else work.
+        let loop_guarded_recovery_reaches_finally = !statement.is_star
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.len() == 1
+            && self.control.withs.active_with_exits.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && loop_recovery_has_nonempty_finally_route(statement);
         let normal_finally_is_borrow_reachable = (simple_fallthrough_handlers_reach_finally
             || compound_fallthrough_handlers_reach_finally
             || runtime_while_handlers_reach_finally)
@@ -26166,7 +26185,8 @@ impl Compiler<'_> {
             || terminal_raise_if_reaches_finally
             || for_exhaustion_reaches_finally
             || generator_else_break_loop_range.is_some()
-            || runtime_while_else_break_reaches_finally;
+            || runtime_while_else_break_reaches_finally
+            || loop_guarded_recovery_reaches_finally;
         let for_break_reaches_finally = !statement.handlers.is_empty()
             && !normal_finally_is_borrow_reachable
             && !statement.is_star
@@ -36258,6 +36278,80 @@ fn recovery_comprehension_call_has_nonempty_exit(expression: &Expr) -> bool {
             matches!(argument, Expr::Name(_)) || fold_constant(argument).is_some()
         }
     }) && comprehensions == 1
+}
+
+/// Recognize ordinary loop recovery whose normal and guarded handler exits remain populated.
+fn loop_recovery_has_nonempty_finally_route(statement: &ruff_python_ast::StmtTry) -> bool {
+    fn runtime_test(test: &Expr) -> bool {
+        condition_has_only_runtime_tests(test)
+            && !expression_contains_inline_branch(test)
+            && !expression_suspends_current_scope(test)
+    }
+
+    fn linear(statement: &Stmt) -> bool {
+        matches!(statement, Stmt::Pass(_))
+            || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+    }
+
+    fn recovery(body: &[Stmt], allow_break: bool, has_guard: &mut bool) -> bool {
+        body.iter().all(|statement| {
+            if linear(statement) {
+                return true;
+            }
+            let Stmt::If(guard) = statement else {
+                return false;
+            };
+            if !runtime_test(&guard.test) || !guard.elif_else_clauses.is_empty() {
+                return false;
+            }
+            if suite_has_linear_raise_exit(&guard.body)
+                || (allow_break && matches!(guard.body.as_slice(), [Stmt::Break(_)]))
+            {
+                *has_guard = true;
+                true
+            } else {
+                guard.body.iter().all(linear)
+            }
+        })
+    }
+
+    fn cleanup(body: &[Stmt]) -> bool {
+        !body.is_empty()
+            && body.iter().all(|statement| {
+                if linear(statement) {
+                    return true;
+                }
+                matches!(statement, Stmt::If(branch)
+                if runtime_test(&branch.test)
+                    && cleanup(&branch.body)
+                    && branch.elif_else_clauses.iter().all(|clause| {
+                        clause.test.as_ref().is_none_or(runtime_test) && cleanup(&clause.body)
+                    }))
+            })
+    }
+
+    let normal_source = if statement.orelse.is_empty() {
+        statement.body.as_slice()
+    } else {
+        statement.orelse.as_slice()
+    };
+    let mut has_handler_guard = false;
+    recovery(&statement.body, false, &mut false)
+        && (statement.orelse.is_empty() || suite_has_linear_borrow_fallthrough(&statement.orelse))
+        && normal_source
+            .last()
+            .is_some_and(|last| suite_has_linear_borrow_fallthrough(std::slice::from_ref(last)))
+        && !statement.handlers.is_empty()
+        && statement.handlers.iter().all(|handler| {
+            handler.as_except_handler().is_some_and(|handler| {
+                handler.type_.as_deref().is_some_and(|type_| {
+                    !expression_contains_inline_branch(type_)
+                        && !expression_suspends_current_scope(type_)
+                }) && recovery(&handler.body, true, &mut has_handler_guard)
+            })
+        })
+        && has_handler_guard
+        && cleanup(&statement.finalbody)
 }
 
 // Runtime re-raise guards keep their false successors connected to handler cleanup.

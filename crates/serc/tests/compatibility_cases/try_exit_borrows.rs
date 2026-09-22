@@ -5452,3 +5452,30 @@ fn preserves_finally_borrow_barrier_after_nonfinal_recovery_arms() {
         }
     }
 }
+
+#[test]
+fn borrows_loop_finally_entries_with_plain_and_guarded_recovery() {
+    for loop_header in ["while flag:", "for item in owner.items:"] {
+        for companion in ["", "except OtherError:\n    recover(owner)\n"] {
+            for normal_else in ["", "else:\n    owner.state = True\n"] {
+                for terminal in ["raise", "break"] {
+                    for cleanup in [
+                        "owner.state = None\n",
+                        "if owner.active():\n    owner.close()\n",
+                        "if owner.ready != owner.previous:\n    if owner.ready:\n        report(owner)\n    else:\n        recover(owner)\nif owner.active():\n    owner.close()\n",
+                    ] {
+                        let recovery = format!(
+                            "try:\n    if owner.failed:\n        raise Error\n    work(owner)\n{companion}except Error as error:\n    if flag:\n        {terminal}\n    recover(owner)\n{normal_else}finally:\n{}",
+                            indent_finally_borrow_case(cleanup),
+                        );
+                        let source = format!(
+                            "def function(owner, flag):\n    {loop_header}\n{}",
+                            indent_finally_borrow_case(&indent_finally_borrow_case(&recovery)),
+                        );
+                        common::assert_matches_cpython_marshal(&source, "loop_recovery_finally.py");
+                    }
+                }
+            }
+        }
+    }
+}
