@@ -1,3 +1,5 @@
+use super::super::block_graph::BasicBlockId;
+
 // Pure model of CPython's ascending, once-per-block small-exit copy rounds.
 // The caller must certify a closed original cleanup graph and supply emission order.
 
@@ -10,7 +12,7 @@ pub(super) struct PrefixSlot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum OriginalTail {
     Jump {
-        target: usize,
+        target: BasicBlockId,
         located: bool,
         interruptible: bool,
     },
@@ -34,7 +36,7 @@ pub(super) enum OriginalTail {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct OriginalNode {
-    pub(super) id: usize,
+    pub(super) id: BasicBlockId,
     pub(super) prefix: Vec<PrefixSlot>,
     pub(super) tail: OriginalTail,
 }
@@ -42,7 +44,7 @@ pub(super) struct OriginalNode {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SlotOrigin {
-    pub(super) node: usize,
+    pub(super) node: BasicBlockId,
     pub(super) slot: usize,
 }
 
@@ -52,7 +54,10 @@ pub(super) enum SlotKind {
     Nop,
     LoadConst,
     ReturnValue,
-    Jump { target: usize, interruptible: bool },
+    Jump {
+        target: BasicBlockId,
+        interruptible: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,20 +70,20 @@ pub(super) struct Slot {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CopyPlan {
-    pub(super) id: usize,
+    pub(super) id: BasicBlockId,
     #[cfg(test)]
-    pub(super) original_target: Option<usize>,
+    pub(super) original_target: Option<BasicBlockId>,
     #[cfg(test)]
     pub(super) original_array_width: usize,
     #[cfg(test)]
-    pub(super) final_target: Option<usize>,
+    pub(super) final_target: Option<BasicBlockId>,
     #[cfg(test)]
     pub(super) first_nop: Option<Slot>,
     pub(super) final_slots: Vec<Slot>,
     // Each identity is the actual target copied at that round, never the final return
     // substituted for an intermediate original target.
     #[cfg(test)]
-    pub(super) copied_targets: Vec<usize>,
+    pub(super) copied_targets: Vec<BasicBlockId>,
 }
 
 #[cfg(test)]
@@ -94,8 +99,8 @@ pub(super) struct CopyStep {
     /// One-based native copy round; entries retain global emission-order visitation.
     #[cfg(test)]
     pub(super) round: usize,
-    pub(super) source: usize,
-    pub(super) target: usize,
+    pub(super) source: BasicBlockId,
+    pub(super) target: BasicBlockId,
     #[cfg(test)]
     pub(super) kind: CopyKind,
     #[cfg(test)]
@@ -356,10 +361,10 @@ mod tests {
 
     fn chain(hops: usize, authored_pass: bool) -> Vec<OriginalNode> {
         let mut nodes = vec![OriginalNode {
-            id: 0,
+            id: BasicBlockId::from_usize(0),
             prefix: vec![],
             tail: OriginalTail::Jump {
-                target: 1,
+                target: BasicBlockId::from_usize(1),
                 located: true,
                 interruptible: true,
             },
@@ -377,17 +382,17 @@ mod tests {
                 located: false,
             });
             nodes.push(OriginalNode {
-                id,
+                id: BasicBlockId::from_usize(id),
                 prefix,
                 tail: OriginalTail::Jump {
-                    target: id + 1,
+                    target: BasicBlockId::from_usize(id + 1),
                     located: false,
                     interruptible: false,
                 },
             });
         }
         nodes.push(OriginalNode {
-            id: hops + 1,
+            id: BasicBlockId::from_usize(hops + 1),
             prefix: vec![],
             tail: OriginalTail::ConstantReturn { located: [true; 3] },
         });
@@ -398,10 +403,10 @@ mod tests {
     fn tuple_return_growth_retains_the_earlier_jump() {
         let mut nodes = (0..3)
             .map(|id| OriginalNode {
-                id,
+                id: BasicBlockId::from_usize(id),
                 prefix: Vec::new(),
                 tail: OriginalTail::Jump {
-                    target: id + 1,
+                    target: BasicBlockId::from_usize(id + 1),
                     located: false,
                     interruptible: false,
                 },
@@ -415,7 +420,7 @@ mod tests {
             2
         ];
         nodes.push(OriginalNode {
-            id: 3,
+            id: BasicBlockId::from_usize(3),
             prefix: Vec::new(),
             tail: OriginalTail::LocalTupleReturn { located: [true; 4] },
         });
@@ -424,11 +429,19 @@ mod tests {
             result
                 .steps
                 .iter()
-                .map(|step| (step.round, step.source, step.target, step.target_width))
+                .map(|step| (
+                    step.round,
+                    step.source.index(),
+                    step.target.index(),
+                    step.target_width
+                ))
                 .collect::<Vec<_>>(),
             [(1, 0, 1, 1), (1, 1, 2, 1), (1, 2, 3, 4), (2, 1, 3, 4)]
         );
-        assert_eq!(result.plans[0].final_target, Some(2));
+        assert_eq!(
+            result.plans[0].final_target.map(BasicBlockId::index),
+            Some(2)
+        );
         assert_eq!(result.plans[2].final_slots.len(), 5);
         assert_eq!(result.plans[1].final_slots.len(), 6);
     }
@@ -442,43 +455,52 @@ mod tests {
         assert_eq!(
             two.steps
                 .iter()
-                .map(|step| (step.round, step.source, step.target))
+                .map(|step| (step.round, step.source.index(), step.target.index()))
                 .collect::<Vec<_>>(),
             [(1, 0, 1), (1, 1, 2), (1, 2, 3), (2, 1, 3)]
         );
         assert_eq!(two.steps[0].kind, CopyKind::Unlocated);
         assert_eq!(two.steps[2].kind, CopyKind::SmallExit);
         let two = two.plans;
-        assert_eq!(two[0].original_target, Some(1));
-        assert_eq!(two[0].final_target, Some(2));
-        assert_eq!(two[0].copied_targets, [1]);
+        assert_eq!(two[0].original_target.map(BasicBlockId::index), Some(1));
+        assert_eq!(two[0].final_target.map(BasicBlockId::index), Some(2));
+        assert_eq!(two[0].copied_targets, [1].map(BasicBlockId::from_usize));
         assert_eq!(two[0].final_slots.len(), 3);
         assert_eq!(
             two[0].final_slots.last().unwrap().origin,
-            SlotOrigin { node: 1, slot: 1 }
+            SlotOrigin {
+                node: BasicBlockId::from_usize(1),
+                slot: 1
+            }
         );
         assert_eq!(two[1].final_target, None);
         assert_eq!(two[1].final_slots.len(), 7);
         assert_eq!(two[2].final_slots.len(), 5);
         let three = plan_normal_try_copies(&chain(3, false)).unwrap().plans;
         assert_eq!(three[0].final_target, None);
-        assert_eq!(three[0].copied_targets, [1, 2, 4]);
+        assert_eq!(
+            three[0].copied_targets,
+            [1, 2, 4].map(BasicBlockId::from_usize)
+        );
         assert_eq!(three[0].final_slots.len(), 10);
         // The normal-try source itself stops at a different original cleanup array.
-        assert_eq!(three[1].final_target, Some(3));
+        assert_eq!(three[1].final_target.map(BasicBlockId::index), Some(3));
         assert_eq!(three[1].final_slots.len(), 4);
     }
 
     #[test]
     fn authored_pass_blocks_copy_even_before_its_target_exits_scope() {
         let plans = plan_normal_try_copies(&chain(2, true)).unwrap().plans;
-        assert_eq!(plans[0].final_target, Some(1));
+        assert_eq!(plans[0].final_target.map(BasicBlockId::index), Some(1));
         assert!(plans[0].copied_targets.is_empty());
         assert_eq!(plans[1].original_array_width, 3);
         assert_eq!(plans[1].final_slots.len(), 8);
         assert_eq!(
             plans[1].first_nop.unwrap().origin,
-            SlotOrigin { node: 1, slot: 0 }
+            SlotOrigin {
+                node: BasicBlockId::from_usize(1),
+                slot: 0
+            }
         );
         assert!(plans[1].first_nop.unwrap().located);
     }
@@ -489,7 +511,7 @@ mod tests {
         nodes.pop();
         assert!(plan_normal_try_copies(&nodes).is_none());
         nodes[1].tail = OriginalTail::Jump {
-            target: 0,
+            target: BasicBlockId::from_usize(0),
             located: false,
             interruptible: false,
         };

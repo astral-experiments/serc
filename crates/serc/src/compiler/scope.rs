@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hasher;
 
+use ruff_index::newtype_index;
 use ruff_python_ast::name::Name;
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
 use ruff_python_ast::{Expr, ExprContext, Pattern, Stmt, StmtClassDef, StmtFunctionDef, TypeParam};
@@ -108,8 +109,14 @@ impl Compiler<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(super) struct NameId(pub(super) u32);
+#[newtype_index]
+pub(super) struct NameId;
+
+impl From<NameId> for crate::code_object::MetadataId {
+    fn from(id: NameId) -> Self {
+        Self::from_u32(id.as_u32())
+    }
+}
 
 const SCOPE_SEED_NAMES: [&str; 26] = [
     SHADOWED_SUPER_SENTINEL,
@@ -153,14 +160,14 @@ pub(super) struct NameSet {
 
 impl NameSet {
     pub(super) fn contains(&self, name: NameId) -> bool {
-        let index = usize::try_from(name.0).expect("name ID should fit in usize");
+        let index = name.index();
         self.words
             .get(index / u64::BITS as usize)
             .is_some_and(|word| word & (1 << (index % u64::BITS as usize)) != 0)
     }
 
     pub(super) fn insert(&mut self, name: NameId) -> bool {
-        let index = usize::try_from(name.0).expect("name ID should fit in usize");
+        let index = name.index();
         let word_index = index / u64::BITS as usize;
         self.words.resize(self.words.len().max(word_index + 1), 0);
         let bit = 1 << (index % u64::BITS as usize);
@@ -170,7 +177,7 @@ impl NameSet {
     }
 
     pub(super) fn remove(&mut self, name: NameId) -> bool {
-        let index = usize::try_from(name.0).expect("name ID should fit in usize");
+        let index = name.index();
         let Some(word) = self.words.get_mut(index / u64::BITS as usize) else {
             return false;
         };
@@ -188,10 +195,7 @@ impl NameSet {
                 (0..u64::BITS)
                     .filter(move |bit| word & (1 << bit) != 0)
                     .map(move |bit| {
-                        NameId(
-                            u32::try_from(word_index * u64::BITS as usize + bit as usize)
-                                .expect("name ID should fit in u32"),
-                        )
+                        NameId::from_usize(word_index * u64::BITS as usize + bit as usize)
                     })
             })
     }
@@ -218,7 +222,7 @@ impl NameInterner {
         let mut names = Vec::with_capacity(seeds.len());
         let mut slots = vec![None; seeds.len().saturating_mul(2).max(8).next_power_of_two()];
         for &name in seeds {
-            let id = NameId(u32::try_from(names.len()).expect("too many interned names"));
+            let id = NameId::from_usize(names.len());
             let mut slot = Self::hash(name) & (slots.len() - 1);
             while slots[slot].is_some() {
                 slot = (slot + 1) & (slots.len() - 1);
@@ -251,13 +255,11 @@ impl NameInterner {
                 while slots[slot].is_some() {
                     slot = (slot + 1) & (slots.len() - 1);
                 }
-                slots[slot] = Some(NameId(
-                    u32::try_from(index).expect("too many interned names"),
-                ));
+                slots[slot] = Some(NameId::from_usize(index));
             }
             self.slots = slots;
         }
-        let id = NameId(u32::try_from(self.names.len()).expect("too many interned names"));
+        let id = NameId::from_usize(self.names.len());
         let mut slot = Self::hash(&name) & (self.slots.len() - 1);
         while self.slots[slot].is_some() {
             slot = (slot + 1) & (self.slots.len() - 1);
@@ -274,9 +276,7 @@ impl NameInterner {
         let mut slot = Self::hash(name) & (self.slots.len() - 1);
         loop {
             let id = self.slots[slot]?;
-            if self.names[usize::try_from(id.0).expect("name ID should fit in usize")].as_ref()
-                == name
-            {
+            if self.names[id.index()].as_ref() == name {
                 return Some(id);
             }
             slot = (slot + 1) & (self.slots.len() - 1);
@@ -297,7 +297,7 @@ impl NameInterner {
     }
 
     pub(super) fn resolve(&self, id: NameId) -> &str {
-        self.names[usize::try_from(id.0).expect("name ID should fit in usize")].as_ref()
+        self.names[id.index()].as_ref()
     }
 
     pub(super) fn len(&self) -> usize {
@@ -1030,11 +1030,11 @@ impl ClassPlan {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(super) struct ScopeId(usize);
+#[newtype_index]
+pub(super) struct ScopeId;
 
 impl ScopeId {
-    pub(super) const MODULE: Self = Self(0);
+    pub(super) const MODULE: Self = Self::from_u32(0);
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1177,9 +1177,9 @@ impl ScopeArena {
     }
 
     pub(super) fn has_nested_class_scopes(&self) -> bool {
-        self.by_parent_and_origin
-            .keys()
-            .any(|(parent, origin)| parent.0 != 0 && matches!(origin, ScopeOrigin::Class(_, _)))
+        self.by_parent_and_origin.keys().any(|(parent, origin)| {
+            *parent != ScopeId::MODULE && matches!(origin, ScopeOrigin::Class(_, _))
+        })
     }
 
     pub(super) fn analyze(body: &[Stmt]) -> Self {
@@ -1239,11 +1239,11 @@ impl ScopeArena {
                 ),
             };
             let id = self.add_scope(input.parent, origin, plan);
-            debug_assert_eq!(id.0, index + 1);
+            debug_assert_eq!(id.index(), index + 1);
         }
 
         for (index, input) in definitions.into_iter().enumerate().rev() {
-            let id = ScopeId(index + 1);
+            let id = ScopeId::from_usize(index + 1);
             match input.definition {
                 ScopeDefinition::Function(definition, flat, private_name) => {
                     self.build_function(
@@ -1268,12 +1268,12 @@ impl ScopeArena {
     }
 
     fn add_scope(&mut self, parent: ScopeId, origin: ScopeOrigin, plan: ScopePlan) -> ScopeId {
-        let id = ScopeId(self.nodes.len());
+        let id = ScopeId::from_usize(self.nodes.len());
         self.nodes.push(ScopeNode {
             plan,
             children: Vec::new(),
         });
-        self.nodes[parent.0].children.push(id);
+        self.nodes[parent.index()].children.push(id);
         self.by_parent_and_origin.insert((parent, origin), id);
         id
     }
@@ -1300,7 +1300,7 @@ impl ScopeArena {
                     required.insert(name);
                 }
             }
-            self.nodes[id.0].plan = ScopePlan::Function(FunctionPlan {
+            self.nodes[id.index()].plan = ScopePlan::Function(FunctionPlan {
                 locals,
                 required,
                 ..FunctionPlan::default()
@@ -1334,7 +1334,7 @@ impl ScopeArena {
             &nested_function_annotation_references,
             &class_requirements,
         );
-        self.nodes[id.0].plan = ScopePlan::Function(plan);
+        self.nodes[id.index()].plan = ScopePlan::Function(plan);
     }
 
     fn build_class(
@@ -1353,8 +1353,8 @@ impl ScopeArena {
             self.nested_function_requirements(id);
         let nested_class_requirements = self.nested_class_requirements(id);
         let dunder_class = self.names.get("__class__");
-        let child_needs_class_closure = self.nodes[id.0].children.iter().any(|child| {
-            dunder_class.is_some_and(|dunder_class| match &self.nodes[child.0].plan {
+        let child_needs_class_closure = self.nodes[id.index()].children.iter().any(|child| {
+            dunder_class.is_some_and(|dunder_class| match &self.nodes[child.index()].plan {
                 ScopePlan::Function(plan) => plan.required.contains(&dunder_class),
                 ScopePlan::Class(plan) => plan.required.contains(&dunder_class),
                 ScopePlan::Module => false,
@@ -1401,7 +1401,7 @@ impl ScopeArena {
                 })
                 .collect();
         }
-        self.nodes[id.0].plan = ScopePlan::Class(plan);
+        self.nodes[id.index()].plan = ScopePlan::Class(plan);
     }
 
     fn nested_function_requirements(
@@ -1410,8 +1410,8 @@ impl ScopeArena {
     ) -> (FxHashSet<NameId>, FxHashSet<NameId>) {
         let mut required = FxHashSet::default();
         let mut annotation_references = FxHashSet::default();
-        for child in &self.nodes[parent.0].children {
-            let ScopePlan::Function(plan) = &self.nodes[child.0].plan else {
+        for child in &self.nodes[parent.index()].children {
+            let ScopePlan::Function(plan) = &self.nodes[child.index()].plan else {
                 continue;
             };
             required.extend(
@@ -1433,10 +1433,10 @@ impl ScopeArena {
     }
 
     fn nested_class_requirements(&self, parent: ScopeId) -> FxHashSet<NameId> {
-        self.nodes[parent.0]
+        self.nodes[parent.index()]
             .children
             .iter()
-            .filter_map(|child| match &self.nodes[child.0].plan {
+            .filter_map(|child| match &self.nodes[child.index()].plan {
                 ScopePlan::Class(plan) => Some(plan),
                 ScopePlan::Module | ScopePlan::Function(_) => None,
             })
@@ -1455,14 +1455,14 @@ impl ScopeArena {
     }
 
     pub(super) fn function(&self, id: ScopeId) -> Option<&FunctionPlan> {
-        match &self.nodes.get(id.0)?.plan {
+        match &self.nodes.get(id.index())?.plan {
             ScopePlan::Function(plan) => Some(plan),
             ScopePlan::Module | ScopePlan::Class(_) => None,
         }
     }
 
     fn class(&self, id: ScopeId) -> Option<&ClassPlan> {
-        match &self.nodes.get(id.0)?.plan {
+        match &self.nodes.get(id.index())?.plan {
             ScopePlan::Class(plan) => Some(plan),
             ScopePlan::Module | ScopePlan::Function(_) => None,
         }
@@ -1671,7 +1671,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                 self.mark_flat_complex();
                 self.intern(definition.name.as_str());
                 let parent = self.current_scope;
-                let scope = ScopeId(self.definitions.len() + 1);
+                let scope = ScopeId::from_usize(self.definitions.len() + 1);
                 self.definitions.push(ScopeBuildInput {
                     parent,
                     definition: ScopeDefinition::Function(
@@ -1738,7 +1738,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                     .expect("function name collection should retain its flat inputs");
                 if !flat.complex {
                     let ScopeDefinition::Function(_, inputs, _) =
-                        &mut self.definitions[scope.0 - 1].definition
+                        &mut self.definitions[scope.index() - 1].definition
                     else {
                         unreachable!("function definition changed while collecting its body");
                     };
@@ -1751,7 +1751,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
             Stmt::ClassDef(definition) => {
                 self.intern(definition.name.as_str());
                 let parent = self.current_scope;
-                self.current_scope = ScopeId(self.definitions.len() + 1);
+                self.current_scope = ScopeId::from_usize(self.definitions.len() + 1);
                 self.definitions.push(ScopeBuildInput {
                     parent,
                     definition: ScopeDefinition::Class(definition, self.private_name.clone()),
@@ -4684,7 +4684,7 @@ mod tests {
             ] {
                 let arena = ScopeArena::analyze_with_python_version(parsed.suite(), version);
                 let annotation = arena.names.get("annotation").unwrap();
-                let outer = arena.function(ScopeId(1)).unwrap();
+                let outer = arena.function(ScopeId::from_usize(1)).unwrap();
                 assert_eq!(
                     outer.cellvars.contains(&annotation),
                     generic || matches!(version, PythonVersion::Py314 | PythonVersion::Py315),
@@ -4704,7 +4704,7 @@ mod tests {
             PythonVersion::Py315,
         ] {
             let arena = ScopeArena::analyze_with_python_version(parsed.suite(), version);
-            let class = arena.class(ScopeId(1)).unwrap();
+            let class = arena.class(ScopeId::from_usize(1)).unwrap();
             let deferred = matches!(version, PythonVersion::Py314 | PythonVersion::Py315);
             assert_eq!(class.needs_classdict, deferred, "{version:?}");
             assert_eq!(class.has_conditional_annotations, deferred, "{version:?}");
@@ -4737,7 +4737,7 @@ mod tests {
                     PythonVersion::Py315,
                 ] {
                     let arena = ScopeArena::analyze_with_python_version(parsed.suite(), version);
-                    let class = arena.class(ScopeId(1)).unwrap();
+                    let class = arena.class(ScopeId::from_usize(1)).unwrap();
                     let deferred = matches!(version, PythonVersion::Py314 | PythonVersion::Py315);
                     assert_eq!(
                         class.needs_classdict,
@@ -4767,7 +4767,7 @@ mod tests {
             PythonVersion::Py315,
         ] {
             let arena = ScopeArena::analyze_with_python_version(parsed.suite(), version);
-            let class = arena.class(ScopeId(1)).unwrap();
+            let class = arena.class(ScopeId::from_usize(1)).unwrap();
             assert!(!class.needs_classdict);
             assert!(!class.has_conditional_annotations);
         }
@@ -4790,13 +4790,19 @@ mod tests {
                 let annotation = arena.names.get("annotation").unwrap();
                 assert_eq!(
                     arena
-                        .function(ScopeId(1))
+                        .function(ScopeId::from_usize(1))
                         .unwrap()
                         .cellvars
                         .contains(&annotation),
                     !future
                 );
-                assert!(arena.function(ScopeId(2)).unwrap().locals.is_empty());
+                assert!(
+                    arena
+                        .function(ScopeId::from_usize(2))
+                        .unwrap()
+                        .locals
+                        .is_empty()
+                );
             }
 
             let parsed = parse_module(
@@ -4804,7 +4810,7 @@ mod tests {
             )
             .unwrap();
             let arena = ScopeArena::analyze_with_python_version(parsed.suite(), version);
-            let plan = arena.function(ScopeId(1)).unwrap();
+            let plan = arena.function(ScopeId::from_usize(1)).unwrap();
             assert_eq!(
                 plan.locals
                     .iter()
@@ -4817,7 +4823,7 @@ mod tests {
                 parse_module("def f(values):\n    local: [(lambda: item) for item in values]\n")
                     .unwrap();
             let arena = ScopeArena::analyze_with_python_version(parsed.suite(), version);
-            let plan = arena.function(ScopeId(1)).unwrap();
+            let plan = arena.function(ScopeId::from_usize(1)).unwrap();
             assert_eq!(
                 plan.locals
                     .iter()
@@ -4968,22 +4974,22 @@ mod tests {
 
         assert_eq!(names.slots.len(), 64);
         for (index, name) in SCOPE_SEED_NAMES.into_iter().enumerate() {
-            let id = NameId(u32::try_from(index).unwrap());
+            let id = NameId::from_usize(index);
             assert_eq!(names.get(name), Some(id));
             assert_eq!(names.resolve(id), name);
             assert!(matches!(names.names[index], Cow::Borrowed(_)));
         }
 
-        assert_eq!(names.intern("__user_name__"), NameId(26));
+        assert_eq!(names.intern("__user_name__"), NameId::from_u32(26));
         assert!(matches!(names.names[26], Cow::Owned(_)));
-        assert_eq!(names.intern("super"), NameId(25));
+        assert_eq!(names.intern("super"), NameId::from_u32(25));
     }
 
     #[test]
     fn default_name_interner_starts_with_zero_id() {
         let mut names = NameInterner::default();
 
-        assert_eq!(names.intern("dynamic"), NameId(0));
+        assert_eq!(names.intern("dynamic"), NameId::from_u32(0));
         assert!(matches!(names.names[0], Cow::Owned(_)));
     }
 
@@ -5012,10 +5018,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 (ScopeId::MODULE, "outer", false),
-                (ScopeId(1), "Inner", false),
-                (ScopeId(2), "method", true),
+                (ScopeId::from_usize(1), "Inner", false),
+                (ScopeId::from_usize(2), "method", true),
                 (ScopeId::MODULE, "Sibling", false),
-                (ScopeId(4), "other", true),
+                (ScopeId::from_usize(4), "other", true),
             ]
         );
     }
@@ -5057,11 +5063,14 @@ mod tests {
             complex: false,
         };
 
-        inputs.record(NameId(2), false);
-        inputs.record(NameId(1), true);
-        inputs.record(NameId(2), true);
+        inputs.record(NameId::from_u32(2), false);
+        inputs.record(NameId::from_u32(1), true);
+        inputs.record(NameId::from_u32(2), true);
 
-        assert_eq!(inputs.names, [(NameId(2), true), (NameId(1), true)]);
+        assert_eq!(
+            inputs.names,
+            [(NameId::from_u32(2), true), (NameId::from_u32(1), true)]
+        );
         assert!(inputs.name_positions.is_none());
     }
 
@@ -5074,16 +5083,16 @@ mod tests {
         };
 
         for name in 0..=FlatFunctionInputs::LINEAR_SEARCH_LIMIT {
-            inputs.record(NameId(u32::try_from(name).unwrap()), false);
+            inputs.record(NameId::from_usize(name), false);
         }
         for name in (0..=FlatFunctionInputs::LINEAR_SEARCH_LIMIT).rev() {
-            inputs.record(NameId(u32::try_from(name).unwrap()), true);
+            inputs.record(NameId::from_usize(name), true);
         }
 
         assert_eq!(
             inputs.names,
             (0..=FlatFunctionInputs::LINEAR_SEARCH_LIMIT)
-                .map(|name| (NameId(u32::try_from(name).unwrap()), true))
+                .map(|name| (NameId::from_usize(name), true))
                 .collect::<Vec<_>>()
         );
         assert!(inputs.name_positions.is_some());
@@ -5092,14 +5101,17 @@ mod tests {
     #[test]
     fn complex_function_inputs_discard_and_stop_recording_names() {
         let mut inputs = FlatFunctionInputs {
-            names: vec![(NameId(1), false), (NameId(2), true)],
-            name_positions: Some(FxHashMap::from_iter([(NameId(1), 0), (NameId(2), 1)])),
+            names: vec![(NameId::from_u32(1), false), (NameId::from_u32(2), true)],
+            name_positions: Some(FxHashMap::from_iter([
+                (NameId::from_u32(1), 0),
+                (NameId::from_u32(2), 1),
+            ])),
             complex: false,
         };
 
         inputs.mark_complex();
-        inputs.record(NameId(3), true);
-        inputs.record(NameId(1), true);
+        inputs.record(NameId::from_u32(3), true);
+        inputs.record(NameId::from_u32(1), true);
 
         assert!(inputs.complex);
         assert!(inputs.names.is_empty());

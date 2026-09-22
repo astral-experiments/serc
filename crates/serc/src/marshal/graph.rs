@@ -2,7 +2,9 @@ use std::collections::hash_map::Entry;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::code_object::{CodeInterningSummary, CodeObject, CompilationInterningEvent, Constant};
+use crate::code_object::{
+    CodeInterningSummary, CodeObject, CompilationInterningEvent, Constant, MetadataId,
+};
 use crate::target::{is_preinterned_string_for, small_int_bounds_for};
 use crate::{CompileError, InitialInternState, PythonVersion};
 
@@ -105,7 +107,6 @@ fn cached_scalar_slots(python_version: PythonVersion) -> usize {
     let (positive, signed) = cached_integer_slots(python_version);
     positive + signed + CACHED_BYTE_SLOTS + CACHED_CHARACTER_SLOTS
 }
-const UNSEEN_CACHED_OBJECT: u32 = u32::MAX;
 const MIN_CACHED_SCALAR_CONSTANTS: usize = 32;
 const MAX_DENSE_METADATA_SLOTS: usize = 1 << 20;
 
@@ -173,7 +174,7 @@ pub(super) struct ObjectGraph<'a> {
     metadata_slots: Box<[Option<ObjectId>]>,
     cached_empty_bytes: Option<ObjectId>,
     cached_empty_tuple: Option<ObjectId>,
-    cached_scalar_ids: Option<Box<[u32]>>,
+    cached_scalar_ids: Option<Box<[Option<ObjectId>]>>,
     cache_scalars: bool,
     uncached_percent_constant: bool,
     fresh_empty_bytes_constant: bool,
@@ -352,9 +353,9 @@ impl<'a> ObjectGraph<'a> {
         &mut self,
         kind: OccurrenceKind,
         value: &'a str,
-        metadata_id: Option<u32>,
+        metadata_id: Option<MetadataId>,
     ) -> bool {
-        let slot_index = metadata_id.map(|id| id as usize);
+        let slot_index = metadata_id.map(MetadataId::index);
         if let Some(id) = slot_index
             .and_then(|index| self.metadata_slots.get(index).copied())
             .flatten()
@@ -380,7 +381,7 @@ impl<'a> ObjectGraph<'a> {
     }
 
     fn interned_string(&mut self, value: &'a str) -> (ObjectId, bool) {
-        let next_id = ObjectId::from_index(self.objects_by_id.len());
+        let next_id = ObjectId::from_usize(self.objects_by_id.len());
         match self.interned_strings.entry(value) {
             Entry::Occupied(entry) => {
                 let id = *entry.get();
@@ -444,7 +445,7 @@ impl<'a> ObjectGraph<'a> {
             "identity-bearing marshal object was recorded twice"
         );
 
-        let id = ObjectId::from_index(self.objects_by_id.len());
+        let id = ObjectId::from_usize(self.objects_by_id.len());
         self.objects_by_id.push(Object {
             shared: false,
             cached: false,
@@ -464,7 +465,7 @@ impl<'a> ObjectGraph<'a> {
                 self.objects_by_id[id.index()].shared = true;
                 return (id, false);
             }
-            let id = ObjectId::from_index(self.objects_by_id.len());
+            let id = ObjectId::from_usize(self.objects_by_id.len());
             self.objects_by_id.push(Object {
                 shared: false,
                 cached: true,
@@ -475,27 +476,26 @@ impl<'a> ObjectGraph<'a> {
         }
 
         let slot = &mut self.cached_scalar_ids.get_or_insert_with(|| {
-            vec![UNSEEN_CACHED_OBJECT; cached_scalar_slots(self.python_version)].into_boxed_slice()
+            vec![None; cached_scalar_slots(self.python_version)].into_boxed_slice()
         })[cached.scalar_index(self.python_version)];
-        if *slot != UNSEEN_CACHED_OBJECT {
-            let id = ObjectId::from_index(*slot as usize);
+        if let Some(id) = *slot {
             self.objects_by_id[id.index()].shared = true;
             return (id, false);
         }
 
         let index = self.objects_by_id.len();
-        let id = ObjectId::from_index(index);
+        let id = ObjectId::from_usize(index);
         self.objects_by_id.push(Object {
             shared: false,
             cached: true,
             interned: matches!(cached, CachedObject::Character(_)),
         });
-        *slot = u32::try_from(index).expect("marshal object limit exceeded");
+        *slot = Some(id);
         (id, true)
     }
 
     fn record_object(&mut self, key: HashedObjectKey<'a>) -> (ObjectId, bool) {
-        let next_id = ObjectId::from_index(self.objects_by_id.len());
+        let next_id = ObjectId::from_usize(self.objects_by_id.len());
         match self.objects.entry(key) {
             Entry::Occupied(entry) => {
                 let cached = Self::is_cached(entry.key().key(), self.python_version);
@@ -570,12 +570,10 @@ impl<'a> ObjectGraph<'a> {
             + self.interned_strings.len()
             + usize::from(self.cached_empty_bytes.is_some())
             + usize::from(self.cached_empty_tuple.is_some())
-            + self.cached_scalar_ids.as_deref().map_or(0, |slots| {
-                slots
-                    .iter()
-                    .filter(|id| **id != UNSEEN_CACHED_OBJECT)
-                    .count()
-            })
+            + self
+                .cached_scalar_ids
+                .as_deref()
+                .map_or(0, |slots| slots.iter().filter(|id| id.is_some()).count())
     }
 
     #[cfg(test)]
@@ -601,7 +599,7 @@ impl<'a> ObjectGraph<'a> {
             .is_some_and(|index| {
                 self.cached_scalar_ids
                     .as_deref()
-                    .is_some_and(|slots| slots[index] != UNSEEN_CACHED_OBJECT)
+                    .is_some_and(|slots| slots[index].is_some())
             })
         {
             return true;
@@ -2168,7 +2166,7 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     }
 
     #[inline]
-    fn metadata_string(&mut self, value: &'code str, metadata_id: Option<u32>) {
+    fn metadata_string(&mut self, value: &'code str, metadata_id: Option<MetadataId>) {
         if self.graph.cache_scalars
             && let Some(character) = CachedObject::character(value)
         {
@@ -2183,7 +2181,7 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     #[inline]
     fn first_line(&mut self, _value: u32) {}
 
-    fn code_filename(&mut self, code: &'code CodeObject, metadata_id: Option<u32>) {
+    fn code_filename(&mut self, code: &'code CodeObject, metadata_id: Option<MetadataId>) {
         if self.graph.python_version != PythonVersion::Py312
             || code.filename.is_empty()
             || is_cached_character(&code.filename)
@@ -2197,7 +2195,7 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
         }
     }
 
-    fn code_name(&mut self, code: &'code CodeObject, metadata_id: Option<u32>) {
+    fn code_name(&mut self, code: &'code CodeObject, metadata_id: Option<MetadataId>) {
         if self.graph.python_version == PythonVersion::Py312
             && code.name.starts_with("<generic parameters of ")
         {
@@ -2210,7 +2208,7 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
         }
     }
 
-    fn code_qualified_name(&mut self, code: &'code CodeObject, metadata_id: Option<u32>) {
+    fn code_qualified_name(&mut self, code: &'code CodeObject, metadata_id: Option<MetadataId>) {
         if self.graph.python_version != PythonVersion::Py312 {
             self.metadata_string(&code.qualified_name, metadata_id);
         } else if code.name == code.qualified_name {

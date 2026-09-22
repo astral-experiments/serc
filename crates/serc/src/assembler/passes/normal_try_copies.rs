@@ -1155,7 +1155,7 @@ impl OptimizationPipeline {
                     return;
                 }
                 if observer {
-                    observer_sources.insert(block.index());
+                    observer_sources.insert(block);
                 }
                 if shared_join {
                     shared_joins.insert(block);
@@ -1173,7 +1173,7 @@ impl OptimizationPipeline {
                     joins.insert(block);
                 }
                 if opaque_source {
-                    opaque_sources.insert(block.index());
+                    opaque_sources.insert(block);
                 }
                 sources.insert(block);
                 selected.insert(block);
@@ -1205,11 +1205,11 @@ impl OptimizationPipeline {
         for &block in order {
             if let Some(&tail) = returns.get(&block) {
                 nodes.push(OriginalNode {
-                    id: block.index(),
+                    id: block,
                     prefix: Vec::new(),
                     tail,
                 });
-            } else if observer_sources.contains(&block.index()) {
+            } else if observer_sources.contains(&block) {
                 let bridge = graph[block]
                     .last_instruction()
                     .expect("witnessed comparison bridge");
@@ -1217,13 +1217,10 @@ impl OptimizationPipeline {
                     unreachable!()
                 };
                 nodes.push(OriginalNode {
-                    id: block.index(),
+                    id: block,
                     prefix: Vec::new(),
                     tail: OriginalTail::Jump {
-                        target: graph
-                            .label_block(end)
-                            .expect("original comparison end")
-                            .index(),
+                        target: graph.label_block(end).expect("original comparison end"),
                         located: false,
                         interruptible: false,
                     },
@@ -1256,7 +1253,7 @@ impl OptimizationPipeline {
                     return;
                 }
                 nodes.push(OriginalNode {
-                    id: block.index(),
+                    id: block,
                     prefix: prefix
                         .iter()
                         .flat_map(|instruction| {
@@ -1275,7 +1272,7 @@ impl OptimizationPipeline {
                         })
                         .collect(),
                     tail: OriginalTail::Jump {
-                        target: target.index(),
+                        target,
                         located: !is_join && jump.location.line >= 0,
                         interruptible: jump.jump_policy.is_interruptible(),
                     },
@@ -1298,10 +1295,10 @@ impl OptimizationPipeline {
         // synthetic instruction, owner hole, or alternate internal label is added.
         let labels = selected
             .iter()
-            .filter(|block| !observer_sources.contains(&block.index()))
+            .filter(|block| !observer_sources.contains(block))
             .map(|&block| {
                 (
-                    block.index(),
+                    block,
                     graph[block].first_label().expect("original head label"),
                 )
             })
@@ -1309,8 +1306,8 @@ impl OptimizationPipeline {
         let copy_blocks = order
             .iter()
             .copied()
-            .filter(|block| sources.contains(block) && !observer_sources.contains(&block.index()))
-            .map(|block| labels[&block.index()])
+            .filter(|block| sources.contains(block) && !observer_sources.contains(block))
+            .map(|block| labels[&block])
             .collect();
         let copy_steps = result
             .steps
@@ -1370,7 +1367,7 @@ impl OptimizationPipeline {
                 // This is only an original adjacency record. A successful static
                 // store exchange must certify the donor later.
                 join_origins.insert(
-                    labels[&block.index()],
+                    labels[&block],
                     TupleJoinLocationOrigin {
                         predecessor,
                         store,
@@ -1655,7 +1652,7 @@ impl OptimizationPipeline {
             .normal_try_jump_owners
             .iter()
             .collect();
-        jump_owners.sort_by_key(|&(&(start, end), _)| (start.0, end.0));
+        jump_owners.sort_by_key(|&(&(start, end), _)| (start.as_u32(), end.as_u32()));
         for (&(start, end), owners) in jump_owners {
             let (Some(&start_offset), Some(&end_offset), Some(block)) = (
                 offsets.get(&start),
@@ -1748,7 +1745,13 @@ impl OptimizationPipeline {
             // CPython copies at most four original exit records; a located runtime
             // prefix also excludes unlocated-exit copying and jump-to-jump threading.
             if prefix == 5 {
-                selected.push((start_offset, start.0, end.0, block, owners.clone()));
+                selected.push((
+                    start_offset,
+                    start.as_u32(),
+                    end.as_u32(),
+                    block,
+                    owners.clone(),
+                ));
             }
         }
         selected.sort_by_key(|(offset, start, end, _, _)| (*offset, *start, *end));
@@ -2428,8 +2431,8 @@ impl OptimizationPipeline {
             let mut pop =
                 Instruction::synthetic(NOP, Operand::Value(0), SourceLocation::NONE, depth);
             pop.fusion_policy.mark_converted_pop_block();
-            let pop_start = Label(self.next_label);
-            let pop_end = Label(self.next_label + 1);
+            let pop_start = Label::from_u32(self.next_label);
+            let pop_end = Label::from_u32(self.next_label + 1);
             self.next_label += 2;
             self.graph.insert_label(block, offset, pop_start);
             self.graph
@@ -2672,7 +2675,7 @@ impl OptimizationPipeline {
                         .position(|item| *item == Item::Label(split))
                         .expect("handler end")
                         + 1;
-                    let end = Label(self.next_label);
+                    let end = Label::from_u32(self.next_label);
                     self.next_label += 1;
                     let mut pop = Instruction::synthetic(
                         NOP,
@@ -3938,7 +3941,7 @@ impl OptimizationPipeline {
         for &block in order {
             if selected_returns.contains(&block) {
                 nodes.push(OriginalNode {
-                    id: block.index(),
+                    id: block,
                     prefix: Vec::new(),
                     tail: returns[&block],
                 });
@@ -4033,10 +4036,10 @@ impl OptimizationPipeline {
                     jump.location.line >= 0
                 };
                 nodes.push(OriginalNode {
-                    id: block.index(),
+                    id: block,
                     prefix,
                     tail: OriginalTail::Jump {
-                        target: target.index(),
+                        target,
                         located,
                         interruptible: jump.opcode == JUMP_BACKWARD
                             || jump.jump_policy.is_interruptible(),
@@ -4080,7 +4083,7 @@ impl OptimizationPipeline {
                 {
                     return None;
                 }
-                Some((start_offset, start.0, end.0, owners))
+                Some((start_offset, start.as_u32(), end.as_u32(), owners))
             })
             .collect::<Vec<_>>();
         // Preserve original source order and then the recorded owner order for
@@ -4105,12 +4108,12 @@ impl OptimizationPipeline {
             let label = if let Some(label) = self.graph[block].first_label() {
                 label
             } else {
-                let label = Label(self.next_label);
+                let label = Label::from_u32(self.next_label);
                 self.next_label += 1;
                 self.graph.insert_label(block, 0, label);
                 label
             };
-            labels.insert(block.index(), label);
+            labels.insert(block, label);
         }
         // Restore original absence only after the complete schedule was accepted.
         // The compiler's inherited final-arm line is not authored on this join.
@@ -4154,8 +4157,8 @@ impl OptimizationPipeline {
             let mut pop =
                 Instruction::synthetic(NOP, Operand::Value(0), SourceLocation::NONE, depth);
             pop.fusion_policy.mark_converted_pop_block();
-            let pop_start = Label(self.next_label);
-            let pop_end = Label(self.next_label + 1);
+            let pop_start = Label::from_u32(self.next_label);
+            let pop_end = Label::from_u32(self.next_label + 1);
             self.next_label += 2;
             let jump_offset = self.graph[*block]
                 .items()
@@ -4230,7 +4233,7 @@ impl OptimizationPipeline {
                 .push(ExceptionRegion { start, ..region });
         }
         self.exception_owner_provenance.normal_try_copy_blocks =
-            sources.iter().map(|block| labels[&block.index()]).collect();
+            sources.iter().map(|block| labels[block]).collect();
         self.exception_owner_provenance.normal_try_copy_pop_ranges = pop_intervals;
         self.exception_owner_provenance.normal_try_copy_steps = result
             .steps
@@ -4280,48 +4283,63 @@ mod tests {
     fn two_exits() -> OptimizationPipeline {
         let mut source = Instruction::new(
             JUMP_BACKWARD,
-            Operand::Forward(Label(2)),
+            Operand::Forward(Label::from_u32(2)),
             SourceLocation::new(11, 11, 8, 13),
             None,
         );
         source.fusion_policy.mark_authored_break();
         let mut assembler = Assembler {
             code: UnoptimizedCode::Linear(vec![
-                Item::Label(Label(0)),
+                Item::Label(Label::from_u32(0)),
                 item(POP_EXCEPT, Operand::Value(0), 11),
                 item(POP_TOP, Operand::Value(0), 11),
                 Item::Instruction(source),
-                Item::Label(Label(1)),
+                Item::Label(Label::from_u32(1)),
                 item(RETURN_VALUE, Operand::Value(0), 1),
-                Item::Label(Label(2)),
-                item(JUMP_FORWARD, Operand::Forward(Label(4)), 5),
-                Item::Label(Label(3)),
+                Item::Label(Label::from_u32(2)),
+                item(JUMP_FORWARD, Operand::Forward(Label::from_u32(4)), 5),
+                Item::Label(Label::from_u32(3)),
                 item(RETURN_VALUE, Operand::Value(0), 2),
-                Item::Label(Label(4)),
-                item(JUMP_FORWARD, Operand::Forward(Label(6)), 3),
-                Item::Label(Label(5)),
+                Item::Label(Label::from_u32(4)),
+                item(JUMP_FORWARD, Operand::Forward(Label::from_u32(6)), 3),
+                Item::Label(Label::from_u32(5)),
                 item(RETURN_VALUE, Operand::Value(0), 2),
-                Item::Label(Label(6)),
+                Item::Label(Label::from_u32(6)),
                 item(NOP, Operand::Value(0), 20),
                 item(LOAD_CONST, Operand::Value(0), 20),
                 item(RETURN_VALUE, Operand::Value(0), 20),
-                Item::Label(Label(7)),
+                Item::Label(Label::from_u32(7)),
                 item(RETURN_VALUE, Operand::Value(0), 21),
-                Item::Label(Label(8)),
+                Item::Label(Label::from_u32(8)),
                 item(RETURN_VALUE, Operand::Value(0), 22),
-                Item::Label(Label(9)),
+                Item::Label(Label::from_u32(9)),
                 item(RETURN_VALUE, Operand::Value(0), 23),
             ]),
             exception_regions: vec![
-                region(Label(0), Label(2), Label(7), false),
-                region(Label(0), Label(4), Label(8), false),
-                region(Label(0), Label(7), Label(9), true),
+                region(
+                    Label::from_u32(0),
+                    Label::from_u32(2),
+                    Label::from_u32(7),
+                    false,
+                ),
+                region(
+                    Label::from_u32(0),
+                    Label::from_u32(4),
+                    Label::from_u32(8),
+                    false,
+                ),
+                region(
+                    Label::from_u32(0),
+                    Label::from_u32(7),
+                    Label::from_u32(9),
+                    true,
+                ),
             ],
             next_label: 10,
             ..Assembler::default()
         };
-        assembler.record_normal_try_exit(Label(2), Label(4), None);
-        assembler.record_normal_try_exit(Label(4), Label(6), None);
+        assembler.record_normal_try_exit(Label::from_u32(2), Label::from_u32(4), None);
+        assembler.record_normal_try_exit(Label::from_u32(4), Label::from_u32(6), None);
         assembler.into_optimization_pipeline()
     }
 
@@ -4357,7 +4375,7 @@ mod tests {
             .filter(|region| positions[&region.start] <= slot && slot < positions[&region.end])
             .map(|region| region.target)
             .collect::<Vec<_>>();
-        owners.sort_by_key(|label| label.0);
+        owners.sort_by_key(|label| label.as_u32());
         owners.dedup();
         owners
     }
@@ -4413,7 +4431,7 @@ mod tests {
                 .normal_try_copy_steps
                 .is_empty()
         );
-        for label in [Label(2), Label(4)] {
+        for label in [Label::from_u32(2), Label::from_u32(4)] {
             let block = pipeline.graph.label_block(label).unwrap();
             let pop = *pipeline.graph[block]
                 .items()
@@ -4428,14 +4446,14 @@ mod tests {
                 pop.exception_policy().exclusion(),
                 crate::assembler::ExceptionExclusion::None
             );
-            assert_eq!(owners_at(&pipeline, block, 0), [Label(9)]);
+            assert_eq!(owners_at(&pipeline, block, 0), [Label::from_u32(9)]);
         }
         let absence = pipeline.capture_original_location_absence();
         let copies = pipeline.duplicate_exit_blocks(&absence, &mut Vec::new());
         let first_copy = *copies.first().expect("first original cleanup copy");
         // Normalization separates labels inside a copied array. Select its exact
         // ordered range instead of assuming the original source remains one block.
-        let copied = instructions_between(&pipeline, first_copy, Label(1));
+        let copied = instructions_between(&pipeline, first_copy, Label::from_u32(1));
         let [
             (pop_block, pop_ordinal, pop),
             (jump_block, jump_ordinal, jump),
@@ -4443,14 +4461,17 @@ mod tests {
         else {
             panic!("first cleanup copy must contain exactly POP_BLOCK and its intermediate jump");
         };
-        assert_eq!(jump.operand(), Operand::Forward(Label(4)));
+        assert_eq!(jump.operand(), Operand::Forward(Label::from_u32(4)));
         assert_eq!(
             owners_at(&pipeline, *jump_block, *jump_ordinal),
-            [Label(8), Label(9)]
+            [Label::from_u32(8), Label::from_u32(9)]
         );
         assert!(pop.fusion_policy.is_converted_pop_block());
-        assert_eq!(owners_at(&pipeline, *pop_block, *pop_ordinal), [Label(9)]);
-        let source = instructions_between(&pipeline, Label(0), first_copy);
+        assert_eq!(
+            owners_at(&pipeline, *pop_block, *pop_ordinal),
+            [Label::from_u32(9)]
+        );
+        let source = instructions_between(&pipeline, Label::from_u32(0), first_copy);
         assert_eq!(source.len(), 3);
         let markers = source
             .iter()
@@ -4465,13 +4486,13 @@ mod tests {
         };
         assert_eq!(
             owners_at(&pipeline, *marker_block, *marker_ordinal),
-            [Label(7), Label(8), Label(9)]
+            [Label::from_u32(7), Label::from_u32(8), Label::from_u32(9)]
         );
     }
     #[test]
     fn label_only_intermediate_block_does_not_certify_an_early_jump_barrier() {
         let mut pipeline = two_exits();
-        let empty = pipeline.graph.label_block(Label(3)).unwrap();
+        let empty = pipeline.graph.label_block(Label::from_u32(3)).unwrap();
         pipeline
             .graph
             .retain_items(empty, |item| matches!(item, Item::Label(_)));
@@ -4508,8 +4529,8 @@ mod tests {
             "artificial_unlocated_prefix",
             "handler_entry",
         ] {
-            let entry = Label(2);
-            let end = Label(4);
+            let entry = Label::from_u32(2);
+            let end = Label::from_u32(4);
             let mut source = Instruction::new(
                 JUMP_FORWARD,
                 Operand::Forward(entry),
@@ -4521,7 +4542,7 @@ mod tests {
                 source.jump_policy.mark_borrow_empty_block();
             }
             let mut items = vec![
-                Item::Label(Label(0)),
+                Item::Label(Label::from_u32(0)),
                 item(
                     POP_JUMP_IF_FALSE,
                     Operand::Forward(entry),
@@ -4533,13 +4554,13 @@ mod tests {
             }
             if case == "artificial_success" {
                 items.extend([
-                    item(POP_JUMP_IF_FALSE, Operand::Forward(Label(1)), 7),
+                    item(POP_JUMP_IF_FALSE, Operand::Forward(Label::from_u32(1)), 7),
                     item(POP_TOP, Operand::Value(0), 8),
-                    Item::Label(Label(1)),
+                    Item::Label(Label::from_u32(1)),
                 ]);
             } else {
                 items.extend([
-                    Item::Label(Label(1)),
+                    Item::Label(Label::from_u32(1)),
                     if case == "artificial_unlocated_prefix" {
                         item(NOP, Operand::Value(0), -1)
                     } else {
@@ -4551,19 +4572,19 @@ mod tests {
                 Item::Instruction(source),
                 Item::Label(entry),
                 item(JUMP_FORWARD, Operand::Forward(end), 8),
-                Item::Label(Label(3)),
+                Item::Label(Label::from_u32(3)),
                 item(RETURN_VALUE, Operand::Value(0), 9),
                 Item::Label(end),
             ]);
             for index in 0..if case == "small_footer" { 1 } else { 5 } {
                 items.push(item(LOAD_CONST, Operand::Value(0), 10));
                 if case == "target_seam" && index == 0 {
-                    items.push(Item::Label(Label(7)));
+                    items.push(Item::Label(Label::from_u32(7)));
                 }
             }
             items.extend([
                 item(RETURN_VALUE, Operand::Value(0), 10),
-                Item::Label(Label(5)),
+                Item::Label(Label::from_u32(5)),
                 item(RETURN_VALUE, Operand::Value(0), 11),
             ]);
             let mut assembler = Assembler {
@@ -4584,14 +4605,14 @@ mod tests {
             if case == "handler_entry" {
                 assembler
                     .exception_regions
-                    .push(region(Label(0), end, entry, false));
+                    .push(region(Label::from_u32(0), end, entry, false));
             }
             let mut pipeline = assembler.into_optimization_pipeline();
             if case == "scheduled" {
                 pipeline
                     .exception_owner_provenance
                     .normal_try_copy_steps
-                    .push((Label(1), entry, 2));
+                    .push((Label::from_u32(1), entry, 2));
             }
             if matches!(
                 case,
@@ -4664,11 +4685,11 @@ mod tests {
             SWAP, TO_BOOL,
         };
 
-        let cleanup = Label(2);
-        let body = Label(3);
-        let otherwise = Label(4);
-        let join = Label(5);
-        let footer = Label(6);
+        let cleanup = Label::from_u32(2);
+        let body = Label::from_u32(3);
+        let otherwise = Label::from_u32(4);
+        let join = Label::from_u32(5);
+        let footer = Label::from_u32(6);
         let mut bridge = Instruction::new(
             JUMP_FORWARD,
             Operand::Forward(body),
@@ -4682,7 +4703,7 @@ mod tests {
         }
         let mut assembler = Assembler {
             code: UnoptimizedCode::Linear(vec![
-                Item::Label(Label(0)),
+                Item::Label(Label::from_u32(0)),
                 item(LOAD_FAST, Operand::Value(0), 10),
                 item(LOAD_FAST, Operand::Value(1), 10),
                 item(SWAP, Operand::Value(2), 10),
@@ -4738,7 +4759,7 @@ mod tests {
             item(BUILD_TUPLE, Operand::Value(2), 13),
             item(RETURN_VALUE, Operand::Value(0), 13),
         ]);
-        for label in [Label(0), cleanup, body, otherwise, join, footer] {
+        for label in [Label::from_u32(0), cleanup, body, otherwise, join, footer] {
             assembler.record_exception_owner_block_boundary(label);
         }
         assembler.into_optimization_pipeline()
@@ -4774,9 +4795,10 @@ mod tests {
                         .exception_owner_provenance
                         .original_comparison_fallthroughs
                         .clear(),
-                    "labelled bridge" => pipeline
-                        .graph
-                        .insert_item(ItemPosition::new(observer, 0), Item::Label(Label(7))),
+                    "labelled bridge" => pipeline.graph.insert_item(
+                        ItemPosition::new(observer, 0),
+                        Item::Label(Label::from_u32(7)),
+                    ),
                     "removed failure" | "removed pop" => {
                         let removed = records[if case == "removed failure" { 0 } else { 4 }];
                         for block in pipeline.graph.order().to_vec() {
@@ -4878,14 +4900,14 @@ mod tests {
         ] {
             let mut shared = Instruction::new(
                 JUMP_FORWARD,
-                Operand::Forward(Label(5)),
+                Operand::Forward(Label::from_u32(5)),
                 SourceLocation::NONE,
                 None,
             );
             shared.no_location_policy.preserve_location();
             let mut success = Instruction::new(
                 JUMP_FORWARD,
-                Operand::Forward(Label(6)),
+                Operand::Forward(Label::from_u32(6)),
                 SourceLocation::new(12, 12, 4, 9),
                 None,
             );
@@ -4902,23 +4924,23 @@ mod tests {
             marker.set_exception_policy(super::super::super::ExceptionPolicy::NoneDynamicCondition);
             let mut assembler = Assembler {
                 code: UnoptimizedCode::Linear(vec![
-                    Item::Label(Label(0)),
+                    Item::Label(Label::from_u32(0)),
                     item(LOAD_CONST, Operand::Value(0), 9),
                     item(STORE_FAST, Operand::Value(1), 9),
-                    item(JUMP_FORWARD, Operand::Forward(Label(1)), 9),
-                    Item::Label(Label(1)),
+                    item(JUMP_FORWARD, Operand::Forward(Label::from_u32(1)), 9),
+                    Item::Label(Label::from_u32(1)),
                     Item::Instruction(shared),
-                    Item::Label(Label(2)),
+                    Item::Label(Label::from_u32(2)),
                     item(LOAD_FAST, Operand::Value(0), 11),
                     item(TO_BOOL, Operand::Value(0), 11),
-                    item(POP_JUMP_IF_FALSE, Operand::Forward(Label(5)), 11),
+                    item(POP_JUMP_IF_FALSE, Operand::Forward(Label::from_u32(5)), 11),
                     Item::Instruction(marker),
-                    Item::Label(Label(3)),
+                    Item::Label(Label::from_u32(3)),
                     item(LOAD_CONST, Operand::Value(1), 12),
                     item(STORE_FAST, Operand::Value(1), 12),
-                    Item::Label(Label(5)),
+                    Item::Label(Label::from_u32(5)),
                     Item::Instruction(success),
-                    Item::Label(Label(6)),
+                    Item::Label(Label::from_u32(6)),
                     item(LOAD_FAST, Operand::Value(2), 13),
                     item(LOAD_FAST, Operand::Value(1), 13),
                     item(BUILD_TUPLE, Operand::Value(2), 13),
@@ -4927,28 +4949,36 @@ mod tests {
                 next_label: 8,
                 ..Assembler::default()
             };
-            for label in [Label(0), Label(1), Label(2), Label(3), Label(5)] {
+            for label in [
+                Label::from_u32(0),
+                Label::from_u32(1),
+                Label::from_u32(2),
+                Label::from_u32(3),
+                Label::from_u32(5),
+            ] {
                 assembler.record_exception_owner_block_boundary(label);
             }
-            assembler.nested_if_unlocated_join_blocks.insert(Label(1));
+            assembler
+                .nested_if_unlocated_join_blocks
+                .insert(Label::from_u32(1));
             assembler
                 .exception_owner_provenance
                 .original_match_join_boundaries
-                .insert(Label(6));
+                .insert(Label::from_u32(6));
             if case == "generic return head" {
-                assembler.record_exception_owner_block_boundary(Label(6));
+                assembler.record_exception_owner_block_boundary(Label::from_u32(6));
             }
             if case.starts_with("independent tail") {
                 let mut tail = Instruction::new(
                     JUMP_FORWARD,
-                    Operand::Forward(Label(6)),
+                    Operand::Forward(Label::from_u32(6)),
                     SourceLocation::NONE,
                     None,
                 );
                 tail.jump_policy.mark_interruptible();
                 let mut none_condition = Instruction::new(
                     crate::target::opcodes::POP_JUMP_IF_NONE,
-                    Operand::Forward(Label(9)),
+                    Operand::Forward(Label::from_u32(9)),
                     SourceLocation::new(15, 15, 4, 9),
                     None,
                 );
@@ -4960,27 +4990,29 @@ mod tests {
                 };
                 let footer = items
                     .iter()
-                    .position(|item| *item == Item::Label(Label(6)))
+                    .position(|item| *item == Item::Label(Label::from_u32(6)))
                     .unwrap();
                 items.splice(
                     footer..footer,
                     [
-                        Item::Label(Label(8)),
+                        Item::Label(Label::from_u32(8)),
                         item(LOAD_FAST, Operand::Value(0), 15),
                         Item::Instruction(none_condition),
                         item(NOT_TAKEN, Operand::Value(0), 15),
-                        Item::Label(Label(10)),
+                        Item::Label(Label::from_u32(10)),
                         item(LOAD_FAST, Operand::Value(0), 16),
                         item(STORE_FAST, Operand::Value(2), 16),
-                        Item::Label(Label(9)),
+                        Item::Label(Label::from_u32(9)),
                         Item::Instruction(tail),
                     ],
                 );
                 assembler.next_label = 12;
-                assembler
-                    .mark_conditional_threading_target(Label(9), SourceLocation::new(15, 15, 4, 9));
+                assembler.mark_conditional_threading_target(
+                    Label::from_u32(9),
+                    SourceLocation::new(15, 15, 4, 9),
+                );
                 if case == "independent tail generic head" {
-                    assembler.record_exception_owner_block_boundary(Label(9));
+                    assembler.record_exception_owner_block_boundary(Label::from_u32(9));
                 }
             }
             if case.starts_with("opaque") {
@@ -4994,7 +5026,7 @@ mod tests {
                 };
                 let mut tail = Instruction::new(
                     JUMP_FORWARD,
-                    Operand::Forward(Label(6)),
+                    Operand::Forward(Label::from_u32(6)),
                     SourceLocation::new(16, 16, 4, 9),
                     Some(0),
                 );
@@ -5015,14 +5047,24 @@ mod tests {
                             tail.jump_policy.retain_redundant_nop_after_threading();
                         }
                     }
-                    assembler.record_exception_owner_block_boundary(Label(9));
+                    assembler.record_exception_owner_block_boundary(Label::from_u32(9));
                     let mut extra = vec![
-                        Item::Label(Label(8)),
-                        record(FOR_ITER, Operand::Forward(Label(9)), 16, depth + 1),
-                        Item::Label(Label(10)),
+                        Item::Label(Label::from_u32(8)),
+                        record(
+                            FOR_ITER,
+                            Operand::Forward(Label::from_u32(9)),
+                            16,
+                            depth + 1,
+                        ),
+                        Item::Label(Label::from_u32(10)),
                         record(STORE_FAST, Operand::Value(3), 16, depth),
-                        record(JUMP_BACKWARD, Operand::Backward(Label(8)), 16, depth),
-                        Item::Label(Label(9)),
+                        record(
+                            JUMP_BACKWARD,
+                            Operand::Backward(Label::from_u32(8)),
+                            16,
+                            depth,
+                        ),
+                        Item::Label(Label::from_u32(9)),
                         record(END_FOR, Operand::Value(0), 16, depth),
                         record(POP_ITER, Operand::Value(0), 16, 0),
                         Item::Instruction(tail),
@@ -5035,8 +5077,12 @@ mod tests {
                             iter.location = SourceLocation::new(17, 17, 4, 9);
                         }
                         "opaque loop extra entry" => {
-                            extra[4] =
-                                record(JUMP_FORWARD, Operand::Forward(Label(9)), 16, depth + 1);
+                            extra[4] = record(
+                                JUMP_FORWARD,
+                                Operand::Forward(Label::from_u32(9)),
+                                16,
+                                depth + 1,
+                            );
                             extra.insert(4, record(LOAD_CONST, Operand::Value(0), 16, depth + 1));
                         }
                         "opaque loop fallthrough" => {
@@ -5067,7 +5113,7 @@ mod tests {
                         );
                         tail.jump_policy.defer_removal();
                     }
-                    let mut extra = vec![Item::Label(Label(8))];
+                    let mut extra = vec![Item::Label(Label::from_u32(8))];
                     if truth {
                         extra.push(record(LOAD_FAST, Operand::Value(0), 15, 1));
                         if copied_truth {
@@ -5077,7 +5123,7 @@ mod tests {
                             record(TO_BOOL, Operand::Value(0), 15, branch_depth + 1),
                             record(
                                 POP_JUMP_IF_TRUE,
-                                Operand::Forward(Label(9)),
+                                Operand::Forward(Label::from_u32(9)),
                                 15,
                                 branch_depth,
                             ),
@@ -5096,7 +5142,12 @@ mod tests {
                             record(LOAD_CONST, Operand::Value(0), 15, 3),
                             record(MATCH_CLASS, Operand::Value(0), 15, 1),
                             Item::Instruction(copy),
-                            record(POP_JUMP_IF_NONE, Operand::Forward(Label(9)), 15, 1),
+                            record(
+                                POP_JUMP_IF_NONE,
+                                Operand::Forward(Label::from_u32(9)),
+                                15,
+                                1,
+                            ),
                         ]);
                     }
                     let marker_index = extra.len();
@@ -5171,9 +5222,9 @@ mod tests {
                         _ => {}
                     }
                     if matches!(case, "opaque class labelled" | "opaque class incoming") {
-                        extra.insert(marker_index, Item::Label(Label(11)));
+                        extra.insert(marker_index, Item::Label(Label::from_u32(11)));
                     }
-                    extra.extend([Item::Instruction(tail), Item::Label(Label(9))]);
+                    extra.extend([Item::Instruction(tail), Item::Label(Label::from_u32(9))]);
                     if branch_depth != 0 {
                         extra.push(record(POP_TOP, Operand::Value(0), 17, 0));
                     }
@@ -5188,25 +5239,28 @@ mod tests {
                 };
                 let footer = items
                     .iter()
-                    .position(|item| *item == Item::Label(Label(6)))
+                    .position(|item| *item == Item::Label(Label::from_u32(6)))
                     .unwrap();
                 items.splice(footer..footer, extra);
                 assembler.next_label = 12;
                 if case == "opaque class region" {
-                    assembler
-                        .exception_regions
-                        .push(region(Label(8), Label(9), Label(0), true));
+                    assembler.exception_regions.push(region(
+                        Label::from_u32(8),
+                        Label::from_u32(9),
+                        Label::from_u32(0),
+                        true,
+                    ));
                 }
                 if case == "opaque class incoming" {
-                    items[3] = record(JUMP_FORWARD, Operand::Forward(Label(11)), 9, 1);
+                    items[3] = record(JUMP_FORWARD, Operand::Forward(Label::from_u32(11)), 9, 1);
                     items.insert(3, record(LOAD_CONST, Operand::Value(0), 9, 1));
                 }
             }
             let mut pipeline = assembler.into_optimization_pipeline();
-            let condition = pipeline.graph.label_block(Label(2)).unwrap();
-            let body = pipeline.graph.label_block(Label(3)).unwrap();
-            let join = pipeline.graph.label_block(Label(5)).unwrap();
-            let footer = pipeline.graph.label_block(Label(6)).unwrap();
+            let condition = pipeline.graph.label_block(Label::from_u32(2)).unwrap();
+            let body = pipeline.graph.label_block(Label::from_u32(3)).unwrap();
+            let join = pipeline.graph.label_block(Label::from_u32(5)).unwrap();
+            let footer = pipeline.graph.label_block(Label::from_u32(6)).unwrap();
             match case {
                 "ordinary"
                 | "generic return head"
@@ -5217,7 +5271,7 @@ mod tests {
                     .original_match_join_boundaries
                     .clear(),
                 "borrow return" => {
-                    pipeline.borrow_block_aliases.insert(Label(6));
+                    pipeline.borrow_block_aliases.insert(Label::from_u32(6));
                 }
                 "hidden return" => pipeline
                     .graph
@@ -5228,8 +5282,8 @@ mod tests {
                 "borrow join" => {
                     pipeline
                         .graph
-                        .insert_item(ItemPosition::new(join, 0), Item::Label(Label(7)));
-                    pipeline.borrow_block_aliases.insert(Label(7));
+                        .insert_item(ItemPosition::new(join, 0), Item::Label(Label::from_u32(7)));
+                    pipeline.borrow_block_aliases.insert(Label::from_u32(7));
                 }
                 "hidden condition" => pipeline
                     .graph
@@ -5241,7 +5295,7 @@ mod tests {
                 "folded condition" => {
                     pipeline
                         .folded_original_predecessor_targets
-                        .insert(Label(2));
+                        .insert(Label::from_u32(2));
                 }
                 "marker owner" | "marker fusion" => {
                     pipeline.graph.for_each_instruction_mut(|instruction| {
@@ -5271,9 +5325,12 @@ mod tests {
                     .unwrap()
                     .add_pre_fold_extra_instructions(1),
                 "protected body" => {
-                    pipeline
-                        .exception_regions
-                        .push(region(Label(3), Label(5), Label(0), false));
+                    pipeline.exception_regions.push(region(
+                        Label::from_u32(3),
+                        Label::from_u32(5),
+                        Label::from_u32(0),
+                        false,
+                    ));
                 }
                 "retained join" => pipeline
                     .graph
@@ -5288,17 +5345,17 @@ mod tests {
                     }
                 }),
                 "independent tail borrowed" => {
-                    let tail = pipeline.graph.label_block(Label(9)).unwrap();
+                    let tail = pipeline.graph.label_block(Label::from_u32(9)).unwrap();
                     pipeline
                         .graph
-                        .insert_item(ItemPosition::new(tail, 0), Item::Label(Label(11)));
-                    pipeline.borrow_block_aliases.insert(Label(11));
+                        .insert_item(ItemPosition::new(tail, 0), Item::Label(Label::from_u32(11)));
+                    pipeline.borrow_block_aliases.insert(Label::from_u32(11));
                 }
                 "independent tail no producer" => pipeline.conditional_threading_targets.clear(),
                 "independent tail hidden"
                 | "independent tail retained"
                 | "independent tail wrong target" => {
-                    let tail = pipeline.graph.label_block(Label(9)).unwrap();
+                    let tail = pipeline.graph.label_block(Label::from_u32(9)).unwrap();
                     let jump = pipeline.graph.instructions_mut(tail).next_back().unwrap();
                     match case {
                         "independent tail hidden" => {
@@ -5308,19 +5365,19 @@ mod tests {
                             jump.jump_policy.retain_redundant_nop_after_threading();
                         }
                         "independent tail wrong target" => {
-                            jump.set_operand(Operand::Forward(Label(5)));
+                            jump.set_operand(Operand::Forward(Label::from_u32(5)));
                         }
                         _ => unreachable!(),
                     }
                 }
                 "independent tail incoming" => {
-                    let source = pipeline.graph.label_block(Label(0)).unwrap();
+                    let source = pipeline.graph.label_block(Label::from_u32(0)).unwrap();
                     pipeline
                         .graph
                         .instructions_mut(source)
                         .next_back()
                         .unwrap()
-                        .set_operand(Operand::Forward(Label(9)));
+                        .set_operand(Operand::Forward(Label::from_u32(9)));
                 }
                 _ if case.starts_with("opaque") => {}
                 _ => unreachable!(),
@@ -5331,7 +5388,9 @@ mod tests {
                 .order()
                 .iter()
                 .copied()
-                .skip_while(|block| pipeline.graph[*block].first_label() != Some(Label(8)))
+                .skip_while(|block| {
+                    pipeline.graph[*block].first_label() != Some(Label::from_u32(8))
+                })
                 .take_while(|block| *block != footer)
                 .map(|block| (block, pipeline.graph[block].items().to_vec()))
                 .collect::<Vec<_>>();
@@ -5357,10 +5416,10 @@ mod tests {
                 assert_eq!(
                     pipeline.exception_owner_provenance.normal_try_copy_steps,
                     [
-                        (Label(0), Label(1), 1),
-                        (Label(1), Label(5), 1),
-                        (Label(5), Label(6), 4),
-                        (Label(1), Label(6), 4),
+                        (Label::from_u32(0), Label::from_u32(1), 1),
+                        (Label::from_u32(1), Label::from_u32(5), 1),
+                        (Label::from_u32(5), Label::from_u32(6), 4),
+                        (Label::from_u32(1), Label::from_u32(6), 4),
                     ],
                     "{case}"
                 );
@@ -5399,17 +5458,17 @@ mod tests {
         // observer verifier must never silently omit either participation kind.
         let mut nodes = (0..2)
             .map(|id| OriginalNode {
-                id,
+                id: BasicBlockId::from_usize(id),
                 prefix: Vec::new(),
                 tail: OriginalTail::Jump {
-                    target: id + 1,
+                    target: BasicBlockId::from_usize(id + 1),
                     located: false,
                     interruptible: false,
                 },
             })
             .collect::<Vec<_>>();
         nodes.push(OriginalNode {
-            id: 2,
+            id: BasicBlockId::from_usize(2),
             prefix: Vec::new(),
             tail: OriginalTail::LocalTupleReturn { located: [true; 4] },
         });
@@ -5418,13 +5477,13 @@ mod tests {
             result
                 .steps
                 .iter()
-                .any(|step| step.source == 0 && step.target == 1)
+                .any(|step| step.source.index() == 0 && step.target.index() == 1)
         );
         assert!(
             result
                 .steps
                 .iter()
-                .any(|step| step.source == 1 && step.target == 2)
+                .any(|step| step.source.index() == 1 && step.target.index() == 2)
         );
     }
 }

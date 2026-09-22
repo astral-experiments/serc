@@ -928,6 +928,7 @@ dependencies = [
  "fs-err",
  "serc_workloads",
  "rayon",
+ "ruff_index",
  "ruff_python_ast",
  "ruff_python_codegen",
  "ruff_python_literal",
@@ -1161,6 +1162,29 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "ruff_index"
+version = "0.0.0"
+source = "git+https://github.com/astral-sh/ruff?rev=e4a063a136ae0e3d6801bd0dad47d09a0f419530#e4a063a136ae0e3d6801bd0dad47d09a0f419530"
+dependencies = [
+ "get-size2",
+ "ruff_macros",
+]
+
+[[package]]
+name = "ruff_macros"
+version = "0.0.0"
+source = "git+https://github.com/astral-sh/ruff?rev=e4a063a136ae0e3d6801bd0dad47d09a0f419530#e4a063a136ae0e3d6801bd0dad47d09a0f419530"
+dependencies = [
+ "heck",
+ "itertools 0.14.0",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "ruff_python_trivia",
+ "syn",
+]
 
 [[package]]
 name = "ruff_python_ast"

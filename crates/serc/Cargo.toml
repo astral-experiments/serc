@@ -19,6 +19,7 @@ workspace = true
 
 [dependencies]
 encoding_rs = { workspace = true }
+ruff_index = { workspace = true }
 ruff_python_ast = { workspace = true }
 ruff_python_codegen = { workspace = true }
 ruff_python_literal = { workspace = true }

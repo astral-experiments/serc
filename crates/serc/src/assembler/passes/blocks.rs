@@ -1265,7 +1265,7 @@ fn restore_retained_pop_block_locations(
         .filter_map(|region| graph.label_block(region.target))
         .collect::<FxHashSet<_>>();
     let mut ordered_origins = origins.iter().collect::<Vec<_>>();
-    ordered_origins.sort_unstable_by_key(|(entry, _)| entry.0);
+    ordered_origins.sort_unstable_by_key(|(entry, _)| entry.as_u32());
     for (entry, prefix) in ordered_origins {
         let Some(target) = graph.label_block(*entry) else {
             continue;
@@ -2547,7 +2547,7 @@ impl OptimizationPipeline {
             })
             .collect::<Vec<_>>();
         for position in loop_anchor_positions.into_iter().rev() {
-            let anchor = Label(self.next_label);
+            let anchor = Label::from_u32(self.next_label);
             self.next_label += 1;
             graph.insert_block(position, vec![Item::Label(anchor)]);
         }
@@ -2581,7 +2581,7 @@ impl OptimizationPipeline {
         let mut omitted_backedges = FxHashSet::default();
         let mut omitted_markers = FxHashSet::default();
         for position in cleanup_positions.into_iter().rev() {
-            let label = Label(self.next_label);
+            let label = Label::from_u32(self.next_label);
             self.next_label += 1;
             // Keep the array empty while physical jumps and locations are finalized.
             let block = graph.insert_block(position, vec![Item::Label(label)]);
@@ -2601,7 +2601,7 @@ impl OptimizationPipeline {
             let label = if let Some(label) = graph[block].first_label() {
                 label
             } else {
-                let label = Label(self.next_label);
+                let label = Label::from_u32(self.next_label);
                 self.next_label += 1;
                 graph.insert_label(block, 0, label);
                 label
@@ -2704,7 +2704,7 @@ impl OptimizationPipeline {
             let target = if let Some(label) = graph[next].first_label() {
                 label
             } else {
-                let label = Label(self.next_label);
+                let label = Label::from_u32(self.next_label);
                 self.next_label += 1;
                 graph.insert_label(next, 0, label);
                 block_labels[next.index()] = Some(label);
@@ -2756,7 +2756,7 @@ impl OptimizationPipeline {
                     location = previous.location;
                 }
             }
-            let label = Label(self.next_label);
+            let label = Label::from_u32(self.next_label);
             self.next_label += 1;
             let mut bridge = Instruction::synthetic(
                 JUMP_BACKWARD_NO_INTERRUPT,
@@ -2988,7 +2988,7 @@ impl OptimizationPipeline {
                 } else if let Some(label) = final_label {
                     label
                 } else {
-                    let label = Label(self.next_label);
+                    let label = Label::from_u32(self.next_label);
                     self.next_label += 1;
                     final_label = Some(label);
                     label
@@ -4191,7 +4191,7 @@ impl OptimizationPipeline {
         for block in order.iter().copied() {
             let original_len = graph[block].items().len();
             if graph[block].first_label().is_none() {
-                let label = Label(self.next_label);
+                let label = Label::from_u32(self.next_label);
                 self.next_label += 1;
                 for gap in &mut *static_swap_store_gaps {
                     gap.prepend_copy_entry(graph, block, label);
@@ -5657,7 +5657,7 @@ impl OptimizationPipeline {
                                     .jump_policy
                                     .retains_nop_for(instruction.operand())
                             }))));
-            let copied_label = Label(self.next_label);
+            let copied_label = Label::from_u32(self.next_label);
             self.next_label += 1;
             if !self.borrow_finally_jump_sources.is_empty() {
                 // A copied terminal jump has no independent original source certificate.
@@ -5677,7 +5677,7 @@ impl OptimizationPipeline {
                         *label = copied_label;
                         replaced_entry_label = true;
                     } else {
-                        *label = Label(self.next_label);
+                        *label = Label::from_u32(self.next_label);
                         self.next_label += 1;
                     }
                     copied_labels.insert(original, *label);
@@ -5819,7 +5819,7 @@ impl OptimizationPipeline {
                 .map(|region| region.end)
                 .collect::<Vec<_>>();
             for original in trailing_region_ends {
-                let copied_end = Label(self.next_label);
+                let copied_end = Label::from_u32(self.next_label);
                 self.next_label += 1;
                 copied.push(Item::Label(copied_end));
                 copied_labels.insert(original, copied_end);
@@ -5827,7 +5827,7 @@ impl OptimizationPipeline {
             // Renaming a region-only re-entry must not create an original unwind slot.
             let reentries = &mut self.exception_owner_provenance.return_region_reentries;
             let mut ordered_copied_labels = copied_labels.iter().collect::<Vec<_>>();
-            ordered_copied_labels.sort_unstable_by_key(|(original, _)| original.0);
+            ordered_copied_labels.sort_unstable_by_key(|(original, _)| original.as_u32());
             for (original, replacement) in ordered_copied_labels {
                 if reentries.contains(original) {
                     reentries.insert(*replacement);
@@ -5914,7 +5914,7 @@ impl OptimizationPipeline {
                     .map(|(_, region)| *region)
                     .collect::<Vec<_>>();
                 if !fallbacks.is_empty() {
-                    let copied_end = Label(self.next_label);
+                    let copied_end = Label::from_u32(self.next_label);
                     self.next_label += 1;
                     copied.push(Item::Label(copied_end));
                     copied_exception_regions.extend(fallbacks.into_iter().map(|region| {
@@ -6386,11 +6386,11 @@ impl OptimizationPipeline {
                         && !planned_copy
                         && let Some(position) = trailing_nop_position
                     {
-                        whole_copy_exclusion_start = Label(self.next_label);
+                        whole_copy_exclusion_start = Label::from_u32(self.next_label);
                         self.next_label += 1;
                         graph.insert_label(source, position, whole_copy_exclusion_start);
                     }
-                    let copied_end = Label(self.next_label);
+                    let copied_end = Label::from_u32(self.next_label);
                     self.next_label += 1;
                     copied.push(Item::Label(copied_end));
                     for index in entirely_excluded_regions {
@@ -6488,7 +6488,7 @@ impl OptimizationPipeline {
                     })
                     .collect::<Vec<_>>();
                 for predecessor in transitive_predecessors {
-                    let copied_label = Label(self.next_label);
+                    let copied_label = Label::from_u32(self.next_label);
                     self.next_label += 1;
                     let mut predecessor_copy = vec![Item::Label(copied_label)];
                     predecessor_copy.extend(
@@ -7807,9 +7807,9 @@ mod copied_pop_block_location_tests {
     #[test]
     fn normal_try_pop_continuations_require_a_live_original_slot() {
         for (empty, entered) in [(false, false), (true, false), (false, true)] {
-            let start = Label(1);
-            let end = Label(2);
-            let target = Label(3);
+            let start = Label::from_u32(1);
+            let end = Label::from_u32(2);
+            let target = Label::from_u32(3);
             let Item::Instruction(mut pop) = head() else {
                 unreachable!();
             };
@@ -7852,12 +7852,12 @@ mod copied_pop_block_location_tests {
     fn retained_pop_block_uses_only_its_original_empty_prefix() {
         for empty_count in [1, 3] {
             for omit_origin in [false, true] {
-                let entry = Label(empty_count + 1);
+                let entry = Label::from_u32(empty_count + 1);
                 let mut items = vec![
-                    Item::Label(Label(0)),
-                    instruction(JUMP_FORWARD, Operand::Forward(Label(1)), 8),
+                    Item::Label(Label::from_u32(0)),
+                    instruction(JUMP_FORWARD, Operand::Forward(Label::from_u32(1)), 8),
                 ];
-                items.extend((1..=empty_count).map(|index| Item::Label(Label(index))));
+                items.extend((1..=empty_count).map(|index| Item::Label(Label::from_u32(index))));
                 items.extend([
                     Item::Label(entry),
                     retained_head(),
@@ -7865,7 +7865,7 @@ mod copied_pop_block_location_tests {
                     instruction(RETURN_VALUE, Operand::Value(0), 20),
                 ]);
                 let prefix = ((if omit_origin { 2 } else { 1 })..=empty_count + 1)
-                    .map(Label)
+                    .map(Label::from_u32)
                     .collect();
                 check_retained(items, &[], entry, prefix, (!omit_origin).then_some(8));
             }
@@ -7874,14 +7874,14 @@ mod copied_pop_block_location_tests {
 
     #[test]
     fn retained_pop_block_rejects_a_shared_empty_predecessor() {
-        let empty = Label(2);
-        let entry = Label(3);
+        let empty = Label::from_u32(2);
+        let entry = Label::from_u32(3);
         check_retained(
             vec![
-                Item::Label(Label(0)),
+                Item::Label(Label::from_u32(0)),
                 instruction(LOAD_FAST, Operand::Value(0), 1),
                 instruction(POP_JUMP_IF_FALSE, Operand::Forward(empty), 1),
-                Item::Label(Label(1)),
+                Item::Label(Label::from_u32(1)),
                 instruction(JUMP_FORWARD, Operand::Forward(empty), 8),
                 Item::Label(empty),
                 Item::Label(entry),
@@ -7899,17 +7899,17 @@ mod copied_pop_block_location_tests {
     #[test]
     fn retained_pop_block_rejects_handler_and_unlocated_donors() {
         for handler in [false, true] {
-            let empty = Label(1);
-            let entry = Label(2);
-            let end = Label(3);
+            let empty = Label::from_u32(1);
+            let entry = Label::from_u32(2);
+            let end = Label::from_u32(3);
             let regions = if handler {
-                vec![region(Label(0), end, empty)]
+                vec![region(Label::from_u32(0), end, empty)]
             } else {
                 Vec::new()
             };
             check_retained(
                 vec![
-                    Item::Label(Label(0)),
+                    Item::Label(Label::from_u32(0)),
                     located(8),
                     instruction(
                         JUMP_FORWARD,
@@ -7977,11 +7977,11 @@ mod copied_pop_block_location_tests {
     #[test]
     fn shared_parent_cannot_seed_a_unique_copied_head() {
         for shared_parent in [false, true] {
-            let entry = Label(0);
-            let left = Label(1);
-            let right = Label(2);
-            let parent = Label(3);
-            let child = Label(4);
+            let entry = Label::from_u32(0);
+            let left = Label::from_u32(1);
+            let right = Label::from_u32(2);
+            let parent = Label::from_u32(3);
+            let child = Label::from_u32(4);
             let mut parent_head = head();
             if let Item::Instruction(instruction) = &mut parent_head {
                 instruction.location = SourceLocation::new(8, 8, 12, 17);
@@ -8033,11 +8033,11 @@ mod copied_pop_block_location_tests {
 
     #[test]
     fn copied_jump_uses_last_located_instruction_and_ignores_dead_predecessor() {
-        let dead = Label(1);
-        let target = Label(2);
+        let dead = Label::from_u32(1);
+        let target = Label::from_u32(2);
         check(
             vec![
-                Item::Label(Label(0)),
+                Item::Label(Label::from_u32(0)),
                 located(8),
                 instruction(POP_EXCEPT, Operand::Value(0), 8),
                 jump(target),
@@ -8057,13 +8057,13 @@ mod copied_pop_block_location_tests {
 
     #[test]
     fn live_external_edges_from_retained_or_materialized_copies_keep_join_shared() {
-        let other = Label(1);
-        let target = Label(2);
+        let other = Label::from_u32(1);
+        let target = Label::from_u32(2);
         // Both edges are present after all retained-target revivals and deferred
         // copies have been materialized. Neither may be discounted as an old copy.
         check(
             vec![
-                Item::Label(Label(0)),
+                Item::Label(Label::from_u32(0)),
                 located(1),
                 instruction(POP_JUMP_IF_FALSE, Operand::Forward(other), 1),
                 located(8),
@@ -8084,10 +8084,10 @@ mod copied_pop_block_location_tests {
 
     #[test]
     fn conditional_jump_and_fallthrough_to_same_block_count_as_two_edges() {
-        let target = Label(1);
+        let target = Label::from_u32(1);
         check(
             vec![
-                Item::Label(Label(0)),
+                Item::Label(Label::from_u32(0)),
                 located(8),
                 instruction(POP_JUMP_IF_FALSE, Operand::Forward(target), 8),
                 Item::Label(target),
@@ -8103,11 +8103,11 @@ mod copied_pop_block_location_tests {
 
     #[test]
     fn handler_predecessor_counts_only_when_its_protected_body_is_reachable() {
-        let entry = Label(0);
-        let dead_start = Label(1);
-        let dead_end = Label(2);
-        let handler = Label(3);
-        let target = Label(4);
+        let entry = Label::from_u32(0);
+        let dead_start = Label::from_u32(1);
+        let dead_end = Label::from_u32(2);
+        let handler = Label::from_u32(3);
+        let target = Label::from_u32(4);
         for live_handler in [false, true] {
             let changed = [(target, 8)];
             check(
@@ -8140,14 +8140,14 @@ mod copied_pop_block_location_tests {
 
     #[test]
     fn preserved_unlocated_source_boundary_blocks_location_inheritance() {
-        let target = Label(1);
+        let target = Label::from_u32(1);
         let Item::Instruction(mut last) = jump(target) else {
             unreachable!()
         };
         last.no_location_policy.preserve_location();
         check(
             vec![
-                Item::Label(Label(0)),
+                Item::Label(Label::from_u32(0)),
                 located(8),
                 Item::Instruction(last),
                 Item::Label(target),
@@ -8163,9 +8163,9 @@ mod copied_pop_block_location_tests {
 
     #[test]
     fn only_selected_unlocated_converted_nonhandler_heads_can_change() {
-        let entry = Label(0);
-        let end = Label(1);
-        let target = Label(2);
+        let entry = Label::from_u32(0);
+        let end = Label::from_u32(1);
+        let target = Label::from_u32(2);
         let selected = [target];
         for case in [
             "located",
@@ -8215,11 +8215,11 @@ mod copied_pop_block_location_tests {
 
     #[test]
     fn backward_sole_predecessor_has_a_location_but_entry_seed_keeps_loop_shared() {
-        let target = Label(1);
-        let source = Label(2);
+        let target = Label::from_u32(1);
+        let source = Label::from_u32(2);
         check(
             vec![
-                Item::Label(Label(0)),
+                Item::Label(Label::from_u32(0)),
                 jump(source),
                 Item::Label(target),
                 head(),
@@ -8247,12 +8247,12 @@ mod copied_pop_block_location_tests {
 
     #[test]
     fn unresolved_chain_does_not_depend_on_candidate_head_order() {
-        let first = Label(1);
-        let second = Label(2);
+        let first = Label::from_u32(1);
+        let second = Label::from_u32(2);
         for heads in [[first, second], [second, first]] {
             check(
                 vec![
-                    Item::Label(Label(0)),
+                    Item::Label(Label::from_u32(0)),
                     located(8),
                     jump(first),
                     Item::Label(first),
@@ -8282,7 +8282,7 @@ mod percent_prefix_setup_tests {
             "none", "range", "setup", "span", "prefix", "depth", "unknown", "owner", "incoming",
         ] {
             let [start, end, setup, stop, handler] =
-                std::array::from_fn(|i| Label(u32::try_from(i).unwrap()));
+                std::array::from_fn(|i| Label::from_u32(u32::try_from(i).unwrap()));
             let location = SourceLocation::new(2, 5, 4, 12);
             let mut marker = Instruction::new(
                 NOP,
@@ -8380,11 +8380,11 @@ mod copied_match_guard_subject_tests {
     fn donor_requires_original_guard_bridge_and_exact_four_record_return() {
         let guard = SourceLocation::new(3, 3, 20, 40);
         let body = SourceLocation::new(4, 4, 12, 30);
-        let cleanup = Label(1);
-        let end = Label(2);
+        let cleanup = Label::from_u32(1);
+        let end = Label::from_u32(2);
         let condition = Instruction::new(
             POP_JUMP_IF_FALSE,
-            Operand::Forward(Label(3)),
+            Operand::Forward(Label::from_u32(3)),
             guard,
             Some(1),
         );
@@ -8394,13 +8394,17 @@ mod copied_match_guard_subject_tests {
         let failure =
             Instruction::new(POP_JUMP_IF_FALSE, Operand::Forward(cleanup), guard, Some(2));
         let cleanup_pop = Instruction::new(POP_TOP, Operand::Value(0), guard, Some(1));
-        let cleanup_jump =
-            Instruction::new(JUMP_FORWARD, Operand::Forward(Label(3)), guard, Some(1));
+        let cleanup_jump = Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(Label::from_u32(3)),
+            guard,
+            Some(1),
+        );
         let mut subject = Instruction::new(POP_TOP, Operand::Value(0), body, Some(0));
         subject.fusion_policy.mark_location_from_next();
         for mutation in 0..12 {
             let mut source = vec![
-                Item::Label(Label(0)),
+                Item::Label(Label::from_u32(0)),
                 Item::Instruction(marker),
                 Item::Instruction(bridge),
             ];
@@ -8442,8 +8446,8 @@ mod copied_match_guard_subject_tests {
             match mutation {
                 1 => origins.clear(),
                 2 => predecessor.location = body,
-                3 => target[0] = Item::Label(Label(99)),
-                4 => target.insert(3, Item::Label(Label(99))),
+                3 => target[0] = Item::Label(Label::from_u32(99)),
+                4 => target.insert(3, Item::Label(Label::from_u32(99))),
                 5 => target.insert(
                     3,
                     Item::Instruction(Instruction::new(NOP, Operand::Value(0), body, Some(1))),
@@ -8474,7 +8478,7 @@ mod copied_match_guard_subject_tests {
                         Some(1),
                     ));
                 }
-                10 => source.insert(2, Item::Label(Label(99))),
+                10 => source.insert(2, Item::Label(Label::from_u32(99))),
                 11 => {
                     let mut changed = bridge;
                     changed.jump_policy.prevent_small_exit_inlining();
@@ -8508,19 +8512,19 @@ mod represented_setup_nop_tests {
     // NOP splits its surrounding exception regions, including an empty prefix.
     fn nested_raise(count: u32) -> (BlockGraph, ExceptionOwnerProvenance, Vec<ExceptionRegion>) {
         let mut items = vec![
-            Item::Label(Label(0)),
+            Item::Label(Label::from_u32(0)),
             Item::Instruction(Instruction::new(
                 JUMP_FORWARD,
-                Operand::Forward(Label(10)),
+                Operand::Forward(Label::from_u32(10)),
                 SourceLocation::new(2, 2, 4, 8),
                 Some(0),
             )),
         ];
         let mut provenance = ExceptionOwnerProvenance::default();
         for index in 0..count {
-            let start = Label(10 + 3 * index);
-            let end = Label(11 + 3 * index);
-            let setup = Label(12 + 3 * index);
+            let start = Label::from_u32(10 + 3 * index);
+            let end = Label::from_u32(11 + 3 * index);
+            let setup = Label::from_u32(12 + 3 * index);
             let line = i32::try_from(index + 4).unwrap();
             let location = SourceLocation::new(line, line + 4, 4, 16);
             items.extend([
@@ -8532,7 +8536,7 @@ mod represented_setup_nop_tests {
             provenance.setups.push((setup, Some(location)));
             provenance
                 .ordinary_try_setups
-                .insert(setup, Label(200 + index));
+                .insert(setup, Label::from_u32(200 + index));
             provenance.setup_nop_ranges.push((start, end));
         }
         let raised = SourceLocation::new(9, 9, 8, 23);
@@ -8549,30 +8553,30 @@ mod represented_setup_nop_tests {
                 raised,
                 Some(0),
             )),
-            Item::Label(Label(100)),
+            Item::Label(Label::from_u32(100)),
         ]);
         let mut regions = Vec::new();
         for index in 0..count {
-            let setup = Label(12 + 3 * index);
-            let handler = Label(200 + index);
+            let setup = Label::from_u32(12 + 3 * index);
+            let handler = Label::from_u32(200 + index);
             let mut start = setup;
             for nested in index + 1..count {
                 regions.push(ExceptionRegion {
-                    priority: ExceptionRegionPriority::OriginalRange(setup, Label(100)),
+                    priority: ExceptionRegionPriority::OriginalRange(setup, Label::from_u32(100)),
                     is_scope_fallback: false,
                     start,
-                    end: Label(10 + 3 * nested),
+                    end: Label::from_u32(10 + 3 * nested),
                     target: handler,
                     depth: 0,
                     preserve_lasti: false,
                 });
-                start = Label(11 + 3 * nested);
+                start = Label::from_u32(11 + 3 * nested);
             }
             regions.push(ExceptionRegion {
-                priority: ExceptionRegionPriority::OriginalRange(setup, Label(100)),
+                priority: ExceptionRegionPriority::OriginalRange(setup, Label::from_u32(100)),
                 is_scope_fallback: false,
                 start,
-                end: Label(100),
+                end: Label::from_u32(100),
                 target: handler,
                 depth: 0,
                 preserve_lasti: false,
@@ -8624,8 +8628,8 @@ mod represented_setup_nop_tests {
             "prefold",
         ] {
             let (mut graph, mut provenance, _) = nested_raise(2);
-            let setup = Label(15);
-            let range = (Label(13), Label(14));
+            let setup = Label::from_u32(15);
+            let range = (Label::from_u32(13), Label::from_u32(14));
             match mutation {
                 "missing_range" => provenance
                     .setup_nop_ranges
@@ -8675,15 +8679,15 @@ mod represented_setup_nop_tests {
         let second = SourceLocation::new(8, 11, 4, 20);
         for first_is_certified in [false, true] {
             let items = vec![
-                Item::Label(Label(0)),
+                Item::Label(Label::from_u32(0)),
                 Item::Instruction(setup_nop(first)),
                 // This label is both an uncertified original setup and the exact
                 // start of a different, certified NOP's range.
-                Item::Label(Label(1)),
-                Item::Label(Label(9)),
+                Item::Label(Label::from_u32(1)),
+                Item::Label(Label::from_u32(9)),
                 Item::Instruction(setup_nop(second)),
-                Item::Label(Label(2)),
-                Item::Label(Label(3)),
+                Item::Label(Label::from_u32(2)),
+                Item::Label(Label::from_u32(3)),
                 Item::Instruction(Instruction::new(
                     RAISE_VARARGS,
                     Operand::Value(0),
@@ -8691,28 +8695,39 @@ mod represented_setup_nop_tests {
                     Some(0),
                 )),
             ];
-            let graph = BlockGraph::from_items(items, &[Label(1)].into_iter().collect());
+            let graph = BlockGraph::from_items(items, &[Label::from_u32(1)].into_iter().collect());
             let mut provenance = ExceptionOwnerProvenance {
                 setups: vec![
                     (
-                        Label(1),
+                        Label::from_u32(1),
                         Some(if first_is_certified { first } else { second }),
                     ),
-                    (Label(3), Some(second)),
+                    (Label::from_u32(3), Some(second)),
                 ],
                 ..ExceptionOwnerProvenance::default()
             };
-            provenance.ordinary_try_setups.insert(Label(1), Label(20));
-            provenance.ordinary_try_setups.insert(Label(3), Label(21));
-            provenance.setup_nop_ranges.push((Label(1), Label(2)));
+            provenance
+                .ordinary_try_setups
+                .insert(Label::from_u32(1), Label::from_u32(20));
+            provenance
+                .ordinary_try_setups
+                .insert(Label::from_u32(3), Label::from_u32(21));
+            provenance
+                .setup_nop_ranges
+                .push((Label::from_u32(1), Label::from_u32(2)));
             if first_is_certified {
-                provenance.setup_nop_ranges.push((Label(0), Label(1)));
+                provenance
+                    .setup_nop_ranges
+                    .push((Label::from_u32(0), Label::from_u32(1)));
             }
             let represented = represented_setup_nops(&graph, graph.order(), &provenance);
-            assert!(represented.labels.contains(&Label(1)));
-            assert!(represented.setups.contains(&Label(3)));
-            assert!(!represented.labels.contains(&Label(9)));
-            assert_eq!(represented.setups.contains(&Label(1)), first_is_certified);
+            assert!(represented.labels.contains(&Label::from_u32(1)));
+            assert!(represented.setups.contains(&Label::from_u32(3)));
+            assert!(!represented.labels.contains(&Label::from_u32(9)));
+            assert_eq!(
+                represented.setups.contains(&Label::from_u32(1)),
+                first_is_certified
+            );
             let mut positions = vec![0; graph.len()];
             for (position, block) in graph.order().iter().enumerate() {
                 positions[block.index()] = position;
