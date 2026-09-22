@@ -1201,6 +1201,16 @@ pub(super) fn explicit_surrogate_string(value: &str, source: &str) -> Option<Vec
             index += 1;
             continue;
         }
+        if source[index..].starts_with(b"\\N{")
+            && let Some(end) = source[index + 3..].iter().position(|byte| *byte == b'}')
+        {
+            let end = index + 3 + end;
+            if source[index + 3..end].eq_ignore_ascii_case(b"REPLACEMENT CHARACTER") {
+                replacements.push(None);
+            }
+            index = end + 1;
+            continue;
+        }
         let (digit_count, escape_len) = match source.get(index + 1) {
             Some(b'u') => (4, 6),
             Some(b'U') => (8, 10),
