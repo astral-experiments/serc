@@ -1,0 +1,188 @@
+---
+source: crates/serc/src/assembler/snapshots.rs
+expression: capture.finish()
+---
+
+== remove_unreachable_instructions (initial) ==
+  RESUME Value(0) @ 1:0-1:0 depth=Some(0) exception=NoneUnchanged
+L5:
+  NOP Value(0) @ 2:4-7:17 depth=Some(0) exception=AlwaysUnchanged
+L6:
+L0:
+  LOAD_FAST Value(0) @ 3:11-3:15 depth=Some(1) exception=NoneUnchanged
+  TO_BOOL Value(0) @ 3:11-3:15 depth=Some(1) exception=NoneUnchanged
+  POP_JUMP_IF_FALSE Forward(Label(7)) @ 3:11-3:15 depth=Some(0) exception=NoneUnchanged
+  NOT_TAKEN Value(0) @ 3:11-3:15 depth=Some(0) exception=AlwaysUnchanged
+L8:
+  LOAD_FAST Value(1) @ 4:19-4:24 depth=Some(1) exception=NoneUnchanged
+L9:
+  RETURN_VALUE Value(0) @ 4:12-4:24 depth=Some(0) exception=NoneUnchanged
+L10:
+L7:
+  NOP Value(0) @ 5:15-5:16 depth=Some(0) exception=NoneUnchanged
+L11:
+  LOAD_SMALL_INT Value(0) @ 5:15-5:16 depth=Some(1) exception=NoneUnchanged
+  RETURN_VALUE Value(0) @ 5:15-5:16 depth=Some(0) exception=NoneUnchanged
+L12:
+L1:
+L2:
+  PUSH_EXC_INFO Value(0) @ -1:-1--1:-1 depth=Some(2) exception=NoneUnchanged
+  LOAD_GLOBAL Value(0) @ 6:11-6:21 depth=Some(3) exception=NoneUnchanged
+  CHECK_EXC_MATCH Value(0) @ 6:4-7:17 depth=Some(3) exception=NoneUnchanged
+  POP_JUMP_IF_FALSE Forward(Label(13)) @ 6:4-7:17 depth=Some(2) exception=NoneUnchanged
+L14:
+  NOT_TAKEN Value(0) @ 6:4-7:17 depth=Some(2) exception=NoneUnchanged
+L15:
+  POP_TOP Value(0) @ 6:4-7:17 depth=Some(1) exception=NoneUnchanged
+L16:
+  LOAD_CONST Value(1) @ 7:15-7:17 depth=Some(2) exception=NoneUnchanged
+  SWAP Value(2) @ 7:8-7:17 depth=Some(2) exception=NoneUnchanged
+L19:
+  POP_EXCEPT Value(0) @ 7:8-7:17 depth=Some(1) exception=NoneUnchanged
+  RETURN_VALUE Value(0) @ 7:8-7:17 depth=Some(0) exception=NoneUnchanged
+L20:
+L17:
+L13:
+  RERAISE Value(0) @ 6:4-7:17 depth=Some(0) exception=NoneUnchanged
+L21:
+L3:
+  COPY Value(3) @ -1:-1--1:-1 depth=Some(4) exception=NoneUnchanged
+  POP_EXCEPT Value(0) @ -1:-1--1:-1 depth=Some(3) exception=NoneUnchanged
+  RERAISE Value(1) @ -1:-1--1:-1 depth=Some(0) exception=NoneUnchanged
+L4:
+  handler L0..L9 -> L2 depth=0 lasti=false fallback=false priority=Resolved { start: 4, end: 20 }
+  handler L10..L11 -> L2 depth=0 lasti=false fallback=false priority=Resolved { start: 4, end: 20 }
+  handler L12..L1 -> L2 depth=0 lasti=false fallback=false priority=Resolved { start: 4, end: 20 }
+  handler L2..L19 -> L3 depth=1 lasti=true fallback=false priority=Resolved { start: 23, end: 39 }
+  handler L20..L17 -> L3 depth=1 lasti=true fallback=false priority=Resolved { start: 23, end: 39 }
+  handler L13..L21 -> L3 depth=1 lasti=true fallback=false priority=Resolved { start: 43, end: 45 }
+
+== duplicate_exit_blocks ==
+  RESUME Value(0) @ 1:0-1:0 depth=Some(0) exception=NoneUnchanged
+L5:
+  NOP Value(0) @ 2:4-7:17 depth=Some(0) exception=AlwaysUnchanged
+L6:
+L0:
+  LOAD_FAST Value(0) @ 3:11-3:15 depth=Some(1) exception=NoneUnchanged
+  TO_BOOL Value(0) @ 3:11-3:15 depth=Some(1) exception=NoneUnchanged
+  POP_JUMP_IF_FALSE Forward(Label(7)) @ 3:11-3:15 depth=Some(0) exception=NoneUnchanged
+  NOT_TAKEN Value(0) @ 3:11-3:15 depth=Some(0) exception=AlwaysUnchanged
+L8:
+  LOAD_FAST Value(1) @ 4:19-4:24 depth=Some(1) exception=NoneUnchanged
+L9:
+  RETURN_VALUE Value(0) @ 4:12-4:24 depth=Some(0) exception=NoneUnchanged
+L10:
+L7:
+  NOP Value(0) @ 5:15-5:16 depth=Some(0) exception=NoneUnchanged
+L11:
+  LOAD_SMALL_INT Value(0) @ 5:15-5:16 depth=Some(1) exception=NoneUnchanged
+  RETURN_VALUE Value(0) @ 5:15-5:16 depth=Some(0) exception=NoneUnchanged
+L12:
+L1:
+L2:
+  PUSH_EXC_INFO Value(0) @ -1:-1--1:-1 depth=Some(2) exception=NoneUnchanged
+  LOAD_GLOBAL Value(0) @ 6:11-6:21 depth=Some(3) exception=NoneUnchanged
+  CHECK_EXC_MATCH Value(0) @ 6:4-7:17 depth=Some(3) exception=NoneUnchanged
+  POP_JUMP_IF_FALSE Forward(Label(13)) @ 6:4-7:17 depth=Some(2) exception=NoneUnchanged
+L14:
+  NOT_TAKEN Value(0) @ 6:4-7:17 depth=Some(2) exception=NoneUnchanged
+L15:
+  POP_TOP Value(0) @ 6:4-7:17 depth=Some(1) exception=NoneUnchanged
+L16:
+  LOAD_CONST Value(1) @ 7:15-7:17 depth=Some(2) exception=NoneUnchanged
+  SWAP Value(2) @ 7:8-7:17 depth=Some(2) exception=NoneUnchanged
+L19:
+  POP_EXCEPT Value(0) @ 7:8-7:17 depth=Some(1) exception=NoneUnchanged
+  RETURN_VALUE Value(0) @ 7:8-7:17 depth=Some(0) exception=NoneUnchanged
+L20:
+L17:
+L13:
+  RERAISE Value(0) @ 6:4-7:17 depth=Some(0) exception=NoneUnchanged
+L21:
+L3:
+  COPY Value(3) @ -1:-1--1:-1 depth=Some(4) exception=NoneUnchanged
+  POP_EXCEPT Value(0) @ -1:-1--1:-1 depth=Some(3) exception=NoneUnchanged
+  RERAISE Value(1) @ -1:-1--1:-1 depth=Some(0) exception=NoneUnchanged
+L4:
+  handler L0..L9 -> L2 depth=0 lasti=false fallback=false priority=Resolved { start: 4, end: 20 }
+  handler L10..L11 -> L2 depth=0 lasti=false fallback=false priority=Resolved { start: 4, end: 20 }
+  handler L12..L1 -> L2 depth=0 lasti=false fallback=false priority=Resolved { start: 4, end: 20 }
+  handler L2..L19 -> L3 depth=1 lasti=true fallback=false priority=Resolved { start: 23, end: 39 }
+  handler L20..L17 -> L3 depth=1 lasti=true fallback=false priority=Resolved { start: 23, end: 39 }
+  handler L13..L21 -> L3 depth=1 lasti=true fallback=false priority=Resolved { start: 43, end: 45 }
+
+== final jump layout ==
+L22:
+  RESUME Value(0) @ 1:0-1:0 depth=Some(0) exception=NoneUnchanged
+L5:
+  NOP Value(0) @ 2:4-7:17 depth=Some(0) exception=AlwaysUnchanged
+L6:
+L0:
+  LOAD_FAST_BORROW Value(0) @ 3:11-3:15 depth=Some(1) exception=NoneUnchanged
+  TO_BOOL Value(0) @ 3:11-3:15 depth=Some(1) exception=NoneUnchanged
+  POP_JUMP_IF_FALSE Forward(Label(7)) @ 3:11-3:15 depth=Some(0) exception=NoneUnchanged
+L23:
+  NOT_TAKEN Value(0) @ 3:11-3:15 depth=Some(0) exception=AlwaysUnchanged
+L8:
+  LOAD_FAST_BORROW Value(1) @ 4:19-4:24 depth=Some(1) exception=NoneUnchanged
+L9:
+  RETURN_VALUE Value(0) @ 4:12-4:24 depth=Some(0) exception=NoneUnchanged
+L10:
+L7:
+L11:
+  LOAD_SMALL_INT Value(0) @ 5:15-5:16 depth=Some(1) exception=NoneUnchanged
+  RETURN_VALUE Value(0) @ 5:15-5:16 depth=Some(0) exception=NoneUnchanged
+L12:
+L1:
+L2:
+  PUSH_EXC_INFO Value(0) @ -1:-1--1:-1 depth=Some(2) exception=NoneUnchanged
+  LOAD_GLOBAL Value(0) @ 6:11-6:21 depth=Some(3) exception=NoneUnchanged
+  CHECK_EXC_MATCH Value(0) @ 6:4-7:17 depth=Some(3) exception=NoneUnchanged
+  POP_JUMP_IF_FALSE Forward(Label(13)) @ 6:4-7:17 depth=Some(2) exception=NoneUnchanged
+L14:
+  NOT_TAKEN Value(0) @ 6:4-7:17 depth=Some(2) exception=NoneUnchanged
+L15:
+  POP_TOP Value(0) @ 6:4-7:17 depth=Some(1) exception=NoneUnchanged
+L16:
+  LOAD_CONST Value(1) @ 7:15-7:17 depth=Some(2) exception=NoneUnchanged
+  SWAP Value(2) @ 7:8-7:17 depth=Some(2) exception=NoneUnchanged
+L19:
+  POP_EXCEPT Value(0) @ 7:8-7:17 depth=Some(1) exception=NoneUnchanged
+  RETURN_VALUE Value(0) @ 7:8-7:17 depth=Some(0) exception=NoneUnchanged
+L20:
+L17:
+L13:
+  RERAISE Value(0) @ 6:4-7:17 depth=Some(0) exception=NoneUnchanged
+L21:
+L3:
+  COPY Value(3) @ -1:-1--1:-1 depth=Some(4) exception=NoneUnchanged
+  POP_EXCEPT Value(0) @ -1:-1--1:-1 depth=Some(3) exception=NoneUnchanged
+  RERAISE Value(1) @ -1:-1--1:-1 depth=Some(0) exception=NoneUnchanged
+  handler L6..L9 -> L2 depth=0 lasti=false fallback=false priority=Resolved { start: 4, end: 20 }
+  handler L10..L11 -> L2 depth=0 lasti=false fallback=false priority=Resolved { start: 4, end: 20 }
+  handler L12..L19 -> L3 depth=1 lasti=true fallback=false priority=Resolved { start: 23, end: 39 }
+  handler L20..L21 -> L3 depth=1 lasti=true fallback=false priority=Resolved { start: 43, end: 45 }
+
+== remove_unreachable_instructions (initial) ==
+  RESUME Value(0) @ 0:0-1:0 depth=Some(0) exception=NoneUnchanged
+  LOAD_CONST Value(0) @ 1:0-7:17 depth=Some(1) exception=NoneUnchanged
+  MAKE_FUNCTION Value(0) @ 1:0-7:17 depth=Some(1) exception=NoneUnchanged
+  STORE_NAME Value(0) @ 1:0-7:17 depth=Some(0) exception=NoneUnchanged
+  LOAD_CONST Value(1) @ -1:-1--1:-1 depth=Some(1) exception=NoneUnchanged
+  RETURN_VALUE Value(0) @ -1:-1--1:-1 depth=Some(0) exception=NoneUnchanged
+
+== duplicate_exit_blocks ==
+  RESUME Value(0) @ 0:0-1:0 depth=Some(0) exception=NoneUnchanged
+  LOAD_CONST Value(0) @ 1:0-7:17 depth=Some(1) exception=NoneUnchanged
+  MAKE_FUNCTION Value(0) @ 1:0-7:17 depth=Some(1) exception=NoneUnchanged
+  STORE_NAME Value(0) @ 1:0-7:17 depth=Some(0) exception=NoneUnchanged
+  LOAD_CONST Value(1) @ -1:-1--1:-1 depth=Some(1) exception=NoneUnchanged
+  RETURN_VALUE Value(0) @ -1:-1--1:-1 depth=Some(0) exception=NoneUnchanged
+
+== final jump layout ==
+  RESUME Value(0) @ 0:0-1:0 depth=Some(0) exception=NoneUnchanged
+  LOAD_CONST Value(0) @ 1:0-7:17 depth=Some(1) exception=NoneUnchanged
+  MAKE_FUNCTION Value(0) @ 1:0-7:17 depth=Some(1) exception=NoneUnchanged
+  STORE_NAME Value(0) @ 1:0-7:17 depth=Some(0) exception=NoneUnchanged
+  LOAD_CONST Value(1) @ 1:0-7:17 depth=Some(1) exception=NoneUnchanged
+  RETURN_VALUE Value(0) @ 1:0-7:17 depth=Some(0) exception=NoneUnchanged
