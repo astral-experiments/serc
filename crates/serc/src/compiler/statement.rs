@@ -26960,6 +26960,32 @@ impl Compiler<'_> {
                 .is_some_and(|manager| {
                     !manager.is_async && manager.terminal_statement_range == Some(statement.range)
                 });
+        // Inside an exceptional finalizer, the inner POP_BLOCK leaves the outer
+        // cleanup active. Its Pass and skip jump share that original array and
+        // owner; synthetic pass exclusions would split the array before copying.
+        let original_nested_pass_exit = self.context.python_version >= crate::PythonVersion::Py314
+            && !terminal
+            && pass_finally_location.is_some()
+            && !pass_finally_leaves_manager
+            && !preserve_exit_nop
+            && !capture_manager_pop
+            && !statement.is_star
+            && statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && self.control.finally.active_finally_end_blocks == 1
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .len()
+                == 1;
         let overriding_return = matches!(statement.finalbody.last(), Some(Stmt::Return(_)));
         if overriding_return
             && self.control.withs.active_with_region_exclusions.is_empty()
@@ -27611,11 +27637,12 @@ impl Compiler<'_> {
             |compiler| compiler.with_fallthrough_tracking(|compiler| {
             if let Some(location) = pass_finally_location {
                 compiler.assembler.set_location(location);
-                if compiler
-                    .control
-                    .exceptions.active_exception_region_exclusions
-                    .is_empty()
-                    && !pass_finally_leaves_manager
+                if original_nested_pass_exit
+                    || (compiler
+                        .control
+                        .exceptions.active_exception_region_exclusions
+                        .is_empty()
+                        && !pass_finally_leaves_manager)
                 {
                     compiler.emit(NOP, 0, 0)?;
                 } else {
@@ -28006,7 +28033,8 @@ impl Compiler<'_> {
                 && !drop_expression_if_exit_nop
                 && !drop_shared_manager_exit_nop
                 && conditional_exit.is_none();
-            let exception_policy = if pass_finally_location.is_some()
+            let exception_policy = if !original_nested_pass_exit
+                && pass_finally_location.is_some()
                 && (pass_finally_leaves_manager
                     || !self
                         .control
@@ -28305,11 +28333,24 @@ impl Compiler<'_> {
                 // assigns locations before shared continuations are threaded.
                 self.assembler.set_location(SourceLocation::NONE);
             }
-            let normal_exit = self.emit_jump_forward_instruction_with_exception_policy(
-                JUMP_FORWARD,
-                end,
-                exception_policy,
-            )?;
+            let normal_exit = if original_nested_pass_exit {
+                self.assembler.set_location(SourceLocation::NONE);
+                let exit = self.emit_jump_forward_instruction_preserving_nop(
+                    JUMP_FORWARD,
+                    end,
+                    exception_policy,
+                )?;
+                // Retain POP_BLOCK, Pass and the replaced jump until small-exit
+                // copying finishes: appending RERAISE makes exactly four slots.
+                self.assembler.preserve_inlined_jump_nop(exit);
+                exit
+            } else {
+                self.emit_jump_forward_instruction_with_exception_policy(
+                    JUMP_FORWARD,
+                    end,
+                    exception_policy,
+                )?
+            };
             if copied_loop_exit.is_some() {
                 self.assembler.preserve_direct_inlined_jump_nop(normal_exit);
             }

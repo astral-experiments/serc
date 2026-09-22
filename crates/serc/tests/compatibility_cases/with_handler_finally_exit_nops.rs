@@ -89,3 +89,14 @@ fn folded_true_finally_call_drops_redundant_manager_exit() {
         common::assert_matches_cpython_marshal(&source, "folded_true_finally_call.py");
     }
 }
+
+#[test]
+fn matches_cpython_nested_pass_finally_continuation() {
+    for continuation in ["after()", "if other:\n    after()"] {
+        let continuation = continuation.replace('\n', "\n        ");
+        let source = format!(
+            "def example(flag, other):\n    try:\n        yield 1\n    finally:\n        try:\n            if flag:\n                first()\n            else:\n                second()\n        finally:\n            pass\n        {continuation}\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "nested_pass_finally_continuation.py");
+    }
+}
