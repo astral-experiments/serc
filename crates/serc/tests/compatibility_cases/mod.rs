@@ -182,6 +182,7 @@ mod membership_literal_construction;
 mod middle_singleton_comprehensions;
 mod module_annotation_indices;
 mod module_handler_iterator_condition_compatibility;
+mod module_super_symbols;
 mod multi_with_compatibility;
 mod multi_with_terminal_compatibility;
 mod multiline_comprehension_filter_owner_compatibility;

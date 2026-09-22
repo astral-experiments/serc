@@ -1039,7 +1039,12 @@ impl ModulePlan {
         };
         let mut imported_scope_names: NameSet =
             facts.imported_scope_names.drain().map(&name_id).collect();
-        if bindings.seen.contains("super") {
+        // Native super-call specialization requires the module symbol to be absent,
+        // including USE-only references and globals declared by nested scopes.
+        if bindings.seen.contains("super")
+            || bindings.module_references_super == Some(true)
+            || facts.module_globals.contains("super")
+        {
             imported_scope_names.insert(
                 names
                     .get(SHADOWED_SUPER_SENTINEL)
@@ -1125,6 +1130,7 @@ impl ScopeArena {
         let mut bindings = LocalCollector {
             eager_function_annotations: eager_annotations,
             eager_statement_annotations: eager_annotations,
+            module_references_super: Some(false),
             ..LocalCollector::default()
         };
         if requires_module_bindings {
@@ -1494,8 +1500,8 @@ impl<'a, 'ast> ModuleNameCollector<'a, 'ast> {
     }
 
     fn intern(&mut self, name: &str) -> NameId {
-        // A module binding named `super` disables the specialized zero-argument form. Be
-        // conservative about nested/header occurrences so the module-local walk can be skipped
+        // A module symbol named `super` disables specialized super calls. Be conservative
+        // about nested/header occurrences so the module-local walk can be skipped
         // only when the sentinel is definitely irrelevant.
         self.requires_module_bindings |= name == "super";
         if self.private_name.is_none() {
@@ -2008,6 +2014,7 @@ struct LocalCollector {
     ignore_generator_body_comprehension_targets: bool,
     eager_function_annotations: bool,
     eager_statement_annotations: bool,
+    module_references_super: Option<bool>,
     legacy_class_comprehension_symbols: Option<Vec<(Name, bool)>>,
 }
 
@@ -2638,9 +2645,13 @@ impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
         if self.collect_known_loads
             && let Expr::Name(name) = expression
             && name.ctx == ExprContext::Load
-            && !self.ignored_candidate_loads.contains(name.id.as_str())
         {
-            self.collector.insert_candidate(name.id.as_str());
+            if let Some(references_super) = &mut self.collector.module_references_super {
+                *references_super |= name.id.as_str() == "super";
+            }
+            if !self.ignored_candidate_loads.contains(name.id.as_str()) {
+                self.collector.insert_candidate(name.id.as_str());
+            }
         }
         let generators = match expression {
             Expr::ListComp(comprehension) => Some(comprehension.generators.as_slice()),
