@@ -389,6 +389,46 @@ impl Compiler<'_> {
         )
     }
 
+    /// Recognizes the three original records in a direct global-attribute return.
+    pub(super) fn is_direct_global_attribute_return(
+        &self,
+        returned: &ruff_python_ast::StmtReturn,
+    ) -> bool {
+        let Some(Expr::Attribute(attribute)) = returned.value.as_deref() else {
+            return false;
+        };
+        let Expr::Name(name) = attribute.value.as_ref() else {
+            return false;
+        };
+        if name.id.as_str() == "__debug__" || self.unit.annotation_classdict_index.is_some() {
+            return false;
+        }
+        let name = self.required_name_id(name.id.as_str());
+        !self.symbols.active_temporaries.contains(name)
+            && matches!(&self.unit.scope, Scope::Function { indices, free_indices, globals, .. }
+                if globals.contains(name)
+                    || (!indices.contains_key(&name) && !free_indices.contains_key(&name)))
+    }
+
+    /// Admits a four-record subject-pop return whose copied entry has a fixed guard donor.
+    fn can_copy_match_guard_subject_return(
+        &self,
+        pattern: &Pattern,
+        guard: &Expr,
+        body: &[Stmt],
+    ) -> bool {
+        self.context.python_version >= PythonVersion::Py314
+            && matches!(pattern, Pattern::MatchAs(pattern)
+                if pattern.pattern.is_none() && pattern.name.is_some())
+            && matches!(guard, Expr::Compare(comparison)
+                if comparison.ops.len() == 2
+                    && !(matches!(comparison.comparators.last(), Some(Expr::NoneLiteral(_)))
+                        && matches!(comparison.ops.last(), Some(CmpOp::Is | CmpOp::IsNot))))
+            && matches!(body, [Stmt::Return(returned)]
+                if self.is_direct_global_attribute_return(returned))
+            && self.match_guard_subject_return_is_unprotected()
+    }
+
     /// Keeps a returning case's comparison bridge eligible for original-budget exit copying.
     fn compile_match_guard(
         &mut self,
@@ -574,13 +614,18 @@ impl Compiler<'_> {
                             .set_location(self.source_location(case.pattern.range()));
                         self.emit(NOP, 0, 0)?;
                     }
-                    if copied_subject {
-                        // A copied subject begins the return with NEXT_LOCATION. Keep
-                        // its existing bridge policy until exit copying also models
-                        // the replaced jump's location transfer onto that subject pop.
-                        self.compile_jump_if(guard, false, context.fail_pop[0])?;
-                    } else {
+                    if !copied_subject
+                        || self.can_copy_match_guard_subject_return(
+                            &case.pattern,
+                            guard,
+                            &case.body,
+                        )
+                    {
+                        // The assembler transports the original bridge donor only onto an
+                        // intact private copy of the four-record subject-pop return.
                         self.compile_match_guard(guard, &case.body, context.fail_pop[0])?;
+                    } else {
+                        self.compile_jump_if(guard, false, context.fail_pop[0])?;
                     }
                 }
             }

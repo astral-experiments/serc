@@ -9,8 +9,8 @@ use super::super::{
 use crate::assembler::block_graph::{BasicBlockId, BlockGraph, ItemPosition};
 use crate::assembler::exception_owners::ExceptionOwnerProvenance;
 use crate::target::opcodes::{
-    BUILD_TUPLE, CALL, CALL_KW, DELETE_FAST, END_ASYNC_FOR, END_SEND, FOR_ITER, LOAD_CONST,
-    LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL, LOAD_SMALL_INT, NOP, NOT_TAKEN, POP_EXCEPT,
+    BUILD_TUPLE, CALL, CALL_KW, DELETE_FAST, END_ASYNC_FOR, END_SEND, FOR_ITER, LOAD_ATTR,
+    LOAD_CONST, LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL, LOAD_SMALL_INT, NOP, NOT_TAKEN, POP_EXCEPT,
     POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP,
     RAISE_VARARGS, RERAISE, RETURN_VALUE, STORE_ATTR, STORE_FAST, SWAP,
 };
@@ -37,6 +37,76 @@ fn is_four_slot_attribute_store_jump(items: &[Item]) -> bool {
                         && instruction.local_policy.hidden_exception_owner_slots() == 0
                 })
     )
+}
+
+/// Certifies the original comparison bridge and its four-record subject-pop return.
+fn copied_match_guard_subject_donor(
+    source: &[Item],
+    target: &[Item],
+    predecessor: &Instruction,
+    origins: &[(Label, Label, [Instruction; 6])],
+) -> Option<(SourceLocation, [Instruction; 4])> {
+    let target_start = target
+        .iter()
+        .position(|item| matches!(item, Item::Instruction(_)))?;
+    let [
+        Item::Instruction(pop),
+        Item::Instruction(global),
+        Item::Instruction(attribute),
+        Item::Instruction(returned),
+    ] = &target[target_start..]
+    else {
+        return None;
+    };
+    let mut expected_pop = Instruction::new(POP_TOP, Operand::Value(0), pop.location, Some(0));
+    expected_pop.fusion_policy.mark_location_from_next();
+    if *pop != expected_pop
+        || global.opcode != LOAD_GLOBAL
+        || !matches!(global.operand(), Operand::Value(argument) if argument & 1 == 0)
+        || attribute.opcode != LOAD_ATTR
+        || !matches!(attribute.operand(), Operand::Value(argument) if argument & 1 == 0)
+        || returned.opcode != RETURN_VALUE
+        || returned.operand() != Operand::Value(0)
+        || [global, attribute, returned].iter().any(|instruction| {
+            instruction.location.line < 0
+                || **instruction
+                    != Instruction::new(
+                        instruction.opcode,
+                        instruction.operand(),
+                        instruction.location,
+                        Some(u32::from(instruction.opcode != RETURN_VALUE)),
+                    )
+        })
+    {
+        return None;
+    }
+    let source_start = source
+        .iter()
+        .position(|item| matches!(item, Item::Instruction(_)))?;
+    let [Item::Instruction(marker), Item::Instruction(bridge)] = &source[source_start..] else {
+        return None;
+    };
+    if bridge.location.line < 0
+        || !bridge.jump_policy.inline_small_exit()
+        || bridge.jump_policy.retained_nop() != super::super::ir::RetainedJumpNop::Always
+        || bridge.location != predecessor.location
+        || marker.location != bridge.location
+        || bridge.depth_after() != Some(1)
+        || marker.depth_after() != Some(1)
+        || predecessor.depth_after() != Some(1)
+    {
+        return None;
+    }
+    origins
+        .iter()
+        .any(|(_, end, records)| {
+            records[1] == *predecessor
+                && records[2] == *marker
+                && records[3] == *bridge
+                && bridge.operand() == Operand::Forward(*end)
+                && target[..target_start].contains(&Item::Label(*end))
+        })
+        .then_some((bridge.location, [*pop, *global, *attribute, *returned]))
 }
 
 /// Retains exactly the incoming-edge information used by original-line propagation.
@@ -5935,6 +6005,41 @@ impl OptimizationPipeline {
                     .iter()
                     .position(|item| matches!(item, Item::Instruction(_)))
                     .unwrap_or(copied.len());
+                if self.python_version >= crate::PythonVersion::Py314
+                    && inline_small_exit
+                    && !planned_copy
+                    && target_pre_fusion_size == 4
+                    && target_chain_end == target_position
+                    && inline_unprotected_return
+                    && let Some(predecessor) = source_position
+                        .checked_sub(1)
+                        .and_then(|position| order.get(position))
+                        .and_then(|block| graph[*block].last_instruction())
+                    && let Some((donor, original)) = copied_match_guard_subject_donor(
+                        graph[source].items(),
+                        graph[target].items(),
+                        predecessor,
+                        &self
+                            .exception_owner_provenance
+                            .original_comparison_fallthroughs,
+                    )
+                    && let [
+                        Item::Instruction(pop),
+                        Item::Instruction(global),
+                        Item::Instruction(attribute),
+                        Item::Instruction(returned),
+                    ] = &mut copied[position..]
+                    && [*pop, *global, *attribute, *returned] == original
+                {
+                    // Native NOP cleanup transfers the replaced bridge's guard span to
+                    // POP_TOP(NEXT_LOCATION). For this intact private copy the intervening
+                    // passes cannot observe the projection: no internal edges, local loads,
+                    // folds or owner state exist. Keep the physical NOP below, so repeated
+                    // exit copying still sees all five original records. The source POP
+                    // remains NEXT_LOCATION and resolves against its own return expression.
+                    pop.location = donor;
+                    pop.fusion_policy.clear_location_from_next();
+                }
                 let mut marker =
                     Instruction::synthetic(NOP, Operand::Value(0), source_location, None);
                 if copied_return_crosses_empty_join {
@@ -8250,6 +8355,127 @@ mod percent_prefix_setup_tests {
                 },
                 "{mutation}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod copied_match_guard_subject_tests {
+    use super::*;
+
+    #[test]
+    fn donor_requires_original_guard_bridge_and_exact_four_record_return() {
+        let guard = SourceLocation::new(3, 3, 20, 40);
+        let body = SourceLocation::new(4, 4, 12, 30);
+        let cleanup = Label(1);
+        let end = Label(2);
+        let condition = Instruction::new(
+            POP_JUMP_IF_FALSE,
+            Operand::Forward(Label(3)),
+            guard,
+            Some(1),
+        );
+        let marker = Instruction::new(NOT_TAKEN, Operand::Value(0), guard, Some(1));
+        let mut bridge = Instruction::new(JUMP_FORWARD, Operand::Forward(end), guard, Some(1));
+        bridge.jump_policy.retain_nop();
+        let failure =
+            Instruction::new(POP_JUMP_IF_FALSE, Operand::Forward(cleanup), guard, Some(2));
+        let cleanup_pop = Instruction::new(POP_TOP, Operand::Value(0), guard, Some(1));
+        let cleanup_jump =
+            Instruction::new(JUMP_FORWARD, Operand::Forward(Label(3)), guard, Some(1));
+        let mut subject = Instruction::new(POP_TOP, Operand::Value(0), body, Some(0));
+        subject.fusion_policy.mark_location_from_next();
+        for mutation in 0..12 {
+            let mut source = vec![
+                Item::Label(Label(0)),
+                Item::Instruction(marker),
+                Item::Instruction(bridge),
+            ];
+            let mut target = vec![
+                Item::Label(end),
+                Item::Instruction(subject),
+                Item::Instruction(Instruction::new(
+                    LOAD_GLOBAL,
+                    Operand::Value(0),
+                    body,
+                    Some(1),
+                )),
+                Item::Instruction(Instruction::new(
+                    LOAD_ATTR,
+                    Operand::Value(0),
+                    body,
+                    Some(1),
+                )),
+                Item::Instruction(Instruction::new(
+                    RETURN_VALUE,
+                    Operand::Value(0),
+                    body,
+                    Some(0),
+                )),
+            ];
+            let mut predecessor = condition;
+            let mut origins = vec![(
+                cleanup,
+                end,
+                [
+                    failure,
+                    condition,
+                    marker,
+                    bridge,
+                    cleanup_pop,
+                    cleanup_jump,
+                ],
+            )];
+            match mutation {
+                1 => origins.clear(),
+                2 => predecessor.location = body,
+                3 => target[0] = Item::Label(Label(99)),
+                4 => target.insert(3, Item::Label(Label(99))),
+                5 => target.insert(
+                    3,
+                    Item::Instruction(Instruction::new(NOP, Operand::Value(0), body, Some(1))),
+                ),
+                6 => {
+                    let mut changed = subject;
+                    changed.fusion_policy.clear_location_from_next();
+                    target[1] = Item::Instruction(changed);
+                }
+                7 => {
+                    let mut changed = subject;
+                    changed.local_policy.add_hidden_exception_owner_slots(1);
+                    target[1] = Item::Instruction(changed);
+                }
+                8 => {
+                    target[2] = Item::Instruction(Instruction::new(
+                        LOAD_GLOBAL,
+                        Operand::Value(1),
+                        body,
+                        Some(1),
+                    ));
+                }
+                9 => {
+                    target[3] = Item::Instruction(Instruction::new(
+                        LOAD_ATTR,
+                        Operand::Value(1),
+                        body,
+                        Some(1),
+                    ));
+                }
+                10 => source.insert(2, Item::Label(Label(99))),
+                11 => {
+                    let mut changed = bridge;
+                    changed.jump_policy.prevent_small_exit_inlining();
+                    source[2] = Item::Instruction(changed);
+                }
+                _ => {}
+            }
+            let donor = copied_match_guard_subject_donor(&source, &target, &predecessor, &origins);
+            assert_eq!(donor.is_some(), mutation == 0, "mutation {mutation}");
+            if let Some((location, records)) = donor {
+                assert_eq!(location, guard);
+                assert_eq!(records[0], subject);
+                assert!(records[0].fusion_policy.location_from_next());
+            }
         }
     }
 }

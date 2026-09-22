@@ -6330,9 +6330,13 @@ impl Assembler {
         true
     }
 
-    /// Retains the empty final-pattern block before copying an unprotected literal return.
+    /// Retains the empty final-pattern block before copying a small unprotected return.
     /// The caller must exclude loops and cleanup suites and require directly returning cases.
-    pub(crate) fn preserve_final_match_failure_return_join(&mut self, emitted: EmittedJump) {
+    pub(crate) fn preserve_final_match_failure_return_join(
+        &mut self,
+        emitted: EmittedJump,
+        guard_location: Option<SourceLocation>,
+    ) {
         let jump = *self.emitted_jump_mut(emitted, "retaining a final match failure join");
         if jump.opcode != JUMP_FORWARD
             || !matches!(jump.operand(), Operand::Forward(_))
@@ -6373,9 +6377,10 @@ impl Assembler {
         let (Some(condition), None) = (incoming.next(), incoming.next()) else {
             return;
         };
+        let donor = guard_location.unwrap_or(jump.location);
         if condition.opcode != POP_JUMP_IF_FALSE
             || !matches!(condition.operand(), Operand::Forward(_))
-            || condition.location != jump.location
+            || condition.location != donor
             || condition.pre_fold_extra_instructions() != 0
         {
             return;
@@ -6384,6 +6389,9 @@ impl Assembler {
         // the outer branch jump. This actual conditional target starts its own
         // block; the preceding return excludes fallthrough into the empty join.
         let jump = self.emitted_jump_mut(emitted, "retaining a final match failure join");
+        // The final guard is this original empty block's sole predecessor. Native
+        // line propagation supplies the retained NOP span after early exit copying.
+        jump.location = donor;
         jump.jump_policy.mark_original_empty_join();
         jump.jump_policy.retain_redundant_nop_after_threading();
         jump.jump_policy.prevent_threading_target();

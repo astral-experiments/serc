@@ -660,6 +660,8 @@ pub(super) struct StatementState {
     // Whether that successor is a direct literal return. CPython can copy this small exit onto
     // the normal edge of a preceding try/else before retaining the edge as a source NOP.
     current_statement_followed_by_literal_return: bool,
+    // A direct global attribute load and return form a three-record match continuation.
+    current_statement_followed_by_global_attribute_return: bool,
     // Whether the following folded tuple return still needs its iterator-break jump.
     // Two literal elements fit the original four-slot exit-copy budget.
     current_statement_followed_by_tuple_return: bool,
@@ -2202,6 +2204,10 @@ impl Compiler<'_> {
                     Some(Stmt::Return(statement))
                         if statement.value.as_deref().is_none_or(is_literal_constant)
                 );
+                let followed_by_global_attribute_return = matches!(
+                    body.get(index + 1),
+                    Some(Stmt::Return(returned)) if self.is_direct_global_attribute_return(returned)
+                );
                 let followed_by_sync_with_return = match (statement, body.get(index + 1)) {
                     (Stmt::With(with), Some(Stmt::Return(statement))) if !with.is_async => {
                         statement
@@ -2478,6 +2484,14 @@ impl Compiler<'_> {
                         .current_statement_followed_by_literal_return,
                     followed_by_literal_return,
                 );
+                let previous_current_statement_followed_by_global_attribute_return =
+                    std::mem::replace(
+                        &mut self
+                            .control
+                            .statements
+                            .current_statement_followed_by_global_attribute_return,
+                        followed_by_global_attribute_return,
+                    );
                 let previous_current_statement_followed_by_tuple_return = std::mem::replace(
                     &mut self
                         .control
@@ -2547,6 +2561,10 @@ impl Compiler<'_> {
                     .statements
                     .current_statement_followed_by_literal_return =
                     previous_current_statement_followed_by_literal_return;
+                self.control
+                    .statements
+                    .current_statement_followed_by_global_attribute_return =
+                    previous_current_statement_followed_by_global_attribute_return;
                 self.control
                     .statements
                     .current_statement_followed_by_name_return =
@@ -12875,13 +12893,18 @@ impl Compiler<'_> {
                         } else {
                             self.assembler.preserve_direct_inlined_jump_nop(branch_exit);
                         }
-                    } else if branch_index == 0
-                        && matches!(self.unit.scope, Scope::Function { .. })
-                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    } else if ((branch_index == 0
                         && self
                             .control
                             .statements
-                            .current_statement_followed_by_literal_return
+                            .current_statement_followed_by_literal_return)
+                        || (self.context.python_version >= crate::PythonVersion::Py314
+                            && self
+                                .control
+                                .statements
+                                .current_statement_followed_by_global_attribute_return))
+                        && matches!(self.unit.scope, Scope::Function { .. })
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                         && self.control.loops.contexts.is_empty()
                         && self.control.withs.active_with_exits.is_empty()
                         && self.control.withs.active_with_region_exclusions.is_empty()
@@ -12915,16 +12938,34 @@ impl Compiler<'_> {
                         && condition_has_only_runtime_tests(&statement.test)
                         && matches!(body, [Stmt::Match(matched)]
                         if matched.cases.len() > 1
-                            && matched.cases.iter().all(|case| {
-                                case.guard.is_none()
-                                    && matches!(case.pattern, Pattern::MatchValue(_))
-                                    && matches!(case.body.as_slice(), [Stmt::Return(_)])
-                            }))
+                            && ((branch_index == 0
+                                && self.control.statements.current_statement_followed_by_literal_return
+                                && matched.cases.iter().all(|case| {
+                                    case.guard.is_none()
+                                        && matches!(case.pattern, Pattern::MatchValue(_))
+                                        && matches!(case.body.as_slice(), [Stmt::Return(_)])
+                                }))
+                                || (self.context.python_version >= crate::PythonVersion::Py314
+                                    && self.control.statements.current_statement_followed_by_global_attribute_return
+                                    && matched.cases.iter().all(|case| {
+                                        case.guard.is_some()
+                                            && matches!(&case.pattern, Pattern::MatchAs(pattern)
+                                                if pattern.pattern.is_none() && pattern.name.is_some())
+                                            && matches!(case.body.as_slice(), [Stmt::Return(_)])
+                                    }))))
                     {
-                        // Only the final pattern can enter this empty join. The following
-                        // literal return fits CPython's small-exit copy without cleanup.
+                        // Only the final pattern or guard can enter this empty join. The
+                        // following literal or global-attribute return fits the native budget.
+                        let guard_location = match body {
+                            [Stmt::Match(matched)] => matched
+                                .cases
+                                .last()
+                                .and_then(|case| case.guard.as_deref())
+                                .map(|guard| self.source_location(guard.range())),
+                            _ => None,
+                        };
                         self.assembler
-                            .preserve_final_match_failure_return_join(branch_exit);
+                            .preserve_final_match_failure_return_join(branch_exit, guard_location);
                     } else if matches!(body.last(), Some(Stmt::Match(matched))
                     if matched.cases.len() > 1
                         && matched.cases.last().is_some_and(|case| {
@@ -13511,6 +13552,18 @@ impl Compiler<'_> {
                 .assembler
                 .current_original_block_pre_fusion_instruction_count()
                 == 0
+    }
+
+    /// Excludes cleanup and suspended scopes from copied match-subject return donation.
+    pub(super) fn match_guard_subject_return_is_unprotected(&self) -> bool {
+        self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && !self.has_active_control_flow_region()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_overriding_finally_returns == 0
     }
 
     fn has_active_control_flow_region(&self) -> bool {
