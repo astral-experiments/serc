@@ -284,10 +284,7 @@ impl Compiler<'_> {
                     let index = self.name_index_with_id(name, name_id)?;
                     return self.emit(LOAD_GLOBAL, index << 1, 1);
                 }
-                let local_index = indices.get(&name_id).copied();
-                if local_index.is_some()
-                    && let Some(index) = free_indices.get(&name_id).copied()
-                {
+                if let Some(index) = free_indices.get(&name_id).copied() {
                     // An inlined comprehension can use a temporary fast-local slot with the
                     // same spelling as a free variable. Outside the comprehension, resolve the
                     // name through the closure.
@@ -299,7 +296,7 @@ impl Compiler<'_> {
                     }
                     return self.emit(LOAD_DEREF, index, 1);
                 }
-                if let Some(index) = local_index {
+                if let Some(index) = indices.get(&name_id).copied() {
                     if cells.contains(name_id) {
                         if let Some(classdict) = annotation_classdict_index
                             && name != "__classdict__"
@@ -324,15 +321,6 @@ impl Compiler<'_> {
                         Ok(())
                     } else {
                         self.emit(LOAD_FAST_CHECK, index, 1)
-                    }
-                } else if let Some(index) = free_indices.get(&name_id).copied() {
-                    if let Some(classdict) = annotation_classdict_index
-                        && name != "__classdict__"
-                    {
-                        self.emit(LOAD_DEREF, classdict, 1)?;
-                        self.emit(LOAD_FROM_DICT_OR_DEREF, index, 0)
-                    } else {
-                        self.emit(LOAD_DEREF, index, 1)
                     }
                 } else {
                     if let Some(classdict) = annotation_classdict_index {
