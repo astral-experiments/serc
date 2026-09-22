@@ -19,7 +19,7 @@ use crate::code_object::{CodeInterningSummary, CodeObject, CompilationInterningE
 
 use super::constant::{
     constant_slice_with_literals, explicit_surrogate_string, fold_constant,
-    fold_constant_with_literals, is_literal_constant, literal_constant,
+    fold_constant_for_version, fold_constant_with_literals, is_literal_constant, literal_constant,
 };
 use super::scope::{ModulePlan, ScopeArena};
 use super::symbol::mangle_name;
@@ -191,7 +191,7 @@ impl<'source> CompilationContext<'source> {
             generated_mangled_strings,
             requires_interning_trace,
             requires_empty_bytes_cache_trace: python_version >= crate::PythonVersion::Py314
-                && suite_folds_empty_bytes(body),
+                && suite_folds_empty_bytes(body, python_version),
             empty_bytes_origin: Cell::new(0),
             interning_events: RefCell::new(Vec::new()),
         }
@@ -767,30 +767,35 @@ fn parser_interned_strings(
     visitor.origins
 }
 
-fn suite_folds_empty_bytes(body: &Suite) -> bool {
-    #[derive(Default)]
-    struct EmptyBytesFold(bool);
+fn suite_folds_empty_bytes(body: &Suite, python_version: crate::PythonVersion) -> bool {
+    struct EmptyBytesFold {
+        found: bool,
+        python_version: crate::PythonVersion,
+    }
 
     impl<'a> Visitor<'a> for EmptyBytesFold {
         fn visit_expr(&mut self, expression: &'a Expr) {
-            if self.0 {
+            if self.found {
                 return;
             }
             if matches!(expression, Expr::BinOp(binary) if binary.op == Operator::Mult)
-                && matches!(fold_constant(expression), Some(Constant::Bytes(value)) if value.is_empty())
+                && matches!(fold_constant_for_version(expression, self.python_version), Some(Constant::Bytes(value)) if value.is_empty())
             {
-                self.0 = true;
+                self.found = true;
             } else {
                 walk_expr(self, expression);
             }
         }
     }
 
-    let mut visitor = EmptyBytesFold::default();
+    let mut visitor = EmptyBytesFold {
+        found: false,
+        python_version,
+    };
     for statement in body {
         visitor.visit_stmt(statement);
     }
-    visitor.0
+    visitor.found
 }
 
 impl Compiler<'_> {
@@ -1106,7 +1111,12 @@ impl Compiler<'_> {
             }
             _ => literal_constant(expression),
         };
-        fold_constant_with_literals(expression, self.context.python_version, &literal)
+        fold_constant_with_literals(
+            expression,
+            self.context.python_version,
+            &literal,
+            self.context.python_version >= crate::PythonVersion::Py314,
+        )
     }
 
     pub(super) fn source_aware_constant_slice(
@@ -1499,45 +1509,69 @@ fn last_store_target_range(
     }
 }
 
-pub(super) fn statement_execution_range(statement: &Stmt) -> ruff_text_size::TextRange {
+pub(super) fn statement_execution_range(
+    statement: &Stmt,
+    python_version: crate::PythonVersion,
+) -> ruff_text_size::TextRange {
     match statement {
-        Stmt::Assign(statement) => first_expression_instruction_range(&statement.value),
+        Stmt::Assign(statement) => {
+            first_expression_instruction_range(&statement.value, python_version)
+        }
         Stmt::AnnAssign(statement) => statement
             .value
             .as_deref()
-            .map_or(statement.range, first_expression_instruction_range),
-        Stmt::AugAssign(statement) => first_expression_instruction_range(&statement.target),
-        Stmt::Expr(statement) => first_expression_instruction_range(&statement.value),
-        Stmt::If(statement) => first_expression_instruction_range(&statement.test),
+            .map_or(statement.range, |expression| {
+                first_expression_instruction_range(expression, python_version)
+            }),
+        Stmt::AugAssign(statement) => {
+            first_expression_instruction_range(&statement.target, python_version)
+        }
+        Stmt::Expr(statement) => {
+            first_expression_instruction_range(&statement.value, python_version)
+        }
+        Stmt::If(statement) => first_expression_instruction_range(&statement.test, python_version),
         Stmt::Return(statement) => statement
             .value
             .as_deref()
-            .map_or(statement.range, first_expression_instruction_range),
+            .map_or(statement.range, |expression| {
+                first_expression_instruction_range(expression, python_version)
+            }),
         _ => statement.range(),
     }
 }
 
-pub(super) fn first_expression_instruction_range(expression: &Expr) -> ruff_text_size::TextRange {
+pub(super) fn first_expression_instruction_range(
+    expression: &Expr,
+    python_version: crate::PythonVersion,
+) -> ruff_text_size::TextRange {
     if matches!(
         expression,
         Expr::BinOp(_) | Expr::Name(_) | Expr::UnaryOp(_) | Expr::Tuple(_)
-    ) && fold_constant(expression).is_some()
+    ) && fold_constant_for_version(expression, python_version).is_some()
     {
         return expression.range();
     }
     match expression {
-        Expr::Attribute(attribute) => first_expression_instruction_range(&attribute.value),
-        Expr::BinOp(binary) => first_expression_instruction_range(&binary.left),
+        Expr::Attribute(attribute) => {
+            first_expression_instruction_range(&attribute.value, python_version)
+        }
+        Expr::BinOp(binary) => first_expression_instruction_range(&binary.left, python_version),
         Expr::BoolOp(boolean) => boolean
             .values
             .first()
-            .map_or(expression.range(), first_expression_instruction_range),
-        Expr::Call(call) => first_expression_instruction_range(&call.func),
-        Expr::Compare(compare) => first_expression_instruction_range(&compare.left),
-        Expr::If(conditional) => first_expression_instruction_range(&conditional.test),
-        Expr::Named(named) => first_expression_instruction_range(&named.value),
-        Expr::Subscript(subscript) => first_expression_instruction_range(&subscript.value),
-        Expr::UnaryOp(unary) => first_expression_instruction_range(&unary.operand),
+            .map_or(expression.range(), |expression| {
+                first_expression_instruction_range(expression, python_version)
+            }),
+        Expr::Call(call) => first_expression_instruction_range(&call.func, python_version),
+        Expr::Compare(compare) => first_expression_instruction_range(&compare.left, python_version),
+        Expr::If(conditional) => {
+            first_expression_instruction_range(&conditional.test, python_version)
+        }
+        Expr::Named(named) => first_expression_instruction_range(&named.value, python_version),
+        Expr::Subscript(subscript) => {
+            first_expression_instruction_range(&subscript.value, python_version)
+        }
+        Expr::UnaryOp(unary) => first_expression_instruction_range(&unary.operand, python_version),
         _ => expression.range(),
     }
 }
