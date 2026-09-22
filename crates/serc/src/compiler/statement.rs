@@ -20035,23 +20035,6 @@ impl Compiler<'_> {
             let body_ends_with_overridden_return =
                 self.control.finally.active_overriding_finally_returns > 0
                     && matches!(statement.body.last(), Some(Stmt::Return(_)));
-            let exit_exclusion_start = if !self
-                .control
-                .exceptions
-                .active_exception_region_exclusions
-                .is_empty()
-                && (body_ends_with_overridden_return
-                    || (body_noop_location.is_some()
-                        && self.context.python_version >= crate::PythonVersion::Py314
-                        && (self.control.finally.active_overriding_finally_returns > 0
-                            || !self.control.exceptions.prevent_try_exit_inlining)))
-            {
-                let start = self.assembler.label();
-                self.assembler.mark(start);
-                Some(start)
-            } else {
-                None
-            };
             // A pass-only nested try leaves an ownerless exit NOP unless the enclosing region
             // is the synthetic protected body of try/finally.
             let exclude_nested_normal_exit = nested_in_final_outer_try_statement
@@ -20060,12 +20043,6 @@ impl Compiler<'_> {
                     .finally
                     .active_pass_finally_locations
                     .is_empty();
-            let trailing_handler_exit_exclusion_start =
-                trailing_fallthrough_handler_try.then(|| {
-                    let start = self.assembler.label();
-                    self.assembler.mark(start);
-                    start
-                });
             // When every handler exits, an empty body leading directly to its own finally
             // retains its unowned POP_BLOCK marker. Other shared or enclosing-region exits
             // retain the normal jump's exception owner.
@@ -20087,6 +20064,31 @@ impl Compiler<'_> {
             } else {
                 ExceptionPolicy::default()
             };
+            let exit_exclusion_start = if !self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+                && (body_ends_with_overridden_return
+                    || (body_noop_location.is_some()
+                        && self.context.python_version >= crate::PythonVersion::Py314
+                        && (self.control.finally.active_overriding_finally_returns > 0
+                            || ((pass_only_handlers
+                                || exception_policy == ExceptionPolicy::EXCLUDE_ALWAYS)
+                                && !self.control.exceptions.prevent_try_exit_inlining))))
+            {
+                let start = self.assembler.label();
+                self.assembler.mark(start);
+                Some(start)
+            } else {
+                None
+            };
+            let trailing_handler_exit_exclusion_start =
+                trailing_fallthrough_handler_try.then(|| {
+                    let start = self.assembler.label();
+                    self.assembler.mark(start);
+                    start
+                });
             // The nested recovery's cold join does not empty this normal source:
             // its original CALL/POP_TOP survives before the jump, and the jump's
             // own finally array begins with runtime work. Borrowing still checks

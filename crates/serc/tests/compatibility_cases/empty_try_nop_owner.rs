@@ -73,3 +73,21 @@ fn empty_try_cleanup_copies_retain_outer_handler_owners() {
         }
     }
 }
+
+#[test]
+fn empty_try_nop_retains_enclosing_finally_owner() {
+    for handler in ["except:", "except Error:", "except Error as error:"] {
+        for action in ["return None", "raise"] {
+            for continuation in ["with manager:\n    pass", "work(value, value, value)"] {
+                for cleanup in ["pass", "cleanup()"] {
+                    let body = format!("try:\n    pass\n{handler}\n    {action}\n{continuation}\n");
+                    let source = format!(
+                        "def operation():\n    try:\n{}    finally:\n        {cleanup}\n",
+                        common::indent(&common::indent(&body))
+                    );
+                    common::assert_matches_cpython_marshal(&source, "empty_try_finally_owner.py");
+                }
+            }
+        }
+    }
+}
