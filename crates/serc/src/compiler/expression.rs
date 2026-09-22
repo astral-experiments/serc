@@ -39,9 +39,9 @@ use crate::{CompileError, PythonVersion};
 
 use super::constant::{
     PercentFormatPart, explicit_surrogate_string, first_literal_constant, fold_constant,
-    folded_bool_operand, folded_constant_owner_slots, is_small_literal_tuple_element,
-    number_constant, optimized_percent_format, python_constant_values_equal,
-    two_element_slice_optimization,
+    fold_constant_for_version, folded_bool_operand, folded_constant_owner_slots,
+    is_small_literal_tuple_element, number_constant, optimized_percent_format,
+    python_constant_values_equal, two_element_slice_optimization,
 };
 use super::scope::{
     LoweringFunctionPlan, NameId, NameSet, analyze_lambda_scope,
@@ -416,7 +416,8 @@ impl Compiler<'_> {
             !terminal && self.control.statements.current_statement_has_following;
         if self.context.python_version >= PythonVersion::Py314
             && matches!(statement.subject.as_ref(), Expr::Tuple(_))
-            && let Some(constant) = fold_constant(&statement.subject)
+            && let Some(constant) =
+                fold_constant_for_version(&statement.subject, self.context.python_version)
         {
             self.record_folded_operands(&statement.subject)?;
             if self.output.constants.is_empty()
@@ -565,7 +566,10 @@ impl Compiler<'_> {
                         && is_wildcard_pattern(&case.pattern)
                         && self.source_location(case.pattern.range()).line
                             != self
-                                .source_location(first_expression_instruction_range(guard))
+                                .source_location(first_expression_instruction_range(
+                                    guard,
+                                    self.context.python_version,
+                                ))
                                 .line
                     {
                         // CPython replaces the wildcard's COPY/POP_TOP pair with NOPs.
@@ -590,7 +594,10 @@ impl Compiler<'_> {
                         self.source_location(case.pattern.range())
                     } else {
                         case.body.first().map_or(SourceLocation::NONE, |statement| {
-                            self.source_location(statement_execution_range(statement))
+                            self.source_location(statement_execution_range(
+                                statement,
+                                self.context.python_version,
+                            ))
                         })
                     };
                     self.assembler.set_location(location);
@@ -870,7 +877,11 @@ impl Compiler<'_> {
                         }
                         let subject_pop_is_optimized_away = !copied_subject
                             && context.stores.is_empty()
-                            && fold_constant(&statement.subject).is_some();
+                            && fold_constant_for_version(
+                                &statement.subject,
+                                self.context.python_version,
+                            )
+                            .is_some();
                         let previous_instruction_covers_branch = context.fail_pop.is_empty()
                             && !subject_pop_is_optimized_away
                             && body_previous_location.is_some_and(|location| {
@@ -1367,7 +1378,9 @@ impl Compiler<'_> {
             .set_location(self.source_location(pattern.range()));
         match pattern {
             Pattern::MatchValue(pattern) => {
-                if let Some(constant) = fold_constant(&pattern.value) {
+                if let Some(constant) =
+                    fold_constant_for_version(&pattern.value, self.context.python_version)
+                {
                     self.emit_preprocessed_constant(&pattern.value, constant)?;
                 } else {
                     self.compile_expression(&pattern.value)?;
@@ -1789,7 +1802,7 @@ impl Compiler<'_> {
             && let Some(keys) = pattern
                 .keys
                 .iter()
-                .map(fold_constant)
+                .map(|value| fold_constant_for_version(value, self.context.python_version))
                 .collect::<Option<Vec<_>>>()
         {
             // Pattern literals are folded by AST optimization before code generation.
@@ -3507,7 +3520,7 @@ impl Compiler<'_> {
             {
                 positional_defaults
                     .iter()
-                    .map(|default| fold_constant(default))
+                    .map(|default| fold_constant_for_version(default, self.context.python_version))
                     .collect::<Option<Vec<_>>>()
             } else {
                 None
@@ -3515,7 +3528,8 @@ impl Compiler<'_> {
             if let Some(defaults) = folded_defaults {
                 let mut hidden_owner_slots = positional_defaults.len();
                 for default in &positional_defaults {
-                    hidden_owner_slots += folded_constant_owner_slots(default);
+                    hidden_owner_slots +=
+                        folded_constant_owner_slots(default, self.context.python_version);
                 }
                 for default in &positional_defaults {
                     self.record_folded_value(default)?;
@@ -6102,7 +6116,11 @@ impl Compiler<'_> {
                 }
                 self.assembler.set_location(collection_location);
                 self.emit_collection_constant(Constant::Tuple(constants))?;
-                let hidden_owner_slots = folded_elements_owner_slots(elements, elements.len());
+                let hidden_owner_slots = folded_elements_owner_slots(
+                    self.context.python_version,
+                    elements,
+                    elements.len(),
+                );
                 self.assembler
                     .add_last_constant_fold_slots(hidden_owner_slots);
                 // Nested literal tuples remove their own loads and builds from this array.
@@ -6162,7 +6180,11 @@ impl Compiler<'_> {
                     1,
                     -1,
                 )?;
-                let hidden_owner_slots = folded_elements_owner_slots(elements, elements.len() - 2);
+                let hidden_owner_slots = folded_elements_owner_slots(
+                    self.context.python_version,
+                    elements,
+                    elements.len() - 2,
+                );
                 self.assembler
                     .add_last_constant_fold_slots(hidden_owner_slots);
                 let scalar_literal = |element: &Expr| {
@@ -6232,6 +6254,7 @@ impl Compiler<'_> {
             self.emit(kind.extend_opcode(), 1, -1)?;
             self.assembler
                 .add_last_constant_fold_slots(folded_elements_owner_slots(
+                    self.context.python_version,
                     &elements[..unpacking_start],
                     if elements.len() <= 30 {
                         unpacking_start.saturating_sub(2)
@@ -6300,6 +6323,7 @@ impl Compiler<'_> {
                     self.emit_collection_constant(Constant::Tuple(constants))?;
                     self.assembler
                         .add_last_constant_fold_slots(folded_elements_owner_slots(
+                            self.context.python_version,
                             &list.elts,
                             if list.elts.len() <= 30 {
                                 list.elts.len()
@@ -6345,6 +6369,7 @@ impl Compiler<'_> {
                 self.emit_collection_constant(constant)?;
                 self.assembler
                     .add_last_constant_fold_slots(folded_elements_owner_slots(
+                        self.context.python_version,
                         &set.elts,
                         if set.elts.len() <= 30 {
                             set.elts.len()
@@ -7083,7 +7108,7 @@ impl Compiler<'_> {
             let is_last = index + 1 == expression.values.len();
             if short_circuited {
                 self.pre_register_expression_names(value)?;
-                if fold_constant(value).is_some() {
+                if fold_constant_for_version(value, self.context.python_version).is_some() {
                     self.record_folded_value(value)?;
                 }
                 continue;
@@ -7096,7 +7121,8 @@ impl Compiler<'_> {
                     short_circuited = true;
                 } else {
                     self.record_folded_value(value)?;
-                    folded_prefix |= index == 0 && fold_constant(value).is_some();
+                    folded_prefix |= index == 0
+                        && fold_constant_for_version(value, self.context.python_version).is_some();
                 }
                 continue;
             }
@@ -9063,11 +9089,15 @@ pub(super) fn literal_truthiness(expression: &Expr) -> Option<bool> {
     }
 }
 
-fn folded_elements_owner_slots(elements: &[Expr], structural_slots: usize) -> usize {
+fn folded_elements_owner_slots(
+    python_version: PythonVersion,
+    elements: &[Expr],
+    structural_slots: usize,
+) -> usize {
     structural_slots
         + elements
             .iter()
-            .map(folded_constant_owner_slots)
+            .map(|element| folded_constant_owner_slots(element, python_version))
             .sum::<usize>()
 }
 
