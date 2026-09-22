@@ -4428,6 +4428,68 @@ impl Assembler {
         })
     }
 
+    /// Recognizes a zero-pop match failure sharing an empty join with cleanup fallthrough.
+    pub(crate) fn at_shared_match_failure_join(&self) -> bool {
+        if !self.at_original_match_join() {
+            return false;
+        }
+        let items = self.linear_items();
+        let labels = items
+            .iter()
+            .rev()
+            .map_while(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let Some(before) = items.len().checked_sub(labels.len() + 1) else {
+            return false;
+        };
+        let Item::Instruction(pop) = &items[before] else {
+            return false;
+        };
+        if pop.opcode != POP_TOP
+            || pop.location.line < 0
+            || pop.depth_after().is_none()
+            || *pop != Instruction::new(POP_TOP, Operand::Value(0), pop.location, pop.depth_after())
+            || self.join_labels_have_authored_location(&labels)
+            || labels.iter().any(|label| {
+                self.exception_owner_provenance
+                    .omitted_nop_counts
+                    .contains_key(label)
+                    || self
+                        .exception_owner_provenance
+                        .omitted_nop_locations
+                        .contains_key(label)
+            })
+        {
+            return false;
+        }
+        let mut conditions = items.iter().filter_map(|item| match item {
+            Item::Instruction(instruction)
+                if is_conditional_jump(instruction.opcode)
+                    && matches!(instruction.operand(), Operand::Forward(label) if labels.contains(&label)) => Some(*instruction),
+            _ => None,
+        });
+        let Some(condition) = conditions.next() else {
+            return false;
+        };
+        conditions.next().is_none()
+            && matches!(
+                condition.opcode,
+                POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
+            )
+            && condition.location.line >= 0
+            && condition.depth_after() == pop.depth_after()
+            && condition
+                == Instruction::new(
+                    condition.opcode,
+                    condition.operand(),
+                    condition.location,
+                    condition.depth_after(),
+                )
+    }
+
     /// Records the source-authored match end until its first instruction is emitted.
     pub(crate) fn mark_original_match_join(&mut self, label: Label) {
         let items = self.linear_items();

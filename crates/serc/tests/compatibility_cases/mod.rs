@@ -742,4 +742,5 @@ mod multiline_match_swap_nops;
 
 mod loop_else_join_locations;
 mod mapping_wildcard_swaps;
+mod match_failure_loop_backedge;
 mod match_store_fusion;

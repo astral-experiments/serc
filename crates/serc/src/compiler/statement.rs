@@ -15857,7 +15857,22 @@ impl Compiler<'_> {
                     .assembler
                     .emitted_region_has_final_fallthrough(arm_start);
             if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
-                if let Some(range) = suite_match_failure_range(body) {
+                let shared_match_failure = self.context.python_version
+                    >= crate::PythonVersion::Py314
+                    && test.is_some()
+                    && !try_body_normal_exit
+                    && matches!(self.unit.scope, Scope::Function { .. })
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && !self.has_active_control_flow_region()
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_overriding_finally_returns == 0
+                    && self.assembler.at_shared_match_failure_join();
+                if shared_match_failure {
+                    self.assembler.set_location(SourceLocation::NONE);
+                } else if let Some(range) = suite_match_failure_range(body) {
                     self.assembler.set_location(self.source_location(range));
                 } else if let Some(Stmt::Pass(statement)) = body.last() {
                     self.assembler
@@ -15878,7 +15893,17 @@ impl Compiler<'_> {
                     self.assembler
                         .set_location(self.source_location(statement.range()));
                 }
-                self.emit_loop_tail_backedge(restart, try_body_normal_exit)?;
+                let backedge = self.emit_loop_tail_backedge(restart, try_body_normal_exit)?;
+                if shared_match_failure {
+                    // Native first copies the common loop exit into this arm's original
+                    // forward if-exit array: [unlocated NOP, unlocated JUMP]. Preserve
+                    // that two-record budget and split its cleanup/condition donors before
+                    // late NOP removal. This is not the common original loop backedge.
+                    self.assembler.add_last_inlined_jump_slot();
+                    self.assembler
+                        .prepare_no_location_block_for_inlining(backedge);
+                    self.assembler.mark_as_artificial_eval_break(backedge);
+                }
             }
             if let Some(next) = next {
                 // An elif starts the original conditional target array even when its

@@ -2252,6 +2252,87 @@ fn mapping_capture_rotations_require_complete_unchanged_same_line_shapes() {
     assert!(super::mapping_capture_cleanup_rotation(&incomplete).is_none());
 }
 
+#[test]
+fn shared_match_failure_join_requires_original_aliases_and_equal_depths() {
+    let failure = super::Label(0);
+    let end = super::Label(1);
+    let cleanup = super::Label(2);
+    let condition = Instruction::new(
+        POP_JUMP_IF_FALSE,
+        Operand::Forward(failure),
+        SourceLocation::new(3, 3, 20, 25),
+        Some(1),
+    );
+    let pop = Instruction::new(
+        POP_TOP,
+        Operand::Value(0),
+        SourceLocation::new(3, 3, 10, 26),
+        Some(1),
+    );
+    for mutation in 0..10 {
+        let mut items = vec![
+            Item::Instruction(condition),
+            pass_instruction(RETURN_VALUE, 0, 4),
+            Item::Label(cleanup),
+            Item::Instruction(pop),
+            Item::Label(failure),
+        ];
+        match mutation {
+            1 => items[3] = pass_instruction(NOP, 0, 3),
+            2 => {
+                items[0] = Item::Instruction(Instruction::new(
+                    POP_JUMP_IF_FALSE,
+                    Operand::Forward(failure),
+                    condition.location,
+                    Some(0),
+                ));
+            }
+            3 => items.insert(0, Item::Instruction(condition)),
+            4 => {
+                items[0] = Item::Instruction(Instruction::new(
+                    POP_JUMP_IF_FALSE,
+                    Operand::Forward(cleanup),
+                    condition.location,
+                    Some(1),
+                ));
+            }
+            5 => {
+                let mut changed = pop;
+                changed.no_location_policy.preserve_location();
+                items[3] = Item::Instruction(changed);
+            }
+            _ => {}
+        }
+        let mut assembler = Assembler::from_linear_items(items);
+        assembler.next_label = 3;
+        if mutation == 6 {
+            assembler.mark(end);
+        } else {
+            assembler.mark_original_match_join(end);
+        }
+        match mutation {
+            7 => {
+                assembler.original_nop_targets.insert(failure);
+            }
+            8 => {
+                assembler
+                    .exception_owner_provenance
+                    .omitted_nop_counts
+                    .insert(failure, 1);
+            }
+            9 => {
+                assembler.emit(NOP, 0);
+            }
+            _ => {}
+        }
+        assert_eq!(
+            assembler.at_shared_match_failure_join(),
+            mutation == 0,
+            "mutation {mutation}"
+        );
+    }
+}
+
 fn pattern_capture_swap_pipeline() -> super::OptimizationPipeline {
     optimization_pipeline(
         [
