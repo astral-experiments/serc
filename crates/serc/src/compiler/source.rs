@@ -116,6 +116,8 @@ pub(super) struct CompilationContext<'source> {
     // Generated names can first become canonical when an otherwise discarded child assembles.
     // Restricted generic-class identifiers also require real child lowering for key origins.
     pub(super) requires_interning_trace: bool,
+    pub(super) requires_empty_bytes_cache_trace: bool,
+    empty_bytes_origin: Cell<u8>,
     interning_events: RefCell<Vec<CompilationInterningEvent>>,
 }
 
@@ -188,12 +190,41 @@ impl<'source> CompilationContext<'source> {
             cached_static_attribute_tuples: RefCell::new(FxHashSet::default()),
             generated_mangled_strings,
             requires_interning_trace,
+            requires_empty_bytes_cache_trace: python_version >= crate::PythonVersion::Py314
+                && suite_folds_empty_bytes(body),
+            empty_bytes_origin: Cell::new(0),
             interning_events: RefCell::new(Vec::new()),
         }
     }
 
     pub(super) const fn module_plan(&self) -> &ModulePlan {
         self.scopes.module()
+    }
+
+    /// Preserve the first empty object admitted to CPython's compilation-wide constant cache.
+    pub(super) fn record_empty_bytes_origin(&self, fresh: bool) {
+        if self.requires_empty_bytes_cache_trace && self.empty_bytes_origin.get() == 0 {
+            self.empty_bytes_origin.set(if fresh { 2 } else { 1 });
+        }
+    }
+
+    pub(super) fn fresh_empty_bytes_constant(&self) -> bool {
+        self.empty_bytes_origin.get() == 2
+    }
+
+    pub(super) fn record_constant_empty_bytes_origin(&self, constant: &Constant) {
+        if !self.requires_empty_bytes_cache_trace || self.empty_bytes_origin.get() != 0 {
+            return;
+        }
+        match constant {
+            Constant::Bytes(value) if value.is_empty() => self.record_empty_bytes_origin(false),
+            Constant::Tuple(values) | Constant::FrozenSet(values) => {
+                for value in values {
+                    self.record_constant_empty_bytes_origin(value);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Records the first object admitted to the compilation-wide constant cache for an
@@ -734,6 +765,32 @@ fn parser_interned_strings(
     *static_attribute_names = visitor.static_attribute_names;
     *has_percent_replacement = visitor.has_percent_replacement;
     visitor.origins
+}
+
+fn suite_folds_empty_bytes(body: &Suite) -> bool {
+    #[derive(Default)]
+    struct EmptyBytesFold(bool);
+
+    impl<'a> Visitor<'a> for EmptyBytesFold {
+        fn visit_expr(&mut self, expression: &'a Expr) {
+            if self.0 {
+                return;
+            }
+            if matches!(expression, Expr::BinOp(binary) if binary.op == Operator::Mult)
+                && matches!(fold_constant(expression), Some(Constant::Bytes(value)) if value.is_empty())
+            {
+                self.0 = true;
+            } else {
+                walk_expr(self, expression);
+            }
+        }
+    }
+
+    let mut visitor = EmptyBytesFold::default();
+    for statement in body {
+        visitor.visit_stmt(statement);
+    }
+    visitor.0
 }
 
 impl Compiler<'_> {
