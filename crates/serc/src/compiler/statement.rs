@@ -16075,8 +16075,12 @@ impl Compiler<'_> {
                     || independent_original_fallthrough)
                 // Each elif starts its own original conditional array. A manager in
                 // the first arm cannot locate that later arm's shared false exit.
+                // An independently certified empty join also separates a sole manager
+                // from its condition's false edges.
                 && (!statement.elif_else_clauses.is_empty()
-                    || !matches!(statement.body.as_slice(), [Stmt::With(_)]))
+                    || !matches!(statement.body.as_slice(), [Stmt::With(_)])
+                    || (self.context.python_version >= crate::PythonVersion::Py314
+                        && independent_original_fallthrough))
                 && condition_jump_target_count(fallthrough_test, false) > 1
                 && let Expr::BoolOp(boolean) = fallthrough_test
             {
