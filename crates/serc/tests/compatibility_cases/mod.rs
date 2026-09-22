@@ -225,6 +225,7 @@ mod nested_if_original_join_locations;
 mod nested_if_while_original_join_locations;
 mod nested_loop_handler_backedges;
 mod nested_scope_first_constant_order;
+mod nested_setup_nop_raise;
 mod nested_try_branch_exit_markers;
 mod nested_try_ifexp_handler_compatibility;
 mod nested_while_branch_exits;
