@@ -37,3 +37,34 @@ fn matches_cpython_small_chained_comparison_return_bridges() {
         "chained_comparison_copied_subject.py",
     );
 }
+
+#[test]
+fn matches_cpython_unlabeled_comparison_subscript_join_copies() {
+    for source in [
+        r"def probe(gate, other, a, b, c, values):
+    if gate:
+        if a < b < c:
+            if other:
+                index = 1
+            else:
+                index = 2
+        else:
+            index = 3
+    else:
+        index = 4
+    return values[index]
+",
+        r"def probe(gate, other, a, b, c, values):
+    if gate:
+        if other:
+            index = 1 if a < b < c else 2
+        else:
+            index = 3
+    else:
+        index = 4
+    return values[index]
+",
+    ] {
+        common::assert_matches_cpython_marshal(source, "comparison_subscript_join_copies.py");
+    }
+}

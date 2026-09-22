@@ -93,6 +93,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) copied_manager_return_compactions: Vec<CopiedManagerReturnCompaction>,
     pub(super) uncompacted_conditional_arrays: Vec<UncompactedConditionalArray>,
     pub(super) original_primitive_condition_boundaries: Vec<Instruction>,
+    // Exact comparison failure/fallthrough/cleanup records; no synthetic head label.
+    pub(super) original_comparison_fallthroughs: Vec<(Label, Label, [Instruction; 6])>,
     // Source-authored match ends establish original arrays independently of case exits.
     pub(super) original_match_join_boundaries: FxHashSet<Label>,
     // Exact post-threading head and original fallthrough donor of a shared case return.
@@ -653,6 +655,11 @@ impl ExceptionOwnerProvenance {
         }
         for instruction in &mut self.original_primitive_condition_boundaries {
             visit(instruction);
+        }
+        for (_, _, records) in &mut self.original_comparison_fallthroughs {
+            for instruction in records {
+                visit(instruction);
+            }
         }
         for record in self.shared_match_return_donors.values_mut() {
             visit(&mut record.0);
@@ -1390,7 +1397,9 @@ impl ExceptionOwnerProvenance {
         prefix: &'a [Item],
         all: &[Item],
     ) -> Option<(Label, &'a [Item], usize)> {
-        use crate::target::opcodes::{CALL, LOAD_ATTR, LOAD_FAST, STORE_FAST, STORE_NAME, SWAP};
+        use crate::target::opcodes::{
+            CALL, LOAD_ATTR, LOAD_FAST, STORE_DEREF, STORE_FAST, STORE_NAME, SWAP,
+        };
 
         let leading = prefix
             .iter()
@@ -1460,12 +1469,15 @@ impl ExceptionOwnerProvenance {
                 .collect::<Vec<_>>();
             // All authored restores are STORE_FAST_MAYBE_NULL in CPython,
             // including cells. They remain distinct through superinstruction
-            // insertion. CALL, LOAD_ATTR, LOAD_FAST, and STORE_NAME prevent static
-            // elimination of SWAP(n + 1): CPython only swaps local stores and POP_TOP,
+            // insertion. CALL, LOAD_ATTR, LOAD_FAST, STORE_DEREF, and STORE_NAME
+            // prevent static elimination of SWAP(n + 1): CPython only swaps local stores and POP_TOP,
             // so only n swappable restores precede the next operation.
             if instructions.starts_with(original)
                 && instructions.get(original.len()).is_some_and(|next| {
-                    matches!(next.opcode, CALL | LOAD_ATTR | LOAD_FAST | STORE_NAME)
+                    matches!(
+                        next.opcode,
+                        CALL | LOAD_ATTR | LOAD_FAST | STORE_DEREF | STORE_NAME
+                    )
                 })
             {
                 return Some((*entry, &prefix[start..], restores.len()));

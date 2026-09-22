@@ -339,3 +339,15 @@ fn matches_cpython_terminal_chain_return_copy_budget() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_final_boolean_with_middle_comparison_chain() {
+    let source = r"def f(items, exact, minimum, maximum, limit, variable):
+    for item in items:
+        if first(item):
+            consume(item)
+        elif not exact and minimum == 0 and 0 < maximum < limit and not variable:
+            consume(item)
+";
+    common::assert_matches_cpython_marshal(source, "loop_tail_middle_comparison_chain.py");
+}

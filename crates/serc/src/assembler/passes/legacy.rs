@@ -151,7 +151,7 @@ impl OptimizationPipeline {
         self.reject_unmodeled_empty_native_jump_targets();
         self.thread_legacy_jumps();
         let (swap_blocks, capture_cleanup_swaps, _) = self.optimize_swap_runs();
-        self.apply_static_swaps((swap_blocks, capture_cleanup_swaps));
+        let _ = self.apply_static_swaps((swap_blocks, capture_cleanup_swaps));
         self.remove_legacy_nops_and_pairs(&original_arrays);
         self.reject_unmodeled_empty_native_jump_targets();
         if self.python_version == PythonVersion::Py312 {

@@ -1214,3 +1214,34 @@ fn matches_cpython_retained_setup_after_named_handler_value_return() {
         }
     }
 }
+
+#[test]
+fn comprehension_cell_assignment_keeps_fresh_setup_marker_owner() {
+    for capture in ["    capture = lambda: exceptions\n", ""] {
+        for prefix in ["    await work()\n", ""] {
+            for comprehension in [
+                "[exc for exc in exceptions]",
+                "[exc for sub in exceptions for exc in sub]",
+                "[exc for outer in exceptions for sub in outer for exc in sub]",
+            ] {
+                let source = format!(
+                    "async def f(host, sock, exceptions, all_errors):
+{capture}{prefix}    if host:
+        if sock is None:
+            exceptions = {comprehension}
+            try:
+                if all_errors:
+                    raise Group(exceptions)
+                raise Error(exceptions)
+            finally:
+                exceptions = None
+    else:
+        consume(sock)
+    await finish()
+"
+                );
+                common::assert_matches_cpython_marshal(&source, "comprehension_cell_setup.py");
+            }
+        }
+    }
+}

@@ -34,7 +34,7 @@ use super::constant::{
 use super::definition::clean_doc;
 use super::scope::{
     LoweringFunctionPlan, NameId, NameSet, ScopeId, collect_conditional_simple_annotations,
-    collect_simple_annotations, has_annotations, has_simple_annotations,
+    collect_simple_annotations, has_annotations,
 };
 use super::source::{CompilationContext, implicit_return_range};
 use super::statement::{
@@ -246,11 +246,18 @@ impl<'source> Compiler<'source> {
             .collect();
         cell_only_locals.sort_by(|left, right| names.resolve(*left).cmp(names.resolve(*right)));
         locals.extend(cell_only_locals);
-        let indices = locals
+        let mut indices = locals
             .iter()
             .enumerate()
             .map(|(index, name)| Ok((*name, to_u32(index, "local variable count")?)))
             .collect::<Result<FxHashMap<_, _>, CompileError>>()?;
+        let mut temporary_indices = FxHashMap::default();
+        for &(alias, original) in &plan.local_aliases {
+            let index = indices[&original];
+            indices.insert(alias, index);
+            temporary_indices.insert(alias, index);
+            temporary_indices.insert(original, index);
+        }
         let local_count = locals.len();
         let free_indices = plan
             .freevars
@@ -271,6 +278,7 @@ impl<'source> Compiler<'source> {
             cell_names: cell_names.clone(),
             free_names,
             initialized_locals,
+            temporary_indices,
             ..SymbolState::default()
         };
         let unit = CodeUnit::from_spec(CodeUnitSpec {
@@ -762,7 +770,7 @@ impl<'source> Compiler<'source> {
             self.emit(STORE_DEREF, index, -1)?;
         }
         if if self.has_deferred_annotations() {
-            self.unit.flags & CO_FUTURE_ANNOTATIONS != 0 && has_simple_annotations(body)
+            self.unit.flags & CO_FUTURE_ANNOTATIONS != 0 && has_annotations(body)
         } else {
             has_annotations(body)
         } {

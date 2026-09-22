@@ -215,3 +215,33 @@ fn iterator_break_join_keeps_its_line_after_nested_return_copy() {
         }
     }
 }
+
+#[test]
+fn nested_raising_finally_keeps_unique_condition_exit_location() {
+    for (declaration, prefix, suffix) in [
+        ("async def", "    await work()\n", "await finish()"),
+        ("def", "", "finish()"),
+        ("def", "    yield None\n", "yield sock"),
+    ] {
+        for cleanup in ["exceptions = None", "cleanup(exceptions)"] {
+            let source = format!(
+                "{declaration} f(host, sock, exceptions, all_errors):
+    capture = lambda: exceptions
+{prefix}    if host:
+        if sock is None:
+            exceptions = [exc for sub in exceptions for exc in sub]
+            try:
+                if all_errors:
+                    raise Group(exceptions)
+                raise Error(exceptions)
+            finally:
+                {cleanup}
+    else:
+        consume(sock)
+    {suffix}
+"
+            );
+            common::assert_matches_cpython_marshal(&source, "nested_raising_finally_exit.py");
+        }
+    }
+}

@@ -746,3 +746,16 @@ fn completed_recovery_preserves_later_manager_finally_owners() {
         }
     }
 }
+
+#[test]
+fn folded_pass_join_preserves_the_authored_finally_marker() {
+    for (header, prefix) in [("def", ""), ("async def", ""), ("def", "    yield None\n")] {
+        for continuation in ["return True", "consume(value)\nreturn value"] {
+            let source = format!(
+                "{header} f(value):\n{prefix}    try:\n        if True:\n            pass\n        else:\n            pass\n    finally:\n        pass\n{}",
+                indent(&format!("{continuation}\n")),
+            );
+            common::assert_matches_cpython_marshal(&source, "folded_pass_finally_marker.py");
+        }
+    }
+}

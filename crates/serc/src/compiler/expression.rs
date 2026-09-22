@@ -48,8 +48,8 @@ use super::scope::{
     collect_nested_comprehension_target_names, collect_self_iterated_nested_comprehension_targets,
     collect_target_names, comprehension_cell_names, comprehension_name_bindings,
     comprehension_scope_facts, comprehension_temporary_names, generator_cellvars,
-    generator_required_names, inlined_comprehension_cell_names_in_expression,
-    legacy_class_comprehension_names, module_comprehension_temporary_names,
+    generator_required_names, global_comprehension_temporary_names,
+    inlined_comprehension_cell_names_in_expression, legacy_class_comprehension_names,
     parameter_default_expressions,
 };
 use super::source::{
@@ -57,7 +57,8 @@ use super::source::{
     statement_execution_range, strip_expression_comments, synthetic_condition_exit_range,
 };
 use super::statement::{
-    condition_jump_target_count, final_chained_comparison_jump, is_wildcard_pattern,
+    NestedIfExitLocation, condition_jump_target_count, final_chained_comparison_jump,
+    final_terminating_arm_fallthrough_test, is_wildcard_pattern, nested_if_exit_location,
     suite_has_linear_borrow_fallthrough, suite_terminates,
     terminal_for_break_exit_inherits_predecessor, unique_condition_jump_target,
 };
@@ -389,6 +390,46 @@ impl Compiler<'_> {
         )
     }
 
+    /// Recognizes the three original records in a direct global-attribute return.
+    pub(super) fn is_direct_global_attribute_return(
+        &self,
+        returned: &ruff_python_ast::StmtReturn,
+    ) -> bool {
+        let Some(Expr::Attribute(attribute)) = returned.value.as_deref() else {
+            return false;
+        };
+        let Expr::Name(name) = attribute.value.as_ref() else {
+            return false;
+        };
+        if name.id.as_str() == "__debug__" || self.unit.annotation_classdict_index.is_some() {
+            return false;
+        }
+        let name = self.required_name_id(name.id.as_str());
+        !self.symbols.active_temporaries.contains(name)
+            && matches!(&self.unit.scope, Scope::Function { indices, free_indices, globals, .. }
+                if globals.contains(name)
+                    || (!indices.contains_key(&name) && !free_indices.contains_key(&name)))
+    }
+
+    /// Admits a four-record subject-pop return whose copied entry has a fixed guard donor.
+    fn can_copy_match_guard_subject_return(
+        &self,
+        pattern: &Pattern,
+        guard: &Expr,
+        body: &[Stmt],
+    ) -> bool {
+        self.context.python_version >= PythonVersion::Py314
+            && matches!(pattern, Pattern::MatchAs(pattern)
+                if pattern.pattern.is_none() && pattern.name.is_some())
+            && matches!(guard, Expr::Compare(comparison)
+                if comparison.ops.len() == 2
+                    && !(matches!(comparison.comparators.last(), Some(Expr::NoneLiteral(_)))
+                        && matches!(comparison.ops.last(), Some(CmpOp::Is | CmpOp::IsNot))))
+            && matches!(body, [Stmt::Return(returned)]
+                if self.is_direct_global_attribute_return(returned))
+            && self.match_guard_subject_return_is_unprotected()
+    }
+
     /// Keeps a returning case's comparison bridge eligible for original-budget exit copying.
     fn compile_match_guard(
         &mut self,
@@ -578,13 +619,18 @@ impl Compiler<'_> {
                             .set_location(self.source_location(case.pattern.range()));
                         self.emit(NOP, 0, 0)?;
                     }
-                    if copied_subject {
-                        // A copied subject begins the return with NEXT_LOCATION. Keep
-                        // its existing bridge policy until exit copying also models
-                        // the replaced jump's location transfer onto that subject pop.
-                        self.compile_jump_if(guard, false, context.fail_pop[0])?;
-                    } else {
+                    if !copied_subject
+                        || self.can_copy_match_guard_subject_return(
+                            &case.pattern,
+                            guard,
+                            &case.body,
+                        )
+                    {
+                        // The assembler transports the original bridge donor only onto an
+                        // intact private copy of the four-record subject-pop return.
                         self.compile_match_guard(guard, &case.body, context.fail_pop[0])?;
+                    } else {
+                        self.compile_jump_if(guard, false, context.fail_pop[0])?;
                     }
                 }
             }
@@ -803,9 +849,35 @@ impl Compiler<'_> {
                                         && unique_condition_jump_target(&assertion.test, true)
                                             .is_some())
                             });
+                        // Earlier tested arms copy the unlocated jump-only success array
+                        // onto their unconditional exits before line propagation, even if
+                        // the later continuation is too large to copy. A terminating final
+                        // elif leaves its false condition as the original jump's sole donor.
+                        let final_condition_join = (self.context.python_version
+                            >= PythonVersion::Py314
+                            && original_unlocated_head)
+                            .then(|| match case.body.last()? {
+                                Stmt::If(tail) if !tail.elif_else_clauses.is_empty() => {
+                                    final_terminating_arm_fallthrough_test(tail)
+                                        .and_then(|test| unique_condition_jump_target(test, false))
+                                }
+                                _ => None,
+                            })
+                            .flatten()
+                            .filter(|test| {
+                                self.assembler.at_original_unconditional_join()
+                                    || self.assembler.original_return_guard_has_false_donor(
+                                        self.source_location(test.range()),
+                                    )
+                            });
+                        if let Some(test) = final_condition_join {
+                            self.assembler
+                                .set_location(self.source_location(test.range()));
+                        }
                         let original_empty_join = self.assembler.at_original_match_join()
                             || fallthrough_if_join
-                            || assertion_success_join;
+                            || assertion_success_join
+                            || final_condition_join.is_some();
                         // The final async-for exhaustion falls directly into the following
                         // match continuation before cold blocks move. Its surviving bridge
                         // represents that fallthrough, not an interruptible case-success jump.
@@ -1210,7 +1282,17 @@ impl Compiler<'_> {
             // The body and false edge share CPython's case-exit block. Small return exits
             // replace its jump before conditional threading is considered.
             let terminating_body = suite_terminates(&statement.body);
-            let unique_false_edge = terminating_body
+            // An ordinary try's normal and handled exits also leave this join by
+            // unconditional jumps. Early small-return copying removes those edges
+            // before the false condition donates its line to the original jump slot.
+            let cleanup_exit = self.context.python_version >= PythonVersion::Py314
+                && matches!(statement.body.last(), Some(Stmt::Try(tail))
+                    if !tail.is_star && tail.finalbody.is_empty())
+                && matches!(
+                    nested_if_exit_location(statement, false),
+                    Some(NestedIfExitLocation::Located(_))
+                );
+            let unique_false_edge = (terminating_body || cleanup_exit)
                 .then(|| unique_condition_jump_target(&statement.test, false))
                 .flatten();
             // 3.12 copies the following small return before resolving lines.
@@ -1230,13 +1312,17 @@ impl Compiler<'_> {
             );
             let original_unlocated_head = self.assembler.at_jump_target();
             let success_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, match_end)?;
-            if final_case {
-                // The final case's jump crosses an empty pattern-failure block. Delay its
-                // removal until exit copying and retain its NOP after conditional threading.
+            if final_case || (cleanup_exit && unique_false_edge.is_some()) {
+                // The final case crosses an empty pattern failure; cleanup predecessors
+                // also need the original empty-join slot after threading. Record it before
+                // small-return copying, while keeping a surviving case JUMP interruptible.
                 self.assembler
                     .preserve_redundant_jump_nop_after_threading(success_exit);
             }
-            if unique_false_edge.is_some() && self.context.python_version != PythonVersion::Py313 {
+            if unique_false_edge.is_some()
+                && !cleanup_exit
+                && self.context.python_version != PythonVersion::Py313
+            {
                 // Only the false edge reaches this original empty block. Preserve its
                 // condition slot even when a containing match retargets the case exit
                 // before a small return replaces the jump.
@@ -3801,12 +3887,25 @@ impl Compiler<'_> {
                 .map(|(name, _)| name)
                 .collect();
         }
-        if matches!(self.unit.scope, Scope::Module)
-            && let Some(module_saves) = module_comprehension_temporary_names(generators, key, value)
-        {
-            // Save module walrus slots in symbol order, but keep their accesses global.
+        let global_saves = match &self.unit.scope {
+            Scope::Module => {
+                global_comprehension_temporary_names(generators, key, value, |_| true, None)
+            }
+            Scope::Function { globals, .. } if globals.iter_unordered().next().is_some() => {
+                global_comprehension_temporary_names(
+                    generators,
+                    key,
+                    value,
+                    |name| globals.contains(self.required_name_id(name)),
+                    self.unit.private_name.as_deref(),
+                )
+            }
+            _ => None,
+        };
+        if let Some(global_saves) = global_saves {
+            // Save explicit-global walrus slots in symbol order without changing their accesses.
             // Only iteration targets belong in active_temporary_names above.
-            temporary_names = module_saves;
+            temporary_names = global_saves;
         }
         // An inner target read by its own iterable must keep the enclosing value live until the
         // inner comprehension starts and takes ownership of its save/restore.
@@ -3848,7 +3947,16 @@ impl Compiler<'_> {
         }
 
         let mut seen_temporaries = FxHashSet::default();
-        temporary_names.retain(|name| seen_temporaries.insert(name.clone()));
+        temporary_names.retain(|name| {
+            let key = if matches!(&self.unit.scope, Scope::Function { globals, .. }
+                if globals.contains(self.required_name_id(name)))
+            {
+                self.mangled_name(name)
+            } else {
+                name.clone()
+            };
+            seen_temporaries.insert(key)
+        });
         // CPython saves the hidden fast slot, but creates and accesses a captured
         // target's cell through its existing free slot while the comprehension is active.
         let mut comprehension_free_cell_indices = FxHashMap::default();
@@ -7716,7 +7824,9 @@ impl Compiler<'_> {
                 .conditions
                 .exclude_condition_not_taken_from_exception
             && !self.control.withs.force_terminal_with_marker_ownerless
-            && let Some(owns_slot) = self.assembler.current_normal_finally_condition_slot_owner()
+            && let Some(owns_slot) = self.assembler.current_normal_finally_condition_slot_owner(
+                &self.control.withs.active_with_region_exclusions,
+            )
         {
             // The loop exit's excluded NOP does not split the original array.
             // Its exact prefix distinguishes a reused call slot from a fresh truth marker.
@@ -8317,6 +8427,8 @@ impl Compiler<'_> {
             // those labels in one block so small return copies see its body.
             self.assembler.preserve_block_boundary_if_new(end);
             self.assembler.mark(end);
+            // Native codegen_jump_if marks this existing short-circuit join.
+            self.assembler.record_exception_owner_block_boundary(end);
             return Ok(());
         }
         if let Expr::If(conditional) = expression {
@@ -8417,6 +8529,12 @@ impl Compiler<'_> {
             }
 
             self.assembler.mark(end);
+            // Native marks this existing join after emitting the comparison cleanup.
+            self.assembler.record_exception_owner_block_boundary(end);
+            if self.context.python_version >= PythonVersion::Py314 && !jump_on {
+                self.assembler
+                    .record_original_comparison_fallthrough(cleanup, end);
+            }
             self.set_depth(base_depth);
             return Ok(());
         }

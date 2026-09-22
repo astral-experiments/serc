@@ -2166,6 +2166,279 @@ fn optimization_pipeline(items: Vec<Item>) -> super::OptimizationPipeline {
     assembler.into_optimization_pipeline()
 }
 
+fn mapping_capture_items(captures: u32, wildcards: u32) -> Vec<Item> {
+    let unpacked = captures + wildcards;
+    let depth = unpacked + 2;
+    let mut items = vec![pass_instruction(UNPACK_SEQUENCE, unpacked, 3)];
+    for _ in 0..captures {
+        for depth in (2..=depth).rev() {
+            items.push(pass_instruction(SWAP, depth, 3));
+        }
+    }
+    for _ in 0..wildcards + 2 {
+        items.push(pass_instruction(POP_TOP, 0, 3));
+    }
+    for local in 0..captures {
+        items.push(pass_instruction(STORE_FAST, local, 3));
+    }
+    items.push(pass_instruction(LOAD_CONST, 0, 4));
+    items
+}
+
+#[test]
+fn mapping_capture_rotations_preserve_arrays_and_predict_native_compaction() {
+    for (captures, wildcards) in [(1, 1), (1, 2), (2, 1), (2, 2), (3, 1), (4, 1)] {
+        let items = mapping_capture_items(captures, wildcards);
+        let swaps = captures * (captures + wildcards + 1);
+        let assembler = Assembler::from_linear_items(items.clone());
+        assert_eq!(
+            assembler.current_block_dynamic_exception_owner_slots(),
+            usize::try_from(swaps + captures / 2).unwrap(),
+        );
+        let mut pipeline = optimization_pipeline(items.clone());
+        let (blocks, cleanup, _) = pipeline.optimize_swap_runs();
+        let gaps = pipeline.apply_static_swaps((blocks, cleanup));
+        assert!(gaps.is_empty());
+        assert_eq!(pipeline.graph.iter_items().count(), items.len());
+        let actual = pipeline
+            .graph
+            .iter_items()
+            .filter(
+                |item| !matches!(item, Item::Instruction(instruction) if instruction.opcode == NOP),
+            )
+            .copied()
+            .collect::<Vec<_>>();
+        let consumers = 1 + usize::try_from(swaps).unwrap();
+        let stores = items.len() - 1 - usize::try_from(captures).unwrap();
+        let expected = std::iter::once(items[0])
+            .chain(items[stores..items.len() - 1].iter().copied())
+            .chain(items[consumers..stores].iter().copied())
+            .chain(std::iter::once(*items.last().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn mapping_capture_rotations_require_complete_unchanged_same_line_shapes() {
+    for mutation in 0..9 {
+        let mut items = mapping_capture_items(2, 1);
+        match mutation {
+            0 => items[0] = pass_instruction(UNPACK_SEQUENCE, 4, 3),
+            1 => items[4] = pass_instruction(SWAP, 3, 3),
+            2 => items[4] = pass_instruction(SWAP, 2, 5),
+            3 => items[10] = pass_instruction(POP_TOP, 0, 5),
+            4 => items[13] = pass_instruction(STORE_FAST, 0, 3),
+            5 => items[13] = pass_instruction(STORE_DEREF, 1, 3),
+            6 => {
+                let Item::Instruction(instruction) = &mut items[4] else {
+                    unreachable!()
+                };
+                instruction.no_location_policy.preserve_location();
+            }
+            7 => items[14] = pass_instruction(LOAD_CONST, 0, 3),
+            8 => {
+                items.insert(9, Item::Label(super::Label(0)));
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            super::mapping_capture_cleanup_rotation(&items).is_none(),
+            "mutation {mutation}"
+        );
+    }
+    let mut incomplete = mapping_capture_items(2, 1);
+    incomplete.pop();
+    assert!(super::mapping_capture_cleanup_rotation(&incomplete).is_none());
+}
+
+#[test]
+fn shared_match_failure_join_requires_original_aliases_and_equal_depths() {
+    let failure = super::Label(0);
+    let end = super::Label(1);
+    let cleanup = super::Label(2);
+    let condition = Instruction::new(
+        POP_JUMP_IF_FALSE,
+        Operand::Forward(failure),
+        SourceLocation::new(3, 3, 20, 25),
+        Some(1),
+    );
+    let pop = Instruction::new(
+        POP_TOP,
+        Operand::Value(0),
+        SourceLocation::new(3, 3, 10, 26),
+        Some(1),
+    );
+    for mutation in 0..10 {
+        let mut items = vec![
+            Item::Instruction(condition),
+            pass_instruction(RETURN_VALUE, 0, 4),
+            Item::Label(cleanup),
+            Item::Instruction(pop),
+            Item::Label(failure),
+        ];
+        match mutation {
+            1 => items[3] = pass_instruction(NOP, 0, 3),
+            2 => {
+                items[0] = Item::Instruction(Instruction::new(
+                    POP_JUMP_IF_FALSE,
+                    Operand::Forward(failure),
+                    condition.location,
+                    Some(0),
+                ));
+            }
+            3 => items.insert(0, Item::Instruction(condition)),
+            4 => {
+                items[0] = Item::Instruction(Instruction::new(
+                    POP_JUMP_IF_FALSE,
+                    Operand::Forward(cleanup),
+                    condition.location,
+                    Some(1),
+                ));
+            }
+            5 => {
+                let mut changed = pop;
+                changed.no_location_policy.preserve_location();
+                items[3] = Item::Instruction(changed);
+            }
+            _ => {}
+        }
+        let mut assembler = Assembler::from_linear_items(items);
+        assembler.next_label = 3;
+        if mutation == 6 {
+            assembler.mark(end);
+        } else {
+            assembler.mark_original_match_join(end);
+        }
+        match mutation {
+            7 => {
+                assembler.original_nop_targets.insert(failure);
+            }
+            8 => {
+                assembler
+                    .exception_owner_provenance
+                    .omitted_nop_counts
+                    .insert(failure, 1);
+            }
+            9 => {
+                assembler.emit(NOP, 0);
+            }
+            _ => {}
+        }
+        assert_eq!(
+            assembler.at_shared_match_failure_join(),
+            mutation == 0,
+            "mutation {mutation}"
+        );
+    }
+}
+
+fn pattern_capture_swap_pipeline() -> super::OptimizationPipeline {
+    optimization_pipeline(
+        [
+            (UNPACK_SEQUENCE, 4),
+            (SWAP, 4),
+            (SWAP, 3),
+            (SWAP, 2),
+            (SWAP, 4),
+            (SWAP, 3),
+            (SWAP, 2),
+            (POP_TOP, 0),
+            (SWAP, 3),
+            (SWAP, 2),
+            (STORE_FAST, 1),
+            (STORE_FAST, 2),
+            (STORE_FAST, 3),
+        ]
+        .into_iter()
+        .map(|(opcode, argument)| pass_instruction(opcode, argument, 3))
+        .collect(),
+    )
+}
+
+#[test]
+fn static_swap_store_gaps_preserve_original_slots_until_fusion() {
+    let mut pipeline = pattern_capture_swap_pipeline();
+    let original_len = pipeline.graph.iter_items().count();
+    let (blocks, cleanup, _) = pipeline.optimize_swap_runs();
+    let gaps = pipeline.apply_static_swaps((blocks, cleanup));
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(pipeline.graph.iter_items().count(), original_len);
+    assert!(pipeline.compact_static_swap_store_gaps(gaps));
+    assert_eq!(pipeline.graph.iter_items().count(), original_len - 2);
+    pipeline.fuse_superinstructions();
+    assert_eq!(
+        graph_opcodes(&pipeline),
+        [
+            UNPACK_SEQUENCE,
+            NOP,
+            NOP,
+            NOP,
+            NOP,
+            NOP,
+            NOP,
+            STORE_FAST_STORE_FAST,
+            POP_TOP,
+            STORE_FAST,
+        ],
+    );
+}
+
+#[test]
+fn static_swap_store_gaps_accept_only_transported_copy_entry_labels() {
+    let mut pipeline = pattern_capture_swap_pipeline();
+    let (blocks, cleanup, _) = pipeline.optimize_swap_runs();
+    let mut gaps = pipeline.apply_static_swaps((blocks, cleanup));
+    let block = pipeline.graph.order()[0];
+    let entry = super::Label(0);
+    for gap in &mut gaps {
+        gap.prepend_copy_entry(&pipeline.graph, block, entry);
+    }
+    pipeline.graph.insert_label(block, 0, entry);
+    assert!(pipeline.compact_static_swap_store_gaps(gaps));
+    assert_eq!(pipeline.graph[block].first_label(), Some(entry));
+}
+
+#[test]
+fn static_swap_store_gaps_require_unchanged_original_prefixes() {
+    for mutation in 0..4 {
+        let mut pipeline = pattern_capture_swap_pipeline();
+        let (blocks, cleanup, _) = pipeline.optimize_swap_runs();
+        let gaps = pipeline.apply_static_swaps((blocks, cleanup));
+        assert_eq!(gaps.len(), 1);
+        let block = pipeline.graph.order()[0];
+        let positions = pipeline.graph.item_positions();
+        match mutation {
+            0 => {
+                pipeline
+                    .graph
+                    .instruction_mut(positions[0])
+                    .unwrap()
+                    .location
+                    .line += 1;
+            }
+            1 => {
+                pipeline
+                    .graph
+                    .instruction_mut(positions[8])
+                    .unwrap()
+                    .location
+                    .column += 1;
+            }
+            2 => pipeline.graph.insert_label(block, 0, super::Label(0)),
+            3 => {
+                let copied = pipeline.graph[block].items().to_vec();
+                pipeline.graph.retain_order(|candidate| candidate != block);
+                pipeline.graph.push_block(copied);
+            }
+            _ => unreachable!(),
+        }
+        let before = pipeline.graph.copy_items();
+        assert!(!pipeline.compact_static_swap_store_gaps(gaps));
+        assert_eq!(pipeline.graph.copy_items(), before);
+    }
+}
+
 #[test]
 fn backward_conditional_normalization_preserves_successor_labels() {
     for labelled_successor in [false, true] {
@@ -3757,6 +4030,87 @@ fn empty_exception_regions_follow_their_original_entry() {
             .graph
             .reachable_blocks(&assembler.exception_regions);
         assert_eq!(reachable[handler.index()], reachable_entry);
+    }
+}
+
+#[test]
+fn constant_return_pop_requires_authored_default_records() {
+    for version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        for mutation in [
+            "intact",
+            "custom owner",
+            "hidden slot",
+            "synthetic marker",
+            "converted pop",
+            "different span",
+            "double marker",
+            "wrong depth",
+            "non-source entry",
+        ] {
+            let mut assembler = Assembler {
+                python_version: version,
+                ..Assembler::default()
+            };
+            let entry = assembler.label();
+            let donor = SourceLocation::new(2, 2, 8, 13);
+            let location = SourceLocation::new(5, 5, 15, 19);
+            let mut pop = Instruction::value_with_depth(NOP, 0, SourceLocation::NONE, 0);
+            pop.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+            pop.fusion_policy.mark_converted_pop_block();
+            let mut tail = vec![
+                Item::Instruction(Instruction::value_with_depth(NOP, 0, location, 0)),
+                Item::Instruction(Instruction::value_with_depth(LOAD_CONST, 0, location, 1)),
+                Item::Instruction(Instruction::value_with_depth(RETURN_VALUE, 0, location, 0)),
+            ];
+            let Item::Instruction(nop) = &mut tail[0] else {
+                unreachable!();
+            };
+            match mutation {
+                "custom owner" => nop.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS),
+                "hidden slot" => nop.local_policy.add_hidden_exception_owner_slots(1),
+                "synthetic marker" => {
+                    *nop = Instruction::synthetic(NOP, Operand::Value(0), location, Some(0));
+                }
+                "converted pop" => nop.fusion_policy.mark_converted_pop_block(),
+                "different span" => nop.location = SourceLocation::new(5, 5, 8, 19),
+                "wrong depth" => *nop = Instruction::value_with_depth(NOP, 0, location, 1),
+                _ => {}
+            }
+            if mutation == "double marker" {
+                tail.insert(1, tail[0]);
+            }
+            assembler.push_linear_item(Item::Instruction(Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(entry),
+                donor,
+                Some(0),
+            )));
+            assembler.push_linear_item(Item::Instruction(Instruction::value_with_depth(
+                STORE_FAST, 0, donor, 0,
+            )));
+            assembler.mark(entry);
+            if mutation != "non-source entry" {
+                assembler.record_exception_owner_block_boundary(entry);
+            }
+            assembler.push_linear_item(Item::Instruction(pop));
+            for item in tail {
+                assembler.push_linear_item(item);
+            }
+            assembler.record_copied_return_fallthrough_pop(2);
+            assert_eq!(
+                assembler
+                    .exception_owner_provenance
+                    .original_fallthrough_pop_blocks
+                    .contains_key(&entry),
+                mutation == "intact" && version >= crate::PythonVersion::Py314,
+                "{version:?}, {mutation}",
+            );
+        }
     }
 }
 

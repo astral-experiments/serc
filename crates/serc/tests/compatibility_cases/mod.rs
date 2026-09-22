@@ -50,6 +50,7 @@ mod constant_condition_admission;
 mod constant_false_comprehension_filters;
 mod constant_negation_ifexp_borrow;
 mod constant_pop_return_owners;
+mod constant_return_pop;
 mod context_manager_return_handler_nesting;
 mod continued_cleanup_locations;
 mod copied_comprehension_store_swaps;
@@ -129,6 +130,7 @@ mod frozenset_discarded_real_assembly;
 mod frozenset_soft_case_identifiers;
 mod frozenset_tuple_marshal_order;
 mod fstring_escaped_newline_locations;
+mod function_global_comprehension_saves;
 mod generator_break_constant_compatibility;
 mod generator_break_return_regions;
 mod generator_call_name_condition_owner_compatibility;
@@ -231,6 +233,7 @@ mod normal_finally_pop_alias_owners;
 mod normal_finally_pop_locations;
 mod normal_finally_with_exit_owner;
 mod normal_handler_cleanup_copies;
+mod normal_try_exit_markers;
 mod normal_try_loop_tail_owners;
 mod normal_try_manager_pop_owners;
 mod optimized_generator_loop_dispatch_owners;
@@ -253,6 +256,7 @@ mod protected_while_none_condition_owner_compatibility;
 mod redundant_copy_pop_pairs;
 mod removed_nop_jump_slots;
 mod return_debug_compatibility;
+mod return_marker_admission;
 mod return_try_manager_nop_owners;
 mod shadowed_comprehension_assignment;
 mod shared_try_exit_locations;
@@ -395,6 +399,7 @@ mod match_case_condition_backedge_locations;
 mod nonlocal_comprehension_shadow;
 mod original_match_jump_heads;
 mod pass_finalizer_unwind_markers;
+mod protected_cleanup_join_locations;
 mod protected_loop_condition_exit_locations;
 mod terminating_handler_shared_false_join_locations;
 
@@ -740,3 +745,12 @@ mod fused_entry_prefix_owners;
 mod multiline_match_swap_nops;
 
 mod loop_else_join_locations;
+mod mapping_wildcard_swaps;
+mod match_failure_loop_backedge;
+mod match_store_fusion;
+
+mod copied_match_guard_subject;
+
+mod shared_handler_cleanup_copies;
+
+mod normal_try_discard_copies;

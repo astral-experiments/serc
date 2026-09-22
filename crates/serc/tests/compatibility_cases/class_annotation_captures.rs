@@ -38,3 +38,22 @@ fn class_generators_capture_enclosing_names_across_class_bindings() {
         }
     }
 }
+
+#[test]
+fn nonsimple_class_annotations_preserve_dictionary_cells() {
+    for future in ["", "from __future__ import annotations\n"] {
+        for body in [
+            "    object.attribute: int = 0\n",
+            "    object[index]: int\n",
+            "    (name): int = 0\n",
+            "    if condition:\n        object.attribute: int = 0\n",
+            "    if False:\n        object[index]: int\n",
+            "    try:\n        object.attribute: int = 0\n    finally:\n        cleanup()\n",
+            "    if condition:\n        class Inner:\n            object.attribute: int = 0\n",
+            "    if condition:\n        def method(self):\n            object.attribute: int = 0\n",
+        ] {
+            let source = format!("{future}class C:\n{body}");
+            common::assert_matches_cpython_marshal(&source, "nonsimple_class_annotation_cells.py");
+        }
+    }
+}

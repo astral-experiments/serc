@@ -309,6 +309,7 @@ impl NameInterner {
 #[derive(Clone, Debug, Default)]
 pub(super) struct FunctionPlan {
     pub(super) locals: Vec<NameId>,
+    pub(super) local_aliases: Vec<(NameId, NameId)>,
     pub(super) globals: FxHashSet<NameId>,
     pub(super) annotation_references: FxHashSet<NameId>,
     pub(super) cellvars: FxHashSet<NameId>,
@@ -339,7 +340,7 @@ pub(super) struct ScopeBodyFacts {
     pub(super) has_function_definition: bool,
     pub(super) has_generic_definition: bool,
     pub(super) has_type_alias: bool,
-    pub(super) has_simple_annotations: bool,
+    pub(super) has_annotations: bool,
     has_inlined_comprehension: bool,
     local_annotation_references: BTreeSet<String>,
     local_annotation_bindings: FxHashSet<String>,
@@ -349,6 +350,7 @@ pub(super) struct ScopeBodyFacts {
 #[derive(Clone, Debug, Default)]
 pub(super) struct LoweringFunctionPlan {
     pub(super) locals: Vec<NameId>,
+    pub(super) local_aliases: Vec<(NameId, NameId)>,
     pub(super) globals: FxHashSet<NameId>,
     pub(super) annotation_references: FxHashSet<NameId>,
     pub(super) cellvars: FxHashSet<NameId>,
@@ -413,12 +415,13 @@ impl FunctionPlan {
         future_annotations: bool,
         eager_annotations: bool,
         facts: ScopeBodyFacts,
+        private_name: Option<&str>,
         nested_function_requirements: &FxHashSet<NameId>,
         nested_function_annotation_references: &FxHashSet<NameId>,
         class_requirements: &FxHashSet<NameId>,
     ) -> Self {
         let ScopeBodyFacts {
-            globals,
+            mut globals,
             nonlocals,
             mut references,
             outside_inlined_comprehension_references,
@@ -436,6 +439,21 @@ impl FunctionPlan {
             ..
         } = facts;
 
+        // Native declarations and name lookups use the same mangled symbol identity.
+        // Keep both source spellings available to the raw-name lowering maps.
+        if let Some(private_name) = private_name.filter(|_| !globals.is_empty()) {
+            let prefix = format!("_{}", private_name.trim_start_matches('_'));
+            for name in globals.iter().cloned().collect::<Vec<_>>() {
+                let canonical = mangle_name(&name, Some(private_name)).into_owned();
+                if let Some(alias) = canonical.strip_prefix(&prefix)
+                    && mangle_name(alias, Some(private_name)) == canonical
+                {
+                    globals.insert(alias.to_string());
+                }
+                globals.insert(canonical);
+            }
+        }
+
         // Record potential local loads and actual bindings in one source-order pass. Filtering the
         // potential names after the pass preserves CPython's load-before-store local ordering
         // without walking the body once just to discover its complete binding set.
@@ -450,7 +468,9 @@ impl FunctionPlan {
         let mut locals = LocalCollector {
             candidate_bindings: Some(FxHashMap::default()),
             shadowed_nonlocal_cells,
+            global_comprehension_saves: !globals.is_empty(),
             globals,
+            private_name: private_name.map(str::to_string),
             has_inlined_comprehension,
             ignore_generator_body_comprehension_targets: generator_named_targets.is_empty(),
             nonlocals,
@@ -494,6 +514,31 @@ impl FunctionPlan {
             })
             .cloned()
             .collect::<FxHashSet<_>>();
+        comprehension_shadowed_targets.extend(
+            locals
+                .comprehension_targets
+                .iter()
+                .filter(|name| locals.globals.contains(name.as_str()))
+                .cloned(),
+        );
+        let mut local_aliases = Vec::new();
+        if private_name.is_some() && !locals.globals.is_empty() {
+            let mut canonical_locals: FxHashMap<String, Name> = FxHashMap::default();
+            locals.names.retain(|name| {
+                if !locals.globals.contains(name.as_str()) {
+                    return true;
+                }
+                let canonical = mangle_name(name.as_str(), private_name).into_owned();
+                if let Some(original) = canonical_locals.get(&canonical) {
+                    local_aliases.push((name.clone(), original.clone()));
+                    false
+                } else {
+                    canonical_locals.insert(canonical, name.clone());
+                    true
+                }
+            });
+        }
+
         let mut annotation_collector = ReferenceCollector::default();
         if !future_annotations {
             for parameter in definition
@@ -634,6 +679,15 @@ impl FunctionPlan {
                 .into_iter()
                 .map(|name| names.intern(name.as_str()))
                 .collect(),
+            local_aliases: local_aliases
+                .into_iter()
+                .map(|(alias, original)| {
+                    (
+                        names.intern(alias.as_str()),
+                        names.intern(original.as_str()),
+                    )
+                })
+                .collect(),
             globals: names.intern_set(locals.globals),
             annotation_references: names.intern_set(annotation_collector.references),
             cellvars: names.intern_set(cellvars),
@@ -647,6 +701,16 @@ impl FunctionPlan {
             required: names.intern_set(required),
             type_parameter_names: names.intern_set(type_parameter_names),
         };
+        // A captured iteration alias shares the representative's emitted local kind,
+        // while raw-name lookup still needs both IDs to address the same slot.
+        for &(alias, original) in &plan.local_aliases {
+            if plan.cellvars.contains(&alias) {
+                plan.cellvars.insert(original);
+            }
+            if plan.inlined_comprehension_cellvars.contains(&alias) {
+                plan.inlined_comprehension_cellvars.insert(original);
+            }
+        }
         plan.absorb_child_requirements(
             nested_function_requirements.iter().copied(),
             nested_function_annotation_references.iter().copied(),
@@ -661,6 +725,11 @@ impl FunctionPlan {
             .filter(|name| !parameter_names.contains(*name))
             .filter_map(|name| {
                 let id = names.get(name)?;
+                // Explicit globals were reserved at their first comprehension save;
+                // ordinary global operations never claimed an earlier fast-local slot.
+                if plan.globals.contains(&id) {
+                    return None;
+                }
                 // Global and cell operations do not reserve the fast-local slot used to
                 // save a later comprehension temporary with the same name.
                 (plan.comprehension_shadowed_targets.contains(&id) || plan.cellvars.contains(&id))
@@ -718,6 +787,7 @@ impl FunctionPlan {
     pub(super) fn into_lowering_plan(self) -> LoweringFunctionPlan {
         LoweringFunctionPlan {
             locals: self.locals,
+            local_aliases: self.local_aliases,
             globals: self.globals,
             annotation_references: self.annotation_references,
             cellvars: self.cellvars,
@@ -770,13 +840,14 @@ impl ClassPlan {
         nested_class_requirements: &FxHashSet<NameId>,
         child_needs_class_closure: bool,
     ) -> Self {
-        // CPython retains this synthetic cell under future annotations even though
-        // the annotation thunk does not capture it in that mode.
-        let mut conditional_annotations = Vec::new();
-        if deferred_annotations {
-            collect_conditional_simple_annotations(&definition.body, &mut conditional_annotations);
-        }
-        let has_conditional_annotations = !conditional_annotations.is_empty();
+        // Symbol analysis records every annotation in a compound statement, even
+        // a non-simple target that emits no annotation thunk. Future annotations
+        // retain this cell as well, although the thunk does not capture it.
+        let has_conditional_annotations = deferred_annotations
+            && definition.body.iter().any(|statement| {
+                !matches!(statement, Stmt::AnnAssign(_))
+                    && has_annotations(std::slice::from_ref(statement))
+            });
         let ScopeBodyFacts {
             globals,
             nonlocals,
@@ -789,7 +860,7 @@ impl ClassPlan {
             has_function_definition,
             has_generic_definition,
             has_type_alias,
-            has_simple_annotations,
+            has_annotations,
             inlined_comprehension_cellvars,
             ..
         } = facts;
@@ -899,7 +970,7 @@ impl ClassPlan {
             || has_generic_definition
             || deferred_annotations
                 && !future_annotations
-                && (has_function_definition || has_simple_annotations);
+                && (has_function_definition || has_annotations);
         let comprehension_targets = locals
             .legacy_class_comprehension_symbols
             .take()
@@ -1131,7 +1202,7 @@ impl ScopeArena {
             eager_function_annotations: eager_annotations,
             eager_statement_annotations: eager_annotations,
             module_references_super: Some(false),
-            module_comprehension_saves: true,
+            global_comprehension_saves: true,
             ..LocalCollector::default()
         };
         if requires_module_bindings {
@@ -1151,7 +1222,7 @@ impl ScopeArena {
         self.by_parent_and_origin.reserve(definitions.len());
         for (index, input) in definitions.iter().enumerate() {
             let (origin, plan) = match input.definition {
-                ScopeDefinition::Function(definition, _) => (
+                ScopeDefinition::Function(definition, _, _) => (
                     ScopeOrigin::function(definition),
                     ScopePlan::Function(FunctionPlan::default()),
                 ),
@@ -1167,8 +1238,15 @@ impl ScopeArena {
         for (index, input) in definitions.into_iter().enumerate().rev() {
             let id = ScopeId(index + 1);
             match input.definition {
-                ScopeDefinition::Function(definition, flat) => {
-                    self.build_function(id, input.parent, definition, flat, future_annotations);
+                ScopeDefinition::Function(definition, flat, private_name) => {
+                    self.build_function(
+                        id,
+                        input.parent,
+                        definition,
+                        flat,
+                        future_annotations,
+                        private_name.as_deref(),
+                    );
                 }
                 ScopeDefinition::Class(definition, enclosing_private_name) => {
                     self.build_class(
@@ -1200,6 +1278,7 @@ impl ScopeArena {
         definition: &StmtFunctionDef,
         flat: Option<FlatFunctionInputs>,
         future_annotations: bool,
+        private_name: Option<&str>,
     ) {
         // Flat functions have no closure, annotation, or evaluation-order edge cases. Their
         // bindings and references were already collected during the module-wide name walk.
@@ -1243,6 +1322,7 @@ impl ScopeArena {
             future_annotations,
             eager_annotations,
             facts,
+            private_name,
             &nested_function_requirements,
             &nested_function_annotation_references,
             &class_requirements,
@@ -1388,7 +1468,11 @@ struct ScopeBuildInput<'ast> {
 }
 
 enum ScopeDefinition<'ast> {
-    Function(&'ast StmtFunctionDef, Option<FlatFunctionInputs>),
+    Function(
+        &'ast StmtFunctionDef,
+        Option<FlatFunctionInputs>,
+        Option<String>,
+    ),
     Class(&'ast StmtClassDef, Option<String>),
 }
 
@@ -1583,7 +1667,11 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                 let scope = ScopeId(self.definitions.len() + 1);
                 self.definitions.push(ScopeBuildInput {
                     parent,
-                    definition: ScopeDefinition::Function(definition, None),
+                    definition: ScopeDefinition::Function(
+                        definition,
+                        None,
+                        self.private_name.clone(),
+                    ),
                 });
                 self.current_scope = scope;
                 let outer_flat = self.flat_function.take();
@@ -1642,7 +1730,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                     .take()
                     .expect("function name collection should retain its flat inputs");
                 if !flat.complex {
-                    let ScopeDefinition::Function(_, inputs) =
+                    let ScopeDefinition::Function(_, inputs, _) =
                         &mut self.definitions[scope.0 - 1].definition
                     else {
                         unreachable!("function definition changed while collecting its body");
@@ -2016,7 +2104,8 @@ struct LocalCollector {
     eager_function_annotations: bool,
     eager_statement_annotations: bool,
     module_references_super: Option<bool>,
-    module_comprehension_saves: bool,
+    global_comprehension_saves: bool,
+    private_name: Option<String>,
     legacy_class_comprehension_symbols: Option<Vec<(Name, bool)>>,
 }
 
@@ -2186,6 +2275,10 @@ impl LocalCollector {
         if self.globals.contains(name) || self.nonlocals.contains(name) {
             return false;
         }
+        self.mark_local_binding(name)
+    }
+
+    fn mark_local_binding(&mut self, name: &str) -> bool {
         if let Some(candidate_bindings) = &mut self.candidate_bindings {
             if let Some(binding) = candidate_bindings.get_mut(name) {
                 *binding = true;
@@ -2736,8 +2829,19 @@ impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
             let iteration_names = comprehension_temporary_names(generators, key, value);
             let module_saves = self
                 .collector
-                .module_comprehension_saves
-                .then(|| module_comprehension_temporary_names(generators, key, value))
+                .global_comprehension_saves
+                .then(|| {
+                    global_comprehension_temporary_names(
+                        generators,
+                        key,
+                        value,
+                        |name| {
+                            self.collector.candidate_bindings.is_none()
+                                || self.collector.globals.contains(name)
+                        },
+                        self.collector.private_name.as_deref(),
+                    )
+                })
                 .flatten();
             let module_iteration_names = module_saves
                 .as_ref()
@@ -2770,7 +2874,13 @@ impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
                 }
                 previous_target_names.push(name.clone());
                 self.collector.claim_annotation_only_position(&name);
-                self.collector.mark_binding(&name);
+                if self.collector.global_comprehension_saves
+                    && self.collector.globals.contains(name.as_str())
+                {
+                    self.collector.mark_local_binding(&name);
+                } else {
+                    self.collector.mark_binding(&name);
+                }
             }
             let previous = std::mem::replace(&mut self.in_inlined_comprehension, true);
             walk_expr(self, expression);
@@ -3097,7 +3207,7 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
                 return;
             }
             Stmt::AnnAssign(annotation) => {
-                self.facts.has_simple_annotations |= annotation.simple;
+                self.facts.has_annotations = true;
                 if self.skip_annotations {
                     self.visit_expr(&annotation.target);
                     if let Some(value) = &annotation.value {
@@ -3701,17 +3811,19 @@ pub(super) fn comprehension_temporary_names(
     key: Option<&Expr>,
     value: &Expr,
 ) -> Vec<String> {
-    comprehension_symbol_names(generators, key, value, false, None)
+    comprehension_symbol_names(generators, key, value, false, None, None)
         .into_iter()
         .map(|(name, _)| name)
         .collect()
 }
 
-/// Return module save order when eligible global walrus slots need to be merged.
-pub(super) fn module_comprehension_temporary_names(
+/// Return save order when eligible global walrus slots need to be merged.
+pub(super) fn global_comprehension_temporary_names(
     generators: &[ruff_python_ast::Comprehension],
     key: Option<&Expr>,
     value: &Expr,
+    is_global: impl Fn(&str) -> bool,
+    private_name: Option<&str>,
 ) -> Option<Vec<String>> {
     let mut walrus_targets = Vec::new();
     if let Some(key) = key {
@@ -3731,16 +3843,41 @@ pub(super) fn module_comprehension_temporary_names(
     // existing outer read unless this comprehension itself also binds the name.
     let walrus_targets = walrus_targets
         .into_iter()
-        .filter(|name| !facts.names.contains(name) || facts.walrus_targets.contains(name))
+        .filter(|name| is_global(name))
+        .filter(|name| {
+            if private_name.is_none() {
+                return !facts.names.contains(name) || facts.walrus_targets.contains(name);
+            }
+            let canonical = mangle_name(name, private_name);
+            !facts
+                .names
+                .iter()
+                .any(|other| mangle_name(other, private_name) == canonical)
+                || facts
+                    .walrus_targets
+                    .iter()
+                    .any(|other| mangle_name(other, private_name) == canonical)
+        })
+        .map(|name| match private_name {
+            Some(private_name) => mangle_name(&name, Some(private_name)).into_owned(),
+            None => name,
+        })
         .collect::<FxHashSet<_>>();
     if walrus_targets.is_empty() {
         return None;
     }
     Some(
-        comprehension_symbol_names(generators, key, value, false, Some(&walrus_targets))
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect(),
+        comprehension_symbol_names(
+            generators,
+            key,
+            value,
+            false,
+            Some(&walrus_targets),
+            private_name,
+        )
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect(),
     )
 }
 
@@ -3752,7 +3889,7 @@ pub(super) fn legacy_class_comprehension_names(
 ) -> Vec<(String, bool)> {
     let mut names = vec![(".0".to_string(), false)];
     names.extend(comprehension_symbol_names(
-        generators, key, value, true, None,
+        generators, key, value, true, None, None,
     ));
     names
 }
@@ -3773,6 +3910,7 @@ fn comprehension_symbol_names(
     value: &Expr,
     all_symbols: bool,
     module_walrus_targets: Option<&FxHashSet<String>>,
+    private_name: Option<&str>,
 ) -> Vec<(String, bool)> {
     #[derive(Default)]
     struct Collector<'a> {
@@ -3782,6 +3920,7 @@ fn comprehension_symbol_names(
         targets: FxHashSet<String>,
         all_symbols: bool,
         module_walrus_targets: Option<&'a FxHashSet<String>>,
+        private_name: Option<&'a str>,
     }
 
     impl<'a> Collector<'a> {
@@ -3791,16 +3930,23 @@ fn comprehension_symbol_names(
             value: &Expr,
             all_symbols: bool,
             module_walrus_targets: Option<&'a FxHashSet<String>>,
+            private_name: Option<&'a str>,
         ) -> Self {
             let mut collector = Self {
                 all_symbols,
                 module_walrus_targets,
+                private_name,
                 ..Self::default()
             };
             for (index, generator) in generators.iter().enumerate() {
                 let mut targets = Vec::new();
                 collect_target_names(&generator.target, &mut targets);
-                collector.targets.extend(targets);
+                collector
+                    .targets
+                    .extend(targets.into_iter().map(|name| match private_name {
+                        Some(private_name) => mangle_name(&name, Some(private_name)).into_owned(),
+                        None => name,
+                    }));
                 collector.visit_expr(&generator.target);
                 if index > 0 {
                     collector.visit_expr(&generator.iter);
@@ -3865,13 +4011,15 @@ fn comprehension_symbol_names(
                 }
                 Expr::Named(named) if self.module_walrus_targets.is_some() => {
                     if let Expr::Name(name) = named.target.as_ref()
-                        && self
-                            .module_walrus_targets
-                            .is_some_and(|targets| targets.contains(name.id.as_str()))
+                        && self.module_walrus_targets.is_some_and(|targets| {
+                            targets
+                                .contains(mangle_name(name.id.as_str(), self.private_name).as_ref())
+                        })
                     {
                         // Native extends the containing scope before visiting the value.
                         // Its DEF_GLOBAL admission reserves this symbol's first position.
-                        self.targets.insert(name.id.to_string());
+                        self.targets
+                            .insert(mangle_name(name.id.as_str(), self.private_name).into_owned());
                         self.names.push((name.id.to_string(), false));
                     }
                     self.visit_expr(&named.value);
@@ -3912,21 +4060,30 @@ fn comprehension_symbol_names(
                 value,
                 self.all_symbols,
                 self.module_walrus_targets,
+                self.private_name,
             );
             self.targets.extend(child.targets);
             self.nested_names.extend(child.names);
         }
     }
 
-    let mut collector =
-        Collector::comprehension(generators, key, value, all_symbols, module_walrus_targets);
+    let mut collector = Collector::comprehension(
+        generators,
+        key,
+        value,
+        all_symbols,
+        module_walrus_targets,
+        private_name,
+    );
     if all_symbols {
         let mut seen = FxHashSet::default();
         collector.names.retain(|name| seen.insert(name.clone()));
     } else {
-        collector
-            .names
-            .retain(|(name, _)| collector.targets.remove(name));
+        collector.names.retain(|(name, _)| {
+            collector
+                .targets
+                .remove(mangle_name(name, private_name).as_ref())
+        });
     }
     collector.names
 }
@@ -4389,12 +4546,6 @@ fn future_feature_flags(body: &[Stmt]) -> u32 {
         })
 }
 
-pub(super) fn has_simple_annotations(body: &[Stmt]) -> bool {
-    let mut annotations = Vec::new();
-    collect_simple_annotations(body, &mut annotations);
-    !annotations.is_empty()
-}
-
 pub(super) fn has_annotations(body: &[Stmt]) -> bool {
     #[derive(Default)]
     struct AnnotationFinder(bool);
@@ -4532,6 +4683,68 @@ mod tests {
             let deferred = matches!(version, PythonVersion::Py314 | PythonVersion::Py315);
             assert_eq!(class.needs_classdict, deferred, "{version:?}");
             assert_eq!(class.has_conditional_annotations, deferred, "{version:?}");
+        }
+    }
+
+    #[test]
+    fn nonsimple_class_annotations_keep_native_scope_cells() {
+        for (body, conditional) in [
+            ("    object.attribute: int = 0\n", false),
+            ("    object[index]: int\n", false),
+            ("    (name): int = 0\n", false),
+            ("    if condition:\n        object.attribute: int\n", true),
+            ("    if False:\n        object[index]: int = 0\n", true),
+        ] {
+            for future in [false, true] {
+                let source = format!(
+                    "{}class C:\n{body}",
+                    if future {
+                        "from __future__ import annotations\n"
+                    } else {
+                        ""
+                    }
+                );
+                let parsed = parse_module(&source).unwrap();
+                for version in [
+                    PythonVersion::Py312,
+                    PythonVersion::Py313,
+                    PythonVersion::Py314,
+                    PythonVersion::Py315,
+                ] {
+                    let arena = ScopeArena::analyze_with_python_version(parsed.suite(), version);
+                    let class = arena.class(ScopeId(1)).unwrap();
+                    let deferred = matches!(version, PythonVersion::Py314 | PythonVersion::Py315);
+                    assert_eq!(
+                        class.needs_classdict,
+                        deferred && !future,
+                        "{source}, {version:?}"
+                    );
+                    assert_eq!(
+                        class.has_conditional_annotations,
+                        deferred && conditional,
+                        "{source}, {version:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_nonsimple_annotations_do_not_mark_the_enclosing_class() {
+        let parsed = parse_module(
+            "class Outer:\n    if condition:\n        class Inner:\n            object.attribute: int = 0\n",
+        )
+        .unwrap();
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let arena = ScopeArena::analyze_with_python_version(parsed.suite(), version);
+            let class = arena.class(ScopeId(1)).unwrap();
+            assert!(!class.needs_classdict);
+            assert!(!class.has_conditional_annotations);
         }
     }
 
@@ -4764,7 +4977,7 @@ mod tests {
                 .iter()
                 .map(|input| {
                     let (name, flat) = match &input.definition {
-                        ScopeDefinition::Function(definition, flat) => {
+                        ScopeDefinition::Function(definition, flat, _) => {
                             (definition.name.as_str(), flat.is_some())
                         }
                         ScopeDefinition::Class(definition, _) => (definition.name.as_str(), false),
