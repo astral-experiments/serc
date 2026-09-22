@@ -55,3 +55,13 @@ fn nested_named_try_exits_keep_the_coroutine_loop_owner() {
 ";
     common::assert_matches_cpython_marshal(source, "nested_try_while_exit_owners.py");
 }
+
+#[test]
+fn shared_normal_try_false_edges_stay_separate_after_a_manager() {
+    for condition in ["first and second", "first and second is False"] {
+        let source = format!(
+            "def f(items, first, second, manager, work):\n    for item in items:\n        try:\n            if {condition}:\n                with manager:\n                    work(item)\n        except ValueError:\n            work(None)\n    return items\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "normal_try_manager_false_edges.py");
+    }
+}

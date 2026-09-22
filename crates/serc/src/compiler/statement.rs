@@ -4914,6 +4914,10 @@ impl Compiler<'_> {
                         start
                     });
                     let has_no_emitted_cleanup = self.assembler.instruction_count() == marker_end;
+                    let original_shared_break_join = self.context.python_version
+                        >= crate::PythonVersion::Py314
+                        && !has_no_emitted_cleanup
+                        && self.assembler.at_original_shared_cleanup_join();
                     let break_jump =
                         self.emit_jump_forward_instruction(JUMP_FORWARD, context.break_label)?;
                     // The authored break NOP precedes unwinding. A legacy finalizer's
@@ -4928,6 +4932,7 @@ impl Compiler<'_> {
                         break_jump,
                         context.break_label,
                         finally_unwind_start,
+                        original_shared_break_join,
                     );
                     if copied_finally_with_join {
                         // Both manager exits copy this synthetic loop cleanup before copying
@@ -16075,8 +16080,12 @@ impl Compiler<'_> {
                     || independent_original_fallthrough)
                 // Each elif starts its own original conditional array. A manager in
                 // the first arm cannot locate that later arm's shared false exit.
+                // An independently certified empty join also separates a sole manager
+                // from its condition's false edges.
                 && (!statement.elif_else_clauses.is_empty()
-                    || !matches!(statement.body.as_slice(), [Stmt::With(_)]))
+                    || !matches!(statement.body.as_slice(), [Stmt::With(_)])
+                    || (self.context.python_version >= crate::PythonVersion::Py314
+                        && independent_original_fallthrough))
                 && condition_jump_target_count(fallthrough_test, false) > 1
                 && let Expr::BoolOp(boolean) = fallthrough_test
             {
@@ -19920,6 +19929,54 @@ impl Compiler<'_> {
             if matched.cases.iter().all(|case| {
                 suite_terminates_before_constant_folding(&case.body)
             }));
+        // Keep the inner try's original POP_BLOCK/JUMP pair until early copying
+        // removes its case-success predecessors. Only the remaining value-pattern
+        // failure then donates a line; the jump still belongs to the outer finally.
+        let compound_match_pop_block = self.context.python_version >= crate::PythonVersion::Py314
+            && !statement.is_star
+            && !statement.finalbody.is_empty()
+            && statement.orelse.is_empty()
+            && !terminal
+            && !direct_continue
+            && !normal_return_emitted
+            && body_noop_location.is_none()
+            && !nested_in_final_outer_try_statement
+            && loop_tail.is_none()
+            && else_loop_tail.is_none()
+            && else_match_tail.is_none()
+            && self.control.stack.depth == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .len()
+                == 1
+            && self.control.finally.active_finally_try_bodies == 1
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_overriding_finally_returns == 0
+            && matches!(statement.body.last(), Some(tail @ Stmt::Match(matched))
+            // Include lambda defaults when declining current-scope yields. Awaited
+            // case bodies retain the same original match-success records.
+            if !suite_contains_yield_with_headers(std::slice::from_ref(tail), true, false)
+                && fold_constant_for_version(&matched.subject, self.context.python_version).is_none()
+                && !expression_contains_inline_branch(&matched.subject)
+                && !expression_suspends_current_scope(&matched.subject)
+                && matched.cases.last().is_some_and(|case| {
+                    case.guard.is_none()
+                        && matches!(&case.pattern, Pattern::MatchValue(pattern)
+                            if self.assembler.original_match_failure_after_success_copy(
+                                try_end,
+                                self.source_location(pattern.range),
+                                self.control.stack.depth.cast_unsigned(),
+                            ))
+                }));
         // A discarded false arm still jumps to this original POP_BLOCK before
         // 3.13 compacts NOPs. Materialize it so jump threading sees that first
         // record, instead of threading straight through the normal-exit jump.
@@ -19934,6 +19991,7 @@ impl Compiler<'_> {
             == crate::PythonVersion::Py312
             || !statement.orelse.is_empty()
             || match_body_pop_block
+            || compound_match_pop_block
             || false_arm_pop_block)
             && !suite_terminates(&statement.body)
             && (!self.assembler.last_instruction_is_nop()
@@ -20531,7 +20589,7 @@ impl Compiler<'_> {
                 && matches!(normal_exit_suite.last(), Some(Stmt::Pass(pass))
                     if self.assembler.has_single_omitted_fallthrough_nop_before_label(
                         try_end, self.source_location(pass.range)));
-            if match_body_pop_block
+            if (match_body_pop_block || compound_match_pop_block)
                 && statement.orelse.is_empty()
                 && deferred_try_pop_block
                 && !removed_shared_try_pop_block
@@ -20880,6 +20938,7 @@ impl Compiler<'_> {
                 self.assembler.set_location(SourceLocation::NONE);
             }
             let normal_exit = if (match_body_pop_block
+                || compound_match_pop_block
                 || self.assembler.python_version() == crate::PythonVersion::Py312)
                 && statement.orelse.is_empty()
                 && deferred_try_pop_block
@@ -20908,6 +20967,14 @@ impl Compiler<'_> {
                     .preserve_empty_join_inlined_jump_nop(normal_exit);
                 self.assembler
                     .preserve_redundant_jump_nop_after_threading(normal_exit);
+            }
+            if compound_match_pop_block {
+                // These are genuine unlocated original records. Copy them only
+                // onto unconditional case-success edges before failure-line donation.
+                debug_assert_eq!(exception_policy, ExceptionPolicy::default());
+                self.assembler
+                    .prepare_no_location_block_for_inlining(normal_exit);
+                self.assembler.allow_last_unconditional_block_inlining();
             }
             if retained_return_guard_exit {
                 // POP_BLOCK disappears beside the same-line normal jump. Cold
@@ -21413,35 +21480,38 @@ impl Compiler<'_> {
                     .is_some_and(|context| {
                         copied_finally_has_terminal_named_recovery(&context.body)
                     });
-            if (terminal_handler_exit
-                && !(self
-                    .control
-                    .statements
-                    .current_statement_followed_by_name_return
-                    && self.control.withs.active_with_exits.is_empty()
-                    && !following_name_return_has_noncopyable_cleanup))
-                || handler_has_orphan_cold_cleanup
-                || handler_has_copied_pass_recovery
-                || handler_has_runtime_while_break_cleanup
-                || recovery_value_match_loop
-                || named_handler_cleanup_suffix
-                || copied_finally_leaves_handler_orphan
-                || has_bare_handler
-                || (!statement.is_star
-                    && !self
+            if !compound_match_pop_block
+                && ((terminal_handler_exit
+                    && !(self
                         .control
                         .statements
-                        .current_statement_followed_by_return_or_raise
-                    && statement.handlers.iter().any(|handler| {
-                        handler.as_except_handler().is_some_and(|handler| {
-                            // A preceding handler statement cannot make the folded
-                            // assertion's success/cleanup array reachable.
-                            matches!(handler.body.last(), Some(Stmt::Assert(assertion))
+                        .current_statement_followed_by_name_return
+                        && self.control.withs.active_with_exits.is_empty()
+                        && !following_name_return_has_noncopyable_cleanup))
+                    || handler_has_orphan_cold_cleanup
+                    || handler_has_copied_pass_recovery
+                    || handler_has_runtime_while_break_cleanup
+                    || recovery_value_match_loop
+                    || named_handler_cleanup_suffix
+                    || copied_finally_leaves_handler_orphan
+                    || has_bare_handler
+                    || (!statement.is_star
+                        && !self
+                            .control
+                            .statements
+                            .current_statement_followed_by_return_or_raise
+                        && statement.handlers.iter().any(|handler| {
+                            handler.as_except_handler().is_some_and(|handler| {
+                                // A preceding handler statement cannot make the folded
+                                // assertion's success/cleanup array reachable.
+                                matches!(handler.body.last(), Some(Stmt::Assert(assertion))
                                 if early_condition_truthiness(&assertion.test) == Some(false))
-                        })
-                    }))
+                            })
+                        })))
             {
-                // CPython removes this normal-exit edge before borrowed-load traversal. Keep
+                // The authenticated match exit retains its original jump as a located
+                // NOP, so it still supplies a nonempty fallthrough into the finally.
+                // Other normal exits lose their edge before borrowed-load traversal. Keep
                 // the barrier on the source edge so a shared target can still be reached from
                 // an enclosing branch or loop. A direct following name return is copied onto
                 // the normal edge first, so its load remains reachable and borrowed. Pending
@@ -27971,6 +28041,44 @@ impl Compiler<'_> {
             .record_normal_finally_none_prefix(normal_finally_pop_block);
         self.assembler
             .record_original_normal_finally_array(normal_finally_pop_block);
+        // Inspect both completed original arrays before the normal footer or any
+        // exceptional copy is emitted. The assembler admits only the retained
+        // closed match-failure edge into this exact populated cleanup.
+        if self.context.python_version == crate::PythonVersion::Py314
+            && !statement.is_star
+            && !statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_overriding_finally_returns == 0
+            && let Some(tail @ Stmt::Match(matched)) = statement.body.last()
+            && !suite_contains_yield_with_headers(std::slice::from_ref(tail), true, false)
+            && fold_constant_for_version(&matched.subject, self.context.python_version).is_none()
+            && !expression_contains_inline_branch(&matched.subject)
+            && !expression_suspends_current_scope(&matched.subject)
+            && let Some(case) = matched.cases.last()
+            && case.guard.is_none()
+            && let Pattern::MatchValue(pattern) = &case.pattern
+        {
+            self.assembler.admit_retained_match_finally_entry(
+                protected_end,
+                normal_finally_pop_block,
+                self.source_location(pattern.range),
+            );
+        }
         let finalbody_stays_in_nonempty_block = self.control.finally.active_normal_finally_bodies
             == 0
             && self.control.finally.active_finally_end_blocks == 0

@@ -2333,6 +2333,355 @@ fn shared_match_failure_join_requires_original_aliases_and_equal_depths() {
     }
 }
 
+#[test]
+fn match_failure_after_success_copy_requires_closed_aliases_and_full_records() {
+    let pattern_location = SourceLocation::new(3, 3, 9, 18);
+    for mutation in [
+        "original",
+        "extra alias",
+        "hidden success slot",
+        "foreign failure owner",
+        "duplicate failure",
+        "range-end edge",
+        "missing match boundary",
+    ] {
+        let mut assembler = Assembler::default();
+        let failure = assembler.label();
+        let end = assembler.label();
+        let try_end = assembler.label();
+        assembler.set_location(pattern_location);
+        let condition = assembler.emit_forward_with_depth(
+            POP_JUMP_IF_FALSE,
+            failure,
+            0,
+            ExceptionPolicy::default(),
+        );
+        if mutation == "foreign failure owner" {
+            assembler
+                .emitted_jump_mut(condition, "changing test owner")
+                .set_exception_owner(NormalizedExceptionOwner::Absent);
+        }
+        assembler.emit_with_depth(NOT_TAKEN, 0, 0, ExceptionPolicy::default());
+        if mutation == "duplicate failure" {
+            assembler.emit_forward_with_depth(
+                POP_JUMP_IF_FALSE,
+                failure,
+                0,
+                ExceptionPolicy::default(),
+            );
+            assembler.emit_with_depth(NOT_TAKEN, 0, 0, ExceptionPolicy::default());
+        } else if mutation == "range-end edge" {
+            assembler.emit_forward_with_depth(JUMP_FORWARD, try_end, 0, ExceptionPolicy::default());
+        }
+        assembler.set_location(SourceLocation::new(4, 4, 12, 19));
+        assembler.emit_with_depth(LOAD_CONST, 0, 1, ExceptionPolicy::default());
+        assembler.emit_with_depth(POP_TOP, 0, 0, ExceptionPolicy::default());
+        let success =
+            assembler.emit_forward_with_depth(JUMP_FORWARD, end, 0, ExceptionPolicy::default());
+        assembler.record_original_match_success(success, false);
+        assembler.mark_jump_as_interruptible(success);
+        assembler.defer_jump_removal(success);
+        if mutation == "hidden success slot" {
+            assembler
+                .emitted_jump_mut(success, "changing test slot")
+                .local_policy
+                .add_hidden_exception_owner_slots(1);
+        }
+        assembler.mark(failure);
+        if mutation == "extra alias" {
+            let alias = assembler.label();
+            assembler.mark(alias);
+        }
+        if mutation == "missing match boundary" {
+            assembler.mark(end);
+        } else {
+            assembler.mark_original_match_join(end);
+        }
+        assembler.mark(try_end);
+        let original_items = assembler.linear_items().to_vec();
+        assert_eq!(
+            assembler.original_match_failure_after_success_copy(try_end, pattern_location, 0),
+            mutation == "original",
+            "{mutation}",
+        );
+        assert_eq!(assembler.linear_items(), original_items, "{mutation}");
+    }
+}
+
+#[test]
+fn retained_match_finally_entry_requires_complete_original_endpoints() {
+    let pattern = SourceLocation::new(3, 3, 9, 18);
+    for mutation in [
+        "original",
+        "source pop owner",
+        "source jump location",
+        "source extra alias",
+        "source copy policy",
+        "late success edge",
+        "duplicate origin",
+        "target extra alias",
+        "target foreign entry",
+        "target pop owner",
+        "short cleanup",
+        "same donor line",
+        "owned first load",
+        "hidden first slot",
+        "target setup",
+        "python315",
+        "dead original",
+        "dead reachable",
+        "dead incoming branch",
+        "dead exception target",
+        "dead extra alias",
+        "dead wrong origin",
+        "dead missing named target",
+        "dead missing cleanup marker",
+        "dead wrong binding",
+        "dead changed owner",
+        "dead changed copy policy",
+        "dead third edge",
+    ] {
+        let mut assembler = Assembler::default();
+        let failure = assembler.label();
+        let join = assembler.label();
+        let source = assembler.label();
+        let handler = assembler.label();
+        let target = assembler.label();
+        let entry = assembler.label();
+        assembler.set_location(pattern);
+        assembler.emit_forward_with_depth(
+            POP_JUMP_IF_FALSE,
+            failure,
+            0,
+            ExceptionPolicy::default(),
+        );
+        assembler.emit_with_depth(NOT_TAKEN, 0, 0, ExceptionPolicy::default());
+        assembler.set_location(SourceLocation::new(4, 4, 12, 19));
+        assembler.emit_with_depth(LOAD_CONST, 0, 1, ExceptionPolicy::default());
+        assembler.emit_with_depth(POP_TOP, 0, 0, ExceptionPolicy::default());
+        let success =
+            assembler.emit_forward_with_depth(JUMP_FORWARD, join, 0, ExceptionPolicy::default());
+        assembler.record_original_match_success(success, false);
+        assembler.mark_jump_as_interruptible(success);
+        assembler.defer_jump_removal(success);
+        assembler.mark(failure);
+        assembler.mark_original_match_join(join);
+        if mutation == "source extra alias" {
+            let extra = assembler.label();
+            assembler.mark(extra);
+        }
+        assembler.mark(source);
+        assembler.set_location(SourceLocation::NONE);
+        let owner = if mutation == "source pop owner" {
+            ExceptionPolicy::default()
+        } else {
+            ExceptionPolicy::EXCLUDE_ALWAYS
+        };
+        assembler.emit_with_depth(NOP, 0, 0, owner);
+        assembler.mark_last_as_converted_pop_block();
+        let exit =
+            assembler.emit_forward_with_depth(JUMP_FORWARD, target, 0, ExceptionPolicy::default());
+        assembler.prepare_no_location_block_for_inlining(exit);
+        if mutation != "source copy policy" {
+            assembler.allow_last_unconditional_block_inlining();
+        }
+        assembler.prevent_jump_inlining(exit);
+        if mutation == "source jump location" {
+            assembler
+                .emitted_jump_mut(exit, "changing source location")
+                .location = pattern;
+        }
+        assembler.record_compound_try_owner_exit(source, target, None);
+        if mutation == "duplicate origin" {
+            assembler.record_compound_try_owner_exit(source, target, None);
+        }
+        assembler.mark(handler);
+        if mutation.starts_with("dead ") {
+            for _ in 0..if mutation == "dead third edge" { 2 } else { 1 } {
+                let body_start = assembler.label();
+                let body_end = assembler.label();
+                let name_cleanup = assembler.label();
+                assembler.mark(body_start);
+                assembler.set_location(SourceLocation::new(6, 8, 8, 22));
+                if mutation == "dead incoming branch" {
+                    assembler.emit_forward_with_depth(
+                        POP_JUMP_IF_FALSE,
+                        body_end,
+                        1,
+                        ExceptionPolicy::default(),
+                    );
+                }
+                assembler.emit_with_depth(
+                    if mutation == "dead reachable" {
+                        POP_TOP
+                    } else {
+                        RAISE_VARARGS
+                    },
+                    if mutation == "dead reachable" { 0 } else { 2 },
+                    1,
+                    ExceptionPolicy::default(),
+                );
+                assembler.mark(body_end);
+                if mutation == "dead extra alias" {
+                    let alias = assembler.label();
+                    assembler.mark(alias);
+                }
+                if mutation != "dead missing cleanup marker" {
+                    assembler.record_unlocated_cleanup_targets();
+                }
+                assembler.emit_with_depth(
+                    POP_EXCEPT,
+                    0,
+                    0,
+                    if mutation == "dead changed owner" {
+                        ExceptionPolicy::EXCLUDE_ALWAYS
+                    } else {
+                        ExceptionPolicy::default()
+                    },
+                );
+                assembler.emit_with_depth(LOAD_CONST, 0, 1, ExceptionPolicy::default());
+                assembler.emit_with_depth(STORE_FAST, 2, 0, ExceptionPolicy::default());
+                assembler.emit_with_depth(
+                    DELETE_FAST,
+                    if mutation == "dead wrong binding" {
+                        3
+                    } else {
+                        2
+                    },
+                    0,
+                    ExceptionPolicy::default(),
+                );
+                let dead_index = assembler.item_count();
+                let dead_exit = assembler.emit_forward_with_depth(
+                    JUMP_FORWARD,
+                    target,
+                    0,
+                    ExceptionPolicy::default(),
+                );
+                assembler.prevent_jump_inlining(dead_exit);
+                if mutation == "dead changed copy policy" {
+                    assembler.prepare_no_location_block_for_inlining(dead_exit);
+                }
+                if mutation != "dead missing named target" {
+                    assembler.record_named_handler_cleanup_target(name_cleanup);
+                }
+                assembler.add_exception_region(body_start, body_end, name_cleanup, 1, true);
+                if mutation == "dead wrong origin" {
+                    assembler.exception_regions.last_mut().unwrap().priority =
+                        super::ExceptionRegionPriority::OriginalRange(handler, body_end);
+                }
+                if mutation == "dead exception target" {
+                    assembler.add_exception_region(body_start, body_end, body_end, 1, true);
+                }
+                assembler.mark(name_cleanup);
+                assembler.set_location(SourceLocation::NONE);
+                assembler.emit_with_depth(RERAISE, 1, 0, ExceptionPolicy::default());
+                if mutation == "dead third edge" {
+                    assert!(
+                        assembler.is_original_unreachable_named_cleanup_exit(dead_index, target)
+                    );
+                }
+            }
+        } else {
+            assembler.emit_with_depth(RERAISE, 0, 0, ExceptionPolicy::default());
+        }
+        assembler.mark(target);
+        assembler
+            .exception_owner_provenance
+            .block_boundaries
+            .insert(target);
+        if mutation == "target extra alias" {
+            let extra = assembler.label();
+            assembler.mark(extra);
+        }
+        assembler.mark(entry);
+        assembler.prevent_borrow_finally_fallthrough(entry);
+        assembler.prevent_borrow_fallthrough_reachability(entry);
+        if mutation == "target foreign entry" {
+            assembler.prevent_borrow_reachability(target);
+        }
+        if mutation == "target setup" {
+            assembler.record_exception_setup(entry, true);
+        }
+        let pop_ordinal = assembler.instruction_count();
+        let owner = if mutation == "target pop owner" {
+            ExceptionPolicy::default()
+        } else {
+            ExceptionPolicy::EXCLUDE_ALWAYS
+        };
+        assembler.emit_with_depth(NOP, 0, 0, owner);
+        assembler.mark_last_as_converted_pop_block();
+        assembler.set_location(if mutation == "same donor line" {
+            pattern
+        } else {
+            SourceLocation::new(9, 9, 8, 12)
+        });
+        assembler.emit_with_depth(LOAD_FAST, 0, 1, ExceptionPolicy::default());
+        if let Some(Item::Instruction(first)) = assembler.linear_items_mut().last_mut() {
+            if mutation == "owned first load" {
+                first.local_policy = LocalPolicy::for_load(true, false);
+            }
+            if mutation == "hidden first slot" {
+                first.local_policy.add_hidden_exception_owner_slots(1);
+            }
+        }
+        assembler.emit_with_depth(LOAD_ATTR, 0, 1, ExceptionPolicy::default());
+        assembler.emit_with_depth(LOAD_ATTR, 1, 2, ExceptionPolicy::default());
+        assembler.emit_with_depth(CALL, 0, 1, ExceptionPolicy::default());
+        if mutation != "short cleanup" {
+            assembler.emit_with_depth(GET_AWAITABLE, 0, 1, ExceptionPolicy::default());
+        }
+        if mutation == "late success edge" {
+            let late = assembler.emit_forward_with_depth(
+                JUMP_FORWARD,
+                join,
+                0,
+                ExceptionPolicy::default(),
+            );
+            assembler.record_original_match_success(late, false);
+            assembler.mark_jump_as_interruptible(late);
+        }
+        if mutation == "python315" {
+            assembler.python_version = crate::PythonVersion::Py315;
+        }
+        let items = assembler.linear_items().to_vec();
+        let origins = assembler
+            .exception_owner_provenance
+            .compound_try_owner_exits
+            .clone();
+        assembler.admit_retained_match_finally_entry(entry, pop_ordinal, pattern);
+        let admitted = matches!(mutation, "original" | "dead original");
+        assert_eq!(
+            assembler.borrow_unreachable_blocks.contains(&entry),
+            !admitted,
+            "{mutation}"
+        );
+        assert_eq!(
+            assembler.borrow_finally_entries.contains_key(&entry),
+            !admitted,
+            "{mutation}"
+        );
+        assert_eq!(
+            assembler.borrow_jump_entry_labels.contains(&entry),
+            !admitted,
+            "{mutation}"
+        );
+        assert_eq!(
+            assembler.borrow_block_aliases.contains(&entry),
+            admitted,
+            "{mutation}"
+        );
+        assert_eq!(assembler.linear_items(), items, "{mutation}");
+        assert_eq!(
+            assembler
+                .exception_owner_provenance
+                .compound_try_owner_exits,
+            origins,
+            "{mutation}"
+        );
+    }
+}
+
 fn pattern_capture_swap_pipeline() -> super::OptimizationPipeline {
     optimization_pipeline(
         [
