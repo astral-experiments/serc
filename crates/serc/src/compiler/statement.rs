@@ -24729,7 +24729,15 @@ impl Compiler<'_> {
                 statement.finalbody.last(),
                 Some(Stmt::If(tail))
                     if tail.elif_else_clauses.is_empty()
-                        && condition_jump_target_count(&tail.test, false) == 1
+                        && (condition_jump_target_count(&tail.test, false) == 1
+                            // Constant folding removes the false edge after native exit copying.
+                            // A single linear call still supplies the normal fallthrough donor.
+                            || (self.context.python_version >= crate::PythonVersion::Py314
+                                && early_condition_truthiness(&tail.test) == Some(true)
+                                && matches!(tail.body.as_slice(), [Stmt::Expr(expression)]
+                                    if matches!(expression.value.as_ref(), Expr::Call(_))
+                                        && !expression_contains_inline_branch(&expression.value)
+                                        && !expression_suspends_current_scope(&expression.value))))
                         && matches!(tail.body.last(), Some(Stmt::Expr(_)))
             );
 

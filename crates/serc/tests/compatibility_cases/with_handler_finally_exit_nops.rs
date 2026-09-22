@@ -79,3 +79,13 @@ fn matches_cpython_manager_pop_after_generator_try_else_finally() {
         common::assert_matches_cpython_marshal(&source, "manager_pop_generator_else.py");
     }
 }
+
+#[test]
+fn folded_true_finally_call_drops_redundant_manager_exit() {
+    for condition in ["__debug__", "True", "1"] {
+        let source = format!(
+            "def probe(outer, inner, work, log):\n    with outer:\n        try:\n            with inner:\n                work()\n        finally:\n            if {condition}:\n                log('finished')\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "folded_true_finally_call.py");
+    }
+}
