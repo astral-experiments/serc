@@ -111,8 +111,9 @@ fn constant_pair_store_tail(items: &[Item]) -> Option<[Instruction; 3]> {
 /// Certifies one complete local-capture cleanup rotation.
 ///
 /// A conditional marker identifies an original block entry with identical pop locations.
-/// After an unpack or pop, all five operations must instead share a line: both replacement
-/// NOPs disappear, and the moved store cannot fuse with either the prefix or trailing pops.
+/// An unpack can instead precede a distinct capture line; its own span must match
+/// the consumers. One capture-line NOP survives that rotation. Same-line cleanups
+/// after an unpack or pop remove both NOPs, with no adjacent local-store fusion.
 fn single_capture_cleanup_vacancies(items: &[Item]) -> Option<usize> {
     let [
         Item::Instruction(marker),
@@ -129,7 +130,10 @@ fn single_capture_cleanup_vacancies(items: &[Item]) -> Option<usize> {
         && [inner, first_pop, last_pop, store]
             .iter()
             .all(|instruction| instruction.location.line == outer.location.line);
-    if (marker.opcode != NOT_TAKEN && !same_line_cleanup)
+    let multiline_unpack_cleanup = marker.opcode == UNPACK_SEQUENCE
+        && marker.operand() == Operand::Value(1)
+        && marker.location == first_pop.location;
+    if (marker.opcode != NOT_TAKEN && !same_line_cleanup && !multiline_unpack_cleanup)
         || outer.opcode != SWAP
         || outer.operand() != Operand::Value(3)
         || inner.opcode != SWAP
