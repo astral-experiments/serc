@@ -26,6 +26,13 @@ impl Compiler<'_> {
             .is_some_and(|plan| plan.globals.contains(&name))
     }
 
+    /// Direct annotation references honor class bindings before enclosing closure cells.
+    pub(super) fn class_scope_shadows_annotation_name(&self, name: NameId) -> bool {
+        self.scope_arena()
+            .class(self.unit.scope_id)
+            .is_some_and(|plan| plan.globals.contains(&name) || plan.bound_names.contains(&name))
+    }
+
     pub(super) fn function_scope_id(
         &self,
         definition: &StmtFunctionDef,
@@ -87,7 +94,15 @@ impl Compiler<'_> {
                 // class body's free variables, but not arbitrary class-local bindings.
                 Scope::Class { free_indices, .. } => {
                     free_indices.contains_key(&name)
-                        || arena.names.get("__class__") == Some(name) && self.is_cell_id(name)
+                        || arena.names.get("__class__") == Some(name)
+                            && self.is_cell_id(name)
+                            && (arena
+                                .class(self.unit.scope_id)
+                                .is_some_and(|plan| !plan.bound_names.contains(&name))
+                                || function_annotation_expressions(definition).any(|annotation| {
+                                    annotation_nested_required_names(annotation)
+                                        .contains("__class__")
+                                }))
                 }
                 Scope::Module | Scope::Function { .. } => self.can_provide_closure_id(name),
             };
@@ -345,6 +360,7 @@ pub(super) struct ScopeBodyFacts {
     pub(super) nested_generator_requirements: BTreeSet<String>,
     pub(super) nested_annotation_scope_requirements: BTreeSet<String>,
     nested_annotation_class_closure: bool,
+    annotation_class_reference: bool,
     annotation_comprehension_requirements: AnnotationComprehensionRequirements,
     pub(super) generator_named_targets: FxHashSet<String>,
     pub(super) inlined_comprehension_cellvars: FxHashSet<String>,
@@ -868,6 +884,7 @@ impl ClassPlan {
             nested_generator_requirements,
             nested_annotation_scope_requirements: annotation_scope_requirements,
             nested_annotation_class_closure,
+            annotation_class_reference,
             annotation_comprehension_requirements,
             has_function_definition,
             has_generic_definition,
@@ -929,15 +946,17 @@ impl ClassPlan {
                 |names| names.contains(mangle_name(name, private_name).as_ref()),
             )
         };
-        let mut body_explicitly_references_dunder_class = explicit_dunder_class_reference;
+        let body_explicitly_references_dunder_class = explicit_dunder_class_reference;
         let mut required = references
             .into_iter()
             .filter(|name| is_nonlocal(name) || (!is_global(name) && !is_bound(name)))
             .collect::<BTreeSet<_>>();
         required.extend(locals.nonlocals.iter().cloned());
         let body_requires_classdict = !deferred_annotations && required.contains("__classdict__");
-        body_explicitly_references_dunder_class |=
-            annotation_scope_requirements.contains("__class__");
+        let annotation_requires_class = !is_bound("__class__")
+            && !is_global("__class__")
+            && !is_nonlocal("__class__")
+            && annotation_class_reference;
         required.extend(
             annotation_scope_requirements
                 .into_iter()
@@ -981,13 +1000,17 @@ impl ClassPlan {
             || annotation_comprehension_requirements.first_iterable_needs_class
                 && !is_global("__class__");
         // The annotation captures the class being defined, not an outer __class__ binding.
-        if comprehension_needs_class && !locals.nonlocals.contains("__class__") {
+        if comprehension_needs_class
+            && !body_requires_dunder_class
+            && !locals.nonlocals.contains("__class__")
+        {
             required.remove("__class__");
         }
         // Separate comprehensions skip class bindings when capturing enclosing locals.
         let needs_class_closure = child_needs_class_closure
             || nested_lambda_requirements.contains("__class__")
             || nested_annotation_class_closure
+            || annotation_requires_class
             || comprehension_needs_class;
         required.extend(
             annotation_comprehension_requirements
@@ -3141,10 +3164,24 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
                 self.visit_expr(annotation);
             }
         }
+        if self.class_scope
+            && !self.skip_annotations
+            && (!self.eager_function_annotations || definition.type_params.is_some())
+            && !definition.type_params.iter().any(|parameters| {
+                parameters
+                    .iter()
+                    .any(|parameter| parameter.name().as_str() == "__class__")
+            })
+        {
+            for annotation in function_annotation_expressions(definition) {
+                self.collect_annotation_class_reference(annotation);
+            }
+        }
         let Some(type_params) = definition.type_params.as_deref() else {
             return;
         };
         self.facts.has_generic_definition = true;
+        self.collect_type_parameter_class_closures(type_params);
         self.collect_type_parameter_comprehensions(type_params);
         let type_names: BTreeSet<_> = type_params
             .iter()
@@ -3196,6 +3233,7 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
             return;
         };
         self.facts.has_generic_definition = true;
+        self.collect_type_parameter_class_closures(type_params);
         self.collect_type_parameter_comprehensions(type_params);
         let type_names: BTreeSet<_> = type_params
             .iter()
@@ -3206,15 +3244,56 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
             for argument in &arguments.args {
                 self.collect_annotation_comprehensions(argument, Some(type_params));
                 required.extend(expression_required_names(argument));
+                if !type_names.contains("__class__") {
+                    self.collect_annotation_class_reference(argument);
+                }
             }
             for keyword in &arguments.keywords {
                 self.collect_annotation_comprehensions(&keyword.value, Some(type_params));
                 required.extend(expression_required_names(&keyword.value));
+                if !type_names.contains("__class__") {
+                    self.collect_annotation_class_reference(&keyword.value);
+                }
             }
         }
         self.facts
             .nested_annotation_scope_requirements
             .extend(required.difference(&type_names).cloned());
+    }
+
+    /// Annotation scopes request the current class cell, independently of class-body captures.
+    fn collect_annotation_class_reference(&mut self, expression: &Expr) {
+        if !self.class_scope || !expression_required_names(expression).contains("__class__") {
+            return;
+        }
+        if !analyze_expression_scope(&ruff_python_ast::Parameters::default(), expression)
+            .required
+            .contains("__class__")
+        {
+            return;
+        }
+        self.facts.annotation_class_reference = true;
+        self.facts.nested_annotation_class_closure |=
+            nested_expression_required_names(expression).contains("__class__");
+    }
+
+    fn collect_type_parameter_class_closures(&mut self, type_params: &ruff_python_ast::TypeParams) {
+        if !self.class_scope
+            || type_params
+                .iter()
+                .any(|parameter| parameter.name().as_str() == "__class__")
+        {
+            return;
+        }
+        for parameter in type_params {
+            let bound = match parameter {
+                TypeParam::TypeVar(parameter) => parameter.bound.as_deref(),
+                TypeParam::TypeVarTuple(_) | TypeParam::ParamSpec(_) => None,
+            };
+            for expression in bound.into_iter().chain(parameter.default()) {
+                self.collect_annotation_class_reference(expression);
+            }
+        }
     }
 
     fn collect_type_alias(&mut self, statement: &'ast ruff_python_ast::StmtTypeAlias) {
@@ -3226,24 +3305,10 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
                     .any(|parameter| parameter.name().as_str() == "__class__")
             })
         {
-            let bounds_and_defaults = statement
-                .type_params
-                .iter()
-                .flat_map(|parameters| parameters.iter())
-                .flat_map(|parameter| {
-                    let bound = match parameter {
-                        TypeParam::TypeVar(parameter) => parameter.bound.as_deref(),
-                        TypeParam::TypeVarTuple(_) | TypeParam::ParamSpec(_) => None,
-                    };
-                    bound.into_iter().chain(parameter.default())
-                });
-            // Nested functions bypass the class namespace and still need its
-            // synthetic cell, even when a class attribute shadows `__class__`.
-            self.facts.nested_annotation_class_closure |= std::iter::once(statement.value.as_ref())
-                .chain(bounds_and_defaults)
-                .any(|expression| {
-                    nested_expression_required_names(expression).contains("__class__")
-                });
+            self.collect_annotation_class_reference(&statement.value);
+            if let Some(parameters) = statement.type_params.as_deref() {
+                self.collect_type_parameter_class_closures(parameters);
+            }
         }
         self.collect_annotation_comprehensions(&statement.value, statement.type_params.as_deref());
         if let Some(parameters) = statement.type_params.as_deref() {
@@ -3323,6 +3388,17 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
                 self.facts.has_annotations = true;
                 if !self.skip_annotations && !self.eager_function_annotations {
                     self.collect_annotation_comprehensions(&annotation.annotation, None);
+                }
+                if self.class_scope && !self.skip_annotations && !self.eager_function_annotations {
+                    self.visit_expr(&annotation.target);
+                    if let Some(value) = &annotation.value {
+                        self.visit_expr(value);
+                    }
+                    let body_reference = self.facts.explicit_dunder_class_reference;
+                    self.visit_expr(&annotation.annotation);
+                    self.collect_annotation_class_reference(&annotation.annotation);
+                    self.facts.explicit_dunder_class_reference = body_reference;
+                    return;
                 }
                 if self.skip_annotations {
                     self.visit_expr(&annotation.target);
