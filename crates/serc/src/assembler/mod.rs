@@ -3852,7 +3852,10 @@ impl Assembler {
     }
 
     /// Resolves the first condition slot in an exact original normal-finally prefix.
-    pub(crate) fn current_normal_finally_condition_slot_owner(&self) -> Option<bool> {
+    pub(crate) fn current_normal_finally_condition_slot_owner(
+        &self,
+        with_exclusions: &[Vec<(Label, Label)>],
+    ) -> Option<bool> {
         use crate::target::opcodes::{
             CALL, LOAD_ATTR, LOAD_DEREF, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, TO_BOOL,
         };
@@ -3878,11 +3881,39 @@ impl Assembler {
         let mut leading_labels = FxHashSet::default();
         let mut labels = FxHashSet::default();
         let mut instructions = Vec::new();
-        for item in prefix {
+        let mut has_post_pop_range_label = false;
+        for (position, item) in prefix.iter().enumerate() {
             match item {
                 Item::Label(label) => {
-                    if instructions.len() > if truth { 2 } else { 1 }
-                        || self.preserved_block_boundaries.contains(label)
+                    if instructions.len() > if truth { 2 } else { 1 } {
+                        // A normal POP_BLOCK exclusion ends inside the original array.
+                        // Defer this label only to the exact attribute/None prefix below;
+                        // other prefixes retain their original label admission.
+                        if truth
+                            || self.python_version != crate::PythonVersion::Py314
+                            || instructions.len() != 2
+                            || provenance.source_boundaries.contains(label)
+                            || !with_exclusions.iter().flatten().any(|(start, end)| {
+                                end == label
+                                    && prefix[..position]
+                                        .iter()
+                                        .rposition(|item| *item == Item::Label(*start))
+                                        .is_some_and(|start| {
+                                            prefix[start + 1..position]
+                                                .iter()
+                                                .filter_map(|item| match item {
+                                                    Item::Instruction(record) => Some(*record),
+                                                    Item::Label(_) => None,
+                                                })
+                                                .eq(std::iter::once(instructions[1]))
+                                        })
+                            })
+                        {
+                            return None;
+                        }
+                        has_post_pop_range_label = true;
+                    }
+                    if self.preserved_block_boundaries.contains(label)
                         || provenance.setups.iter().any(|(setup, _)| setup == label)
                         || provenance.fusion_boundaries.contains(label)
                         || provenance.omitted_nop_counts.contains_key(label)
@@ -4080,8 +4111,49 @@ impl Assembler {
             }
         }
         let (plain, pop, owns_slot) = match instructions.as_slice() {
+            // The two IR markers represent one original POP_BLOCK. In 3.14,
+            // its seven-record attribute/None array compacts to four records;
+            // the appended marker reuses the owned IS_OP slot at index four.
+            // 3.15 clears those vacated slots and must keep its existing policy.
+            [plain, pop, receiver, attribute, condition]
+                if self.python_version == crate::PythonVersion::Py314
+                    && !truth
+                    && matches!(receiver.opcode, LOAD_FAST | LOAD_DEREF)
+                    && matches!(receiver.operand(), Operand::Value(_))
+                    && attribute.opcode == LOAD_ATTR
+                    && matches!(attribute.operand(), Operand::Value(argument) if argument & 1 == 0)
+                    && condition.location.line >= 0
+                    && condition.location.end_line == condition.location.line
+                    && plain.location.line != condition.location.line
+                    && matches!(condition.operand(), Operand::Forward(_))
+                    && pop.depth_after().is_some()
+                    && plain.depth_after() == pop.depth_after()
+                    && receiver.depth_after()
+                        == pop.depth_after().and_then(|depth| depth.checked_add(1))
+                    && attribute.depth_after() == receiver.depth_after()
+                    && condition.depth_after() == pop.depth_after()
+                    && [receiver, attribute].iter().all(|record| {
+                        record.location.line == condition.location.line
+                            && record.location.end_line == condition.location.end_line
+                            && record.location.column == condition.location.column
+                            && record.location.end_column <= condition.location.end_column
+                            && !record.fusion_policy.is_converted_pop_block()
+                    })
+                    && provenance
+                        .source_none_conditions
+                        .iter()
+                        .filter(|origin| {
+                            origin.instruction == *condition
+                                && leading_labels.contains(&origin.entry)
+                        })
+                        .count()
+                        == 1 =>
+            {
+                (*plain, *pop, true)
+            }
             [plain, pop, receiver, method, call, discard, load, condition]
                 if !truth
+                    && !has_post_pop_range_label
                     && matches!(receiver.opcode, LOAD_FAST | LOAD_DEREF)
                     && method.opcode == LOAD_ATTR
                     && matches!(method.operand(), Operand::Value(argument) if argument & 1 != 0)
@@ -4127,7 +4199,11 @@ impl Assembler {
             || instructions.iter().enumerate().any(|(index, instruction)| {
                 instruction.pre_fold_extra_instructions() != 0
                     || instruction.local_policy.hidden_exception_owner_slots()
-                        != if owns_slot && index == 7 { 3 } else { 0 }
+                        != if owns_slot && index + 1 == instructions.len() {
+                            3
+                        } else {
+                            0
+                        }
                     || instruction.no_location_policy.borrow_fallthrough()
                         != BorrowFallthrough::Reachable
                     || (index != 1 && instruction.exception_policy() != ExceptionPolicy::default())
@@ -4162,7 +4238,7 @@ impl Assembler {
         {
             return None;
         }
-        // The call/None prefix keeps its proven owned comparison slot. A direct
+        // The admitted None prefixes keep their proven owned comparison slots. A direct
         // truth prefix has no call or comparison compaction: its first marker
         // retains the normal-finally NULL slot after the two leading NOPs merge.
         Some(owns_slot)

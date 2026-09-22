@@ -7711,7 +7711,9 @@ impl Compiler<'_> {
                 .conditions
                 .exclude_condition_not_taken_from_exception
             && !self.control.withs.force_terminal_with_marker_ownerless
-            && let Some(owns_slot) = self.assembler.current_normal_finally_condition_slot_owner()
+            && let Some(owns_slot) = self.assembler.current_normal_finally_condition_slot_owner(
+                &self.control.withs.active_with_region_exclusions,
+            )
         {
             // The loop exit's excluded NOP does not split the original array.
             // Its exact prefix distinguishes a reused call slot from a fresh truth marker.
