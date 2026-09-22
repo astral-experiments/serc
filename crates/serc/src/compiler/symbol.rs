@@ -28,8 +28,8 @@ use crate::{CompileError, PythonVersion};
 use super::RETURN_VALUE;
 
 use super::constant::{
-    DeferredConstantTarget, constant_slice, fold_constant, literal_constant,
-    python_constant_values_equal,
+    DeferredConstantTarget, constant_slice, fold_constant, fold_constant_for_version,
+    literal_constant, python_constant_values_equal,
 };
 use super::scope::{NameId, NameSet, definitely_evaluated_references};
 use super::source::unparse_annotation;
@@ -902,6 +902,7 @@ impl Compiler<'_> {
             legacy_compiler: Option<&'compiler Compiler<'source>>,
             legacy_annotated_scope: bool,
             source: &'source str,
+            python_version: PythonVersion,
         }
 
         impl<'ast> Collector<'_, '_, 'ast> {
@@ -1526,9 +1527,9 @@ impl Compiler<'_> {
                     _ => None,
                 };
                 if elements.is_some_and(|elements| {
-                    elements
-                        .iter()
-                        .any(|element| fold_constant(element).is_none())
+                    elements.iter().any(|element| {
+                        fold_constant_for_version(element, self.python_version).is_none()
+                    })
                 }) {
                     self.has_untracked_collection = true;
                 }
@@ -1564,7 +1565,7 @@ impl Compiler<'_> {
                 }
                 if self.register_folds
                     && literal_constant(expression).is_none()
-                    && fold_constant(expression).is_some()
+                    && fold_constant_for_version(expression, self.python_version).is_some()
                 {
                     self.folded_expressions.push(expression);
                 }
@@ -1835,6 +1836,7 @@ impl Compiler<'_> {
             legacy_annotated_scope: !self.has_deferred_annotations()
                 && matches!(self.unit.scope, Scope::Module | Scope::Class { .. }),
             source: self.context.source,
+            python_version: self.context.python_version,
             ..Collector::default()
         };
         if let Some(expression) = expression_only {

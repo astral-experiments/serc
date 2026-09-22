@@ -500,7 +500,12 @@ pub(super) fn can_order_early_boolean_admissions(body: &[Stmt]) -> bool {
         fn visit_stmt(&mut self, statement: &'ast Stmt) {
             match statement {
                 Stmt::Assign(_) | Stmt::Return(_) | Stmt::Pass(_) => walk_stmt(self, statement),
-                Stmt::Expr(expression) if fold_constant(&expression.value).is_none() => {
+                // Keep existing tuple-not exclusions as modern sequence folding expands.
+                Stmt::Expr(expression)
+                    if fold_constant(&expression.value).is_none()
+                        && fold_constant_for_version(&expression.value, PythonVersion::Py314)
+                            .is_none() =>
+                {
                     walk_stmt(self, statement);
                 }
                 Stmt::If(conditional) => {
@@ -607,7 +612,8 @@ impl Compiler<'_> {
             self.assembler
                 .set_location(self.source_location(expression.range()));
         }
-        let hidden_owner_slots = folded_constant_owner_slots(expression);
+        let hidden_owner_slots =
+            folded_constant_owner_slots(expression, self.context.python_version);
         if self.context.python_version >= PythonVersion::Py314
             && let Constant::Int(value) = constant
             && let Ok(value) = u8::try_from(value)
@@ -681,7 +687,7 @@ impl Compiler<'_> {
                         }
                     }
                 } else if !matches!(
-                    fold_constant(&subscript.slice),
+                    fold_constant_for_version(&subscript.slice, self.context.python_version),
                     Some(Constant::Int(value)) if u8::try_from(value).is_ok()
                 ) {
                     self.record_folded_value(&subscript.slice)?;
@@ -1147,30 +1153,37 @@ pub(super) fn is_small_literal_tuple_element(expression: &Expr) -> bool {
 ///
 /// The count is attached to the emitted folded result so labels and other control-flow
 /// boundaries naturally constrain which later boolean marker can reuse the stale slots.
-pub(super) fn folded_constant_owner_slots(expression: &Expr) -> usize {
-    fn direct(expression: &Expr) -> usize {
+pub(super) fn folded_constant_owner_slots(
+    expression: &Expr,
+    python_version: PythonVersion,
+) -> usize {
+    fn direct(expression: &Expr, python_version: PythonVersion) -> usize {
         match expression {
-            Expr::BinOp(binary) => 2 + direct(&binary.left) + direct(&binary.right),
-            Expr::Tuple(tuple) => tuple
-                .elts
-                .iter()
-                .fold(tuple.elts.len(), |slots, element| slots + direct(element)),
+            Expr::BinOp(binary) => {
+                2 + direct(&binary.left, python_version) + direct(&binary.right, python_version)
+            }
+            Expr::Tuple(tuple) => tuple.elts.iter().fold(tuple.elts.len(), |slots, element| {
+                slots + direct(element, python_version)
+            }),
             Expr::UnaryOp(unary) => {
                 if unary.op == UnaryOp::Not
                     && matches!(unary.operand.as_ref(), Expr::Tuple(_))
-                    && fold_constant(&unary.operand).is_none()
+                    && fold_constant_for_version(&unary.operand, python_version).is_none()
                 {
                     1
                 } else {
-                    1 + direct(&unary.operand)
+                    1 + direct(&unary.operand, python_version)
                 }
             }
-            Expr::Subscript(subscript) => 2 + direct(&subscript.value) + direct(&subscript.slice),
+            Expr::Subscript(subscript) => {
+                2 + direct(&subscript.value, python_version)
+                    + direct(&subscript.slice, python_version)
+            }
             _ => 0,
         }
     }
 
-    direct(expression)
+    direct(expression, python_version)
 }
 
 pub(super) fn explicit_surrogate_string(value: &str, source: &str) -> Option<Vec<u8>> {
@@ -1669,7 +1682,18 @@ fn parse_percent_format(
 }
 
 pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
-    fold_constant_with_literals(expression, PythonVersion::Py314, &literal_constant)
+    fold_constant_with_literals(expression, PythonVersion::Py314, &literal_constant, false)
+}
+
+/// Preserves neutral legacy folding while enabling modern sequence-count folds.
+pub(super) fn fold_constant_for_version(
+    expression: &Expr,
+    python_version: PythonVersion,
+) -> Option<Constant> {
+    if python_version <= PythonVersion::Py313 {
+        return fold_constant(expression);
+    }
+    fold_constant_with_literals(expression, python_version, &literal_constant, true)
 }
 
 /// Folds the same expression shapes using source-aware literal values when supplied.
@@ -1681,6 +1705,7 @@ pub(super) fn fold_constant_with_literals(
     expression: &Expr,
     python_version: PythonVersion,
     literal: &impl Fn(&Expr) -> Option<Constant>,
+    boolean_sequence_repetition: bool,
 ) -> Option<Constant> {
     if let Some(constant) = literal(expression) {
         return Some(constant);
@@ -1709,37 +1734,75 @@ pub(super) fn fold_constant_with_literals(
         Expr::Tuple(tuple) if tuple.ctx == ExprContext::Load => tuple
             .elts
             .iter()
-            .map(|value| fold_constant_with_literals(value, python_version, literal))
+            .map(|value| {
+                fold_constant_with_literals(
+                    value,
+                    python_version,
+                    literal,
+                    boolean_sequence_repetition,
+                )
+            })
             .collect::<Option<Vec<_>>>()
             .map(Constant::Tuple),
-        Expr::Subscript(subscript) if subscript.ctx == ExprContext::Load => {
-            fold_literal_subscript(&subscript.value, &subscript.slice, python_version, literal)
-        }
+        Expr::Subscript(subscript) if subscript.ctx == ExprContext::Load => fold_literal_subscript(
+            &subscript.value,
+            &subscript.slice,
+            python_version,
+            literal,
+            boolean_sequence_repetition,
+        ),
         Expr::Slice(slice) => constant_slice_with_literals(slice, literal),
         Expr::UnaryOp(unary) => match unary.op {
-            UnaryOp::UAdd => {
-                match fold_constant_with_literals(&unary.operand, python_version, literal)? {
-                    Constant::Bool(value) => Some(Constant::Int(u64::from(value))),
-                    constant @ (Constant::Int(_)
-                    | Constant::SignedInt(_)
-                    | Constant::BigInt { .. }
-                    | Constant::Float(_)
-                    | Constant::Complex { .. }
-                    | Constant::NonReflexive(_)) => Some(constant),
-                    _ => None,
-                }
+            UnaryOp::UAdd => match fold_constant_with_literals(
+                &unary.operand,
+                python_version,
+                literal,
+                boolean_sequence_repetition,
+            )? {
+                Constant::Bool(value) => Some(Constant::Int(u64::from(value))),
+                constant @ (Constant::Int(_)
+                | Constant::SignedInt(_)
+                | Constant::BigInt { .. }
+                | Constant::Float(_)
+                | Constant::Complex { .. }
+                | Constant::NonReflexive(_)) => Some(constant),
+                _ => None,
+            },
+            // Modern CPython folds BUILD_TUPLE after its LOAD_CONST/TO_BOOL sweep.
+            // The remaining TO_BOOL blocks UNARY_NOT folding, including when Boolean
+            // repetition made the tuple's elements constant in that same later pass.
+            UnaryOp::Not
+                if boolean_sequence_repetition
+                    && matches!(unary.operand.as_ref(), Expr::Tuple(_)) =>
+            {
+                None
             }
             UnaryOp::Not => {
                 if matches!(unary.operand.as_ref(), Expr::Tuple(_)) {
-                    fold_constant_with_literals(&unary.operand, python_version, literal)?;
+                    fold_constant_with_literals(
+                        &unary.operand,
+                        python_version,
+                        literal,
+                        boolean_sequence_repetition,
+                    )?;
                 }
                 literal_truthiness(&unary.operand).map(|value| Constant::Bool(!value))
             }
-            UnaryOp::USub => fold_constant_with_literals(&unary.operand, python_version, literal)?
-                .into_numeric_value()
-                .negated(),
+            UnaryOp::USub => fold_constant_with_literals(
+                &unary.operand,
+                python_version,
+                literal,
+                boolean_sequence_repetition,
+            )?
+            .into_numeric_value()
+            .negated(),
             UnaryOp::Invert => {
-                let operand = fold_constant_with_literals(&unary.operand, python_version, literal)?;
+                let operand = fold_constant_with_literals(
+                    &unary.operand,
+                    python_version,
+                    literal,
+                    boolean_sequence_repetition,
+                )?;
                 // CPython leaves boolean inversion at runtime for its deprecation warning.
                 if matches!(operand, Constant::Bool(_)) {
                     return None;
@@ -1755,10 +1818,20 @@ pub(super) fn fold_constant_with_literals(
             }
         },
         Expr::BinOp(binary) => {
-            let left = fold_constant_with_literals(&binary.left, python_version, literal)?
-                .into_numeric_value();
-            let right = fold_constant_with_literals(&binary.right, python_version, literal)?
-                .into_numeric_value();
+            let left = fold_constant_with_literals(
+                &binary.left,
+                python_version,
+                literal,
+                boolean_sequence_repetition,
+            )?
+            .into_numeric_value();
+            let right = fold_constant_with_literals(
+                &binary.right,
+                python_version,
+                literal,
+                boolean_sequence_repetition,
+            )?
+            .into_numeric_value();
             match (left, binary.op, right) {
                 (left, operator @ (Operator::Add | Operator::Sub | Operator::Mult), right)
                     if is_integer_constant(&left) && is_integer_constant(&right) =>
@@ -1916,8 +1989,9 @@ pub(super) fn fold_constant_with_literals(
                     left.extend(right);
                     Some(Constant::Tuple(left))
                 }
-                (Constant::String(value), Operator::Mult, Constant::Int(times))
-                | (Constant::Int(times), Operator::Mult, Constant::String(value)) => {
+                (Constant::String(value), Operator::Mult, times)
+                | (times, Operator::Mult, Constant::String(value)) => {
+                    let times = sequence_repeat_count(&times, boolean_sequence_repetition)?;
                     let length = value.chars().count();
                     let Some(max_times) = 4096_usize.checked_div(length) else {
                         return Some(Constant::String(String::new()));
@@ -1925,8 +1999,9 @@ pub(super) fn fold_constant_with_literals(
                     let times = usize::try_from(times).ok()?;
                     (times <= max_times).then(|| Constant::String(value.repeat(times)))
                 }
-                (Constant::SurrogateString(value), Operator::Mult, Constant::Int(times))
-                | (Constant::Int(times), Operator::Mult, Constant::SurrogateString(value)) => {
+                (Constant::SurrogateString(value), Operator::Mult, times)
+                | (times, Operator::Mult, Constant::SurrogateString(value)) => {
+                    let times = sequence_repeat_count(&times, boolean_sequence_repetition)?;
                     let length = value.iter().filter(|byte| **byte & 0xc0 != 0x80).count();
                     let Some(max_times) = 4096_usize.checked_div(length) else {
                         return Some(Constant::String(String::new()));
@@ -1934,16 +2009,18 @@ pub(super) fn fold_constant_with_literals(
                     let times = usize::try_from(times).ok()?;
                     (times <= max_times).then(|| surrogate_string_constant(value.repeat(times)))
                 }
-                (Constant::Bytes(value), Operator::Mult, Constant::Int(times))
-                | (Constant::Int(times), Operator::Mult, Constant::Bytes(value)) => {
+                (Constant::Bytes(value), Operator::Mult, times)
+                | (times, Operator::Mult, Constant::Bytes(value)) => {
+                    let times = sequence_repeat_count(&times, boolean_sequence_repetition)?;
                     let Some(max_times) = 4096_usize.checked_div(value.len()) else {
                         return Some(Constant::Bytes(Vec::new()));
                     };
                     let times = usize::try_from(times).ok()?;
                     (times <= max_times).then(|| Constant::Bytes(value.repeat(times)))
                 }
-                (Constant::Tuple(value), Operator::Mult, Constant::Int(times))
-                | (Constant::Int(times), Operator::Mult, Constant::Tuple(value)) => {
+                (Constant::Tuple(value), Operator::Mult, times)
+                | (times, Operator::Mult, Constant::Tuple(value)) => {
+                    let times = sequence_repeat_count(&times, boolean_sequence_repetition)?;
                     let Some(max_times) = 256_usize.checked_div(value.len()) else {
                         return Some(Constant::Tuple(Vec::new()));
                     };
@@ -1960,6 +2037,14 @@ pub(super) fn fold_constant_with_literals(
     let origin = (u64::from(expression.range().start().to_u32()) << 32)
         | u64::from(expression.range().end().to_u32());
     result.map(|constant| constant.with_non_reflexive_origin(origin))
+}
+
+fn sequence_repeat_count(value: &Constant, boolean_sequence_repetition: bool) -> Option<u64> {
+    match value {
+        Constant::Bool(value) if boolean_sequence_repetition => Some(u64::from(*value)),
+        Constant::Int(value) => Some(*value),
+        _ => None,
+    }
 }
 
 fn fold_integer_bitwise(left: &Constant, operator: Operator, right: &Constant) -> Option<Constant> {
@@ -2542,9 +2627,15 @@ fn fold_literal_subscript(
     index: &Expr,
     python_version: PythonVersion,
     literal: &impl Fn(&Expr) -> Option<Constant>,
+    boolean_sequence_repetition: bool,
 ) -> Option<Constant> {
-    fn integer(expression: &Expr) -> Option<usize> {
-        match fold_constant(expression)? {
+    fn integer(expression: &Expr, boolean_sequence_repetition: bool) -> Option<usize> {
+        match fold_constant_with_literals(
+            expression,
+            PythonVersion::Py314,
+            &literal_constant,
+            boolean_sequence_repetition,
+        )? {
             Constant::Bool(value) => Some(usize::from(value)),
             Constant::Int(value) => usize::try_from(value).ok(),
             Constant::SignedInt(value) if value >= 0 => usize::try_from(value).ok(),
@@ -2557,26 +2648,53 @@ fn fold_literal_subscript(
         }
     }
 
-    fn bound(expression: Option<&Expr>, length: usize, default: usize) -> Option<usize> {
+    fn bound(
+        expression: Option<&Expr>,
+        length: usize,
+        default: usize,
+        boolean_sequence_repetition: bool,
+    ) -> Option<usize> {
         let Some(expression) = expression else {
             return Some(default);
         };
-        integer(expression).map(|value| value.min(length))
+        integer(expression, boolean_sequence_repetition).map(|value| value.min(length))
     }
 
-    fn indices(slice: &ruff_python_ast::ExprSlice, length: usize) -> Option<Vec<usize>> {
-        let lower = bound(slice.lower.as_deref(), length, 0)?;
-        let upper = bound(slice.upper.as_deref(), length, length)?;
-        let step = slice.step.as_deref().map_or(Some(1), integer)?;
+    fn indices(
+        slice: &ruff_python_ast::ExprSlice,
+        length: usize,
+        boolean_sequence_repetition: bool,
+    ) -> Option<Vec<usize>> {
+        let lower = bound(
+            slice.lower.as_deref(),
+            length,
+            0,
+            boolean_sequence_repetition,
+        )?;
+        let upper = bound(
+            slice.upper.as_deref(),
+            length,
+            length,
+            boolean_sequence_repetition,
+        )?;
+        let step = slice.step.as_deref().map_or(Some(1), |expression| {
+            integer(expression, boolean_sequence_repetition)
+        })?;
         if step == 0 {
             return None;
         }
         Some((lower.min(upper)..upper).step_by(step).collect())
     }
 
-    let value = fold_constant_with_literals(value, python_version, literal)?;
+    let value =
+        fold_constant_with_literals(value, python_version, literal, boolean_sequence_repetition)?;
     if !matches!(index, Expr::Slice(_)) {
-        let index = match fold_constant(index)? {
+        let index = match fold_constant_with_literals(
+            index,
+            PythonVersion::Py314,
+            &literal_constant,
+            boolean_sequence_repetition,
+        )? {
             Constant::Bool(value) => i128::from(u8::from(value)),
             Constant::Int(value) => i128::from(value),
             Constant::SignedInt(value) => i128::from(value),
@@ -2624,7 +2742,7 @@ fn fold_literal_subscript(
         Constant::String(value) => {
             let characters = value.chars().collect::<Vec<_>>();
             Some(Constant::String(
-                indices(slice, characters.len())?
+                indices(slice, characters.len(), boolean_sequence_repetition)?
                     .into_iter()
                     .map(|index| characters[index])
                     .collect(),
@@ -2633,20 +2751,20 @@ fn fold_literal_subscript(
         Constant::SurrogateString(value) => {
             let characters = surrogate_characters(&value);
             Some(surrogate_string_constant(
-                indices(slice, characters.len())?
+                indices(slice, characters.len(), boolean_sequence_repetition)?
                     .into_iter()
                     .flat_map(|index| characters[index].iter().copied())
                     .collect(),
             ))
         }
         Constant::Bytes(value) => Some(Constant::Bytes(
-            indices(slice, value.len())?
+            indices(slice, value.len(), boolean_sequence_repetition)?
                 .into_iter()
                 .map(|index| value[index])
                 .collect(),
         )),
         Constant::Tuple(value) => Some(Constant::Tuple(
-            indices(slice, value.len())?
+            indices(slice, value.len(), boolean_sequence_repetition)?
                 .into_iter()
                 .map(|index| value[index].clone())
                 .collect(),
@@ -2682,14 +2800,15 @@ pub(super) fn folded_bool_operand(
     python_version: PythonVersion,
 ) -> Option<(&Expr, Constant)> {
     let Expr::BoolOp(boolean) = expression else {
-        return fold_constant(expression).map(|constant| (expression, constant));
+        return fold_constant_for_version(expression, python_version)
+            .map(|constant| (expression, constant));
     };
     let (last, leading) = boolean.values.split_last()?;
     for value in leading {
         if matches!(value, Expr::BoolOp(_)) {
             return None;
         }
-        let constant = fold_constant(value)?;
+        let constant = fold_constant_for_version(value, python_version)?;
         let truthiness = if python_version <= PythonVersion::Py313 {
             constant.is_truthy()
         } else {
@@ -2706,7 +2825,7 @@ pub(super) fn folded_bool_operand(
     if matches!(last, Expr::BoolOp(_)) {
         None
     } else {
-        fold_constant(last).map(|constant| (last, constant))
+        fold_constant_for_version(last, python_version).map(|constant| (last, constant))
     }
 }
 

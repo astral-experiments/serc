@@ -24,7 +24,7 @@ use crate::target::operands::{
 };
 use crate::{CompileError, PythonVersion};
 
-use super::constant::{fold_constant, folded_constant_owner_slots};
+use super::constant::{fold_constant_for_version, folded_constant_owner_slots};
 use super::scope::{
     LoweringFunctionPlan, NameId, ReferenceCollector, collect_conditional_simple_annotations,
     collect_simple_annotations, expression_required_names,
@@ -660,7 +660,7 @@ impl Compiler<'_> {
             {
                 positional_defaults
                     .iter()
-                    .map(|default| fold_constant(default))
+                    .map(|default| fold_constant_for_version(default, self.context.python_version))
                     .collect::<Option<Vec<_>>>()
             } else {
                 None
@@ -668,7 +668,8 @@ impl Compiler<'_> {
             if let Some(defaults) = folded_defaults {
                 let mut hidden_owner_slots = positional_defaults.len();
                 for default in &positional_defaults {
-                    hidden_owner_slots += folded_constant_owner_slots(default);
+                    hidden_owner_slots +=
+                        folded_constant_owner_slots(default, self.context.python_version);
                 }
                 for default in &positional_defaults {
                     self.record_folded_value(default)?;
