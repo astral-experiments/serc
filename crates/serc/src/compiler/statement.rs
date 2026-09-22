@@ -19328,7 +19328,15 @@ impl Compiler<'_> {
                 .then(|| {
                     statement
                         .body
-                        .last()
+                        .iter()
+                        .rev()
+                        // Zero-record declarations do not donate a line to POP_BLOCK.
+                        .find(|statement| {
+                            !matches!(
+                                statement,
+                                Stmt::AnnAssign(_) | Stmt::Global(_) | Stmt::Nonlocal(_)
+                            )
+                        })
                         .map(|statement| self.source_location(statement.range()))
                 })
                 .flatten();
@@ -19721,7 +19729,16 @@ impl Compiler<'_> {
             .then(|| {
                 statement
                     .orelse
-                    .last()
+                    .iter()
+                    .rev()
+                    // A declaration can emit no native record at all. Only an omitted
+                    // instruction can donate a location to the unlocated normal exit.
+                    .find(|statement| {
+                        !matches!(
+                            statement,
+                            Stmt::AnnAssign(_) | Stmt::Global(_) | Stmt::Nonlocal(_)
+                        )
+                    })
                     .map(|statement| self.source_location(statement.range()))
             })
             .flatten();
