@@ -4,8 +4,8 @@ use std::hash::{Hash, Hasher};
 
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
 use ruff_python_ast::{
-    BoolOp, Expr, ExprBinOp, ExprContext, FStringPart, InterpolatedStringElement, Number, Operator,
-    Stmt, UnaryOp,
+    BoolOp, Expr, ExprBinOp, ExprContext, ExprStringLiteral, FStringPart,
+    InterpolatedStringElement, Number, Operator, Stmt, UnaryOp,
 };
 use ruff_text_size::Ranged;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
@@ -1537,7 +1537,7 @@ pub(super) fn literal_constant(expression: &Expr) -> Option<Constant> {
     }
 }
 pub(super) enum PercentFormatPart<'a> {
-    Literal(String),
+    Literal(Constant),
     Formatted {
         expression: &'a Expr,
         conversion: Conversion,
@@ -1547,6 +1547,7 @@ pub(super) enum PercentFormatPart<'a> {
 
 pub(super) fn optimized_percent_format(
     expression: &ExprBinOp,
+    decode_literal: impl FnOnce(&ExprStringLiteral) -> Constant,
 ) -> Option<Vec<PercentFormatPart<'_>>> {
     if expression.op != Operator::Mod {
         return None;
@@ -1565,24 +1566,34 @@ pub(super) fn optimized_percent_format(
         return None;
     }
 
-    let format = format.value.chars().collect::<Vec<_>>();
+    // Percent-format syntax is ASCII, so parsing bytes preserves surrogate-pass UTF-8 in
+    // literal fragments without changing the supported conversions or width/precision limits.
+    let format = match decode_literal(format) {
+        Constant::String(value) => value.into_bytes(),
+        Constant::SurrogateString(value) => value,
+        _ => unreachable!("string literal decoding returns a string constant"),
+    };
     let mut position = 0;
     let mut argument_index = 0;
     let mut parts = Vec::with_capacity(arguments.elts.len() * 2 + 1);
     while position < format.len() {
-        let mut literal = String::new();
+        let mut literal = Vec::new();
         while position < format.len() {
-            if format[position] != '%' {
+            if format[position] != b'%' {
                 literal.push(format[position]);
                 position += 1;
-            } else if format.get(position + 1) == Some(&'%') {
-                literal.push('%');
+            } else if format.get(position + 1) == Some(&b'%') {
+                literal.push(b'%');
                 position += 2;
             } else {
                 break;
             }
         }
         if !literal.is_empty() {
+            let literal = String::from_utf8(literal).map_or_else(
+                |error| Constant::SurrogateString(error.into_bytes()),
+                Constant::String,
+            );
             parts.push(PercentFormatPart::Literal(literal));
         }
         if position == format.len() {
@@ -1603,7 +1614,7 @@ pub(super) fn optimized_percent_format(
 }
 
 fn parse_percent_format(
-    format: &[char],
+    format: &[u8],
     position: &mut usize,
 ) -> Option<(Conversion, Option<String>)> {
     const MAX_DIGITS: usize = 3;
@@ -1618,8 +1629,8 @@ fn parse_percent_format(
     let mut character = loop {
         let character = next()?;
         match character {
-            '-' => left_justify = true,
-            '+' | ' ' | '#' | '0' => {}
+            b'-' => left_justify = true,
+            b'+' | b' ' | b'#' | b'0' => {}
             _ => break character,
         }
     };
@@ -1629,7 +1640,7 @@ fn parse_percent_format(
         let mut value = 0_u32;
         let mut digits = 0;
         while character.is_ascii_digit() {
-            value = value * 10 + character.to_digit(10).unwrap();
+            value = value * 10 + u32::from(character - b'0');
             character = next()?;
             digits += 1;
             if digits >= MAX_DIGITS {
@@ -1640,13 +1651,13 @@ fn parse_percent_format(
     }
 
     let mut precision = None;
-    if character == '.' {
+    if character == b'.' {
         character = next()?;
         let mut value = 0_u32;
         if character.is_ascii_digit() {
             let mut digits = 0;
             while character.is_ascii_digit() {
-                value = value * 10 + character.to_digit(10).unwrap();
+                value = value * 10 + u32::from(character - b'0');
                 character = next()?;
                 digits += 1;
                 if digits >= MAX_DIGITS {
@@ -1658,9 +1669,9 @@ fn parse_percent_format(
     }
 
     let conversion = match character {
-        's' => Conversion::STR,
-        'r' => Conversion::REPR,
-        'a' => Conversion::ASCII,
+        b's' => Conversion::STR,
+        b'r' => Conversion::REPR,
+        b'a' => Conversion::ASCII,
         _ => return None,
     };
     let mut format_spec = String::new();

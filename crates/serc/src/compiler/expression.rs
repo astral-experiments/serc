@@ -2740,7 +2740,9 @@ impl Compiler<'_> {
             // percent formatting, so it no longer has the required Tuple AST node.
             return Ok(SpecializedLowering::NotApplicable);
         }
-        let Some(parts) = optimized_percent_format(expression) else {
+        let Some(parts) =
+            optimized_percent_format(expression, |literal| self.string_literal_constant(literal))
+        else {
             return Ok(SpecializedLowering::NotApplicable);
         };
 
@@ -2749,13 +2751,14 @@ impl Compiler<'_> {
         for part in parts {
             match part {
                 PercentFormatPart::Literal(value) => {
-                    if value == "%" {
+                    if matches!(&value, Constant::String(value) if value == "%") {
                         self.context.record_percent_replacement();
                     }
                     // The preprocessing pass synthesizes these constants without
                     // source locations.
                     self.assembler.set_location(SourceLocation::NONE);
-                    self.load_string_constant(&value)?;
+                    let constant = self.add_constant(value)?;
+                    self.emit(LOAD_CONST, constant, 1)?;
                     self.assembler
                         .inherit_percent_target_location_for_last_instruction();
                 }

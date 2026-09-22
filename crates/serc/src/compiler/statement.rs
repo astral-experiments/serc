@@ -4546,7 +4546,7 @@ impl Compiler<'_> {
                 } else if preserve_no_location || optimized_generator_call {
                     self.assembler.set_location(SourceLocation::NONE);
                 } else {
-                    if matches!(expression.value.as_ref(), Expr::BinOp(binary) if optimized_percent_format(binary).is_some())
+                    if matches!(expression.value.as_ref(), Expr::BinOp(binary) if optimized_percent_format(binary, |literal| self.string_literal_constant(literal)).is_some())
                         && let Some(location) = self.assembler.last_instruction_location()
                     {
                         self.assembler.set_location(location);

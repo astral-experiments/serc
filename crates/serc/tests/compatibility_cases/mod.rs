@@ -475,6 +475,7 @@ mod terminal_assert_await_finally_nop;
 mod for_iter_original_cleanup;
 
 mod percent_format_pre_fusion_locations;
+mod percent_format_surrogate;
 mod retained_finally_nop_entries;
 
 mod handler_shared_exit_locations;
