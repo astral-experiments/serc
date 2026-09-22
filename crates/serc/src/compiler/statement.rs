@@ -22717,6 +22717,35 @@ impl Compiler<'_> {
                         && if_has_multiple_normal_exit_targets(tail)
                         && matches!(tail.body.as_slice(), [Stmt::Break(_) | Stmt::Assign(_)]))
                 && self.assembler.at_original_shared_conditional_join();
+            // A final guard and its nested for-end alias the original handler cleanup.
+            // The authored break copies that unlocated array before line propagation,
+            // while iterator exhaustion and the guard's false edge keep the shared copy.
+            let handler_has_guarded_for_break_join = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && handler.name.is_none()
+                && !terminal
+                && loop_tail.is_none()
+                && !cleanup_has_small_return_successor
+                && self.control.in_loop()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self.control.exceptions.active_try_marker_slots.is_empty()
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && matches!(handler.body.last(), Some(Stmt::If(tail))
+                    if tail.elif_else_clauses.is_empty()
+                        && condition_has_only_runtime_tests(&tail.test)
+                        && matches!(tail.body.as_slice(), [Stmt::For(loop_)]
+                            if !loop_.is_async
+                                && loop_.orelse.is_empty()
+                                && suite_contains_loop_break(&loop_.body)
+                                && !suite_contains_loop_break_with_finally(&loop_.body)))
+                && self.assembler.at_original_authored_break_join();
             let handler_ends_with_runtime_while_break_cleanup =
                 handler_has_runtime_while_break_cleanup
                     && handler.name.is_none()
@@ -22831,6 +22860,7 @@ impl Compiler<'_> {
                 || coroutine_guarded_finally_cleanup
                 || handler_has_named_while_break_join
                 || handler_has_original_conditional_loop_join
+                || handler_has_guarded_for_break_join
                 || handler_has_nested_else_loop_cleanup
                 || handler_ends_with_named_conditional_cleanup
                 || handler_ends_with_loop_tail_join

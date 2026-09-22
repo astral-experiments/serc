@@ -140,6 +140,7 @@ mod generator_iterator_negated_name_ifexp_owner_compatibility;
 mod generator_lambda_walrus_scope;
 mod generator_walrus_temporaries;
 mod generator_with_finally_condition_compatibility;
+mod guarded_for_handler_cleanup;
 mod handler_cleanup_join_locations;
 mod handler_cleanup_location_compatibility;
 mod handler_cleanup_loop_scope;
