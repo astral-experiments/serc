@@ -1267,8 +1267,9 @@ impl OptimizationPipeline {
         }
     }
 
-    /// Copies an original unlocated discard/`POP_BLOCK`/jump array before its return grows.
+    /// Keeps an original unlocated discard/`POP_BLOCK`/jump array eligible for copying.
     fn prepare_unlocated_normal_try_discards(&mut self) {
+        use super::super::ir::BorrowFallthrough;
         use crate::target::opcodes::{LOAD_FAST, POP_TOP, RETURN_VALUE};
 
         // A trailing authored Pass can be absent from the array without a head alias.
@@ -1320,7 +1321,7 @@ impl OptimizationPipeline {
                 let cleanup = order[cleanup_position];
                 let discard = *order.get(cleanup_position.checked_sub(1)?)?;
                 let target_position = position(target)?;
-                let return_block = order[target_position];
+                let continuation = self.graph[order[target_position]].items();
                 let [Item::Label(join), Item::Instruction(pop)] = self.graph[discard].items()
                 else {
                     return None;
@@ -1330,16 +1331,75 @@ impl OptimizationPipeline {
                 else {
                     return None;
                 };
-                let [
-                    Item::Label(return_entry),
-                    Item::Instruction(load),
-                    Item::Instruction(ret),
-                ] = self.graph[return_block].items()
-                else {
-                    return None;
-                };
-                if *cleanup_entry != entry
-                    || *return_entry != target
+                let depth = pop.depth_after()?;
+                let local_return = matches!(continuation,
+                    [Item::Label(return_entry), Item::Instruction(load), Item::Instruction(ret)]
+                        if depth == 0
+                            && *return_entry == target
+                            && load.opcode == LOAD_FAST
+                            && matches!(load.operand(), Operand::Value(_))
+                            && load.location.line >= 0
+                            && ret.location.line >= 0
+                            && *load == Instruction::new(
+                                LOAD_FAST, load.operand(), load.location, Some(1))
+                            && *ret == Instruction::new(
+                                RETURN_VALUE, Operand::Value(0), ret.location, Some(0)));
+                // The same three original records can leave one live iterator on
+                // the stack. The continuation stays separate: either the original
+                // common backedge or a located, non-exiting source block follows.
+                let iterator_depth = 1 + u32::from(self.python_version == crate::PythonVersion::Py315);
+                let loop_continuation = self.python_version >= crate::PythonVersion::Py314
+                    && depth == iterator_depth
+                    && match continuation {
+                        [Item::Label(label), Item::Instruction(backedge)]
+                            if *label == target && backedge.opcode == JUMP_BACKWARD =>
+                        {
+                            backedge.location == SourceLocation::NONE
+                                && backedge.depth_after() == Some(depth)
+                                && matches!(backedge.operand(), Operand::Backward(header)
+                                    if position(header).is_some_and(|head| head < cleanup_position))
+                                && self.conditional_threading_targets.get(&target)
+                                    == Some(&backedge.location)
+                                && backedge.pre_fold_extra_instructions() == 0
+                                && backedge.local_policy.hidden_exception_owner_slots() == 0
+                                && !backedge.fusion_policy.is_authored_break()
+                                && !backedge.fusion_policy.is_converted_pop_block()
+                        }
+                        [Item::Label(label), Item::Instruction(first), ..]
+                            if *label == target
+                                && first.location.line >= 0
+                                && first.opcode != NOP
+                                && !is_unconditional_jump(first.opcode)
+                                && !super::super::is_conditional_jump(first.opcode) =>
+                        {
+                            continuation[1..]
+                                .iter()
+                                .all(|item| matches!(item, Item::Instruction(instruction)
+                                    if !super::super::ends_scope(instruction.opcode)
+                                        && instruction.pre_fold_extra_instructions() == 0
+                                        && instruction.local_policy.hidden_exception_owner_slots() == 0
+                                        && !instruction.fusion_policy.is_converted_pop_block()))
+                        }
+                        _ => false,
+                    };
+                let mut expected_jump = Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(target),
+                    SourceLocation::NONE,
+                    Some(depth),
+                );
+                if loop_continuation
+                    && jump.no_location_policy.borrow_fallthrough() == BorrowFallthrough::Barrier
+                {
+                    // A terminating handler marks this original normal exit as a
+                    // borrow barrier. It adds no native record; keep the barrier
+                    // unchanged when the existing copier transports this suffix.
+                    expected_jump
+                        .no_location_policy
+                        .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+                }
+                if (!local_return && !loop_continuation)
+                    || *cleanup_entry != entry
                     || cleanup_position >= target_position
                     || [*join, entry, target]
                         .iter()
@@ -1367,22 +1427,9 @@ impl OptimizationPipeline {
                             POP_TOP,
                             Operand::Value(0),
                             SourceLocation::NONE,
-                            Some(0),
+                            Some(depth),
                         )
-                    || *jump
-                        != Instruction::new(
-                            JUMP_FORWARD,
-                            Operand::Forward(target),
-                            SourceLocation::NONE,
-                            Some(0),
-                        )
-                    || load.opcode != LOAD_FAST
-                    || !matches!(load.operand(), Operand::Value(_))
-                    || load.location.line < 0
-                    || ret.location.line < 0
-                    || *load != Instruction::new(LOAD_FAST, load.operand(), load.location, Some(1))
-                    || *ret
-                        != Instruction::new(RETURN_VALUE, Operand::Value(0), ret.location, Some(0))
+                    || *jump != expected_jump
                 {
                     return None;
                 }
@@ -1409,20 +1456,24 @@ impl OptimizationPipeline {
                                 JUMP_FORWARD,
                                 Operand::Forward(*join),
                                 instruction.location,
-                                Some(1),
+                                Some(depth + 1),
                             );
+                            // IfExp edges already carry the split-copy policy. A
+                            // plain fast-call edge is admitted only by this entire
+                            // original-array and ordinary-owner certificate.
+                            let plain_loop_edge = loop_continuation && *instruction == expected;
                             expected.no_location_policy.allow_split_return_exit_copy();
                             if incoming.is_some()
                                 || source_position >= cleanup_position - 1
-                                || *instruction != expected
+                                || (*instruction != expected && !plain_loop_edge)
                             {
                                 return None;
                             }
-                            incoming = Some(source_position);
+                            incoming = Some((source_position, plain_loop_edge.then_some(source)));
                         }
                     }
                 }
-                let source_position = incoming?;
+                let (source_position, plain_source) = incoming?;
                 let mut owner = false;
                 for region in &self.exception_regions {
                     let start = position(region.start)?;
@@ -1433,7 +1484,7 @@ impl OptimizationPipeline {
                     if region.end == entry {
                         if owner
                             || region.is_scope_fallback
-                            || region.depth != 0
+                            || region.depth != depth
                             || region.preserve_lasti
                             || !(start..end).contains(&source_position)
                             || !(start..end).contains(&(cleanup_position - 1))
@@ -1461,10 +1512,20 @@ impl OptimizationPipeline {
                         return None;
                     }
                 }
-                owner.then_some(cleanup)
+                owner.then_some((cleanup, plain_source))
             })
             .collect::<Vec<_>>();
-        for cleanup in selected {
+        for (cleanup, plain_source) in selected {
+            if let Some(source) = plain_source {
+                // Copy the authenticated original range-end split with the suffix:
+                // the discard stays protected, while the following jump does not.
+                self.graph
+                    .instructions_mut(source)
+                    .next_back()
+                    .expect("certified discard predecessor")
+                    .no_location_policy
+                    .allow_split_return_exit_copy();
+            }
             // Keep the original region-end slot and ordinary copy schedule. Only the
             // original no-line-number eligibility was missing from this split array.
             self.graph
