@@ -16080,6 +16080,11 @@ impl Compiler<'_> {
         statement: &ruff_python_ast::StmtWhile,
     ) -> Result<(), CompileError> {
         let base_depth = self.control.stack.depth;
+        // A split prefix or conditional arm can end at this loop while its
+        // source successor remains inside the same enclosing protected region.
+        let has_source_continuation = self.control.statements.same_region_continuation
+            == Some(statement.range)
+            || self.control.loops.split_loop_tail_prefix_end == Some(statement.range);
         if let Some(truthiness) = early_condition_truthiness(&statement.test) {
             // CPython interns a folded loop test before compiling the body, even though the
             // optimized condition emits no load. Unused nonzero constants are pruned later;
@@ -16147,12 +16152,13 @@ impl Compiler<'_> {
             // including CPython's shadowed index for IMPORT_FROM and similar opcodes.
             self.assembler.record_borrow_analysis_block_boundary(body);
             self.assembler.mark(body);
-            let context = self.loop_context(
+            let mut context = self.loop_context(
                 start,
                 end,
                 IteratorCleanup::None,
                 self.loop_break_policy(statement.range),
             );
+            context.break_target_keeps_exception_owner |= has_source_continuation;
             let body_start = self.assembler.instruction_count();
             let tail_jumps = self.with_loop_context(context, |compiler| {
                 compiler.compile_while_tail_suite(&statement.body, start)
@@ -16700,12 +16706,13 @@ impl Compiler<'_> {
         }
         // The loop condition's fallthrough begins a separate original body array.
         self.assembler.record_short_circuit_owner_continuation();
-        let context = self.loop_context(
+        let mut context = self.loop_context(
             start,
             end,
             IteratorCleanup::None,
             self.loop_break_policy(statement.range),
         );
+        context.break_target_keeps_exception_owner |= has_source_continuation;
         let body_start = self.assembler.instruction_count();
         let tail_jumps = self.with_loop_context(context, |compiler| {
             compiler.compile_while_tail_suite(&statement.body, start)
