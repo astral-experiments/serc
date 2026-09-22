@@ -663,6 +663,7 @@ impl OptimizationPipeline {
         }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::OptimizeRedundantStoreFast)?;
+        let copied_comprehension_swaps = self.capture_copied_comprehension_swaps();
         let (swap_blocks, capture_cleanup_swaps, swaps_changed) = self.optimize_swap_runs();
         if swaps_changed {
             original_owners.retain_pipeline(&self);
@@ -690,6 +691,7 @@ impl OptimizationPipeline {
                     .map(|constants| &mut **constants as &mut dyn ConstantTable),
             )?
         };
+        self.replay_copied_comprehension_swaps(copied_comprehension_swaps);
         self.borrow_threaded_jump_entries.clear();
         self.borrow_authored_finally_break_origins =
             crate::assembler::ir::AuthoredFinallyBreakOrigins::default();

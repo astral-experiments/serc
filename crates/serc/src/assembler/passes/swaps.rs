@@ -5,8 +5,8 @@ use super::super::{
     UNPACK_EX, UNPACK_SEQUENCE, capture_cleanup_rotation, ends_scope,
     single_capture_cleanup_vacancies,
 };
-use crate::assembler::OptimizationPipeline;
 use crate::assembler::block_graph::{BlockGraph, ItemPosition};
+use crate::assembler::{Label, OptimizationPipeline};
 
 /// Pass-local positions from the existing swap partition; labels still delimit source arrays.
 pub(in crate::assembler) struct SwapBlock {
@@ -546,6 +546,205 @@ impl OptimizationPipeline {
                     .expect("swappable item is an instruction") = first_instruction;
             }
             clear_redundant_swap_nop_locations(graph, &positions, &rewritten, &original_donors);
+        }
+    }
+}
+
+/// The original restore and small exit, before their copying makes a static swap possible.
+pub(in crate::assembler) struct CopiedComprehensionSwap {
+    entry: Label,
+    source: Vec<Item>,
+    target: Vec<Item>,
+    restores: Vec<Instruction>,
+    tail: [Instruction; 3],
+    original_labels: FxHashSet<Label>,
+}
+
+impl OptimizationPipeline {
+    /// Records only an unchanged comprehension restore jumping to a three-cell local exit.
+    pub(in crate::assembler) fn capture_copied_comprehension_swaps(
+        &self,
+    ) -> Vec<CopiedComprehensionSwap> {
+        use crate::target::opcodes::{JUMP_FORWARD, LOAD_CONST, LOAD_FAST, RETURN_VALUE};
+
+        if self
+            .exception_owner_provenance
+            .original_comprehension_normal_restores
+            .is_empty()
+        {
+            return Vec::new();
+        }
+        let graph = &self.graph;
+        let mut offsets = FxHashMap::default();
+        let mut offset = 0;
+        for item in graph.iter_items() {
+            match item {
+                Item::Label(label) => {
+                    offsets.insert(*label, offset);
+                }
+                Item::Instruction(_) => offset += 1,
+            }
+        }
+        let protected = |start: usize, end: usize| {
+            self.exception_regions.iter().any(|region| {
+                !region.is_scope_fallback
+                    && offsets[&region.start] < end
+                    && start < offsets[&region.end]
+            })
+        };
+        let mut records = Vec::new();
+        for (_, block) in graph.iter() {
+            let source = block.items();
+            let Some((entry, restores)) = source.iter().find_map(|item| match item {
+                Item::Label(entry) => self
+                    .exception_owner_provenance
+                    .original_comprehension_normal_restores
+                    .get(entry)
+                    .map(|restores| (*entry, restores)),
+                Item::Instruction(_) => None,
+            }) else {
+                continue;
+            };
+            let labels = source
+                .iter()
+                .take_while(|item| matches!(item, Item::Label(_)))
+                .count();
+            let [swap, stores @ ..] = restores.as_slice() else {
+                continue;
+            };
+            let Some(Item::Instruction(jump)) = source.last() else {
+                continue;
+            };
+            let Operand::Forward(target) = jump.operand() else {
+                continue;
+            };
+            if stores.is_empty()
+                || swap.opcode != SWAP
+                || swap.operand() != Operand::Value(u32::try_from(restores.len()).unwrap_or(0))
+                || source.len() != labels + restores.len() + 1
+                || !source[labels..source.len() - 1]
+                    .iter()
+                    .copied()
+                    .eq(restores.iter().copied().map(Item::Instruction))
+                || jump.opcode != JUMP_FORWARD
+                || !jump.jump_policy.inline_small_exit()
+                || jump.location != SourceLocation::NONE
+                || protected(offsets[&entry], offsets[&entry] + restores.len() + 1)
+            {
+                continue;
+            }
+            let Some(target_block) = graph.label_block(target) else {
+                continue;
+            };
+            let target_items = graph[target_block].items();
+            let target_labels = target_items
+                .iter()
+                .take_while(|item| matches!(item, Item::Label(_)))
+                .count();
+            let [
+                Item::Instruction(store),
+                Item::Instruction(load),
+                Item::Instruction(ret),
+            ] = &target_items[target_labels..]
+            else {
+                continue;
+            };
+            if store.opcode != STORE_FAST
+                || store.local_policy.may_store_null()
+                || !matches!(load.opcode, LOAD_FAST | LOAD_CONST)
+                || ret.opcode != RETURN_VALUE
+                || store.location.line < 0
+                || protected(offsets[&target], offsets[&target] + 3)
+                || stores.iter().any(|restore| {
+                    restore.opcode != STORE_FAST
+                        || !restore.local_policy.may_store_null()
+                        || restore.location.line != store.location.line
+                })
+                || restores
+                    .iter()
+                    .chain([store, load, ret, jump])
+                    .any(|instruction| {
+                        instruction.pre_fold_extra_instructions() != 0
+                            || instruction.local_policy.hidden_exception_owner_slots() != 0
+                            || instruction.exception_policy()
+                                != super::super::ExceptionPolicy::default()
+                    })
+            {
+                continue;
+            }
+            let mut locals = FxHashSet::default();
+            if !stores.iter().chain([store]).all(|instruction| {
+                matches!(instruction.operand(), Operand::Value(local) if locals.insert(local))
+            }) { continue; }
+            records.push(CopiedComprehensionSwap {
+                entry,
+                source: source.to_vec(),
+                target: target_items.to_vec(),
+                restores: restores.clone(),
+                tail: [*store, *load, *ret],
+                original_labels: offsets.keys().copied().collect(),
+            });
+        }
+        records
+    }
+
+    /// Replays the native static swap only after the copier produced the captured exit verbatim.
+    pub(in crate::assembler) fn replay_copied_comprehension_swaps(
+        &mut self,
+        records: Vec<CopiedComprehensionSwap>,
+    ) {
+        for record in records {
+            let Some(block) = self.graph.label_block(record.entry) else {
+                continue;
+            };
+            let Some(index) = self
+                .graph
+                .order()
+                .iter()
+                .position(|candidate| *candidate == block)
+            else {
+                continue;
+            };
+            let Some(&copy_block) = self.graph.order().get(index + 1) else {
+                continue;
+            };
+            let source = self.graph[block].items();
+            // The actual copy removes only the original jump and inserts one fresh entry.
+            if source != &record.source[..record.source.len() - 1] {
+                continue;
+            }
+            let copy = self.graph[copy_block].items();
+            let [Item::Label(entry), tail @ ..] = copy else {
+                continue;
+            };
+            let mut expected_tail = record.tail;
+            expected_tail[0].add_pre_fold_extra_instructions(1);
+            if record.original_labels.contains(entry)
+                || !tail.iter().copied().eq(expected_tail.into_iter().map(Item::Instruction))
+                || self.graph.iter_items().any(|item| matches!(item, Item::Instruction(instruction)
+                    if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label) if label == *entry)))
+                || self.exception_regions.iter().any(|region| [region.start, region.end, region.target].contains(entry))
+                || !self.graph.iter().any(|(_, block)| block.items() == record.target)
+            { continue; }
+            let start = source.len() - record.restores.len();
+            let mut first = record.restores[1];
+            // The replaced jump remains at the copied entry when stores exchange.
+            first.add_pre_fold_extra_instructions(1);
+            let mut swap = record.restores[0];
+            swap.opcode = NOP;
+            swap.set_operand(Operand::Value(0));
+            *self
+                .graph
+                .instruction_mut(ItemPosition::new(block, start))
+                .expect("captured swap") = swap;
+            *self
+                .graph
+                .instruction_mut(ItemPosition::new(block, start + 1))
+                .expect("captured restore") = record.tail[0];
+            *self
+                .graph
+                .instruction_mut(ItemPosition::new(copy_block, 1))
+                .expect("copied store") = first;
         }
     }
 }

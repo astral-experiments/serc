@@ -49,6 +49,7 @@ mod constant_negation_ifexp_borrow;
 mod constant_pop_return_owners;
 mod context_manager_return_handler_nesting;
 mod continued_cleanup_locations;
+mod copied_comprehension_store_swaps;
 mod copied_exit_borrow_fusion_compatibility;
 mod copied_exit_owner_slots;
 mod copied_finally_break_nop;
