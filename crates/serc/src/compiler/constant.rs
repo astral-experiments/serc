@@ -2919,7 +2919,7 @@ fn complex_quotient(left: (f64, f64), right: (f64, f64)) -> Option<(f64, f64)> {
     } else {
         (f64::NAN, f64::NAN)
     };
-    (result.0.is_finite() && result.1.is_finite()).then_some(result)
+    Some(result)
 }
 
 fn fold_complex_division(
@@ -2929,7 +2929,7 @@ fn fold_complex_division(
 ) -> Option<Constant> {
     let left_parts = constant_complex_parts(left)?;
     let right_parts = constant_complex_parts(right)?;
-    let (real, imag) = match (left, right) {
+    let (mut real, mut imag) = match (left, right) {
         _ if python_version <= PythonVersion::Py313 => {
             // Legacy CPython converts real operands to complex with imaginary +0.0.
             // Its quotient formula can produce different signed zeros from the mixed
@@ -2958,18 +2958,49 @@ fn fold_complex_division(
                     left_parts.0 / denominator,
                     (-left_parts.0 * ratio) / denominator,
                 )
-            } else {
+            } else if abs_imag >= abs_real {
                 let ratio = right_parts.0 / right_parts.1;
                 let denominator = right_parts.0 * ratio + right_parts.1;
                 (
                     (left_parts.0 * ratio) / denominator,
                     (-left_parts.0) / denominator,
                 )
+            } else {
+                (f64::NAN, f64::NAN)
             }
         }
         _ => return None,
     };
-    (real.is_finite() && imag.is_finite()).then_some(Constant::Complex { real, imag })
+    if python_version >= PythonVersion::Py314 && real.is_nan() && imag.is_nan() {
+        // Modern CPython recovers infinities and signed zeros when the quotient
+        // formula produces two NaNs. Legacy targets retain the original NaNs.
+        if matches!(left, Constant::Complex { .. })
+            && matches!(right, Constant::Complex { .. })
+            && (left_parts.0.is_infinite() || left_parts.1.is_infinite())
+            && right_parts.0.is_finite()
+            && right_parts.1.is_finite()
+        {
+            let x = f64::from(left_parts.0.is_infinite()).copysign(left_parts.0);
+            let y = f64::from(left_parts.1.is_infinite()).copysign(left_parts.1);
+            real = f64::INFINITY * (x * right_parts.0 + y * right_parts.1);
+            imag = f64::INFINITY * (y * right_parts.0 - x * right_parts.1);
+        } else if matches!(right, Constant::Complex { .. })
+            && (right_parts.0.is_infinite() || right_parts.1.is_infinite())
+            && left_parts.0.is_finite()
+            && left_parts.1.is_finite()
+        {
+            let x = f64::from(right_parts.0.is_infinite()).copysign(right_parts.0);
+            let y = f64::from(right_parts.1.is_infinite()).copysign(right_parts.1);
+            if matches!(left, Constant::Complex { .. }) {
+                real = 0.0 * (left_parts.0 * x + left_parts.1 * y);
+                imag = 0.0 * (left_parts.1 * x - left_parts.0 * y);
+            } else {
+                real = 0.0 * (left_parts.0 * x);
+                imag = 0.0 * (-left_parts.0 * y);
+            }
+        }
+    }
+    Some(Constant::Complex { real, imag })
 }
 
 #[expect(
