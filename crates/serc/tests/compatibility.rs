@@ -15,7 +15,7 @@ mod tests {
         CPYTHON_TARGET, CompileError, compile, compile_bytes, compile_bytes_to_pyc, compile_to_pyc,
         decode_source,
     };
-    use serc_workloads as benchmark_workloads;
+    use serc_fixtures as fixtures;
 
     #[test]
     fn exposes_the_pinned_cpython_source_identity() {
@@ -310,11 +310,11 @@ async def coroutine():
 
     #[test]
     fn benchmark_workloads_match_cpython_marshal() {
-        for workload in benchmark_workloads::COMPILE_MICRO_WORKLOADS
+        for workload in fixtures::COMPILE_MICRO_WORKLOADS
             .iter()
-            .chain(benchmark_workloads::COMPOSITE_WORKLOADS)
-            .chain(benchmark_workloads::LARGE_WORKLOADS)
-            .chain(benchmark_workloads::MARSHAL_MICRO_WORKLOADS)
+            .chain(fixtures::COMPOSITE_WORKLOADS)
+            .chain(fixtures::LARGE_WORKLOADS)
+            .chain(fixtures::MARSHAL_MICRO_WORKLOADS)
         {
             assert_matches_cpython_marshal(workload.source, workload.filename);
         }
@@ -334,7 +334,7 @@ async def coroutine():
 
     #[test]
     fn matches_cpython_marshal_when_a_match_case_ends_in_a_constant_expression() {
-        let source = include_str!("fixtures/benchmark/match_control_flow.py");
+        let source = fixtures::MATCH_CONTROL_FLOW;
         assert_matches_cpython_marshal(source, "match.py");
     }
 
@@ -1120,7 +1120,7 @@ def parent():
 
     #[test]
     fn matches_cpython_marshal_for_annotation_scope_closures() {
-        let source = include_str!("fixtures/benchmark/annotation_scopes.py");
+        let source = fixtures::ANNOTATION_SCOPES;
         assert_matches_cpython_marshal(source, "annotation_scopes.py");
     }
 
@@ -7311,7 +7311,7 @@ print(" ".join(
 
     #[test]
     fn matches_cpython_marshal_for_loop_and_async_iteration_edges() {
-        let source = include_str!("fixtures/benchmark/loop_async_edges.py");
+        let source = fixtures::LOOP_ASYNC_EDGES;
         assert_matches_cpython_marshal(source, "loop_tail.py");
     }
 
@@ -13968,7 +13968,7 @@ print(parse(False), parse(True))
 
     #[test]
     fn executes_context_managers_and_exception_suppression() {
-        let source = include_str!("fixtures/execution/context_managers.py");
+        let source = fixtures::CONTEXT_MANAGERS;
         assert_executes(
             source,
             "['enter', 42, 'exit', 'enter', 'exit', 'enter', 'enter', 'exit', 'exit', 'enter', 0, 'exit', 'enter', 1, 'exit', 'handled-0', 'handled-1']\n",

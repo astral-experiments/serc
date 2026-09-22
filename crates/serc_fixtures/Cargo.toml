@@ -1,8 +1,8 @@
 [package]
-name = "serc_workloads"
+name = "serc_fixtures"
 version = "0.0.0"
 publish = false
-description = "Shared source workloads for Serc compatibility tests and benchmarks"
+description = "Shared Python fixtures for Serc compatibility tests and benchmarks"
 edition = { workspace = true }
 rust-version = { workspace = true }
 homepage = { workspace = true }
