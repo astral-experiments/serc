@@ -6898,6 +6898,56 @@ impl Compiler<'_> {
                                 && !suite_contains_abrupt_control_flow(&outer.body)
                                 && !suite_contains_yield(&outer.body)
                     );
+                // The handler exits before the inner finalizer, but the ordinary
+                // try between these finalizers remains active until the outer copy.
+                let tracks_handler_between_plain_finalizers = !return_is_overridden
+                    && preserve_tos
+                    && matches!(statement.value.as_deref(), Some(Expr::Name(_)))
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.loops.contexts.is_empty()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.copied_return_finally_preserved_values == 0
+                    && self
+                        .control
+                        .finally
+                        .active_pass_finally_locations
+                        .is_empty()
+                    && self
+                        .control
+                        .finally
+                        .preserved_return_value_contexts
+                        .is_empty()
+                    && matches!(
+                        (
+                            self.control.exceptions.active_exception_handlers.as_slice(),
+                            self.control.finally.active_return_finally_contexts.as_slice(),
+                        ),
+                        ([handler], [outer, inner])
+                            if outer.handler_depth == 0
+                                && inner.handler_depth == 0
+                                && outer.with_depth == 0
+                                && inner.with_depth == 0
+                                && handler.with_depth == 0
+                                && outer.loop_depth == 0
+                                && inner.loop_depth == 0
+                                && handler.loop_depth == 0
+                                && handler.finally_end_depth == 0
+                                && outer.exception_region_depth == 0
+                                && outer.try_body_depth == 0
+                                && inner.exception_region_depth == 2
+                                && inner.try_body_depth == 1
+                                && handler.exception_region_depth == 3
+                                && handler.try_body_depth == 1
+                                && self.control.exceptions.active_try_marker_slots.len() == 1
+                                && self.control.exceptions.active_exception_region_exclusions.len() == 4
+                                && !suite_contains_abrupt_control_flow(&inner.body)
+                                && !suite_contains_yield(&inner.body)
+                                && !suite_contains_abrupt_control_flow(&outer.body)
+                                && !suite_contains_yield(&outer.body)
+                    );
                 let tracks_finally_region_unwinds = !return_is_overridden
                     && (handler_count == 0
                         || tracks_handler_finally_iterator_unwinds
@@ -6905,6 +6955,7 @@ impl Compiler<'_> {
                         || tracks_outer_try_handler_finally_unwinds
                         || tracks_two_named_handlers_before_finally
                         || tracks_try_between_finally_unwinds
+                        || tracks_handler_between_plain_finalizers
                         || unwinds_handler_and_with
                         || self
                             .control
@@ -10111,7 +10162,9 @@ impl Compiler<'_> {
                             && !suite_contains_abrupt_control_flow(&finally_context.body)
                             && !suite_contains_yield(&finally_context.body);
                         let retained_try_owns_copy = retained_iterator_try_owns_copy
-                            || (tracks_try_between_finally_unwinds && context_index == 1)
+                            || ((tracks_try_between_finally_unwinds
+                                || tracks_handler_between_plain_finalizers)
+                                && context_index == 1)
                             || ((handler_count == 0
                                 || (preserves_manager_handler_try_owner
                                     && next_handler == 0
