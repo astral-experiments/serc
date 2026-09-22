@@ -458,8 +458,8 @@ pub(super) struct ExceptionState {
 
 #[derive(Debug, Default)]
 pub(super) struct FinallyState {
-    // A complete two-level source certificate uses recursive native return
-    // unwinding even when both finalizers replace the pending return.
+    // Certified direct and nested finalizers use recursive native return
+    // unwinding even when cleanup replaces the pending return.
     copies_terminating_finally_returns: bool,
     // The direct tail statement is followed by the copied lexical unwind.
     copied_finally_tail: Option<TextRange>,
@@ -24365,10 +24365,8 @@ impl Compiler<'_> {
         terminal: bool,
     ) -> Result<(), CompileError> {
         let finally = &self.control.finally;
-        if self.context.python_version <= crate::PythonVersion::Py313
-            && !finally.copies_terminating_finally_returns
+        if !finally.copies_terminating_finally_returns
             && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
-            && self.control.loops.contexts.is_empty()
             && self.control.withs.active_with_exits.is_empty()
             && self.control.withs.active_with_region_exclusions.is_empty()
             && self.control.exceptions.active_exception_handlers.is_empty()
@@ -24389,7 +24387,17 @@ impl Compiler<'_> {
             && finally.active_copied_finally_bodies == 0
             && finally.active_finally_end_blocks == 0
             && finally.active_overriding_finally_returns == 0
-            && supports_nested_terminating_finally_returns(statement)
+            && ((self.context.python_version <= crate::PythonVersion::Py313
+                && self.control.loops.contexts.is_empty()
+                && supports_nested_terminating_finally_returns(statement))
+                || (self.unit.flags & CO_COROUTINE == 0
+                    && self.control.loops.contexts.iter().all(|context| {
+                        context.iterator_cleanup != IteratorCleanup::Async
+                            && context.with_depth == 0
+                            && context.finally_end_depth == 0
+                            && context.exception_region_depth == 0
+                    })
+                    && supports_direct_terminating_finally_returns(statement)))
         {
             return self.with_control_override(
                 |control| &mut control.finally.copies_terminating_finally_returns,
@@ -26675,7 +26683,7 @@ impl Compiler<'_> {
                 [Stmt::Delete(delete)] if matches!(delete.targets.as_slice(), [Expr::Name(_)])
             );
         // Native FINALLY_TRY visits the cleanup before any overriding Return
-        // discards the pending value. The certified chain uses the existing
+        // discards the pending value. The certified forms use the existing
         // copied-return contexts for terminating and falling-through cleanup.
         let copy_finally_on_exit = self.control.finally.copies_terminating_finally_returns
             || !suite_terminates(&statement.finalbody);
@@ -32599,6 +32607,26 @@ fn finalizer_tail_has_matching_linear_copies(body: &[Stmt]) -> bool {
             let mut suspensions = SuspensionFinder::default();
             suspensions.visit_expr(&assignment.value);
             !suspensions.found
+        })
+}
+
+/// A direct finalizer return unwinds the pending value before enclosing iterators.
+/// Both expressions stay in one block, with no newly entered cleanup scope.
+fn supports_direct_terminating_finally_returns(statement: &ruff_python_ast::StmtTry) -> bool {
+    let [Stmt::Return(body)] = statement.body.as_slice() else {
+        return false;
+    };
+    let [Stmt::Return(finalizer)] = statement.finalbody.as_slice() else {
+        return false;
+    };
+    !statement.is_star
+        && statement.handlers.is_empty()
+        && statement.orelse.is_empty()
+        && [body, finalizer].iter().all(|statement| {
+            statement.value.as_deref().is_none_or(|value| {
+                !expression_contains_inline_branch(value)
+                    && !expression_suspends_current_scope(value)
+            })
         })
 }
 

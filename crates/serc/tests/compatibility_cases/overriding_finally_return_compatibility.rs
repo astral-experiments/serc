@@ -162,3 +162,35 @@ fn matches_cpython_handler_exits_into_local_finally_returns() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_pending_values_before_direct_finally_returns() {
+    for (filename, source) in [
+        (
+            "pending_subscript_return.py",
+            "def f(values):\n    try:\n        return values[1]\n    finally:\n        return values[0]\n",
+        ),
+        (
+            "pending_call_return.py",
+            "def f(factory, other):\n    try:\n        return factory()\n    finally:\n        return other()\n",
+        ),
+        (
+            "pending_iterator_bare_return.py",
+            "def f(values):\n    for value in values:\n        try:\n            return value\n        finally:\n            return\n",
+        ),
+        (
+            "pending_iterator_subscript_return.py",
+            "def f(values):\n    for value in values:\n        try:\n            return value\n        finally:\n            return values[0]\n",
+        ),
+        (
+            "pending_two_iterators_return.py",
+            "def f(values):\n    for value in values:\n        for other in values:\n            try:\n                return value\n            finally:\n                return other\n",
+        ),
+        (
+            "pending_while_return.py",
+            "def f(values, flag):\n    while flag:\n        try:\n            return values[1]\n        finally:\n            return values[0]\n",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
