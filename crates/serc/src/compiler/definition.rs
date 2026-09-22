@@ -151,18 +151,7 @@ impl Compiler<'_> {
             0,
             wrapper_flags,
         )?;
-        wrapper
-            .unit
-            .private_name
-            .clone_from(&self.unit.private_name);
-        wrapper
-            .unit
-            .mangled_names
-            .clone_from(&self.unit.mangled_names);
-        wrapper
-            .symbols
-            .imported_scope_names
-            .clone_from(&self.symbols.imported_scope_names);
+        wrapper.inherit_lexical_context(self);
         let type_parameter_names = type_names.iter().copied().collect();
         wrapper.symbols.type_parameter_names = type_parameter_names;
         wrapper.unit.generic_target_qualified_name =
@@ -186,16 +175,7 @@ impl Compiler<'_> {
         if self.context.python_version == PythonVersion::Py312 {
             self.emit(PUSH_NULL, 0, 1)?;
         }
-        if !wrapper_closure_names.is_empty() {
-            self.emit_closure_tuple(&wrapper_closure_names)?;
-        }
-        let code = self.add_constant(Constant::Code(Box::new(wrapper)))?;
-        self.emit(LOAD_CONST, code, 1)?;
-        self.emit_make_function(if wrapper_closure_names.is_empty() {
-            0
-        } else {
-            FunctionAttribute::CLOSURE.argument()
-        })?;
+        self.emit_function_with_closure(wrapper, &wrapper_closure_names)?;
         if self.context.python_version != PythonVersion::Py312 {
             self.emit(PUSH_NULL, 0, 1)?;
         }
@@ -358,18 +338,7 @@ impl Compiler<'_> {
             0,
             wrapper_flags,
         )?;
-        wrapper
-            .unit
-            .private_name
-            .clone_from(&self.unit.private_name);
-        wrapper
-            .unit
-            .mangled_names
-            .clone_from(&self.unit.mangled_names);
-        wrapper
-            .symbols
-            .imported_scope_names
-            .clone_from(&self.symbols.imported_scope_names);
+        wrapper.inherit_lexical_context(self);
         let type_parameter_names = type_names.iter().copied().collect();
         wrapper.symbols.type_parameter_names = type_parameter_names;
         if !self.has_deferred_annotations() {
@@ -410,16 +379,7 @@ impl Compiler<'_> {
         let wrapper = wrapper.finish_inner(false)?;
         let wrapper_closure_names = wrapper_plan.freevars;
         self.assembler.set_location(definition_location);
-        if !wrapper_closure_names.is_empty() {
-            self.emit_closure_tuple(&wrapper_closure_names)?;
-        }
-        let code = self.add_constant(Constant::Code(Box::new(wrapper)))?;
-        self.emit(LOAD_CONST, code, 1)?;
-        self.emit_make_function(if wrapper_closure_names.is_empty() {
-            0
-        } else {
-            FunctionAttribute::CLOSURE.argument()
-        })?;
+        self.emit_function_with_closure(wrapper, &wrapper_closure_names)?;
         if self.context.python_version == PythonVersion::Py312 {
             if default_argument_count > 0 {
                 self.emit(
@@ -580,29 +540,12 @@ impl Compiler<'_> {
             keyword_only_arg_count,
             parameter_flags,
         )?;
-        child.unit.private_name.clone_from(&self.unit.private_name);
-        child
-            .unit
-            .mangled_names
-            .clone_from(&self.unit.mangled_names);
-        child
-            .symbols
-            .imported_scope_names
-            .clone_from(&self.symbols.imported_scope_names);
+        child.inherit_lexical_context(self);
         let child = child.compile_function_body(&definition.body)?;
 
         self.assembler.set_location(definition_location);
         if let Some((annotation_child, annotation_closure_names)) = annotation_child {
-            if !annotation_closure_names.is_empty() {
-                self.emit_closure_tuple(&annotation_closure_names)?;
-            }
-            let annotation = self.add_constant(Constant::Code(Box::new(annotation_child)))?;
-            self.emit(LOAD_CONST, annotation, 1)?;
-            self.emit_make_function(if annotation_closure_names.is_empty() {
-                0
-            } else {
-                FunctionAttribute::CLOSURE.argument()
-            })?;
+            self.emit_function_with_closure(annotation_child, &annotation_closure_names)?;
         }
         if !closure_names.is_empty() {
             self.emit_closure_tuple(&closure_names)?;
@@ -640,6 +583,24 @@ impl Compiler<'_> {
         } else {
             self.store_name(definition.name.as_str())
         }
+    }
+
+    /// Create a function after placing its closure below the code object.
+    pub(super) fn emit_function_with_closure(
+        &mut self,
+        code: CodeObject,
+        closure_names: &[NameId],
+    ) -> Result<(), CompileError> {
+        if !closure_names.is_empty() {
+            self.emit_closure_tuple(closure_names)?;
+        }
+        let code = self.add_constant(Constant::Code(Box::new(code)))?;
+        self.emit(LOAD_CONST, code, 1)?;
+        self.emit_make_function(if closure_names.is_empty() {
+            0
+        } else {
+            FunctionAttribute::CLOSURE.argument()
+        })
     }
 
     fn compile_function_defaults(
@@ -901,16 +862,7 @@ impl Compiler<'_> {
         if self.context.python_version == PythonVersion::Py312 {
             self.emit(PUSH_NULL, 0, 1)?;
         }
-        if !wrapper_closure_names.is_empty() {
-            self.emit_closure_tuple(&wrapper_closure_names)?;
-        }
-        let code = self.add_constant(Constant::Code(Box::new(wrapper)))?;
-        self.emit(LOAD_CONST, code, 1)?;
-        self.emit_make_function(if wrapper_closure_names.is_empty() {
-            0
-        } else {
-            FunctionAttribute::CLOSURE.argument()
-        })?;
+        self.emit_function_with_closure(wrapper, &wrapper_closure_names)?;
         if self.context.python_version != PythonVersion::Py312 {
             self.emit(PUSH_NULL, 0, 1)?;
         }
@@ -1066,16 +1018,7 @@ impl Compiler<'_> {
         if self.context.python_version != PythonVersion::Py312 {
             self.emit(PUSH_NULL, 0, 1)?;
         }
-        if !closure_names.is_empty() {
-            self.emit_closure_tuple(&closure_names)?;
-        }
-        let code = self.add_constant(Constant::Code(Box::new(child)))?;
-        self.emit(LOAD_CONST, code, 1)?;
-        self.emit_make_function(if closure_names.is_empty() {
-            0
-        } else {
-            FunctionAttribute::CLOSURE.argument()
-        })?;
+        self.emit_function_with_closure(child, &closure_names)?;
         self.context
             .record_constant_string_origin(definition.name.as_str(), true);
         let name = self.add_constant(Constant::String(definition.name.as_str().to_string()))?;
@@ -1490,15 +1433,7 @@ impl Compiler<'_> {
             0,
             (if nested { CO_NESTED } else { 0 }) | (self.unit.flags & SUPPORTED_FUTURE_FLAGS),
         )?;
-        child.unit.private_name.clone_from(&self.unit.private_name);
-        child
-            .unit
-            .mangled_names
-            .clone_from(&self.unit.mangled_names);
-        child
-            .symbols
-            .imported_scope_names
-            .clone_from(&self.symbols.imported_scope_names);
+        child.inherit_lexical_context(self);
         // Before 3.14, type alias values use ordinary function scopes, so
         // definitions within them include the alias and `<locals>`.
         if !type_alias || self.has_deferred_annotations() {
@@ -1728,15 +1663,7 @@ impl Compiler<'_> {
                         .to_string()
                 });
         }
-        child.unit.private_name.clone_from(&self.unit.private_name);
-        child
-            .unit
-            .mangled_names
-            .clone_from(&self.unit.mangled_names);
-        child
-            .symbols
-            .imported_scope_names
-            .clone_from(&self.symbols.imported_scope_names);
+        child.inherit_lexical_context(self);
         child.unit.annotation_thunk = true;
         if can_see_class_scope {
             child.unit.annotation_classdict_index = Some(child.closure_index("__classdict__")?);
@@ -1834,15 +1761,7 @@ impl Compiler<'_> {
             0,
             parameter_flags,
         )?;
-        child.unit.private_name.clone_from(&self.unit.private_name);
-        child
-            .unit
-            .mangled_names
-            .clone_from(&self.unit.mangled_names);
-        child
-            .symbols
-            .imported_scope_names
-            .clone_from(&self.symbols.imported_scope_names);
+        child.inherit_lexical_context(self);
         child.unit.annotation_thunk = true;
         child.unit.annotation_classdict_index = Some(child.closure_index("__classdict__")?);
         child.emit_function_prologue()?;
@@ -1946,15 +1865,7 @@ impl Compiler<'_> {
             0,
             0,
         )?;
-        child.unit.private_name.clone_from(&self.unit.private_name);
-        child
-            .unit
-            .mangled_names
-            .clone_from(&self.unit.mangled_names);
-        child
-            .symbols
-            .imported_scope_names
-            .clone_from(&self.symbols.imported_scope_names);
+        child.inherit_lexical_context(self);
         child.unit.annotation_thunk = true;
         child.emit_function_prologue()?;
         let setup_location = self.source_location(body.first().map_or(first.range, Ranged::range));

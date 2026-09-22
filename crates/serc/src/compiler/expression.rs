@@ -3755,15 +3755,7 @@ impl Compiler<'_> {
             keyword_only,
             parameter_flags,
         )?;
-        child.unit.private_name.clone_from(&self.unit.private_name);
-        child
-            .unit
-            .mangled_names
-            .clone_from(&self.unit.mangled_names);
-        child
-            .symbols
-            .imported_scope_names
-            .clone_from(&self.symbols.imported_scope_names);
+        child.inherit_lexical_context(self);
         child.emit_function_prologue()?;
         if self.context.python_version <= PythonVersion::Py313 {
             child.add_constant(Constant::None)?;
@@ -4471,15 +4463,7 @@ impl Compiler<'_> {
             flags,
         )?;
         child.control.generators.generator_expression = true;
-        child.unit.private_name.clone_from(&self.unit.private_name);
-        child
-            .unit
-            .mangled_names
-            .clone_from(&self.unit.mangled_names);
-        child
-            .symbols
-            .imported_scope_names
-            .clone_from(&self.symbols.imported_scope_names);
+        child.inherit_lexical_context(self);
         // CPython only inserts `.<locals>` for function, async-function, and lambda parents.
         child.unit.child_qualified_name_parent = Some(child.unit.qualified_name.clone());
         let generator_location = child.source_location(generator_range);
@@ -4504,16 +4488,7 @@ impl Compiler<'_> {
 
         self.assembler
             .set_location(self.source_location(generator_range));
-        if !closure_names.is_empty() {
-            self.emit_closure_tuple(&closure_names)?;
-        }
-        let code = self.add_constant(Constant::Code(Box::new(child)))?;
-        self.emit(LOAD_CONST, code, 1)?;
-        self.emit_make_function(if closure_names.is_empty() {
-            0
-        } else {
-            FunctionAttribute::CLOSURE.argument()
-        })?;
+        self.emit_function_with_closure(child, &closure_names)?;
         if (generator.generators[0].is_async && self.context.python_version >= PythonVersion::Py314)
             || self.context.python_version == PythonVersion::Py315
         {

@@ -146,6 +146,17 @@ impl<'source> Compiler<'source> {
         }
     }
 
+    /// Inherit the enclosing scope's name mangling and imported-name context.
+    pub(super) fn inherit_lexical_context(&mut self, parent: &Self) {
+        self.unit.private_name.clone_from(&parent.unit.private_name);
+        self.unit
+            .mangled_names
+            .clone_from(&parent.unit.mangled_names);
+        self.symbols
+            .imported_scope_names
+            .clone_from(&parent.symbols.imported_scope_names);
+    }
+
     /// Shares lexical context while keeping discarded parent instructions in a fresh emitter.
     pub(super) fn discarded_builder(&self) -> Self {
         Self::new(
