@@ -31801,6 +31801,16 @@ fn with_body_conditional_exit_location(
             // locates this arm's jump and the manager's original normal POP_BLOCK.
             unique_condition_jump_target(&assertion.test, true).map(Ranged::range)
         }
+        Stmt::For(iterator)
+            if compiler.context.python_version >= crate::PythonVersion::Py314
+                && !iterator.is_async
+                && iterator.orelse.is_empty()
+                && !suite_contains_loop_break(&iterator.body) =>
+        {
+            // Exhaustion is the sole normal edge from this arm. Its iterator span
+            // reaches the manager's original POP_BLOCK through the arm's jump.
+            Some(iterator.iter.range())
+        }
         Stmt::With(manager)
             if manager.items.len() == 1
                 && matches!(manager.body.last(), Some(Stmt::Return(_) | Stmt::Raise(_))) =>
