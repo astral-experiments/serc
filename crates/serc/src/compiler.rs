@@ -23,6 +23,7 @@ mod scope;
 mod source;
 mod statement;
 mod symbol;
+pub(crate) mod syntax;
 #[cfg(test)]
 mod tests;
 

@@ -13,30 +13,30 @@ case "$python_version" in
     3.12)
         expected_exact=2174
         expected_rejected=277
-        expected_matched_rejection=210
-        expected_rejection_mismatch=61
-        expected_compiler_failure=6
+        expected_matched_rejection=257
+        expected_rejection_mismatch=18
+        expected_compiler_failure=2
         ;;
     3.13)
         expected_exact=2193
         expected_rejected=258
-        expected_matched_rejection=196
-        expected_rejection_mismatch=55
-        expected_compiler_failure=7
+        expected_matched_rejection=244
+        expected_rejection_mismatch=12
+        expected_compiler_failure=2
         ;;
     3.14)
         expected_exact=2230
         expected_rejected=221
-        expected_matched_rejection=152
-        expected_rejection_mismatch=55
-        expected_compiler_failure=14
+        expected_matched_rejection=207
+        expected_rejection_mismatch=12
+        expected_compiler_failure=2
         ;;
     3.15)
         expected_exact=2249
         expected_rejected=202
-        expected_matched_rejection=133
-        expected_rejection_mismatch=55
-        expected_compiler_failure=14
+        expected_matched_rejection=189
+        expected_rejection_mismatch=11
+        expected_compiler_failure=2
         ;;
     *)
         echo "error: unsupported Python target '$python_version'; expected 3.12, 3.13, 3.14, or 3.15" >&2

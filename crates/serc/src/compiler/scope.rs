@@ -4735,11 +4735,7 @@ fn future_feature_flags(body: &[Stmt]) -> u32 {
             let Stmt::ImportFrom(import) = statement else {
                 return None;
             };
-            import
-                .module
-                .as_ref()
-                .is_some_and(|module| module.as_str() == "__future__")
-                .then_some(import)
+            (import.level == 0 && import.module.as_deref() == Some("__future__")).then_some(import)
         })
         .flat_map(|import| &import.names)
         .fold(0, |flags, alias| {
