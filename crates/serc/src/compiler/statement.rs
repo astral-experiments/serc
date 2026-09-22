@@ -19141,6 +19141,38 @@ impl Compiler<'_> {
                 self.assembler
                     .allow_borrow_surviving_break_at_trailing_loop_exit();
             }
+            // The successful break enters the original POP_BLOCK/else array.
+            // Its runtime condition keeps that array nonempty when POP_BLOCK is
+            // removed. Retain only surviving authored break edges; the erased
+            // terminal break still cannot reopen the disconnected loop boundary.
+            if self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && !statement.is_star
+                && statement.finalbody.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .len()
+                    == 1
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && matches!(statement.body.last(), Some(Stmt::While(tail))
+                    if early_condition_truthiness(&tail.test) == Some(true)
+                        && tail.orelse.is_empty()
+                        && suite_contains_borrow_reachable_conditional_loop_break(&tail.body))
+                && matches!(statement.orelse.first(), Some(Stmt::If(condition))
+                    if condition_has_linear_runtime_leaves(&condition.test)
+                        && !expression_suspends_current_scope(&condition.test))
+            {
+                self.assembler
+                    .allow_borrow_surviving_break_at_trailing_loop_exit();
+            }
             if retained_assertion_exit {
                 self.assembler.mark_before_trailing_labels(try_end);
             } else if self.context.python_version <= crate::PythonVersion::Py313
