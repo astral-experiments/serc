@@ -5916,6 +5916,66 @@ impl Compiler<'_> {
                         .is_empty()
                     && self.control.withs.active_with_exits.is_empty()
                     && self.control.loops.contexts.is_empty();
+                // Iterators entered by an exceptional finally sit above its saved
+                // exception state. Unwind that inner suffix before FINALLY_END, then
+                // leave older iterators for the later return cleanup.
+                let loops_before_finally_end = (!return_is_overridden
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && self.control.finally.active_finally_end_blocks == 1
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self
+                        .control
+                        .finally
+                        .active_return_finally_contexts
+                        .is_empty()
+                    && self
+                        .control
+                        .finally
+                        .preserved_return_value_contexts
+                        .is_empty()
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.exceptions.active_try_marker_slots.is_empty()
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+                        == 1
+                    && self.control.withs.active_with_exits.is_empty())
+                .then(|| {
+                    self.control
+                        .loops
+                        .contexts
+                        .iter()
+                        .position(|context| context.finally_end_depth == 1)
+                })
+                .flatten()
+                .filter(|&depth| {
+                    self.control.loops.contexts[..depth].iter().all(|context| {
+                        context.finally_end_depth == 0
+                            && context.exception_region_depth == 0
+                            && context.with_depth == 0
+                    }) && self.control.loops.contexts[depth..]
+                        .iter()
+                        .any(|context| context.iterator_cleanup == IteratorCleanup::Sync)
+                        && self.control.loops.contexts[depth..].iter().all(|context| {
+                            matches!(
+                                context.iterator_cleanup,
+                                IteratorCleanup::None | IteratorCleanup::Sync
+                            ) && context.finally_end_depth == 1
+                                && context.exception_region_depth == 1
+                                && context.with_depth == 0
+                        })
+                });
+                if let Some(depth) = loops_before_finally_end {
+                    self.emit_loop_iterator_cleanup(
+                        depth,
+                        self.control.loops.contexts.len(),
+                        preserve_tos,
+                    )?;
+                }
                 let nested_finally_region_unwind_start = (!handler_before_finally_end
                     && self.control.finally.active_finally_end_blocks > 0
                     && self
@@ -6529,7 +6589,8 @@ impl Compiler<'_> {
                     && !tracks_two_handlers_inside_ordinary_try
                     && self.plain_handler_chain_has_outer_try();
                 let mut protected_outer_pop_except_start = None;
-                let mut next_loop = self.control.loops.contexts.len();
+                let mut next_loop =
+                    loops_before_finally_end.unwrap_or(self.control.loops.contexts.len());
                 let mut next_with = self.control.withs.active_with_exits.len();
                 let mut with_unwind_starts = Vec::new();
                 let mut with_unwind_before_exception_start = 0;
