@@ -35393,11 +35393,31 @@ fn suite_has_unconditional_cleanup_exit(body: &[Stmt]) -> bool {
                                 && !expression_suspends_current_scope(value)
                         }))
                 });
+            // If every original normal arm raises, the normal finalizer entry is
+            // unreachable before location propagation. Only the enclosing guard's
+            // false edge can reach its empty continuation. Keep copied returns,
+            // loop exits, and nested cleanup outside this certificate.
+            let raising_body = statement.handlers.is_empty()
+                && statement.orelse.is_empty()
+                && suite_terminates_before_constant_folding(&statement.body)
+                && !suite_contains_yield_with_headers(&statement.body, true, true)
+                && !suite_any_statement(&statement.body, |statement| {
+                    matches!(
+                        statement,
+                        Stmt::Return(_)
+                            | Stmt::Break(_)
+                            | Stmt::Continue(_)
+                            | Stmt::For(_)
+                            | Stmt::While(_)
+                            | Stmt::Try(_)
+                            | Stmt::With(_)
+                    )
+                });
             statement.finalbody.is_empty()
                 // A terminal condition in the protected body can leave an empty
                 // original join before cleanup. Linear finalizer work alone does
                 // not certify the enclosing condition's sole predecessor.
-                || ((suite_has_linear_borrow_fallthrough(&statement.body) || returning_body)
+                || ((suite_has_linear_borrow_fallthrough(&statement.body) || returning_body || raising_body)
                     && suite_has_linear_borrow_fallthrough(&statement.finalbody)
                     && !suite_contains_yield(&statement.finalbody))
         }

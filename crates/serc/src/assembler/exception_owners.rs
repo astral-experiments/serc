@@ -1397,7 +1397,9 @@ impl ExceptionOwnerProvenance {
         prefix: &'a [Item],
         all: &[Item],
     ) -> Option<(Label, &'a [Item], usize)> {
-        use crate::target::opcodes::{CALL, LOAD_ATTR, LOAD_FAST, STORE_FAST, STORE_NAME, SWAP};
+        use crate::target::opcodes::{
+            CALL, LOAD_ATTR, LOAD_FAST, STORE_DEREF, STORE_FAST, STORE_NAME, SWAP,
+        };
 
         let leading = prefix
             .iter()
@@ -1467,12 +1469,15 @@ impl ExceptionOwnerProvenance {
                 .collect::<Vec<_>>();
             // All authored restores are STORE_FAST_MAYBE_NULL in CPython,
             // including cells. They remain distinct through superinstruction
-            // insertion. CALL, LOAD_ATTR, LOAD_FAST, and STORE_NAME prevent static
-            // elimination of SWAP(n + 1): CPython only swaps local stores and POP_TOP,
+            // insertion. CALL, LOAD_ATTR, LOAD_FAST, STORE_DEREF, and STORE_NAME
+            // prevent static elimination of SWAP(n + 1): CPython only swaps local stores and POP_TOP,
             // so only n swappable restores precede the next operation.
             if instructions.starts_with(original)
                 && instructions.get(original.len()).is_some_and(|next| {
-                    matches!(next.opcode, CALL | LOAD_ATTR | LOAD_FAST | STORE_NAME)
+                    matches!(
+                        next.opcode,
+                        CALL | LOAD_ATTR | LOAD_FAST | STORE_DEREF | STORE_NAME
+                    )
                 })
             {
                 return Some((*entry, &prefix[start..], restores.len()));
