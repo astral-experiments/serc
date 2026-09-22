@@ -5351,3 +5351,25 @@ fn borrows_chained_stores_only_without_fast_local_transfers() {
         common::assert_matches_cpython_marshal(&source, "chained_store_owned_control.py");
     }
 }
+
+#[test]
+fn borrows_after_surviving_for_break_through_nested_try_exits() {
+    for handler_binding in ["", " as error"] {
+        for prefix in [
+            "",
+            "value = work()\nif check(value):\n    response.result = value\n    return work(response)\n",
+        ] {
+            for test in ["check(item)", "item and check(item)"] {
+                let recovery = format!(
+                    "try:\n    values = work(items)\n    for item in values:\n        if {test}:\n            result = work(item)\n            break\nexcept ValueError{handler_binding}:\n    result = 'inner'\n",
+                );
+                let protected = format!("{prefix}{recovery}");
+                let source = format!(
+                    "def function(items, response, check, work):\n    result = 'ok'\n    try:\n{}    except Exception{handler_binding}:\n        result = 'outer'\n    response.result = result\n    return work(response)\n",
+                    indent_finally_borrow_case(&indent_finally_borrow_case(&protected)),
+                );
+                common::assert_matches_cpython_marshal(&source, "nested_for_break_entry.py");
+            }
+        }
+    }
+}

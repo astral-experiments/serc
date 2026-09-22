@@ -18516,6 +18516,25 @@ impl Compiler<'_> {
             && self.control.finally.active_copied_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
             && nested_pass_recovery_has_populated_call_arm(statement);
+        // A surviving iterator break can thread both ordinary try exits and
+        // enter the continuation independently of their empty normal arrays.
+        let nested_for_break_entry = borrow_exit_has_source_successor
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && nested_try_has_populated_for_break_entry(statement);
         // CPython can leave an empty physical block after a final with or nested try. Borrowed-
         // load traversal stops there, so a following suite cannot reach this try join through
         // that normal-exit edge.
@@ -18527,7 +18546,8 @@ impl Compiler<'_> {
                 && suite_ends_in_empty_try_exit_block(normal_exit_suite, loop_tail.is_some())
                 && !nested_conditional_store_entry
                 && !nested_else_call_entry
-                && !nested_pass_call_entry)
+                && !nested_pass_call_entry
+                && !nested_for_break_entry)
         {
             self.assembler.prevent_borrow_reachability(end);
         }
@@ -33445,6 +33465,75 @@ fn async_recovery_has_populated_handler_suffix(body: &[Stmt]) -> bool {
                 && handler.name.is_some()
                 && suite_has_linear_borrow_fallthrough(&handler.body)
         }))
+}
+
+// An authored iterator break copies the two unlocated ordinary-try exits.
+// Its jump survives even when the original exit arrays become empty.
+fn nested_try_has_populated_for_break_entry(statement: &ruff_python_ast::StmtTry) -> bool {
+    let linear = |body: &[Stmt]| body.is_empty() || suite_has_linear_borrow_fallthrough(body);
+    let ordinary_recovery = |statement: &ruff_python_ast::StmtTry| {
+        !statement.is_star
+            && statement.orelse.is_empty()
+            && statement.finalbody.is_empty()
+            && !statement.handlers.is_empty()
+            && statement.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.as_ref().is_some_and(|type_| {
+                        !expression_contains_inline_branch(type_)
+                            && !expression_suspends_current_scope(type_)
+                    }) && suite_has_linear_borrow_fallthrough(&handler.body)
+                })
+            })
+    };
+    if !ordinary_recovery(statement) {
+        return false;
+    }
+    let Some((Stmt::Try(nested), leading)) = statement.body.split_last() else {
+        return false;
+    };
+    // An earlier conditional return has a separate terminal edge; the false
+    // path still reaches the iterator and its authored break.
+    if !leading.iter().all(|part| {
+        suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+            || matches!(part, Stmt::If(guard)
+            if guard.elif_else_clauses.is_empty()
+                && condition_has_linear_runtime_leaves(&guard.test)
+                && !expression_suspends_current_scope(&guard.test)
+                && guard.body.split_last().is_some_and(|(last, prefix)| {
+                    linear(prefix)
+                        && matches!(last, Stmt::Return(return_)
+                            if return_.value.as_deref().is_none_or(|value| {
+                                !expression_contains_inline_branch(value)
+                                    && !expression_suspends_current_scope(value)
+                            }))
+                }))
+    }) || !ordinary_recovery(nested)
+    {
+        return false;
+    }
+    let Some((Stmt::For(loop_), leading)) = nested.body.split_last() else {
+        return false;
+    };
+    if !linear(leading)
+        || loop_.is_async
+        || !loop_.orelse.is_empty()
+        || !matches!(loop_.target.as_ref(), Expr::Name(_))
+        || expression_contains_inline_branch(&loop_.iter)
+        || expression_suspends_current_scope(&loop_.iter)
+    {
+        return false;
+    }
+    let Some((Stmt::If(guard), leading)) = loop_.body.split_last() else {
+        return false;
+    };
+    linear(leading)
+        && guard.elif_else_clauses.is_empty()
+        && condition_has_linear_runtime_leaves(&guard.test)
+        && !expression_suspends_current_scope(&guard.test)
+        && guard
+            .body
+            .split_last()
+            .is_some_and(|(last, leading)| matches!(last, Stmt::Break(_)) && linear(leading))
 }
 
 // The first arm of a nested try-else conditional keeps its populated jump to
