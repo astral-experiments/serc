@@ -129,3 +129,15 @@ fn matches_cpython_percent_prefix_at_try_entry() {
         common::assert_matches_cpython_marshal(source, "percent_prefix_try_contexts.py");
     }
 }
+
+#[test]
+fn removes_literal_marker_after_percent_prefix_inherits_its_line() {
+    for function in ["def", "async def"] {
+        for marker in ["pass", "\"unused statement\"", "42", "1 + 2"] {
+            let source = format!(
+                "{function} f(value):\n    anchor = value\n    {marker}\n    result = \"prefix %s\" % (value,)\n    return result\n"
+            );
+            common::assert_matches_cpython_marshal(&source, "percent_prefix_literal_donor.py");
+        }
+    }
+}

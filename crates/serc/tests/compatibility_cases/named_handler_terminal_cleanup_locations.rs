@@ -275,6 +275,26 @@ fn matches_cpython_named_handler_complete_else_cleanup_joins() {
 }
 
 #[test]
+fn matches_cpython_coroutine_named_complete_cleanup_joins() {
+    for outer in ["flag", "flag and other"] {
+        for prefix in ["", "            notify(error)\n"] {
+            for (first, last) in [
+                ("first(error)", "last(error)"),
+                ("value = error", "value = None"),
+            ] {
+                let source = format!(
+                    "async def f(flag, other):\n    try:\n        await work()\n    except Error as error:\n        if {outer}:\n{prefix}            if other:\n                {first}\n            else:\n                {last}\n"
+                );
+                common::assert_matches_cpython_marshal(
+                    &source,
+                    "coroutine_named_complete_cleanup.py",
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn matches_cpython_terminal_named_handler_original_false_joins() {
     for condition in ["flag and error.code", "flag or error.code", "flag"] {
         let source = format!(

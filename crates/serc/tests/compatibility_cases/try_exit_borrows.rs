@@ -5410,3 +5410,72 @@ fn borrows_linear_else_cleanup_with_returning_and_plain_handlers() {
         }
     }
 }
+
+#[test]
+fn nested_raise_handler_suffix_keeps_borrow_boundary() {
+    for named in ["", " as error"] {
+        for function in [false, true] {
+            let body = format!(
+                "try:\n    work()\nexcept Error:\n    try:\n        raise Other\n    except Other{named}:\n        value = recover()\n    result = value\nprepare()\nresult = [n for n in items if not check(n)]\n"
+            );
+            let source = if function {
+                format!(
+                    "def run(items, check):\n    {}",
+                    body.replace('\n', "\n    ")
+                )
+            } else {
+                body
+            };
+            common::assert_matches_cpython_marshal(&source, "nested_raise_handler_suffix.py");
+        }
+    }
+}
+
+#[test]
+fn preserves_finally_borrow_barrier_after_nonfinal_recovery_arms() {
+    for name in ["", " as error"] {
+        for alternative in ["", "elif other:\n    pass\n", "else:\n    pass\n"] {
+            for arm_tail in ["", "recover(owner)\n"] {
+                let recovery = format!(
+                    "if flag:\n{}{}finish(owner)\n",
+                    indent_finally_borrow_case(&format!(
+                        "try:\n    work(owner)\nexcept OtherError:\n    pass\n{arm_tail}",
+                    )),
+                    alternative,
+                );
+                let source = format!(
+                    "def function(owner, flag, other):\n    try:\n        work(owner)\n    except Error{name}:\n{}    finally:\n        owner.close()\n",
+                    indent_finally_borrow_case(&indent_finally_borrow_case(&recovery)),
+                );
+                common::assert_matches_cpython_marshal(&source, "conditional_recovery_finally.py");
+            }
+        }
+    }
+}
+
+#[test]
+fn borrows_loop_finally_entries_with_plain_and_guarded_recovery() {
+    for loop_header in ["while flag:", "for item in owner.items:"] {
+        for companion in ["", "except OtherError:\n    recover(owner)\n"] {
+            for normal_else in ["", "else:\n    owner.state = True\n"] {
+                for terminal in ["raise", "break"] {
+                    for cleanup in [
+                        "owner.state = None\n",
+                        "if owner.active():\n    owner.close()\n",
+                        "if owner.ready != owner.previous:\n    if owner.ready:\n        report(owner)\n    else:\n        recover(owner)\nif owner.active():\n    owner.close()\n",
+                    ] {
+                        let recovery = format!(
+                            "try:\n    if owner.failed:\n        raise Error\n    work(owner)\n{companion}except Error as error:\n    if flag:\n        {terminal}\n    recover(owner)\n{normal_else}finally:\n{}",
+                            indent_finally_borrow_case(cleanup),
+                        );
+                        let source = format!(
+                            "def function(owner, flag):\n    {loop_header}\n{}",
+                            indent_finally_borrow_case(&indent_finally_borrow_case(&recovery)),
+                        );
+                        common::assert_matches_cpython_marshal(&source, "loop_recovery_finally.py");
+                    }
+                }
+            }
+        }
+    }
+}

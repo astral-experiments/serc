@@ -671,3 +671,34 @@ fn matches_cpython_nested_conditional_named_recovery_finalizer_borrows() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_iterator_continue_recovery_finally_borrows() {
+    for (managed, guarded_prefix) in [(false, false), (false, true), (true, false), (true, true)] {
+        let prefix = if guarded_prefix {
+            "            if report:\n                obj.report(item)\n"
+        } else {
+            ""
+        };
+        let body = format!(
+            "        try:\n            value = obj.load(item)\n        except ValueError:\n{prefix}            if retry:\n                continue\n            obj.skip(item)\n        finally:\n            status = obj.finish(item)\n        obj.check(value, status)\n"
+        );
+        let body = if managed {
+            let mut indented = String::new();
+            for line in body.lines() {
+                indented.push_str("    ");
+                indented.push_str(line);
+                indented.push('\n');
+            }
+            format!("        with obj.manager(item):\n{indented}")
+        } else {
+            body
+        };
+        let source =
+            format!("def recover(items, obj, report, retry):\n    for item in items:\n{body}");
+        common::assert_matches_cpython_marshal(
+            &source,
+            &format!("iterator_continue_finally_{managed}_{guarded_prefix}.py"),
+        );
+    }
+}

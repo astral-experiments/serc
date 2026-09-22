@@ -576,3 +576,16 @@ fn preserves_guarded_async_finally_empty_borrow_exit_nops() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn compacts_assertion_pop_before_matching_normal_exit() {
+    for (header, condition, name) in [
+        ("with manager():", "isinstance(value, Type)", " as error"),
+        ("for item in items:", "5 >= value >= 1", ""),
+    ] {
+        let source = format!(
+            "def f(flag, other, items):\n    {header}\n        if flag:\n            try:\n                value = load()\n                assert {condition}\n            except Error{name}:\n                raise BadValue(value)\n        else:\n            value = other\n        consume(value)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "sync_assertion_pop_compaction.py");
+    }
+}

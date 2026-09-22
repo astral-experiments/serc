@@ -39,24 +39,27 @@ use crate::{CompileError, PythonVersion};
 
 use super::constant::{
     PercentFormatPart, explicit_surrogate_string, first_literal_constant, fold_constant,
-    folded_bool_operand, folded_constant_owner_slots, number_constant, optimized_percent_format,
-    python_constant_values_equal, two_element_slice_optimization,
+    folded_bool_operand, folded_constant_owner_slots, is_small_literal_tuple_element,
+    number_constant, optimized_percent_format, python_constant_values_equal,
+    two_element_slice_optimization,
 };
 use super::scope::{
     LoweringFunctionPlan, NameId, NameSet, analyze_lambda_scope,
-    collect_named_expression_target_names, collect_nested_comprehension_target_names,
-    collect_self_iterated_nested_comprehension_targets, collect_target_names,
-    comprehension_cell_names, comprehension_name_bindings, comprehension_temporary_names,
-    generator_cellvars, generator_required_names, inlined_comprehension_cell_names_in_expression,
-    legacy_class_comprehension_names, parameter_default_expressions,
+    collect_nested_comprehension_target_names, collect_self_iterated_nested_comprehension_targets,
+    collect_target_names, comprehension_cell_names, comprehension_name_bindings,
+    comprehension_scope_facts, comprehension_temporary_names, generator_cellvars,
+    generator_required_names, inlined_comprehension_cell_names_in_expression,
+    legacy_class_comprehension_names, module_comprehension_temporary_names,
+    parameter_default_expressions,
 };
 use super::source::{
     debug_text_range, first_expression_instruction_range, fstring_literal_range,
     statement_execution_range, strip_expression_comments, synthetic_condition_exit_range,
 };
 use super::statement::{
-    final_chained_comparison_jump, is_wildcard_pattern, suite_has_linear_borrow_fallthrough,
-    suite_terminates, terminal_for_break_exit_inherits_predecessor, unique_condition_jump_target,
+    condition_jump_target_count, final_chained_comparison_jump, is_wildcard_pattern,
+    suite_has_linear_borrow_fallthrough, suite_terminates,
+    terminal_for_break_exit_inherits_predecessor, unique_condition_jump_target,
 };
 use super::symbol::{
     ComparisonMode, ComprehensionRestore, ReraiseStackState, ResumeDepth, expression_name, to_u32,
@@ -273,85 +276,6 @@ enum SpecializedLowering {
     NotApplicable,
 }
 
-#[derive(Default)]
-struct ComprehensionScopeFacts {
-    names: BTreeSet<String>,
-    walrus_targets: BTreeSet<String>,
-}
-
-impl ComprehensionScopeFacts {
-    fn visit_nested_comprehension(&mut self, generators: &[ruff_python_ast::Comprehension]) {
-        // The first iterable is evaluated in the containing scope; the remaining
-        // expressions enter the nested comprehension's own inlined scope.
-        if let Some(generator) = generators.first() {
-            self.visit_expr(&generator.iter);
-        }
-    }
-}
-
-impl<'ast> Visitor<'ast> for ComprehensionScopeFacts {
-    fn visit_expr(&mut self, expression: &'ast Expr) {
-        match expression {
-            Expr::Name(name) => {
-                self.names.insert(name.id.as_str().to_string());
-            }
-            Expr::Named(named) => {
-                if let Expr::Name(name) = named.target.as_ref() {
-                    self.walrus_targets.insert(name.id.as_str().to_string());
-                }
-            }
-            Expr::Generator(generator) => {
-                self.visit_nested_comprehension(&generator.generators);
-                return;
-            }
-            Expr::ListComp(comprehension) => {
-                self.visit_nested_comprehension(&comprehension.generators);
-                return;
-            }
-            Expr::SetComp(comprehension) => {
-                self.visit_nested_comprehension(&comprehension.generators);
-                return;
-            }
-            Expr::DictComp(comprehension) => {
-                self.visit_nested_comprehension(&comprehension.generators);
-                return;
-            }
-            Expr::Lambda(lambda) => {
-                if let Some(parameters) = lambda.parameters.as_deref() {
-                    for default in parameter_default_expressions(parameters) {
-                        self.visit_expr(default);
-                    }
-                }
-                return;
-            }
-            _ => {}
-        }
-        walk_expr(self, expression);
-    }
-}
-
-fn comprehension_scope_facts(
-    generators: &[ruff_python_ast::Comprehension],
-    key: Option<&Expr>,
-    value: &Expr,
-) -> ComprehensionScopeFacts {
-    let mut facts = ComprehensionScopeFacts::default();
-    for generator in generators {
-        facts.visit_expr(&generator.target);
-        for condition in &generator.ifs {
-            facts.visit_expr(condition);
-        }
-    }
-    for generator in generators.iter().skip(1) {
-        facts.visit_expr(&generator.iter);
-    }
-    if let Some(key) = key {
-        facts.visit_expr(key);
-    }
-    facts.visit_expr(value);
-    facts
-}
-
 #[derive(Clone, Copy, Debug)]
 enum SuperAttributeKind {
     Attribute,
@@ -462,6 +386,23 @@ impl Compiler<'_> {
             |control| &mut control.loops.match_case_iterator_continuation,
             iterator_continuation,
             |compiler| compiler.compile_suite(body),
+        )
+    }
+
+    /// Keeps a returning case's comparison bridge eligible for original-budget exit copying.
+    fn compile_match_guard(
+        &mut self,
+        guard: &Expr,
+        body: &[Stmt],
+        otherwise: Label,
+    ) -> Result<(), CompileError> {
+        let retained_exit = matches!(body.last(), Some(Stmt::Return(_)))
+            .then(|| final_chained_comparison_jump(guard))
+            .flatten();
+        self.with_control_override(
+            |control| &mut control.conditions.retained_chained_comparison_exit,
+            retained_exit,
+            |compiler| compiler.compile_jump_if(guard, false, otherwise),
         )
     }
 
@@ -597,8 +538,21 @@ impl Compiler<'_> {
                         } else {
                             guard.range()
                         };
-                        self.assembler.set_location(self.source_location(range));
+                        let location = self.source_location(range);
+                        let redundant_capture_line = truthiness
+                            && !context.stores.is_empty()
+                            && self.source_location(case.pattern.range()).line == location.line;
+                        self.assembler.set_location(if redundant_capture_line {
+                            SourceLocation::NONE
+                        } else {
+                            location
+                        });
                         self.emit(NOP, 0, 0)?;
+                        if redundant_capture_line {
+                            // Native constant folding removes the guard's line after the
+                            // same-line capture store. Keep its slot for original block sizing.
+                            self.assembler.preserve_last_no_location();
+                        }
                     }
                     if !truthiness {
                         self.ensure_match_fail_pop(&mut context, 0);
@@ -619,7 +573,14 @@ impl Compiler<'_> {
                             .set_location(self.source_location(case.pattern.range()));
                         self.emit(NOP, 0, 0)?;
                     }
-                    self.compile_jump_if(guard, false, context.fail_pop[0])?;
+                    if copied_subject {
+                        // A copied subject begins the return with NEXT_LOCATION. Keep
+                        // its existing bridge policy until exit copying also models
+                        // the replaced jump's location transfer onto that subject pop.
+                        self.compile_jump_if(guard, false, context.fail_pop[0])?;
+                    } else {
+                        self.compile_match_guard(guard, &case.body, context.fail_pop[0])?;
+                    }
                 }
             }
             if !guard_always_false {
@@ -898,11 +859,12 @@ impl Compiler<'_> {
                         }
                         if index + 1 == matched_cases
                             && (!context.fail_pop.is_empty()
-                                || context.direct_loop_failure.is_some())
+                                || context.direct_loop_failure.is_some()
+                                || assertion_success_join)
                         {
                             // CPython duplicates small exits before removing this jump across
-                            // the empty final pattern-failure block. A directly normalized
-                            // loop failure still leaves the case-success exit to be copied.
+                            // the empty final pattern-failure block. An assertion success
+                            // also keeps its original jump until conditional threading.
                             self.assembler.defer_jump_removal(success_exit);
                         }
                         let subject_pop_is_optimized_away = !copied_subject
@@ -1086,7 +1048,7 @@ impl Compiler<'_> {
                     // the copy inherits its span, rather than the wildcard NOP's span.
                     self.assembler.defer_jump_removal(exit);
                 } else {
-                    self.compile_jump_if(guard, false, end)?;
+                    self.compile_match_guard(guard, &case.body, end)?;
                 }
                 failure_reaches_end = true;
             }
@@ -3824,29 +3786,12 @@ impl Compiler<'_> {
                 .map(|(name, _)| name)
                 .collect();
         }
-        if matches!(self.unit.scope, Scope::Module) {
-            // CPython assigns a hidden fast-local slot to module-scope walrus targets while
-            // inlining a comprehension. Function-scope targets remain bindings in the
-            // containing function and are not part of the comprehension's save set.
-            let mut walrus_targets = Vec::new();
-            if let Some(key) = key {
-                collect_named_expression_target_names(key, &mut walrus_targets);
-            }
-            collect_named_expression_target_names(value, &mut walrus_targets);
-            for generator in generators {
-                for condition in &generator.ifs {
-                    collect_named_expression_target_names(condition, &mut walrus_targets);
-                }
-            }
-            if !walrus_targets.is_empty() {
-                let facts = comprehension_scope_facts(generators, key, value);
-                // Inlining a child copies its binding flags only for names absent
-                // from this scope. An existing outer read does not become a local
-                // merely because a nested comprehension assigns that name.
-                temporary_names.extend(walrus_targets.into_iter().filter(|name| {
-                    !facts.names.contains(name) || facts.walrus_targets.contains(name)
-                }));
-            }
+        if matches!(self.unit.scope, Scope::Module)
+            && let Some(module_saves) = module_comprehension_temporary_names(generators, key, value)
+        {
+            // Save module walrus slots in symbol order, but keep their accesses global.
+            // Only iteration targets belong in active_temporary_names above.
+            temporary_names = module_saves;
         }
         // An inner target read by its own iterable must keep the enclosing value live until the
         // inner comprehension starts and takes ownership of its save/restore.
@@ -4577,8 +4522,17 @@ impl Compiler<'_> {
         self.assembler.mark(send_end);
         self.set_depth(loop_depth + 2 + self.iterator_extra_slots());
         self.emit(END_SEND, 0, -self.iterator_slots())?;
+        if self.context.python_version == PythonVersion::Py314 {
+            // Native compaction erases the POP_BLOCK between END_SEND and target storage.
+            // Its vacant record remains in the original array used by later markers.
+            self.assembler.add_last_hidden_exception_owner_slots(1);
+        }
         self.assembler.mark(protected_end);
         self.compile_store_target(&generator.target)?;
+        if self.context.python_version == PythonVersion::Py314 {
+            self.assembler
+                .transfer_linear_try_pop_block_slot(protected_end);
+        }
 
         for condition in &generator.ifs {
             let accepted = self.assembler.label();
@@ -6147,28 +6101,14 @@ impl Compiler<'_> {
                 }
                 self.assembler.set_location(collection_location);
                 self.emit_collection_constant(Constant::Tuple(constants))?;
+                let hidden_owner_slots = folded_elements_owner_slots(elements, elements.len());
                 self.assembler
-                    .add_last_constant_fold_slots(folded_elements_owner_slots(
-                        elements,
-                        elements.len(),
-                    ));
-                // Each literal and BUILD_TUPLE belongs to this same original array.
+                    .add_last_constant_fold_slots(hidden_owner_slots);
+                // Nested literal tuples remove their own loads and builds from this array.
                 // Larger tuples use LIST_APPEND and have different slot accounting.
-                if elements.len() <= 30
-                    && elements.iter().all(|element| {
-                        matches!(
-                            element,
-                            Expr::NoneLiteral(_)
-                                | Expr::BooleanLiteral(_)
-                                | Expr::NumberLiteral(_)
-                                | Expr::StringLiteral(_)
-                                | Expr::BytesLiteral(_)
-                                | Expr::EllipsisLiteral(_)
-                        )
-                    })
-                {
+                if elements.len() <= 30 && elements.iter().all(is_small_literal_tuple_element) {
                     self.assembler
-                        .record_last_uniform_fold_owner_slots(elements.len());
+                        .record_last_uniform_fold_owner_slots(hidden_owner_slots);
                 }
                 return Ok(());
             }
@@ -6880,6 +6820,17 @@ impl Compiler<'_> {
         }
         if matches!(expression.body.as_ref(), Expr::BoolOp(_)) || preserve_nested_no_location {
             self.assembler.preserve_no_location(body_exit.instruction());
+        }
+        if self.context.python_version == PythonVersion::Py314
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && condition_jump_target_count(&expression.test, false) == 0
+        {
+            // A folded short-circuit outcome can discard the else array while
+            // retaining evaluation of its runtime operands. Erasing this exit
+            // still crosses that empty original array before the shared join.
+            self.assembler.record_noncopyable_borrow_exit(body_exit);
         }
         self.assembler
             .record_exception_owner_block_boundary(else_label);
@@ -8230,6 +8181,15 @@ impl Compiler<'_> {
                 self.assembler.preserve_inlined_jump_nop(exit);
                 self.assembler
                     .mark_folded_jump_borrow_fallthrough(exit, empty_folded_block);
+                if matches!(
+                    self.context.python_version,
+                    PythonVersion::Py314 | PythonVersion::Py315
+                ) && self.control.conditions.uncopied_assertion_success == Some(label)
+                {
+                    // This edge becomes unconditional only after CPython's early
+                    // copy pass; a located assertion continuation stays shared.
+                    self.assembler.prevent_jump_inlining(exit);
+                }
             } else {
                 // Native line resolution still sees this edge before constant folding.
                 self.assembler.record_folded_condition_predecessor(label);
@@ -8353,6 +8313,14 @@ impl Compiler<'_> {
                 && matches!(final_operator, CmpOp::Is | CmpOp::IsNot);
             if specialized_none_jump {
                 self.add_constant(Constant::None)?;
+                let none_location = self.source_location(final_comparator.range());
+                if self.context.python_version >= PythonVersion::Py314
+                    && none_location.line != self.source_location(comparison.range).line
+                {
+                    // Specializing None leaves its original operand-line cell until NOP cleanup.
+                    self.assembler.set_location(none_location);
+                    self.emit(NOP, 0, 0)?;
+                }
             } else {
                 self.compile_comparison_rhs(final_operator, final_comparator)?;
             }

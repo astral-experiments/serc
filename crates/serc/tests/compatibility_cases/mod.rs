@@ -14,11 +14,13 @@ mod boolean_original_prefix_owners;
 mod boolean_value_end_owner_boundary;
 mod branch_expression_name_scopes;
 mod chained_boolean_return_copies;
+mod chained_comparison_original_exit_copies;
 mod chained_comparison_owner_slots;
 mod chained_conditional_expression_returns;
 mod chained_else_return_copies;
 mod chained_raise_copies;
 mod class_comprehension_cells;
+mod class_footer_predecessors;
 mod class_pattern_wildcard_locations;
 mod class_static_attribute_ownership;
 mod cleanup_interrupt_checks;
@@ -28,6 +30,7 @@ mod comprehension_iterable_captures;
 mod comprehension_local_reservation_order;
 mod comprehension_none_condition_owner_compatibility;
 mod comprehension_scope_cells;
+mod comprehension_temporary_names;
 mod comprehension_tuple_guard_owner_compatibility;
 mod conditional_attribute_name_return_fusion_compatibility;
 mod conditional_cleanup_source_ranges;
@@ -179,7 +182,9 @@ mod match_tail_if_original_join_locations;
 mod membership_literal_construction;
 mod middle_singleton_comprehensions;
 mod module_annotation_indices;
+mod module_comprehension_walrus_order;
 mod module_handler_iterator_condition_compatibility;
+mod module_super_symbols;
 mod multi_with_compatibility;
 mod multi_with_terminal_compatibility;
 mod multiline_comprehension_filter_owner_compatibility;
@@ -278,6 +283,7 @@ mod terminal_break_deferred_none_compatibility;
 mod terminal_chained_comparison_returns_compatibility;
 mod terminal_chained_exit_nops;
 mod terminal_chained_none_compatibility;
+mod terminal_condition_exits;
 mod terminal_ifexp_call_compatibility;
 mod terminal_none_and_raise_compatibility;
 mod terminal_synchronous_with_condition_owner_compatibility;
@@ -556,6 +562,7 @@ mod folded_while_import_borrow;
 mod intervening_try_finally_copy;
 
 mod async_generator_finally_owner;
+mod async_generator_pop_block_slots;
 mod conditional_finally_return_owner;
 
 mod located_manager_handler_join;
@@ -666,6 +673,7 @@ mod match_success_normal_try_copies;
 
 mod terminal_cold_join_probes;
 
+mod nested_literal_tuple_owner_slots;
 mod nested_manager_none_slot;
 
 mod named_handler_jump_locations;

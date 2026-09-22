@@ -837,3 +837,28 @@ fn matches_cpython_match_assertion_success_return_copies() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_final_assertion_success_continuations() {
+    for pattern in ["_ as item", "[item]", "_"] {
+        for continuation in [
+            "    consume(item)\n",
+            "    if ready:\n        consume(item)\n",
+            "    return item.attr\n",
+        ] {
+            let source = format!(
+                "def select(subject, item, ready):
+    match subject:
+        case 1:
+            consume(item)
+        case {pattern}:
+            assert item
+{continuation}"
+            );
+            common::assert_matches_cpython_marshal(
+                &source,
+                "final_assertion_match_continuation.py",
+            );
+        }
+    }
+}

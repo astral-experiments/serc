@@ -27,3 +27,17 @@ fn while_else_partial_if_keeps_its_original_join_unlocated() {
         }
     }
 }
+
+#[test]
+fn guarded_for_with_terminal_else_keeps_false_join_line() {
+    // Early copying moves every break past the original conditional exit.
+    // Its remaining false edge supplies the line of the copied return's NOP.
+    for condition in ["guard", "guard(value)", "guard or mode", "guard and mode"] {
+        for terminal in ["raise ValueError", "return 0"] {
+            let source = format!(
+                "def f(mode, guard, items, value):\n    if mode:\n        if {condition}:\n            for item in items:\n                value = item\n                if value:\n                    break\n            else:\n                {terminal}\n    else:\n        value = 0\n    return value\n"
+            );
+            common::assert_matches_cpython_marshal(&source, "guarded_for_terminal_else.py");
+        }
+    }
+}

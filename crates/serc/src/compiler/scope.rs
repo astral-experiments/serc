@@ -1039,7 +1039,12 @@ impl ModulePlan {
         };
         let mut imported_scope_names: NameSet =
             facts.imported_scope_names.drain().map(&name_id).collect();
-        if bindings.seen.contains("super") {
+        // Native super-call specialization requires the module symbol to be absent,
+        // including USE-only references and globals declared by nested scopes.
+        if bindings.seen.contains("super")
+            || bindings.module_references_super == Some(true)
+            || facts.module_globals.contains("super")
+        {
             imported_scope_names.insert(
                 names
                     .get(SHADOWED_SUPER_SENTINEL)
@@ -1125,6 +1130,8 @@ impl ScopeArena {
         let mut bindings = LocalCollector {
             eager_function_annotations: eager_annotations,
             eager_statement_annotations: eager_annotations,
+            module_references_super: Some(false),
+            module_comprehension_saves: true,
             ..LocalCollector::default()
         };
         if requires_module_bindings {
@@ -1494,8 +1501,8 @@ impl<'a, 'ast> ModuleNameCollector<'a, 'ast> {
     }
 
     fn intern(&mut self, name: &str) -> NameId {
-        // A module binding named `super` disables the specialized zero-argument form. Be
-        // conservative about nested/header occurrences so the module-local walk can be skipped
+        // A module symbol named `super` disables specialized super calls. Be conservative
+        // about nested/header occurrences so the module-local walk can be skipped
         // only when the sentinel is definitely irrelevant.
         self.requires_module_bindings |= name == "super";
         if self.private_name.is_none() {
@@ -2008,6 +2015,8 @@ struct LocalCollector {
     ignore_generator_body_comprehension_targets: bool,
     eager_function_annotations: bool,
     eager_statement_annotations: bool,
+    module_references_super: Option<bool>,
+    module_comprehension_saves: bool,
     legacy_class_comprehension_symbols: Option<Vec<(Name, bool)>>,
 }
 
@@ -2638,9 +2647,13 @@ impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
         if self.collect_known_loads
             && let Expr::Name(name) = expression
             && name.ctx == ExprContext::Load
-            && !self.ignored_candidate_loads.contains(name.id.as_str())
         {
-            self.collector.insert_candidate(name.id.as_str());
+            if let Some(references_super) = &mut self.collector.module_references_super {
+                *references_super |= name.id.as_str() == "super";
+            }
+            if !self.ignored_candidate_loads.contains(name.id.as_str()) {
+                self.collector.insert_candidate(name.id.as_str());
+            }
         }
         let generators = match expression {
             Expr::ListComp(comprehension) => Some(comprehension.generators.as_slice()),
@@ -2720,15 +2733,32 @@ impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
                 .deferred_nonlocal_comprehension_names(generators, key, value);
             // Reserve current-scope saves before visiting children. An explicit nonlocal
             // reference retains its outer value until the child that actually binds it.
+            let iteration_names = comprehension_temporary_names(generators, key, value);
+            let module_saves = self
+                .collector
+                .module_comprehension_saves
+                .then(|| module_comprehension_temporary_names(generators, key, value))
+                .flatten();
+            let module_iteration_names = module_saves
+                .as_ref()
+                .map(|_| iteration_names.iter().cloned().collect::<FxHashSet<_>>());
+            let temporary_names = module_saves.unwrap_or(iteration_names);
             let mut previous_target_names = Vec::new();
-            for name in comprehension_temporary_names(generators, key, value)
+            for name in temporary_names
                 .into_iter()
                 .filter(|name| !deferred_nonlocal_names.contains(name))
                 .map(Name::from)
             {
                 let is_new_target = !self.collector.seen_comprehension_targets.contains(&name);
-                self.collector
-                    .insert_comprehension_iteration_target(name.clone());
+                if module_iteration_names
+                    .as_ref()
+                    .is_none_or(|names| names.contains(name.as_str()))
+                {
+                    self.collector
+                        .insert_comprehension_iteration_target(name.clone());
+                } else {
+                    self.collector.insert_comprehension_target(name.clone());
+                }
                 if is_new_target
                     && self.collector.comprehension_late_bindings.contains(&name)
                     && let Some(predecessors) = self
@@ -3585,6 +3615,85 @@ pub(super) fn collect_target_names(target: &Expr, names: &mut Vec<String>) {
     }
 }
 
+#[derive(Default)]
+pub(super) struct ComprehensionScopeFacts {
+    pub(super) names: BTreeSet<String>,
+    pub(super) walrus_targets: BTreeSet<String>,
+}
+
+impl ComprehensionScopeFacts {
+    fn visit_nested_comprehension(&mut self, generators: &[ruff_python_ast::Comprehension]) {
+        // The first iterable is evaluated in the containing scope; the remaining
+        // expressions enter the nested comprehension's own inlined scope.
+        if let Some(generator) = generators.first() {
+            self.visit_expr(&generator.iter);
+        }
+    }
+}
+
+impl<'ast> Visitor<'ast> for ComprehensionScopeFacts {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        match expression {
+            Expr::Name(name) => {
+                self.names.insert(name.id.as_str().to_string());
+            }
+            Expr::Named(named) => {
+                if let Expr::Name(name) = named.target.as_ref() {
+                    self.walrus_targets.insert(name.id.as_str().to_string());
+                }
+            }
+            Expr::Generator(generator) => {
+                self.visit_nested_comprehension(&generator.generators);
+                return;
+            }
+            Expr::ListComp(comprehension) => {
+                self.visit_nested_comprehension(&comprehension.generators);
+                return;
+            }
+            Expr::SetComp(comprehension) => {
+                self.visit_nested_comprehension(&comprehension.generators);
+                return;
+            }
+            Expr::DictComp(comprehension) => {
+                self.visit_nested_comprehension(&comprehension.generators);
+                return;
+            }
+            Expr::Lambda(lambda) => {
+                if let Some(parameters) = lambda.parameters.as_deref() {
+                    for default in parameter_default_expressions(parameters) {
+                        self.visit_expr(default);
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+        walk_expr(self, expression);
+    }
+}
+
+pub(super) fn comprehension_scope_facts(
+    generators: &[ruff_python_ast::Comprehension],
+    key: Option<&Expr>,
+    value: &Expr,
+) -> ComprehensionScopeFacts {
+    let mut facts = ComprehensionScopeFacts::default();
+    for generator in generators {
+        facts.visit_expr(&generator.target);
+        for condition in &generator.ifs {
+            facts.visit_expr(condition);
+        }
+    }
+    for generator in generators.iter().skip(1) {
+        facts.visit_expr(&generator.iter);
+    }
+    if let Some(key) = key {
+        facts.visit_expr(key);
+    }
+    facts.visit_expr(value);
+    facts
+}
+
 /// Return saved comprehension locals in CPython's symbol insertion order.
 /// Nested inlined scopes merge after the containing scope's own symbols.
 pub(super) fn comprehension_temporary_names(
@@ -3592,10 +3701,47 @@ pub(super) fn comprehension_temporary_names(
     key: Option<&Expr>,
     value: &Expr,
 ) -> Vec<String> {
-    comprehension_symbol_names(generators, key, value, false)
+    comprehension_symbol_names(generators, key, value, false, None)
         .into_iter()
         .map(|(name, _)| name)
         .collect()
+}
+
+/// Return module save order when eligible global walrus slots need to be merged.
+pub(super) fn module_comprehension_temporary_names(
+    generators: &[ruff_python_ast::Comprehension],
+    key: Option<&Expr>,
+    value: &Expr,
+) -> Option<Vec<String>> {
+    let mut walrus_targets = Vec::new();
+    if let Some(key) = key {
+        collect_named_expression_target_names(key, &mut walrus_targets);
+    }
+    collect_named_expression_target_names(value, &mut walrus_targets);
+    for generator in generators {
+        for condition in &generator.ifs {
+            collect_named_expression_target_names(condition, &mut walrus_targets);
+        }
+    }
+    if walrus_targets.is_empty() {
+        return None;
+    }
+    let facts = comprehension_scope_facts(generators, key, value);
+    // A child copies its flags only for an absent outer symbol. Preserve an
+    // existing outer read unless this comprehension itself also binds the name.
+    let walrus_targets = walrus_targets
+        .into_iter()
+        .filter(|name| !facts.names.contains(name) || facts.walrus_targets.contains(name))
+        .collect::<FxHashSet<_>>();
+    if walrus_targets.is_empty() {
+        return None;
+    }
+    Some(
+        comprehension_symbol_names(generators, key, value, false, Some(&walrus_targets))
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect(),
+    )
 }
 
 /// Return legacy class save candidates; `true` entries require an enclosing free binding.
@@ -3605,7 +3751,9 @@ pub(super) fn legacy_class_comprehension_names(
     value: &Expr,
 ) -> Vec<(String, bool)> {
     let mut names = vec![(".0".to_string(), false)];
-    names.extend(comprehension_symbol_names(generators, key, value, true));
+    names.extend(comprehension_symbol_names(
+        generators, key, value, true, None,
+    ));
     names
 }
 
@@ -3624,25 +3772,29 @@ fn comprehension_symbol_names(
     key: Option<&Expr>,
     value: &Expr,
     all_symbols: bool,
+    module_walrus_targets: Option<&FxHashSet<String>>,
 ) -> Vec<(String, bool)> {
     #[derive(Default)]
-    struct Collector {
+    struct Collector<'a> {
         names: Vec<(String, bool)>,
         nested_names: Vec<(String, bool)>,
         closure_references: BTreeSet<String>,
         targets: FxHashSet<String>,
         all_symbols: bool,
+        module_walrus_targets: Option<&'a FxHashSet<String>>,
     }
 
-    impl Collector {
+    impl<'a> Collector<'a> {
         fn comprehension(
             generators: &[ruff_python_ast::Comprehension],
             key: Option<&Expr>,
             value: &Expr,
             all_symbols: bool,
+            module_walrus_targets: Option<&'a FxHashSet<String>>,
         ) -> Self {
             let mut collector = Self {
                 all_symbols,
+                module_walrus_targets,
                 ..Self::default()
             };
             for (index, generator) in generators.iter().enumerate() {
@@ -3679,7 +3831,7 @@ fn comprehension_symbol_names(
         }
     }
 
-    impl<'ast> Visitor<'ast> for Collector {
+    impl<'ast> Visitor<'ast> for Collector<'_> {
         fn visit_expr(&mut self, expression: &'ast Expr) {
             let (generators, key, value) = match expression {
                 Expr::ListComp(comprehension) => {
@@ -3711,6 +3863,21 @@ fn comprehension_symbol_names(
                     }
                     return;
                 }
+                Expr::Named(named) if self.module_walrus_targets.is_some() => {
+                    if let Expr::Name(name) = named.target.as_ref()
+                        && self
+                            .module_walrus_targets
+                            .is_some_and(|targets| targets.contains(name.id.as_str()))
+                    {
+                        // Native extends the containing scope before visiting the value.
+                        // Its DEF_GLOBAL admission reserves this symbol's first position.
+                        self.targets.insert(name.id.to_string());
+                        self.names.push((name.id.to_string(), false));
+                    }
+                    self.visit_expr(&named.value);
+                    self.visit_expr(&named.target);
+                    return;
+                }
                 Expr::Name(name) => {
                     self.names.push((name.id.as_str().to_string(), false));
                     if self.all_symbols && name.id.as_str() == "super" {
@@ -3718,7 +3885,9 @@ fn comprehension_symbol_names(
                     }
                     return;
                 }
-                Expr::Dict(dictionary) if self.all_symbols => {
+                Expr::Dict(dictionary)
+                    if self.all_symbols || self.module_walrus_targets.is_some() =>
+                {
                     for item in &dictionary.items {
                         if let Some(key) = &item.key {
                             self.visit_expr(key);
@@ -3737,13 +3906,20 @@ fn comprehension_symbol_names(
             if let Some(first) = generators.first() {
                 self.visit_expr(&first.iter);
             }
-            let child = Self::comprehension(generators, key, value, self.all_symbols);
+            let child = Self::comprehension(
+                generators,
+                key,
+                value,
+                self.all_symbols,
+                self.module_walrus_targets,
+            );
             self.targets.extend(child.targets);
             self.nested_names.extend(child.names);
         }
     }
 
-    let mut collector = Collector::comprehension(generators, key, value, all_symbols);
+    let mut collector =
+        Collector::comprehension(generators, key, value, all_symbols, module_walrus_targets);
     if all_symbols {
         let mut seen = FxHashSet::default();
         collector.names.retain(|name| seen.insert(name.clone()));

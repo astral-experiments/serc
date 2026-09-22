@@ -38,6 +38,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) named_handler_try_prefixes: Vec<OriginalPopBlockSpan>,
     pub(super) continued_handler_try_prefixes: Vec<OriginalPopBlockSpan>,
     pub(super) copied_handler_finally_pops: Vec<OriginalPopBlockSpan>,
+    pub(super) copied_method_cleanup_pop_spans: Vec<OriginalPopBlockSpan>,
     pub(super) iterator_return_pop_spans: Vec<(Instruction, OriginalPopBlockSpan)>,
     pub(super) fused_manager_owners: Vec<(Instruction, Instruction, super::ExceptionRegion)>,
     pub(super) handler_dispatch_arrays: Vec<HandlerDispatchArray>,
@@ -390,7 +391,11 @@ impl ExceptionOwnerProvenance {
                 }
             }
         }
-        for origin in &mut self.copied_handler_finally_pops {
+        for origin in self
+            .copied_handler_finally_pops
+            .iter_mut()
+            .chain(&mut self.copied_method_cleanup_pop_spans)
+        {
             for item in &mut origin.items {
                 if let Item::Instruction(instruction) = item {
                     visit(instruction);
@@ -2407,14 +2412,19 @@ impl LayoutAssembler {
         &self,
         jump_targets: &FxHashSet<Label>,
         label_positions: &FxHashMap<Label, usize>,
-    ) -> (FxHashMap<usize, usize>, FxHashSet<Label>) {
+    ) -> (
+        FxHashMap<usize, usize>,
+        FxHashSet<Label>,
+        FxHashMap<usize, usize>,
+    ) {
         let provenance = &self.exception_owner_provenance;
         let mut slots = FxHashMap::default();
         let mut aliases = FxHashSet::default();
-        for (origin, pop_count, requires_handler_pair, returned_value) in provenance
+        let mut method_donors = FxHashMap::default();
+        for (origin, pop_count, requires_handler_pair, returned_value, method_cleanup) in provenance
             .named_handler_pop_pairs
             .iter()
-            .map(|origin| (origin, 2, false, None))
+            .map(|origin| (origin, 2, false, None, false))
             .chain(provenance.copied_handler_finally_pops.iter().map(|origin| {
                 let pops = origin
                     .items
@@ -2424,13 +2434,19 @@ impl LayoutAssembler {
                         if instruction.fusion_policy.is_converted_pop_block())
                     })
                     .count();
-                (origin, pops, true, None)
+                (origin, pops, true, None, false)
+            }))
+            .chain(provenance.copied_method_cleanup_pop_spans.iter().filter_map(|origin| {
+                let pops = origin.items.iter().filter(|item| matches!(item,
+                    Item::Instruction(record) if record.fusion_policy.is_converted_pop_block())).count();
+                (matches!(origin.items.last(), Some(Item::Instruction(record)) if matches!(record.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE))
+                    && (3..=4).contains(&pops)).then_some((origin, pops, false, None, true))
             }))
             .chain(
                 provenance
                     .iterator_return_pop_spans
                     .iter()
-                    .map(|(value, origin)| (origin, 2, false, Some(*value))),
+                    .map(|(value, origin)| (origin, 2, false, Some(*value), false)),
             )
         {
             let Some(&array) = label_positions.get(&origin.entry) else {
@@ -2527,7 +2543,7 @@ impl LayoutAssembler {
                 let Some(Item::Instruction(current_value)) =
                     begin.checked_sub(1).and_then(|index| self.items.get(index))
                 else {
-                    continue;
+                continue;
                 };
                 if current_value.opcode == super::LOAD_FAST_BORROW {
                     value.opcode = super::LOAD_FAST_BORROW;
@@ -2543,7 +2559,7 @@ impl LayoutAssembler {
                             || provenance.omitted_nop_counts.contains_key(label)
                     })
                 {
-                    continue;
+                continue;
                 }
             }
             if !expected.iter().zip(current).all(|(expected, current)| {
@@ -2566,17 +2582,18 @@ impl LayoutAssembler {
             if first < array {
                 continue;
             }
-            for successor in successors {
+            for (offset, successor) in successors.into_iter().enumerate() {
                 let index = first
                     + expected[..successor]
                         .iter()
                         .filter(|item| matches!(item, Item::Instruction(_)))
                         .count();
                 slots.insert(index, array);
+                if method_cleanup && offset == 0 { method_donors.insert(index + 3, array); }
             }
             aliases.extend(labels);
         }
-        (slots, aliases)
+        (slots, aliases, method_donors)
     }
 
     /// Resolves append slots in the first captured normal-POP instruction array.
@@ -4802,7 +4819,7 @@ impl LayoutAssembler {
         );
         let retained_normal_pop_terminators =
             self.retained_normal_pop_terminators(&jump_targets, &label_positions);
-        let (captured_pop_slots, captured_pop_aliases) =
+        let (captured_pop_slots, captured_pop_aliases, captured_method_donors) =
             self.captured_pop_slots(&jump_targets, &label_positions);
         let original_normal_finally_null_markers =
             self.original_normal_finally_null_markers(&jump_targets);
@@ -4858,6 +4875,8 @@ impl LayoutAssembler {
         let mut ended_pop_slot = None;
         let mut captured_null_slots = Vec::new();
         let mut captured_handler_owner_slots = Vec::new();
+        let mut captured_method_owner_slots = Vec::new();
+        let mut certified_method_markers = FxHashMap::default();
         let mut pending_null_append = None;
         let mut pending_fresh_null_append = None;
         let mut pending_await_null_append = None;
@@ -4884,6 +4903,7 @@ impl LayoutAssembler {
                     if is_join || setup.is_some() || is_source_boundary {
                         captured_null_slots.clear();
                         captured_handler_owner_slots.clear();
+                        captured_method_owner_slots.clear();
                     }
                     let copied_handler_cleanups = if owner_history_exact
                         && !self
@@ -5173,6 +5193,7 @@ impl LayoutAssembler {
                         original_array_start = instruction_index;
                         captured_null_slots.clear();
                         captured_handler_owner_slots.clear();
+                        captured_method_owner_slots.clear();
                         tail = ExceptionOwnerTail::default();
                         late_setup_positions.clear();
                         late_setup_history_known = true;
@@ -5525,6 +5546,7 @@ impl LayoutAssembler {
                     {
                         captured_null_slots.clear();
                         captured_handler_owner_slots.clear();
+                        captured_method_owner_slots.clear();
                     }
                     source_block |= is_source_boundary;
                     if is_boundary && is_source_boundary {
@@ -5973,6 +5995,7 @@ impl LayoutAssembler {
                         ended_pop_slot = None;
                         captured_null_slots.clear();
                         captured_handler_owner_slots.clear();
+                        captured_method_owner_slots.clear();
                         pending_null_append = None;
                         pending_fresh_null_append = None;
                         pending_await_null_append = None;
@@ -6101,6 +6124,51 @@ impl LayoutAssembler {
                             != super::BorrowFallthrough::Barrier
                     {
                         has_uninterrupted_fusion = true;
+                    }
+                    // A source-captured method cleanup retains its final POP_TOP cell.
+                    // Keep its old slot relative to the actual native array, including
+                    // every earlier setup and compaction; authored try labels do not split it.
+                    if instruction.opcode == crate::target::opcodes::POP_TOP
+                        && instruction.operand() == Operand::Value(0)
+                        && owner_history_exact
+                        && pop_slot_epoch_known
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && let Some(receiver) = instruction_index.checked_sub(3)
+                        && captured_method_donors.get(&instruction_index)
+                            == Some(&original_array_start)
+                        && indexed_instructions[receiver]
+                            .local_policy
+                            .hidden_exception_owner_slots()
+                            == 2
+                        && matches!(
+                            indexed_instructions[receiver].opcode,
+                            crate::target::opcodes::LOAD_FAST
+                                | crate::target::opcodes::LOAD_FAST_BORROW
+                        )
+                        && indexed_instructions[receiver + 1].opcode
+                            == crate::target::opcodes::LOAD_ATTR
+                        && matches!(indexed_instructions[receiver + 1].operand(), Operand::Value(argument) if argument & 1 != 0)
+                        && indexed_instructions[receiver + 2].opcode == crate::target::opcodes::CALL
+                        && indexed_instructions[receiver + 2].operand() == Operand::Value(0)
+                        && (receiver..=instruction_index).all(|index| !owners.contains_key(&index))
+                        && let Some(region) = self.uniform_exception_owner(
+                            receiver,
+                            instruction_index + 1,
+                            &label_positions,
+                        )
+                        && !self.exception_regions[region].is_scope_fallback
+                        && !self.exception_regions[region].preserve_lasti
+                        && self.exception_regions[region].depth == 0
+                        && let Some(slot) = instruction_index.checked_add(tail.early_removals)
+                    {
+                        captured_method_owner_slots.push((
+                            original_array_start,
+                            slot,
+                            region,
+                            instruction_index + 2,
+                        ));
                     }
                     let uniform_fold = original_uniform_folds.contains(&instruction_index)
                         || (instruction.local_policy.hidden_exception_owner_slots() > 0
@@ -7324,6 +7392,32 @@ impl LayoutAssembler {
                                 })
                     {
                         owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision::override_with_region(Some(*region)),
+                        );
+                    }
+                    // Exact copied-cleanup donors outrank generic absent-owner guesses.
+                    // Retain the conclusion until those broader rules have finished.
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                        && owner_history_exact
+                        && pop_slot_epoch_known
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && previous.is_some_and(|condition| {
+                            matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                                && matches!(condition.operand(), Operand::Forward(_))
+                        })
+                        && let Some((_, _, region, _)) = captured_method_owner_slots.iter().find(
+                            |(array, slot, _, condition)| {
+                                *array == original_array_start
+                                    && *slot == instruction_index
+                                    && *condition + 1 == instruction_index
+                            },
+                        )
+                    {
+                        certified_method_markers.insert(
                             instruction_index,
                             ExceptionOwnerDecision::override_with_region(Some(*region)),
                         );
@@ -8933,6 +9027,7 @@ impl LayoutAssembler {
                         original_array_start = instruction_index;
                         captured_null_slots.clear();
                         captured_handler_owner_slots.clear();
+                        captured_method_owner_slots.clear();
                         tail = ExceptionOwnerTail::default();
                         has_uninterrupted_fusion = false;
                         late_setup_positions.clear();
@@ -8970,6 +9065,7 @@ impl LayoutAssembler {
         // Replay the exact source certificate after all generic NULL conclusions.
         owners.extend(self.copied_conjunction_break_owners(&label_positions, &jump_targets));
         owners.extend(self.named_handler_truth_owners(&label_positions, &jump_targets));
+        owners.extend(certified_method_markers);
         owners
     }
 

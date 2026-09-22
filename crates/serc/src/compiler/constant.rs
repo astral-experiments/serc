@@ -623,23 +623,16 @@ impl Compiler<'_> {
         }
         self.assembler
             .add_last_constant_fold_slots(hidden_owner_slots);
-        // Literal tuple elements, including prebuilt constant slices, each remove
-        // one load from this owner's block when the tuple is folded.
+        // Recursive literal tuples and prebuilt constant slices fold within the
+        // same original array, so every removed record has the survivor's owner.
         if let Expr::Tuple(tuple) = expression
             && tuple.elts.iter().all(|element| {
-                matches!(
-                    element,
-                    Expr::NoneLiteral(_)
-                        | Expr::BooleanLiteral(_)
-                        | Expr::NumberLiteral(_)
-                        | Expr::StringLiteral(_)
-                        | Expr::BytesLiteral(_)
-                        | Expr::EllipsisLiteral(_)
-                ) || matches!(element, Expr::Slice(slice) if constant_slice(slice).is_some())
+                is_small_literal_tuple_element(element)
+                    || matches!(element, Expr::Slice(slice) if constant_slice(slice).is_some())
             })
         {
             self.assembler
-                .record_last_uniform_fold_owner_slots(tuple.elts.len());
+                .record_last_uniform_fold_owner_slots(hidden_owner_slots);
         } else if matches!(expression, Expr::UnaryOp(unary)
             if unary.op == UnaryOp::USub
                 && matches!(unary.operand.as_ref(), Expr::NumberLiteral(_)))
@@ -1118,6 +1111,19 @@ fn is_literal_binary_tree(expression: &Expr) -> bool {
     match expression {
         Expr::BinOp(binary) => {
             is_literal_binary_tree(&binary.left) && is_literal_binary_tree(&binary.right)
+        }
+        _ => is_literal_constant(expression),
+    }
+}
+
+/// Identifies literal tuple trees whose loads and builds share one original CFG array.
+///
+/// Tuples above the stack-use limit use list append operations instead of `BUILD_TUPLE`.
+/// Nonliteral folds may retain line NOPs or contain control-flow boundaries.
+pub(super) fn is_small_literal_tuple_element(expression: &Expr) -> bool {
+    match expression {
+        Expr::Tuple(tuple) => {
+            tuple.elts.len() <= 30 && tuple.elts.iter().all(is_small_literal_tuple_element)
         }
         _ => is_literal_constant(expression),
     }

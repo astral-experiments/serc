@@ -111,8 +111,9 @@ fn constant_pair_store_tail(items: &[Item]) -> Option<[Instruction; 3]> {
 /// Certifies one complete local-capture cleanup rotation.
 ///
 /// A conditional marker identifies an original block entry with identical pop locations.
-/// After an unpack or pop, all five operations must instead share a line: both replacement
-/// NOPs disappear, and the moved store cannot fuse with either the prefix or trailing pops.
+/// An unpack can instead precede a distinct capture line; its own span must match
+/// the consumers. One capture-line NOP survives that rotation. Same-line cleanups
+/// after an unpack or pop remove both NOPs, with no adjacent local-store fusion.
 fn single_capture_cleanup_vacancies(items: &[Item]) -> Option<usize> {
     let [
         Item::Instruction(marker),
@@ -129,7 +130,10 @@ fn single_capture_cleanup_vacancies(items: &[Item]) -> Option<usize> {
         && [inner, first_pop, last_pop, store]
             .iter()
             .all(|instruction| instruction.location.line == outer.location.line);
-    if (marker.opcode != NOT_TAKEN && !same_line_cleanup)
+    let multiline_unpack_cleanup = marker.opcode == UNPACK_SEQUENCE
+        && marker.operand() == Operand::Value(1)
+        && marker.location == first_pop.location;
+    if (marker.opcode != NOT_TAKEN && !same_line_cleanup && !multiline_unpack_cleanup)
         || outer.opcode != SWAP
         || outer.operand() != Operand::Value(3)
         || inner.opcode != SWAP
@@ -1978,22 +1982,27 @@ impl Assembler {
     /// A final assertion may also enter through a conditional success edge. Every edge
     /// must retain its original source boundary and have no omitted instruction slots.
     pub(crate) fn at_original_shared_handler_join(&self) -> bool {
-        self.original_shared_handler_join(false, false)
+        self.original_shared_handler_join(&[], false)
     }
 
     /// Certifies a guarded finalizer join with one recorded same-line None comparison.
     pub(crate) fn at_original_guarded_finally_handler_join(&self) -> bool {
-        self.original_shared_handler_join(true, false)
+        self.original_shared_handler_join(&[POP_JUMP_IF_NONE], false)
+    }
+
+    /// Certifies a normal coroutine finalizer join with either recorded None-test polarity.
+    pub(crate) fn at_original_coroutine_guarded_finally_handler_join(&self) -> bool {
+        self.original_shared_handler_join(&[POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE], false)
     }
 
     /// Certifies a copied finalizer join that includes an exactly recorded named cleanup.
     pub(crate) fn at_original_shared_finally_iterator_join(&self) -> bool {
-        self.original_shared_handler_join(false, true)
+        self.original_shared_handler_join(&[], true)
     }
 
     fn original_shared_handler_join(
         &self,
-        allow_recorded_none_guard: bool,
+        recorded_none_opcodes: &[Opcode],
         allow_recorded_cleanup: bool,
     ) -> bool {
         let items = self.linear_items();
@@ -2073,9 +2082,8 @@ impl Assembler {
             if instruction.local_policy.hidden_exception_owner_slots() != 0 {
                 // Only the captured LOAD_CONST(None), IS_OP, and TO_BOOL slots may
                 // be absent here. A second guard or an unrelated hidden slot rejects.
-                if !allow_recorded_none_guard
+                if !recorded_none_opcodes.contains(&instruction.opcode)
                     || recorded_none_guard.is_some()
-                    || instruction.opcode != POP_JUMP_IF_NONE
                     || instruction.local_policy.hidden_exception_owner_slots() != 3
                     || self
                         .exception_owner_provenance
@@ -2706,6 +2714,7 @@ impl Assembler {
     /// Resolves pending entries using label groups before any assembler optimization.
     fn resolve_folded_condition_borrow_entries(&mut self) {
         self.resolve_name_return_borrow_exits();
+        self.resolve_noncopyable_borrow_exits();
         if self.deferred_borrow_entries.is_empty() {
             return;
         }
@@ -4653,6 +4662,62 @@ impl Assembler {
         self.emitted_instruction_mut(emitted, "marking a borrow fallthrough barrier")
             .no_location_policy
             .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+    }
+
+    /// Defers a source barrier until its completed target proves too large to copy.
+    pub(crate) fn record_noncopyable_borrow_exit(&mut self, source: EmittedJump) {
+        let original = *self.emitted_jump_mut(source, "recording a pending borrow barrier");
+        self.deferred_noncopyable_borrow_exits
+            .push((source, original));
+    }
+
+    /// Checks the original source edge and a conservative target prefix before optimization.
+    fn resolve_noncopyable_borrow_exits(&mut self) {
+        let pending = std::mem::take(&mut self.deferred_noncopyable_borrow_exits);
+        if pending.is_empty() {
+            return;
+        }
+        let items = self.linear_items();
+        let mut targets = FxHashMap::default();
+        let mut offset = 0;
+        for item in items {
+            match item {
+                Item::Label(label) => {
+                    targets.insert(*label, offset);
+                }
+                Item::Instruction(_) => offset += 1,
+            }
+        }
+        let mut barriers = Vec::new();
+        for (source, original) in pending {
+            let source = source.instruction();
+            if source.stream != self.emission_stream {
+                continue;
+            }
+            let index = usize::try_from(source.item_index).expect("emitted index fits in usize");
+            if !matches!(items.get(index), Some(Item::Instruction(current)) if *current == original)
+            {
+                continue;
+            }
+            let Operand::Forward(target) = original.operand() else {
+                continue;
+            };
+            if original.opcode == JUMP_FORWARD
+                && targets
+                    .get(&target)
+                    .is_some_and(|&start| self.has_large_linear_prefix_since(start))
+            {
+                barriers.push(index);
+            }
+        }
+        for index in barriers {
+            let Item::Instruction(source) = &mut self.linear_items_mut()[index] else {
+                unreachable!("validated source is an instruction");
+            };
+            source
+                .no_location_policy
+                .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+        }
     }
 
     /// Captures the complete normal jump before emission proceeds into its finalizer.
@@ -12194,11 +12259,26 @@ impl Assembler {
         let UnoptimizedCode::Linear(items) = &mut self.code else {
             unreachable!();
         };
+        let next_stream = ir::EmissionStreamId::next();
+        // Removing this later NOP leaves a checked earlier source unchanged. Transfer only
+        // those private deferred origins; public emitted handles still all expire below.
+        self.deferred_noncopyable_borrow_exits.retain_mut(|(source, original)| {
+            let source_index = usize::try_from(source.0.item_index)
+                .expect("emitted instruction index fits in usize");
+            if source.0.stream != self.emission_stream
+                || source_index >= index
+                || !matches!(items.get(source_index), Some(Item::Instruction(current)) if *current == *original)
+            {
+                return false;
+            }
+            source.0.stream = next_stream;
+            true
+        });
         items.remove(index);
         self.instruction_count -= 1;
         // A later emission can reuse the removed item's index. Start a fresh stream so a copied
         // handle to the NOP cannot alias the replacement instruction.
-        self.emission_stream = ir::EmissionStreamId::next();
+        self.emission_stream = next_stream;
         Some(RemovedNop {
             location: instruction.location,
             exclusion,
@@ -12388,6 +12468,155 @@ impl Assembler {
         self.exception_owner_provenance
             .named_handler_truth_prefixes
             .push(origin);
+    }
+
+    /// Captures the two source POPs and intact method cleanup copied by a return.
+    pub(crate) fn record_copied_method_cleanup_pop_span(&mut self, start: usize) {
+        let items = self.linear_items();
+        let Some(entry) = items[..start].iter().rev().find_map(|item| match item {
+            Item::Label(label)
+                if self
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .contains(label)
+                    && self
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .contains(label) =>
+            {
+                Some(*label)
+            }
+            _ => None,
+        }) else {
+            return;
+        };
+        let original = &items[start..];
+        let records = original
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(record) => Some(*record),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let [first, second, receiver, method, call, discard] = records.as_slice() else {
+            return;
+        };
+        if [first, second].iter().any(|pop| {
+            pop.opcode != NOP
+                || pop.operand() != Operand::Value(0)
+                || !pop.fusion_policy.is_converted_pop_block()
+                || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+        }) || receiver.opcode != LOAD_FAST
+            || method.opcode != LOAD_ATTR
+            || !matches!(method.operand(), Operand::Value(argument) if argument & 1 != 0)
+            || call.opcode != crate::target::opcodes::CALL
+            || call.operand() != Operand::Value(0)
+            || discard.opcode != POP_TOP
+            || discard.operand() != Operand::Value(0)
+            || records.iter().any(|record| {
+                record.local_policy.hidden_exception_owner_slots() != 0
+                    || record.pre_fold_extra_instructions() != 0
+                    || record.no_location_policy.borrow_fallthrough()
+                        != BorrowFallthrough::Reachable
+                    || record.jump_policy.borrow_empty_block()
+            })
+            || records[2..]
+                .iter()
+                .any(|record| record.exception_policy() != ExceptionPolicy::NoneUnchanged)
+            || records
+                .iter()
+                .map(Instruction::depth_after)
+                .ne([1, 1, 2, 3, 2, 1].map(Some))
+        {
+            return;
+        }
+        let origin = exception_owners::OriginalPopBlockSpan {
+            entry,
+            items: original.to_vec(),
+        };
+        self.exception_owner_provenance
+            .copied_method_cleanup_pop_spans
+            .push(origin);
+    }
+
+    /// Extends the same copied cleanup through the outer POPs and first None marker.
+    pub(crate) fn extend_copied_method_cleanup_pop_span(&mut self, return_item: usize) {
+        let Some(origin) = self
+            .exception_owner_provenance
+            .copied_method_cleanup_pop_spans
+            .last()
+        else {
+            return;
+        };
+        let items = self.linear_items();
+        let Some(start) = items[return_item..]
+            .iter()
+            .position(|item| Some(item) == origin.items.first())
+            .map(|offset| return_item + offset)
+        else {
+            return;
+        };
+        let Some(end) = items[start..]
+            .iter()
+            .position(|item| {
+                matches!(item,
+            Item::Instruction(instruction) if instruction.opcode == NOT_TAKEN)
+            })
+            .map(|offset| start + offset + 1)
+        else {
+            return;
+        };
+        let prefix = &items[start..end];
+        if !prefix.starts_with(&origin.items) {
+            return;
+        }
+        let suffix = prefix[origin.items.len()..]
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let (pops, tail) = suffix.split_at(suffix.len().saturating_sub(3));
+        let [load, condition, marker] = tail else {
+            return;
+        };
+        if !(1..=2).contains(&pops.len())
+            || pops.iter().any(|pop| {
+                pop.opcode != NOP
+                    || pop.operand() != Operand::Value(0)
+                    || !pop.fusion_policy.is_converted_pop_block()
+                    || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+                    || pop.location != SourceLocation::NONE
+                    || pop.depth_after() != Some(1)
+            })
+            || load.opcode != LOAD_FAST
+            || load.depth_after() != Some(2)
+            || load.exception_policy() != ExceptionPolicy::NoneUnchanged
+            || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.local_policy.hidden_exception_owner_slots() != 3
+            || condition.exception_policy() != ExceptionPolicy::NoneUnchanged
+            || condition.depth_after() != Some(1)
+            || marker.exception_policy() != ExceptionPolicy::NonePresent
+            || marker.depth_after() != Some(1)
+            || suffix.iter().any(|record| {
+                record.pre_fold_extra_instructions() != 0
+                    || record.opcode != condition.opcode
+                        && record.local_policy.hidden_exception_owner_slots() != 0
+                    || record.jump_policy.borrow_empty_block()
+                    || record.no_location_policy.borrow_fallthrough()
+                        != BorrowFallthrough::Reachable
+            })
+        {
+            return;
+        }
+        let prefix = prefix[..prefix.len() - 1].to_vec();
+        self.exception_owner_provenance
+            .copied_method_cleanup_pop_spans
+            .last_mut()
+            .unwrap()
+            .items = prefix;
     }
 
     /// Captures the two original NULL POP records around a saved handler return value.

@@ -446,3 +446,30 @@ fn matches_cpython_mapping_capture_before_try_boundaries() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn folds_single_multiline_mapping_capture_with_one_retained_line() {
+    for pattern in [
+        "{\n        \"key\": captured\n    }",
+        "{\"key\": (\n        captured\n    )}",
+    ] {
+        let matched = format!(
+            "match subject:\n    case {pattern}:\n        if captured is None:\n            consume(None)\n        else:\n            consume(captured)\n    case _:\n        consume(None)\n"
+        );
+        for body in [
+            matched.clone(),
+            format!(
+                "try:\n{}except Error:\n    consume(None)\n",
+                common::indent(&matched)
+            ),
+            format!("try:\n{}finally:\n    finish()\n", common::indent(&matched)),
+            format!("with manager:\n{}", common::indent(&matched)),
+        ] {
+            let source = format!(
+                "def f(subject, consume, manager, finish):\n{}",
+                common::indent(&body)
+            );
+            common::assert_matches_cpython_marshal(&source, "single_multiline_mapping_capture.py");
+        }
+    }
+}

@@ -10,11 +10,34 @@ use crate::assembler::block_graph::{BasicBlockId, BlockGraph, ItemPosition};
 use crate::assembler::exception_owners::ExceptionOwnerProvenance;
 use crate::target::opcodes::{
     BUILD_TUPLE, CALL, CALL_KW, DELETE_FAST, END_ASYNC_FOR, END_SEND, FOR_ITER, LOAD_CONST,
-    LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL, NOP, NOT_TAKEN, POP_EXCEPT, POP_JUMP_IF_FALSE,
-    POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP, RAISE_VARARGS, RERAISE,
-    RETURN_VALUE, STORE_ATTR, STORE_FAST, SWAP,
+    LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL, LOAD_SMALL_INT, NOP, NOT_TAKEN, POP_EXCEPT,
+    POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP,
+    RAISE_VARARGS, RERAISE, RETURN_VALUE, STORE_ATTR, STORE_FAST, SWAP,
 };
 use crate::target::{is_conditional_jump, is_unconditional_jump};
+
+/// Recognizes a located attribute assignment with exactly four original copy slots.
+fn is_four_slot_attribute_store_jump(items: &[Item]) -> bool {
+    let Some(first) = items
+        .iter()
+        .position(|item| matches!(item, Item::Instruction(_)))
+    else {
+        return false;
+    };
+    matches!(
+        &items[first..],
+        [Item::Instruction(value), Item::Instruction(object), Item::Instruction(store), Item::Instruction(jump)]
+            if matches!(value.opcode, LOAD_CONST | LOAD_SMALL_INT)
+                && object.opcode == LOAD_FAST
+                && store.opcode == STORE_ATTR
+                && jump.opcode == JUMP_FORWARD
+                && [value, object, store, jump].iter().all(|instruction| {
+                    instruction.location.line >= 0
+                        && instruction.pre_fold_extra_instructions() == 0
+                        && instruction.local_policy.hidden_exception_owner_slots() == 0
+                })
+    )
+}
 
 /// Retains exactly the incoming-edge information used by original-line propagation.
 #[derive(Clone, Copy)]
@@ -2175,6 +2198,15 @@ impl OptimizationPipeline {
             else {
                 continue;
             };
+            let authored_nop_predecessor =
+                self.graph[source]
+                    .last_instruction()
+                    .is_some_and(|instruction| {
+                        instruction.opcode == NOP
+                            && instruction.location.line >= 0
+                            && !instruction.fusion_policy.is_converted_pop_block()
+                            && instruction.exception_policy() == ExceptionPolicy::default()
+                    });
             for target in fallthrough.into_iter().chain(jump_target) {
                 if predecessors[target.index()] != 1 {
                     continue;
@@ -2185,6 +2217,13 @@ impl OptimizationPipeline {
                 if first.location.line >= 0
                     || first.no_location_policy.percent_target_location != u8::MAX
                 {
+                    continue;
+                }
+                if authored_nop_predecessor && fallthrough == Some(target) {
+                    // Native line propagation gives the synthesized literal its preceding
+                    // authored NOP's span before equal-next-line NOP compaction.
+                    first.location = location;
+                    first.no_location_policy.percent_target_location = 0;
                     continue;
                 }
                 let Ok(id) = u8::try_from(locations.len() + 1) else {
@@ -4977,6 +5016,7 @@ impl OptimizationPipeline {
                         (RETURN_VALUE, Operand::Value(0)),
                     ]);
             if exit_without_unique_predecessor[target.index()]
+                && !self.exception_regions.is_empty()
                 && !split_iterator_return
                 && target_pre_fusion_size > 4
                 && !target_blocks.iter().any(|block| {
@@ -4998,8 +5038,9 @@ impl OptimizationPipeline {
                 // CPython's second exit-duplication pass runs after cold blocks move. For a
                 // large class footer shared by warm and cold jumps, that makes the cold, later
                 // predecessor receive the copy while the warm predecessor keeps the original.
-                // Exception cleanup exits are copied before that relocation and retain the
-                // original predecessor order, even when clearing a name makes the exit large.
+                // Without exception regions there are no cold blocks to reorder, so ordinary
+                // class predecessors retain native copying order. Exception cleanup exits are
+                // also copied before relocation, even when clearing a name makes them large.
                 continue;
             }
             // An omitted authored NOP entry is distinct from a later aliased jump head.
@@ -5839,6 +5880,17 @@ impl OptimizationPipeline {
                 }
                 copied.insert(position, Item::Instruction(marker));
             }
+            let inline_reraising_attribute_store = matches!(
+                self.python_version,
+                crate::PythonVersion::Py314 | crate::PythonVersion::Py315
+            ) && inline_small_exit
+                && target_terminal_opcode == Some(RERAISE)
+                && target_pre_fusion_size == 1
+                && target_chain_end == target_position
+                && graph[target].last_instruction().is_some_and(|instruction| {
+                    instruction.location.line < 0 && instruction.operand() == Operand::Value(0)
+                })
+                && is_four_slot_attribute_store_jump(graph[source].items());
             let inline_reraising_iterator_break = self.python_version
                 == crate::PythonVersion::Py315
                 && inline_small_exit
@@ -5858,7 +5910,8 @@ impl OptimizationPipeline {
                     .eq([NOP, POP_TOP, POP_TOP, JUMP_FORWARD]);
             if (inline_unprotected_return
                 || inline_unprotected_raise
-                || inline_reraising_iterator_break)
+                || inline_reraising_iterator_break
+                || inline_reraising_attribute_store)
                 && !planned_copy
                 && let Some(instruction) = copied.iter_mut().find_map(|item| match item {
                     Item::Instruction(instruction) => Some(instruction),
@@ -5867,8 +5920,9 @@ impl OptimizationPipeline {
             {
                 // CPython retains the replaced jump and any jumps bypassed by our earlier
                 // threading as NOPs until after the repeated small-exit copy pass. A 3.15
-                // iterator break's marker and two POPs then make its copied RERAISE
-                // five original slots, preventing another small-exit copy.
+                // iterator break's marker and two POPs, or a located three-operation
+                // attribute store, then make its copied RERAISE five original slots,
+                // preventing another small-exit copy.
                 let jump_extra = graph[source]
                     .last_instruction()
                     .map_or(0, Instruction::pre_fold_extra_instructions);
