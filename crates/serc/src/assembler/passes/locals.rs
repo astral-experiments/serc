@@ -32,6 +32,8 @@ use crate::target::{
     },
 };
 
+pub(in crate::assembler) type LocalNopDonors = FxHashSet<(i32, i32, i32, i32)>;
+
 /// Original block entries retained for CPython's final borrowing traversal.
 #[derive(Clone, Copy)]
 pub(in crate::assembler) struct BorrowEntryLabels<'a> {
@@ -2356,6 +2358,72 @@ impl OptimizationPipeline {
         }
     }
 
+    /// Records authored NOP donors before cleanup copying can collapse their arrays.
+    pub(in crate::assembler) fn capture_local_nop_donors(&self) -> LocalNopDonors {
+        let mut donors = LocalNopDonors::default();
+        if self.exception_regions.is_empty() || !self.graph.features().has_fast_load() {
+            return donors;
+        }
+        let mut boundaries = self.exception_owner_provenance.block_boundaries.clone();
+        boundaries.extend(self.exception_regions.iter().map(|region| region.target));
+        boundaries.extend(self.graph.iter_items().filter_map(|item| match item {
+            Item::Instruction(instruction) => match instruction.operand() {
+                Operand::Forward(label) | Operand::Backward(label) => Some(label),
+                Operand::Value(_) | Operand::Deferred(_) => None,
+            },
+            Item::Label(_) => None,
+        }));
+        let mut other_occurrences = LocalNopDonors::default();
+        let mut previous: Option<(Instruction, bool)> = None;
+        for item in self.graph.iter_items() {
+            let Item::Instruction(instruction) = item else {
+                if let Item::Label(label) = item
+                    && boundaries.contains(label)
+                    && let Some((_, crossed_boundary)) = &mut previous
+                {
+                    *crossed_boundary = true;
+                }
+                continue;
+            };
+            if let Some((donor, crossed_boundary)) = previous {
+                let location = donor.location;
+                let key = (
+                    location.line,
+                    location.end_line,
+                    location.column,
+                    location.end_column,
+                );
+                if instruction.opcode == NOP
+                    && instruction.fusion_policy.is_converted_pop_block()
+                    && (instruction.location.line == location.line
+                        || (instruction.location.line < 0 && !crossed_boundary))
+                {
+                    donors.insert(key);
+                } else {
+                    other_occurrences.insert(key);
+                }
+            }
+            previous = (instruction.opcode == NOP
+                && instruction.location.line >= 0
+                && !instruction.fusion_policy.is_converted_pop_block()
+                && !instruction.jump_policy.always_retains_nop()
+                && !instruction.jump_policy.preserves_explicit_nop()
+                && !instruction.jump_policy.borrow_empty_block())
+            .then_some((*instruction, false));
+        }
+        if let Some((donor, _)) = previous {
+            let location = donor.location;
+            other_occurrences.insert((
+                location.line,
+                location.end_line,
+                location.column,
+                location.end_column,
+            ));
+        }
+        donors.retain(|location| !other_occurrences.contains(location));
+        donors
+    }
+
     /// Converts potentially uninitialized local loads to checked loads.
     ///
     /// Mirrors CPython's `add_checks_for_loads_of_uninitialized_variables`
@@ -2365,8 +2433,14 @@ impl OptimizationPipeline {
         &mut self,
         local_count: usize,
         parameter_count: usize,
+        nop_donors: &LocalNopDonors,
     ) {
-        self.add_checks_for_uninitialized_loads_in_arrays(local_count, parameter_count, None);
+        self.add_checks_for_uninitialized_loads_in_arrays(
+            local_count,
+            parameter_count,
+            None,
+            Some(nop_donors),
+        );
     }
 
     /// Keeps legacy high-local checks scoped to instruction arrays captured before folding.
@@ -2380,6 +2454,7 @@ impl OptimizationPipeline {
             local_count,
             parameter_count,
             Some(original_arrays),
+            None,
         );
     }
 
@@ -2388,6 +2463,7 @@ impl OptimizationPipeline {
         local_count: usize,
         parameter_count: usize,
         original_arrays: Option<&FxHashMap<BasicBlockId, usize>>,
+        nop_donors: Option<&LocalNopDonors>,
     ) {
         if local_count == 0 {
             return;
@@ -2519,6 +2595,44 @@ impl OptimizationPipeline {
             exception_successors[start..start + span].fill(Some(target));
         }
 
+        // Native local analysis follows NOP compaction. Ownerless setup/POP
+        // records cannot transmit uncertainty through a physical enclosing range.
+        if self.python_version >= crate::PythonVersion::Py314 && !self.exception_regions.is_empty()
+        {
+            let mut previous_nop: Option<(usize, crate::assembler::SourceLocation)> = None;
+            for (index, item) in graph.iter_items().enumerate() {
+                let Item::Instruction(instruction) = item else {
+                    continue;
+                };
+                if instruction.opcode == NOP {
+                    if instruction.exception_policy().exclusion()
+                        == super::super::ExceptionExclusion::Always
+                    {
+                        exception_successors[index] = None;
+                    }
+                    if instruction.fusion_policy.is_converted_pop_block()
+                        && let Some((previous, location)) = previous_nop
+                        && location.line == instruction.location.line
+                        && nop_donors.is_some_and(|donors| {
+                            donors.contains(&(
+                                location.line,
+                                location.end_line,
+                                location.column,
+                                location.end_column,
+                            ))
+                        })
+                    {
+                        exception_successors[previous] = None;
+                    }
+                }
+                previous_nop = (instruction.opcode == NOP
+                    && instruction.location.line >= 0
+                    && !instruction.jump_policy.always_retains_nop()
+                    && !instruction.jump_policy.preserves_explicit_nop()
+                    && !instruction.jump_policy.borrow_empty_block())
+                .then_some((index, instruction.location));
+            }
+        }
         let initialized = parameter_count.min(local_count).min(64);
         let mut unsafe_at_entry = vec![0_u64; order.len()];
         unsafe_at_entry[0] = u64::MAX

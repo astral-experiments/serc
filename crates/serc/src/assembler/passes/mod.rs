@@ -577,6 +577,7 @@ impl OptimizationPipeline {
                 constants,
             );
         }
+        let local_nop_donors = self.capture_local_nop_donors();
         let reversed_store_handler_exits = self.capture_reversed_store_handler_exits();
         self.preserve_shared_original_manager_pop_locations();
         self.record_shared_unlocated_jump_entries();
@@ -902,7 +903,11 @@ impl OptimizationPipeline {
         if assertion_side_exits {
             self.add_checks_for_assertion_side_exits(local_count, parameter_count);
         } else {
-            self.add_checks_for_uninitialized_loads(local_count, parameter_count);
+            self.add_checks_for_uninitialized_loads(
+                local_count,
+                parameter_count,
+                &local_nop_donors,
+            );
         }
         original_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
