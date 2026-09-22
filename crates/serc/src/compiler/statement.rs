@@ -3717,14 +3717,8 @@ impl Compiler<'_> {
             self.assembler.set_location(SourceLocation::NONE);
         }
         let body_entry = self.emit_jump_forward_instruction(JUMP_FORWARD, body)?;
-        if matches!(
-            statement.body.last(),
-            Some(Stmt::Return(return_statement))
-                if return_statement.value.as_deref().is_none_or(|value| {
-                    matches!(value, Expr::Name(_)) || is_literal_constant(value)
-                })
-        ) {
-            // A simple final return does not make the whole body a small exit. Keep
+        if matches!(statement.body.last(), Some(Stmt::Return(_))) {
+            // A final return does not make the whole body a small exit. Keep
             // the original jump/cleanup/body order and let the assembler count every
             // original body record against CPython's four-instruction copy limit.
             // Only a completed small-exit copy retains this comparison jump as a NOP.

@@ -467,6 +467,23 @@ impl Compiler<'_> {
         )
     }
 
+    /// Keeps a returning case's comparison bridge eligible for original-budget exit copying.
+    fn compile_match_guard(
+        &mut self,
+        guard: &Expr,
+        body: &[Stmt],
+        otherwise: Label,
+    ) -> Result<(), CompileError> {
+        let retained_exit = matches!(body.last(), Some(Stmt::Return(_)))
+            .then(|| final_chained_comparison_jump(guard))
+            .flatten();
+        self.with_control_override(
+            |control| &mut control.conditions.retained_chained_comparison_exit,
+            retained_exit,
+            |compiler| compiler.compile_jump_if(guard, false, otherwise),
+        )
+    }
+
     pub(super) fn compile_match_inner(
         &mut self,
         statement: &ruff_python_ast::StmtMatch,
@@ -634,7 +651,14 @@ impl Compiler<'_> {
                             .set_location(self.source_location(case.pattern.range()));
                         self.emit(NOP, 0, 0)?;
                     }
-                    self.compile_jump_if(guard, false, context.fail_pop[0])?;
+                    if copied_subject {
+                        // A copied subject begins the return with NEXT_LOCATION. Keep
+                        // its existing bridge policy until exit copying also models
+                        // the replaced jump's location transfer onto that subject pop.
+                        self.compile_jump_if(guard, false, context.fail_pop[0])?;
+                    } else {
+                        self.compile_match_guard(guard, &case.body, context.fail_pop[0])?;
+                    }
                 }
             }
             if !guard_always_false {
@@ -1102,7 +1126,7 @@ impl Compiler<'_> {
                     // the copy inherits its span, rather than the wildcard NOP's span.
                     self.assembler.defer_jump_removal(exit);
                 } else {
-                    self.compile_jump_if(guard, false, end)?;
+                    self.compile_match_guard(guard, &case.body, end)?;
                 }
                 failure_reaches_end = true;
             }
