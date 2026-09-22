@@ -1182,6 +1182,7 @@ impl<'source> Compiler<'source> {
             marshal_provenance: MarshalProvenance {
                 assembly_order: None,
                 interning_events: Vec::new(),
+                interned_metadata_tuples: Vec::new(),
                 locals_identity: if self.unit.annotation_thunk {
                     LocalsIdentity::Fresh
                 } else {
@@ -1207,6 +1208,8 @@ impl<'source> Compiler<'source> {
         code.marshal_provenance.assembly_order = self.context.record_code_assembly(&code);
         if matches!(self.unit.scope, Scope::Module) {
             code.marshal_provenance.interning_events = self.context.take_interning_events();
+            code.marshal_provenance.interned_metadata_tuples =
+                self.context.take_interned_metadata_tuples();
         }
         Ok(code)
     }

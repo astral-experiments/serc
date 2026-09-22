@@ -216,6 +216,9 @@ impl<'a> ObjectGraph<'a> {
     ) -> Self {
         let mut explicitly_interned = FxHashSet::default();
         let mut metadata_tuples = FxHashSet::default();
+        for values in &code.marshal_provenance.interned_metadata_tuples {
+            metadata_tuples.insert(strings_tuple_key(values).into());
+        }
         let frozenset_recreation_need = collect_explicitly_interned(
             code,
             python_version,

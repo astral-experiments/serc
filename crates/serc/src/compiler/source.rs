@@ -109,6 +109,8 @@ pub(super) struct CompilationContext<'source> {
     // Class qualified-name and synthesized character identity depend on the first cache admission,
     // even when that constant or the defining class is later removed as unreachable.
     constant_origins: Option<RefCell<ConstantOrigins>>,
+    // Discarded code can intern an equal literal tuple without interning standalone literals.
+    interned_metadata_tuples: Option<RefCell<Vec<Vec<String>>>>,
     static_attribute_names: FxHashSet<String>,
     active_class_static_attributes: RefCell<Vec<BTreeSet<String>>>,
     cached_static_attribute_tuples: RefCell<FxHashSet<Vec<String>>>,
@@ -176,6 +178,10 @@ impl<'source> CompilationContext<'source> {
                 ..ConstantOrigins::default()
             })
         });
+        let interned_metadata_tuples = constant_string_origins
+            .keys()
+            .any(|name| !name.is_ascii())
+            .then(RefCell::default);
         Self {
             python_version,
             filename: filename.to_string(),
@@ -185,6 +191,7 @@ impl<'source> CompilationContext<'source> {
             scopes,
             constant_string_origins,
             constant_origins,
+            interned_metadata_tuples,
             static_attribute_names,
             active_class_static_attributes: RefCell::default(),
             cached_static_attribute_tuples: RefCell::new(FxHashSet::default()),
@@ -386,6 +393,18 @@ impl<'source> CompilationContext<'source> {
     }
 
     pub(super) fn record_code_assembly(&self, code: &CodeObject) -> Option<usize> {
+        if let Some(tuples) = &self.interned_metadata_tuples {
+            let mut tuples = tuples.borrow_mut();
+            if code.names.iter().any(|name| !name.is_ascii()) {
+                tuples.push(code.names.clone());
+            }
+            if code.marshal_provenance.locals_identity
+                == crate::code_object::LocalsIdentity::ByValue
+                && code.locals.iter().any(|name| !name.is_ascii())
+            {
+                tuples.push(code.locals.clone());
+            }
+        }
         if let Some(origins) = &self.constant_origins {
             let mut origins = origins.borrow_mut();
             origins.record_code_assembly(code);
@@ -427,6 +446,12 @@ impl<'source> CompilationContext<'source> {
         self.interning_events.take()
     }
 
+    pub(super) fn take_interned_metadata_tuples(&self) -> Vec<Vec<String>> {
+        self.interned_metadata_tuples
+            .as_ref()
+            .map_or_else(Vec::new, RefCell::take)
+    }
+
     pub(super) fn has_tracked_string_origins(&self) -> bool {
         !self.constant_string_origins.is_empty() || self.tracks_constant_origins()
     }
@@ -439,6 +464,7 @@ impl<'source> CompilationContext<'source> {
         self.requires_interning_trace
             || self.tracks_constant_origins()
             || !self.active_class_static_attributes.borrow().is_empty()
+            || self.interned_metadata_tuples.is_some()
     }
 
     /// Records the class body's actual qualified-name constant admission.
