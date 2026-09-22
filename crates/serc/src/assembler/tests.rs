@@ -2253,6 +2253,276 @@ fn mapping_capture_rotations_require_complete_unchanged_same_line_shapes() {
 }
 
 #[test]
+fn while_else_conjunction_footer_requires_exact_ordered_failure_edges() {
+    let failure = super::Label(0);
+    let end = super::Label(1);
+    let first_location = SourceLocation::new(10, 10, 15, 20);
+    let second_location = SourceLocation::new(11, 11, 19, 24);
+    let conditions = [
+        (first_location, POP_JUMP_IF_FALSE),
+        (second_location, POP_JUMP_IF_TRUE),
+    ];
+    let mut break_jump = Instruction::new(
+        JUMP_FORWARD,
+        Operand::Forward(end),
+        SourceLocation::new(6, 6, 12, 17),
+        Some(0),
+    );
+    break_jump.fusion_policy.mark_authored_break();
+    break_jump.jump_policy.prevent_threading_target();
+    break_jump.jump_policy.retain_nop_for_direct_target();
+    break_jump.add_pre_fold_extra_instructions(1);
+    let first = Instruction::new(
+        POP_JUMP_IF_FALSE,
+        Operand::Forward(failure),
+        first_location,
+        Some(0),
+    );
+    let second = Instruction::new(
+        POP_JUMP_IF_TRUE,
+        Operand::Forward(failure),
+        second_location,
+        Some(0),
+    );
+    for mutation in [
+        "original",
+        "swapped conditions",
+        "wrong polarity",
+        "missing condition",
+        "extra condition",
+        "foreign jump",
+        "shared break target",
+        "second break",
+        "condition depth",
+        "hidden condition slot",
+        "condition location policy",
+        "condition owner",
+        "condition jump policy",
+        "condition fusion policy",
+        "condition early admission",
+        "footer owner",
+        "break policy",
+        "folded target",
+        "missing original boundary",
+        "extra footer alias",
+        "singleton",
+        "singleton foreign policies",
+    ] {
+        let mut changed = second;
+        match mutation {
+            "wrong polarity" => changed.opcode = POP_JUMP_IF_FALSE,
+            "shared break target" => changed.set_operand(Operand::Forward(end)),
+            "condition depth" => {
+                changed =
+                    Instruction::new(second.opcode, second.operand(), second.location, Some(1));
+            }
+            "hidden condition slot" => changed.local_policy.add_hidden_exception_owner_slots(1),
+            "condition location policy" => changed.no_location_policy.preserve_location(),
+            "condition owner" => changed.set_exception_owner(NormalizedExceptionOwner::Absent),
+            "condition jump policy" => changed.jump_policy.prevent_threading_target(),
+            "condition fusion policy" => {
+                changed.fusion_policy.allow_transitive_small_exit_inlining();
+            }
+            "condition early admission" => changed.early_boolean_admissions.append(true),
+            _ => {}
+        }
+        let mut items = vec![
+            Item::Instruction(break_jump),
+            Item::Instruction(first),
+            Item::Instruction(changed),
+            Item::Instruction(Instruction::new(
+                POP_TOP,
+                Operand::Value(0),
+                SourceLocation::new(12, 12, 12, 19),
+                Some(0),
+            )),
+            Item::Label(failure),
+            Item::Label(end),
+        ];
+        if matches!(mutation, "break policy" | "singleton foreign policies") {
+            let Item::Instruction(jump) = &mut items[0] else {
+                unreachable!()
+            };
+            jump.jump_policy.defer_removal();
+        }
+        if matches!(mutation, "footer owner" | "singleton foreign policies") {
+            let Item::Instruction(pop) = &mut items[3] else {
+                unreachable!()
+            };
+            pop.set_exception_owner(NormalizedExceptionOwner::Absent);
+        }
+        if mutation == "singleton foreign policies" {
+            let Item::Instruction(condition) = &mut items[1] else {
+                unreachable!()
+            };
+            condition.set_exception_owner(NormalizedExceptionOwner::Absent);
+            condition.early_boolean_admissions.append(true);
+        }
+        match mutation {
+            "swapped conditions" => items.swap(1, 2),
+            "missing condition" | "singleton" | "singleton foreign policies" => {
+                items.remove(2);
+            }
+            "extra condition" => items.insert(3, Item::Instruction(second)),
+            "foreign jump" => items.insert(
+                3,
+                Item::Instruction(Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(failure),
+                    second_location,
+                    Some(0),
+                )),
+            ),
+            "second break" => items.insert(1, Item::Instruction(break_jump)),
+            "extra footer alias" => items.push(Item::Label(super::Label(2))),
+            _ => {}
+        }
+        let mut assembler = Assembler::from_linear_items(items);
+        assembler.record_exception_owner_block_boundary(failure);
+        if mutation == "folded target" {
+            assembler.folded_away_condition_targets.insert(failure);
+        } else if mutation == "missing original boundary" {
+            assembler
+                .exception_owner_provenance
+                .source_boundaries
+                .remove(&failure);
+        }
+        let original_items = assembler.linear_items().to_vec();
+        assert_eq!(
+            assembler.at_original_while_else_break_conjunction_join(&conditions),
+            mutation == "original",
+            "{mutation}",
+        );
+        if matches!(mutation, "singleton" | "singleton foreign policies") {
+            assert!(assembler.at_original_while_else_break_join(first_location));
+        }
+        assert_eq!(assembler.linear_items(), original_items, "{mutation}");
+    }
+}
+
+#[test]
+fn class_failure_return_join_requires_original_pop_and_class_edges() {
+    for mutation in [
+        "intact",
+        "legacy",
+        "extra join edge",
+        "wrong condition",
+        "missing class fold slots",
+        "foreign pop owner",
+        "wrong pop depth",
+        "extra alias",
+        "missing match boundary",
+        "omitted join nop",
+        "extra class edge",
+        "reversed patterns",
+        "foreign exit owner",
+    ] {
+        let mut assembler = Assembler::with_python_version(if mutation == "legacy" {
+            crate::PythonVersion::Py313
+        } else {
+            crate::PythonVersion::Py314
+        });
+        let failure = assembler.label();
+        let zero_pop = assembler.label();
+        let end = assembler.label();
+        let target = assembler.label();
+        let mut patterns = vec![
+            (SourceLocation::new(3, 3, 13, 36), 0),
+            (SourceLocation::new(3, 3, 26, 35), 0),
+        ];
+        if mutation == "extra join edge" {
+            assembler.set_location(patterns[0].0);
+            assembler.emit_forward_with_depth(
+                POP_JUMP_IF_FALSE,
+                zero_pop,
+                0,
+                ExceptionPolicy::default(),
+            );
+        }
+        for &(location, positional) in &patterns {
+            assembler.set_location(location);
+            assembler.emit_with_depth(MATCH_CLASS, positional, 1, ExceptionPolicy::default());
+            assembler.emit_with_depth(COPY, 1, 2, ExceptionPolicy::default());
+            if mutation != "missing class fold slots" {
+                assembler.add_last_hidden_exception_owner_slots(2);
+            }
+            assembler.emit_forward_with_depth(
+                if mutation == "wrong condition" {
+                    POP_JUMP_IF_FALSE
+                } else {
+                    POP_JUMP_IF_NONE
+                },
+                failure,
+                1,
+                ExceptionPolicy::default(),
+            );
+            assembler.emit_with_depth(NOT_TAKEN, 0, 1, ExceptionPolicy::default());
+        }
+        if mutation == "extra class edge" {
+            assembler.emit_forward_with_depth(
+                POP_JUMP_IF_NONE,
+                failure,
+                1,
+                ExceptionPolicy::default(),
+            );
+        }
+        assembler.set_location(SourceLocation::new(4, 4, 19, 23));
+        assembler.emit_with_depth(RETURN_VALUE, 0, 0, ExceptionPolicy::default());
+        assembler.mark(failure);
+        assembler.set_location(patterns[0].0);
+        assembler.emit_with_depth(
+            POP_TOP,
+            0,
+            u32::from(mutation == "wrong pop depth"),
+            if mutation == "foreign pop owner" {
+                ExceptionPolicy::EXCLUDE_ALWAYS
+            } else {
+                ExceptionPolicy::default()
+            },
+        );
+        assembler.mark(zero_pop);
+        if mutation == "extra alias" {
+            let extra = assembler.label();
+            assembler.mark(extra);
+        }
+        if mutation == "missing match boundary" {
+            assembler.mark(end);
+        } else {
+            assembler.mark_original_match_join(end);
+        }
+        if mutation == "omitted join nop" {
+            assembler
+                .exception_owner_provenance
+                .omitted_nop_counts
+                .insert(end, 1);
+        }
+        let exit = assembler.emit_forward_with_depth(
+            JUMP_FORWARD,
+            target,
+            0,
+            if mutation == "foreign exit owner" {
+                ExceptionPolicy::EXCLUDE_ALWAYS
+            } else {
+                ExceptionPolicy::default()
+            },
+        );
+        if mutation == "reversed patterns" {
+            patterns.reverse();
+        }
+        let original = assembler.linear_items().to_vec();
+        assembler.preserve_class_match_failure_return_join(exit, &patterns);
+        if mutation == "intact" {
+            let jump = assembler.emitted_jump_mut(exit, "checking certified failure exit");
+            assert!(jump.jump_policy.is_original_empty_join());
+            assert!(jump.jump_policy.preserves_nop_after_threading());
+            assert_eq!(assembler.linear_items().len(), original.len());
+        } else {
+            assert_eq!(assembler.linear_items(), original, "{mutation}");
+        }
+    }
+}
+
+#[test]
 fn shared_match_failure_join_requires_original_aliases_and_equal_depths() {
     let failure = super::Label(0);
     let end = super::Label(1);

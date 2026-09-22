@@ -3253,16 +3253,66 @@ impl Compiler<'_> {
         let Some(Stmt::If(tail)) = statement.orelse.last() else {
             return false;
         };
-        condition_has_only_runtime_tests(&statement.test)
+        if !(condition_has_only_runtime_tests(&statement.test)
             && suite_contains_loop_break(&statement.body)
             && !suite_contains_nested_exception_cleanup(&statement.body)
             && !suite_contains_nested_exception_cleanup(&statement.orelse)
             && tail.elif_else_clauses.is_empty()
             && condition_has_only_runtime_tests(&tail.test)
-            && suite_has_linear_borrow_fallthrough(&tail.body)
-            && self.assembler.at_original_while_else_break_join(
-                self.source_location(condition_fallthrough_range(&tail.test)),
-            )
+            && suite_has_linear_borrow_fallthrough(&tail.body))
+        {
+            return false;
+        }
+        if self.assembler.at_original_while_else_break_join(
+            self.source_location(condition_fallthrough_range(&tail.test)),
+        ) {
+            return true;
+        }
+        if self.context.python_version < crate::PythonVersion::Py314 {
+            return false;
+        }
+        let Expr::BoolOp(boolean) = tail.test.as_ref() else {
+            return false;
+        };
+        if boolean.op != BoolOp::And || boolean.values.len() < 2 {
+            return false;
+        }
+        // Native sends each AND operand to the same empty exit, retaining that
+        // operand's span and polarity. Internal branches have separate original
+        // joins and cannot be certified by this one-edge-per-operand sequence.
+        let mut conditions = Vec::with_capacity(boolean.values.len());
+        for value in &boolean.values {
+            if expression_contains_inline_branch(value) {
+                return false;
+            }
+            let mut value = value;
+            let mut jump_on = false;
+            while let Expr::UnaryOp(unary) = value {
+                if unary.op != UnaryOp::Not {
+                    break;
+                }
+                value = &unary.operand;
+                jump_on = !jump_on;
+            }
+            let opcode = if let Expr::Compare(comparison) = value
+                && comparison.ops.len() == 1
+                && matches!(comparison.comparators[0], Expr::NoneLiteral(_))
+                && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
+            {
+                if jump_on == (comparison.ops[0] == CmpOp::Is) {
+                    POP_JUMP_IF_NONE
+                } else {
+                    POP_JUMP_IF_NOT_NONE
+                }
+            } else if jump_on {
+                POP_JUMP_IF_TRUE
+            } else {
+                POP_JUMP_IF_FALSE
+            };
+            conditions.push((self.source_location(value.range()), opcode));
+        }
+        self.assembler
+            .at_original_while_else_break_conjunction_join(&conditions)
     }
 
     fn compile_terminal_if(
@@ -12769,6 +12819,28 @@ impl Compiler<'_> {
                         } else {
                             self.assembler.preserve_direct_inlined_jump_nop(branch_exit);
                         }
+                    } else if branch_index == 0
+                        && self
+                            .control
+                            .statements
+                            .current_statement_followed_by_literal_return
+                        && self.can_descend_match_tail_wrappers()
+                        && self
+                            .control
+                            .finally
+                            .active_pass_finally_locations
+                            .is_empty()
+                        && condition_has_only_runtime_tests(&statement.test)
+                        && let Some(patterns) = single_pop_class_match_return_patterns(body)
+                    {
+                        // The final class failure POP falls into a distinct original
+                        // match-end array before this small return is copied onto it.
+                        let patterns = patterns
+                            .into_iter()
+                            .map(|(range, positional)| (self.source_location(range), positional))
+                            .collect::<Vec<_>>();
+                        self.assembler
+                            .preserve_class_match_failure_return_join(branch_exit, &patterns);
                     } else if ((branch_index == 0
                         && self
                             .control
@@ -36373,6 +36445,42 @@ fn suite_has_shared_guarded_match_failure(body: &[Stmt]) -> bool {
             matches!(guard, Expr::Name(_)) && early_condition_truthiness(guard).is_none()
         })
         && matches!(case.body.as_slice(), [Stmt::Assign(_) | Stmt::Expr(_)])
+}
+
+/// Finds a returning class-pattern chain whose failures all discard one subject.
+fn single_pop_class_match_return_patterns(body: &[Stmt]) -> Option<Vec<(TextRange, u32)>> {
+    let Stmt::Match(statement) = body.last()? else {
+        return None;
+    };
+    let [case] = statement.cases.as_slice() else {
+        return None;
+    };
+    if case.guard.is_some() || !matches!(case.body.as_slice(), [Stmt::Return(_)]) {
+        return None;
+    }
+    let mut pattern = &case.pattern;
+    let mut patterns = Vec::new();
+    loop {
+        let Pattern::MatchClass(class) = pattern else {
+            return None;
+        };
+        if expression_contains_inline_branch(&class.cls) {
+            return None;
+        }
+        patterns.push((
+            class.range,
+            u32::try_from(class.arguments.patterns.len()).ok()?,
+        ));
+        pattern = match (
+            class.arguments.patterns.as_slice(),
+            class.arguments.keywords.as_slice(),
+        ) {
+            ([], []) => return Some(patterns),
+            ([child], []) => child,
+            ([], [keyword]) => &keyword.pattern,
+            _ => return None,
+        };
+    }
 }
 
 // Once case-success exits have been copied, the last refutable pattern is the
