@@ -1655,7 +1655,7 @@ fn parse_percent_format(
 }
 
 pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
-    fold_constant_with_literals(expression, &literal_constant)
+    fold_constant_with_literals(expression, PythonVersion::Py314, &literal_constant)
 }
 
 /// Folds the same expression shapes using source-aware literal values when supplied.
@@ -1665,6 +1665,7 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
 )]
 pub(super) fn fold_constant_with_literals(
     expression: &Expr,
+    python_version: PythonVersion,
     literal: &impl Fn(&Expr) -> Option<Constant>,
 ) -> Option<Constant> {
     if let Some(constant) = literal(expression) {
@@ -1694,35 +1695,37 @@ pub(super) fn fold_constant_with_literals(
         Expr::Tuple(tuple) if tuple.ctx == ExprContext::Load => tuple
             .elts
             .iter()
-            .map(|value| fold_constant_with_literals(value, literal))
+            .map(|value| fold_constant_with_literals(value, python_version, literal))
             .collect::<Option<Vec<_>>>()
             .map(Constant::Tuple),
         Expr::Subscript(subscript) if subscript.ctx == ExprContext::Load => {
-            fold_literal_subscript(&subscript.value, &subscript.slice, literal)
+            fold_literal_subscript(&subscript.value, &subscript.slice, python_version, literal)
         }
         Expr::Slice(slice) => constant_slice_with_literals(slice, literal),
         Expr::UnaryOp(unary) => match unary.op {
-            UnaryOp::UAdd => match fold_constant_with_literals(&unary.operand, literal)? {
-                Constant::Bool(value) => Some(Constant::Int(u64::from(value))),
-                constant @ (Constant::Int(_)
-                | Constant::SignedInt(_)
-                | Constant::BigInt { .. }
-                | Constant::Float(_)
-                | Constant::Complex { .. }
-                | Constant::NonReflexive(_)) => Some(constant),
-                _ => None,
-            },
+            UnaryOp::UAdd => {
+                match fold_constant_with_literals(&unary.operand, python_version, literal)? {
+                    Constant::Bool(value) => Some(Constant::Int(u64::from(value))),
+                    constant @ (Constant::Int(_)
+                    | Constant::SignedInt(_)
+                    | Constant::BigInt { .. }
+                    | Constant::Float(_)
+                    | Constant::Complex { .. }
+                    | Constant::NonReflexive(_)) => Some(constant),
+                    _ => None,
+                }
+            }
             UnaryOp::Not => {
                 if matches!(unary.operand.as_ref(), Expr::Tuple(_)) {
-                    fold_constant_with_literals(&unary.operand, literal)?;
+                    fold_constant_with_literals(&unary.operand, python_version, literal)?;
                 }
                 literal_truthiness(&unary.operand).map(|value| Constant::Bool(!value))
             }
-            UnaryOp::USub => fold_constant_with_literals(&unary.operand, literal)?
+            UnaryOp::USub => fold_constant_with_literals(&unary.operand, python_version, literal)?
                 .into_numeric_value()
                 .negated(),
             UnaryOp::Invert => {
-                let operand = fold_constant_with_literals(&unary.operand, literal)?;
+                let operand = fold_constant_with_literals(&unary.operand, python_version, literal)?;
                 // CPython leaves boolean inversion at runtime for its deprecation warning.
                 if matches!(operand, Constant::Bool(_)) {
                     return None;
@@ -1738,8 +1741,10 @@ pub(super) fn fold_constant_with_literals(
             }
         },
         Expr::BinOp(binary) => {
-            let left = fold_constant_with_literals(&binary.left, literal)?.into_numeric_value();
-            let right = fold_constant_with_literals(&binary.right, literal)?.into_numeric_value();
+            let left = fold_constant_with_literals(&binary.left, python_version, literal)?
+                .into_numeric_value();
+            let right = fold_constant_with_literals(&binary.right, python_version, literal)?
+                .into_numeric_value();
             match (left, binary.op, right) {
                 (left, operator @ (Operator::Add | Operator::Sub | Operator::Mult), right)
                     if is_integer_constant(&left) && is_integer_constant(&right) =>
@@ -1854,7 +1859,7 @@ pub(super) fn fold_constant_with_literals(
                     if matches!(left, Constant::Complex { .. })
                         || matches!(right, Constant::Complex { .. }) =>
                 {
-                    fold_complex_arithmetic(&left, operator, &right)
+                    fold_complex_arithmetic(&left, operator, &right, python_version)
                 }
                 (left, Operator::Div, right)
                     if matches!(left, Constant::Complex { .. })
@@ -2521,6 +2526,7 @@ fn integer_constant(negative: bool, digits: Vec<u16>) -> Constant {
 fn fold_literal_subscript(
     value: &Expr,
     index: &Expr,
+    python_version: PythonVersion,
     literal: &impl Fn(&Expr) -> Option<Constant>,
 ) -> Option<Constant> {
     fn integer(expression: &Expr) -> Option<usize> {
@@ -2554,7 +2560,7 @@ fn fold_literal_subscript(
         Some((lower.min(upper)..upper).step_by(step).collect())
     }
 
-    let value = fold_constant_with_literals(value, literal)?;
+    let value = fold_constant_with_literals(value, python_version, literal)?;
     if !matches!(index, Expr::Slice(_)) {
         let index = match fold_constant(index)? {
             Constant::Bool(value) => i128::from(u8::from(value)),
@@ -2713,18 +2719,38 @@ fn fold_complex_arithmetic(
     left: &Constant,
     operator: Operator,
     right: &Constant,
+    python_version: PythonVersion,
 ) -> Option<Constant> {
     let (left_real, left_imag) = constant_complex_parts(left)?;
     let (right_real, right_imag) = constant_complex_parts(right)?;
-    // CPython uses mixed real/complex formulas without introducing an imaginary
-    // zero for the real operand. That distinction preserves signed zeros.
+    // Before 3.14, CPython converts real operands to complex with imaginary +0.0.
+    // The newer mixed formulas preserve different signed zeros and NaN components.
     let (real, imag) = match (left, right) {
-        (Constant::Complex { .. }, Constant::Complex { .. }) => match operator {
-            Operator::Add => (left_real + right_real, left_imag + right_imag),
-            Operator::Sub => (left_real - right_real, left_imag - right_imag),
-            Operator::Mult => complex_product((left_real, left_imag), (right_real, right_imag)),
-            _ => unreachable!(),
-        },
+        _ if python_version <= PythonVersion::Py313
+            || matches!(
+                (left, right),
+                (Constant::Complex { .. }, Constant::Complex { .. })
+            ) =>
+        {
+            match operator {
+                Operator::Add => (left_real + right_real, left_imag + right_imag),
+                Operator::Sub => (left_real - right_real, left_imag - right_imag),
+                // Apple's legacy CPython builds contract these C expressions into FMADD.
+                // Negate the rounded second product, preserving generated NaN signs as well
+                // as finite cancellation; 3.14+ uses separate intermediate statements.
+                Operator::Mult
+                    if cfg!(all(target_os = "macos", target_arch = "aarch64"))
+                        && python_version <= PythonVersion::Py313 =>
+                {
+                    (
+                        left_real.mul_add(right_real, -(left_imag * right_imag)),
+                        left_real.mul_add(right_imag, left_imag * right_real),
+                    )
+                }
+                Operator::Mult => complex_product((left_real, left_imag), (right_real, right_imag)),
+                _ => unreachable!(),
+            }
+        }
         (Constant::Complex { .. }, _) => match operator {
             Operator::Add => (left_real + right_real, left_imag),
             Operator::Sub => (left_real - right_real, left_imag),
