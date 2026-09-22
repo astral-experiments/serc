@@ -5408,7 +5408,11 @@ impl Compiler<'_> {
             self.source_location(range)
         };
         self.assembler.set_location(exit_location);
-        self.emit_jump_forward(JUMP_FORWARD, accepted, 0)?;
+        let body_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, accepted)?;
+        // This is the original conditional-expression join, even when its rejected
+        // arm has already become a backward condition. Retain its slot when a
+        // small accepted exit is copied before native line-number cleanup.
+        self.assembler.preserve_direct_inlined_jump_nop(body_exit);
         if shared_body_exit {
             self.assembler.preserve_last_no_location();
         }
