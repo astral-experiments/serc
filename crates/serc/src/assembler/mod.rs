@@ -3026,6 +3026,97 @@ impl Assembler {
             .sum()
     }
 
+    /// Recognizes a small exit whose emitted slots occupy one original array.
+    pub(crate) fn is_small_linear_scope_exit_since(&self, instruction_offset: usize) -> bool {
+        let items = self.linear_items();
+        let Some(start) = items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| matches!(item, Item::Instruction(_)))
+            .nth(instruction_offset)
+            .map(|(index, _)| index)
+        else {
+            return false;
+        };
+        let mut count = 0;
+        for item in &items[start..] {
+            let Item::Instruction(instruction) = item else {
+                return false;
+            };
+            if matches!(
+                instruction.operand(),
+                Operand::Forward(_) | Operand::Backward(_)
+            ) || instruction.opcode == NOT_TAKEN
+                || instruction.pre_fold_extra_instructions() != 0
+                || instruction.local_policy.hidden_exception_owner_slots() != 0
+                || instruction.jump_policy.borrow_empty_block()
+                || instruction.no_location_policy.borrow_fallthrough()
+                    != BorrowFallthrough::Reachable
+            {
+                return false;
+            }
+            count += 1
+                + usize::from(
+                    instruction.opcode == LOAD_GLOBAL
+                        && matches!(instruction.operand(), Operand::Value(argument) if argument & 1 != 0),
+                );
+            if count > 4 {
+                return false;
+            }
+            if ends_scope(instruction.opcode) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Proves that an emitted prefix exceeds CPython's four-slot exit-copy budget.
+    pub(crate) fn has_large_linear_prefix_since(&self, instruction_offset: usize) -> bool {
+        let items = self.linear_items();
+        let Some(start) = items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| matches!(item, Item::Instruction(_)))
+            .nth(instruction_offset)
+            .map(|(index, _)| index)
+        else {
+            return false;
+        };
+        let mut count = 0;
+        let mut located = false;
+        for item in &items[start..] {
+            let Item::Instruction(instruction) = item else {
+                return false;
+            };
+            if matches!(
+                instruction.operand(),
+                Operand::Forward(_) | Operand::Backward(_)
+            ) || matches!(instruction.opcode, NOT_TAKEN | COPY | TO_BOOL)
+                || instruction.jump_policy.borrow_empty_block()
+                || instruction.no_location_policy.borrow_fallthrough()
+                    != BorrowFallthrough::Reachable
+            {
+                return false;
+            }
+            // Use a lower bound: synthetic NOPs and omitted original slots
+            // cannot make a small native array appear larger than it is.
+            if !matches!(
+                instruction.opcode,
+                NOP | NOT_TAKEN | COPY_FREE_VARS | MAKE_CELL
+            ) {
+                count += 1;
+                located |= instruction.location.line >= 0;
+            }
+            if count > 4 && located {
+                return true;
+            }
+            if ends_scope(instruction.opcode) {
+                return false;
+            }
+        }
+        false
+    }
+
     /// Marks an emitted instruction as ownerless when normalization does not reuse a stale slot.
     pub(crate) fn exclude_normalized_exception_owner_at(&mut self, instruction_offset: usize) {
         let instruction = self

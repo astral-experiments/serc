@@ -83,7 +83,7 @@ struct MatchContext {
     on_top: usize,
     ownerless_markers_after_specialized_none: bool,
     eager_final_mapping_capture: bool,
-    empty_failure_jumps: Vec<(usize, usize)>,
+    empty_failure_jumps: Vec<(usize, usize, Option<Label>)>,
     empty_success_blocks: Vec<(Label, usize)>,
 }
 
@@ -509,6 +509,7 @@ impl Compiler<'_> {
         let mut failure_reaches_end = false;
         let mut specialized_none_seen = false;
         let mut or_default_success_exit = None;
+        let mut aliased_or_failure_jumps = Vec::new();
 
         for (index, case) in statement.cases[..matched_cases].iter().enumerate() {
             let copied_subject = index + 1 != matched_cases;
@@ -746,13 +747,24 @@ impl Compiler<'_> {
                     // empty block during borrow analysis. Count from the success label:
                     // capture stores, stack rotations, and both subject pops also belong
                     // to the copied block.
-                    for &(failure, success_start) in &context.empty_failure_jumps {
+                    for &(failure, success_start, cleanup) in &context.empty_failure_jumps {
                         if self
                             .assembler
                             .pre_fusion_instruction_count_since(success_start)
                             <= 4
                         {
-                            self.assembler.mark_borrow_empty_block_at(failure);
+                            if cleanup.is_none() {
+                                self.assembler.mark_borrow_empty_block_at(failure);
+                            } else if has_default
+                                && index + 1 == matched_cases
+                                && case.guard.is_none()
+                                && cleanup.is_some_and(|label| context.fail_pop.contains(&label))
+                                && self
+                                    .assembler
+                                    .is_small_linear_scope_exit_since(success_start)
+                            {
+                                aliased_or_failure_jumps.push(failure);
+                            }
                         }
                     }
                 }
@@ -1147,6 +1159,17 @@ impl Compiler<'_> {
                 self.assembler.mark(implicit_return);
                 self.emit_deferred_implicit_return()?;
                 failure_reaches_end = case.guard.is_some();
+            }
+            if !aliased_or_failure_jumps.is_empty()
+                && case.guard.is_none()
+                && self.assembler.has_large_linear_prefix_since(default_start)
+            {
+                // Fail-pop cleanup either shares this large wildcard array or
+                // falls through to it. Neither target can be copied onto the
+                // OR failure jump before its success array becomes empty.
+                for failure in aliased_or_failure_jumps {
+                    self.assembler.mark_borrow_empty_block_at(failure);
+                }
             }
         }
 
@@ -1633,12 +1656,14 @@ impl Compiler<'_> {
         let pops = context.on_top + context.stores.len();
         self.ensure_match_fail_pop(context, pops);
         self.emit_jump_forward_instruction(JUMP_FORWARD, context.fail_pop[pops])?;
-        if pops == 0 {
-            let success_start = self.assembler.instruction_count();
-            context
-                .empty_failure_jumps
-                .push((success_start - 1, success_start));
-        }
+        // Outer failure pops also allow the success array to copy away, but
+        // their failure target must remain too large to copy into this jump.
+        let success_start = self.assembler.instruction_count();
+        context.empty_failure_jumps.push((
+            success_start - 1,
+            success_start,
+            (pops != 0).then_some(context.fail_pop[pops]),
+        ));
         if empty_success {
             context
                 .empty_success_blocks
