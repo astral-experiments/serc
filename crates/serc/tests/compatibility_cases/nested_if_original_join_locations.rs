@@ -190,3 +190,28 @@ fn folded_populated_predecessors_keep_original_tuple_copy_rounds() {
         }
     }
 }
+
+#[test]
+fn iterator_break_join_keeps_its_line_after_nested_return_copy() {
+    let source = r"def choose(items, enabled, alternate):
+    if enabled:
+        if items:
+            for item in items:
+                inspect(item)
+                if alternate:
+                    break
+        elif alternate:
+            raise ValueError()
+    elif alternate:
+        raise ValueError()
+    return items
+";
+    for exit in ["return items", "return 1", "return", "return finish(items)"] {
+        for loop_exit in ["break", "inspect(item)"] {
+            let source = source
+                .replace("return items", exit)
+                .replace("break", loop_exit);
+            common::assert_matches_cpython_marshal(&source, "iterator_break_nested_return.py");
+        }
+    }
+}
