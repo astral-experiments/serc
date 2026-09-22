@@ -53,6 +53,12 @@ pub(super) struct SymbolState {
     pub(super) module_globals: NameSet,
 }
 
+#[derive(Clone, Copy)]
+enum NameMutation {
+    Store,
+    Delete,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ComparisonMode {
     Value,
@@ -354,120 +360,57 @@ impl Compiler<'_> {
 
     pub(super) fn store_name(&mut self, name: &str) -> Result<(), CompileError> {
         let name_id = self.required_name_id(name);
-        self.store_name_with_id(name, name_id)
+        self.mutate_name_with_id(name, name_id, NameMutation::Store)
     }
 
     pub(super) fn store_name_id(&mut self, name_id: NameId) -> Result<(), CompileError> {
         let context = Rc::clone(&self.context);
         let name = context.scopes.names.resolve(name_id);
-        self.store_name_with_id(name, name_id)
-    }
-
-    fn store_name_with_id(&mut self, name: &str, name_id: NameId) -> Result<(), CompileError> {
-        if self.symbols.active_temporaries.contains(name_id) {
-            let index = self.active_temporary_index(name_id);
-            return self.emit(
-                if self.symbols.cell_names.contains(name_id)
-                    && !self.symbols.active_temporary_fast_cells.contains(name_id)
-                {
-                    STORE_DEREF
-                } else {
-                    STORE_FAST
-                },
-                index,
-                -1,
-            );
-        }
-        match &self.unit.scope {
-            Scope::Module => {
-                let index = self.name_index_with_id(name, name_id)?;
-                if self.symbols.module_globals.contains(name_id) {
-                    self.emit(STORE_GLOBAL, index, -1)
-                } else {
-                    self.emit(STORE_NAME, index, -1)
-                }
-            }
-            Scope::Class {
-                globals,
-                nonlocals,
-                free_indices,
-                ..
-            } => {
-                if globals.contains(name_id) {
-                    let index = self.name_index_with_id(name, name_id)?;
-                    self.emit(STORE_GLOBAL, index, -1)
-                } else if nonlocals.contains(name_id) {
-                    let index = free_indices.get(&name_id).copied().ok_or_else(|| {
-                        CompileError::Internal(format!("missing class nonlocal variable `{name}`"))
-                    })?;
-                    self.emit(STORE_DEREF, index, -1)
-                } else {
-                    let index = self.name_index_with_id(name, name_id)?;
-                    self.emit(STORE_NAME, index, -1)
-                }
-            }
-            Scope::Function {
-                indices,
-                free_indices,
-                cells,
-                globals,
-            } => {
-                if globals.contains(name_id) {
-                    let index = self.name_index_with_id(name, name_id)?;
-                    return self.emit(STORE_GLOBAL, index, -1);
-                }
-                // An inactive comprehension temporary does not replace a nonlocal binding.
-                if let Some(index) = free_indices.get(&name_id).copied() {
-                    self.emit(STORE_DEREF, index, -1)
-                } else if let Some(index) = indices.get(&name_id).copied() {
-                    self.symbols.initialized_locals.insert(name_id);
-                    if cells.contains(name_id) {
-                        self.emit(STORE_DEREF, index, -1)
-                    } else {
-                        self.emit(STORE_FAST, index, -1)
-                    }
-                } else {
-                    Err(CompileError::Internal(format!(
-                        "missing local variable `{name}`"
-                    )))
-                }
-            }
-        }
+        self.mutate_name_with_id(name, name_id, NameMutation::Store)
     }
 
     pub(super) fn delete_name(&mut self, name: &str) -> Result<(), CompileError> {
         let name_id = self.required_name_id(name);
-        self.delete_name_with_id(name, name_id)
+        self.mutate_name_with_id(name, name_id, NameMutation::Delete)
     }
 
     pub(super) fn delete_name_id(&mut self, name_id: NameId) -> Result<(), CompileError> {
         let context = Rc::clone(&self.context);
         let name = context.scopes.names.resolve(name_id);
-        self.delete_name_with_id(name, name_id)
+        self.mutate_name_with_id(name, name_id, NameMutation::Delete)
     }
 
-    fn delete_name_with_id(&mut self, name: &str, name_id: NameId) -> Result<(), CompileError> {
+    fn mutate_name_with_id(
+        &mut self,
+        name: &str,
+        name_id: NameId,
+        mutation: NameMutation,
+    ) -> Result<(), CompileError> {
+        let (global, namespace, deref, fast, effect) = match mutation {
+            NameMutation::Store => (STORE_GLOBAL, STORE_NAME, STORE_DEREF, STORE_FAST, -1),
+            NameMutation::Delete => (DELETE_GLOBAL, DELETE_NAME, DELETE_DEREF, DELETE_FAST, 0),
+        };
         if self.symbols.active_temporaries.contains(name_id) {
             let index = self.active_temporary_index(name_id);
             return self.emit(
                 if self.symbols.cell_names.contains(name_id)
                     && !self.symbols.active_temporary_fast_cells.contains(name_id)
                 {
-                    DELETE_DEREF
+                    deref
                 } else {
-                    DELETE_FAST
+                    fast
                 },
                 index,
-                0,
+                effect,
             );
         }
         match &self.unit.scope {
             Scope::Module => {
                 let index = self.name_index_with_id(name, name_id)?;
                 if self.symbols.module_globals.contains(name_id) {
-                    self.emit(DELETE_GLOBAL, index, 0)
+                    self.emit(global, index, effect)
                 } else {
-                    self.emit(DELETE_NAME, index, 0)
+                    self.emit(namespace, index, effect)
                 }
             }
             Scope::Class {
@@ -478,15 +421,15 @@ impl Compiler<'_> {
             } => {
                 if globals.contains(name_id) {
                     let index = self.name_index_with_id(name, name_id)?;
-                    self.emit(DELETE_GLOBAL, index, 0)
+                    self.emit(global, index, effect)
                 } else if nonlocals.contains(name_id) {
                     let index = free_indices.get(&name_id).copied().ok_or_else(|| {
                         CompileError::Internal(format!("missing class nonlocal variable `{name}`"))
                     })?;
-                    self.emit(DELETE_DEREF, index, 0)
+                    self.emit(deref, index, effect)
                 } else {
                     let index = self.name_index_with_id(name, name_id)?;
-                    self.emit(DELETE_NAME, index, 0)
+                    self.emit(namespace, index, effect)
                 }
             }
             Scope::Function {
@@ -497,16 +440,20 @@ impl Compiler<'_> {
             } => {
                 if globals.contains(name_id) {
                     let index = self.name_index_with_id(name, name_id)?;
-                    return self.emit(DELETE_GLOBAL, index, 0);
+                    return self.emit(global, index, effect);
                 }
+                // An inactive comprehension temporary does not replace a nonlocal binding.
                 if let Some(index) = free_indices.get(&name_id).copied() {
-                    self.emit(DELETE_DEREF, index, 0)
+                    self.emit(deref, index, effect)
                 } else if let Some(index) = indices.get(&name_id).copied() {
-                    self.symbols.initialized_locals.remove(name_id);
+                    match mutation {
+                        NameMutation::Store => self.symbols.initialized_locals.insert(name_id),
+                        NameMutation::Delete => self.symbols.initialized_locals.remove(name_id),
+                    };
                     if cells.contains(name_id) {
-                        self.emit(DELETE_DEREF, index, 0)
+                        self.emit(deref, index, effect)
                     } else {
-                        self.emit(DELETE_FAST, index, 0)
+                        self.emit(fast, index, effect)
                     }
                 } else {
                     Err(CompileError::Internal(format!(
