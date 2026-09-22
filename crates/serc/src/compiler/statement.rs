@@ -2701,16 +2701,24 @@ impl Compiler<'_> {
         self.emit_deferred_implicit_return()
     }
 
-    fn mark_terminal_statement_implicit_return_boundary(&mut self, body: &[Stmt]) {
+    fn mark_terminal_statement_implicit_return_boundary(
+        &mut self,
+        body: &[Stmt],
+        has_later_arm: bool,
+    ) {
         let legacy = self.context.python_version <= crate::PythonVersion::Py313;
         let needs_boundary = legacy
             || matches!(body.last(), Some(Stmt::Assign(_)))
+            // Nonfinal deletion arms have an authored end jump. A one-slot Name
+            // delete plus that replaced jump and the return can still fit a copy.
+            || (!has_later_arm && matches!(body.last(), Some(Stmt::Delete(_))))
             || matches!(body.last(), Some(Stmt::Expr(expression))
                 if matches!(expression.value.as_ref(), Expr::Call(_)));
         if needs_boundary {
             // CPython emits the implicit return in the enclosing if's separate join block.
             // Keep that original boundary when terminal lowering distributes the return into
-            // a branch, so an incoming jump cannot copy an assignment or call with the footer.
+            // a branch, so an incoming jump cannot copy an assignment, deletion, or call
+            // with the footer.
             let implicit_return = self.assembler.label();
             if legacy {
                 self.assembler.preserve_block_boundary(implicit_return);
@@ -3567,7 +3575,10 @@ impl Compiler<'_> {
                         self.assembler.mark(implicit_return);
                         self.assembler.set_location(return_location);
                     } else {
-                        self.mark_terminal_statement_implicit_return_boundary(body);
+                        self.mark_terminal_statement_implicit_return_boundary(
+                            body,
+                            branch_index < statement.elif_else_clauses.len(),
+                        );
                     }
                     self.emit_deferred_implicit_return()?;
                 }
@@ -3633,7 +3644,7 @@ impl Compiler<'_> {
                         self.assembler
                             .set_location(self.source_location(statement.range()));
                     }
-                    self.mark_terminal_statement_implicit_return_boundary(body);
+                    self.mark_terminal_statement_implicit_return_boundary(body, false);
                     self.emit_deferred_implicit_return()?;
                 }
             }

@@ -5506,3 +5506,21 @@ fn guarded_raising_finalizer_keeps_cleanup_donor_and_borrow_boundary() {
         common::assert_matches_cpython_marshal(&source, "guarded_raising_finalizer.py");
     }
 }
+
+#[test]
+fn terminal_deletion_preserves_original_return_boundary() {
+    for deletion in ["del value.attribute", "del value[key]", "del value"] {
+        let source = format!(
+            r"def probe(flag, value, key=None):
+    if flag:
+        try:
+            work(value)
+        except ValueError as error:
+            if recover(value):
+                raise error
+        {deletion}
+"
+        );
+        common::assert_matches_cpython_marshal(&source, "terminal_deletion_return.py");
+    }
+}
