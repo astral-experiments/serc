@@ -5601,6 +5601,31 @@ async def conditional(values, source, enabled):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_constant_false_match_guard_cleanup() {
+        for (pattern, guard) in [
+            ("([captured] | [_, captured]) as whole", "False"),
+            ("[captured]", "False"),
+            ("[head, [tail]]", "False"),
+            ("{\"key\": captured}", "False"),
+            ("Record(captured)", "False"),
+            ("[captured]", "0"),
+            ("[captured]", "None"),
+            ("0", "False"),
+        ] {
+            let source = format!(
+                "def capture(subject):\n    match subject:\n        case {pattern} if {guard}:\n            pass\n        case _:\n            return subject\n"
+            );
+            assert_matches_cpython_marshal(&source, "constant_false_match_guard.py");
+        }
+        for source in [
+            "def capture(subject):\n    match subject:\n        case [captured] if False:\n            pass\n        case [captured]:\n            return captured\n        case _:\n            return subject\n",
+            "def capture(subject, manager):\n    with manager:\n        match subject:\n            case [captured] if False:\n                pass\n            case _:\n                return subject\n",
+        ] {
+            assert_matches_cpython_marshal(source, "constant_false_match_guard_context.py");
+        }
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_multiline_constant_match_guards() {
         let source = "match 1:\n    case _ if (True):\n        pass\n\nmatch 1:\n    case _ if (\n        True\n    ):\n        pass\n";
         assert_matches_cpython_marshal(source, "match_guard.py");
