@@ -35329,7 +35329,7 @@ fn terminal_try_bool_expression_supported(expression: &ruff_python_ast::ExprBool
 
 // CPython leaves this shared small exit source-less before copying it onto each authored break
 // edge. Each copy then inherits that break's location instead of the enclosing `for` location.
-fn terminal_for_break_exit_inherits_predecessor(body: &[Stmt]) -> bool {
+pub(super) fn terminal_for_break_exit_inherits_predecessor(body: &[Stmt]) -> bool {
     matches!(
         body.last(),
         Some(Stmt::For(statement))

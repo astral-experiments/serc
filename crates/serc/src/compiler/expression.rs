@@ -56,7 +56,7 @@ use super::source::{
 };
 use super::statement::{
     final_chained_comparison_jump, is_wildcard_pattern, suite_has_linear_borrow_fallthrough,
-    suite_terminates, unique_condition_jump_target,
+    suite_terminates, terminal_for_break_exit_inherits_predecessor, unique_condition_jump_target,
 };
 use super::symbol::{
     ComparisonMode, ComprehensionRestore, ReraiseStackState, ResumeDepth, expression_name, to_u32,
@@ -778,8 +778,11 @@ impl Compiler<'_> {
                         self.set_branch_end_location(&case.body, body_start);
                     }
                     self.set_match_case_backedge_location(&case.body);
-                    if self.context.python_version <= crate::PythonVersion::Py313 {
+                    if self.context.python_version <= crate::PythonVersion::Py313
+                        || (terminal && terminal_for_break_exit_inherits_predecessor(&case.body))
+                    {
                         // Native case exits receive their span in the target CFG schedule.
+                        // A terminal loop break supplies its own span after exit copying.
                         self.assembler.set_location(SourceLocation::NONE);
                     }
                     if terminal {
@@ -1129,7 +1132,9 @@ impl Compiler<'_> {
             }
             if terminal && !suite_terminates(&case.body) && !emitted_fallthrough {
                 self.set_branch_end_location(&case.body, body_start);
-                if self.context.python_version <= crate::PythonVersion::Py313 {
+                if self.context.python_version <= crate::PythonVersion::Py313
+                    || terminal_for_break_exit_inherits_predecessor(&case.body)
+                {
                     self.assembler.set_location(SourceLocation::NONE);
                 }
                 // The wildcard body falls through to the original match-end block.
