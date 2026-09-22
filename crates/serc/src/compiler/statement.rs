@@ -12341,6 +12341,28 @@ impl Compiler<'_> {
                                 _ => None,
                             })
                         }
+                        // A while-else has the same original shared join. Require
+                        // an empty array so a real fallthrough donor remains intact.
+                        Stmt::While(loop_statement)
+                            if self.assembler.current_original_block_location().is_none() =>
+                        {
+                            loop_statement.orelse.last().and_then(|tail| match tail {
+                                Stmt::If(tail)
+                                    if condition_has_only_runtime_tests(&tail.test)
+                                        && tail.elif_else_clauses.iter().all(|clause| {
+                                            clause
+                                                .test
+                                                .as_ref()
+                                                .is_some_and(condition_has_only_runtime_tests)
+                                        }) =>
+                                {
+                                    nested_if_exit_location(tail, false).filter(|location| {
+                                        matches!(location, NestedIfExitLocation::Unlocated)
+                                    })
+                                }
+                                _ => None,
+                            })
+                        }
                         _ => None,
                     });
                     let nested_if_ends_in_break = matches!(
@@ -19588,8 +19610,24 @@ impl Compiler<'_> {
                     if branch.elif_else_clauses.is_empty()
                         && early_condition_truthiness(&branch.test) == Some(false)
                         && !suite_terminates_before_constant_folding(&branch.body));
+            // Every live earlier arm reaches the normal exit through an unlocated
+            // if-success jump. Early copying redirects those jumps past this original
+            // array; the terminal else cannot donate its last instruction's location.
+            let terminal_else_orphan_exit = !statement.is_star
+                && !statement.orelse.is_empty()
+                && self.assembler.current_original_block_location().is_none()
+                && matches!(statement.orelse.last(), Some(Stmt::If(branch))
+                if condition_has_only_runtime_tests(&branch.test)
+                    && branch.elif_else_clauses.iter().all(|clause| {
+                        clause.test.as_ref().is_none_or(condition_has_only_runtime_tests)
+                    })
+                    && branch.elif_else_clauses.last().is_some_and(|clause| {
+                        clause.test.is_none()
+                            && suite_terminates_before_constant_folding(&clause.body)
+                    }));
             let shared_conditional_exit = shared_assertion_exit
                 || folded_false_try_exit
+                || terminal_else_orphan_exit
                 || forwarded_conditional_exit.is_none()
                     && guarded_finally_exit_location.is_none()
                     && (statement.orelse.is_empty()

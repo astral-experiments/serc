@@ -726,3 +726,5 @@ mod leading_pass_try_owners;
 mod fused_entry_prefix_owners;
 
 mod multiline_match_swap_nops;
+
+mod loop_else_join_locations;
