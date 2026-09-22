@@ -1982,22 +1982,27 @@ impl Assembler {
     /// A final assertion may also enter through a conditional success edge. Every edge
     /// must retain its original source boundary and have no omitted instruction slots.
     pub(crate) fn at_original_shared_handler_join(&self) -> bool {
-        self.original_shared_handler_join(false, false)
+        self.original_shared_handler_join(&[], false)
     }
 
     /// Certifies a guarded finalizer join with one recorded same-line None comparison.
     pub(crate) fn at_original_guarded_finally_handler_join(&self) -> bool {
-        self.original_shared_handler_join(true, false)
+        self.original_shared_handler_join(&[POP_JUMP_IF_NONE], false)
+    }
+
+    /// Certifies a normal coroutine finalizer join with either recorded None-test polarity.
+    pub(crate) fn at_original_coroutine_guarded_finally_handler_join(&self) -> bool {
+        self.original_shared_handler_join(&[POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE], false)
     }
 
     /// Certifies a copied finalizer join that includes an exactly recorded named cleanup.
     pub(crate) fn at_original_shared_finally_iterator_join(&self) -> bool {
-        self.original_shared_handler_join(false, true)
+        self.original_shared_handler_join(&[], true)
     }
 
     fn original_shared_handler_join(
         &self,
-        allow_recorded_none_guard: bool,
+        recorded_none_opcodes: &[Opcode],
         allow_recorded_cleanup: bool,
     ) -> bool {
         let items = self.linear_items();
@@ -2077,9 +2082,8 @@ impl Assembler {
             if instruction.local_policy.hidden_exception_owner_slots() != 0 {
                 // Only the captured LOAD_CONST(None), IS_OP, and TO_BOOL slots may
                 // be absent here. A second guard or an unrelated hidden slot rejects.
-                if !allow_recorded_none_guard
+                if !recorded_none_opcodes.contains(&instruction.opcode)
                     || recorded_none_guard.is_some()
-                    || instruction.opcode != POP_JUMP_IF_NONE
                     || instruction.local_policy.hidden_exception_owner_slots() != 3
                     || self
                         .exception_owner_provenance

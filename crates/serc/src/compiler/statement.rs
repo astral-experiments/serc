@@ -21892,6 +21892,7 @@ impl Compiler<'_> {
                 continue;
             }
             let handler_body_start = self.assembler.instruction_count();
+            let handler_suspension_epoch = self.control.generators.coroutine_suspension_epoch;
             let newly_owned_handler_locals = {
                 let initialized_locals = &self.symbols.initialized_locals;
                 let owned_load_locals = &mut self.symbols.owned_load_locals;
@@ -22278,6 +22279,48 @@ impl Compiler<'_> {
                     || self.control.finally.active_finally_end_blocks > 0)
                 && handler_has_guarded_linear_conditional_cleanup(&handler.body)
                 && self.assembler.at_original_guarded_finally_handler_join();
+            // A normal coroutine finalizer has the same original unlocated name-cleanup
+            // array. Earlier awaits do not change the guarded join or its exposed owner;
+            // suspending recovery and copied or exceptional finalizers keep their policy.
+            let coroutine_guarded_finally_cleanup = matches!(
+                self.context.python_version,
+                crate::PythonVersion::Py314 | crate::PythonVersion::Py315
+            ) && self.unit.flags
+                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                == CO_COROUTINE
+                && !terminal
+                && !statement.is_star
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty()
+                && statement.handlers.len() == 1
+                && handler.name.is_some()
+                && handler.type_.as_deref().is_some_and(|test| {
+                    !expression_contains_inline_branch(test)
+                        && !expression_suspends_current_scope(test)
+                })
+                && matches!(statement.body.as_slice(), [Stmt::Expr(expression)]
+                    if matches!(expression.value.as_ref(), Expr::Call(_))
+                        && !expression_contains_inline_branch(&expression.value)
+                        && !expression_suspends_current_scope(&expression.value))
+                && !self.control.in_loop()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self.control.exceptions.active_try_marker_slots.is_empty()
+                && self.control.finally.active_normal_finally_bodies == 1
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self
+                    .control
+                    .finally
+                    .active_return_finally_contexts
+                    .is_empty()
+                && self.control.generators.coroutine_suspension_epoch == handler_suspension_epoch
+                && handler_has_prefixed_guarded_linear_conditional_cleanup(&handler.body)
+                && self
+                    .assembler
+                    .at_original_coroutine_guarded_finally_handler_join();
             // Multiple original false edges have no unique location donor, even
             // when the named cleanup immediately returns from the function.
             let handler_has_original_terminal_false_join = handler.name.is_some()
@@ -22288,6 +22331,7 @@ impl Compiler<'_> {
                 && self.assembler.defer_original_while_break_cleanup_edges();
             let handler_ends_with_inlineable_cleanup = handler_ends_with_preordered_cleanup
                 || handler_has_guarded_finally_cleanup
+                || coroutine_guarded_finally_cleanup
                 || handler_has_named_while_break_join
                 || handler_has_original_conditional_loop_join
                 || handler_has_nested_else_loop_cleanup
@@ -34783,12 +34827,21 @@ fn assertion_has_only_runtime_tests(expression: &Expr) -> bool {
 
 /// Recognizes a runtime guard around a complete conditional with linear cleanup arms.
 fn handler_has_guarded_linear_conditional_cleanup(body: &[Stmt]) -> bool {
+    matches!(body, [Stmt::If(guard)] if matches!(guard.body.as_slice(), [Stmt::If(_)]))
+        && handler_has_prefixed_guarded_linear_conditional_cleanup(body)
+}
+
+/// Allows linear work before the guarded complete conditional's original cleanup join.
+fn handler_has_prefixed_guarded_linear_conditional_cleanup(body: &[Stmt]) -> bool {
     let [Stmt::If(guard)] = body else {
         return false;
     };
-    let [Stmt::If(choice)] = guard.body.as_slice() else {
+    let Some((Stmt::If(choice), prefix)) = guard.body.split_last() else {
         return false;
     };
+    if !prefix.is_empty() && !suite_has_linear_borrow_fallthrough(prefix) {
+        return false;
+    }
     let [otherwise] = choice.elif_else_clauses.as_slice() else {
         return false;
     };
