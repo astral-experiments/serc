@@ -404,6 +404,7 @@ mod copied_finally_continue_jumps;
 mod enclosing_cleanup_handler_join_locations;
 mod first_slice_constant_admission;
 mod float_floor_division;
+mod float_modulo;
 mod handler_return_pop_block_slots;
 mod lambda_comprehension_outer_references;
 mod match_case_condition_backedge_locations;
