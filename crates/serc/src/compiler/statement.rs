@@ -27664,7 +27664,52 @@ impl Compiler<'_> {
             {
                 conditional_exit = Some(NestedIfExitLocation::Located(&tail.test));
             }
-            if let Some(NestedIfExitLocation::Located(test)) = conditional_exit {
+            let loop_break_exit = statement.finalbody.last().and_then(|tail| {
+                let Stmt::While(tail) = tail else {
+                    return None;
+                };
+                (!preserve_exit_nop
+                    && self.context.python_version >= crate::PythonVersion::Py314
+                    && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                    && self
+                        .control
+                        .statements
+                        .current_statement_followed_by_literal_return
+                    && self.control.loops.contexts.is_empty()
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty()
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.assembler.current_original_block_location().is_none()
+                    && self
+                        .assembler
+                        .current_original_block_pre_fusion_instruction_count()
+                        == 0
+                    && tail.orelse.is_empty()
+                    && condition_has_linear_runtime_leaves(&tail.test)
+                    && original_condition_has_unique_jump_target(&tail.test, false)
+                    && tail.body.split_last().is_some_and(|(last, leading)| {
+                        matches!(last, Stmt::If(branch)
+                            if branch.elif_else_clauses.is_empty()
+                                && condition_has_linear_runtime_leaves(&branch.test)
+                                && matches!(branch.body.as_slice(), [Stmt::Break(_)]))
+                            && (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
+                    }))
+                .then(|| while_condition_exit_range(&tail.test))
+            });
+            if let Some(range) = loop_break_exit {
+                // Small-exit copying removes the break's incoming edge first. The
+                // remaining condition edge donates this empty original array's line.
+                self.assembler.set_location(self.source_location(range));
+            } else if let Some(NestedIfExitLocation::Located(test)) = conditional_exit {
                 self.assembler
                     .set_location(self.source_location(condition_fallthrough_range(test)));
             } else if matches!(conditional_exit, Some(NestedIfExitLocation::Unlocated)) {
@@ -28003,6 +28048,9 @@ impl Compiler<'_> {
                 end,
                 exception_policy,
             )?;
+            if loop_break_exit.is_some() {
+                self.assembler.preserve_direct_inlined_jump_nop(normal_exit);
+            }
             if discarded_if_exit
                 && self.assembler.last_instruction_location() == Some(SourceLocation::NONE)
             {

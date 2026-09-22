@@ -1699,7 +1699,7 @@ impl OptimizationPipeline {
             }));
         }
         // A cleanup-free break first copies its original loop-exit bridge, then
-        // the small local or tuple return. Keep that break's requested NOP through
+        // the small constant, local or tuple return. Keep that break's requested NOP through
         // our earlier threading only when all three original arrays still match.
         let original_break_return_bridges = instruction_positions
             .iter()
@@ -1772,6 +1772,11 @@ impl OptimizationPipeline {
                         if matches!(load.opcode, crate::target::opcodes::LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
                             && load.depth_after() == Some(1)
                             && return_.opcode == RETURN_VALUE);
+                let constant_return = is_original_constant_return(graph, target)
+                    && return_items.iter().zip([0, 1, 0]).all(|(item, depth)| {
+                        matches!(item, Item::Instruction(instruction)
+                            if instruction.depth_after() == Some(depth))
+                    });
                 let tuple_return = super::normal_try_copies::original_local_tuple_return(return_items)
                     .is_some()
                     && return_items.iter().zip([1, 2, 1, 0]).all(|(item, depth)| {
@@ -1781,7 +1786,7 @@ impl OptimizationPipeline {
                 let Some(Item::Instruction(return_)) = return_items.last() else {
                     return None;
                 };
-                if !(local_return || tuple_return)
+                if !(constant_return || local_return || tuple_return)
                     || !target_items[..first].iter().all(clean_label)
                     || return_.depth_after() != Some(0)
                     || return_.location.line < 0
@@ -1806,14 +1811,38 @@ impl OptimizationPipeline {
                 }
                 let join_index = label_offsets[&entry];
                 let return_index = label_offsets[&target];
+                // A coroutine's single StopIteration owner is split around await
+                // and cleanup arrays. A constant exit can cross those intervals
+                // only when every original slot still has that exact same owner.
+                let shared_constant_fallback = constant_return
+                    && self.exception_regions.iter().zip(&region_ranges)
+                        .find(|(_, range)| range.contains(&source_index))
+                        .is_some_and(|(owner, _)| {
+                            owner.is_scope_fallback && owner.depth == 0 && owner.preserve_lasti
+                                && [source_index, join_index].into_iter()
+                                    .chain(return_index..return_index + return_items.len())
+                                    .all(|index| {
+                                        let mut found = false;
+                                        for (region, range) in self.exception_regions.iter().zip(&region_ranges) {
+                                            if range.contains(&index) {
+                                                if !region.is_scope_fallback || region.target != owner.target
+                                                    || region.depth != owner.depth || region.preserve_lasti != owner.preserve_lasti {
+                                                    return false;
+                                                }
+                                                found = true;
+                                            }
+                                        }
+                                        found
+                                    })
+                        });
                 if !(source_index < join_index && join_index < return_index)
-                    || self.exception_regions.iter().zip(&region_ranges).any(|(region, range)| {
+                    || (!shared_constant_fallback && self.exception_regions.iter().zip(&region_ranges).any(|(region, range)| {
                         let mut covered = [source_index, join_index].into_iter()
                             .chain(return_index..return_index + return_items.len());
                         let any_covered = covered.clone().any(|index| range.contains(&index));
                         any_covered
                             && (!region.is_scope_fallback || !covered.all(|index| range.contains(&index)))
-                    })
+                    }))
                 {
                     return None;
                 }
@@ -4570,6 +4599,7 @@ impl OptimizationPipeline {
                                     && !self.borrow_block_aliases.contains(label)
                                     && !self.original_nop_targets.contains(label))
                         });
+
                     if !preserves_original_fallthrough_nop
                         && !preserves_compound_fallthrough_nop
                         && !preserves_copied_finally_break_nop

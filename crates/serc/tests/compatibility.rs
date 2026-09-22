@@ -4824,6 +4824,30 @@ def iteration(items, flag):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_finally_loop_break_constant_exits() {
+        let source = r"async def coroutine(obj, future):
+    try:
+        await future
+    finally:
+        while obj.value > 0:
+            if not obj.step():
+                break
+    return True
+
+
+def ordinary(obj):
+    try:
+        work()
+    finally:
+        while obj.value > 0:
+            if not obj.step():
+                break
+    return True
+";
+        assert_matches_cpython_marshal(source, "finally_loop_break_constant_exits.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_protected_finally_while_break_owners() {
         let source = r"def initialized_before_try(frame):
     result = 0
