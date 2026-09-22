@@ -1945,7 +1945,7 @@ pub(super) fn fold_constant_with_literals(
                     if matches!(left, Constant::Complex { .. })
                         || matches!(right, Constant::Complex { .. }) =>
                 {
-                    fold_complex_integer_power(&left, &right)
+                    fold_complex_power(&left, &right)
                 }
                 (Constant::String(mut left), Operator::Add, Constant::String(right)) => {
                     left.push_str(&right);
@@ -2999,12 +2999,39 @@ fn fold_complex_division(
     clippy::float_cmp,
     reason = "CPython checks complex exponents for exact binary64 integrality"
 )]
-fn fold_complex_integer_power(base: &Constant, exponent: &Constant) -> Option<Constant> {
+fn fold_complex_power(base: &Constant, exponent: &Constant) -> Option<Constant> {
     let base = constant_complex_parts(base)?;
     let (exponent_real, exponent_imag) = constant_complex_parts(exponent)?;
     if exponent_imag != 0.0 || exponent_real != exponent_real.floor() || exponent_real.abs() > 100.0
     {
-        return None;
+        // Match _Py_c_pow, preserving its operation order and signed zeros.
+        if base.0 == 0.0 && base.1 == 0.0 {
+            if exponent_imag != 0.0 || exponent_real < 0.0 {
+                return None;
+            }
+            return Some(Constant::Complex {
+                real: 0.0,
+                imag: 0.0,
+            });
+        }
+        let absolute = base.0.hypot(base.1);
+        let mut magnitude = absolute.powf(exponent_real);
+        let angle = base.1.atan2(base.0);
+        let mut phase = angle * exponent_real;
+        if exponent_imag != 0.0 {
+            magnitude *= (-angle * exponent_imag).exp();
+            phase += exponent_imag * absolute.ln();
+        }
+        // macOS libm returns NaNs for sin/cos of infinity without setting errno;
+        // other supported platforms set EDOM, so CPython leaves the power unfolded.
+        // _Py_ADJUST_ERANGE2 only retains overflow for infinite outputs.
+        if phase.is_infinite() && !cfg!(target_os = "macos") {
+            return None;
+        }
+        let real = magnitude * phase.cos();
+        let imag = magnitude * phase.sin();
+        return (!real.is_infinite() && !imag.is_infinite())
+            .then_some(Constant::Complex { real, imag });
     }
     #[expect(
         clippy::cast_possible_truncation,

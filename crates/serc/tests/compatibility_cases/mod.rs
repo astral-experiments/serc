@@ -28,6 +28,7 @@ mod class_static_attribute_ownership;
 mod cleanup_interrupt_checks;
 mod cleanup_throw_stack_depth;
 mod cold_with_handler_cleanup;
+mod complex_power_folding;
 mod comprehension_iterable_captures;
 mod comprehension_local_reservation_order;
 mod comprehension_none_condition_owner_compatibility;
