@@ -18689,6 +18689,39 @@ impl Compiler<'_> {
                 .as_except_handler()
                 .is_some_and(|handler| handler.type_.is_none())
         });
+        let preserve_empty_try_setup = self.context.python_version >= crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && !terminal
+            && emit_statement_nop
+            && loop_tail.is_none()
+            && else_loop_tail.is_none()
+            && else_match_tail.is_none()
+            && self.control.statements.current_statement_has_following
+            && statement.orelse.is_empty()
+            && statement.finalbody.is_empty()
+            && matches!(statement.body.as_slice(), [Stmt::Pass(pass)]
+                if self.source_location(pass.range).line
+                    == self.source_location(statement.range).line)
+            && matches!(statement.handlers.as_slice(), [handler]
+            if handler.as_except_handler().is_some_and(|handler| {
+                handler.type_.is_none()
+                    && handler.name.is_none()
+                    && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+            }))
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0;
         let has_tuple_handler = statement.handlers.iter().any(|handler| {
             handler
                 .as_except_handler()
@@ -19803,6 +19836,18 @@ impl Compiler<'_> {
             }
             location
         };
+        if preserve_empty_try_setup && body_noop_location.is_some() {
+            // SETUP survives native reachability and same-line Pass compaction.
+            // Keep its actual record through our earlier normal-jump emission;
+            // removing it would thread past the empty body and strand its handler.
+            self.assembler.preserve_original_empty_try_setup(
+                try_start,
+                try_end,
+                handler_start,
+                self.source_location_including_trailing_semicolon(statement.range),
+                base_depth.cast_unsigned(),
+            );
+        }
         let body_ends_in_nop = self.assembler.last_instruction_is_nop();
         let _try_marker_slots = self
             .control
