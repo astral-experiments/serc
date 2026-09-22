@@ -1782,6 +1782,13 @@ impl HandlerDispatchCertificate {
                 | CHECK_EXC_MATCH => {}
                 LOAD_ATTR if matches!(instruction.operand(), Operand::Value(argument) if argument & 1 == 0) =>
                     {}
+                // Code generation emits a zero-argument method lookup as one LOAD_ATTR
+                // record followed by CALL. Unlike a global call, it has no PUSH_NULL
+                // record to compact, so the existing one-slot certificate is unchanged.
+                LOAD_ATTR
+                    if matches!(instruction.operand(), Operand::Value(argument) if argument & 1 != 0)
+                        && matches!(view.items.get(index + 1), Some(Item::Instruction(next))
+                            if next.opcode == CALL && next.operand() == Operand::Value(0)) => {}
                 CALL => call = true,
                 POP_JUMP_IF_FALSE if index == condition => {}
                 _ => return None,
