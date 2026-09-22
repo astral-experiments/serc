@@ -1,3 +1,5 @@
+use ruff_index::IndexVec;
+
 use std::collections::hash_map::Entry;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -180,7 +182,7 @@ pub(super) struct ObjectGraph<'a> {
     fresh_empty_bytes_constant: bool,
     needs_reference_sorting: bool,
     legacy_qualified_name_aliases: FxHashSet<usize>,
-    objects_by_id: Vec<Object>,
+    objects_by_id: IndexVec<ObjectId, Object>,
     occurrences: Vec<Occurrence>,
     #[cfg(debug_assertions)]
     unique_objects: FxHashSet<HashedObjectKey<'a>>,
@@ -332,6 +334,7 @@ impl<'a> ObjectGraph<'a> {
             .reserve(estimated_descendants.saturating_sub(interned_strings));
         self.interned_strings.reserve(interned_strings);
         self.objects_by_id
+            .raw
             .reserve(estimated_descendants.saturating_add(1));
         self.occurrences
             .reserve(estimated_descendants.saturating_add(1));
@@ -365,7 +368,7 @@ impl<'a> ObjectGraph<'a> {
                 Some(&id),
                 "metadata ID must identify one string"
             );
-            self.objects_by_id[id.index()].shared = true;
+            self.objects_by_id[id].shared = true;
             self.occurrences.push(Occurrence { object: id, kind });
             return false;
         }
@@ -381,11 +384,11 @@ impl<'a> ObjectGraph<'a> {
     }
 
     fn interned_string(&mut self, value: &'a str) -> (ObjectId, bool) {
-        let next_id = ObjectId::from_usize(self.objects_by_id.len());
+        let next_id = self.objects_by_id.next_index();
         match self.interned_strings.entry(value) {
             Entry::Occupied(entry) => {
                 let id = *entry.get();
-                self.objects_by_id[id.index()].shared = true;
+                self.objects_by_id[id].shared = true;
                 (id, false)
             }
             Entry::Vacant(entry) => {
@@ -445,7 +448,7 @@ impl<'a> ObjectGraph<'a> {
             "identity-bearing marshal object was recorded twice"
         );
 
-        let id = ObjectId::from_usize(self.objects_by_id.len());
+        let id = self.objects_by_id.next_index();
         self.objects_by_id.push(Object {
             shared: false,
             cached: false,
@@ -462,10 +465,10 @@ impl<'a> ObjectGraph<'a> {
         };
         if let Some(slot) = empty_slot {
             if let Some(id) = *slot {
-                self.objects_by_id[id.index()].shared = true;
+                self.objects_by_id[id].shared = true;
                 return (id, false);
             }
-            let id = ObjectId::from_usize(self.objects_by_id.len());
+            let id = self.objects_by_id.next_index();
             self.objects_by_id.push(Object {
                 shared: false,
                 cached: true,
@@ -479,12 +482,11 @@ impl<'a> ObjectGraph<'a> {
             vec![None; cached_scalar_slots(self.python_version)].into_boxed_slice()
         })[cached.scalar_index(self.python_version)];
         if let Some(id) = *slot {
-            self.objects_by_id[id.index()].shared = true;
+            self.objects_by_id[id].shared = true;
             return (id, false);
         }
 
-        let index = self.objects_by_id.len();
-        let id = ObjectId::from_usize(index);
+        let id = self.objects_by_id.next_index();
         self.objects_by_id.push(Object {
             shared: false,
             cached: true,
@@ -495,12 +497,12 @@ impl<'a> ObjectGraph<'a> {
     }
 
     fn record_object(&mut self, key: HashedObjectKey<'a>) -> (ObjectId, bool) {
-        let next_id = ObjectId::from_usize(self.objects_by_id.len());
+        let next_id = self.objects_by_id.next_index();
         match self.objects.entry(key) {
             Entry::Occupied(entry) => {
                 let cached = Self::is_cached(entry.key().key(), self.python_version);
                 let id = *entry.get();
-                let object = &mut self.objects_by_id[id.index()];
+                let object = &mut self.objects_by_id[id];
                 object.shared = true;
                 object.cached |= cached;
                 (id, false)
@@ -524,7 +526,7 @@ impl<'a> ObjectGraph<'a> {
             || self
                 .objects
                 .get(&HashedObjectKey::from(key.clone()))
-                .is_some_and(|id| self.objects_by_id[id.index()].shared)
+                .is_some_and(|id| self.objects_by_id[*id].shared)
             || matches!(
                 key,
                 ObjectKey::String(value)
@@ -552,7 +554,7 @@ impl<'a> ObjectGraph<'a> {
     }
 
     pub(super) fn is_shared_object(&self, id: ObjectId) -> bool {
-        let object = &self.objects_by_id[id.index()];
+        let object = &self.objects_by_id[id];
         object.shared || object.cached
     }
 
@@ -589,7 +591,7 @@ impl<'a> ObjectGraph<'a> {
     }
 
     pub(super) fn is_interned_object(&self, id: ObjectId) -> bool {
-        self.objects_by_id[id.index()].interned
+        self.objects_by_id[id].interned
     }
 
     #[cfg(test)]

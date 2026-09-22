@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hasher;
 
-use ruff_index::newtype_index;
+use ruff_index::{IndexVec, newtype_index};
 use ruff_python_ast::name::Name;
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
 use ruff_python_ast::{Expr, ExprContext, Pattern, Stmt, StmtClassDef, StmtFunctionDef, TypeParam};
@@ -152,7 +152,7 @@ const SCOPE_SEED_NAMES: [&str; 26] = [
 
 #[derive(Debug, Default)]
 pub(super) struct NameInterner {
-    names: Vec<Cow<'static, str>>,
+    names: IndexVec<NameId, Cow<'static, str>>,
     slots: Vec<Option<NameId>>,
 }
 
@@ -222,10 +222,10 @@ impl FromIterator<NameId> for NameSet {
 
 impl NameInterner {
     fn seeded(seeds: &[&'static str]) -> Self {
-        let mut names = Vec::with_capacity(seeds.len());
+        let mut names = IndexVec::with_capacity(seeds.len());
         let mut slots = vec![None; seeds.len().saturating_mul(2).max(8).next_power_of_two()];
         for &name in seeds {
-            let id = NameId::from_usize(names.len());
+            let id = names.next_index();
             let mut slot = Self::hash(name) & (slots.len() - 1);
             while slots[slot].is_some() {
                 slot = (slot + 1) & (slots.len() - 1);
@@ -262,7 +262,7 @@ impl NameInterner {
             }
             self.slots = slots;
         }
-        let id = NameId::from_usize(self.names.len());
+        let id = self.names.next_index();
         let mut slot = Self::hash(&name) & (self.slots.len() - 1);
         while self.slots[slot].is_some() {
             slot = (slot + 1) & (self.slots.len() - 1);
@@ -279,7 +279,7 @@ impl NameInterner {
         let mut slot = Self::hash(name) & (self.slots.len() - 1);
         loop {
             let id = self.slots[slot]?;
-            if self.names[id.index()].as_ref() == name {
+            if self.names[id].as_ref() == name {
                 return Some(id);
             }
             slot = (slot + 1) & (self.slots.len() - 1);
@@ -300,7 +300,7 @@ impl NameInterner {
     }
 
     pub(super) fn resolve(&self, id: NameId) -> &str {
-        self.names[id.index()].as_ref()
+        self.names[id].as_ref()
     }
 
     pub(super) fn len(&self) -> usize {
@@ -1098,7 +1098,7 @@ struct ScopeNode {
 pub(super) struct ScopeArena {
     pub(super) names: NameInterner,
     module: ModulePlan,
-    nodes: Vec<ScopeNode>,
+    nodes: IndexVec<ScopeId, ScopeNode>,
     by_parent_and_origin: FxHashMap<(ScopeId, ScopeOrigin), ScopeId>,
     deferred_annotations: bool,
     python_version: PythonVersion,
@@ -1182,10 +1182,10 @@ impl Default for ScopeArena {
         Self {
             names: NameInterner::default(),
             module: ModulePlan::default(),
-            nodes: vec![ScopeNode {
+            nodes: IndexVec::from([ScopeNode {
                 plan: ScopePlan::Module,
                 children: Vec::new(),
-            }],
+            }]),
             by_parent_and_origin: FxHashMap::default(),
             deferred_annotations: true,
             python_version: PythonVersion::Py314,
@@ -1250,7 +1250,7 @@ impl ScopeArena {
     }
 
     fn build_scopes(&mut self, definitions: Vec<ScopeBuildInput<'_>>, future_annotations: bool) {
-        self.nodes.reserve(definitions.len());
+        self.nodes.raw.reserve(definitions.len());
         self.by_parent_and_origin.reserve(definitions.len());
         for (index, input) in definitions.iter().enumerate() {
             let (origin, plan) = match input.definition {
@@ -1293,12 +1293,12 @@ impl ScopeArena {
     }
 
     fn add_scope(&mut self, parent: ScopeId, origin: ScopeOrigin, plan: ScopePlan) -> ScopeId {
-        let id = ScopeId::from_usize(self.nodes.len());
+        let id = self.nodes.next_index();
         self.nodes.push(ScopeNode {
             plan,
             children: Vec::new(),
         });
-        self.nodes[parent.index()].children.push(id);
+        self.nodes[parent].children.push(id);
         self.by_parent_and_origin.insert((parent, origin), id);
         id
     }
@@ -1325,7 +1325,7 @@ impl ScopeArena {
                     required.insert(name);
                 }
             }
-            self.nodes[id.index()].plan = ScopePlan::Function(FunctionPlan {
+            self.nodes[id].plan = ScopePlan::Function(FunctionPlan {
                 locals,
                 required,
                 ..FunctionPlan::default()
@@ -1359,7 +1359,7 @@ impl ScopeArena {
             &nested_function_annotation_references,
             &class_requirements,
         );
-        self.nodes[id.index()].plan = ScopePlan::Function(plan);
+        self.nodes[id].plan = ScopePlan::Function(plan);
     }
 
     fn build_class(
@@ -1383,8 +1383,8 @@ impl ScopeArena {
             self.nested_function_requirements(id);
         let nested_class_requirements = self.nested_class_requirements(id);
         let dunder_class = self.names.get("__class__");
-        let child_needs_class_closure = self.nodes[id.index()].children.iter().any(|child| {
-            dunder_class.is_some_and(|dunder_class| match &self.nodes[child.index()].plan {
+        let child_needs_class_closure = self.nodes[id].children.iter().any(|child| {
+            dunder_class.is_some_and(|dunder_class| match &self.nodes[*child].plan {
                 ScopePlan::Function(plan) => plan.required.contains(&dunder_class),
                 ScopePlan::Class(plan) => plan.required.contains(&dunder_class),
                 ScopePlan::Module => false,
@@ -1431,7 +1431,7 @@ impl ScopeArena {
                 })
                 .collect();
         }
-        self.nodes[id.index()].plan = ScopePlan::Class(plan);
+        self.nodes[id].plan = ScopePlan::Class(plan);
     }
 
     fn nested_function_requirements(
@@ -1440,8 +1440,8 @@ impl ScopeArena {
     ) -> (FxHashSet<NameId>, FxHashSet<NameId>) {
         let mut required = FxHashSet::default();
         let mut annotation_references = FxHashSet::default();
-        for child in &self.nodes[parent.index()].children {
-            let ScopePlan::Function(plan) = &self.nodes[child.index()].plan else {
+        for child in &self.nodes[parent].children {
+            let ScopePlan::Function(plan) = &self.nodes[*child].plan else {
                 continue;
             };
             required.extend(
@@ -1463,10 +1463,10 @@ impl ScopeArena {
     }
 
     fn nested_class_requirements(&self, parent: ScopeId) -> FxHashSet<NameId> {
-        self.nodes[parent.index()]
+        self.nodes[parent]
             .children
             .iter()
-            .filter_map(|child| match &self.nodes[child.index()].plan {
+            .filter_map(|child| match &self.nodes[*child].plan {
                 ScopePlan::Class(plan) => Some(plan),
                 ScopePlan::Module | ScopePlan::Function(_) => None,
             })
@@ -1485,14 +1485,14 @@ impl ScopeArena {
     }
 
     pub(super) fn function(&self, id: ScopeId) -> Option<&FunctionPlan> {
-        match &self.nodes.get(id.index())?.plan {
+        match &self.nodes.get(id)?.plan {
             ScopePlan::Function(plan) => Some(plan),
             ScopePlan::Module | ScopePlan::Class(_) => None,
         }
     }
 
     fn class(&self, id: ScopeId) -> Option<&ClassPlan> {
-        match &self.nodes.get(id.index())?.plan {
+        match &self.nodes.get(id)?.plan {
             ScopePlan::Class(plan) => Some(plan),
             ScopePlan::Module | ScopePlan::Function(_) => None,
         }
@@ -5158,11 +5158,11 @@ mod tests {
             let id = NameId::from_usize(index);
             assert_eq!(names.get(name), Some(id));
             assert_eq!(names.resolve(id), name);
-            assert!(matches!(names.names[index], Cow::Borrowed(_)));
+            assert!(matches!(names.names[id], Cow::Borrowed(_)));
         }
 
         assert_eq!(names.intern("__user_name__"), NameId::from_u32(26));
-        assert!(matches!(names.names[26], Cow::Owned(_)));
+        assert!(matches!(names.names[NameId::from_u32(26)], Cow::Owned(_)));
         assert_eq!(names.intern("super"), NameId::from_u32(25));
     }
 
@@ -5171,7 +5171,7 @@ mod tests {
         let mut names = NameInterner::default();
 
         assert_eq!(names.intern("dynamic"), NameId::from_u32(0));
-        assert!(matches!(names.names[0], Cow::Owned(_)));
+        assert!(matches!(names.names[NameId::from_u32(0)], Cow::Owned(_)));
     }
 
     #[test]
