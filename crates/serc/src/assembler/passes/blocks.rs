@@ -1997,6 +1997,11 @@ fn propagate_exit_block_locations(
     }
 }
 
+type ExitCopyRetargets<'a> = (
+    &'a mut Vec<(Instruction, Instruction)>,
+    &'a mut Vec<(ExceptionRegion, ExceptionRegion)>,
+);
+
 impl OptimizationPipeline {
     /// Resolves synthesized percent-format literals before their location donors are optimized.
     ///
@@ -3900,10 +3905,10 @@ impl OptimizationPipeline {
         let threaded_normal_try_joins = self.capture_threaded_normal_try_joins();
         self.duplicate_exit_blocks_with_store_origins(
             original_location_absence,
-            owner_retargets,
-            &mut Vec::new(),
+            (owner_retargets, &mut Vec::new()),
             &origins,
             &threaded_normal_try_joins,
+            &mut [],
             None,
         )
         .expect("test constant-free copy does not allocate constants")
@@ -3912,12 +3917,13 @@ impl OptimizationPipeline {
     pub(in crate::assembler) fn duplicate_exit_blocks_with_store_origins(
         &mut self,
         original_location_absence: &FxHashSet<Label>,
-        owner_retargets: &mut Vec<(Instruction, Instruction)>,
-        region_retargets: &mut Vec<(ExceptionRegion, ExceptionRegion)>,
+        retargets: ExitCopyRetargets<'_>,
         reversed_store_handler_exits: &ReversedStoreHandlerExits,
         threaded_normal_try_joins: &ThreadedNormalTryJoins,
+        static_swap_store_gaps: &mut [super::swaps::StaticSwapStoreGap],
         mut constants: Option<&mut dyn ConstantTable>,
     ) -> Result<Vec<Label>, crate::CompileError> {
+        let (owner_retargets, region_retargets) = retargets;
         let graph = &mut self.graph;
         if graph.is_normalized_jump_free_single_block(&self.preserved_block_boundaries) {
             return Ok(Vec::new());
@@ -4104,6 +4110,9 @@ impl OptimizationPipeline {
             if graph[block].first_label().is_none() {
                 let label = Label(self.next_label);
                 self.next_label += 1;
+                for gap in &mut *static_swap_store_gaps {
+                    gap.prepend_copy_entry(graph, block, label);
+                }
                 graph.insert_label(block, 0, label);
                 for &(index, marker_position) in &shared_break_markers {
                     if marker_position == original_position {

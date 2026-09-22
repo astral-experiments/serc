@@ -2166,6 +2166,112 @@ fn optimization_pipeline(items: Vec<Item>) -> super::OptimizationPipeline {
     assembler.into_optimization_pipeline()
 }
 
+fn pattern_capture_swap_pipeline() -> super::OptimizationPipeline {
+    optimization_pipeline(
+        [
+            (UNPACK_SEQUENCE, 4),
+            (SWAP, 4),
+            (SWAP, 3),
+            (SWAP, 2),
+            (SWAP, 4),
+            (SWAP, 3),
+            (SWAP, 2),
+            (POP_TOP, 0),
+            (SWAP, 3),
+            (SWAP, 2),
+            (STORE_FAST, 1),
+            (STORE_FAST, 2),
+            (STORE_FAST, 3),
+        ]
+        .into_iter()
+        .map(|(opcode, argument)| pass_instruction(opcode, argument, 3))
+        .collect(),
+    )
+}
+
+#[test]
+fn static_swap_store_gaps_preserve_original_slots_until_fusion() {
+    let mut pipeline = pattern_capture_swap_pipeline();
+    let original_len = pipeline.graph.iter_items().count();
+    let (blocks, cleanup, _) = pipeline.optimize_swap_runs();
+    let gaps = pipeline.apply_static_swaps((blocks, cleanup));
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(pipeline.graph.iter_items().count(), original_len);
+    assert!(pipeline.compact_static_swap_store_gaps(gaps));
+    assert_eq!(pipeline.graph.iter_items().count(), original_len - 2);
+    pipeline.fuse_superinstructions();
+    assert_eq!(
+        graph_opcodes(&pipeline),
+        [
+            UNPACK_SEQUENCE,
+            NOP,
+            NOP,
+            NOP,
+            NOP,
+            NOP,
+            NOP,
+            STORE_FAST_STORE_FAST,
+            POP_TOP,
+            STORE_FAST,
+        ],
+    );
+}
+
+#[test]
+fn static_swap_store_gaps_accept_only_transported_copy_entry_labels() {
+    let mut pipeline = pattern_capture_swap_pipeline();
+    let (blocks, cleanup, _) = pipeline.optimize_swap_runs();
+    let mut gaps = pipeline.apply_static_swaps((blocks, cleanup));
+    let block = pipeline.graph.order()[0];
+    let entry = super::Label(0);
+    for gap in &mut gaps {
+        gap.prepend_copy_entry(&pipeline.graph, block, entry);
+    }
+    pipeline.graph.insert_label(block, 0, entry);
+    assert!(pipeline.compact_static_swap_store_gaps(gaps));
+    assert_eq!(pipeline.graph[block].first_label(), Some(entry));
+}
+
+#[test]
+fn static_swap_store_gaps_require_unchanged_original_prefixes() {
+    for mutation in 0..4 {
+        let mut pipeline = pattern_capture_swap_pipeline();
+        let (blocks, cleanup, _) = pipeline.optimize_swap_runs();
+        let gaps = pipeline.apply_static_swaps((blocks, cleanup));
+        assert_eq!(gaps.len(), 1);
+        let block = pipeline.graph.order()[0];
+        let positions = pipeline.graph.item_positions();
+        match mutation {
+            0 => {
+                pipeline
+                    .graph
+                    .instruction_mut(positions[0])
+                    .unwrap()
+                    .location
+                    .line += 1;
+            }
+            1 => {
+                pipeline
+                    .graph
+                    .instruction_mut(positions[8])
+                    .unwrap()
+                    .location
+                    .column += 1;
+            }
+            2 => pipeline.graph.insert_label(block, 0, super::Label(0)),
+            3 => {
+                let copied = pipeline.graph[block].items().to_vec();
+                pipeline.graph.retain_order(|candidate| candidate != block);
+                pipeline.graph.push_block(copied);
+            }
+            _ => unreachable!(),
+        }
+        let before = pipeline.graph.copy_items();
+        assert!(!pipeline.compact_static_swap_store_gaps(gaps));
+        assert_eq!(pipeline.graph.copy_items(), before);
+    }
+}
+
 #[test]
 fn backward_conditional_normalization_preserves_successor_labels() {
     for labelled_successor in [false, true] {

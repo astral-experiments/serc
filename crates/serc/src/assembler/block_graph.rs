@@ -42,6 +42,14 @@ impl ItemPosition {
     pub(super) const fn new(block: BasicBlockId, offset: usize) -> Self {
         Self { block, offset }
     }
+
+    pub(super) const fn block(self) -> BasicBlockId {
+        self.block
+    }
+
+    pub(super) const fn offset(self) -> usize {
+        self.offset
+    }
 }
 
 /// A mutable view of a block item that keeps labels opaque and immutable.

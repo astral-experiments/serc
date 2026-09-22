@@ -671,7 +671,8 @@ impl OptimizationPipeline {
         }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::OptimizeSwapRuns)?;
-        self.apply_static_swaps((swap_blocks, capture_cleanup_swaps));
+        let mut static_swap_store_gaps =
+            self.apply_static_swaps((swap_blocks, capture_cleanup_swaps));
         original_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::ApplyStaticSwaps)?;
@@ -683,10 +684,13 @@ impl OptimizationPipeline {
         } else {
             self.duplicate_exit_blocks_with_store_origins(
                 &original_location_absence,
-                &mut copied_exit_owner_retargets,
-                &mut copied_exit_region_retargets,
+                (
+                    &mut copied_exit_owner_retargets,
+                    &mut copied_exit_region_retargets,
+                ),
                 &reversed_store_handler_exits,
                 &threaded_normal_try_joins,
+                &mut static_swap_store_gaps,
                 constants
                     .as_mut()
                     .map(|constants| &mut **constants as &mut dyn ConstantTable),
@@ -912,6 +916,9 @@ impl OptimizationPipeline {
         original_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::AddChecksForUninitializedLoads)?;
+        if self.compact_static_swap_store_gaps(static_swap_store_gaps) {
+            original_owners.retain_pipeline(&self);
+        }
         let before_fusion = FusionOwnerCertificates::snapshot(&self);
         self.fuse_superinstructions();
         let mut fusion_owners = original_owners.after_fusion(&before_fusion, &self);

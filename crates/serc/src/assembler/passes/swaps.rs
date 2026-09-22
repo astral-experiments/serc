@@ -5,7 +5,7 @@ use super::super::{
     UNPACK_EX, UNPACK_SEQUENCE, capture_cleanup_rotation, ends_scope,
     single_capture_cleanup_vacancies,
 };
-use crate::assembler::block_graph::{BlockGraph, ItemPosition};
+use crate::assembler::block_graph::{BasicBlockId, BlockGraph, ItemPosition};
 use crate::assembler::{Label, OptimizationPipeline};
 
 /// Pass-local positions from the existing swap partition; labels still delimit source arrays.
@@ -54,7 +54,99 @@ fn clear_redundant_swap_nop_locations(
     }
 }
 
+/// Rewritten swap slots that native NOP compaction removes before local-pair fusion.
+pub(in crate::assembler) struct StaticSwapStoreGap {
+    block: BasicBlockId,
+    prefix: Vec<Item>,
+    gap: std::ops::Range<usize>,
+}
+
+impl StaticSwapStoreGap {
+    /// Transport only the entry label inserted by the existing exit-copy preparation.
+    pub(in crate::assembler) fn prepend_copy_entry(
+        &mut self,
+        graph: &BlockGraph,
+        block: BasicBlockId,
+        label: Label,
+    ) {
+        if self.block == block && graph[block].items().starts_with(&self.prefix) {
+            self.prefix.insert(0, Item::Label(label));
+            self.gap.start += 1;
+            self.gap.end += 1;
+        }
+    }
+}
+
+fn capture_static_swap_store_gaps(
+    graph: &BlockGraph,
+    positions: &[ItemPosition],
+    rewritten: &FxHashSet<ItemPosition>,
+    gaps: &mut Vec<StaticSwapStoreGap>,
+) {
+    if rewritten.is_empty() {
+        return;
+    }
+    for (index, &position) in positions.iter().enumerate() {
+        let Item::Instruction(first) = graph.item(position) else {
+            continue;
+        };
+        if first.opcode != STORE_FAST {
+            continue;
+        }
+        let mut end = position.offset() + 1;
+        for &next in &positions[index + 1..] {
+            if next.block() != position.block() || next.offset() != end {
+                break;
+            }
+            let Item::Instruction(instruction) = graph.item(next) else {
+                break;
+            };
+            if rewritten.contains(&next)
+                && instruction.opcode == NOP
+                && (instruction.location.line < 0
+                    || instruction.location.line == first.location.line)
+            {
+                end += 1;
+                continue;
+            }
+            if end > position.offset() + 1
+                && instruction.opcode == STORE_FAST
+                && super::locals::fuse_pair(first, instruction).is_some()
+            {
+                gaps.push(StaticSwapStoreGap {
+                    block: position.block(),
+                    prefix: graph[position.block()].items()[..=end].to_vec(),
+                    gap: position.offset() + 1..end,
+                });
+            }
+            break;
+        }
+    }
+}
+
 impl OptimizationPipeline {
+    /// Keeps original slot counts through copying, then compacts only unchanged swap gaps.
+    pub(in crate::assembler) fn compact_static_swap_store_gaps(
+        &mut self,
+        gaps: Vec<StaticSwapStoreGap>,
+    ) -> bool {
+        let mut changed = false;
+        // Later gaps precede earlier ones here, so their removal cannot shift a
+        // still-pending prefix. Retired or changed source arrays lose admission.
+        for gap in gaps.into_iter().rev() {
+            if !self.graph.order().contains(&gap.block)
+                || !self.graph[gap.block].items().starts_with(&gap.prefix)
+            {
+                continue;
+            }
+            for offset in gap.gap.rev() {
+                self.graph.remove_item_at(gap.block, offset);
+            }
+            changed = true;
+        }
+        changed
+    }
+
     pub(in crate::assembler) fn remove_redundant_swaps_before_pops(&mut self) -> bool {
         let graph = &self.graph;
         if !graph.features().has_swap() {
@@ -332,7 +424,7 @@ impl OptimizationPipeline {
     pub(in crate::assembler) fn apply_static_swaps(
         &mut self,
         blocks: (Vec<SwapBlock>, FxHashSet<ItemPosition>),
-    ) {
+    ) -> Vec<StaticSwapStoreGap> {
         fn swappable(instruction: &Instruction) -> bool {
             matches!(instruction.opcode, POP_TOP | STORE_FAST)
         }
@@ -371,6 +463,7 @@ impl OptimizationPipeline {
         }
 
         let (blocks, capture_cleanup_swaps) = blocks;
+        let mut store_gaps = Vec::new();
         let join_origins =
             std::mem::take(&mut self.exception_owner_provenance.normal_try_copy_join_origins);
         let retired_labels = &self
@@ -546,7 +639,9 @@ impl OptimizationPipeline {
                     .expect("swappable item is an instruction") = first_instruction;
             }
             clear_redundant_swap_nop_locations(graph, &positions, &rewritten, &original_donors);
+            capture_static_swap_store_gaps(graph, &positions, &rewritten, &mut store_gaps);
         }
+        store_gaps
     }
 }
 
