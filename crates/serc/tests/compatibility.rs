@@ -1092,6 +1092,12 @@ def parent():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_class_global_qualnames() {
+        let source = include_str!("fixtures/class_global_qualnames.py");
+        assert_matches_cpython_marshal(source, "class_global_qualnames.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_global_annotation_scope_qualnames() {
         let source = r"def outer():
     global PlainAlias, GenericAlias, GenericFunction, GenericClass

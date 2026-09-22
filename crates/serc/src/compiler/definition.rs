@@ -1622,19 +1622,15 @@ impl Compiler<'_> {
                     self.annotation_child_qualified_name(definition.name.as_str())
                 )
             }
+        } else if self.unit.generic_target_qualified_name.is_some() {
+            // A global definition resets its own name, but its annotation scope still
+            // belongs to the generic wrapper's enclosing scope.
+            self.unit.qualified_name.rsplit_once('.').map_or_else(
+                || "__annotate__".to_string(),
+                |(parent, _)| format!("{parent}.__annotate__"),
+            )
         } else {
-            self.unit
-                .generic_target_qualified_name
-                .as_ref()
-                .map_or_else(
-                    || self.child_qualified_name("__annotate__"),
-                    |qualified_name| {
-                        qualified_name.rsplit_once('.').map_or_else(
-                            || "__annotate__".to_string(),
-                            |(parent, _)| format!("{parent}.__annotate__"),
-                        )
-                    },
-                )
+            self.child_qualified_name("__annotate__")
         };
         let mut child = Self::function(
             Rc::clone(&self.context),
