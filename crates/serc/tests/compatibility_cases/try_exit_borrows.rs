@@ -5479,3 +5479,30 @@ fn borrows_loop_finally_entries_with_plain_and_guarded_recovery() {
         }
     }
 }
+
+#[test]
+fn guarded_raising_finalizer_keeps_cleanup_donor_and_borrow_boundary() {
+    for continuation in [
+        "    consume(value, other, ready)\n    value.ready = ready\n    finish(value)\n    return value\n",
+        "    return value\n",
+    ] {
+        let source = format!(
+            r"def probe(flag, value, other=False, ready=False, manager=None):
+    try:
+        protect(value)
+    except OSError as error:
+        ready = False
+        prepare(value)
+        if flag:
+            failure = make_error(error)
+            try:
+                raise failure
+            finally:
+                failure = None
+    else:
+        ready = True
+{continuation}"
+        );
+        common::assert_matches_cpython_marshal(&source, "guarded_raising_finalizer.py");
+    }
+}

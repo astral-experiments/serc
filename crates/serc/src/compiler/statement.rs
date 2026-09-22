@@ -18605,6 +18605,36 @@ impl Compiler<'_> {
         } else {
             statement.orelse.as_slice()
         };
+        let guarded_raise_finally_test = (!statement.is_star
+            && statement.finalbody.is_empty()
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && suite_has_linear_borrow_fallthrough(&statement.body)
+            && (statement.orelse.is_empty()
+                || suite_has_linear_borrow_fallthrough(&statement.orelse)))
+        .then(|| {
+            let [handler] = statement.handlers.as_slice() else {
+                return None;
+            };
+            let handler = handler.as_except_handler()?;
+            handler.type_.as_ref()?;
+            handler.name.as_ref()?;
+            let (Stmt::If(guard), prefix) = handler.body.split_last()? else {
+                return None;
+            };
+            (!suite_terminates(prefix))
+                .then(|| guarded_raise_finally_fallthrough_test(guard))
+                .flatten()
+        })
+        .flatten();
         let relocated_try_else_exit = self
             .control
             .statements
@@ -21743,6 +21773,16 @@ impl Compiler<'_> {
                 self.assembler.record_guarded_try_else_exit(normal_exit);
             }
             if self.context.python_version == crate::PythonVersion::Py314
+                && borrow_exit_has_source_successor
+                && guarded_raise_finally_test.is_some()
+            {
+                // The raise leaves the normal finalizer copy unreachable. Its empty,
+                // non-cold array remains between this normal edge and its continuation.
+                // Only stop 3.14 borrowing after the actual target proves too large for
+                // early exit copying; 3.15 traverses these empty arrays.
+                self.assembler.record_noncopyable_borrow_exit(normal_exit);
+            }
+            if self.context.python_version == crate::PythonVersion::Py314
                 && !statement.is_star
                 && statement.orelse.is_empty()
                 && statement.finalbody.is_empty()
@@ -22796,7 +22836,9 @@ impl Compiler<'_> {
                 .then(|| handler_cold_with_exit_range(&handler.body))
                 .flatten();
             let handler_cleanup_fallthrough = handler.body.last().and_then(|tail| match tail {
-                Stmt::If(tail) => handler_cleanup_fallthrough_test(tail),
+                Stmt::If(tail) => {
+                    handler_cleanup_fallthrough_test(tail).or(guarded_raise_finally_test)
+                }
                 _ => None,
             });
             // An emitted unconditional edge into an empty original array precedes this
@@ -36268,6 +36310,31 @@ fn handler_cleanup_has_runtime_else_join(statement: &ruff_python_ast::StmtIf) ->
                 && !matches!(tail.body.as_slice(), [Stmt::Assert(_)])
                 && !(tail.body.iter().any(|statement| matches!(statement, Stmt::If(_)))
                     && tail.body.iter().any(|statement| matches!(statement, Stmt::Assert(_)))))
+}
+
+/// Proves a guard's true arm raises through a single-name finalizer.
+fn guarded_raise_finally_fallthrough_test(statement: &ruff_python_ast::StmtIf) -> Option<&Expr> {
+    let (Stmt::Try(cleanup), prefix) = statement.body.split_last()? else {
+        return None;
+    };
+    (statement.elif_else_clauses.is_empty()
+        && condition_has_only_runtime_tests(&statement.test)
+        && original_condition_has_unique_jump_target(&statement.test, false)
+        && !expression_suspends_current_scope(&statement.test)
+        && (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
+        && suite_has_nonsuspending_raise_work(prefix)
+        && !cleanup.is_star
+        && cleanup.handlers.is_empty()
+        && cleanup.orelse.is_empty()
+        && matches!(cleanup.body.as_slice(), [Stmt::Raise(raised)]
+        if raised.exc.iter().chain(&raised.cause).all(|value| {
+            !expression_contains_inline_branch(value)
+                && !expression_suspends_current_scope(value)
+        }))
+        && matches!(cleanup.finalbody.as_slice(), [Stmt::Assign(assignment)]
+            if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                && is_literal_constant(&assignment.value)))
+    .then_some(statement.test.as_ref())
 }
 
 fn handler_cleanup_fallthrough_test(statement: &ruff_python_ast::StmtIf) -> Option<&Expr> {
