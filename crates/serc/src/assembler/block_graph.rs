@@ -1,5 +1,6 @@
 use std::ops::Index;
 
+use ruff_index::newtype_index;
 use rustc_hash::FxHashSet;
 
 use crate::target::opcodes::{
@@ -16,16 +17,9 @@ use super::{
 ///
 /// Blocks live in an append-only arena. Reordering or removing a block from the
 /// emitted order therefore never changes the identity of any other block.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(super) struct BasicBlockId(usize);
-
-const UNBOUND_BLOCK: BasicBlockId = BasicBlockId(usize::MAX);
-
-impl BasicBlockId {
-    pub(super) const fn index(self) -> usize {
-        self.0
-    }
-}
+#[newtype_index]
+#[derive(Ord, PartialOrd)]
+pub(super) struct BasicBlockId;
 
 /// A temporary cursor into a block's item list.
 ///
@@ -167,7 +161,7 @@ impl PipelineFeatures {
 pub(super) struct BlockGraph {
     blocks: Vec<BasicBlock>,
     order: Vec<BasicBlockId>,
-    label_blocks: Vec<BasicBlockId>,
+    label_blocks: Vec<Option<BasicBlockId>>,
     features: PipelineFeatures,
 }
 
@@ -308,7 +302,7 @@ impl BlockGraph {
     ) -> Self {
         let (blocks, features) = Self::partition_items(items, preserved_block_boundaries);
         let blocks = blocks.into_iter().map(BasicBlock::new).collect::<Vec<_>>();
-        let order = (0..blocks.len()).map(BasicBlockId).collect();
+        let order = (0..blocks.len()).map(BasicBlockId::from_usize).collect();
         let mut graph = Self {
             blocks,
             order,
@@ -408,23 +402,20 @@ impl BlockGraph {
     }
 
     pub(super) fn label_block(&self, label: Label) -> Option<BasicBlockId> {
-        self.label_blocks
-            .get(usize::try_from(label.0).unwrap())
-            .copied()
-            .filter(|block| *block != UNBOUND_BLOCK)
+        self.label_blocks.get(label.index()).copied().flatten()
     }
 
     fn clear_label_index(&mut self) {
-        self.label_blocks.fill(UNBOUND_BLOCK);
+        self.label_blocks.fill(None);
     }
 
     fn bind_label(&mut self, label: Label, block: BasicBlockId) {
-        let index = usize::try_from(label.0).unwrap();
+        let index = label.index();
         if index >= self.label_blocks.len() {
-            self.label_blocks.resize(index + 1, UNBOUND_BLOCK);
+            self.label_blocks.resize(index + 1, None);
         }
-        let previous = std::mem::replace(&mut self.label_blocks[index], block);
-        debug_assert_eq!(previous, UNBOUND_BLOCK, "label is bound more than once");
+        let previous = self.label_blocks[index].replace(block);
+        debug_assert_eq!(previous, None, "label is bound more than once");
     }
 
     /// Binds labels in a newly added block suffix in item order.
@@ -438,9 +429,9 @@ impl BlockGraph {
     }
 
     fn unbind_label(&mut self, label: Label) {
-        let index = usize::try_from(label.0).unwrap();
+        let index = label.index();
         if let Some(block) = self.label_blocks.get_mut(index) {
-            *block = UNBOUND_BLOCK;
+            *block = None;
         }
     }
 
@@ -455,7 +446,7 @@ impl BlockGraph {
     }
 
     pub(super) fn allocate_block(&mut self, items: Vec<Item>) -> BasicBlockId {
-        let block = BasicBlockId(self.blocks.len());
+        let block = BasicBlockId::from_usize(self.blocks.len());
         self.blocks.push(BasicBlock::new(items));
         self.bind_block_labels(block, 0);
         block
@@ -690,9 +681,9 @@ impl BlockGraph {
         items.retain(|item| {
             let retain = keep(item);
             if !retain && let Item::Label(label) = item {
-                let index = usize::try_from(label.0).unwrap();
-                if label_blocks.get(index).copied() == Some(block) {
-                    label_blocks[index] = UNBOUND_BLOCK;
+                let index = label.index();
+                if label_blocks.get(index).copied().flatten() == Some(block) {
+                    label_blocks[index] = None;
                 }
             }
             retain
@@ -701,16 +692,16 @@ impl BlockGraph {
 
     fn rebuild_label_index(&mut self) {
         let mut label_blocks = std::mem::take(&mut self.label_blocks);
-        label_blocks.fill(UNBOUND_BLOCK);
+        label_blocks.fill(None);
         for block in self.order.iter().copied() {
             for item in self[block].items() {
                 if let Item::Label(label) = item {
-                    let index = usize::try_from(label.0).unwrap();
+                    let index = label.index();
                     if index >= label_blocks.len() {
-                        label_blocks.resize(index + 1, UNBOUND_BLOCK);
+                        label_blocks.resize(index + 1, None);
                     }
-                    let previous = std::mem::replace(&mut label_blocks[index], block);
-                    debug_assert_eq!(previous, UNBOUND_BLOCK, "label is bound more than once");
+                    let previous = label_blocks[index].replace(block);
+                    debug_assert_eq!(previous, None, "label is bound more than once");
                 }
             }
         }
@@ -796,7 +787,9 @@ impl BlockGraph {
             reachable.truncate(blocks.len());
         }
         self.blocks = blocks;
-        self.order = (0..self.blocks.len()).map(BasicBlockId).collect();
+        self.order = (0..self.blocks.len())
+            .map(BasicBlockId::from_usize)
+            .collect();
         self.rebuild_label_index();
     }
 
@@ -1100,21 +1093,21 @@ impl BlockGraph {
             }
             for item in contents.items() {
                 if let Item::Label(label) = item {
-                    let index = usize::try_from(label.0).unwrap();
+                    let index = label.index();
                     if index >= labels.len() {
-                        labels.resize(index + 1, UNBOUND_BLOCK);
+                        labels.resize(index + 1, None);
                     }
-                    if std::mem::replace(&mut labels[index], block) != UNBOUND_BLOCK {
-                        return Err(format!("label {} is bound more than once", label.0));
+                    if labels[index].replace(block).is_some() {
+                        return Err(format!("label {} is bound more than once", label.as_u32()));
                     }
                 }
             }
         }
-        while labels.last() == Some(&UNBOUND_BLOCK) {
+        while labels.last() == Some(&None) {
             labels.pop();
         }
         let mut indexed = self.label_blocks.as_slice();
-        while indexed.last() == Some(&UNBOUND_BLOCK) {
+        while indexed.last() == Some(&None) {
             indexed = &indexed[..indexed.len() - 1];
         }
         if labels != indexed {
@@ -1152,7 +1145,7 @@ mod tests {
 
     #[test]
     fn graph_construction_summarizes_all_pass_triggers() {
-        let target = Label(0);
+        let target = Label::from_u32(0);
         let mut borrow_marker =
             Instruction::new(NOP, Operand::Value(0), SourceLocation::NONE, None);
         borrow_marker.jump_policy.mark_borrow_empty_block();
@@ -1183,7 +1176,7 @@ mod tests {
 
     #[test]
     fn graph_construction_does_not_mark_non_threadable_jumps_as_forward_candidates() {
-        let target = Label(0);
+        let target = Label::from_u32(0);
         let graph = BlockGraph::from_items(
             vec![
                 instruction(JUMP_BACKWARD, Operand::Backward(target)),
@@ -1206,7 +1199,7 @@ mod tests {
 
     #[test]
     fn allocating_partitioned_blocks_keeps_the_feature_summary_conservative() {
-        let target = Label(0);
+        let target = Label::from_u32(0);
         let mut graph = BlockGraph::from_items(
             vec![instruction(RETURN_VALUE, Operand::Value(0))],
             &FxHashSet::default(),
@@ -1229,10 +1222,10 @@ mod tests {
 
     #[test]
     fn partitioning_bulk_copies_each_normalized_segment() {
-        let entry = Label(0);
-        let preserved = Label(1);
-        let jump = Label(2);
-        let target = Label(3);
+        let entry = Label::from_u32(0);
+        let preserved = Label::from_u32(1);
+        let jump = Label::from_u32(2);
+        let target = Label::from_u32(3);
         let items = vec![
             Item::Label(entry),
             Item::Label(preserved),
@@ -1266,7 +1259,7 @@ mod tests {
     #[test]
     fn partitioning_reuses_a_single_segment_allocation() {
         let mut items = Vec::with_capacity(16);
-        items.push(Item::Label(Label(0)));
+        items.push(Item::Label(Label::from_u32(0)));
         items.push(instruction(NOP, Operand::Value(0)));
         items.push(instruction(RETURN_VALUE, Operand::Value(0)));
         let pointer = items.as_ptr();
@@ -1279,9 +1272,9 @@ mod tests {
 
     #[test]
     fn block_ids_survive_reordering_and_insertion() {
-        let first_label = Label(0);
-        let second_label = Label(1);
-        let inserted_label = Label(2);
+        let first_label = Label::from_u32(0);
+        let second_label = Label::from_u32(1);
+        let inserted_label = Label::from_u32(2);
         let mut graph = BlockGraph::from_items(
             vec![
                 Item::Label(first_label),
@@ -1333,7 +1326,9 @@ mod tests {
         );
         let block = graph.block_at(0);
 
-        let error = graph.replace_order(vec![BasicBlockId(1)]).unwrap_err();
+        let error = graph
+            .replace_order(vec![BasicBlockId::from_usize(1)])
+            .unwrap_err();
 
         assert_eq!(error, "block 1 is outside the arena");
         assert_eq!(graph.order(), &[block]);
@@ -1342,9 +1337,9 @@ mod tests {
 
     #[test]
     fn retaining_order_drops_labels_without_reusing_block_ids() {
-        let dropped_label = Label(0);
-        let retained_label = Label(1);
-        let inserted_label = Label(2);
+        let dropped_label = Label::from_u32(0);
+        let retained_label = Label::from_u32(1);
+        let inserted_label = Label::from_u32(2);
         let mut graph = BlockGraph::from_items(
             vec![
                 Item::Label(dropped_label),
@@ -1375,8 +1370,8 @@ mod tests {
 
     #[test]
     fn removing_an_item_removes_its_label_from_lookup() {
-        let removed_label = Label(0);
-        let retained_label = Label(1);
+        let removed_label = Label::from_u32(0);
+        let retained_label = Label::from_u32(1);
         let mut graph = BlockGraph::from_items(
             vec![
                 Item::Label(removed_label),
@@ -1397,7 +1392,7 @@ mod tests {
 
     #[test]
     fn ordered_instruction_compaction_matches_reverse_removal() {
-        let labels = [Label(0), Label(1), Label(2)];
+        let labels = [Label::from_u32(0), Label::from_u32(1), Label::from_u32(2)];
         let mut marked = Instruction::new(NOP, Operand::Value(3), SourceLocation::NONE, None);
         marked.jump_policy.mark_borrow_empty_block();
         let graph = BlockGraph::from_items(
@@ -1464,8 +1459,8 @@ mod tests {
 
     #[test]
     fn retaining_items_removes_discarded_labels_from_lookup() {
-        let removed_label = Label(0);
-        let retained_label = Label(1);
+        let removed_label = Label::from_u32(0);
+        let retained_label = Label::from_u32(1);
         let mut graph = BlockGraph::from_items(
             vec![
                 Item::Label(removed_label),
@@ -1488,8 +1483,8 @@ mod tests {
 
     #[test]
     fn inserting_a_label_adds_it_to_lookup() {
-        let old_label = Label(0);
-        let new_label = Label(1);
+        let old_label = Label::from_u32(0);
+        let new_label = Label::from_u32(1);
         let mut graph = BlockGraph::from_items(
             vec![
                 Item::Label(old_label),
@@ -1508,8 +1503,8 @@ mod tests {
 
     #[test]
     fn preserved_consecutive_label_starts_a_distinct_block() {
-        let first = Label(0);
-        let boundary = Label(1);
+        let first = Label::from_u32(0);
+        let boundary = Label::from_u32(1);
         let graph = BlockGraph::from_items(
             vec![
                 Item::Label(first),
@@ -1526,8 +1521,8 @@ mod tests {
 
     #[test]
     fn normalizing_allocates_stable_ids_for_split_suffixes() {
-        let first_label = Label(0);
-        let second_label = Label(1);
+        let first_label = Label::from_u32(0);
+        let second_label = Label::from_u32(1);
         let mut graph = BlockGraph {
             blocks: Vec::new(),
             order: Vec::new(),
@@ -1555,11 +1550,11 @@ mod tests {
 
     #[test]
     fn streaming_normalization_check_matches_segment_planner() {
-        let entry = Label(0);
-        let preserved = Label(1);
-        let internal = Label(2);
-        let jump = Label(3);
-        let target = Label(4);
+        let entry = Label::from_u32(0);
+        let preserved = Label::from_u32(1);
+        let internal = Label::from_u32(2);
+        let jump = Label::from_u32(3);
+        let target = Label::from_u32(4);
         let items = vec![
             Item::Label(entry),
             Item::Label(preserved),
@@ -1608,7 +1603,7 @@ mod tests {
 
     #[test]
     fn recognizes_a_normalized_jump_free_single_block() {
-        let label = Label(0);
+        let label = Label::from_u32(0);
         let graph = BlockGraph::from_items(
             vec![
                 Item::Label(label),
@@ -1623,8 +1618,8 @@ mod tests {
 
     #[test]
     fn single_block_fast_path_rejects_normalization_boundaries_and_jumps() {
-        let first = Label(0);
-        let internal = Label(1);
+        let first = Label::from_u32(0);
+        let internal = Label::from_u32(1);
         let mut graph = BlockGraph::from_items(
             vec![
                 Item::Label(first),
@@ -1637,7 +1632,7 @@ mod tests {
         graph.insert_label(block, 2, internal);
         assert!(!graph.is_normalized_jump_free_single_block(&FxHashSet::default()));
 
-        let target = Label(2);
+        let target = Label::from_u32(2);
         let graph = BlockGraph::from_items(
             vec![
                 Item::Label(first),
@@ -1647,7 +1642,7 @@ mod tests {
         );
         assert!(!graph.is_normalized_jump_free_single_block(&FxHashSet::default()));
 
-        let preserved = Label(3);
+        let preserved = Label::from_u32(3);
         let graph = BlockGraph::from_items(
             vec![
                 Item::Label(first),
@@ -1661,9 +1656,9 @@ mod tests {
 
     #[test]
     fn removes_only_initial_preserved_boundaries() {
-        let entry = Label(0);
-        let preserved = Label(1);
-        let target = Label(2);
+        let entry = Label::from_u32(0);
+        let preserved = Label::from_u32(1);
+        let target = Label::from_u32(2);
         let mut graph = BlockGraph::from_items(
             vec![
                 Item::Label(entry),

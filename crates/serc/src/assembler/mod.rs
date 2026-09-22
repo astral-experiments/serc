@@ -4715,7 +4715,7 @@ impl Assembler {
     }
 
     pub(crate) fn label(&mut self) -> Label {
-        let label = Label(self.next_label);
+        let label = Label::from_u32(self.next_label);
         self.next_label += 1;
         label
     }
@@ -15613,9 +15613,7 @@ impl Assembler {
         opcode: Opcode,
         depth_after: u32,
     ) -> OperandPatchId {
-        let id = OperandPatchId(
-            u32::try_from(self.operand_patches.len()).expect("too many operand patches"),
-        );
+        let id = OperandPatchId::from_usize(self.operand_patches.len());
         self.operand_patches.push(OperandPatch {
             item_index: u32::try_from(self.linear_items().len())
                 .expect("assembler item index should fit in u32"),
@@ -15630,15 +15628,14 @@ impl Assembler {
         id: OperandPatchId,
         argument: u32,
     ) -> Result<(), CompileError> {
-        let index = usize::try_from(id.0).expect("operand patch ID should fit in usize");
-        let patch = self
-            .operand_patches
-            .get_mut(index)
-            .ok_or_else(|| CompileError::Internal(format!("unknown operand patch {}", id.0)))?;
+        let index = id.index();
+        let patch = self.operand_patches.get_mut(index).ok_or_else(|| {
+            CompileError::Internal(format!("unknown operand patch {}", id.as_u32()))
+        })?;
         if patch.argument.is_some() {
             return Err(CompileError::Internal(format!(
                 "operand patch {} was resolved more than once",
-                id.0
+                id.as_u32()
             )));
         }
         patch.argument = Some(argument);
@@ -15661,7 +15658,7 @@ impl Assembler {
             } else {
                 "unresolved"
             };
-            let expected = OperandPatchId(u32::try_from(id).expect("too many operand patches"));
+            let expected = OperandPatchId::from_usize(id);
             let item_index = usize::try_from(patch.item_index)
                 .expect("assembler item index should fit in usize");
             let Some(Item::Instruction(instruction)) = items.get(item_index) else {
@@ -15683,11 +15680,11 @@ impl Assembler {
             let Operand::Deferred(id) = instruction.operand() else {
                 continue;
             };
-            let index = usize::try_from(id.0).expect("operand patch ID should fit in usize");
+            let index = id.index();
             let Some(patch) = self.operand_patches.get(index) else {
                 return Err(CompileError::Internal(format!(
                     "instruction references unknown operand patch {}",
-                    id.0
+                    id.as_u32()
                 )));
             };
             if usize::try_from(patch.item_index).expect("assembler item index should fit in usize")
@@ -15695,13 +15692,13 @@ impl Assembler {
             {
                 return Err(CompileError::Internal(format!(
                     "operand patch {} belongs to more than one instruction",
-                    id.0
+                    id.as_u32()
                 )));
             }
             let Some(argument) = patch.argument else {
                 return Err(CompileError::Internal(format!(
                     "operand patch {} was never resolved",
-                    id.0
+                    id.as_u32()
                 )));
             };
             // This patch resolves one uniquely attached source operand. Carry an
@@ -15814,7 +15811,7 @@ impl Assembler {
             .discarded_fold_admissions
             .iter_mut()
             .collect::<Vec<_>>();
-        discarded_admissions.sort_unstable_by_key(|(label, _)| label.0);
+        discarded_admissions.sort_unstable_by_key(|(label, _)| label.as_u32());
         for (_, admissions) in discarded_admissions {
             admissions.retain_mut(|index| {
                 if let Some(remapped) = index_map[*index as usize] {
@@ -16266,7 +16263,7 @@ fn cleanup_block_creation_order(block: &[Item]) -> u32 {
             let Item::Label(label) = item else {
                 return None;
             };
-            Some(label.0)
+            Some(label.as_u32())
         })
         .min()
         .expect("cleanup block has a label")

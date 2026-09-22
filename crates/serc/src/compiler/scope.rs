@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hasher;
 
+use ruff_index::newtype_index;
 use ruff_python_ast::name::Name;
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
 use ruff_python_ast::{Expr, ExprContext, Pattern, Stmt, StmtClassDef, StmtFunctionDef, TypeParam};
@@ -84,7 +85,10 @@ impl Compiler<'_> {
             let captures_name = match &self.unit.scope {
                 // Method annotation thunks are created by the class body and can capture the
                 // class body's free variables, but not arbitrary class-local bindings.
-                Scope::Class { free_indices, .. } => free_indices.contains_key(&name),
+                Scope::Class { free_indices, .. } => {
+                    free_indices.contains_key(&name)
+                        || arena.names.get("__class__") == Some(name) && self.is_cell_id(name)
+                }
                 Scope::Module | Scope::Function { .. } => self.can_provide_closure_id(name),
             };
             if captures_name {
@@ -108,8 +112,14 @@ impl Compiler<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(super) struct NameId(pub(super) u32);
+#[newtype_index]
+pub(super) struct NameId;
+
+impl From<NameId> for crate::code_object::MetadataId {
+    fn from(id: NameId) -> Self {
+        Self::from_u32(id.as_u32())
+    }
+}
 
 const SCOPE_SEED_NAMES: [&str; 26] = [
     SHADOWED_SUPER_SENTINEL,
@@ -153,14 +163,14 @@ pub(super) struct NameSet {
 
 impl NameSet {
     pub(super) fn contains(&self, name: NameId) -> bool {
-        let index = usize::try_from(name.0).expect("name ID should fit in usize");
+        let index = name.index();
         self.words
             .get(index / u64::BITS as usize)
             .is_some_and(|word| word & (1 << (index % u64::BITS as usize)) != 0)
     }
 
     pub(super) fn insert(&mut self, name: NameId) -> bool {
-        let index = usize::try_from(name.0).expect("name ID should fit in usize");
+        let index = name.index();
         let word_index = index / u64::BITS as usize;
         self.words.resize(self.words.len().max(word_index + 1), 0);
         let bit = 1 << (index % u64::BITS as usize);
@@ -170,7 +180,7 @@ impl NameSet {
     }
 
     pub(super) fn remove(&mut self, name: NameId) -> bool {
-        let index = usize::try_from(name.0).expect("name ID should fit in usize");
+        let index = name.index();
         let Some(word) = self.words.get_mut(index / u64::BITS as usize) else {
             return false;
         };
@@ -188,10 +198,7 @@ impl NameSet {
                 (0..u64::BITS)
                     .filter(move |bit| word & (1 << bit) != 0)
                     .map(move |bit| {
-                        NameId(
-                            u32::try_from(word_index * u64::BITS as usize + bit as usize)
-                                .expect("name ID should fit in u32"),
-                        )
+                        NameId::from_usize(word_index * u64::BITS as usize + bit as usize)
                     })
             })
     }
@@ -218,7 +225,7 @@ impl NameInterner {
         let mut names = Vec::with_capacity(seeds.len());
         let mut slots = vec![None; seeds.len().saturating_mul(2).max(8).next_power_of_two()];
         for &name in seeds {
-            let id = NameId(u32::try_from(names.len()).expect("too many interned names"));
+            let id = NameId::from_usize(names.len());
             let mut slot = Self::hash(name) & (slots.len() - 1);
             while slots[slot].is_some() {
                 slot = (slot + 1) & (slots.len() - 1);
@@ -251,13 +258,11 @@ impl NameInterner {
                 while slots[slot].is_some() {
                     slot = (slot + 1) & (slots.len() - 1);
                 }
-                slots[slot] = Some(NameId(
-                    u32::try_from(index).expect("too many interned names"),
-                ));
+                slots[slot] = Some(NameId::from_usize(index));
             }
             self.slots = slots;
         }
-        let id = NameId(u32::try_from(self.names.len()).expect("too many interned names"));
+        let id = NameId::from_usize(self.names.len());
         let mut slot = Self::hash(&name) & (self.slots.len() - 1);
         while self.slots[slot].is_some() {
             slot = (slot + 1) & (self.slots.len() - 1);
@@ -274,9 +279,7 @@ impl NameInterner {
         let mut slot = Self::hash(name) & (self.slots.len() - 1);
         loop {
             let id = self.slots[slot]?;
-            if self.names[usize::try_from(id.0).expect("name ID should fit in usize")].as_ref()
-                == name
-            {
+            if self.names[id.index()].as_ref() == name {
                 return Some(id);
             }
             slot = (slot + 1) & (self.slots.len() - 1);
@@ -297,7 +300,7 @@ impl NameInterner {
     }
 
     pub(super) fn resolve(&self, id: NameId) -> &str {
-        self.names[usize::try_from(id.0).expect("name ID should fit in usize")].as_ref()
+        self.names[id.index()].as_ref()
     }
 
     pub(super) fn len(&self) -> usize {
@@ -342,6 +345,7 @@ pub(super) struct ScopeBodyFacts {
     pub(super) nested_generator_requirements: BTreeSet<String>,
     pub(super) nested_annotation_scope_requirements: BTreeSet<String>,
     nested_annotation_class_closure: bool,
+    annotation_comprehension_requirements: AnnotationComprehensionRequirements,
     pub(super) generator_named_targets: FxHashSet<String>,
     pub(super) inlined_comprehension_cellvars: FxHashSet<String>,
     pub(super) has_function_definition: bool,
@@ -546,7 +550,7 @@ impl FunctionPlan {
             });
         }
 
-        let mut annotation_collector = ReferenceCollector::default();
+        let mut annotation_references = FxHashSet::default();
         if !future_annotations {
             for parameter in definition
                 .parameters
@@ -555,26 +559,26 @@ impl FunctionPlan {
                 .chain(&definition.parameters.args)
             {
                 if let Some(annotation) = parameter.parameter.annotation.as_deref() {
-                    annotation_collector.visit_expr(annotation);
+                    annotation_references.extend(expression_required_names(annotation));
                 }
             }
             if let Some(parameter) = &definition.parameters.vararg
                 && let Some(annotation) = parameter.annotation.as_deref()
             {
-                annotation_collector.visit_expr(annotation);
+                annotation_references.extend(expression_required_names(annotation));
             }
             for parameter in &definition.parameters.kwonlyargs {
                 if let Some(annotation) = parameter.parameter.annotation.as_deref() {
-                    annotation_collector.visit_expr(annotation);
+                    annotation_references.extend(expression_required_names(annotation));
                 }
             }
             if let Some(parameter) = &definition.parameters.kwarg
                 && let Some(annotation) = parameter.annotation.as_deref()
             {
-                annotation_collector.visit_expr(annotation);
+                annotation_references.extend(expression_required_names(annotation));
             }
             if let Some(annotation) = definition.returns.as_deref() {
-                annotation_collector.visit_expr(annotation);
+                annotation_references.extend(expression_required_names(annotation));
             }
         }
 
@@ -696,7 +700,7 @@ impl FunctionPlan {
                 })
                 .collect(),
             globals: names.intern_set(locals.globals),
-            annotation_references: names.intern_set(annotation_collector.references),
+            annotation_references: names.intern_set(annotation_references),
             cellvars: names.intern_set(cellvars),
             inlined_comprehension_cellvars: names.intern_set(inlined_comprehension_cellvars),
             freevars: Vec::new(),
@@ -864,6 +868,7 @@ impl ClassPlan {
             nested_generator_requirements,
             nested_annotation_scope_requirements: annotation_scope_requirements,
             nested_annotation_class_closure,
+            annotation_comprehension_requirements,
             has_function_definition,
             has_generic_definition,
             has_type_alias,
@@ -970,9 +975,26 @@ impl ClassPlan {
         }
         required.remove("__conditional_annotations__");
 
+        let comprehension_needs_class = annotation_comprehension_requirements
+            .captures
+            .contains("__class__")
+            || annotation_comprehension_requirements.first_iterable_needs_class
+                && !is_global("__class__");
+        // The annotation captures the class being defined, not an outer __class__ binding.
+        if comprehension_needs_class && !locals.nonlocals.contains("__class__") {
+            required.remove("__class__");
+        }
+        // Separate comprehensions skip class bindings when capturing enclosing locals.
         let needs_class_closure = child_needs_class_closure
             || nested_lambda_requirements.contains("__class__")
-            || nested_annotation_class_closure;
+            || nested_annotation_class_closure
+            || comprehension_needs_class;
+        required.extend(
+            annotation_comprehension_requirements
+                .captures
+                .into_iter()
+                .filter(|name| name != "__class__"),
+        );
         let needs_classdict = has_type_alias
             || has_generic_definition
             || deferred_annotations
@@ -1030,11 +1052,11 @@ impl ClassPlan {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(super) struct ScopeId(usize);
+#[newtype_index]
+pub(super) struct ScopeId;
 
 impl ScopeId {
-    pub(super) const MODULE: Self = Self(0);
+    pub(super) const MODULE: Self = Self::from_u32(0);
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1079,6 +1101,7 @@ pub(super) struct ScopeArena {
     nodes: Vec<ScopeNode>,
     by_parent_and_origin: FxHashMap<(ScopeId, ScopeOrigin), ScopeId>,
     deferred_annotations: bool,
+    python_version: PythonVersion,
 }
 
 #[derive(Debug, Default)]
@@ -1165,6 +1188,7 @@ impl Default for ScopeArena {
             }],
             by_parent_and_origin: FxHashMap::default(),
             deferred_annotations: true,
+            python_version: PythonVersion::Py314,
         }
     }
 }
@@ -1177,9 +1201,9 @@ impl ScopeArena {
     }
 
     pub(super) fn has_nested_class_scopes(&self) -> bool {
-        self.by_parent_and_origin
-            .keys()
-            .any(|(parent, origin)| parent.0 != 0 && matches!(origin, ScopeOrigin::Class(_, _)))
+        self.by_parent_and_origin.keys().any(|(parent, origin)| {
+            *parent != ScopeId::MODULE && matches!(origin, ScopeOrigin::Class(_, _))
+        })
     }
 
     pub(super) fn analyze(body: &[Stmt]) -> Self {
@@ -1198,6 +1222,7 @@ impl ScopeArena {
         let mut arena = Self {
             names: NameInterner::seeded(&SCOPE_SEED_NAMES),
             deferred_annotations,
+            python_version,
             ..Self::default()
         };
         // The name walk also records scope definitions in preorder. Allocating their nodes first
@@ -1239,11 +1264,11 @@ impl ScopeArena {
                 ),
             };
             let id = self.add_scope(input.parent, origin, plan);
-            debug_assert_eq!(id.0, index + 1);
+            debug_assert_eq!(id.index(), index + 1);
         }
 
         for (index, input) in definitions.into_iter().enumerate().rev() {
-            let id = ScopeId(index + 1);
+            let id = ScopeId::from_usize(index + 1);
             match input.definition {
                 ScopeDefinition::Function(definition, flat, private_name) => {
                     self.build_function(
@@ -1268,12 +1293,12 @@ impl ScopeArena {
     }
 
     fn add_scope(&mut self, parent: ScopeId, origin: ScopeOrigin, plan: ScopePlan) -> ScopeId {
-        let id = ScopeId(self.nodes.len());
+        let id = ScopeId::from_usize(self.nodes.len());
         self.nodes.push(ScopeNode {
             plan,
             children: Vec::new(),
         });
-        self.nodes[parent.0].children.push(id);
+        self.nodes[parent.index()].children.push(id);
         self.by_parent_and_origin.insert((parent, origin), id);
         id
     }
@@ -1300,7 +1325,7 @@ impl ScopeArena {
                     required.insert(name);
                 }
             }
-            self.nodes[id.0].plan = ScopePlan::Function(FunctionPlan {
+            self.nodes[id.index()].plan = ScopePlan::Function(FunctionPlan {
                 locals,
                 required,
                 ..FunctionPlan::default()
@@ -1334,7 +1359,7 @@ impl ScopeArena {
             &nested_function_annotation_references,
             &class_requirements,
         );
-        self.nodes[id.0].plan = ScopePlan::Function(plan);
+        self.nodes[id.index()].plan = ScopePlan::Function(plan);
     }
 
     fn build_class(
@@ -1344,17 +1369,22 @@ impl ScopeArena {
         future_annotations: bool,
         enclosing_private_name: Option<&str>,
     ) {
-        let facts = if !self.deferred_annotations && !future_annotations {
+        let mut facts = if !self.deferred_annotations && !future_annotations {
             ScopeBodyFactsCollector::collect(&definition.body, false, ScopeBodyContext::Class, true)
         } else {
             ScopeBodyFacts::for_class(&definition.body, future_annotations)
         };
+        if self.python_version == PythonVersion::Py312 {
+            // Python 3.12 rejects comprehensions in class-visible annotation scopes.
+            facts.annotation_comprehension_requirements =
+                AnnotationComprehensionRequirements::default();
+        }
         let (method_requirements, method_annotation_references) =
             self.nested_function_requirements(id);
         let nested_class_requirements = self.nested_class_requirements(id);
         let dunder_class = self.names.get("__class__");
-        let child_needs_class_closure = self.nodes[id.0].children.iter().any(|child| {
-            dunder_class.is_some_and(|dunder_class| match &self.nodes[child.0].plan {
+        let child_needs_class_closure = self.nodes[id.index()].children.iter().any(|child| {
+            dunder_class.is_some_and(|dunder_class| match &self.nodes[child.index()].plan {
                 ScopePlan::Function(plan) => plan.required.contains(&dunder_class),
                 ScopePlan::Class(plan) => plan.required.contains(&dunder_class),
                 ScopePlan::Module => false,
@@ -1401,7 +1431,7 @@ impl ScopeArena {
                 })
                 .collect();
         }
-        self.nodes[id.0].plan = ScopePlan::Class(plan);
+        self.nodes[id.index()].plan = ScopePlan::Class(plan);
     }
 
     fn nested_function_requirements(
@@ -1410,8 +1440,8 @@ impl ScopeArena {
     ) -> (FxHashSet<NameId>, FxHashSet<NameId>) {
         let mut required = FxHashSet::default();
         let mut annotation_references = FxHashSet::default();
-        for child in &self.nodes[parent.0].children {
-            let ScopePlan::Function(plan) = &self.nodes[child.0].plan else {
+        for child in &self.nodes[parent.index()].children {
+            let ScopePlan::Function(plan) = &self.nodes[child.index()].plan else {
                 continue;
             };
             required.extend(
@@ -1433,10 +1463,10 @@ impl ScopeArena {
     }
 
     fn nested_class_requirements(&self, parent: ScopeId) -> FxHashSet<NameId> {
-        self.nodes[parent.0]
+        self.nodes[parent.index()]
             .children
             .iter()
-            .filter_map(|child| match &self.nodes[child.0].plan {
+            .filter_map(|child| match &self.nodes[child.index()].plan {
                 ScopePlan::Class(plan) => Some(plan),
                 ScopePlan::Module | ScopePlan::Function(_) => None,
             })
@@ -1455,14 +1485,14 @@ impl ScopeArena {
     }
 
     pub(super) fn function(&self, id: ScopeId) -> Option<&FunctionPlan> {
-        match &self.nodes.get(id.0)?.plan {
+        match &self.nodes.get(id.index())?.plan {
             ScopePlan::Function(plan) => Some(plan),
             ScopePlan::Module | ScopePlan::Class(_) => None,
         }
     }
 
     fn class(&self, id: ScopeId) -> Option<&ClassPlan> {
-        match &self.nodes.get(id.0)?.plan {
+        match &self.nodes.get(id.index())?.plan {
             ScopePlan::Class(plan) => Some(plan),
             ScopePlan::Module | ScopePlan::Function(_) => None,
         }
@@ -1671,7 +1701,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                 self.mark_flat_complex();
                 self.intern(definition.name.as_str());
                 let parent = self.current_scope;
-                let scope = ScopeId(self.definitions.len() + 1);
+                let scope = ScopeId::from_usize(self.definitions.len() + 1);
                 self.definitions.push(ScopeBuildInput {
                     parent,
                     definition: ScopeDefinition::Function(
@@ -1738,7 +1768,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                     .expect("function name collection should retain its flat inputs");
                 if !flat.complex {
                     let ScopeDefinition::Function(_, inputs, _) =
-                        &mut self.definitions[scope.0 - 1].definition
+                        &mut self.definitions[scope.index() - 1].definition
                     else {
                         unreachable!("function definition changed while collecting its body");
                     };
@@ -1751,7 +1781,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
             Stmt::ClassDef(definition) => {
                 self.intern(definition.name.as_str());
                 let parent = self.current_scope;
-                self.current_scope = ScopeId(self.definitions.len() + 1);
+                self.current_scope = ScopeId::from_usize(self.definitions.len() + 1);
                 self.definitions.push(ScopeBuildInput {
                     parent,
                     definition: ScopeDefinition::Class(definition, self.private_name.clone()),
@@ -3003,7 +3033,75 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
         collector.facts
     }
 
+    fn collect_annotation_comprehensions(
+        &mut self,
+        expression: &Expr,
+        type_params: Option<&ruff_python_ast::TypeParams>,
+    ) {
+        if !self.collect_function_scope_facts {
+            let requirements = annotation_comprehension_requirements(expression);
+            let is_type_parameter = |name: &str| {
+                type_params.is_some_and(|parameters| {
+                    parameters
+                        .iter()
+                        .any(|parameter| parameter.name().as_str() == name)
+                })
+            };
+            self.facts
+                .annotation_comprehension_requirements
+                .first_iterable_needs_class |=
+                requirements.first_iterable_needs_class && !is_type_parameter("__class__");
+            self.facts
+                .annotation_comprehension_requirements
+                .captures
+                .extend(
+                    requirements
+                        .captures
+                        .into_iter()
+                        .filter(|name| !is_type_parameter(name)),
+                );
+        }
+    }
+
+    fn collect_type_parameter_comprehensions(&mut self, parameters: &ruff_python_ast::TypeParams) {
+        for parameter in parameters {
+            if let TypeParam::TypeVar(parameter) = parameter
+                && let Some(bound) = &parameter.bound
+            {
+                self.collect_annotation_comprehensions(bound, Some(parameters));
+            }
+            if let Some(default) = parameter.default() {
+                self.collect_annotation_comprehensions(default, Some(parameters));
+            }
+        }
+    }
+
     fn collect_function_header(&mut self, definition: &'ast StmtFunctionDef) {
+        if !self.skip_annotations && !self.eager_function_annotations {
+            for annotation in function_annotation_expressions(definition) {
+                self.facts.nested_lambda_requirements.extend(
+                    annotation_nested_required_names(annotation)
+                        .into_iter()
+                        .filter(|name| {
+                            !definition.type_params.as_deref().is_some_and(|parameters| {
+                                parameters
+                                    .iter()
+                                    .any(|parameter| parameter.name().as_str() == name)
+                            })
+                        }),
+                );
+            }
+        }
+        if !self.skip_annotations
+            && (!self.eager_function_annotations || definition.type_params.is_some())
+        {
+            for annotation in function_annotation_expressions(definition) {
+                self.collect_annotation_comprehensions(
+                    annotation,
+                    definition.type_params.as_deref(),
+                );
+            }
+        }
         self.facts.has_function_definition = true;
         // Symbol analysis visits defaults before decorators, which can establish the
         // first inlined-comprehension binding of a name in the enclosing scope.
@@ -3047,6 +3145,7 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
             return;
         };
         self.facts.has_generic_definition = true;
+        self.collect_type_parameter_comprehensions(type_params);
         let type_names: BTreeSet<_> = type_params
             .iter()
             .map(|parameter| parameter.name().as_str().to_string())
@@ -3097,6 +3196,7 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
             return;
         };
         self.facts.has_generic_definition = true;
+        self.collect_type_parameter_comprehensions(type_params);
         let type_names: BTreeSet<_> = type_params
             .iter()
             .map(|parameter| parameter.name().as_str().to_string())
@@ -3104,9 +3204,11 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
         let mut required = type_parameter_required_names(type_params);
         if let Some(arguments) = definition.arguments.as_deref() {
             for argument in &arguments.args {
+                self.collect_annotation_comprehensions(argument, Some(type_params));
                 required.extend(expression_required_names(argument));
             }
             for keyword in &arguments.keywords {
+                self.collect_annotation_comprehensions(&keyword.value, Some(type_params));
                 required.extend(expression_required_names(&keyword.value));
             }
         }
@@ -3142,6 +3244,10 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
                 .any(|expression| {
                     nested_expression_required_names(expression).contains("__class__")
                 });
+        }
+        self.collect_annotation_comprehensions(&statement.value, statement.type_params.as_deref());
+        if let Some(parameters) = statement.type_params.as_deref() {
+            self.collect_type_parameter_comprehensions(parameters);
         }
         let mut required = expression_required_names(&statement.value);
         if let Some(type_params) = statement.type_params.as_deref() {
@@ -3215,6 +3321,9 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
             }
             Stmt::AnnAssign(annotation) => {
                 self.facts.has_annotations = true;
+                if !self.skip_annotations && !self.eager_function_annotations {
+                    self.collect_annotation_comprehensions(&annotation.annotation, None);
+                }
                 if self.skip_annotations {
                     self.visit_expr(&annotation.target);
                     if let Some(value) = &annotation.value {
@@ -3604,6 +3713,66 @@ pub(super) fn expression_required_names(expression: &Expr) -> BTreeSet<String> {
     required
 }
 
+#[derive(Debug, Default)]
+pub(super) struct AnnotationComprehensionRequirements {
+    pub(super) captures: BTreeSet<String>,
+    first_iterable_needs_class: bool,
+}
+
+/// Separate child captures from the first iterable, which uses annotation lookup rules.
+pub(super) fn annotation_comprehension_requirements(
+    expression: &Expr,
+) -> AnnotationComprehensionRequirements {
+    #[derive(Default)]
+    struct Collector(AnnotationComprehensionRequirements);
+
+    impl<'ast> Visitor<'ast> for Collector {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            let (generators, key, value) = match expression {
+                Expr::ListComp(comprehension) => {
+                    (&comprehension.generators, None, comprehension.elt.as_ref())
+                }
+                Expr::SetComp(comprehension) => {
+                    (&comprehension.generators, None, comprehension.elt.as_ref())
+                }
+                Expr::DictComp(comprehension) => (
+                    &comprehension.generators,
+                    comprehension.key.as_deref(),
+                    comprehension.value.as_ref(),
+                ),
+                Expr::Lambda(lambda) => {
+                    visit_lambda_defaults(self, lambda);
+                    return;
+                }
+                Expr::Generator(generator) => {
+                    if let Some(first) = generator.generators.first() {
+                        self.visit_expr(&first.iter);
+                    }
+                    return;
+                }
+                _ => {
+                    walk_expr(self, expression);
+                    return;
+                }
+            };
+            self.0.captures.extend(
+                comprehension_name_bindings(generators, key, value)
+                    .into_iter()
+                    .filter_map(|(name, bound)| (!bound).then_some(name)),
+            );
+            if let Some(first) = generators.first() {
+                self.visit_expr(&first.iter);
+                self.0.first_iterable_needs_class |=
+                    expression_required_names(&first.iter).contains("__class__");
+            }
+        }
+    }
+
+    let mut collector = Collector::default();
+    collector.visit_expr(expression);
+    collector.0
+}
+
 pub(super) fn expression_requirements_outside_comprehensions(
     expression: &Expr,
 ) -> BTreeSet<String> {
@@ -3664,6 +3833,18 @@ pub(super) fn inlined_comprehension_local_names_in_expression(expression: &Expr)
         })
         .map(String::from)
         .collect()
+}
+
+/// Enclosing bindings passed through an annotation to its nested functions and comprehensions.
+pub(super) fn annotation_nested_required_names(expression: &Expr) -> BTreeSet<String> {
+    let required =
+        analyze_expression_scope(&ruff_python_ast::Parameters::default(), expression).required;
+    let mut nested: BTreeSet<_> = nested_expression_required_names(expression)
+        .intersection(&required)
+        .cloned()
+        .collect();
+    nested.extend(annotation_comprehension_requirements(expression).captures);
+    nested
 }
 
 pub(super) fn nested_expression_required_names(expression: &Expr) -> BTreeSet<String> {
@@ -4684,7 +4865,7 @@ mod tests {
             ] {
                 let arena = ScopeArena::analyze_with_python_version(parsed.suite(), version);
                 let annotation = arena.names.get("annotation").unwrap();
-                let outer = arena.function(ScopeId(1)).unwrap();
+                let outer = arena.function(ScopeId::from_usize(1)).unwrap();
                 assert_eq!(
                     outer.cellvars.contains(&annotation),
                     generic || matches!(version, PythonVersion::Py314 | PythonVersion::Py315),
@@ -4704,7 +4885,7 @@ mod tests {
             PythonVersion::Py315,
         ] {
             let arena = ScopeArena::analyze_with_python_version(parsed.suite(), version);
-            let class = arena.class(ScopeId(1)).unwrap();
+            let class = arena.class(ScopeId::from_usize(1)).unwrap();
             let deferred = matches!(version, PythonVersion::Py314 | PythonVersion::Py315);
             assert_eq!(class.needs_classdict, deferred, "{version:?}");
             assert_eq!(class.has_conditional_annotations, deferred, "{version:?}");
@@ -4737,7 +4918,7 @@ mod tests {
                     PythonVersion::Py315,
                 ] {
                     let arena = ScopeArena::analyze_with_python_version(parsed.suite(), version);
-                    let class = arena.class(ScopeId(1)).unwrap();
+                    let class = arena.class(ScopeId::from_usize(1)).unwrap();
                     let deferred = matches!(version, PythonVersion::Py314 | PythonVersion::Py315);
                     assert_eq!(
                         class.needs_classdict,
@@ -4767,7 +4948,7 @@ mod tests {
             PythonVersion::Py315,
         ] {
             let arena = ScopeArena::analyze_with_python_version(parsed.suite(), version);
-            let class = arena.class(ScopeId(1)).unwrap();
+            let class = arena.class(ScopeId::from_usize(1)).unwrap();
             assert!(!class.needs_classdict);
             assert!(!class.has_conditional_annotations);
         }
@@ -4790,13 +4971,19 @@ mod tests {
                 let annotation = arena.names.get("annotation").unwrap();
                 assert_eq!(
                     arena
-                        .function(ScopeId(1))
+                        .function(ScopeId::from_usize(1))
                         .unwrap()
                         .cellvars
                         .contains(&annotation),
                     !future
                 );
-                assert!(arena.function(ScopeId(2)).unwrap().locals.is_empty());
+                assert!(
+                    arena
+                        .function(ScopeId::from_usize(2))
+                        .unwrap()
+                        .locals
+                        .is_empty()
+                );
             }
 
             let parsed = parse_module(
@@ -4804,7 +4991,7 @@ mod tests {
             )
             .unwrap();
             let arena = ScopeArena::analyze_with_python_version(parsed.suite(), version);
-            let plan = arena.function(ScopeId(1)).unwrap();
+            let plan = arena.function(ScopeId::from_usize(1)).unwrap();
             assert_eq!(
                 plan.locals
                     .iter()
@@ -4817,7 +5004,7 @@ mod tests {
                 parse_module("def f(values):\n    local: [(lambda: item) for item in values]\n")
                     .unwrap();
             let arena = ScopeArena::analyze_with_python_version(parsed.suite(), version);
-            let plan = arena.function(ScopeId(1)).unwrap();
+            let plan = arena.function(ScopeId::from_usize(1)).unwrap();
             assert_eq!(
                 plan.locals
                     .iter()
@@ -4968,22 +5155,22 @@ mod tests {
 
         assert_eq!(names.slots.len(), 64);
         for (index, name) in SCOPE_SEED_NAMES.into_iter().enumerate() {
-            let id = NameId(u32::try_from(index).unwrap());
+            let id = NameId::from_usize(index);
             assert_eq!(names.get(name), Some(id));
             assert_eq!(names.resolve(id), name);
             assert!(matches!(names.names[index], Cow::Borrowed(_)));
         }
 
-        assert_eq!(names.intern("__user_name__"), NameId(26));
+        assert_eq!(names.intern("__user_name__"), NameId::from_u32(26));
         assert!(matches!(names.names[26], Cow::Owned(_)));
-        assert_eq!(names.intern("super"), NameId(25));
+        assert_eq!(names.intern("super"), NameId::from_u32(25));
     }
 
     #[test]
     fn default_name_interner_starts_with_zero_id() {
         let mut names = NameInterner::default();
 
-        assert_eq!(names.intern("dynamic"), NameId(0));
+        assert_eq!(names.intern("dynamic"), NameId::from_u32(0));
         assert!(matches!(names.names[0], Cow::Owned(_)));
     }
 
@@ -5012,10 +5199,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 (ScopeId::MODULE, "outer", false),
-                (ScopeId(1), "Inner", false),
-                (ScopeId(2), "method", true),
+                (ScopeId::from_usize(1), "Inner", false),
+                (ScopeId::from_usize(2), "method", true),
                 (ScopeId::MODULE, "Sibling", false),
-                (ScopeId(4), "other", true),
+                (ScopeId::from_usize(4), "other", true),
             ]
         );
     }
@@ -5057,11 +5244,14 @@ mod tests {
             complex: false,
         };
 
-        inputs.record(NameId(2), false);
-        inputs.record(NameId(1), true);
-        inputs.record(NameId(2), true);
+        inputs.record(NameId::from_u32(2), false);
+        inputs.record(NameId::from_u32(1), true);
+        inputs.record(NameId::from_u32(2), true);
 
-        assert_eq!(inputs.names, [(NameId(2), true), (NameId(1), true)]);
+        assert_eq!(
+            inputs.names,
+            [(NameId::from_u32(2), true), (NameId::from_u32(1), true)]
+        );
         assert!(inputs.name_positions.is_none());
     }
 
@@ -5074,16 +5264,16 @@ mod tests {
         };
 
         for name in 0..=FlatFunctionInputs::LINEAR_SEARCH_LIMIT {
-            inputs.record(NameId(u32::try_from(name).unwrap()), false);
+            inputs.record(NameId::from_usize(name), false);
         }
         for name in (0..=FlatFunctionInputs::LINEAR_SEARCH_LIMIT).rev() {
-            inputs.record(NameId(u32::try_from(name).unwrap()), true);
+            inputs.record(NameId::from_usize(name), true);
         }
 
         assert_eq!(
             inputs.names,
             (0..=FlatFunctionInputs::LINEAR_SEARCH_LIMIT)
-                .map(|name| (NameId(u32::try_from(name).unwrap()), true))
+                .map(|name| (NameId::from_usize(name), true))
                 .collect::<Vec<_>>()
         );
         assert!(inputs.name_positions.is_some());
@@ -5092,14 +5282,17 @@ mod tests {
     #[test]
     fn complex_function_inputs_discard_and_stop_recording_names() {
         let mut inputs = FlatFunctionInputs {
-            names: vec![(NameId(1), false), (NameId(2), true)],
-            name_positions: Some(FxHashMap::from_iter([(NameId(1), 0), (NameId(2), 1)])),
+            names: vec![(NameId::from_u32(1), false), (NameId::from_u32(2), true)],
+            name_positions: Some(FxHashMap::from_iter([
+                (NameId::from_u32(1), 0),
+                (NameId::from_u32(2), 1),
+            ])),
             complex: false,
         };
 
         inputs.mark_complex();
-        inputs.record(NameId(3), true);
-        inputs.record(NameId(1), true);
+        inputs.record(NameId::from_u32(3), true);
+        inputs.record(NameId::from_u32(1), true);
 
         assert!(inputs.complex);
         assert!(inputs.names.is_empty());

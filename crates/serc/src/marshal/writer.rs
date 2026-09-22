@@ -1,4 +1,6 @@
-use crate::code_object::{CodeObject, Constant};
+use ruff_index::newtype_index;
+
+use crate::code_object::{CodeObject, Constant, MetadataId};
 use crate::{InitialInternState, PythonVersion};
 
 use super::graph::{ObjectGraph, OccurrenceCursor, OccurrenceKind};
@@ -63,7 +65,9 @@ const _: () = {
     assert!(super::v5::TYPE_UNICODE == super::v6::TYPE_UNICODE);
 };
 
-const UNSEEN_REFERENCE: u32 = u32::MAX;
+/// Identifies an object in the serialized marshal reference table.
+#[newtype_index]
+struct ReferenceId;
 
 #[cfg(test)]
 pub(crate) fn encode_code(code: &CodeObject) -> Vec<u8> {
@@ -119,7 +123,7 @@ fn encode_code_into_with_mode(
     let mut writer = Writer {
         graph: &graph,
         output,
-        references: vec![UNSEEN_REFERENCE; graph.object_count()],
+        references: vec![None; graph.object_count()],
         reference_count: 0,
         occurrences: graph.occurrence_cursor(),
     };
@@ -130,7 +134,7 @@ fn encode_code_into_with_mode(
 struct Writer<'output, 'graph, 'code> {
     graph: &'graph ObjectGraph<'code>,
     output: &'output mut Vec<u8>,
-    references: Vec<u32>,
+    references: Vec<Option<ReferenceId>>,
     reference_count: usize,
     occurrences: OccurrenceCursor<'graph>,
 }
@@ -187,14 +191,13 @@ impl Writer<'_, '_, '_> {
         if reference_mode == ReferenceMode::IfShared && !self.graph.is_shared_object(object) {
             return Some(0);
         }
-        let index = self.references[object.index()];
-        if index != UNSEEN_REFERENCE {
-            self.byte_and_long(TYPE_REF, index);
+        if let Some(index) = self.references[object.index()] {
+            self.byte_and_long(TYPE_REF, index.as_u32());
             return None;
         }
-        let index = u32::try_from(self.reference_count).expect("marshal reference limit exceeded");
+        let index = ReferenceId::from_usize(self.reference_count);
         self.reference_count += 1;
-        self.references[object.index()] = index;
+        self.references[object.index()] = Some(index);
         Some(FLAG_REF)
     }
 
@@ -516,12 +519,12 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
     }
 
     #[inline]
-    fn metadata_string(&mut self, value: &'code str, _metadata_id: Option<u32>) {
+    fn metadata_string(&mut self, value: &'code str, _metadata_id: Option<MetadataId>) {
         let object = self.next_object(OccurrenceKind::MetadataString);
         self.string_with_object(object, value, ReferenceMode::IfShared);
     }
 
-    fn code_filename(&mut self, code: &'code CodeObject, metadata_id: Option<u32>) {
+    fn code_filename(&mut self, code: &'code CodeObject, metadata_id: Option<MetadataId>) {
         if self.graph.python_version() == PythonVersion::Py312 {
             // The compile caller retains its filename alongside the code object.
             let object = self.next_object(OccurrenceKind::MetadataString);

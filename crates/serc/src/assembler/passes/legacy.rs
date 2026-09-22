@@ -1610,11 +1610,11 @@ mod tests {
 
         let cases = [(0, 254), (0, 255), (0, 300), (1, 300), (2, 300), (3, 300)];
         for (unknown_capture, native_label) in cases {
-            let start = Label(0);
-            let first_body = Label(1);
-            let second_body = Label(2);
-            let end = Label(3);
-            let normal_end = Label(4);
+            let start = Label::from_u32(0);
+            let first_body = Label::from_u32(1);
+            let second_body = Label::from_u32(2);
+            let end = Label::from_u32(3);
+            let normal_end = Label::from_u32(4);
             let location = SourceLocation::new(2, 2, 4, 12);
             let primitive =
                 Instruction::new(POP_JUMP_IF_FALSE, Operand::Forward(end), location, Some(0));
@@ -1657,7 +1657,7 @@ mod tests {
                 .push(primitive);
             let mut captured_none = none;
             if unknown_capture == 1 {
-                captured_none.retarget(Operand::Forward(Label(900)));
+                captured_none.retarget(Operand::Forward(Label::from_u32(900)));
             }
             assembler
                 .exception_owner_provenance
@@ -1680,7 +1680,7 @@ mod tests {
                 });
             let mut manager_send = send;
             if unknown_capture == 2 {
-                manager_send.retarget(Operand::Forward(Label(901)));
+                manager_send.retarget(Operand::Forward(Label::from_u32(901)));
             }
             assembler
                 .exception_owner_provenance
@@ -1694,7 +1694,7 @@ mod tests {
                 });
             let mut captured_normal_exit = normal_exit;
             if unknown_capture == 3 {
-                captured_normal_exit.retarget(Operand::Forward(Label(902)));
+                captured_normal_exit.retarget(Operand::Forward(Label::from_u32(902)));
             }
             assembler
                 .exception_owner_provenance
@@ -2313,8 +2313,8 @@ mod tests {
 
     #[test]
     fn legacy_setup_nop_keeps_its_span_until_pseudo_conversion() {
-        let start = Label(0);
-        let end = Label(1);
+        let start = Label::from_u32(0);
+        let end = Label::from_u32(1);
         let setup_location = SourceLocation::new(2, 3, 1, 16);
         let return_location = SourceLocation::new(2, 2, 6, 16);
         let mut assembler = Assembler::from_linear_items(vec![
@@ -2365,7 +2365,7 @@ mod tests {
     fn legacy_small_exit_copying_includes_raising_blocks() {
         for python_version in [PythonVersion::Py312, PythonVersion::Py313] {
             for opcode in [crate::target::opcodes::RAISE_VARARGS, RERAISE] {
-                let target = Label(0);
+                let target = Label::from_u32(0);
                 let location = SourceLocation::new(2, 2, 0, 5);
                 let exit = Instruction::new(opcode, Operand::Value(0), location, Some(0));
                 let mut assembler = Assembler::from_linear_items(vec![
@@ -2396,9 +2396,9 @@ mod tests {
 
         for python_version in [PythonVersion::Py312, PythonVersion::Py313] {
             for source_boundary in [false, true] {
-                let target = Label(0);
-                let range_end = Label(1);
-                let handler = Label(2);
+                let target = Label::from_u32(0);
+                let range_end = Label::from_u32(1);
+                let handler = Label::from_u32(2);
                 let location = SourceLocation::new(2, 2, 0, 5);
                 let mut assembler = Assembler::from_linear_items(vec![
                     Item::Instruction(Instruction::new(
@@ -2469,7 +2469,7 @@ mod tests {
 
         for python_version in [PythonVersion::Py312, PythonVersion::Py313] {
             for fused_null in [false, true] {
-                let target = Label(0);
+                let target = Label::from_u32(0);
                 let location = SourceLocation::new(2, 2, 0, 5);
                 let load = Instruction::new(
                     LOAD_GLOBAL,
@@ -2535,9 +2535,9 @@ mod tests {
                 (false, Some(JUMP_FORWARD)),
                 (false, Some(POP_JUMP_IF_FALSE)),
             ] {
-                let start = Label(0);
-                let range_end = Label(1);
-                let handler = Label(2);
+                let start = Label::from_u32(0);
+                let range_end = Label::from_u32(1);
+                let handler = Label::from_u32(2);
                 let location = SourceLocation::new(2, 2, 0, 1);
                 let mut marker = Instruction::new(NOP, Operand::Value(0), location, None);
                 marker.fusion_policy.mark_converted_pop_block();
@@ -3152,9 +3152,9 @@ mod finally_capture_seed_tests {
     fn finalizer_prefix_and_incoming_seeds_are_atomic_and_preserve_equality() {
         for native_entry in [12, 256] {
             for invalid in 0..4 {
-                let start = Label(0);
-                let entry = Label(1);
-                let end = Label(2);
+                let start = Label::from_u32(0);
+                let entry = Label::from_u32(1);
+                let end = Label::from_u32(2);
                 let incoming = Instruction::new(
                     JUMP_FORWARD,
                     Operand::Forward(entry),
@@ -3188,7 +3188,7 @@ mod finally_capture_seed_tests {
                 assembler.certify_legacy_native_labels();
                 let mut captured_condition = condition;
                 if invalid == 1 {
-                    captured_condition.retarget(Operand::Forward(Label(900)));
+                    captured_condition.retarget(Operand::Forward(Label::from_u32(900)));
                 }
                 let mut captured_incoming = incoming;
                 if invalid == 2 {

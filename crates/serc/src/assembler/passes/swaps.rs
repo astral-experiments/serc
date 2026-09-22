@@ -902,7 +902,7 @@ mod tests {
             };
             let mut items = vec![instruction(donor, donor_line)];
             if boundary {
-                items.push(Item::Label(Label(0)));
+                items.push(Item::Label(Label::from_u32(0)));
             }
             items.push(instruction(NOP, 5));
             let mut graph = BlockGraph::from_items(items, &FxHashSet::default());

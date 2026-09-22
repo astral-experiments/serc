@@ -45,7 +45,7 @@ fn validate_structure(
         if label_positions.insert(*label, index).is_some() {
             return Err(invariant_error(format!(
                 "label {} is bound more than once",
-                label.0
+                label.as_u32()
             )));
         }
     }
@@ -59,7 +59,7 @@ fn validate_structure(
             Operand::Deferred(id) => {
                 return Err(invariant_error(format!(
                     "instruction {index} has unresolved operand patch {}",
-                    id.0
+                    id.as_u32()
                 )));
             }
             Operand::Forward(target) => (target, true),
@@ -74,19 +74,19 @@ fn validate_structure(
         let Some(target_index) = label_positions.get(&target).copied() else {
             return Err(invariant_error(format!(
                 "instruction {index} targets unbound label {}",
-                target.0
+                target.as_u32()
             )));
         };
         if is_forward && target_index <= index {
             return Err(invariant_error(format!(
                 "instruction {index} has a forward operand to label {} at {target_index}",
-                target.0
+                target.as_u32()
             )));
         }
         if !is_forward && target_index >= index {
             return Err(invariant_error(format!(
                 "instruction {index} has a backward operand to label {} at {target_index}",
-                target.0
+                target.as_u32()
             )));
         }
     }
@@ -96,7 +96,7 @@ fn validate_structure(
             label_positions.get(&label).copied().ok_or_else(|| {
                 invariant_error(format!(
                     "exception region {index} has an unbound {role} label {}",
-                    label.0
+                    label.as_u32()
                 ))
             })
         };
@@ -557,7 +557,7 @@ impl Assembler {
 
 impl OptimizationPipeline {
     fn label(&mut self) -> Label {
-        let label = Label(self.next_label);
+        let label = Label::from_u32(self.next_label);
         self.next_label += 1;
         label
     }
@@ -1011,7 +1011,7 @@ impl OptimizationPipeline {
         )
         .into_iter()
         .collect();
-        setup_finally_entries.sort_unstable_by_key(|(source, _)| source.0);
+        setup_finally_entries.sort_unstable_by_key(|(source, _)| source.as_u32());
         for (source, target) in setup_finally_entries {
             retained_finally_entries.entry(source).or_insert(target);
         }
@@ -1286,7 +1286,7 @@ impl LayoutAssembler {
                     };
                 }
                 Item::Label(label) => {
-                    labels[usize::try_from(label.0).unwrap()] = Some(code_units);
+                    labels[label.index()] = Some(code_units);
                 }
             }
         }
@@ -1335,7 +1335,7 @@ impl LayoutAssembler {
             for item in &self.items {
                 match *item {
                     Item::Instruction(_) => index += 1,
-                    Item::Label(label) => indices[usize::try_from(label.0).unwrap()] = Some(index),
+                    Item::Label(label) => indices[label.index()] = Some(index),
                 }
             }
             can_be_unextended &= self.items.iter().all(|item| match item {
@@ -1430,7 +1430,7 @@ impl LayoutAssembler {
                     Operand::Deferred(id) => {
                         return Err(CompileError::Internal(format!(
                             "unresolved operand patch {} reached final layout",
-                            id.0
+                            id.as_u32()
                         )));
                     }
                     Operand::Forward(label) => {
@@ -1513,7 +1513,7 @@ mod uniform_jump_seed_tests {
         // The physical target index exceeds255, but a distinct source proof may
         // certify that all native symbolic operands start without EXTENDED_ARG.
         items.extend((0..300).map(|_| instruction(NOP, 0)));
-        let target = Label(0);
+        let target = Label::from_u32(0);
         items.push(Item::Label(target));
         items.extend((0..254).map(|_| instruction(NOP, 0)));
         let mut jump = Instruction::new(

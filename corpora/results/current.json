@@ -1,25 +1,13 @@
 {
   "schema": 1,
-  "measurement_date": "2026-09-21",
-  "provenance": {
-    "basis": "Fresh comparisons on the unchanged pinned corpora, with independent outcome and source-identity reviews.",
-    "raw_evidence_status": "Raw comparison logs, mismatch reproductions, identity checks, and completion receipts are retained in durable workspace storage. This is a new measurement, not a reconstruction of the earlier ephemeral records.",
-    "prior_summary": "compatibility-2026-09-21.json",
-    "evidence_sha256": {
-      "public/PACKAGE-COMPLETE.json": "8fbf2c511ad3290410b1d199ee8f91d544bcb4a879f809685706406c6ef74cc9",
-      "public/PUBLIC-RESULT-REVIEW.json": "99cb2aaa345ae051538a4871c9940e0b5b546b6017f4b60426afea64d8e1c9b7",
-      "holdouts/COMPLETE.json": "45530aa5dc1ea9cdd6ddbcd8951e0e2f527f902ea1897a555085e67c4eb8ad96",
-      "holdouts/RESULT-REVIEW.json": "01c5b37ffc6cb3c16126756f9c1e0ede6761f6777bbe76ae0ee68aa28bb22928",
-      "TEST-RUFF-SUMMARY.json": "06845992a6ce0ba95c80776dbf47bc7f54d7a69b1194037f423dfbe866697916"
-    }
-  },
+  "measurement_date": "2026-09-22",
+  "source_report": "https://github.com/astral-sh/serc/blob/a3f4d501cac002d06a712f0c4ca3fef4cbf9ca28/corpora/results/compatibility-2026-09-22-public-af3806c.json",
   "compiler": {
     "repository": "astral-sh/serc",
-    "measured_commit": "f5e8d921dedc5a7c3b0ad87986d0fbd832d911d0",
-    "build_commit": "f5e8d921dedc5a7c3b0ad87986d0fbd832d911d0",
-    "source_binding": "Compiler sources and Cargo.lock were unchanged throughout build and validation; documentation and public outcome-baseline updates follow this measured commit.",
+    "measured_commit": "af3806c71f8823f6d1cd2adecadc2c2cdc0f5a47",
+    "build_commit": "af3806c71f8823f6d1cd2adecadc2c2cdc0f5a47",
     "comparison_binary": "compare_cpython_corpus",
-    "binary_sha256": "161a8a116e1388c5977ad152f3ec98eff96b184243c0517ba9d259de862b09fb",
+    "binary_sha256": "30a998129f92726da807ccd8ee0056d0a06bf2da6f24e5f3746a7733a23ff780",
     "binary_scope": [
       "numpy",
       "mypy-primer",
@@ -39,17 +27,14 @@
     "binary_sha256": "c27397da5541f67655be462e128ca3d3eb6e0a8eb0d39036896c9042529f4304"
   },
   "protocol": {
+    "comparison": "Raw marshal bytes; corpus source is compiled, never executed.",
     "native_process": "Fresh subprocess per file: python -I -S -c ORACLE PATH",
     "native_startup": "import marshal; import pathlib; import sys",
-    "native_input": "path = pathlib.Path(sys.argv[1]); source = path.read_bytes()",
     "native_compile": "compile(source, str(path), 'exec', dont_inherit=True, optimize=0)",
-    "native_output": "marshal.dumps(code)",
-    "comparison": "Raw byte-for-byte equality; corpus code is compiled, never executed.",
-    "serc_source_mode": "text means UTF-8 text input; bytes means --source-bytes.",
-    "state": "Default intern state; no caller model, initial-intern profile, native-output cache, normalization or nondeterminism exclusions.",
-    "filenames": "Absolute input filenames passed unchanged to both compilers. All comparisons against the preceding fix-wave baselines use these same paths. The older holdout checkout paths before recovery were unavailable.",
-    "membership": "Regular files only, without following symlinks; no submodule source traversal.",
-    "holdout_scope": "Historical file counts match .py-only membership. Prior README prose claiming stubs was inaccurate: 11 Airflow and 2 Ansible .pyi files were excluded by extension before compilation.",
+    "intern_state": "Default; no caller model or initial-intern profile.",
+    "native_output_cache": false,
+    "normalization": false,
+    "nondeterminism_exclusions": false,
     "oracle_sha256": "6812e016e7e871700001ad9f8f832c5998d553bc33c84afb1745dbd664a965fb"
   },
   "corpora": [
@@ -74,15 +59,8 @@
         "non-utf8": 0,
         "oracle-failure": 0
       },
-      "measured_roots": [
-        "/home/dev-user/code/oss/serc-public-validation-wave3d-20260921/vendor/ruff/crates/ty_python_semantic/resources/corpus",
-        "/home/dev-user/code/oss/serc-public-validation-wave3d-20260921/vendor/ruff/crates/ruff_python_parser/resources/valid",
-        "/home/dev-user/code/oss/serc-public-validation-wave3d-20260921/vendor/ruff/crates/ruff_python_parser/resources/inline/ok",
-        "/home/dev-user/code/oss/serc-public-validation-wave3d-20260921/vendor/ruff/crates/ruff_linter/resources/test/fixtures",
-        "/home/dev-user/code/oss/serc-public-validation-wave3d-20260921/vendor/ruff/crates/ruff_python_formatter/resources/test/fixtures"
-      ],
-      "comparison_binary_sha256": "109a9c0ac7b9bb3a133cd727cb6fbf5159c41aa098aafc96b18910d60cb67f52",
-      "build_profile": "dev"
+      "build_profile": "dev",
+      "comparison_binary_sha256": "7cdd16d260164313512c58b9731a42301add4526d09900561142d1231a5f5a95"
     },
     {
       "id": "numpy",
@@ -97,18 +75,15 @@
       "accepted_compiler_failures": 0,
       "outcomes": {
         "exact": 505,
+        "matched-rejection": 0,
+        "rejection-mismatch": 0,
         "byte-mismatch": 0,
         "unsupported": 0,
         "parse-mismatch": 0,
         "compiler-failure": 0,
-        "matched-rejection": 0,
-        "rejection-mismatch": 0,
         "non-utf8": 0,
         "oracle-failure": 0
-      },
-      "measured_roots": [
-        "/home/dev-user/.codex/worktrees/0b2a/serc/target/benchmarks/numpy/numpy"
-      ]
+      }
     },
     {
       "id": "mypy-primer",
@@ -116,7 +91,6 @@
       "repository": "hauntsaninja/mypy_primer",
       "catalog_commit": "ff3d9531335dad605d43fcc208c9c159bb09fa81",
       "project_revisions": "corpora/mypy-primer.lock.json",
-      "lock_sha256": "d72172de57d547219c667b2219640908c9fa37a75f292a4e7b7876c2860e26aa",
       "source_content_sha256": "58699031040d02c1a4d18c9a5425d0250393316b04e0bee4819474c188f6484b",
       "source_bytes": 691638412,
       "source_mode": "bytes",
@@ -125,19 +99,16 @@
       "cpython_rejected": 160,
       "accepted_compiler_failures": 0,
       "outcomes": {
-        "exact": 73162,
-        "byte-mismatch": 215,
+        "exact": 73364,
+        "matched-rejection": 123,
+        "rejection-mismatch": 29,
+        "byte-mismatch": 13,
         "unsupported": 0,
         "parse-mismatch": 0,
         "compiler-failure": 8,
-        "matched-rejection": 123,
-        "rejection-mismatch": 29,
         "non-utf8": 0,
         "oracle-failure": 0
-      },
-      "measured_roots": [
-        "/home/dev-user/.codex/worktrees/0b2a/serc/target/corpora/mypy-primer/checkouts/<locked repository id>"
-      ]
+      }
     },
     {
       "id": "django",
@@ -159,10 +130,7 @@
         "parse-mismatch": 0,
         "rejection-mismatch": 0,
         "unsupported": 0
-      },
-      "measured_roots": [
-        "/home/dev-user/.codex/visualizations/2026/09/20/01a0bff8-af34-7092-870a-e441b4dec4ca/public-fixes-20260921/holdouts/django/checkout"
-      ]
+      }
     },
     {
       "id": "airflow",
@@ -175,19 +143,16 @@
       "cpython_rejected": 0,
       "accepted_compiler_failures": 0,
       "outcomes": {
-        "byte-mismatch": 7,
+        "byte-mismatch": 0,
         "compiler-failure": 0,
-        "exact": 7614,
+        "exact": 7621,
         "matched-rejection": 0,
         "non-utf8": 0,
         "oracle-failure": 0,
         "parse-mismatch": 0,
         "rejection-mismatch": 0,
         "unsupported": 0
-      },
-      "measured_roots": [
-        "/home/dev-user/.codex/visualizations/2026/09/20/01a0bff8-af34-7092-870a-e441b4dec4ca/public-fixes-20260921/holdouts/airflow/checkout"
-      ]
+      }
     },
     {
       "id": "transformers",
@@ -200,19 +165,16 @@
       "cpython_rejected": 0,
       "accepted_compiler_failures": 0,
       "outcomes": {
-        "byte-mismatch": 4,
+        "byte-mismatch": 0,
         "compiler-failure": 0,
-        "exact": 4639,
+        "exact": 4643,
         "matched-rejection": 0,
         "non-utf8": 0,
         "oracle-failure": 0,
         "parse-mismatch": 0,
         "rejection-mismatch": 0,
         "unsupported": 0
-      },
-      "measured_roots": [
-        "/home/dev-user/.codex/visualizations/2026/09/20/01a0bff8-af34-7092-870a-e441b4dec4ca/public-fixes-20260921/holdouts/transformers/checkout"
-      ]
+      }
     },
     {
       "id": "ansible",
@@ -225,19 +187,16 @@
       "cpython_rejected": 0,
       "accepted_compiler_failures": 0,
       "outcomes": {
-        "byte-mismatch": 9,
+        "byte-mismatch": 0,
         "compiler-failure": 0,
-        "exact": 1801,
+        "exact": 1810,
         "matched-rejection": 0,
         "non-utf8": 0,
         "oracle-failure": 0,
         "parse-mismatch": 0,
         "rejection-mismatch": 0,
         "unsupported": 0
-      },
-      "measured_roots": [
-        "/home/dev-user/.codex/visualizations/2026/09/20/01a0bff8-af34-7092-870a-e441b4dec4ca/public-fixes-20260921/holdouts/ansible/checkout"
-      ]
+      }
     }
   ],
   "accounting": "Each outcomes object is disjoint and sums to files. cpython_rejected is an independent overlapping total. Accepted-input rate is exact / (files - cpython_rejected); accepted compiler failures remain in that denominator.",
@@ -245,25 +204,18 @@
     "public": {
       "files": 76493,
       "cpython_rejected": 381,
-      "exact": 75897,
-      "byte_mismatches": 215,
+      "exact": 76099,
+      "byte_mismatches": 13,
       "accepted_compiler_failures": 0,
-      "accepted_input_match_rate": "99.72%"
+      "accepted_input_match_rate": "99.98%"
     },
     "holdout": {
       "files": 17001,
       "cpython_rejected": 1,
-      "exact": 16980,
-      "byte_mismatches": 20,
+      "exact": 17000,
+      "byte_mismatches": 0,
       "accepted_compiler_failures": 0,
-      "accepted_input_match_rate": "99.88%"
+      "accepted_input_match_rate": "100%"
     }
-  },
-  "change_from_prior": {
-    "mypy_accepted_failures_fixed": 65,
-    "holdout_accepted_failures_fixed": 15,
-    "new_accepted_failure_paths": 0,
-    "corpus_pins_or_membership_changes": false,
-    "new_exclusions": false
   }
 }

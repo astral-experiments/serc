@@ -25,6 +25,22 @@ use super::scope::{ModulePlan, ScopeArena};
 use super::symbol::mangle_name;
 use super::{CachedSourceLine, Compiler};
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum StringConstantOrigin {
+    #[default]
+    Unrecorded,
+    Uninterned,
+    Interned,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum EmptyBytesOrigin {
+    #[default]
+    Unrecorded,
+    Singleton,
+    Fresh,
+}
+
 #[derive(Debug, Default)]
 struct ConstantOrigins {
     all_strings: bool,
@@ -105,7 +121,7 @@ pub(super) struct CompilationContext<'source> {
     pub(super) tokens: &'source Tokens,
     line_index: LineIndex,
     pub(super) scopes: ScopeArena,
-    constant_string_origins: FxHashMap<String, Cell<u8>>,
+    constant_string_origins: FxHashMap<String, Cell<StringConstantOrigin>>,
     // Class qualified-name and synthesized character identity depend on the first cache admission,
     // even when that constant or the defining class is later removed as unreachable.
     constant_origins: Option<RefCell<ConstantOrigins>>,
@@ -119,7 +135,7 @@ pub(super) struct CompilationContext<'source> {
     // Restricted generic-class identifiers also require real child lowering for key origins.
     pub(super) requires_interning_trace: bool,
     pub(super) requires_empty_bytes_cache_trace: bool,
-    empty_bytes_origin: Cell<u8>,
+    empty_bytes_origin: Cell<EmptyBytesOrigin>,
     interning_events: RefCell<Vec<CompilationInterningEvent>>,
 }
 
@@ -199,7 +215,7 @@ impl<'source> CompilationContext<'source> {
             requires_interning_trace,
             requires_empty_bytes_cache_trace: python_version >= crate::PythonVersion::Py314
                 && suite_folds_empty_bytes(body, python_version),
-            empty_bytes_origin: Cell::new(0),
+            empty_bytes_origin: Cell::default(),
             interning_events: RefCell::new(Vec::new()),
         }
     }
@@ -210,17 +226,25 @@ impl<'source> CompilationContext<'source> {
 
     /// Preserve the first empty object admitted to CPython's compilation-wide constant cache.
     pub(super) fn record_empty_bytes_origin(&self, fresh: bool) {
-        if self.requires_empty_bytes_cache_trace && self.empty_bytes_origin.get() == 0 {
-            self.empty_bytes_origin.set(if fresh { 2 } else { 1 });
+        if self.requires_empty_bytes_cache_trace
+            && self.empty_bytes_origin.get() == EmptyBytesOrigin::Unrecorded
+        {
+            self.empty_bytes_origin.set(if fresh {
+                EmptyBytesOrigin::Fresh
+            } else {
+                EmptyBytesOrigin::Singleton
+            });
         }
     }
 
     pub(super) fn fresh_empty_bytes_constant(&self) -> bool {
-        self.empty_bytes_origin.get() == 2
+        self.empty_bytes_origin.get() == EmptyBytesOrigin::Fresh
     }
 
     pub(super) fn record_constant_empty_bytes_origin(&self, constant: &Constant) {
-        if !self.requires_empty_bytes_cache_trace || self.empty_bytes_origin.get() != 0 {
+        if !self.requires_empty_bytes_cache_trace
+            || self.empty_bytes_origin.get() != EmptyBytesOrigin::Unrecorded
+        {
             return;
         }
         match constant {
@@ -239,16 +263,20 @@ impl<'source> CompilationContext<'source> {
     /// even when the first load is removed by control-flow optimization.
     pub(super) fn record_constant_string_origin(&self, value: &str, interned: bool) {
         if let Some(origin) = self.constant_string_origins.get(value)
-            && origin.get() == 0
+            && origin.get() == StringConstantOrigin::Unrecorded
         {
-            origin.set(if interned { 2 } else { 1 });
+            origin.set(if interned {
+                StringConstantOrigin::Interned
+            } else {
+                StringConstantOrigin::Uninterned
+            });
         }
     }
 
     pub(super) fn constant_string_origin_is_interned(&self, value: &str) -> bool {
         self.constant_string_origins
             .get(value)
-            .is_some_and(|origin| origin.get() == 2)
+            .is_some_and(|origin| origin.get() == StringConstantOrigin::Interned)
     }
 
     pub(super) fn record_identifier_constant_origin(&self, raw: &str, mangled: &str) {
@@ -530,7 +558,7 @@ impl<'source> CompilationContext<'source> {
         )]
         for (value, origin) in origins {
             let generated = context.generated_mangled_strings.contains(&value);
-            if origin.into_inner() == 2 {
+            if origin.into_inner() == StringConstantOrigin::Interned {
                 if generated {
                     canonical.insert(value);
                 } else {
@@ -556,10 +584,10 @@ fn parser_interned_strings(
     requires_interning_trace: &mut bool,
     static_attribute_names: &mut FxHashSet<String>,
     has_percent_replacement: &mut bool,
-) -> FxHashMap<String, Cell<u8>> {
+) -> FxHashMap<String, Cell<StringConstantOrigin>> {
     #[derive(Default)]
     struct ConstantIdentifiers {
-        origins: FxHashMap<String, Cell<u8>>,
+        origins: FxHashMap<String, Cell<StringConstantOrigin>>,
         private_name: Option<String>,
         mangled_names: Option<FxHashSet<String>>,
         generated_mangled_strings: FxHashSet<String>,
@@ -2235,12 +2263,12 @@ mod tests {
         let tokens = Tokens::new(Vec::new());
         let mut context = CompilationContext::new("example.py", "", &tokens, &Suite::new());
         context.constant_string_origins = [
-            ("unused", 0),
-            ("not_interned", 1),
-            ("canonical", 2),
-            ("mangled_unused", 0),
-            ("mangled_not_interned", 1),
-            ("mangled_canonical", 2),
+            ("unused", StringConstantOrigin::Unrecorded),
+            ("not_interned", StringConstantOrigin::Uninterned),
+            ("canonical", StringConstantOrigin::Interned),
+            ("mangled_unused", StringConstantOrigin::Unrecorded),
+            ("mangled_not_interned", StringConstantOrigin::Uninterned),
+            ("mangled_canonical", StringConstantOrigin::Interned),
         ]
         .into_iter()
         .map(|(name, state)| (name.to_string(), Cell::new(state)))

@@ -237,6 +237,9 @@ pub fn compile_with_options(
     filename: &str,
     options: &CompileOptions,
 ) -> Result<CompiledModule, CompileError> {
+    if source.contains('\0') {
+        return Err(CompileError::Decode(SourceDecodeError::NullByte));
+    }
     let source = source::normalize_source(source);
     compile_normalized(&source, filename, options)
 }

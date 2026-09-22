@@ -161,14 +161,14 @@ mod tests {
     fn fragmented_graph() -> BlockGraph {
         BlockGraph::from_items(
             vec![
-                Item::Label(Label(0)),
+                Item::Label(Label::from_u32(0)),
                 Item::Instruction(Instruction::new(
                     NOP,
                     Operand::Value(0),
                     SourceLocation::NONE,
                     None,
                 )),
-                Item::Label(Label(1)),
+                Item::Label(Label::from_u32(1)),
                 Item::Instruction(Instruction::new(
                     RETURN_VALUE,
                     Operand::Value(0),
@@ -183,11 +183,11 @@ mod tests {
     #[test]
     fn native_array_label_survives_an_empty_metadata_head() {
         let mut graph = fragmented_graph();
-        let head = graph.label_block(Label(0)).unwrap();
-        let tail = graph.label_block(Label(1)).unwrap();
+        let head = graph.label_block(Label::from_u32(0)).unwrap();
+        let tail = graph.label_block(Label::from_u32(1)).unwrap();
         let arrays = [(head, 7), (tail, 7)].into_iter().collect();
         let mut native = LegacyNativeLabels::default();
-        native.bind(Label(0), 255);
+        native.bind(Label::from_u32(0), 255);
         native.certify();
         native.initialize_blocks(&graph, &arrays);
         graph.retain_items(head, |item| matches!(item, Item::Label(_)));
@@ -209,17 +209,17 @@ mod tests {
         // distinct native entries in one coarse array, and a real next array.
         for case in 0..4 {
             let mut graph = fragmented_graph();
-            let head = graph.label_block(Label(0)).unwrap();
-            let tail = graph.label_block(Label(1)).unwrap();
+            let head = graph.label_block(Label::from_u32(0)).unwrap();
+            let tail = graph.label_block(Label::from_u32(1)).unwrap();
             let arrays = [(head, 7), (tail, if case == 3 { 8 } else { 7 })]
                 .into_iter()
                 .collect();
             let mut native = LegacyNativeLabels::default();
             if case >= 2 {
-                native.bind(Label(0), 255);
+                native.bind(Label::from_u32(0), 255);
             }
             if case == 1 || case == 2 {
-                native.bind(Label(1), 256);
+                native.bind(Label::from_u32(1), 256);
             }
             native.certify();
             native.initialize_blocks(&graph, &arrays);
@@ -236,15 +236,15 @@ mod tests {
     #[test]
     fn native_fragment_certificate_never_skips_an_intervening_array() {
         let mut graph = fragmented_graph();
-        let head = graph.label_block(Label(0)).unwrap();
-        let tail = graph.label_block(Label(1)).unwrap();
+        let head = graph.label_block(Label::from_u32(0)).unwrap();
+        let tail = graph.label_block(Label::from_u32(1)).unwrap();
         let arrays = [(head, 7), (tail, 7)].into_iter().collect();
         let mut native = LegacyNativeLabels::default();
-        native.bind(Label(0), 255);
+        native.bind(Label::from_u32(0), 255);
         native.certify();
         native.initialize_blocks(&graph, &arrays);
         graph.retain_items(head, |item| matches!(item, Item::Label(_)));
-        graph.insert_block(1, vec![Item::Label(Label(2))]);
+        graph.insert_block(1, vec![Item::Label(Label::from_u32(2))]);
         assert!(!native.target_is_nonempty(&graph, head));
     }
 }

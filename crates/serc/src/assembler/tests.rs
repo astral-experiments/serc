@@ -12,6 +12,13 @@ use crate::target::operands::{CommonConstant, ResumeLocation};
 #[test]
 #[cfg(target_pointer_width = "64")]
 fn instruction_items_remain_cache_compact() {
+    assert_eq!(std::mem::size_of::<Option<super::Label>>(), 4);
+    assert_eq!(std::mem::size_of::<Option<OperandPatchId>>(), 4);
+    assert_eq!(
+        std::mem::size_of::<Option<super::block_graph::BasicBlockId>>(),
+        4
+    );
+
     // Five copied-slot counts plus the original-entry state give six metadata states.
     // 23 policies * 6 states * 2 copy modes require 276 nonzero values, so metadata
     // uses NonZeroU16. The intentional 32-to-36-byte increase costs 12.5% per item.
@@ -117,7 +124,7 @@ fn compact_initial_borrow_metadata_keeps_all_logical_fields_independent() {
             for count in 0..=5 {
                 let mut instruction = Instruction::new(
                     JUMP_FORWARD,
-                    Operand::Forward(super::Label(u32::MAX)),
+                    Operand::Forward(super::Label::from_u32(u32::MAX - 1)),
                     SourceLocation::NONE,
                     None,
                 );
@@ -126,10 +133,10 @@ fn compact_initial_borrow_metadata_keeps_all_logical_fields_independent() {
                 }
                 instruction.set_exception_policy(policy);
                 instruction.add_pre_fold_extra_instructions(count);
-                instruction.mark_initial_borrow_jump_target(super::Label(u32::MAX));
+                instruction.mark_initial_borrow_jump_target(super::Label::from_u32(u32::MAX - 1));
                 assert_eq!(
                     instruction.initial_borrow_jump_target(),
-                    (count == 0).then_some(super::Label(u32::MAX))
+                    (count == 0).then_some(super::Label::from_u32(u32::MAX - 1))
                 );
                 assert_eq!(instruction.exception_policy(), policy);
                 assert_eq!(instruction.pre_fold_extra_instructions(), count.min(4));
@@ -156,7 +163,7 @@ fn compact_initial_borrow_metadata_keeps_all_logical_fields_independent() {
                 );
                 assert_eq!(
                     instruction.initial_borrow_jump_target(),
-                    (count == 0).then_some(super::Label(u32::MAX))
+                    (count == 0).then_some(super::Label::from_u32(u32::MAX - 1))
                 );
                 instruction.add_pre_fold_extra_instructions(1);
                 assert_eq!(instruction.initial_borrow_jump_target(), None);
@@ -171,9 +178,9 @@ fn compact_initial_borrow_metadata_keeps_all_logical_fields_independent() {
 fn compact_operands_preserve_full_width_payloads() {
     let operands = [
         Operand::Value(u32::MAX),
-        Operand::Deferred(OperandPatchId(u32::MAX)),
-        Operand::Forward(super::Label(u32::MAX)),
-        Operand::Backward(super::Label(u32::MAX)),
+        Operand::Deferred(OperandPatchId::from_u32(u32::MAX - 1)),
+        Operand::Forward(super::Label::from_u32(u32::MAX - 1)),
+        Operand::Backward(super::Label::from_u32(u32::MAX - 1)),
     ];
     let mut instruction = Instruction::new(NOP, operands[0], SourceLocation::NONE, None);
     for operand in operands {
@@ -357,7 +364,7 @@ fn jump_policy_fusion_is_exhaustive() {
 
 #[test]
 fn retained_jump_nop_distinguishes_direct_target_provenance() {
-    let expected = super::Label(1);
+    let expected = super::Label::from_u32(1);
     let mut instruction = Instruction::new(
         JUMP_FORWARD,
         Operand::Forward(expected),
@@ -376,7 +383,7 @@ fn retained_jump_nop_distinguishes_direct_target_provenance() {
         instruction.jump_policy.retained_nop(),
         RetainedJumpNop::DirectTarget
     );
-    instruction.retarget(Operand::Forward(super::Label(2)));
+    instruction.retarget(Operand::Forward(super::Label::from_u32(2)));
     assert_eq!(
         instruction.jump_policy.retained_nop(),
         RetainedJumpNop::None
@@ -1155,7 +1162,7 @@ fn operand_patches_reject_duplicate_and_unknown_attachments() {
     let Item::Instruction(mut instruction) = unknown.linear_items()[0] else {
         unreachable!();
     };
-    instruction.set_operand(Operand::Deferred(OperandPatchId(1)));
+    instruction.set_operand(Operand::Deferred(OperandPatchId::from_u32(1)));
     unknown.push_linear_item(Item::Instruction(instruction));
     let error = unknown.resolve_operand_patches().unwrap_err();
     assert!(error.to_string().contains("unknown operand patch"));
@@ -1638,7 +1645,7 @@ fn fused_final_artifacts_preserve_cache_extended_argument_location_and_depth_sem
                 first_location,
                 Some(3),
             )),
-            Item::Label(super::Label(0)),
+            Item::Label(super::Label::from_u32(0)),
             Item::Instruction(Instruction::new(
                 LOAD_CONST,
                 Operand::Value(0x1234),
@@ -1706,7 +1713,7 @@ fn fused_final_artifacts_preserve_cache_extended_argument_location_and_depth_sem
 fn unextended_final_artifacts_preserve_jump_cache_location_and_depth_semantics() {
     let first_location = SourceLocation::new(7, 7, 0, 1);
     let second_location = SourceLocation::new(8, 8, 2, 4);
-    let target = super::Label(0);
+    let target = super::Label::from_u32(0);
     let assembler = super::LayoutAssembler {
         python_version: crate::PythonVersion::Py314,
         legacy_uniform_jump_seed: false,
@@ -1952,9 +1959,9 @@ fn discarded_value_emission_matches_handle_emission() {
 }
 
 fn assembler_with_preserved_constant_boundary() -> Assembler {
-    let entry = super::Label(0);
-    let preserved = super::Label(1);
-    let target = super::Label(2);
+    let entry = super::Label::from_u32(0);
+    let preserved = super::Label::from_u32(1);
+    let target = super::Label::from_u32(2);
     let mut assembler = Assembler::from_linear_items(vec![
         Item::Label(entry),
         Item::Label(preserved),
@@ -2021,7 +2028,7 @@ fn straight_line_constant_reachability_uses_dense_indices() {
 
 #[test]
 fn assertion_constant_reachability_keeps_the_optimization_stream_linear() {
-    let target = super::Label(0);
+    let target = super::Label::from_u32(0);
     let assembler = || {
         let mut assembler = Assembler::from_linear_items(vec![
             pass_instruction(LOAD_CONST, 0, 1),
@@ -2059,8 +2066,8 @@ fn assertion_constant_reachability_keeps_the_optimization_stream_linear() {
 
 #[test]
 fn assertion_constant_reachability_rejects_mixed_control_flow() {
-    let assertion_target = super::Label(0);
-    let other_target = super::Label(1);
+    let assertion_target = super::Label::from_u32(0);
+    let other_target = super::Label::from_u32(1);
     let mut assembler = Assembler::from_linear_items(vec![
         pass_instruction(LOAD_CONST, 0, 1),
         Item::Instruction(Instruction::new(
@@ -2098,7 +2105,7 @@ fn assertion_constant_reachability_rejects_mixed_control_flow() {
 #[test]
 fn assertion_constant_reachability_keeps_swap_and_borrow_markers_off_the_linear_fast_path() {
     for borrow_marker in [false, true] {
-        let target = super::Label(0);
+        let target = super::Label::from_u32(0);
         let mut jump = Instruction::new(
             POP_JUMP_IF_TRUE,
             Operand::Forward(target),
@@ -2153,9 +2160,9 @@ fn optimization_pipeline(items: Vec<Item>) -> super::OptimizationPipeline {
     let next_label = items
         .iter()
         .filter_map(|item| match item {
-            Item::Label(label) => Some(label.0 + 1),
+            Item::Label(label) => Some(label.as_u32() + 1),
             Item::Instruction(instruction) => match instruction.operand() {
-                Operand::Forward(label) | Operand::Backward(label) => Some(label.0 + 1),
+                Operand::Forward(label) | Operand::Backward(label) => Some(label.as_u32() + 1),
                 Operand::Value(_) | Operand::Deferred(_) => None,
             },
         })
@@ -2238,7 +2245,7 @@ fn mapping_capture_rotations_require_complete_unchanged_same_line_shapes() {
             }
             7 => items[14] = pass_instruction(LOAD_CONST, 0, 3),
             8 => {
-                items.insert(9, Item::Label(super::Label(0)));
+                items.insert(9, Item::Label(super::Label::from_u32(0)));
             }
             _ => unreachable!(),
         }
@@ -2254,8 +2261,8 @@ fn mapping_capture_rotations_require_complete_unchanged_same_line_shapes() {
 
 #[test]
 fn while_else_conjunction_footer_requires_exact_ordered_failure_edges() {
-    let failure = super::Label(0);
-    let end = super::Label(1);
+    let failure = super::Label::from_u32(0);
+    let end = super::Label::from_u32(1);
     let first_location = SourceLocation::new(10, 10, 15, 20);
     let second_location = SourceLocation::new(11, 11, 19, 24);
     let conditions = [
@@ -2374,7 +2381,7 @@ fn while_else_conjunction_footer_requires_exact_ordered_failure_edges() {
                 )),
             ),
             "second break" => items.insert(1, Item::Instruction(break_jump)),
-            "extra footer alias" => items.push(Item::Label(super::Label(2))),
+            "extra footer alias" => items.push(Item::Label(super::Label::from_u32(2))),
             _ => {}
         }
         let mut assembler = Assembler::from_linear_items(items);
@@ -2735,9 +2742,9 @@ fn class_failure_return_join_requires_original_pop_and_class_edges() {
 
 #[test]
 fn shared_match_failure_join_requires_original_aliases_and_equal_depths() {
-    let failure = super::Label(0);
-    let end = super::Label(1);
-    let cleanup = super::Label(2);
+    let failure = super::Label::from_u32(0);
+    let end = super::Label::from_u32(1);
+    let cleanup = super::Label::from_u32(2);
     let condition = Instruction::new(
         POP_JUMP_IF_FALSE,
         Operand::Forward(failure),
@@ -3220,7 +3227,7 @@ fn static_swap_store_gaps_accept_only_transported_copy_entry_labels() {
     let (blocks, cleanup, _) = pipeline.optimize_swap_runs();
     let mut gaps = pipeline.apply_static_swaps((blocks, cleanup));
     let block = pipeline.graph.order()[0];
-    let entry = super::Label(0);
+    let entry = super::Label::from_u32(0);
     for gap in &mut gaps {
         gap.prepend_copy_entry(&pipeline.graph, block, entry);
     }
@@ -3255,7 +3262,9 @@ fn static_swap_store_gaps_require_unchanged_original_prefixes() {
                     .location
                     .column += 1;
             }
-            2 => pipeline.graph.insert_label(block, 0, super::Label(0)),
+            2 => pipeline
+                .graph
+                .insert_label(block, 0, super::Label::from_u32(0)),
             3 => {
                 let copied = pipeline.graph[block].items().to_vec();
                 pipeline.graph.retain_order(|candidate| candidate != block);
@@ -3272,7 +3281,7 @@ fn static_swap_store_gaps_require_unchanged_original_prefixes() {
 #[test]
 fn backward_conditional_normalization_preserves_successor_labels() {
     for labelled_successor in [false, true] {
-        let restart = super::Label(0);
+        let restart = super::Label::from_u32(0);
         let mut items = vec![
             Item::Label(restart),
             pass_instruction(LOAD_FAST, 0, 1),
@@ -3284,7 +3293,7 @@ fn backward_conditional_normalization_preserves_successor_labels() {
             )),
         ];
         if labelled_successor {
-            items.push(Item::Label(super::Label(1)));
+            items.push(Item::Label(super::Label::from_u32(1)));
         }
         items.extend([
             pass_instruction(NOT_TAKEN, 0, 1),
@@ -3321,10 +3330,10 @@ fn backward_conditional_normalization_preserves_successor_labels() {
 #[test]
 fn assertion_side_exit_fast_path_accepts_all_conditional_directions() {
     let targets = [
-        super::Label(0),
-        super::Label(1),
-        super::Label(2),
-        super::Label(3),
+        super::Label::from_u32(0),
+        super::Label::from_u32(1),
+        super::Label::from_u32(2),
+        super::Label::from_u32(3),
     ];
     let mut items = Vec::new();
     for (line, (opcode, target)) in [
@@ -3363,8 +3372,8 @@ fn assertion_side_exit_fast_path_accepts_all_conditional_directions() {
 
 #[test]
 fn assertion_side_exit_fast_path_rejects_mixed_control_flow() {
-    let assertion_target = super::Label(0);
-    let other_target = super::Label(1);
+    let assertion_target = super::Label::from_u32(0);
+    let other_target = super::Label::from_u32(1);
     let assertion = [
         pass_instruction(LOAD_FAST, 0, 1),
         Item::Instruction(Instruction::new(
@@ -3426,7 +3435,7 @@ fn assertion_side_exit_fast_path_rejects_single_block_without_scanning() {
 
 #[test]
 fn assertion_side_exit_fast_path_rejects_annotation_guard_without_scanning() {
-    let target = super::Label(0);
+    let target = super::Label::from_u32(0);
     let assembler = optimization_pipeline(vec![
         pass_instruction(LOAD_FAST, 0, 1),
         Item::Instruction(Instruction::new(
@@ -3448,7 +3457,7 @@ fn assertion_side_exit_fast_path_rejects_annotation_guard_without_scanning() {
 
 #[test]
 fn assertion_side_exit_fast_path_rejects_exception_regions() {
-    let target = super::Label(0);
+    let target = super::Label::from_u32(0);
     let mut assembler = optimization_pipeline(vec![
         pass_instruction(LOAD_FAST, 0, 1),
         Item::Instruction(Instruction::new(
@@ -3483,7 +3492,7 @@ fn assertion_side_exit_fast_path_rejects_exception_regions() {
 
 #[test]
 fn assertion_side_exit_fast_path_propagates_final_condition_location() {
-    let target = super::Label(0);
+    let target = super::Label::from_u32(0);
     let location = SourceLocation::new(7, 7, 4, 19);
     let mut assembler = optimization_pipeline(vec![
         pass_instruction(LOAD_FAST, 0, 7),
@@ -3545,8 +3554,8 @@ fn graph_opcodes(assembler: &super::OptimizationPipeline) -> Vec<crate::target::
 
 #[test]
 fn threads_unconditional_forward_jumps_without_conditional_jumps() {
-    let first_target = super::Label(0);
-    let final_target = super::Label(1);
+    let first_target = super::Label::from_u32(0);
+    let final_target = super::Label::from_u32(1);
     let mut assembler = optimization_pipeline(vec![
         Item::Instruction(Instruction::new(
             JUMP_FORWARD,
@@ -3741,10 +3750,10 @@ fn folded_condition_loop_tails_require_original_provenance_before_threading() {
 fn threads_forward_operands_with_backward_jump_kinds() {
     for source_opcode in [JUMP_FORWARD, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT] {
         for intermediate in [None, Some(JUMP_BACKWARD)] {
-            let entry = super::Label(0);
-            let source_label = super::Label(1);
-            let first_target = super::Label(2);
-            let last_target = super::Label(3);
+            let entry = super::Label::from_u32(0);
+            let source_label = super::Label::from_u32(1);
+            let first_target = super::Label::from_u32(2);
+            let last_target = super::Label::from_u32(3);
             let mut source = Instruction::new(
                 source_opcode,
                 Operand::Forward(first_target),
@@ -3803,9 +3812,9 @@ fn threads_forward_operands_with_backward_jump_kinds() {
 #[test]
 fn forward_operand_threading_preserves_barriers_and_unthreaded_metadata() {
     for control in 0..4 {
-        let entry = super::Label(0);
-        let source_label = super::Label(1);
-        let target = super::Label(2);
+        let entry = super::Label::from_u32(0);
+        let source_label = super::Label::from_u32(1);
+        let target = super::Label::from_u32(2);
         let mut source = Instruction::new(
             JUMP_BACKWARD,
             if control == 2 {
@@ -3857,8 +3866,8 @@ fn forward_operand_threading_preserves_barriers_and_unthreaded_metadata() {
 
 #[test]
 fn a_threaded_target_cycle_keeps_direct_target_retention() {
-    let first = super::Label(0);
-    let second = super::Label(1);
+    let first = super::Label::from_u32(0);
+    let second = super::Label::from_u32(1);
     let mut source = Instruction::new(
         JUMP_BACKWARD,
         Operand::Forward(first),
@@ -3904,9 +3913,9 @@ fn a_threaded_target_cycle_keeps_direct_target_retention() {
 
 #[test]
 fn threads_unconditional_forward_jumps_without_conditional_targets() {
-    let conditional_target = super::Label(0);
-    let first_target = super::Label(1);
-    let final_target = super::Label(2);
+    let conditional_target = super::Label::from_u32(0);
+    let first_target = super::Label::from_u32(1);
+    let final_target = super::Label::from_u32(2);
     let mut assembler = optimization_pipeline(vec![
         Item::Instruction(Instruction::new(
             POP_JUMP_IF_FALSE,
@@ -3950,8 +3959,8 @@ fn threads_unconditional_forward_jumps_without_conditional_targets() {
 
 #[test]
 fn threads_opposite_conditional_jumps_through_a_new_fallthrough_label() {
-    let inner_target = super::Label(0);
-    let final_target = super::Label(1);
+    let inner_target = super::Label::from_u32(0);
+    let final_target = super::Label::from_u32(1);
     let mut assembler = optimization_pipeline(vec![
         pass_instruction(COPY, 1, 1),
         pass_instruction(TO_BOOL, 0, 1),
@@ -3980,7 +3989,7 @@ fn threads_opposite_conditional_jumps_through_a_new_fallthrough_label() {
 
     assert!(assembler.thread_forward_jumps());
 
-    let fallthrough = super::Label(2);
+    let fallthrough = super::Label::from_u32(2);
     let items = assembler.graph.iter_items().copied().collect::<Vec<_>>();
     let jumps = items
         .iter()
@@ -4009,9 +4018,9 @@ fn threads_opposite_conditional_jumps_through_a_new_fallthrough_label() {
 
 #[test]
 fn threads_chained_conditional_jumps_to_the_final_target() {
-    let middle_target = super::Label(0);
-    let inner_target = super::Label(1);
-    let final_target = super::Label(2);
+    let middle_target = super::Label::from_u32(0);
+    let inner_target = super::Label::from_u32(1);
+    let final_target = super::Label::from_u32(2);
     let mut assembler = optimization_pipeline(vec![
         pass_instruction(COPY, 1, 1),
         pass_instruction(TO_BOOL, 0, 1),
@@ -4082,7 +4091,7 @@ fn threads_chained_conditional_jumps_to_the_final_target() {
 
 #[test]
 fn threading_reports_no_edge_change_for_terminal_targets() {
-    let target = super::Label(0);
+    let target = super::Label::from_u32(0);
     let mut direct_jump = optimization_pipeline(vec![
         Item::Instruction(Instruction::new(
             JUMP_FORWARD,
@@ -4111,8 +4120,8 @@ fn threading_reports_no_edge_change_for_terminal_targets() {
 
 #[test]
 fn threaded_edge_change_retains_second_reachability_cleanup_and_removed_depth() {
-    let bypassed = super::Label(0);
-    let target = super::Label(1);
+    let bypassed = super::Label::from_u32(0);
+    let target = super::Label::from_u32(1);
     let mut assembler = optimization_pipeline(vec![
         Item::Instruction(Instruction::new(
             JUMP_FORWARD,
@@ -4138,7 +4147,7 @@ fn threaded_edge_change_retains_second_reachability_cleanup_and_removed_depth() 
 
 #[test]
 fn redundant_jump_removal_preserves_borrow_traversal_barrier() {
-    let target = super::Label(0);
+    let target = super::Label::from_u32(0);
     let mut jump = Instruction::new(
         JUMP_FORWARD,
         Operand::Forward(target),
@@ -4175,9 +4184,9 @@ fn redundant_jump_removal_preserves_borrow_traversal_barrier() {
 
 #[test]
 fn redundant_jump_removal_streams_consecutive_cross_block_jumps() {
-    let intervening_label = super::Label(0);
-    let first_target = super::Label(1);
-    let second_target = super::Label(2);
+    let intervening_label = super::Label::from_u32(0);
+    let first_target = super::Label::from_u32(1);
+    let second_target = super::Label::from_u32(2);
     let location = SourceLocation::new(7, 7, 0, 0);
     let mut first = Instruction::new(JUMP_FORWARD, Operand::Forward(first_target), location, None);
     first.exclude_from_exception_table(ExceptionExclusion::IfExtended);
@@ -4242,7 +4251,7 @@ fn redundant_jump_removal_streams_consecutive_cross_block_jumps() {
 
 #[test]
 fn deferred_nonadjacent_forward_jump_is_still_resolved() {
-    let target = super::Label(0);
+    let target = super::Label::from_u32(0);
     let mut jump = Instruction::new(
         JUMP_FORWARD,
         Operand::Forward(target),
@@ -4275,7 +4284,7 @@ fn deferred_nonadjacent_forward_jump_is_still_resolved() {
 
 #[test]
 fn borrow_empty_block_marker_survives_until_local_analysis() {
-    let target = super::Label(0);
+    let target = super::Label::from_u32(0);
     let mut jump = Instruction::new(
         JUMP_FORWARD,
         Operand::Forward(target),
@@ -4332,7 +4341,7 @@ fn borrow_empty_block_marker_survives_until_local_analysis() {
 
 #[test]
 fn uninitialized_load_analysis_follows_single_block_backedges() {
-    let label = super::Label(0);
+    let label = super::Label::from_u32(0);
     let mut assembler = optimization_pipeline(vec![
         Item::Label(label),
         pass_instruction(LOAD_FAST, 0, 1),
@@ -4355,7 +4364,7 @@ fn uninitialized_load_analysis_follows_single_block_backedges() {
 
 #[test]
 fn uninitialized_load_analysis_resets_locals_above_the_fast_mask_at_block_entry() {
-    let target = super::Label(0);
+    let target = super::Label::from_u32(0);
     let mut assembler = optimization_pipeline(vec![
         pass_instruction(STORE_FAST, 63, 1),
         pass_instruction(STORE_FAST, 64, 1),
@@ -4388,7 +4397,7 @@ fn uninitialized_load_analysis_resets_locals_above_the_fast_mask_at_block_entry(
 
 #[test]
 fn assertion_uninitialized_load_analysis_preserves_low_and_high_local_semantics() {
-    let target = super::Label(0);
+    let target = super::Label::from_u32(0);
     let mut assembler = optimization_pipeline(vec![
         pass_instruction(STORE_FAST, 63, 1),
         pass_instruction(STORE_FAST, 64, 1),
@@ -4435,7 +4444,7 @@ fn assertion_uninitialized_load_analysis_preserves_low_and_high_local_semantics(
 
 #[test]
 fn linear_assertion_optimizer_matches_the_block_graph_pipeline() {
-    let target = super::Label(0);
+    let target = super::Label::from_u32(0);
     let items = vec![
         pass_instruction(LOAD_FAST, 0, 1),
         pass_instruction(TO_BOOL, 0, 1),
@@ -4593,7 +4602,7 @@ fn linear_constant_return_rejects_nontrivial_instructions_and_metadata() {
         pass_instruction(LOAD_FAST, 0, 2),
         pass_instruction(UNPACK_SEQUENCE, 1, 2),
         pass_instruction(NOP, 0, -1),
-        Item::Label(super::Label(0)),
+        Item::Label(super::Label::from_u32(0)),
     ] {
         let mut items = original();
         items[1] = replacement;
@@ -4714,11 +4723,11 @@ fn swap_runs_report_only_changed_slots() {
 fn redundant_swap_removal_preserves_forward_scan_semantics() {
     let mut assembler = optimization_pipeline(vec![
         pass_instruction(SWAP, 2, 1),
-        Item::Label(super::Label(0)),
+        Item::Label(super::Label::from_u32(0)),
         pass_instruction(SWAP, 2, 1),
         pass_instruction(SWAP, 2, 1),
         pass_instruction(POP_TOP, 0, 1),
-        Item::Label(super::Label(1)),
+        Item::Label(super::Label::from_u32(1)),
         pass_instruction(POP_TOP, 0, 1),
     ]);
 
@@ -4807,7 +4816,7 @@ fn redundant_nop_removal_preserves_forward_scan_semantics() {
     converted.fusion_policy.mark_converted_pop_block();
     let mut assembler = optimization_pipeline(vec![
         pass_instruction(NOP, 0, 1),
-        Item::Label(super::Label(0)),
+        Item::Label(super::Label::from_u32(0)),
         pass_instruction(NOP, 0, -1),
         pass_instruction(LOAD_CONST, 0, 1),
         pass_instruction(NOP, 0, -1),
@@ -4842,10 +4851,10 @@ fn consecutive_pop_slot_width_respects_original_array_boundaries() {
         instruction.fusion_policy.mark_converted_pop_block();
         Item::Instruction(instruction)
     };
-    let setup = Label(0);
-    let end = Label(1);
-    let interior = Label(2);
-    let handler = Label(3);
+    let setup = Label::from_u32(0);
+    let end = Label::from_u32(1);
+    let interior = Label::from_u32(2);
+    let handler = Label::from_u32(3);
     let location = SourceLocation::new(1, 1, 0, 0);
     for (case, expected_width) in [
         ("contiguous", Some(2)),
@@ -4896,8 +4905,8 @@ fn consecutive_pop_slot_width_respects_original_array_boundaries() {
         }
         items.push(Item::Label(interior));
         if case == "bookkeeping_alias" {
-            items.push(Item::Label(Label(4)));
-            items.push(Item::Label(Label(5)));
+            items.push(Item::Label(Label::from_u32(4)));
+            items.push(Item::Label(Label::from_u32(5)));
         }
         let count = if case == "count_does_not_fit" {
             usize::from(LocalPolicy::MAX_HIDDEN_EXCEPTION_OWNER_SLOTS)
@@ -4986,9 +4995,9 @@ fn duplicated_finally_exits_keep_internal_jump_labels_local() {
 #[test]
 fn empty_exception_regions_follow_their_original_entry() {
     for reachable_entry in [false, true] {
-        let start = super::Label(0);
-        let end = super::Label(1);
-        let handler = super::Label(2);
+        let start = super::Label::from_u32(0);
+        let end = super::Label::from_u32(1);
+        let handler = super::Label::from_u32(2);
         let mut items = Vec::new();
         if !reachable_entry {
             items.extend([
@@ -5161,10 +5170,10 @@ fn copied_return_pop_origins_retire_only_with_erased_unreachable_arrays() {
 
 #[test]
 fn no_location_block_inlining_reaches_a_fixed_point() {
-    let restart = super::Label(0);
-    let source = super::Label(1);
-    let first_cleanup = super::Label(2);
-    let second_cleanup = super::Label(3);
+    let restart = super::Label::from_u32(0);
+    let source = super::Label::from_u32(1);
+    let first_cleanup = super::Label::from_u32(2);
+    let second_cleanup = super::Label::from_u32(3);
     let mut first_cleanup_jump = Instruction::new(
         JUMP_FORWARD,
         Operand::Forward(second_cleanup),
@@ -5256,11 +5265,11 @@ fn no_location_block_inlining_reaches_a_fixed_point() {
 #[test]
 fn shared_inlined_cleanup_locations_distinguish_exit_and_continuation() {
     for terminal in [JUMP_BACKWARD_NO_INTERRUPT, RERAISE, JUMP_BACKWARD] {
-        let restart = super::Label(0);
-        let condition = super::Label(1);
-        let body = super::Label(2);
-        let first_cleanup = super::Label(3);
-        let second_cleanup = super::Label(4);
+        let restart = super::Label::from_u32(0);
+        let condition = super::Label::from_u32(1);
+        let body = super::Label::from_u32(2);
+        let first_cleanup = super::Label::from_u32(3);
+        let second_cleanup = super::Label::from_u32(4);
         let mut first_jump = Instruction::new(
             JUMP_FORWARD,
             Operand::Forward(second_cleanup),
@@ -5337,11 +5346,11 @@ fn shared_inlined_cleanup_locations_distinguish_exit_and_continuation() {
 
 #[test]
 fn no_location_block_inlining_crosses_exception_splits() {
-    let restart = super::Label(0);
-    let source = super::Label(1);
-    let cleanup = super::Label(2);
-    let outer_unwind = super::Label(3);
-    let handler = super::Label(4);
+    let restart = super::Label::from_u32(0);
+    let source = super::Label::from_u32(1);
+    let cleanup = super::Label::from_u32(2);
+    let outer_unwind = super::Label::from_u32(3);
+    let handler = super::Label::from_u32(4);
     let mut cleanup_jump = Instruction::new(
         JUMP_BACKWARD_NO_INTERRUPT,
         Operand::Backward(restart),
@@ -5412,11 +5421,11 @@ fn no_location_block_inlining_crosses_exception_splits() {
 
 #[test]
 fn unconditional_cleanup_inlining_keeps_the_conditional_target_shared() {
-    let restart = super::Label(0);
-    let conditional = super::Label(1);
-    let normal = super::Label(2);
-    let handler = super::Label(3);
-    let cleanup = super::Label(4);
+    let restart = super::Label::from_u32(0);
+    let conditional = super::Label::from_u32(1);
+    let normal = super::Label::from_u32(2);
+    let handler = super::Label::from_u32(3);
+    let cleanup = super::Label::from_u32(4);
     let mut backedge = Instruction::new(
         JUMP_BACKWARD,
         Operand::Backward(restart),
@@ -5487,9 +5496,9 @@ fn unconditional_cleanup_inlining_keeps_the_conditional_target_shared() {
 
 #[test]
 fn direct_target_return_copy_crosses_an_exception_boundary() {
-    let return_start = super::Label(0);
-    let return_split = super::Label(1);
-    let handler = super::Label(2);
+    let return_start = super::Label::from_u32(0);
+    let return_split = super::Label::from_u32(1);
+    let handler = super::Label::from_u32(2);
     let mut jump = Instruction::new(
         JUMP_FORWARD,
         Operand::Forward(return_start),
@@ -5539,10 +5548,10 @@ fn direct_target_return_copy_crosses_an_exception_boundary() {
 #[test]
 fn retained_setup_nop_identity_survives_consecutive_labels_without_aliasing_removed_setups() {
     let location = SourceLocation::new(2, 9, 4, 16);
-    let start = super::Label(0);
-    let end = super::Label(1);
-    let intermediate = super::Label(2);
-    let setup = super::Label(3);
+    let start = super::Label::from_u32(0);
+    let end = super::Label::from_u32(1);
+    let intermediate = super::Label::from_u32(2);
+    let setup = super::Label::from_u32(3);
     let nop = Item::Instruction(Instruction::new(NOP, Operand::Value(0), location, None));
     for retained in [false, true] {
         // Both layouts have the same NOP location followed by consecutive labels.
@@ -5788,7 +5797,9 @@ fn cleanup_prefix_locations_retain_original_donors_through_late_writers() {
         for original_donor in [false, true] {
             for deferred_location in [0, 1, 2] {
                 let [first, second, intermediate, cleanup, suffix, exit, handler] =
-                    std::array::from_fn(|index| super::Label(u32::try_from(index).unwrap()));
+                    std::array::from_fn(|index| {
+                        super::Label::from_u32(u32::try_from(index).unwrap())
+                    });
                 let jump = |opcode, target, line| {
                     Item::Instruction(Instruction::new(
                         opcode,
@@ -5919,12 +5930,12 @@ fn uninitialized_load_analysis_preserves_original_exception_region_priority() {
     for fallback in [false, true] {
         for resolved in [false, true] {
             for cleared in [false, true] {
-                let outer = super::Label(0);
-                let inner = super::Label(1);
-                let fragment = super::Label(2);
-                let end = super::Label(3);
-                let handler = super::Label(4);
-                let other_handler = super::Label(5);
+                let outer = super::Label::from_u32(0);
+                let inner = super::Label::from_u32(1);
+                let fragment = super::Label::from_u32(2);
+                let end = super::Label::from_u32(3);
+                let handler = super::Label::from_u32(4);
+                let other_handler = super::Label::from_u32(5);
                 let mut instructions = vec![
                     Item::Label(outer),
                     pass_instruction(LOAD_CONST, 0, 1),
@@ -5953,7 +5964,7 @@ fn uninitialized_load_analysis_preserves_original_exception_region_priority() {
                 let priority = |start: super::Label| {
                     if resolved {
                         super::ExceptionRegionPriority::Resolved {
-                            start: usize::try_from(start.0).unwrap(),
+                            start: start.index(),
                             end: 20,
                         }
                     } else {
@@ -6002,8 +6013,8 @@ fn uninitialized_load_analysis_preserves_original_exception_region_priority() {
 
 #[test]
 fn late_redundant_jump_removal_revisits_newly_adjacent_targets() {
-    let intermediate = super::Label(0);
-    let target = super::Label(1);
+    let intermediate = super::Label::from_u32(0);
+    let target = super::Label::from_u32(1);
     let location = SourceLocation::new(7, 7, 3, 9);
     let mut jump = Instruction::new(JUMP_FORWARD, Operand::Forward(target), location, None);
     jump.exclude_from_exception_table(ExceptionExclusion::IfExtended);
@@ -6050,8 +6061,8 @@ fn late_redundant_jump_removal_revisits_newly_adjacent_targets() {
 #[test]
 fn late_jump_retries_preserve_deferred_and_borrowed_markers() {
     for policy in ["deferred", "borrowed", "retained"] {
-        let intermediate = super::Label(0);
-        let target = super::Label(1);
+        let intermediate = super::Label::from_u32(0);
+        let target = super::Label::from_u32(1);
         let mut jump = Instruction::new(
             JUMP_FORWARD,
             Operand::Forward(target),
@@ -6117,8 +6128,8 @@ fn late_jump_retries_require_proven_empty_line_blocks() {
         (7, -1, false, true),
         (-1, 8, true, true),
     ] {
-        let intermediate = super::Label(0);
-        let target = super::Label(1);
+        let intermediate = super::Label::from_u32(0);
+        let target = super::Label::from_u32(1);
         let mut middle = Instruction::new(
             JUMP_FORWARD,
             Operand::Forward(target),
@@ -6176,10 +6187,10 @@ fn shared_unlocated_jump_retries_require_original_conditional_predecessors() {
         "hidden_slot",
         "lost_predecessor",
     ] {
-        let entry = super::Label(0);
-        let target = super::Label(1);
-        let alias = super::Label(2);
-        let second = super::Label(3);
+        let entry = super::Label::from_u32(0);
+        let target = super::Label::from_u32(1);
+        let alias = super::Label::from_u32(2);
+        let second = super::Label::from_u32(3);
         let instruction = |opcode, target, line| {
             Item::Instruction(Instruction::new(
                 opcode,
@@ -6339,10 +6350,10 @@ fn folded_borrow_entries_preserve_a_future_alias() {
 fn copied_regions_retarget_only_handlers_copied_with_instructions() {
     for fallback in [false, true] {
         for shape in ["external", "internal", "other region end"] {
-            let start = super::Label(0);
-            let end = super::Label(1);
-            let handler = super::Label(2);
-            let outer_handler = super::Label(3);
+            let start = super::Label::from_u32(0);
+            let end = super::Label::from_u32(1);
+            let handler = super::Label::from_u32(2);
+            let outer_handler = super::Label::from_u32(3);
             let mut jump = Instruction::new(
                 JUMP_FORWARD,
                 Operand::Forward(start),
@@ -6448,7 +6459,7 @@ fn copied_regions_retarget_only_handlers_copied_with_instructions() {
 #[test]
 fn unlocated_borrow_marker_does_not_block_redundant_jump_removal() {
     for location in [SourceLocation::NONE, SourceLocation::new(2, 2, 0, 0)] {
-        let target = super::Label(1);
+        let target = super::Label::from_u32(1);
         let mut marker = Instruction::new(NOP, Operand::Value(0), location, None);
         marker.jump_policy.mark_borrow_empty_block();
         let mut assembler = optimization_pipeline(vec![
@@ -6459,7 +6470,7 @@ fn unlocated_borrow_marker_does_not_block_redundant_jump_removal() {
                 SourceLocation::new(1, 1, 0, 0),
                 None,
             )),
-            Item::Label(super::Label(0)),
+            Item::Label(super::Label::from_u32(0)),
             Item::Instruction(marker),
             Item::Label(target),
             pass_instruction(RETURN_VALUE, 0, 3),
@@ -6488,7 +6499,7 @@ fn unlocated_borrow_marker_does_not_block_redundant_jump_removal() {
 
 #[test]
 fn borrow_marker_conversion_retries_without_another_jump_deletion() {
-    let target = super::Label(1);
+    let target = super::Label::from_u32(1);
     let mut marker = Instruction::new(
         JUMP_FORWARD,
         Operand::Forward(target),
@@ -6504,7 +6515,7 @@ fn borrow_marker_conversion_retries_without_another_jump_deletion() {
             SourceLocation::new(1, 1, 0, 0),
             None,
         )),
-        Item::Label(super::Label(0)),
+        Item::Label(super::Label::from_u32(0)),
         Item::Instruction(marker),
         Item::Label(target),
         pass_instruction(RETURN_VALUE, 0, 3),
@@ -6540,7 +6551,7 @@ fn split_return_condition_transports_only_a_unique_exact_source_witness() {
     let location = SourceLocation::new(13, 13, 15, 35);
     let mut condition = Instruction::new(
         POP_JUMP_IF_NOT_NONE,
-        Operand::Forward(Label(3)),
+        Operand::Forward(Label::from_u32(3)),
         location,
         Some(2),
     );
@@ -6559,7 +6570,7 @@ fn split_return_condition_transports_only_a_unique_exact_source_witness() {
         "different location",
         "different hidden slots",
     ] {
-        let mut items = vec![Item::Label(Label(0))];
+        let mut items = vec![Item::Label(Label::from_u32(0))];
         match change {
             "original clone" => items.push(Item::Instruction(condition)),
             "updated clone" => items.push(Item::Instruction(updated)),
@@ -6570,7 +6581,7 @@ fn split_return_condition_transports_only_a_unique_exact_source_witness() {
         let mut assembler = Assembler::from_linear_items(items.clone());
         let mut source = condition;
         match change {
-            "different operand" => source.set_operand(Operand::Forward(Label(4))),
+            "different operand" => source.set_operand(Operand::Forward(Label::from_u32(4))),
             "different location" => source.location = SourceLocation::new(14, 14, 15, 35),
             "different hidden slots" => source.local_policy.add_hidden_exception_owner_slots(1),
             _ => {}
@@ -6585,10 +6596,10 @@ fn split_return_condition_transports_only_a_unique_exact_source_witness() {
                 .exception_owner_provenance
                 .source_none_conditions
                 .push(SourceNoneCondition {
-                    entry: Label(0),
-                    labels: vec![Label(0)],
+                    entry: Label::from_u32(0),
+                    labels: vec![Label::from_u32(0)],
                     instruction: source,
-                    entry_prefix: Some(vec![Item::Label(Label(0))]),
+                    entry_prefix: Some(vec![Item::Label(Label::from_u32(0))]),
                 });
         }
         let condition_item = items.len() - 2;
@@ -6604,11 +6615,11 @@ fn split_return_condition_transports_only_a_unique_exact_source_witness() {
                     if change == "unique" { updated } else { source },
                     "{change}"
                 );
-                assert_eq!(origin.entry, Label(0), "{change}");
-                assert_eq!(origin.labels, vec![Label(0)], "{change}");
+                assert_eq!(origin.entry, Label::from_u32(0), "{change}");
+                assert_eq!(origin.labels, vec![Label::from_u32(0)], "{change}");
                 assert_eq!(
                     origin.entry_prefix,
-                    Some(vec![Item::Label(Label(0))]),
+                    Some(vec![Item::Label(Label::from_u32(0))]),
                     "{change}"
                 );
             }

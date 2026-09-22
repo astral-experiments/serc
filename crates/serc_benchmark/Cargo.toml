@@ -21,7 +21,7 @@ workspace = true
 [dependencies]
 codspeed-criterion-compat = { workspace = true, optional = true }
 criterion = { workspace = true, optional = true }
-serc_workloads = { workspace = true }
+serc_fixtures = { workspace = true }
 
 [dev-dependencies]
 mimalloc = { workspace = true }

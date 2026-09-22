@@ -4,8 +4,8 @@ use std::hash::{Hash, Hasher};
 
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
 use ruff_python_ast::{
-    BoolOp, Expr, ExprBinOp, ExprContext, FStringPart, InterpolatedStringElement, Number, Operator,
-    Stmt, UnaryOp,
+    BoolOp, Expr, ExprBinOp, ExprContext, ExprStringLiteral, FStringPart,
+    InterpolatedStringElement, Number, Operator, Stmt, UnaryOp,
 };
 use ruff_text_size::Ranged;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
@@ -20,7 +20,7 @@ use super::Compiler;
 use super::expression::{jump_constant_truthiness, literal_truthiness};
 use super::scope::NameId;
 use super::symbol::{mangle_name, to_u32};
-use crate::code_object::{CodeObject, Constant, NonReflexiveRemap};
+use crate::code_object::{CodeObject, Constant, MetadataId, NonReflexiveRemap};
 
 #[derive(Debug, Default)]
 pub(super) struct ConstantPool {
@@ -247,7 +247,7 @@ pub(super) struct OutputState {
     pub(super) has_untracked_discarded_collection: bool,
     pub(super) deferred_names: Vec<(OperandPatchId, String)>,
     pub(super) names: Vec<String>,
-    pub(super) name_ids: Vec<u32>,
+    pub(super) name_ids: Vec<MetadataId>,
     name_indices: FxHashMap<NameId, u32>,
     pub(super) interned_constant_strings: FxHashSet<String>,
     pub(super) qualified_name_constant_index: Option<u32>,
@@ -953,7 +953,7 @@ impl Compiler<'_> {
             Entry::Vacant(entry) => {
                 let index = to_u32(self.output.names.len(), "name count")?;
                 self.output.names.push(name.into_owned());
-                self.output.name_ids.push(name_id.0);
+                self.output.name_ids.push(MetadataId::from(name_id));
                 entry.insert(index);
                 Ok(index)
             }
@@ -1199,6 +1199,16 @@ pub(super) fn explicit_surrogate_string(value: &str, source: &str) -> Option<Vec
             .count();
         if preceding_backslashes % 2 == 1 {
             index += 1;
+            continue;
+        }
+        if source[index..].starts_with(b"\\N{")
+            && let Some(end) = source[index + 3..].iter().position(|byte| *byte == b'}')
+        {
+            let end = index + 3 + end;
+            if source[index + 3..end].eq_ignore_ascii_case(b"REPLACEMENT CHARACTER") {
+                replacements.push(None);
+            }
+            index = end + 1;
             continue;
         }
         let (digit_count, escape_len) = match source.get(index + 1) {
@@ -1527,7 +1537,7 @@ pub(super) fn literal_constant(expression: &Expr) -> Option<Constant> {
     }
 }
 pub(super) enum PercentFormatPart<'a> {
-    Literal(String),
+    Literal(Constant),
     Formatted {
         expression: &'a Expr,
         conversion: Conversion,
@@ -1537,6 +1547,7 @@ pub(super) enum PercentFormatPart<'a> {
 
 pub(super) fn optimized_percent_format(
     expression: &ExprBinOp,
+    decode_literal: impl FnOnce(&ExprStringLiteral) -> Constant,
 ) -> Option<Vec<PercentFormatPart<'_>>> {
     if expression.op != Operator::Mod {
         return None;
@@ -1555,24 +1566,34 @@ pub(super) fn optimized_percent_format(
         return None;
     }
 
-    let format = format.value.chars().collect::<Vec<_>>();
+    // Percent-format syntax is ASCII, so parsing bytes preserves surrogate-pass UTF-8 in
+    // literal fragments without changing the supported conversions or width/precision limits.
+    let format = match decode_literal(format) {
+        Constant::String(value) => value.into_bytes(),
+        Constant::SurrogateString(value) => value,
+        _ => unreachable!("string literal decoding returns a string constant"),
+    };
     let mut position = 0;
     let mut argument_index = 0;
     let mut parts = Vec::with_capacity(arguments.elts.len() * 2 + 1);
     while position < format.len() {
-        let mut literal = String::new();
+        let mut literal = Vec::new();
         while position < format.len() {
-            if format[position] != '%' {
+            if format[position] != b'%' {
                 literal.push(format[position]);
                 position += 1;
-            } else if format.get(position + 1) == Some(&'%') {
-                literal.push('%');
+            } else if format.get(position + 1) == Some(&b'%') {
+                literal.push(b'%');
                 position += 2;
             } else {
                 break;
             }
         }
         if !literal.is_empty() {
+            let literal = String::from_utf8(literal).map_or_else(
+                |error| Constant::SurrogateString(error.into_bytes()),
+                Constant::String,
+            );
             parts.push(PercentFormatPart::Literal(literal));
         }
         if position == format.len() {
@@ -1593,7 +1614,7 @@ pub(super) fn optimized_percent_format(
 }
 
 fn parse_percent_format(
-    format: &[char],
+    format: &[u8],
     position: &mut usize,
 ) -> Option<(Conversion, Option<String>)> {
     const MAX_DIGITS: usize = 3;
@@ -1608,8 +1629,8 @@ fn parse_percent_format(
     let mut character = loop {
         let character = next()?;
         match character {
-            '-' => left_justify = true,
-            '+' | ' ' | '#' | '0' => {}
+            b'-' => left_justify = true,
+            b'+' | b' ' | b'#' | b'0' => {}
             _ => break character,
         }
     };
@@ -1619,7 +1640,7 @@ fn parse_percent_format(
         let mut value = 0_u32;
         let mut digits = 0;
         while character.is_ascii_digit() {
-            value = value * 10 + character.to_digit(10).unwrap();
+            value = value * 10 + u32::from(character - b'0');
             character = next()?;
             digits += 1;
             if digits >= MAX_DIGITS {
@@ -1630,13 +1651,13 @@ fn parse_percent_format(
     }
 
     let mut precision = None;
-    if character == '.' {
+    if character == b'.' {
         character = next()?;
         let mut value = 0_u32;
         if character.is_ascii_digit() {
             let mut digits = 0;
             while character.is_ascii_digit() {
-                value = value * 10 + character.to_digit(10).unwrap();
+                value = value * 10 + u32::from(character - b'0');
                 character = next()?;
                 digits += 1;
                 if digits >= MAX_DIGITS {
@@ -1648,9 +1669,9 @@ fn parse_percent_format(
     }
 
     let conversion = match character {
-        's' => Conversion::STR,
-        'r' => Conversion::REPR,
-        'a' => Conversion::ASCII,
+        b's' => Conversion::STR,
+        b'r' => Conversion::REPR,
+        b'a' => Conversion::ASCII,
         _ => return None,
     };
     let mut format_spec = String::new();
@@ -1685,10 +1706,6 @@ pub(super) fn fold_constant_for_version(
 }
 
 /// Folds the same expression shapes using source-aware literal values when supplied.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "CPython mixed integer/float folding rounds integer operands to binary64"
-)]
 pub(super) fn fold_constant_with_literals(
     expression: &Expr,
     python_version: PythonVersion,
@@ -1857,15 +1874,11 @@ pub(super) fn fold_constant_with_literals(
                 {
                     fold_float_remainder(&left, &right).map(Constant::Float)
                 }
-                (
-                    left,
-                    Operator::Pow,
-                    right @ (Constant::Bool(_)
-                    | Constant::Int(_)
-                    | Constant::BigInt {
-                        negative: false, ..
-                    }),
-                ) if is_integer_constant(&left) => fold_integer_power(&left, &right),
+                (left, Operator::Pow, right)
+                    if is_integer_constant(&left) && is_integer_constant(&right) =>
+                {
+                    fold_integer_power(&left, &right)
+                }
                 (left, operator @ (Operator::LShift | Operator::RShift), right)
                     if is_integer_constant(&left) && is_integer_constant(&right) =>
                 {
@@ -1889,20 +1902,6 @@ pub(super) fn fold_constant_with_literals(
                 }
                 (Constant::Float(left), Operator::Div, Constant::Float(right)) if right != 0.0 => {
                     Some(Constant::Float(left / right))
-                }
-                (
-                    left @ (Constant::Bool(_) | Constant::Int(_) | Constant::SignedInt(_)),
-                    Operator::Pow,
-                    Constant::SignedInt(right),
-                ) if right < 0 => {
-                    let left = match left {
-                        Constant::Bool(value) => f64::from(value),
-                        Constant::Int(value) => value as f64,
-                        Constant::SignedInt(value) => value as f64,
-                        _ => unreachable!(),
-                    };
-                    let result = left.powf(right as f64);
-                    result.is_finite().then_some(Constant::Float(result))
                 }
                 (
                     left,
@@ -2013,9 +2012,15 @@ pub(super) fn fold_constant_with_literals(
                         return Some(Constant::Tuple(Vec::new()));
                     };
                     let times = usize::try_from(times).ok()?;
-                    (times <= max_times).then(|| {
-                        Constant::Tuple((0..times).flat_map(|_| value.iter().cloned()).collect())
-                    })
+                    if times > max_times {
+                        return None;
+                    }
+                    if let Some(budget) = 1024_usize.checked_div(times) {
+                        check_tuple_complexity(&value, budget)?;
+                    }
+                    Some(Constant::Tuple(
+                        (0..times).flat_map(|_| value.iter().cloned()).collect(),
+                    ))
                 }
                 _ => None,
             }
@@ -2033,6 +2038,15 @@ fn sequence_repeat_count(value: &Constant, boolean_sequence_repetition: bool) ->
         Constant::Int(value) => Some(*value),
         _ => None,
     }
+}
+
+// CPython also limits recursively contained tuple items when folding repetition.
+fn check_tuple_complexity(values: &[Constant], budget: usize) -> Option<usize> {
+    let budget = budget.checked_sub(values.len())?;
+    values.iter().try_fold(budget, |budget, value| match value {
+        Constant::Tuple(values) => check_tuple_complexity(values, budget),
+        _ => Some(budget),
+    })
 }
 
 fn fold_integer_bitwise(left: &Constant, operator: Operator, right: &Constant) -> Option<Constant> {
@@ -2327,16 +2341,18 @@ fn fold_integer_arithmetic(
 fn fold_integer_power(left: &Constant, right: &Constant) -> Option<Constant> {
     const MAX_INT_SIZE: usize = 128;
 
+    let exponent = folded_integer(right)?;
+    if exponent.negative {
+        return fold_float_power(constant_as_float(left)?, constant_as_float(right)?);
+    }
     let left = folded_integer(left)?;
-    let right = folded_integer(right)?;
-    debug_assert!(!right.negative);
-    if right.digits.is_empty() {
+    if exponent.digits.is_empty() {
         return Some(Constant::Int(1));
     }
     if left.digits.is_empty() {
         return Some(Constant::Int(0));
     }
-    let mut exponent = magnitude_to_usize(&right.digits)?;
+    let mut exponent = magnitude_to_usize(&exponent.digits)?;
     if magnitude_bit_length(&left.digits) > MAX_INT_SIZE / exponent {
         return None;
     }
@@ -3832,7 +3848,7 @@ mod tests {
         constant_pool_fingerprint,
     };
     use crate::code_object::{
-        CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance,
+        CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance, MetadataId,
     };
 
     fn code_object(constants: Vec<Constant>) -> CodeObject {
@@ -3856,8 +3872,8 @@ mod tests {
             marshal_provenance: MarshalProvenance {
                 metadata_ids: MarshalMetadataIds {
                     domain_len: 2,
-                    locals: vec![0],
-                    filename: 1,
+                    locals: vec![MetadataId::from_u32(0)],
+                    filename: MetadataId::from_u32(1),
                     ..MarshalMetadataIds::default()
                 },
                 subtree_has_frozenset_constants: true,

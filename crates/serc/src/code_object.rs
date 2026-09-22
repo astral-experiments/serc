@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use ruff_index::newtype_index;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::CompileError;
@@ -13,6 +14,17 @@ pub(crate) enum LocalsIdentity {
     Fresh,
 }
 
+/// Identifies a string in a module's marshal metadata domain, including its filename.
+#[newtype_index]
+pub(crate) struct MetadataId;
+
+#[cfg(test)]
+impl Default for MetadataId {
+    fn default() -> Self {
+        Self::from_u32(0)
+    }
+}
+
 /// Dense, module-wide name IDs that let marshal graph planning bypass repeated string lookups.
 ///
 /// Every code object in a module shares the compiler's immutable name domain, with one additional
@@ -21,11 +33,11 @@ pub(crate) enum LocalsIdentity {
 #[cfg_attr(test, derive(Default))]
 pub(crate) struct MarshalMetadataIds {
     pub(crate) domain_len: u32,
-    pub(crate) names: Vec<u32>,
-    pub(crate) locals: Vec<u32>,
-    pub(crate) filename: u32,
-    pub(crate) name: Option<u32>,
-    pub(crate) qualified_name: Option<u32>,
+    pub(crate) names: Vec<MetadataId>,
+    pub(crate) locals: Vec<MetadataId>,
+    pub(crate) filename: MetadataId,
+    pub(crate) name: Option<MetadataId>,
+    pub(crate) qualified_name: Option<MetadataId>,
 }
 
 /// A constant-cache admission or real code assembly in compilation order.
@@ -469,7 +481,7 @@ fn bytecode_length_error(bytes: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance,
+        CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance, MetadataId,
         bytecode_length_error,
     };
     use crate::CompileError;
@@ -514,11 +526,11 @@ mod tests {
         let mut second = MarshalProvenance {
             metadata_ids: MarshalMetadataIds {
                 domain_len: 3,
-                names: vec![0, 1],
-                locals: vec![1],
-                filename: 2,
-                name: Some(0),
-                qualified_name: Some(1),
+                names: vec![MetadataId::from_u32(0), MetadataId::from_u32(1)],
+                locals: vec![MetadataId::from_u32(1)],
+                filename: MetadataId::from_u32(2),
+                name: Some(MetadataId::from_u32(0)),
+                qualified_name: Some(MetadataId::from_u32(1)),
             },
             subtree_has_frozenset_constants: true,
             ..MarshalProvenance::default()
