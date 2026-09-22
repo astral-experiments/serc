@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: "23 5 * * *"
 
 permissions: {}
 
@@ -252,8 +254,26 @@ jobs:
         run: cargo test --workspace --lib --bins --all-features --locked
       # The benchmark_scripts integration target remains Linux-only because it exercises
       # Bash-specific tooling.
+      # Keep the exhaustive suite on Linux for each PR and on every platform nightly.
+      # Manual runs also exercise the full suite so platform failures can be reproduced.
       - name: "Test CPython compatibility"
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: cargo test -p serc --test compatibility --all-features --locked
+      - name: "Smoke test CPython compatibility"
+        if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+        run: >-
+          cargo test -p serc --test compatibility --all-features --locked -- --exact
+          common::python_text_stdout_normalizes_windows_newlines
+          tests::emits_a_python_3145_pyc_header
+          tests::compiles_source_bytes_and_uses_the_raw_size_in_pyc_headers
+          tests::matches_cpython_marshal_for_supported_source_encodings
+          tests::normalizes_bom_and_newlines_before_compiling
+          tests::matches_cpython_marshal_for_an_empty_module
+          tests::executes_literals_and_collections
+          tests::executes_fstrings_and_arbitrary_precision_integers
+          tests::executes_for_loops_imports_and_globals
+          tests::executes_coroutines_and_async_generators
+          tests::executes_source_aware_surrogate_folds
       - name: "Test pinned inputs"
         run: cargo test -p serc --test pinned_inputs --all-features --locked
       - name: "Test CLI"
