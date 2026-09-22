@@ -4,6 +4,10 @@ Serc targets exact CPython releases, not arbitrary versions or inputs. Python 3.
 default. See the
 [target pins](../crates/serc/README.md#updating-the-cpython-target) for commits and magic numbers.
 
+Exact releases can still differ by native build: two CPython 3.14.5 Linux builds fold
+complex NaNs to different marshal bytes. The [build-profile diagnostic](cpython-build-profiles.md)
+records the reproducer and identities; the policy for selecting these profiles is unresolved.
+
 ## Required Ruff gate
 
 From the repository root:
