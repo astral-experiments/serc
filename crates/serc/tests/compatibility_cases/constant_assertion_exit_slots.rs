@@ -185,3 +185,22 @@ fn matches_cpython_terminal_many_or_assertion_success_returns() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_folded_assertion_success_inside_synchronous_manager() {
+    for assertion in ["True", "1"] {
+        for alternate in ["assert False, 'no'", "recover()"] {
+            let body = format!(
+                "with manager():\n    if not flag:\n        assert {assertion}, 'yes'\n    else:\n        {alternate}\n"
+            );
+            for scope in ["", "def f():\n", "class Scope:\n"] {
+                let source = if scope.is_empty() {
+                    body.clone()
+                } else {
+                    format!("{scope}{}", common::indent(&body))
+                };
+                common::assert_matches_cpython_marshal(&source, "manager_assertion_success.py");
+            }
+        }
+    }
+}

@@ -1858,27 +1858,23 @@ impl HandlerDispatchCertificate {
     }
 }
 
-/// A folded assertion's original empty success array under only the scope fallback.
+/// A folded assertion's empty success array under one authenticated owner.
 struct FoldedAssertSuccessCertificate {
     entry: Label,
     next: Label,
     jump: Instruction,
-    fallback: ExceptionRegion,
+    owner: ExceptionRegion,
 }
 
 impl FoldedAssertSuccessCertificate {
-    fn sole_fallback(view: &View<'_>, index: usize) -> Option<ExceptionRegion> {
+    fn sole_owner(view: &View<'_>, index: usize) -> Option<ExceptionRegion> {
         let position = view.instruction_position(index);
         let mut owner = None;
         for region in view.regions {
             let start = *view.label_position(region.start)?;
             let end = *view.label_position(region.end)?;
             if start <= position && position < end {
-                if !region.is_scope_fallback
-                    || region.depth != 0
-                    || !region.preserve_lasti
-                    || owner.replace(*region).is_some()
-                {
+                if !region.preserve_lasti || owner.replace(*region).is_some() {
                     return None;
                 }
             }
@@ -1914,19 +1910,38 @@ impl FoldedAssertSuccessCertificate {
             || jump.pre_fold_extra_instructions() != 0
             || jump.local_policy != super::LocalPolicy::default()
             || jump.no_location_policy != super::ir::NoLocationPolicy::default()
-            || jump.jump_policy != super::ir::JumpPolicy::default()
         {
             return None;
         }
-        let fallback = Self::sole_fallback(view, index + 2)?;
-        if !same_manager_region(&Self::sole_fallback(view, index)?, &fallback) {
+        let owner = Self::sole_owner(view, index + 2)?;
+        let scope_fallback = owner.is_scope_fallback && owner.depth == 0;
+        // This original SETUP owns the single manager's two saved exit slots.
+        // Capture it before cold ordering can split the protected range.
+        let synchronous_manager = !owner.is_scope_fallback
+            && owner.depth == 2
+            && view
+                .provenance
+                .synchronous_with_setups
+                .contains(&owner.start);
+        // The branch emitter authenticates this separate assertion-success array
+        // before asking inlining to retain its source jump on a direct copy.
+        let mut direct_target = super::ir::JumpPolicy::default();
+        direct_target.retain_nop_for_direct_target();
+        direct_target.mark_original_empty_join();
+        if !(scope_fallback || synchronous_manager)
+            || (jump.jump_policy != super::ir::JumpPolicy::default()
+                && !(synchronous_manager && jump.jump_policy == direct_target))
+        {
+            return None;
+        }
+        if !same_manager_region(&Self::sole_owner(view, index)?, &owner) {
             return None;
         }
         let result = Self {
             entry: *entry,
             next: *next,
             jump: *jump,
-            fallback,
+            owner,
         };
         result.valid(view)?;
         Some(result)
@@ -1965,13 +1980,13 @@ impl FoldedAssertSuccessCertificate {
         {
             return None;
         }
-        let fallback = Self::sole_fallback(view, start + 1)?;
-        // Cold ordering can split the enclosing fallback range. Its target,
+        let owner = Self::sole_owner(view, start + 1)?;
+        // Cold ordering can split the enclosing owner range. Its target,
         // stack state, and original priority still identify this same owner.
-        let mut shape = fallback;
-        shape.start = self.fallback.start;
-        shape.end = self.fallback.end;
-        same_manager_region(&shape, &self.fallback).then_some(start + 1)
+        let mut shape = owner;
+        shape.start = self.owner.start;
+        shape.end = self.owner.end;
+        same_manager_region(&shape, &self.owner).then_some(start + 1)
     }
 }
 
