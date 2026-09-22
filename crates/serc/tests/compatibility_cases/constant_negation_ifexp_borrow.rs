@@ -9,3 +9,15 @@ fn negated_constant_selector_keeps_discarded_arm_borrow_boundary() {
         common::assert_matches_cpython_marshal(&source, "negated_selector_borrow.py");
     }
 }
+
+#[test]
+fn folded_true_selector_keeps_large_continuation_borrow_boundary() {
+    for condition in ["flag or True", "not (flag and False)"] {
+        for selected in ["1", "value", "value()", "(value, value)"] {
+            let source = format!(
+                "{selected} if {condition} else fallback()\nresult = [n for n in range(10) if n or True]\nassert True or flag\nif True:\n    pass\n"
+            );
+            common::assert_matches_cpython_marshal(&source, "folded_true_ifexpr_borrow.py");
+        }
+    }
+}

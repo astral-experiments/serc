@@ -475,7 +475,7 @@ pub(super) struct FinallyState {
     active_return_finally_contexts: Vec<FinallyExitContext>,
     active_loop_finally_contexts: Vec<FinallyExitContext>,
     // A loop control inside a copied finalizer replaces the pending exit and has its own unwind.
-    active_copied_finally_bodies: usize,
+    pub(super) active_copied_finally_bodies: usize,
     // A sole copied finally condition can duplicate the preserved return onto its false edge.
     copy_return_finally_condition_exit: bool,
     // Return values kept on the stack while an enclosing finally body is copied.
@@ -29439,7 +29439,7 @@ fn condition_starts_with_removed_boolean_operand(expression: &Expr) -> bool {
 
 // Mirrors the edges that `compile_jump_if` emits directly to its caller-provided target. The
 // converted with-body `POP_BLOCK` only retains a location when that target has one predecessor.
-fn condition_jump_target_count(expression: &Expr, jump_on: bool) -> usize {
+pub(super) fn condition_jump_target_count(expression: &Expr, jump_on: bool) -> usize {
     if let Expr::UnaryOp(unary) = expression
         && unary.op == UnaryOp::Not
     {

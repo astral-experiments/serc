@@ -1604,6 +1604,8 @@ pub(crate) struct Assembler {
     pub(super) deferred_borrow_entries: Vec<DeferredBorrowEntry>,
     /// Normal edges whose following local return must prove its original copy width.
     pub(super) deferred_name_return_borrow_exits: Vec<super::NameReturnBorrowExit>,
+    /// Source edges awaiting a located target larger than the native exit-copy budget.
+    pub(super) deferred_noncopyable_borrow_exits: Vec<(EmittedJump, Instruction)>,
     /// Exact omitted ordinary-try POP slots in pending local-return targets.
     pub(super) name_return_pop_boundaries: FxHashSet<Label>,
     /// Ordinary-return `POP_BLOCK` records needed by the legacy CFG copy phases.
@@ -1857,6 +1859,7 @@ impl Default for Assembler {
             borrow_jump_entry_labels: FxHashSet::default(),
             deferred_borrow_entries: Vec::new(),
             deferred_name_return_borrow_exits: Vec::new(),
+            deferred_noncopyable_borrow_exits: Vec::new(),
             name_return_pop_boundaries: FxHashSet::default(),
             legacy_return_pop_blocks: FxHashMap::default(),
             name_return_iterator_region_aliases: FxHashMap::default(),

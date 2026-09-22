@@ -2706,6 +2706,7 @@ impl Assembler {
     /// Resolves pending entries using label groups before any assembler optimization.
     fn resolve_folded_condition_borrow_entries(&mut self) {
         self.resolve_name_return_borrow_exits();
+        self.resolve_noncopyable_borrow_exits();
         if self.deferred_borrow_entries.is_empty() {
             return;
         }
@@ -4653,6 +4654,62 @@ impl Assembler {
         self.emitted_instruction_mut(emitted, "marking a borrow fallthrough barrier")
             .no_location_policy
             .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+    }
+
+    /// Defers a source barrier until its completed target proves too large to copy.
+    pub(crate) fn record_noncopyable_borrow_exit(&mut self, source: EmittedJump) {
+        let original = *self.emitted_jump_mut(source, "recording a pending borrow barrier");
+        self.deferred_noncopyable_borrow_exits
+            .push((source, original));
+    }
+
+    /// Checks the original source edge and a conservative target prefix before optimization.
+    fn resolve_noncopyable_borrow_exits(&mut self) {
+        let pending = std::mem::take(&mut self.deferred_noncopyable_borrow_exits);
+        if pending.is_empty() {
+            return;
+        }
+        let items = self.linear_items();
+        let mut targets = FxHashMap::default();
+        let mut offset = 0;
+        for item in items {
+            match item {
+                Item::Label(label) => {
+                    targets.insert(*label, offset);
+                }
+                Item::Instruction(_) => offset += 1,
+            }
+        }
+        let mut barriers = Vec::new();
+        for (source, original) in pending {
+            let source = source.instruction();
+            if source.stream != self.emission_stream {
+                continue;
+            }
+            let index = usize::try_from(source.item_index).expect("emitted index fits in usize");
+            if !matches!(items.get(index), Some(Item::Instruction(current)) if *current == original)
+            {
+                continue;
+            }
+            let Operand::Forward(target) = original.operand() else {
+                continue;
+            };
+            if original.opcode == JUMP_FORWARD
+                && targets
+                    .get(&target)
+                    .is_some_and(|&start| self.has_large_linear_prefix_since(start))
+            {
+                barriers.push(index);
+            }
+        }
+        for index in barriers {
+            let Item::Instruction(source) = &mut self.linear_items_mut()[index] else {
+                unreachable!("validated source is an instruction");
+            };
+            source
+                .no_location_policy
+                .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+        }
     }
 
     /// Captures the complete normal jump before emission proceeds into its finalizer.
@@ -12194,11 +12251,26 @@ impl Assembler {
         let UnoptimizedCode::Linear(items) = &mut self.code else {
             unreachable!();
         };
+        let next_stream = ir::EmissionStreamId::next();
+        // Removing this later NOP leaves a checked earlier source unchanged. Transfer only
+        // those private deferred origins; public emitted handles still all expire below.
+        self.deferred_noncopyable_borrow_exits.retain_mut(|(source, original)| {
+            let source_index = usize::try_from(source.0.item_index)
+                .expect("emitted instruction index fits in usize");
+            if source.0.stream != self.emission_stream
+                || source_index >= index
+                || !matches!(items.get(source_index), Some(Item::Instruction(current)) if *current == *original)
+            {
+                return false;
+            }
+            source.0.stream = next_stream;
+            true
+        });
         items.remove(index);
         self.instruction_count -= 1;
         // A later emission can reuse the removed item's index. Start a fresh stream so a copied
         // handle to the NOP cannot alias the replacement instruction.
-        self.emission_stream = ir::EmissionStreamId::next();
+        self.emission_stream = next_stream;
         Some(RemovedNop {
             location: instruction.location,
             exclusion,

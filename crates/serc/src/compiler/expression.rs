@@ -56,8 +56,9 @@ use super::source::{
     statement_execution_range, strip_expression_comments, synthetic_condition_exit_range,
 };
 use super::statement::{
-    final_chained_comparison_jump, is_wildcard_pattern, suite_has_linear_borrow_fallthrough,
-    suite_terminates, terminal_for_break_exit_inherits_predecessor, unique_condition_jump_target,
+    condition_jump_target_count, final_chained_comparison_jump, is_wildcard_pattern,
+    suite_has_linear_borrow_fallthrough, suite_terminates,
+    terminal_for_break_exit_inherits_predecessor, unique_condition_jump_target,
 };
 use super::symbol::{
     ComparisonMode, ComprehensionRestore, ReraiseStackState, ResumeDepth, expression_name, to_u32,
@@ -6909,6 +6910,17 @@ impl Compiler<'_> {
         }
         if matches!(expression.body.as_ref(), Expr::BoolOp(_)) || preserve_nested_no_location {
             self.assembler.preserve_no_location(body_exit.instruction());
+        }
+        if self.context.python_version == PythonVersion::Py314
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && condition_jump_target_count(&expression.test, false) == 0
+        {
+            // A folded short-circuit outcome can discard the else array while
+            // retaining evaluation of its runtime operands. Erasing this exit
+            // still crosses that empty original array before the shared join.
+            self.assembler.record_noncopyable_borrow_exit(body_exit);
         }
         self.assembler
             .record_exception_owner_block_boundary(else_label);
