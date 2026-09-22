@@ -56,16 +56,16 @@ impl CompiledFunctionDefaults {
 }
 
 impl Compiler<'_> {
-    /// Class globals apply to direct annotation loads; nested functions and comprehensions retain captures.
+    /// Class bindings apply to direct annotation loads; nested functions and comprehensions retain captures.
     fn class_visible_annotation_requirements(&self, expression: &Expr) -> BTreeSet<String> {
         let mut required = expression_required_names(expression);
         if required
             .iter()
-            .any(|name| self.class_scope_declares_global(self.required_name_id(name)))
+            .any(|name| self.class_scope_shadows_annotation_name(self.required_name_id(name)))
         {
             let nested = annotation_nested_required_names(expression);
             required.retain(|name| {
-                !self.class_scope_declares_global(self.required_name_id(name))
+                !self.class_scope_shadows_annotation_name(self.required_name_id(name))
                     || nested.contains(name)
             });
         }
@@ -306,7 +306,7 @@ impl Compiler<'_> {
                 .copied()
                 .filter(|name| {
                     self.has_deferred_annotations()
-                        && (!self.class_scope_declares_global(*name)
+                        && (!self.class_scope_shadows_annotation_name(*name)
                             || nested_annotation_requirements.contains(name))
                 }),
         );
@@ -1416,7 +1416,8 @@ impl Compiler<'_> {
             .filter(|name| !self.unit.pending_private_type_parameters.contains(*name))
             .filter(|name| self.is_type_parameter_id(**name) || self.can_provide_closure_id(**name))
             .filter(|name| {
-                !self.class_scope_declares_global(**name) || nested_requirements.contains(*name)
+                !self.class_scope_shadows_annotation_name(**name)
+                    || nested_requirements.contains(*name)
             })
             .copied()
             .collect();
@@ -1429,7 +1430,9 @@ impl Compiler<'_> {
             .references
             .iter()
             .map(|name| self.required_name_id(name))
-            .filter(|name| !freevar_set.contains(name) || self.class_scope_declares_global(*name))
+            .filter(|name| {
+                !freevar_set.contains(name) || self.class_scope_shadows_annotation_name(*name)
+            })
             .collect();
         let cellvars = self.name_id_set(inlined_cellvars);
         let plan = LoweringFunctionPlan {
@@ -1605,7 +1608,7 @@ impl Compiler<'_> {
         );
         let mut freevars = function_plan.annotation_freevars.clone();
         freevars.retain(|name| {
-            !self.class_scope_declares_global(*name) || nested_requirements.contains(name)
+            !self.class_scope_shadows_annotation_name(*name) || nested_requirements.contains(name)
         });
         if self.unit.flags & CO_FUTURE_ANNOTATIONS == 0 {
             for name in function_plan
@@ -1613,7 +1616,7 @@ impl Compiler<'_> {
                 .iter()
                 .filter(|name| {
                     self.is_type_parameter_id(**name)
-                        && (!self.class_scope_declares_global(**name)
+                        && (!self.class_scope_shadows_annotation_name(**name)
                             || nested_requirements.contains(*name))
                 })
                 .copied()
@@ -1657,7 +1660,7 @@ impl Compiler<'_> {
                 .annotation_references
                 .iter()
                 .copied()
-                .filter(|name| self.class_scope_declares_global(*name)),
+                .filter(|name| self.class_scope_shadows_annotation_name(*name)),
         );
         let cellvars = self.name_id_set(inlined_cellvars);
         let plan = LoweringFunctionPlan {
@@ -1783,7 +1786,7 @@ impl Compiler<'_> {
             .iter()
             .filter(|name| {
                 available_freevars.contains(*name)
-                    && (!self.class_scope_declares_global(**name)
+                    && (!self.class_scope_shadows_annotation_name(**name)
                         || nested_requirements.contains(*name))
             })
             .copied()
@@ -1793,7 +1796,7 @@ impl Compiler<'_> {
         let dunder_class = self.required_name_id("__class__");
         if reference_ids.contains(&dunder_class)
             && self.is_cell_id(dunder_class)
-            && (!self.class_scope_declares_global(dunder_class)
+            && (!self.class_scope_shadows_annotation_name(dunder_class)
                 || nested_requirements.contains(&dunder_class))
         {
             self.insert_lexical_name(&mut freevars, dunder_class);
@@ -1807,7 +1810,9 @@ impl Compiler<'_> {
         let freevar_set: FxHashSet<_> = freevars.iter().copied().collect();
         let globals = reference_ids
             .into_iter()
-            .filter(|name| !freevar_set.contains(name) || self.class_scope_declares_global(*name))
+            .filter(|name| {
+                !freevar_set.contains(name) || self.class_scope_shadows_annotation_name(*name)
+            })
             .collect();
         let closure_names = freevars.clone();
         let plan = LoweringFunctionPlan {

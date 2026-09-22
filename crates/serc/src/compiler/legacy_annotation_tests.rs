@@ -4358,3 +4358,40 @@ fn python313_manager_pop_stays_unlocated_until_infinite_loop_folding() {
     assert_eq!(function.qualified_name, "f");
     assert!(matches!(function.constants.as_slice(), [Constant::None]));
 }
+
+#[test]
+fn annotation_class_cells_follow_target_evaluation_rules() {
+    use crate::target::local_kinds::CO_FAST_CELL;
+
+    for version in [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
+    ] {
+        for future in ["", "from __future__ import annotations\n"] {
+            for definition in [
+                "field: __class__",
+                "def method(arg: __class__): pass",
+                "type Alias = __class__",
+                "type Alias = [__class__ for __class__ in ()]",
+            ] {
+                let module = compile(&format!("{future}class C:\n    {definition}\n"), version);
+                let class = child(&module, "C");
+                let has_class_cell = class
+                    .locals
+                    .iter()
+                    .zip(&class.local_kinds)
+                    .any(|(name, kind)| name == "__class__" && kind & CO_FAST_CELL != 0);
+                let expected = definition == "type Alias = __class__"
+                    || !definition.starts_with("type ")
+                        && version >= PythonVersion::Py314
+                        && future.is_empty();
+                assert_eq!(
+                    has_class_cell, expected,
+                    "{version:?}: {future}{definition}"
+                );
+            }
+        }
+    }
+}

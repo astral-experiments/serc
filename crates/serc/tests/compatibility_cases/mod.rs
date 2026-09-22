@@ -1,3 +1,4 @@
+mod annotation_class_cell;
 mod annotation_lambda_captures;
 mod assert_call_none_compatibility;
 mod async_cleanup_order;

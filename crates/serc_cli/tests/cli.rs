@@ -232,7 +232,7 @@ for template, expected in cases:
 }
 
 #[test]
-fn class_globals_preserve_type_parameter_wrapper_cells() {
+fn class_bindings_preserve_type_parameter_wrapper_cells() {
     for version in [
         serc::PythonVersion::Py312,
         serc::PythonVersion::Py313,
@@ -246,6 +246,10 @@ fn class_globals_preserve_type_parameter_wrapper_cells() {
             "T = int\nclass C:\n global T\n type Alias[T] = T\n",
             "T = int\nclass C:\n global T\n def method[T: T](): pass\n",
             "T = int\nclass C:\n global T\n class Inner[T: T]: pass\n",
+            "class C:\n T = int\n def method[T](arg: T): return T\n",
+            "class C:\n T = int\n type Alias[T] = T\n",
+            "class C:\n T = int\n def method[T: T](): pass\n",
+            "class C:\n T = int\n class Inner[T: T]: pass\n",
         ];
         if version >= serc::PythonVersion::Py313 {
             sources.extend([
@@ -257,6 +261,10 @@ fn class_globals_preserve_type_parameter_wrapper_cells() {
                 "T = int\nclass C:\n global T\n type Alias[T] = [T for T in (0,)]\n",
                 "T = int\nclass C:\n global T\n def method[T: (T, [T for _ in (0,)])](): pass\n",
                 "T = int\nclass C:\n global T\n class Inner[T: (T, [T for _ in (0,)])]: pass\n",
+                "class C:\n T = int\n type Alias[T] = (T, lambda: T, [T for _ in (0,)])\n",
+                "class C:\n T = int\n type Alias[T = T] = T\n",
+                "class C:\n T = int\n def method[T = T](): pass\n",
+                "class C:\n T = int\n class Inner[T = T]: pass\n",
             ]);
         }
         for source in sources {
