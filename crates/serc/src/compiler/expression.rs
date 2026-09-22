@@ -3578,7 +3578,7 @@ impl Compiler<'_> {
         }
         let name_id = self.required_name_id(name.id.as_str());
         if self.unit.annotation_classdict_index.is_some()
-            && !self.class_scope_declares_global(name_id)
+            && (self.is_type_parameter_id(name_id) || !self.class_scope_declares_global(name_id))
         {
             return Ok(SpecializedLowering::NotApplicable);
         }

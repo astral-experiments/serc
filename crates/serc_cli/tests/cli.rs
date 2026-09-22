@@ -156,6 +156,53 @@ for template, expected in cases:
 }
 
 #[test]
+fn generic_signature_cells_preserve_class_lookup_before_deferred_annotations() {
+    for version in [
+        serc::PythonVersion::Py312,
+        serc::PythonVersion::Py313,
+        serc::PythonVersion::Py314,
+        serc::PythonVersion::Py315,
+    ] {
+        for source in [
+            "T = 'global'\nclass C:\n global T\n locals()['T'] = 'class'\n def f[T](arg: T): return T\n",
+            "T = lambda: 'global'\nclass C:\n global T\n locals()['T'] = lambda: 'class'\n def f[T](arg: T()): return T\n",
+            "T = 'global'\nclass C:\n global T\n locals()['T'] = 'class'\n def f[T: T](arg: T): return T\n",
+        ] {
+            let mut oracle = match version {
+                serc::PythonVersion::Py312 => common::python_312_command(),
+                serc::PythonVersion::Py313 => common::python_313_command(),
+                serc::PythonVersion::Py314 => common::python_3145_command(),
+                serc::PythonVersion::Py315 => common::python_315_command(),
+            };
+            let native = oracle
+                .args([
+                    "-c",
+                    "import marshal, sys; code = compile(sys.argv[1], sys.argv[2], 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))",
+                    source,
+                    "generic_signature.py",
+                ])
+                .output()
+                .unwrap();
+            assert!(native.status.success(), "{version}: {native:?}");
+            let compiled = serc::compile_with_options(
+                source,
+                "generic_signature.py",
+                &serc::CompileOptions {
+                    python_version: version,
+                    ..serc::CompileOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                compiled.marshal(),
+                native.stdout,
+                "Python {version}: {source}"
+            );
+        }
+    }
+}
+
+#[test]
 fn compile_matches_cpython_for_version_specific_marshal_identity() {
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("module.py");
