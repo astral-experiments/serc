@@ -340,7 +340,7 @@ pub(super) struct ScopeBodyFacts {
     pub(super) has_function_definition: bool,
     pub(super) has_generic_definition: bool,
     pub(super) has_type_alias: bool,
-    pub(super) has_simple_annotations: bool,
+    pub(super) has_annotations: bool,
     has_inlined_comprehension: bool,
     local_annotation_references: BTreeSet<String>,
     local_annotation_bindings: FxHashSet<String>,
@@ -840,13 +840,14 @@ impl ClassPlan {
         nested_class_requirements: &FxHashSet<NameId>,
         child_needs_class_closure: bool,
     ) -> Self {
-        // CPython retains this synthetic cell under future annotations even though
-        // the annotation thunk does not capture it in that mode.
-        let mut conditional_annotations = Vec::new();
-        if deferred_annotations {
-            collect_conditional_simple_annotations(&definition.body, &mut conditional_annotations);
-        }
-        let has_conditional_annotations = !conditional_annotations.is_empty();
+        // Symbol analysis records every annotation in a compound statement, even
+        // a non-simple target that emits no annotation thunk. Future annotations
+        // retain this cell as well, although the thunk does not capture it.
+        let has_conditional_annotations = deferred_annotations
+            && definition.body.iter().any(|statement| {
+                !matches!(statement, Stmt::AnnAssign(_))
+                    && has_annotations(std::slice::from_ref(statement))
+            });
         let ScopeBodyFacts {
             globals,
             nonlocals,
@@ -859,7 +860,7 @@ impl ClassPlan {
             has_function_definition,
             has_generic_definition,
             has_type_alias,
-            has_simple_annotations,
+            has_annotations,
             inlined_comprehension_cellvars,
             ..
         } = facts;
@@ -969,7 +970,7 @@ impl ClassPlan {
             || has_generic_definition
             || deferred_annotations
                 && !future_annotations
-                && (has_function_definition || has_simple_annotations);
+                && (has_function_definition || has_annotations);
         let comprehension_targets = locals
             .legacy_class_comprehension_symbols
             .take()
@@ -3206,7 +3207,7 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
                 return;
             }
             Stmt::AnnAssign(annotation) => {
-                self.facts.has_simple_annotations |= annotation.simple;
+                self.facts.has_annotations = true;
                 if self.skip_annotations {
                     self.visit_expr(&annotation.target);
                     if let Some(value) = &annotation.value {
@@ -4545,12 +4546,6 @@ fn future_feature_flags(body: &[Stmt]) -> u32 {
         })
 }
 
-pub(super) fn has_simple_annotations(body: &[Stmt]) -> bool {
-    let mut annotations = Vec::new();
-    collect_simple_annotations(body, &mut annotations);
-    !annotations.is_empty()
-}
-
 pub(super) fn has_annotations(body: &[Stmt]) -> bool {
     #[derive(Default)]
     struct AnnotationFinder(bool);
@@ -4688,6 +4683,68 @@ mod tests {
             let deferred = matches!(version, PythonVersion::Py314 | PythonVersion::Py315);
             assert_eq!(class.needs_classdict, deferred, "{version:?}");
             assert_eq!(class.has_conditional_annotations, deferred, "{version:?}");
+        }
+    }
+
+    #[test]
+    fn nonsimple_class_annotations_keep_native_scope_cells() {
+        for (body, conditional) in [
+            ("    object.attribute: int = 0\n", false),
+            ("    object[index]: int\n", false),
+            ("    (name): int = 0\n", false),
+            ("    if condition:\n        object.attribute: int\n", true),
+            ("    if False:\n        object[index]: int = 0\n", true),
+        ] {
+            for future in [false, true] {
+                let source = format!(
+                    "{}class C:\n{body}",
+                    if future {
+                        "from __future__ import annotations\n"
+                    } else {
+                        ""
+                    }
+                );
+                let parsed = parse_module(&source).unwrap();
+                for version in [
+                    PythonVersion::Py312,
+                    PythonVersion::Py313,
+                    PythonVersion::Py314,
+                    PythonVersion::Py315,
+                ] {
+                    let arena = ScopeArena::analyze_with_python_version(parsed.suite(), version);
+                    let class = arena.class(ScopeId(1)).unwrap();
+                    let deferred = matches!(version, PythonVersion::Py314 | PythonVersion::Py315);
+                    assert_eq!(
+                        class.needs_classdict,
+                        deferred && !future,
+                        "{source}, {version:?}"
+                    );
+                    assert_eq!(
+                        class.has_conditional_annotations,
+                        deferred && conditional,
+                        "{source}, {version:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_nonsimple_annotations_do_not_mark_the_enclosing_class() {
+        let parsed = parse_module(
+            "class Outer:\n    if condition:\n        class Inner:\n            object.attribute: int = 0\n",
+        )
+        .unwrap();
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let arena = ScopeArena::analyze_with_python_version(parsed.suite(), version);
+            let class = arena.class(ScopeId(1)).unwrap();
+            assert!(!class.needs_classdict);
+            assert!(!class.has_conditional_annotations);
         }
     }
 

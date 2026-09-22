@@ -26876,13 +26876,24 @@ impl Compiler<'_> {
                     }
                     if !has_instructions {
                         if let Some(last) = statement.body.last() {
-                            compiler
-                                .assembler
-                                .set_location(compiler.source_location(last.range()));
+                            let location = if compiler.context.python_version
+                                >= crate::PythonVersion::Py313
+                                && matches!(statement.body.as_slice(), [Stmt::Pass(_)])
+                                && compiler.source_location(last.range()).line
+                                    == compiler.source_location(statement.range).line
+                            {
+                                // The untargeted body label shares SETUP_FINALLY's native
+                                // array. Early NOP removal drops the same-line Pass before
+                                // setup becomes a NOP, so this ownerless marker keeps setup's
+                                // whole-try span. 3.12 preserves the separate body label.
+                                compiler.source_location(statement.range)
+                            } else {
+                                compiler.source_location(last.range())
+                            };
+                            compiler.assembler.set_location(location);
                         }
-                        // Line propagation gives the following POP_BLOCK this no-op's
-                        // location, then removes the authored no-op. Its replacement keeps
-                        // POP_BLOCK's empty exception owner, including in coroutine scopes.
+                        // The surviving setup or converted POP_BLOCK marker has no
+                        // exception owner, including in coroutine scopes.
                         compiler.emit_with_exception_policy(
                             NOP,
                             0,

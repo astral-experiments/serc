@@ -1173,7 +1173,7 @@ fn scope_body_facts_preserve_named_scope_and_annotation_boundaries() {
     assert!(facts.has_function_definition);
     assert!(facts.has_generic_definition);
     assert!(facts.has_type_alias);
-    assert!(facts.has_simple_annotations);
+    assert!(facts.has_annotations);
 
     let source = "class Container:\n    item: annotation = value\n";
     let parsed = parse_module(source).unwrap();

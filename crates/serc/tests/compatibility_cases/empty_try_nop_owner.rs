@@ -149,3 +149,32 @@ fn folded_pass_try_handoff_keeps_nested_managers_and_following_work() {
         }
     }
 }
+
+#[test]
+fn same_line_pass_retains_the_whole_try_setup_span() {
+    for prefix in [
+        "",
+        "try: work()\nexcept Error: pass\n",
+        "try: work()\nexcept* Error: pass\n",
+    ] {
+        let body = format!("{prefix}try: pass\nfinally: pass\nconsume(value)\n");
+        let source = format!("def f(value):\n{}", common::indent(&body));
+        common::assert_matches_cpython_marshal(&source, "same_line_pass_try_setup_span.py");
+    }
+}
+
+#[test]
+fn same_line_pass_setup_handoff_keeps_neighboring_markers() {
+    for body in [
+        "try:\n    pass\nfinally: pass\nconsume(value)\n",
+        "try: work()\nfinally: pass\nconsume(value)\n",
+        "try: pass\nfinally: cleanup()\nconsume(value)\n",
+        "with manager():\n    try: pass\n    finally: pass\nconsume(value)\n",
+        "try:\n    try: pass\n    finally: pass\nexcept Error: pass\nconsume(value)\n",
+        "try: pass\nfinally: pass\n",
+        "yield value\ntry: pass\nfinally: pass\nyield value\n",
+    ] {
+        let source = format!("def f(value):\n{}", common::indent(body));
+        common::assert_matches_cpython_marshal(&source, "same_line_pass_setup_boundary.py");
+    }
+}

@@ -32,7 +32,7 @@ use super::constant::{DeferredConstantTarget, OutputState, fold_constant};
 use super::definition::clean_doc;
 use super::scope::{
     LoweringFunctionPlan, NameId, NameSet, ScopeId, collect_conditional_simple_annotations,
-    collect_simple_annotations, has_annotations, has_simple_annotations,
+    collect_simple_annotations, has_annotations,
 };
 use super::source::{CompilationContext, implicit_return_range};
 use super::statement::{
@@ -755,7 +755,7 @@ impl<'source> Compiler<'source> {
             self.emit(STORE_DEREF, index, -1)?;
         }
         if if self.has_deferred_annotations() {
-            self.unit.flags & CO_FUTURE_ANNOTATIONS != 0 && has_simple_annotations(body)
+            self.unit.flags & CO_FUTURE_ANNOTATIONS != 0 && has_annotations(body)
         } else {
             has_annotations(body)
         } {
