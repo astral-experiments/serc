@@ -1010,24 +1010,53 @@ pub(super) struct OriginalNormalFinallyArray {
     pub(super) borrow_join: Option<(Label, Instruction)>,
 }
 
+/// Whether a slot is protected, with its exact source region when known.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct ExceptionOwnerDecision {
-    pub(super) has_owner: bool,
+pub(super) enum ExceptionOwner {
+    Absent,
+    /// An owner exists, but layout must infer its source region.
+    Present,
     // An earlier original-array record can have a different owner from the condition.
-    pub(super) source_region: Option<usize>,
-    pub(super) definitive: bool,
-    pub(super) override_existing: bool,
+    SourceRegion(usize),
+}
+
+/// The strength of an ownership result reconstructed from original-array provenance.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ExceptionOwnerDecision {
+    Tentative(ExceptionOwner),
+    Definitive(ExceptionOwner),
+    Override(ExceptionOwner),
 }
 
 impl ExceptionOwnerDecision {
     /// Replaces the inferred owner with an exact source region or an unowned slot.
     fn override_with_region(source_region: Option<usize>) -> Self {
-        Self {
-            has_owner: source_region.is_some(),
-            source_region,
-            definitive: true,
-            override_existing: true,
+        Self::Override(source_region.map_or(ExceptionOwner::Absent, ExceptionOwner::SourceRegion))
+    }
+
+    fn owner(self) -> ExceptionOwner {
+        match self {
+            Self::Tentative(owner) | Self::Definitive(owner) | Self::Override(owner) => owner,
         }
+    }
+
+    pub(super) fn has_owner(self) -> bool {
+        !matches!(self.owner(), ExceptionOwner::Absent)
+    }
+
+    pub(super) fn source_region(self) -> Option<usize> {
+        match self.owner() {
+            ExceptionOwner::SourceRegion(region) => Some(region),
+            ExceptionOwner::Absent | ExceptionOwner::Present => None,
+        }
+    }
+
+    pub(super) fn is_definitive(self) -> bool {
+        !matches!(self, Self::Tentative(_))
+    }
+
+    pub(super) fn overrides_existing(self) -> bool {
+        matches!(self, Self::Override(_))
     }
 }
 
@@ -6418,7 +6447,7 @@ impl LayoutAssembler {
                             && !has_owner
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive);
+                                .is_none_or(|owner| !owner.is_definitive());
                         // Presence is already proved for a value-preserving Boolean
                         // marker. Retained array provenance supplies its exact source owner.
                         let source_region = (has_owner
@@ -6426,7 +6455,7 @@ impl LayoutAssembler {
                                 == NormalizedExceptionOwner::Dynamic
                             && instruction_index > 0
                             && owners.get(&instruction_index).is_none_or(
-                                |owner: &ExceptionOwnerDecision| owner.source_region.is_none(),
+                                |owner: &ExceptionOwnerDecision| owner.source_region().is_none(),
                             ))
                         .then(|| {
                             self.exception_owner_provenance
@@ -6447,18 +6476,23 @@ impl LayoutAssembler {
                                 })
                         })
                         .flatten();
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner,
-                                source_region,
-                                override_existing: false,
-                                definitive: proven_unprotected_slot
-                                    || prologue_consumed_all_slots
-                                    || instruction.exception_policy().owner()
-                                        != NormalizedExceptionOwner::DynamicCondition,
-                            },
-                        );
+                        let owner = if let Some(region) = source_region {
+                            ExceptionOwner::SourceRegion(region)
+                        } else if has_owner {
+                            ExceptionOwner::Present
+                        } else {
+                            ExceptionOwner::Absent
+                        };
+                        let decision = if proven_unprotected_slot
+                            || prologue_consumed_all_slots
+                            || instruction.exception_policy().owner()
+                                != NormalizedExceptionOwner::DynamicCondition
+                        {
+                            ExceptionOwnerDecision::Definitive(owner)
+                        } else {
+                            ExceptionOwnerDecision::Tentative(owner)
+                        };
+                        owners.insert(instruction_index, decision);
                     }
                     // These replay rules only resolve inserted markers.
                     if instruction.opcode == NOT_TAKEN {
@@ -6477,16 +6511,11 @@ impl LayoutAssembler {
                             && tail.post_compaction_fusions == 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                         {
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: false,
-                                    source_region: None,
-                                    definitive: true,
-                                    override_existing: false,
-                                },
+                                ExceptionOwnerDecision::Definitive(ExceptionOwner::Absent),
                             );
                         }
                         // Local fusion leaves a newer stale suffix inside the original array.
@@ -6572,12 +6601,7 @@ impl LayoutAssembler {
                             {
                                 owners.insert(
                                     instruction_index,
-                                    ExceptionOwnerDecision {
-                                        has_owner: false,
-                                        source_region: None,
-                                        definitive: true,
-                                        override_existing: false,
-                                    },
+                                    ExceptionOwnerDecision::Definitive(ExceptionOwner::Absent),
                                 );
                             }
                         }
@@ -6646,12 +6670,7 @@ impl LayoutAssembler {
                             {
                                 owners.insert(
                                     instruction_index,
-                                    ExceptionOwnerDecision {
-                                        has_owner: true,
-                                        source_region: None,
-                                        definitive: true,
-                                        override_existing: true,
-                                    },
+                                    ExceptionOwnerDecision::Override(ExceptionOwner::Present),
                                 );
                             }
                         }
@@ -6724,12 +6743,7 @@ impl LayoutAssembler {
                         }) {
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: true,
-                                    source_region: None,
-                                    definitive: true,
-                                    override_existing: true,
-                                },
+                                ExceptionOwnerDecision::Override(ExceptionOwner::Present),
                             );
                         }
                         let reusable_suffix_slots = if tail.late_removals > 0 {
@@ -6790,12 +6804,7 @@ impl LayoutAssembler {
                             // no removed records. Appending its marker allocates a NULL owner.
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: false,
-                                    source_region: None,
-                                    definitive: true,
-                                    override_existing: false,
-                                },
+                                ExceptionOwnerDecision::Definitive(ExceptionOwner::Absent),
                             );
                         }
                         // Fusion leaves stale records in a uniformly owned original source
@@ -6829,7 +6838,7 @@ impl LayoutAssembler {
                             && tail.post_compaction_fusions == 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive)
+                                .is_none_or(|owner| !owner.is_definitive())
                             && let Some(region) = self.entry_manager_return_setup_owner(
                                 instruction_index,
                                 tail.insertions,
@@ -6853,7 +6862,7 @@ impl LayoutAssembler {
                             && tail.post_compaction_fusions == 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive)
+                                .is_none_or(|owner| !owner.is_definitive())
                             && self.retained_manager_return_none_owner(
                                 instruction_index,
                                 original_array_start,
@@ -6880,7 +6889,7 @@ impl LayoutAssembler {
                             && tail.late_removals == 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive)
+                                .is_none_or(|owner| !owner.is_definitive())
                             && let Some(decision) = self.copied_manager_return_compaction_owner(
                                 instruction_index,
                                 original_array_start,
@@ -6911,7 +6920,7 @@ impl LayoutAssembler {
                             && tail.post_compaction_fusions == 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive)
+                                .is_none_or(|owner| !owner.is_definitive())
                             && let Some(decision) = self.copied_manager_return_compaction_owner(
                                 instruction_index,
                                 original_array_start,
@@ -6933,7 +6942,7 @@ impl LayoutAssembler {
                             && tail.post_compaction_fusions == 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive)
+                                .is_none_or(|owner| !owner.is_definitive())
                             && let Some(decision) = self.copied_manager_return_compaction_owner(
                                 instruction_index,
                                 original_array_start,
@@ -6957,7 +6966,7 @@ impl LayoutAssembler {
                             && tail.post_compaction_fusions == 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive)
+                                .is_none_or(|owner| !owner.is_definitive())
                             && let Some(region) = self.copied_return_call_parent_owner(
                                 instruction_index,
                                 original_array_start,
@@ -6984,7 +6993,7 @@ impl LayoutAssembler {
                             && tail.post_compaction_fusions == 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive)
+                                .is_none_or(|owner| !owner.is_definitive())
                             && let Some(decision) = self.copied_return_attribute_truth_owner(
                                 instruction_index,
                                 original_array_start,
@@ -7281,7 +7290,7 @@ impl LayoutAssembler {
                             != super::BorrowFallthrough::Barrier
                         && owners
                             .get(&(instruction_index + 1))
-                            .is_none_or(|owner| !owner.definitive)
+                            .is_none_or(|owner| !owner.is_definitive())
                     {
                         owners.insert(
                             instruction_index + 1,
@@ -7509,11 +7518,11 @@ impl LayoutAssembler {
                                 !self.exception_regions[region].is_scope_fallback
                             }) && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive))
+                                .is_none_or(|owner| !owner.is_definitive()))
                             || (reuses_null_setup
                                 && owners
                                     .get(&instruction_index)
-                                    .is_none_or(|owner| !owner.definitive))
+                                    .is_none_or(|owner| !owner.is_definitive()))
                         {
                             owners.insert(
                                 instruction_index,
@@ -7532,7 +7541,7 @@ impl LayoutAssembler {
                         && tail.post_compaction_fusions == 0
                         && owners
                             .get(&instruction_index)
-                            .is_none_or(|owner| !owner.definitive)
+                            .is_none_or(|owner| !owner.is_definitive())
                         && let Some(region) = self.copied_bare_handler_none_owner(
                             instruction_index,
                             original_array_start,
@@ -8038,7 +8047,7 @@ impl LayoutAssembler {
                         && index == instruction_index
                         && owners
                             .get(&instruction_index)
-                            .is_none_or(|owner| !owner.definitive || owner.has_owner)
+                            .is_none_or(|owner| !owner.is_definitive() || owner.has_owner())
                     {
                         owners.insert(
                             instruction_index,
@@ -8086,7 +8095,7 @@ impl LayoutAssembler {
                         && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
                         && owners
                             .get(&instruction_index)
-                            .is_none_or(|owner| !owner.definitive)
+                            .is_none_or(|owner| !owner.is_definitive())
                         && let Some(owner) = self.copied_return_membership_owner(
                             instruction_index,
                             original_array_start,
@@ -8125,7 +8134,7 @@ impl LayoutAssembler {
                             && index == instruction_index
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive)
+                                .is_none_or(|owner| !owner.is_definitive())
                         {
                             owners.insert(
                                 instruction_index,
@@ -8135,7 +8144,7 @@ impl LayoutAssembler {
                         if instruction_index > 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive)
+                                .is_none_or(|owner| !owner.is_definitive())
                         {
                             for (condition, marker, region) in
                                 &self.exception_owner_provenance.fused_manager_owners
@@ -8168,10 +8177,10 @@ impl LayoutAssembler {
                                 .values()
                                 .any(|position| *position == instruction_index)
                             && owners.get(&instruction_index).is_none_or(|decision| {
-                                !decision.definitive
-                                    || (decision.has_owner
-                                        && decision.source_region.is_none()
-                                        && !decision.override_existing)
+                                !decision.is_definitive()
+                                    || (decision.has_owner()
+                                        && decision.source_region().is_none()
+                                        && !decision.overrides_existing())
                             })
                             && let Some(region) = self.copied_handler_value_owner(
                                 instruction_index,
@@ -8194,7 +8203,7 @@ impl LayoutAssembler {
                             && owner_history_exact
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                             && let Some(region) = self.named_handler_try_owner(
                                 instruction_index,
                                 original_array_start,
@@ -8213,7 +8222,7 @@ impl LayoutAssembler {
                             && owner_history_exact
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                             && self
                                 .continued_handler_try_is_null(
                                     instruction_index,
@@ -8237,7 +8246,7 @@ impl LayoutAssembler {
                             && pop_slot_epoch_known
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                             && self.saved_named_handler_none_is_null(
                                 instruction_index,
                                 original_array_start,
@@ -8258,7 +8267,7 @@ impl LayoutAssembler {
                             && owner_history_exact
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                             && let Some(decision) = self.copied_cleanup_return_none_owner(
                                 instruction_index,
                                 original_array_start,
@@ -8287,7 +8296,7 @@ impl LayoutAssembler {
                             )
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                             && let Some((
                                 array,
                                 start,
@@ -8585,7 +8594,7 @@ impl LayoutAssembler {
                             )
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                             && let Some((array, pop, slot, region)) = early_return_nop_slot
                             && original_array_start == array
                             && pop < instruction_index
@@ -8626,7 +8635,7 @@ impl LayoutAssembler {
                             && instruction.pre_fold_extra_instructions() == 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                             && let Some((array, iterator, slot, region)) =
                                 early_return_iterator_slot
                             && original_array_start == array
@@ -8678,7 +8687,7 @@ impl LayoutAssembler {
                             && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive)
+                                .is_none_or(|owner| !owner.is_definitive())
                             && let Some((array, iterator, slot, region)) =
                                 early_return_iterator_slot
                             && original_array_start == array
@@ -8761,7 +8770,7 @@ impl LayoutAssembler {
                             && instruction.pre_fold_extra_instructions() == 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                             && let Some((array, pop, slot)) = early_return_truth_slot
                             && original_array_start == array
                             && instruction_index - pop == 4
@@ -8799,12 +8808,7 @@ impl LayoutAssembler {
                             if !protected || source_region.is_some() {
                                 owners.insert(
                                     instruction_index,
-                                    ExceptionOwnerDecision {
-                                        has_owner: protected,
-                                        source_region,
-                                        definitive: true,
-                                        override_existing: true,
-                                    },
+                                    ExceptionOwnerDecision::override_with_region(source_region),
                                 );
                             }
                         }
@@ -8884,11 +8888,11 @@ impl LayoutAssembler {
                                     | NormalizedExceptionOwner::DynamicCondition
                             ) || threaded_paired_pop_marker)
                             && owners.get(&instruction_index).is_none_or(|decision| {
-                                !decision.definitive
+                                !decision.is_definitive()
                                     || (threaded_paired_pop_marker
-                                        && decision.has_owner
-                                        && decision.source_region.is_none()
-                                        && !decision.override_existing)
+                                        && decision.has_owner()
+                                        && decision.source_region().is_none()
+                                        && !decision.overrides_existing())
                             })
                             && let Some((array, pop, slot, region)) = early_return_nop_slot
                             && original_array_start == array
@@ -8939,7 +8943,7 @@ impl LayoutAssembler {
                                 == NormalizedExceptionOwner::Present
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                             && self.entry_retained_setup_null_marker(
                                 instruction_index,
                                 &indexed_instructions,
@@ -8980,7 +8984,7 @@ impl LayoutAssembler {
                             && tail.post_compaction_fusions == 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                             && self.copied_named_break_truth_is_null(
                                 instruction_index,
                                 original_array_start,
@@ -8999,7 +9003,7 @@ impl LayoutAssembler {
                                 == super::ExceptionPolicy::NoneDynamicCondition
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                             && let Some(region) = self.copied_shared_break_truth_owner(
                                 instruction_index,
                                 original_array_start,
@@ -9226,12 +9230,7 @@ impl LayoutAssembler {
             // the old condition cell at index four for the appended NOT_TAKEN.
             owners.insert(
                 marker,
-                ExceptionOwnerDecision {
-                    has_owner: true,
-                    source_region: Some(region),
-                    definitive: true,
-                    override_existing: true,
-                },
+                ExceptionOwnerDecision::override_with_region(Some(region)),
             );
         }
         owners
@@ -11483,9 +11482,9 @@ mod tests {
             }
             let decisions = assembler.dynamic_exception_owners();
             let decision = decisions.get(&3).expect("dynamic marker decision");
-            assert!(!decision.has_owner);
-            assert_eq!(decision.definitive, !barrier && !outer_region);
-            assert_eq!(decision.override_existing, !barrier && !outer_region);
+            assert!(!decision.has_owner());
+            assert_eq!(decision.is_definitive(), !barrier && !outer_region);
+            assert_eq!(decision.overrides_existing(), !barrier && !outer_region);
 
             if !barrier && !outer_region {
                 let Item::Instruction(instruction) = &mut assembler.items[5] else {
@@ -11494,7 +11493,7 @@ mod tests {
                 instruction.opcode = LOAD_FAST;
                 let decisions = assembler.dynamic_exception_owners();
                 let decision = decisions.get(&3).expect("ordinary dynamic owner decision");
-                assert!(!decision.override_existing);
+                assert!(!decision.overrides_existing());
             }
         }
     }
@@ -11693,7 +11692,7 @@ mod tests {
             let owners = assembler.dynamic_exception_owners();
             let decision = owners.get(&marker_index).expect("dynamic marker decision");
             assert_eq!(
-                !decision.has_owner && decision.definitive && decision.override_existing,
+                !decision.has_owner() && decision.is_definitive() && decision.overrides_existing(),
                 matches!(change, "unchanged" | "bookkeeping"),
                 "{change}"
             );
@@ -13343,14 +13342,18 @@ mod tests {
                 "none" | "not none" | "present" | "global fold" | "boolean compare"
             ) {
                 let decision = decisions.get(&4).expect("marker after region-end label");
-                assert_eq!(decision.source_region, Some(0), "{case}");
+                assert_eq!(decision.source_region(), Some(0), "{case}");
                 assert!(
-                    decision.has_owner && decision.definitive && decision.override_existing,
+                    decision.has_owner()
+                        && decision.is_definitive()
+                        && decision.overrides_existing(),
                     "{case}"
                 );
             } else if case == "excluded marker" {
                 assert!(
-                    !decisions.get(&4).is_some_and(|decision| decision.has_owner),
+                    !decisions
+                        .get(&4)
+                        .is_some_and(|decision| decision.has_owner()),
                     "{case}"
                 );
             }
