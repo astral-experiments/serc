@@ -6901,6 +6901,7 @@ impl Compiler<'_> {
                 // The handler exits before the inner finalizer, but the ordinary
                 // try between these finalizers remains active until the outer copy.
                 let tracks_handler_between_plain_finalizers = !return_is_overridden
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     && preserve_tos
                     && matches!(statement.value.as_deref(), Some(Expr::Name(_)))
                     && self.control.withs.active_with_exits.is_empty()

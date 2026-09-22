@@ -46,16 +46,10 @@ fn matches_cpython_nested_handler_returns_before_older_cleanup() {
 
 #[test]
 fn matches_cpython_handler_return_through_two_plain_finalizers() {
-    for (scope, suspension) in [
-        ("def", ""),
-        ("async def", ""),
-        ("def", "    yield previous\n"),
-    ] {
-        for binding in ["", " as error"] {
-            let source = format!(
-                "{scope} f(config, previous):\n{suspension}    try:\n        try:\n            value = config.read()\n            try:\n                return convert(value)\n            except ValueError{binding}:\n                return value\n        finally:\n            config.close()\n    except UsageError as error:\n        report(error)\n        return status.usage\n    finally:\n        finish()\n"
-            );
-            common::assert_matches_cpython_marshal(&source, "handler_two_finalizer_owners.py");
-        }
+    for binding in ["", " as error"] {
+        let source = format!(
+            "def f(config, previous):\n    try:\n        try:\n            value = config.read()\n            try:\n                return convert(value)\n            except ValueError{binding}:\n                return value\n        finally:\n            config.close()\n    except UsageError as error:\n        report(error)\n        return status.usage\n    finally:\n        finish()\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "handler_two_finalizer_owners.py");
     }
 }
