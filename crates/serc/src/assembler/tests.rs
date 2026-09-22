@@ -3368,6 +3368,165 @@ fn threads_unconditional_forward_jumps_without_conditional_jumps() {
 }
 
 #[test]
+fn folded_condition_loop_tails_require_original_provenance_before_threading() {
+    for version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        for source_opcode in [JUMP_FORWARD, JUMP_BACKWARD_NO_INTERRUPT] {
+            for case in [
+                "excluded condition",
+                "default policy",
+                "missing marker",
+                "source in another array",
+                "different marker span",
+                "while source boundary",
+                "while exit anchor",
+                "ambiguous sources",
+                "changed exception owner",
+                "changed jump policy",
+                "changed location policy",
+                "hidden original slot",
+                "hidden owner slot",
+            ] {
+                let mut assembler = Assembler {
+                    python_version: version,
+                    ..Assembler::default()
+                };
+                let head = assembler.label();
+                let incoming = assembler.label();
+                let continuation = assembler.label();
+                let marker = assembler.label();
+                let fallthrough = assembler.label();
+                let discarded = assembler.label();
+                let end = assembler.label();
+                let location = SourceLocation::new(20, 21, 8, 19);
+                assembler.record_folded_condition_predecessor(discarded);
+                if case == "while exit anchor" {
+                    assembler.record_folded_loop_exit_anchor(discarded);
+                }
+                if case == "source in another array" {
+                    let foreign = assembler.label();
+                    let foreign_end = assembler.label();
+                    assembler.mark(foreign);
+                    assembler.set_location(location);
+                    assembler.emit_with_depth(NOP, 0, 1, ExceptionPolicy::default());
+                    assembler.record_folded_predecessor_source(foreign, discarded);
+                    assembler.mark(foreign_end);
+                    let removed = assembler.take_trailing_nop_location().unwrap();
+                    assert_eq!(removed.original_slots, 0);
+                    assembler.emit_with_depth(LOAD_CONST, 0, 2, ExceptionPolicy::default());
+                    assembler.emit_with_depth(POP_TOP, 0, 1, ExceptionPolicy::default());
+                }
+                assembler.mark(head);
+                assembler.record_exception_owner_block_boundary(head);
+                assembler.set_location(SourceLocation::new(2, 2, 4, 12));
+                assembler.emit_forward_with_depth(FOR_ITER, end, 2, ExceptionPolicy::default());
+                assembler.mark(incoming);
+                let source = Instruction::new(
+                    source_opcode,
+                    Operand::Forward(continuation),
+                    SourceLocation::new(10, 10, 8, 15),
+                    Some(1),
+                );
+                assembler.push_linear_item(Item::Instruction(source));
+                assembler.mark(continuation);
+                assembler.record_exception_owner_block_boundary(continuation);
+                assembler.mark(marker);
+                if case == "while source boundary" {
+                    assembler.record_exception_owner_block_boundary(marker);
+                }
+                let second_marker = (case == "ambiguous sources").then(|| assembler.label());
+                if let Some(second_marker) = second_marker {
+                    assembler.mark(second_marker);
+                }
+                assembler.set_location(location);
+                assembler.emit_with_depth(NOP, 0, 1, ExceptionPolicy::default());
+                if !matches!(
+                    case,
+                    "default policy" | "missing marker" | "source in another array"
+                ) {
+                    assembler.record_folded_predecessor_source(marker, discarded);
+                }
+                if let Some(second_marker) = second_marker {
+                    assembler.record_folded_predecessor_source(second_marker, discarded);
+                }
+                assembler.record_exception_owner_block_boundary(fallthrough);
+                assembler.mark(fallthrough);
+                // Exercise the same early NOP removal that exposes the loop backedge.
+                // Reuse this IR on legacy targets to check that the new policy stays modern.
+                let removed = assembler.take_trailing_nop_location().unwrap();
+                assert_eq!(removed.location, location);
+                assert_eq!(removed.original_slots, 0);
+                let tail_location = if case == "different marker span" {
+                    SourceLocation::new(20, 21, 9, 19)
+                } else {
+                    removed.location
+                };
+                let mut tail = Instruction::new(
+                    JUMP_BACKWARD,
+                    Operand::Backward(head),
+                    tail_location,
+                    Some(1),
+                );
+                tail.set_exception_policy(if case == "default policy" {
+                    ExceptionPolicy::default()
+                } else {
+                    ExceptionPolicy::EXCLUDE_ALWAYS
+                });
+                match case {
+                    "changed exception owner" => {
+                        tail.set_exception_policy(ExceptionPolicy::AlwaysAbsent);
+                    }
+                    "changed jump policy" => tail.jump_policy.prevent_small_exit_inlining(),
+                    "changed location policy" => tail.no_location_policy.preserve_location(),
+                    "hidden original slot" => tail.add_pre_fold_extra_instructions(1),
+                    "hidden owner slot" => tail.local_policy.add_hidden_exception_owner_slots(1),
+                    _ => {}
+                }
+                assembler.push_linear_item(Item::Instruction(tail));
+                assembler.mark(discarded);
+                assembler.mark(end);
+                assembler.emit_with_depth(RETURN_VALUE, 0, 0, ExceptionPolicy::default());
+
+                let mut pipeline = assembler.into_optimization_pipeline();
+                let source_block = pipeline.graph.label_block(incoming).unwrap();
+                let tail_block = pipeline.graph.label_block(continuation).unwrap();
+                let original_tail = pipeline.graph[tail_block].items().to_vec();
+                let retained = case == "default policy"
+                    || (case == "excluded condition" && version >= crate::PythonVersion::Py314);
+                assert_eq!(
+                    pipeline.thread_forward_jumps(),
+                    !retained,
+                    "{version:?}, {source_opcode:?}, {case}",
+                );
+                let mut expected = source;
+                if !retained {
+                    expected.retarget(Operand::Backward(head));
+                    expected.opcode = JUMP_BACKWARD;
+                    expected.add_pre_fold_extra_instructions(1);
+                    if source_opcode != JUMP_FORWARD {
+                        expected.jump_policy.mark_interruptible();
+                    }
+                }
+                assert_eq!(
+                    pipeline.graph[source_block].last_instruction(),
+                    Some(&expected),
+                    "incoming jump: {version:?}, {source_opcode:?}, {case}",
+                );
+                assert_eq!(
+                    pipeline.graph[tail_block].items(),
+                    original_tail,
+                    "tail array: {version:?}, {source_opcode:?}, {case}",
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn threads_forward_operands_with_backward_jump_kinds() {
     for source_opcode in [JUMP_FORWARD, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT] {
         for intermediate in [None, Some(JUMP_BACKWARD)] {
