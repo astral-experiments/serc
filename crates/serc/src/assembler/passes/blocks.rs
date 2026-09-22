@@ -2175,6 +2175,15 @@ impl OptimizationPipeline {
             else {
                 continue;
             };
+            let authored_nop_predecessor =
+                self.graph[source]
+                    .last_instruction()
+                    .is_some_and(|instruction| {
+                        instruction.opcode == NOP
+                            && instruction.location.line >= 0
+                            && !instruction.fusion_policy.is_converted_pop_block()
+                            && instruction.exception_policy() == ExceptionPolicy::default()
+                    });
             for target in fallthrough.into_iter().chain(jump_target) {
                 if predecessors[target.index()] != 1 {
                     continue;
@@ -2185,6 +2194,13 @@ impl OptimizationPipeline {
                 if first.location.line >= 0
                     || first.no_location_policy.percent_target_location != u8::MAX
                 {
+                    continue;
+                }
+                if authored_nop_predecessor && fallthrough == Some(target) {
+                    // Native line propagation gives the synthesized literal its preceding
+                    // authored NOP's span before equal-next-line NOP compaction.
+                    first.location = location;
+                    first.no_location_policy.percent_target_location = 0;
                     continue;
                 }
                 let Ok(id) = u8::try_from(locations.len() + 1) else {
