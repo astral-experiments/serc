@@ -41,6 +41,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) iterator_return_pop_spans: Vec<(Instruction, OriginalPopBlockSpan)>,
     pub(super) fused_manager_owners: Vec<(Instruction, Instruction, super::ExceptionRegion)>,
     pub(super) handler_dispatch_arrays: Vec<HandlerDispatchArray>,
+    // Matched named-handler entry through its first primitive truth condition.
+    pub(super) named_handler_truth_prefixes: Vec<NamedHandlerTruthPrefix>,
     pub(super) block_boundaries: FxHashSet<Label>,
     // Original entries that split borrowed-load analysis without changing the physical CFG.
     pub(super) borrow_only_block_boundaries: FxHashSet<Label>,
@@ -204,6 +206,17 @@ impl ExceptionOwnerProvenance {
                     )
                 })
         {
+            return false;
+        }
+        if !self.named_handler_truth_prefixes.iter().all(|origin| {
+            origin.items.iter().all(|item| match item {
+                Item::Instruction(instruction) => matches!(
+                    instruction.operand(),
+                    Operand::Value(_) | Operand::Forward(_)
+                ),
+                Item::Label(_) => true,
+            })
+        }) {
             return false;
         }
         if !self.original_normal_finally_arrays.iter().all(|origin| {
@@ -395,6 +408,13 @@ impl ExceptionOwnerProvenance {
         for record in &mut self.fused_manager_owners {
             visit(&mut record.0);
             visit(&mut record.1);
+        }
+        for origin in &mut self.named_handler_truth_prefixes {
+            for item in &mut origin.items {
+                if let Item::Instruction(instruction) = item {
+                    visit(instruction);
+                }
+            }
         }
         for origin in &mut self.handler_dispatch_arrays {
             for item in &mut origin.items {
@@ -956,6 +976,15 @@ pub(super) struct ConstantPassCluster {
 pub(super) struct RetainedNormalPopBlock {
     pub(super) before: Vec<Label>,
     pub(super) after: Vec<Label>,
+}
+
+/// The original fallthrough array containing one named SETUP and its first truth test.
+#[derive(Debug)]
+pub(super) struct NamedHandlerTruthPrefix {
+    pub(super) entry: Label,
+    pub(super) setup: Label,
+    pub(super) target: Label,
+    pub(super) items: Vec<Item>,
 }
 
 /// The original normal-finally prefix and the jumps that entered its fresh array.
@@ -4652,6 +4681,10 @@ impl LayoutAssembler {
             && self
                 .exception_owner_provenance
                 .normal_try_break_pop_owners
+                .is_empty()
+            && self
+                .exception_owner_provenance
+                .named_handler_truth_prefixes
                 .is_empty()
             && !self.items.iter().any(|item| {
                 let Item::Instruction(instruction) = item else {
@@ -9179,6 +9212,163 @@ impl LayoutAssembler {
         // The generic fresh-array rule cannot see this pair of omitted POPs.
         // Replay the exact source certificate after all generic NULL conclusions.
         owners.extend(self.copied_conjunction_break_owners(&label_positions, &jump_targets));
+        owners.extend(self.named_handler_truth_owners(&label_positions, &jump_targets));
+        owners
+    }
+
+    /// Replays the single late SETUP vacancy in an unchanged matched-handler array.
+    fn named_handler_truth_owners(
+        &self,
+        positions: &FxHashMap<Label, usize>,
+        jump_targets: &FxHashSet<Label>,
+    ) -> FxHashMap<usize, ExceptionOwnerDecision> {
+        let provenance = &self.exception_owner_provenance;
+        let mut owners = FxHashMap::default();
+        if provenance.named_handler_truth_prefixes.is_empty() {
+            return owners;
+        }
+        let unique = UniqueLabelPositions::new(&self.items);
+        for origin in &provenance.named_handler_truth_prefixes {
+            let Some((item_start, start)) = unique.get(origin.entry) else {
+                continue;
+            };
+            let marker = start + 4;
+            let within = |label: &Label| {
+                positions
+                    .get(label)
+                    .is_some_and(|position| (start..=marker).contains(position))
+            };
+            // A copied or independently entered alias is a different physical array,
+            // even when it shares the captured entry's current instruction position.
+            if jump_targets.iter().any(within)
+                || self
+                    .exception_regions
+                    .iter()
+                    .any(|region| within(&region.target))
+                || [
+                    &provenance.normal_try_copy_blocks,
+                    &provenance.normal_try_copy_jump_nop_successors,
+                    &provenance.normal_try_copy_inline_labels,
+                    &provenance.retired_normal_try_copy_labels,
+                ]
+                .iter()
+                .any(|labels| labels.iter().any(within))
+                || provenance
+                    .normal_try_copy_internal_labels
+                    .iter()
+                    .any(within)
+                || provenance
+                    .normal_try_copy_steps
+                    .iter()
+                    .any(|(a, b, _)| within(a) || within(b))
+                || provenance
+                    .normal_try_copy_pop_ranges
+                    .iter()
+                    .any(|(a, b)| within(a) || within(b))
+                || provenance.omitted_nop_counts.keys().any(within)
+                || provenance.omitted_nop_locations.keys().any(within)
+                || !provenance
+                    .named_handler_cleanup_targets
+                    .contains(&origin.target)
+                || positions.get(&origin.setup) != Some(&(start + 1))
+                || provenance
+                    .setups
+                    .iter()
+                    .filter(|(label, _)| within(label))
+                    .copied()
+                    .collect::<Vec<_>>()
+                    != [(origin.setup, None)]
+            {
+                continue;
+            }
+            let captured_labels = origin
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Label(label) => Some(*label),
+                    Item::Instruction(_) => None,
+                })
+                .collect::<FxHashSet<_>>();
+            let mut cursor = item_start;
+            let exact = origin.items.iter().all(|expected| {
+                while let Some(Item::Label(label)) = self.items.get(cursor)
+                    && !captured_labels.contains(label)
+                {
+                    // Exception-range aliases add no native array records or edges.
+                    if provenance.block_boundaries.contains(label)
+                        || provenance.source_boundaries.contains(label)
+                        || provenance.removed_pop_block_boundaries.contains(label)
+                        || self.preserved_block_boundaries.contains(label)
+                        || provenance.setups.iter().any(|(setup, _)| setup == label)
+                        || unique.get(*label).is_none()
+                    {
+                        return false;
+                    }
+                    cursor += 1;
+                }
+                let same = match (self.items.get(cursor), expected) {
+                    (Some(Item::Label(current)), Item::Label(expected)) => {
+                        current == expected
+                            && unique.get(*current).is_some()
+                            && (*current == origin.entry
+                                || *current == origin.setup
+                                || (!provenance.block_boundaries.contains(current)
+                                    && !provenance.source_boundaries.contains(current)
+                                    && !self.preserved_block_boundaries.contains(current)))
+                    }
+                    (Some(Item::Instruction(current)), Item::Instruction(expected)) => {
+                        let mut expected = *expected;
+                        if expected.opcode == crate::target::opcodes::LOAD_FAST
+                            && matches!(
+                                current.opcode,
+                                crate::target::opcodes::LOAD_FAST_BORROW
+                                    | crate::target::opcodes::LOAD_FAST_CHECK
+                            )
+                        {
+                            expected.opcode = current.opcode;
+                        }
+                        *current == expected
+                    }
+                    _ => false,
+                };
+                cursor += 1;
+                same
+            });
+            if !exact {
+                continue;
+            }
+            let current = &self.items[item_start..cursor];
+            let Some(region) = self.uniform_exception_owner(start + 1, marker, positions) else {
+                continue;
+            };
+            let owner = self.exception_regions[region];
+            let store = current
+                .iter()
+                .find_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction),
+                    Item::Label(_) => None,
+                })
+                .unwrap();
+            if owner.target != origin.target
+                || owner.is_scope_fallback
+                || !owner.preserve_lasti
+                || store.depth_after() != Some(owner.depth)
+            {
+                continue;
+            }
+            // Original cells are STORE, SETUP(NULL), LOAD, TO_BOOL, condition.
+            // The SETUP prevents early STORE/LOAD fusion. Its late removal leaves
+            // the old condition cell at index four for the appended NOT_TAKEN.
+            owners.insert(
+                marker,
+                ExceptionOwnerDecision {
+                    has_owner: true,
+                    source_region: Some(region),
+                    definitive: true,
+                    override_existing: true,
+                },
+            );
+        }
         owners
     }
 

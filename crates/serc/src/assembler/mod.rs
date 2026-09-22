@@ -12157,6 +12157,140 @@ impl Assembler {
             .insert(label);
     }
 
+    /// Captures the matched named-handler array before its first primitive truth marker.
+    pub(crate) fn record_named_handler_truth_prefix(
+        &mut self,
+        store_item: usize,
+        setup: Label,
+        target: Label,
+    ) {
+        if self.python_version != crate::PythonVersion::Py314 {
+            return;
+        }
+        let items = self.linear_items();
+        let Some((entry_at, entry)) = items[..store_item]
+            .iter()
+            .enumerate()
+            .rev()
+            .take_while(|(_, item)| matches!(item, Item::Label(_)))
+            .find_map(|(index, item)| match item {
+                Item::Label(label)
+                    if self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(label) =>
+                {
+                    Some((index, *label))
+                }
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let records = items[store_item..]
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, item)| match item {
+                Item::Instruction(instruction) => Some((offset, *instruction)),
+                Item::Label(_) => None,
+            })
+            .take(5)
+            .collect::<Vec<_>>();
+        let [
+            (_, store),
+            (_, load),
+            (_, truth),
+            (_, condition),
+            (last, marker),
+        ] = records.as_slice()
+        else {
+            return;
+        };
+        let Some(depth) = store.depth_after() else {
+            return;
+        };
+        if store.opcode != STORE_FAST
+            || load.opcode != LOAD_FAST
+            || truth.opcode != TO_BOOL
+            || !matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+            || !matches!(condition.operand(), Operand::Forward(_))
+            || marker.opcode != NOT_TAKEN
+            || marker.operand() != Operand::Value(0)
+            || marker.jump_policy.is_authored_branch_marker()
+            || [load, truth]
+                .iter()
+                .any(|record| record.depth_after() != depth.checked_add(1))
+            || [condition, marker]
+                .iter()
+                .any(|record| record.depth_after() != Some(depth))
+            || [load, truth, condition]
+                .iter()
+                .any(|record| record.location != marker.location)
+            || [store, load, truth, condition]
+                .iter()
+                .any(|record| record.exception_policy() != ExceptionPolicy::NoneUnchanged)
+            || records.iter().any(|(_, record)| {
+                record.local_policy.hidden_exception_owner_slots() != 0
+                    || record.pre_fold_extra_instructions() != 0
+                    || record.jump_policy.borrow_empty_block()
+                    || record.no_location_policy.borrow_fallthrough()
+                        != BorrowFallthrough::Reachable
+            })
+        {
+            return;
+        }
+        let prefix = &items[entry_at..=store_item + last];
+        let mut position = 0;
+        for item in prefix {
+            match item {
+                Item::Instruction(_) => position += 1,
+                Item::Label(label) => {
+                    if *label == setup {
+                        if position != 1 {
+                            return;
+                        }
+                    } else if *label != entry
+                        && (self
+                            .exception_owner_provenance
+                            .block_boundaries
+                            .contains(label)
+                            || self
+                                .exception_owner_provenance
+                                .source_boundaries
+                                .contains(label))
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+        if prefix
+            .iter()
+            .filter(|item| **item == Item::Label(setup))
+            .count()
+            != 1
+            || self
+                .exception_owner_provenance
+                .setups
+                .iter()
+                .filter(|(label, _)| *label == setup)
+                .copied()
+                .collect::<Vec<_>>()
+                != [(setup, None)]
+        {
+            return;
+        }
+        let origin = exception_owners::NamedHandlerTruthPrefix {
+            entry,
+            setup,
+            target,
+            items: prefix.to_vec(),
+        };
+        self.exception_owner_provenance
+            .named_handler_truth_prefixes
+            .push(origin);
+    }
+
     /// Captures the two original NULL POP records around a saved handler return value.
     pub(crate) fn record_named_handler_pop_pair(&mut self, start: usize) {
         let items = self.linear_items();

@@ -21294,6 +21294,7 @@ impl Compiler<'_> {
             }
 
             self.assembler.set_location(handler_location);
+            let named_handler_prefix_start = self.assembler.item_count();
             if let Some(name) = &handler.name {
                 self.store_name(name.as_str())?;
             } else {
@@ -21770,6 +21771,13 @@ impl Compiler<'_> {
             }
             for name in newly_owned_handler_locals {
                 self.symbols.owned_load_locals.remove(name);
+            }
+            if handler.name.is_some() {
+                self.assembler.record_named_handler_truth_prefix(
+                    named_handler_prefix_start,
+                    body_start,
+                    name_cleanup,
+                );
             }
             let handler_body_has_instructions =
                 self.assembler.instruction_count() > handler_body_start;
