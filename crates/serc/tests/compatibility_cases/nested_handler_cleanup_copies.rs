@@ -491,3 +491,15 @@ def bare_return(primary, secondary, finish):
         "interleaved_unnamed_handler_literal_returns.py",
     );
 }
+
+#[test]
+fn matches_cpython_shared_handler_nested_join_borrow_return_copies() {
+    for alternative in ["elif d", "else"] {
+        for returned in ["value", "42"] {
+            let source = format!(
+                "def f(value, a, b, c, d):\n    try:\n        work()\n    except Error:\n        if a:\n            if b:\n                if c:\n                    value = update(value)\n            else:\n                raise\n        {alternative}:\n            value = update(value)\n    return {returned}\n"
+            );
+            common::assert_matches_cpython_marshal(&source, "shared_handler_nested_join_return.py");
+        }
+    }
+}
