@@ -13,7 +13,7 @@ use crate::assembler::block_graph::{BasicBlockId, BlockGraph, ItemMut, ItemPosit
 use crate::code_object::Constant;
 use crate::target::Opcode;
 use crate::target::opcodes::{
-    DELETE_FAST, END_ASYNC_FOR, LOAD_CONST, LOAD_GLOBAL, POP_EXCEPT, POP_JUMP_IF_NONE,
+    CALL, DELETE_FAST, END_ASYNC_FOR, LOAD_CONST, LOAD_GLOBAL, POP_EXCEPT, POP_JUMP_IF_NONE,
     POP_JUMP_IF_NOT_NONE, RAISE_VARARGS, RERAISE, RETURN_VALUE, SWAP,
 };
 use crate::target::operands::ComparisonOperation;
@@ -4600,6 +4600,76 @@ impl OptimizationPipeline {
                                     && !self.original_nop_targets.contains(label))
                         });
 
+                    // This certified authored break starts its original array before a
+                    // synchronous manager's POP_BLOCK and five cleanup records.
+                    // That located, non-exit prefix cannot be copied early. Native
+                    // NOP compaction therefore resets its previous line here.
+                    let original_manager_break_join = !finalize_borrow_empty_blocks
+                        && first_scan
+                        && previous == previous_at_block_entry
+                        && instruction.location.line >= 0
+                        && previous_line == Some(instruction.location.line)
+                        && next_line.is_some_and(|line| line >= 0 && line != instruction.location.line)
+                        && previous.is_some_and(|previous| {
+                            previous.block() != block
+                                && matches!(graph.item(previous), Item::Instruction(backedge)
+                                    if backedge.opcode == JUMP_BACKWARD
+                                        && matches!(backedge.operand(), Operand::Backward(_))
+                                        && backedge.depth_after() == Some(2))
+                        })
+                        && {
+                            let mut original = Instruction::new(
+                                JUMP_FORWARD, Operand::Forward(target), instruction.location, Some(2),
+                            );
+                            original.fusion_policy.mark_authored_break();
+                            original.jump_policy.prevent_threading_target();
+                            original.jump_policy.retain_nop_for_direct_target();
+                            original.add_pre_fold_extra_instructions(1);
+                            instruction == original
+                        }
+                        && graph[block].items()[..offset].iter().all(|item| {
+                            matches!(item, Item::Label(label)
+                                if self.original_nop_targets.contains(label)
+                                    && !self.borrow_block_aliases.contains(label)
+                                    && !self.exception_owner_provenance.omitted_nop_counts.contains_key(label)
+                                    && !self.exception_owner_provenance.omitted_nop_locations.contains_key(label))
+                        })
+                        && graph[block].items()[..offset].iter().any(|item| {
+                            matches!(item, Item::Label(label)
+                                if self.exception_owner_provenance.block_boundaries.contains(label))
+                        })
+                        && next.is_some_and(|next| {
+                            let items = graph[next.block()].items();
+                            let heads = &items[..next.offset()];
+                            let Some(prefix) = items.get(next.offset()..next.offset() + 5) else { return false; };
+                            let Item::Instruction(first) = prefix[0] else { return false; };
+                            let Operand::Value(constant) = first.operand() else { return false; };
+                            let plain = |opcode, operand, depth| Item::Instruction(Instruction::new(
+                                opcode, Operand::Value(operand), first.location, Some(depth),
+                            ));
+                            if !heads.contains(&Item::Label(target))
+                                || !heads.iter().all(|item| matches!(item, Item::Label(label)
+                                    if !self.borrow_block_aliases.contains(label)
+                                        && !self.original_nop_targets.contains(label)
+                                        && !self.exception_owner_provenance.omitted_nop_counts.contains_key(label)
+                                        && !self.exception_owner_provenance.omitted_nop_locations.contains_key(label)))
+                                || !self.exception_owner_provenance.block_boundaries.contains(&target)
+                                || prefix != [plain(LOAD_CONST, constant, 3), plain(LOAD_CONST, constant, 4),
+                                    plain(LOAD_CONST, constant, 5), plain(CALL, 3, 1), plain(POP_TOP, 0, 0)]
+                            { return false; }
+                            let mut endings = self.exception_regions.iter()
+                                .filter(|region| heads.contains(&Item::Label(region.end)));
+                            let Some(owner) = endings.next() else { return false; };
+                            endings.next().is_none()
+                                && !owner.is_scope_fallback && owner.depth == 2 && owner.preserve_lasti
+                                && graph[block].items()[..offset].contains(&Item::Label(owner.start))
+                                && heads.iter().all(|item| *item == Item::Label(target) || *item == Item::Label(owner.end))
+                                && self.exception_regions.iter().all(|region| {
+                                    !heads.contains(&Item::Label(region.start))
+                                        && !heads.contains(&Item::Label(region.target))
+                                })
+                        });
+
                     if !preserves_original_fallthrough_nop
                         && !preserves_compound_fallthrough_nop
                         && !preserves_copied_finally_break_nop
@@ -4607,6 +4677,7 @@ impl OptimizationPipeline {
                             || absorbed_normal_try_exit)
                         && (instruction.location.line < 0
                             || (!original_async_for_join
+                                && !original_manager_break_join
                                 && previous_line == Some(instruction.location.line))
                             || next_line == Some(instruction.location.line))
                     {
