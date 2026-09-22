@@ -5320,7 +5320,20 @@ impl OptimizationPipeline {
                             {
                                 original_manager_pops.insert(ItemPosition::new(block, offset));
                             }
-                            if original_fallthrough_pop == Some(instruction) {
+                            if original_fallthrough_pop.is_some_and(|original| {
+                                if original == instruction {
+                                    return true;
+                                }
+                                // A small return's original POP stays unlocated until
+                                // its jumping predecessors have copied it. Only its
+                                // location changes during the ensuing propagation.
+                                let mut propagated = *original;
+                                if propagated.location != SourceLocation::NONE {
+                                    return false;
+                                }
+                                propagated.location = instruction.location;
+                                propagated == *instruction
+                            }) {
                                 original_fallthrough_pops.insert(ItemPosition::new(block, offset));
                             }
                             original_manager_pop = false;

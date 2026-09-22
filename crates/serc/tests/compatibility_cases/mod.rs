@@ -232,6 +232,7 @@ mod normal_finally_pop_alias_owners;
 mod normal_finally_pop_locations;
 mod normal_finally_with_exit_owner;
 mod normal_handler_cleanup_copies;
+mod normal_try_exit_markers;
 mod normal_try_loop_tail_owners;
 mod normal_try_manager_pop_owners;
 mod optimized_generator_loop_dispatch_owners;

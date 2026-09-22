@@ -19824,6 +19824,15 @@ impl Compiler<'_> {
                 )
             },
         )?;
+        if deferred_try_pop_block
+            && !removed_shared_try_pop_block
+            && !statement.is_star
+            && statement.finalbody.is_empty()
+            && !try_body_suspended
+        {
+            self.assembler
+                .record_copied_return_fallthrough_pop(deferred_try_pop_instruction);
+        }
         if removed_try_pop_block && !deferred_try_pop_block {
             self.assembler.transfer_linear_try_pop_block_slot(try_end);
         }
@@ -20157,6 +20166,26 @@ impl Compiler<'_> {
                         test,
                         chained_comparison_cleanup: false,
                     })
+                });
+            let retained_return_guard_exit = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && !statement.is_star
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty()
+                && matches!(statement.body.last(), Some(Stmt::If(branch))
+                    if branch.elif_else_clauses.is_empty()
+                        && condition_has_only_runtime_tests(&branch.test)
+                        && original_condition_has_unique_jump_target(&branch.test, false)
+                        && matches!(branch.body.as_slice(), [Stmt::Return(returned)]
+                            if returned.value.as_deref().is_none_or(|value| {
+                                !expression_contains_inline_branch(value)
+                                    && !expression_suspends_current_scope(value)
+                            }))
+                        && !suite_contains_yield_with_headers(&branch.body, true, true))
+                && direct_exit_location.is_some_and(|location| {
+                    self.assembler.original_return_guard_has_false_donor(
+                        self.source_location(location.test.range()),
+                    )
                 });
             let chained_assertion_exit_location = (!statement.orelse.is_empty())
                 .then(|| match normal_exit_suite.last()? {
@@ -20566,6 +20595,14 @@ impl Compiler<'_> {
                     exception_policy,
                 )?
             };
+            if retained_return_guard_exit {
+                // POP_BLOCK disappears beside the same-line normal jump. Cold
+                // handler placement later converts this original jump to a NOP.
+                self.assembler
+                    .preserve_redundant_jump_nop_after_threading(normal_exit);
+                self.assembler
+                    .mark_retained_nop_borrow_fallthrough_if_unblocked(normal_exit);
+            }
             if self.context.python_version >= crate::PythonVersion::Py314
                 && folded_pass_body_join.is_some()
             {
