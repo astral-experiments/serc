@@ -1939,7 +1939,7 @@ pub(super) fn fold_constant_with_literals(
                     if matches!(left, Constant::Complex { .. })
                         || matches!(right, Constant::Complex { .. }) =>
                 {
-                    fold_complex_division(&left, &right)
+                    fold_complex_division(&left, &right, python_version)
                 }
                 (left, Operator::Pow, right)
                     if matches!(left, Constant::Complex { .. })
@@ -2938,10 +2938,20 @@ fn complex_quotient(left: (f64, f64), right: (f64, f64)) -> Option<(f64, f64)> {
     (result.0.is_finite() && result.1.is_finite()).then_some(result)
 }
 
-fn fold_complex_division(left: &Constant, right: &Constant) -> Option<Constant> {
+fn fold_complex_division(
+    left: &Constant,
+    right: &Constant,
+    python_version: PythonVersion,
+) -> Option<Constant> {
     let left_parts = constant_complex_parts(left)?;
     let right_parts = constant_complex_parts(right)?;
     let (real, imag) = match (left, right) {
+        _ if python_version <= PythonVersion::Py313 => {
+            // Legacy CPython converts real operands to complex with imaginary +0.0.
+            // Its quotient formula can produce different signed zeros from the mixed
+            // real/complex division introduced in 3.14.
+            complex_quotient(left_parts, right_parts)?
+        }
         (Constant::Complex { .. }, Constant::Complex { .. }) => {
             complex_quotient(left_parts, right_parts)?
         }

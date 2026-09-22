@@ -1,0 +1,16 @@
+negative_complex = -0j / 1
+positive_complex = 0j / 1
+negative_real = -0.0 / (1 + 0j)
+positive_real = 0.0 / (1 + 0j)
+integer_zero = 0 / (1 + 0j)
+negative_divisor = -0j / -1
+positive_imaginary_divisor = 0 / 1j
+negative_imaginary_divisor = 0 / -1j
+complex_zero_divisor = -0j / (1 + 0j)
+complex_signed_divisor = -0j / (-1 - 0j)
+finite_complex = (1 + 2j) / 3
+finite_real = 3 / (1 + 2j)
+zero_real_divisor = 1j / 0
+negative_zero_real_divisor = 1j / -0.0
+zero_complex_divisor = 1 / 0j
+negative_zero_complex_divisor = 1 / -0j
