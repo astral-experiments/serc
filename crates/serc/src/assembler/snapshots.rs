@@ -30,7 +30,7 @@ pub(super) fn record(stage: AssemblerStage, items: &[Item], regions: &[Exception
                     writeln!(
                         trace,
                         "  {} {:?} @ {}:{}-{}:{} depth={:?} exception={:?}",
-                        opcode_name(instruction.opcode.code()),
+                        instruction.opcode.name(),
                         instruction.operand(),
                         location.line,
                         location.column,
@@ -58,27 +58,6 @@ pub(super) fn record(stage: AssemblerStage, items: &[Item], regions: &[Exception
             .unwrap();
         }
     });
-}
-
-/// Read mnemonics from the same generated metadata that defines the IR opcodes.
-fn opcode_name(code: u8) -> &'static str {
-    for source in [
-        include_str!("../target/cpython_3_14_5.rs"),
-        include_str!("../target/legacy_opcodes.rs"),
-    ] {
-        for line in source.lines() {
-            if let Some(declaration) = line.trim().strip_prefix("pub(crate) const ")
-                && let Some((name, value)) = declaration.split_once(": Opcode = Opcode::new(")
-                && value
-                    .strip_suffix(");")
-                    .and_then(|value| value.parse::<u8>().ok())
-                    == Some(code)
-            {
-                return name;
-            }
-        }
-    }
-    panic!("missing generated mnemonic for opcode {code}");
 }
 
 struct Capture;
