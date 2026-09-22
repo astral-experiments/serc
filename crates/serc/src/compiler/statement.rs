@@ -403,6 +403,8 @@ pub(super) struct ExceptionState {
     // The complete final if whose fallthrough retains a converted POP_BLOCK before a terminal
     // try-else suite. The range keeps nested and preceding if statements from consuming it.
     retained_try_body_if_exit: Option<ruff_text_size::TextRange>,
+    // Exact final if whose folded Pass compacts into an ordinary try normal-exit marker.
+    compacting_try_body_pass_join: Option<TextRange>,
     pub(super) active_exception_region_exclusions: Vec<Vec<(Label, Label)>>,
     // Whether each active ordinary try body has only pass handlers. The innermost entry controls
     // normalized markers whose reused slots depend on that try's handler CFG.
@@ -11170,8 +11172,13 @@ impl Compiler<'_> {
                 // A later statement in this suite starts a separate original join even
                 // when the discarded else belongs to an active handler or manager.
                 if !statement.elif_else_clauses.is_empty() && !suite_terminates(&statement.body) {
-                    // This analysis-only edge must not absorb the body's located NOP.
-                    if self.assembler.last_instruction_is_nop() {
+                    // A folded Pass immediately before an ordinary try exit donates its
+                    // line through the original unlocated POP_BLOCK/normal-jump array.
+                    let ordinary_try_pass_join =
+                        self.control.exceptions.compacting_try_body_pass_join
+                            == Some(statement.range);
+                    // Other analysis-only edges must not absorb the body's located NOP.
+                    if self.assembler.last_instruction_is_nop() && !ordinary_try_pass_join {
                         self.assembler.preserve_last_nop();
                     }
                     if self.context.python_version <= crate::PythonVersion::Py313 {
@@ -18954,6 +18961,22 @@ impl Compiler<'_> {
             .exceptions
             .active_pass_only_try_bodies
             .push(pass_only_handlers);
+        let folded_pass_body_join = if self.context.python_version >= crate::PythonVersion::Py313
+            && statement.orelse.is_empty()
+            && statement.finalbody.is_empty()
+            && self.control.finally.active_finally_try_bodies == 0
+        {
+            statement.body.last().and_then(|tail| match tail {
+                Stmt::If(branch) if if_has_folded_pass_arms(branch) => Some(branch.range),
+                _ => None,
+            })
+        } else {
+            None
+        };
+        let previous_compacting_pass_join = std::mem::replace(
+            &mut self.control.exceptions.compacting_try_body_pass_join,
+            folded_pass_body_join,
+        );
         let previous_try_body_start = self.control.exceptions.active_try_body_start.replace((
             self.assembler.item_count(),
             self.control.generators.coroutine_suspension_epoch,
@@ -19542,6 +19565,7 @@ impl Compiler<'_> {
             .active_try_body_start
             .is_some_and(|(_, epoch)| self.control.generators.coroutine_suspension_epoch > epoch);
         self.control.exceptions.active_try_body_start = previous_try_body_start;
+        self.control.exceptions.compacting_try_body_pass_join = previous_compacting_pass_join;
         let _tuple_handler_try_body = self
             .control
             .exceptions
@@ -20454,6 +20478,14 @@ impl Compiler<'_> {
                     exception_policy,
                 )?
             };
+            if self.context.python_version >= crate::PythonVersion::Py314
+                && folded_pass_body_join.is_some()
+            {
+                // NOP compaction moves the authored Pass line to this existing
+                // normal exit. Retain its marker after the handler is moved cold.
+                self.assembler
+                    .preserve_redundant_jump_nop_after_threading(normal_exit);
+            }
             if statement.orelse.is_empty()
                 && statement.finalbody.is_empty()
                 && !suite_terminates(&statement.body)
@@ -27031,6 +27063,15 @@ impl Compiler<'_> {
             && suite_ends_in_sole_else_fallthrough(&statement.body))
         .then(|| self.assembler.original_fallthrough_join_location())
         .flatten();
+        // Both authored arms reach this original join before constant folding. Its
+        // POP_BLOCK has no unique line donor; the finalizer Pass owns the next marker.
+        let folded_pass_finally_exit = self.context.python_version >= crate::PythonVersion::Py313
+            && statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && pass_finally_location.is_some()
+            && matches!(statement.body.as_slice(), [Stmt::If(branch)]
+                if if_has_folded_pass_arms(branch))
+            && self.assembler.at_empty_borrow_block();
         self.assembler
             .set_location(sole_else_pop_location.unwrap_or(SourceLocation::NONE));
         // CPython converts POP_BLOCK to a NOP without assigning it an exception owner,
@@ -27046,6 +27087,9 @@ impl Compiler<'_> {
             self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
             index
         };
+        if folded_pass_finally_exit {
+            self.assembler.preserve_last_no_location();
+        }
         if (statement.handlers.is_empty()
             || (self.context.python_version == crate::PythonVersion::Py313
                 && !statement.orelse.is_empty()))
@@ -28038,7 +28082,8 @@ impl Compiler<'_> {
                 && pass_finally_location == self.assembler.last_instruction_location()
                 && statement.handlers.is_empty()
                 && statement.orelse.is_empty()
-                && suite_has_linear_borrow_fallthrough(&statement.body)
+                && (folded_pass_finally_exit
+                    || suite_has_linear_borrow_fallthrough(&statement.body))
                 && self
                     .assembler
                     .instruction_location_at(normal_finally_pop_block)
@@ -32718,6 +32763,14 @@ fn completed_recovery_has_runtime_fallthrough(statement: &ruff_python_ast::StmtT
                     && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
             })
         })
+}
+
+/// Identifies a folded true branch whose two authored arms each carry one Pass marker.
+fn if_has_folded_pass_arms(statement: &ruff_python_ast::StmtIf) -> bool {
+    early_condition_truthiness(&statement.test) == Some(true)
+        && matches!(statement.body.as_slice(), [Stmt::Pass(_)])
+        && matches!(statement.elif_else_clauses.as_slice(), [clause]
+            if clause.test.is_none() && matches!(clause.body.as_slice(), [Stmt::Pass(_)]))
 }
 
 // Certify an emitted-work path with no internal branch or cleanup entry. A suite
