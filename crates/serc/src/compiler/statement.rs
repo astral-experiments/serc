@@ -3226,6 +3226,20 @@ impl Compiler<'_> {
         &mut self,
         statement: &ruff_python_ast::StmtIf,
     ) -> Result<(), CompileError> {
+        if statement.elif_else_clauses.is_empty()
+            && matches!(statement.body.last(), Some(Stmt::Expr(expression))
+                if matches!(expression.value.as_ref(), Expr::If(conditional)
+                    if early_condition_truthiness(&conditional.test).is_none()
+                        && fold_constant(&conditional.body).is_none()
+                        && fold_constant(&conditional.orelse).is_none()))
+        {
+            // Runtime arms retain their shared discard before falling through the
+            // enclosing if's separate footer. Keep that non-exiting original array
+            // through small-exit copying instead of distributing the return into it.
+            self.compile_if(statement)?;
+            self.assembler.set_location(SourceLocation::NONE);
+            return self.emit_deferred_implicit_return();
+        }
         if self.context.python_version == crate::PythonVersion::Py312
             && statement
                 .elif_else_clauses
