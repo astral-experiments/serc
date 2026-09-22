@@ -18,6 +18,13 @@ impl Compiler<'_> {
         &self.context.scopes
     }
 
+    /// Synthetic class-visible annotation scopes retain their enclosing class's scope ID.
+    pub(super) fn class_scope_declares_global(&self, name: NameId) -> bool {
+        self.scope_arena()
+            .class(self.unit.scope_id)
+            .is_some_and(|plan| plan.globals.contains(&name))
+    }
+
     pub(super) fn function_scope_id(
         &self,
         definition: &StmtFunctionDef,

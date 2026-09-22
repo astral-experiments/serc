@@ -287,7 +287,9 @@ impl Compiler<'_> {
                 .annotation_references
                 .iter()
                 .copied()
-                .filter(|_| self.has_deferred_annotations()),
+                .filter(|name| {
+                    self.has_deferred_annotations() && !self.class_scope_declares_global(*name)
+                }),
         );
         if !self.has_deferred_annotations() && self.unit.flags & CO_FUTURE_ANNOTATIONS == 0 {
             // Legacy signatures execute inside the generic wrapper. Only their
@@ -1619,11 +1621,14 @@ impl Compiler<'_> {
         }
 
         let mut freevars = function_plan.annotation_freevars.clone();
+        freevars.retain(|name| !self.class_scope_declares_global(*name));
         if self.unit.flags & CO_FUTURE_ANNOTATIONS == 0 {
             for name in function_plan
                 .annotation_references
                 .iter()
-                .filter(|name| self.is_type_parameter_id(**name))
+                .filter(|name| {
+                    self.is_type_parameter_id(**name) && !self.class_scope_declares_global(**name)
+                })
                 .copied()
             {
                 self.insert_lexical_name(&mut freevars, name);
@@ -1654,12 +1659,19 @@ impl Compiler<'_> {
         }
         let mut seen = FxHashSet::default();
         local_names.retain(|name| seen.insert(name.clone()));
-        let annotation_globals: FxHashSet<_> = references
+        let mut annotation_globals: FxHashSet<_> = references
             .references
             .iter()
             .map(|name| self.required_name_id(name))
             .filter(|name| !freevars.contains(name))
             .collect();
+        annotation_globals.extend(
+            function_plan
+                .annotation_references
+                .iter()
+                .copied()
+                .filter(|name| self.class_scope_declares_global(*name)),
+        );
         let cellvars = self.name_id_set(inlined_cellvars);
         let plan = LoweringFunctionPlan {
             locals: self.name_ids(&local_names),
@@ -1789,13 +1801,18 @@ impl Compiler<'_> {
         let mut freevars = Vec::new();
         for name in reference_ids
             .iter()
-            .filter(|name| available_freevars.contains(*name))
+            .filter(|name| {
+                available_freevars.contains(*name) && !self.class_scope_declares_global(**name)
+            })
             .copied()
         {
             self.insert_lexical_name(&mut freevars, name);
         }
         let dunder_class = self.required_name_id("__class__");
-        if reference_ids.contains(&dunder_class) && self.is_cell_id(dunder_class) {
+        if reference_ids.contains(&dunder_class)
+            && self.is_cell_id(dunder_class)
+            && !self.class_scope_declares_global(dunder_class)
+        {
             self.insert_lexical_name(&mut freevars, dunder_class);
         }
         let classdict = self.required_name_id("__classdict__");

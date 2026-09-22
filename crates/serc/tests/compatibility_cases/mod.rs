@@ -754,3 +754,5 @@ mod copied_match_guard_subject;
 mod shared_handler_cleanup_copies;
 
 mod normal_try_discard_copies;
+
+mod class_annotation_globals;

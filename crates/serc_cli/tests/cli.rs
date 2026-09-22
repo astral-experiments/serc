@@ -173,6 +173,14 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
             "from __future__ import annotations\nsequence: [lambda: item for item in (1,)]\ndef function(argument: [lambda: item for item in (2,)]):\n    pass\n",
             "def f[T](x: [lambda: item for item in (1,)]): pass\n",
             "def outer(values):\n def f[T](x: [lambda: item for item in values]): pass\n return f\n",
+            // Deferred class-visible annotations preserve explicit global lookup.
+            "x = 'global'\nclass C:\n global x\n locals()['x'] = 'class'\n def f(arg: x) -> x: pass\n",
+            "x = 'global'\nclass C:\n x = 'class'\n def f(arg: x) -> x: pass\n",
+            "x = 'global'\ndef outer():\n x = 'outer'\n class C:\n  global x\n  locals()['x'] = 'class'\n  def f(arg: x): pass\n return C\n",
+            "T = 'global'\nclass C:\n global T\n locals()['T'] = 'class'\n def f[T](arg: T): pass\n",
+            "T = 'global'\nclass C:\n global T\n locals()['T'] = 'class'\n def f[T](arg: T): return T\n",
+            "def x(): return 'global'\nclass C:\n global x\n locals()['x'] = lambda: 'class'\n def f(arg: x()): pass\n",
+            "x = 'global'\nclass C:\n global x\n locals()['x'] = 'class'\n field: x\n",
             // Preserve legacy boolean inversion during recursive literal-aware folding.
             "value = ((~True,),)",
             r#"value = ((~False,), "\ud800")"#,
