@@ -169,7 +169,8 @@ impl OptimizationPipeline {
     /// Schedules exact local-tuple exits through their original unprotected arrays.
     pub(in crate::assembler) fn prepare_plain_tuple_copy_plan(&mut self) {
         use crate::target::opcodes::{
-            BUILD_LIST, LOAD_CONST, LOAD_GLOBAL, NOT_TAKEN, STORE_FAST, SWAP,
+            BUILD_LIST, LOAD_CONST, LOAD_FAST, LOAD_GLOBAL, NOT_TAKEN, POP_JUMP_IF_FALSE,
+            STORE_FAST, SWAP, TO_BOOL, YIELD_VALUE,
         };
 
         if !self.graph.features().has_forward_jump()
@@ -431,6 +432,334 @@ impl OptimizationPipeline {
             }
             persistent_slots >= 4
         };
+        // A direct case-tail exit with no unconditional incoming edge cannot be
+        // copied into any scheduled source. Its independent copy of the immutable,
+        // fully located tuple return commutes with the closed original-array plan.
+        // Keep it on the generic path, including global predecessor accounting.
+        let is_independent_match_tail = |block, target| {
+            let Some((Item::Instruction(jump), head)) = graph[block].items().split_last() else {
+                return false;
+            };
+            let Operand::Forward(end) = jump.operand() else {
+                return false;
+            };
+            if self.conditional_threading_targets.is_empty()
+                || !head.iter().all(|item| {
+                    matches!(item, Item::Label(label)
+                    if !self.borrow_block_aliases.contains(label))
+                })
+                || !head.iter().any(|item| {
+                    matches!(item, Item::Label(label)
+                    if self.conditional_threading_targets.contains_key(label))
+                })
+                || !intact(block, false, false)
+                || graph.label_block(end) != Some(target)
+                || !self
+                    .exception_owner_provenance
+                    .original_match_join_boundaries
+                    .contains(&end)
+                || !intact(target, false, false)
+                || original_local_tuple_return(graph[target].items()).is_none()
+                || graph[target].items().iter().any(|item| match item {
+                    Item::Label(label) => {
+                        self.borrow_block_aliases.contains(label)
+                            || self.folded_original_predecessor_targets.contains(label)
+                    }
+                    Item::Instruction(instruction) => {
+                        *instruction
+                            != Instruction::new(
+                                instruction.opcode,
+                                instruction.operand(),
+                                instruction.location,
+                                instruction.depth_after(),
+                            )
+                    }
+                })
+            {
+                return false;
+            }
+            let mut expected = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(end),
+                SourceLocation::NONE,
+                jump.depth_after(),
+            );
+            expected.jump_policy.mark_interruptible();
+            *jump == expected && !graph.iter_items().any(|item| matches!(item,
+                Item::Instruction(incoming) if is_unconditional_jump(incoming.opcode)
+                    && matches!(incoming.operand(), Operand::Forward(label) | Operand::Backward(label)
+                        if graph.label_block(label) == Some(block))))
+        };
+        // These sources cannot become unconditional copy targets. Leave their
+        // independent tuple copy, including borrowing and defer markers, generic.
+        // In particular, a merged loop cleanup is not one native original array.
+        let is_independent_case_source = |block, target| {
+            use crate::target::opcodes::{
+                COPY, END_ASYNC_FOR, END_FOR, FOR_ITER, MATCH_CLASS, POP_ITER, POP_JUMP_IF_NONE,
+                POP_JUMP_IF_TRUE, POP_TOP, RESUME, RETURN_GENERATOR,
+            };
+
+            if self.python_version < crate::PythonVersion::Py314
+                || !self.exception_regions.is_empty()
+                || !intact(block, false, false)
+                || !intact(target, false, false)
+            {
+                return false;
+            }
+            let Some((Item::Instruction(jump), prefix)) = graph[block].items().split_last() else {
+                return false;
+            };
+            let Operand::Forward(end) = jump.operand() else {
+                return false;
+            };
+            if graph.label_block(end) != Some(target)
+                || !self
+                    .exception_owner_provenance
+                    .original_match_join_boundaries
+                    .contains(&end)
+                || original_local_tuple_return(graph[target].items()).is_none()
+                || graph[target].items().iter().any(|item| match item {
+                    Item::Label(label) => {
+                        self.borrow_block_aliases.contains(label)
+                            || self.folded_original_predecessor_targets.contains(label)
+                    }
+                    Item::Instruction(instruction) => {
+                        *instruction
+                            != Instruction::new(
+                                instruction.opcode,
+                                instruction.operand(),
+                                instruction.location,
+                                instruction.depth_after(),
+                            )
+                    }
+                })
+                || jump.location.line < 0
+            {
+                return false;
+            }
+            let mut expected_jump =
+                Instruction::new(JUMP_FORWARD, Operand::Forward(end), jump.location, Some(0));
+            expected_jump.jump_policy.mark_original_match_success();
+            expected_jump.jump_policy.mark_interruptible();
+
+            if let [
+                head @ ..,
+                Item::Instruction(end_for),
+                Item::Instruction(pop_iter),
+            ] = prefix
+                && !head.is_empty()
+                && head.iter().all(|item| {
+                    matches!(item, Item::Label(label)
+                    if !self.borrow_block_aliases.contains(label))
+                })
+            {
+                let iterator_depth =
+                    1 + u32::from(self.python_version == crate::PythonVersion::Py315);
+                expected_jump.jump_policy.mark_borrow_empty_block();
+                if jump.jump_policy.defers_redundant_removal() {
+                    expected_jump.jump_policy.defer_removal();
+                }
+                if !intact(block, true, false)
+                    || *jump != expected_jump
+                    || *end_for
+                        != Instruction::new(
+                            END_FOR,
+                            Operand::Value(0),
+                            jump.location,
+                            Some(iterator_depth),
+                        )
+                    || *pop_iter
+                        != Instruction::new(POP_ITER, Operand::Value(0), jump.location, Some(0))
+                    || positions[&block].checked_sub(1).is_none_or(|index| {
+                        super::super::block_has_fallthrough(graph[order[index]].items())
+                    })
+                {
+                    return false;
+                }
+                // This sole-entry check also excludes every unconditional input.
+                let mut exhaustion = false;
+                for &source in order {
+                    for item in graph[source].items() {
+                        let Item::Instruction(incoming) = item else {
+                            continue;
+                        };
+                        let (Operand::Forward(label) | Operand::Backward(label)) =
+                            incoming.operand()
+                        else {
+                            continue;
+                        };
+                        if graph.label_block(label) != Some(block) {
+                            continue;
+                        }
+                        if exhaustion
+                            || positions[&source] >= positions[&block]
+                            || graph[source].last_instruction() != Some(incoming)
+                            || *incoming
+                                != Instruction::new(
+                                    FOR_ITER,
+                                    Operand::Forward(label),
+                                    jump.location,
+                                    Some(iterator_depth + 1),
+                                )
+                        {
+                            return false;
+                        }
+                        exhaustion = true;
+                    }
+                }
+                return exhaustion;
+            }
+
+            // A true fallthrough body has no addressable entry, including an
+            // internal alias, so no jump can address it. Its initial marker
+            // belongs to the preceding test. These exact suffixes also exclude
+            // the COPY/TO_BOOL target insertion in forward jump threading.
+            let [Item::Instruction(marker), work @ ..] = prefix else {
+                return false;
+            };
+            if work.is_empty() || prefix.iter().any(|item| matches!(item, Item::Label(_))) {
+                return false;
+            }
+            let Some(previous) = positions[&block].checked_sub(1).map(|index| order[index]) else {
+                return false;
+            };
+            let [
+                ..,
+                Item::Instruction(value),
+                Item::Instruction(convert),
+                Item::Instruction(condition),
+            ] = graph[previous].items()
+            else {
+                return false;
+            };
+            let Operand::Forward(failure) = condition.operand() else {
+                return false;
+            };
+            let Some(failure_block) = graph.label_block(failure) else {
+                return false;
+            };
+            let Some(depth) = condition.depth_after() else {
+                return false;
+            };
+            if positions[&failure_block] <= positions[&block]
+                || condition.location.line < 0
+                || *condition
+                    != Instruction::new(
+                        condition.opcode,
+                        condition.operand(),
+                        condition.location,
+                        Some(depth),
+                    )
+            {
+                return false;
+            }
+            let class_test = condition.opcode == POP_JUMP_IF_NONE
+                && value.opcode == MATCH_CLASS
+                && matches!(value.operand(), Operand::Value(_))
+                && *value
+                    == Instruction::new(
+                        MATCH_CLASS,
+                        value.operand(),
+                        condition.location,
+                        Some(depth),
+                    )
+                && {
+                    // Literal class-keyword records can precede this COPY. They
+                    // belong to the untouched test, not to the opaque body.
+                    let mut expected_copy = Instruction::new(
+                        COPY,
+                        Operand::Value(1),
+                        condition.location,
+                        Some(depth + 1),
+                    );
+                    expected_copy.local_policy.add_hidden_exception_owner_slots(
+                        convert.local_policy.hidden_exception_owner_slots(),
+                    );
+                    *convert == expected_copy
+                };
+            let truth_test = matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+                && value.opcode == LOAD_FAST
+                && matches!(value.operand(), Operand::Value(_))
+                && *value
+                    == Instruction::new(
+                        LOAD_FAST,
+                        value.operand(),
+                        condition.location,
+                        Some(depth + 1),
+                    )
+                && *convert
+                    == Instruction::new(
+                        TO_BOOL,
+                        Operand::Value(0),
+                        condition.location,
+                        Some(depth + 1),
+                    );
+            if !class_test && !truth_test {
+                return false;
+            }
+            let mut expected_marker = Instruction::new(
+                NOT_TAKEN,
+                Operand::Value(0),
+                condition.location,
+                Some(depth),
+            );
+            if truth_test {
+                expected_marker
+                    .set_exception_policy(super::super::ExceptionPolicy::NoneDynamicCondition);
+            }
+            if *marker != expected_marker {
+                return false;
+            }
+            if jump.jump_policy.defers_redundant_removal() {
+                expected_jump.jump_policy.defer_removal();
+            }
+            if *jump != expected_jump {
+                return false;
+            }
+            work.iter().enumerate().all(|(index, item)| {
+                let Item::Instruction(instruction) = item else {
+                    return false;
+                };
+                if !matches!(instruction.operand(), Operand::Value(_))
+                    || instruction.location.line < 0
+                    || super::super::ends_scope(instruction.opcode)
+                    || matches!(
+                        instruction.opcode,
+                        NOT_TAKEN
+                            | YIELD_VALUE
+                            | RETURN_GENERATOR
+                            | RESUME
+                            | END_FOR
+                            | POP_ITER
+                            | END_ASYNC_FOR
+                    )
+                {
+                    return false;
+                }
+                let mut expected = Instruction::new(
+                    instruction.opcode,
+                    instruction.operand(),
+                    instruction.location,
+                    instruction.depth_after(),
+                );
+                if instruction.opcode == LOAD_FAST {
+                    expected.local_policy = super::super::ir::LocalPolicy::for_load(
+                        instruction.local_policy.force_owned_load(),
+                        instruction.local_policy.strict_owned_load(),
+                    );
+                }
+                if instruction.fusion_policy.location_from_next() {
+                    if instruction.opcode != POP_TOP
+                        || !matches!(work.get(index + 1), Some(Item::Instruction(donor))
+                            if donor.location.line >= 0 && donor.location == instruction.location)
+                    {
+                        return false;
+                    }
+                    expected.fusion_policy.mark_location_from_next();
+                }
+                *instruction == expected
+            })
+        };
         // A populated predecessor cannot itself become a small tuple exit: its
         // replaced jump remains a NOP beside the four return slots. A located
         // work prefix also excludes no-line copying. Preserve its entry and owner
@@ -576,9 +905,38 @@ impl OptimizationPipeline {
             )
         };
         let mut returns = FxHashMap::default();
+        let mut match_head_returns = FxHashSet::default();
         for &block in order {
             if !intact(block, true, false) {
-                continue;
+                // Live case-success edges establish the original match end without
+                // the generic source-boundary tag. Admit only its exact tuple array;
+                // seed discovery below still requires the shared-join certificate.
+                if original_local_tuple_return(graph[block].items()).is_none()
+                    || !intact(block, false, false)
+                    || !graph[block].items().iter().any(|item| {
+                        matches!(item,
+                        Item::Label(label) if self.exception_owner_provenance
+                            .original_match_join_boundaries.contains(label))
+                    })
+                    || graph[block].items().iter().any(|item| match item {
+                        Item::Label(label) => {
+                            self.borrow_block_aliases.contains(label)
+                                || self.folded_original_predecessor_targets.contains(label)
+                        }
+                        Item::Instruction(instruction) => {
+                            *instruction
+                                != Instruction::new(
+                                    instruction.opcode,
+                                    instruction.operand(),
+                                    instruction.location,
+                                    instruction.depth_after(),
+                                )
+                        }
+                    })
+                {
+                    continue;
+                }
+                match_head_returns.insert(block);
             }
             if let Some(tail) = original_local_tuple_return(graph[block].items())
                 .map(|located| OriginalTail::LocalTupleReturn { located })
@@ -587,27 +945,151 @@ impl OptimizationPipeline {
                 returns.insert(block, tail);
             }
         }
+        if returns.is_empty() {
+            return;
+        }
+        // A shared case-success array keeps its first NOP unlocated after copying
+        // a four-slot return. Authenticate two inputs that survive the early copy
+        // rounds: a runtime conditional and its distinct, located store fallthrough.
+        // A current predecessor count alone cannot establish their later survival.
+        let mut shared_match_joins = FxHashMap::default();
+        for &block in order {
+            if !is_match_success_join(block)
+                || !intact(block, true, false)
+                || graph[block].items().iter().any(|item| {
+                    matches!(item,
+                    Item::Label(label) if self.borrow_block_aliases.contains(label))
+                })
+            {
+                continue;
+            }
+            let jump = graph[block].last_instruction().expect("match-success jump");
+            let Operand::Forward(end) = jump.operand() else {
+                continue;
+            };
+            let Some(target) = graph.label_block(end) else {
+                continue;
+            };
+            if !returns.contains_key(&target)
+                || original_local_tuple_return(graph[target].items()).is_none()
+                || !self
+                    .exception_owner_provenance
+                    .original_match_join_boundaries
+                    .contains(&end)
+                || graph[target].items().iter().any(|item| match item {
+                    Item::Label(label) => {
+                        self.borrow_block_aliases.contains(label)
+                            || self.folded_original_predecessor_targets.contains(label)
+                    }
+                    Item::Instruction(instruction) => {
+                        *instruction
+                            != Instruction::new(
+                                instruction.opcode,
+                                instruction.operand(),
+                                instruction.location,
+                                instruction.depth_after(),
+                            )
+                    }
+                })
+                || jump.jump_policy.preserves_nop_after_threading()
+                || jump.no_location_policy.preserves_location()
+                || jump.pre_fold_extra_instructions() != 0
+            {
+                continue;
+            }
+            let Some(start) = positions[&block].checked_sub(3) else {
+                continue;
+            };
+            let [condition_block, marker_block, body, _] = order[start..=positions[&block]] else {
+                unreachable!("three preceding blocks")
+            };
+            if !intact(condition_block, true, false) || !intact(body, true, false) {
+                continue;
+            }
+            let [
+                ..,
+                Item::Instruction(load),
+                Item::Instruction(convert),
+                Item::Instruction(condition),
+            ] = graph[condition_block].items()
+            else {
+                continue;
+            };
+            let [Item::Instruction(marker)] = graph[marker_block].items() else {
+                continue;
+            };
+            let Some(store) = graph[body].last_instruction() else {
+                continue;
+            };
+            let mut expected_marker = Instruction::new(
+                NOT_TAKEN,
+                Operand::Value(0),
+                condition.location,
+                condition.depth_after(),
+            );
+            expected_marker
+                .set_exception_policy(super::super::ExceptionPolicy::NoneDynamicCondition);
+            if load.opcode != LOAD_FAST
+                || !matches!(load.operand(), Operand::Value(_))
+                || convert.opcode != TO_BOOL
+                || convert.operand() != Operand::Value(0)
+                || condition.opcode != POP_JUMP_IF_FALSE
+                || !matches!(condition.operand(), Operand::Forward(label)
+                    if graph.label_block(label) == Some(block))
+                || *marker != expected_marker
+                || store.opcode != STORE_FAST
+                || store.local_policy.may_store_null()
+                || [condition_block, body].into_iter().any(|source| {
+                    graph[source].items().iter().any(|item| match item {
+                        Item::Label(label) => self.borrow_block_aliases.contains(label),
+                        Item::Instruction(instruction) => {
+                            instruction.location.line < 0
+                                || *instruction
+                                    != Instruction::new(
+                                        instruction.opcode,
+                                        instruction.operand(),
+                                        instruction.location,
+                                        instruction.depth_after(),
+                                    )
+                                || (instruction != condition
+                                    && (!matches!(instruction.operand(), Operand::Value(_))
+                                        || super::super::ends_scope(instruction.opcode)
+                                        || matches!(
+                                            instruction.opcode,
+                                            NOP | NOT_TAKEN | SWAP | YIELD_VALUE
+                                        )))
+                        }
+                    })
+                })
+            {
+                continue;
+            }
+            shared_match_joins.insert(block, (target, condition_block, body));
+        }
         // Limit this plan to tuple tails reached by a certified original join,
         // directly or through one certified shared nested-if array. The full
         // predecessor closure below still verifies every original copy slot;
         // unrelated tuple exits in the same compilation unit keep their own path.
         returns.retain(|block, _| {
-            graph.iter_items().any(|item| {
-                matches!(item, Item::Instruction(instruction)
-                if instruction.opcode == JUMP_FORWARD
-                    && instruction.jump_policy.is_original_empty_join()
-                    && matches!(instruction.operand(), Operand::Forward(label)
-                        if graph.label_block(label).is_some_and(|target| {
-                            target == *block
-                                || (intact(target, true, false)
-                                    && is_shared_join(target)
-                                    && graph[target].last_instruction().is_some_and(|bridge| {
-                                        bridge.opcode == JUMP_FORWARD
-                                            && matches!(bridge.operand(), Operand::Forward(end)
-                                                if graph.label_block(end) == Some(*block))
-                                    }))
-                        })))
-            })
+            shared_match_joins
+                .values()
+                .any(|(target, _, _)| target == block)
+                || (!match_head_returns.contains(block) && graph.iter_items().any(|item| {
+                    matches!(item, Item::Instruction(instruction)
+                    if instruction.opcode == JUMP_FORWARD
+                        && instruction.jump_policy.is_original_empty_join()
+                        && matches!(instruction.operand(), Operand::Forward(label)
+                            if graph.label_block(label).is_some_and(|target| {
+                                target == *block
+                                    || (intact(target, true, false)
+                                        && is_shared_join(target)
+                                        && graph[target].last_instruction().is_some_and(|bridge| {
+                                            bridge.opcode == JUMP_FORWARD
+                                                && matches!(bridge.operand(), Operand::Forward(end)
+                                                    if graph.label_block(end) == Some(*block))
+                                        }))
+                            })))
+                }))
         });
         if returns.is_empty() {
             return;
@@ -639,11 +1121,12 @@ impl OptimizationPipeline {
                 if !selected.contains(&target) {
                     continue;
                 }
-                if !intact(block, true, false)
-                    && returns.contains_key(&target)
+                if returns.contains_key(&target)
                     && matches!(jump.operand(), Operand::Forward(_))
                     && positions[&block] < positions[&target]
-                    && is_opaque_match_source(block)
+                    && ((!intact(block, true, false) && is_opaque_match_source(block))
+                        || is_independent_match_tail(block, target)
+                        || is_independent_case_source(block, target))
                 {
                     // No head is synthesized and no copy step is scheduled here.
                     // Global predecessor accounting still includes this direct edge.
@@ -664,6 +1147,7 @@ impl OptimizationPipeline {
                     || (jump.jump_policy.always_retains_nop() && !observer)
                     || jump.jump_policy.borrow_empty_block()
                     || (jump.jump_policy.defers_redundant_removal()
+                        && !shared_match_joins.contains_key(&block)
                         && !(jump.jump_policy.is_original_empty_join()
                             && jump.jump_policy.preserves_nop_after_threading()))
                     || (jump.no_location_policy.preserves_location() && !shared_join)
@@ -698,7 +1182,11 @@ impl OptimizationPipeline {
                 break;
             }
         }
-        if joins.is_empty() {
+        if joins.is_empty()
+            || shared_match_joins
+                .values()
+                .any(|(_, condition, body)| selected.contains(condition) || selected.contains(body))
+        {
             return;
         }
         // The producer also certifies a sole conditional predecessor after a
@@ -708,7 +1196,8 @@ impl OptimizationPipeline {
             matches!(item, Item::Instruction(instruction)
                 if !is_unconditional_jump(instruction.opcode)
                     && matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
-                        if graph.label_block(label).is_some_and(|target| joins.contains(&target))))
+                        if graph.label_block(label).is_some_and(|target| joins.contains(&target)
+                            && !shared_match_joins.contains_key(&target))))
         }) {
             return;
         }
@@ -862,7 +1351,13 @@ impl OptimizationPipeline {
                 .expect("original empty join");
             if jump.jump_policy.defers_redundant_removal() {
                 // The complete plan now owns this certified singleton's jump vacancy.
-                jump.jump_policy.consume_original_join_copy_prediction();
+                if shared_match_joins.contains_key(&block) {
+                    // This certificate owns an ordinary deferred case-success slot,
+                    // with no predicted retained NOP to transfer into the copy plan.
+                    jump.jump_policy.resolve_deferred_removal();
+                } else {
+                    jump.jump_policy.consume_original_join_copy_prediction();
+                }
             }
             let origin = fallthrough_stores
                 .get(&block)
@@ -4322,6 +4817,577 @@ mod tests {
                         2
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_match_tuple_plan_preserves_five_slot_join_and_live_inputs() {
+        use crate::target::opcodes::{
+            BUILD_TUPLE, COPY, END_FOR, FOR_ITER, LOAD_FAST, MATCH_CLASS, NOT_TAKEN, POP_ITER,
+            POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_TRUE, STORE_FAST, TO_BOOL,
+            YIELD_VALUE,
+        };
+
+        for case in [
+            "ordinary",
+            "generic return head",
+            "no match end",
+            "borrow return",
+            "hidden return",
+            "borrow join",
+            "hidden condition",
+            "folded condition",
+            "marker owner",
+            "marker fusion",
+            "body no store",
+            "hidden body",
+            "protected body",
+            "retained join",
+            "wide tuple",
+            "independent tail",
+            "independent tail generic head",
+            "independent tail borrowed",
+            "independent tail no producer",
+            "independent tail hidden",
+            "independent tail incoming",
+            "independent tail retained",
+            "independent tail wrong target",
+            "opaque loop",
+            "opaque loop 315",
+            "opaque loop deferred",
+            "opaque loop deferred retained",
+            "opaque loop iterator span",
+            "opaque loop extra entry",
+            "opaque loop fallthrough",
+            "opaque loop hidden cleanup",
+            "opaque class",
+            "opaque truth",
+            "opaque owned donor",
+            "opaque class labelled",
+            "opaque class hidden",
+            "opaque class folded",
+            "opaque class owner",
+            "opaque class suspension",
+            "opaque class incoming",
+            "opaque class region",
+            "opaque class marker span",
+            "opaque class marker owner",
+            "opaque truth copy producer",
+            "opaque external donor",
+        ] {
+            let mut shared = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(Label(5)),
+                SourceLocation::NONE,
+                None,
+            );
+            shared.no_location_policy.preserve_location();
+            let mut success = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(Label(6)),
+                SourceLocation::new(12, 12, 4, 9),
+                None,
+            );
+            success.jump_policy.mark_original_match_success();
+            success.jump_policy.mark_interruptible();
+            success.jump_policy.defer_removal();
+            success.no_location_policy.mark_artificial_eval_break();
+            let mut marker = Instruction::new(
+                NOT_TAKEN,
+                Operand::Value(0),
+                SourceLocation::new(11, 11, 4, 9),
+                None,
+            );
+            marker.set_exception_policy(super::super::super::ExceptionPolicy::NoneDynamicCondition);
+            let mut assembler = Assembler {
+                code: UnoptimizedCode::Linear(vec![
+                    Item::Label(Label(0)),
+                    item(LOAD_CONST, Operand::Value(0), 9),
+                    item(STORE_FAST, Operand::Value(1), 9),
+                    item(JUMP_FORWARD, Operand::Forward(Label(1)), 9),
+                    Item::Label(Label(1)),
+                    Item::Instruction(shared),
+                    Item::Label(Label(2)),
+                    item(LOAD_FAST, Operand::Value(0), 11),
+                    item(TO_BOOL, Operand::Value(0), 11),
+                    item(POP_JUMP_IF_FALSE, Operand::Forward(Label(5)), 11),
+                    Item::Instruction(marker),
+                    Item::Label(Label(3)),
+                    item(LOAD_CONST, Operand::Value(1), 12),
+                    item(STORE_FAST, Operand::Value(1), 12),
+                    Item::Label(Label(5)),
+                    Item::Instruction(success),
+                    Item::Label(Label(6)),
+                    item(LOAD_FAST, Operand::Value(2), 13),
+                    item(LOAD_FAST, Operand::Value(1), 13),
+                    item(BUILD_TUPLE, Operand::Value(2), 13),
+                    item(RETURN_VALUE, Operand::Value(0), 13),
+                ]),
+                next_label: 8,
+                ..Assembler::default()
+            };
+            for label in [Label(0), Label(1), Label(2), Label(3), Label(5)] {
+                assembler.record_exception_owner_block_boundary(label);
+            }
+            assembler.nested_if_unlocated_join_blocks.insert(Label(1));
+            assembler
+                .exception_owner_provenance
+                .original_match_join_boundaries
+                .insert(Label(6));
+            if case == "generic return head" {
+                assembler.record_exception_owner_block_boundary(Label(6));
+            }
+            if case.starts_with("independent tail") {
+                let mut tail = Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(Label(6)),
+                    SourceLocation::NONE,
+                    None,
+                );
+                tail.jump_policy.mark_interruptible();
+                let mut none_condition = Instruction::new(
+                    crate::target::opcodes::POP_JUMP_IF_NONE,
+                    Operand::Forward(Label(9)),
+                    SourceLocation::new(15, 15, 4, 9),
+                    None,
+                );
+                none_condition
+                    .local_policy
+                    .add_hidden_exception_owner_slots(3);
+                let UnoptimizedCode::Linear(items) = &mut assembler.code else {
+                    unreachable!()
+                };
+                let footer = items
+                    .iter()
+                    .position(|item| *item == Item::Label(Label(6)))
+                    .unwrap();
+                items.splice(
+                    footer..footer,
+                    [
+                        Item::Label(Label(8)),
+                        item(LOAD_FAST, Operand::Value(0), 15),
+                        Item::Instruction(none_condition),
+                        item(NOT_TAKEN, Operand::Value(0), 15),
+                        Item::Label(Label(10)),
+                        item(LOAD_FAST, Operand::Value(0), 16),
+                        item(STORE_FAST, Operand::Value(2), 16),
+                        Item::Label(Label(9)),
+                        Item::Instruction(tail),
+                    ],
+                );
+                assembler.next_label = 12;
+                assembler
+                    .mark_conditional_threading_target(Label(9), SourceLocation::new(15, 15, 4, 9));
+                if case == "independent tail generic head" {
+                    assembler.record_exception_owner_block_boundary(Label(9));
+                }
+            }
+            if case.starts_with("opaque") {
+                let record = |opcode, operand, line, depth| {
+                    Item::Instruction(Instruction::new(
+                        opcode,
+                        operand,
+                        SourceLocation::new(line, line, 4, 9),
+                        Some(depth),
+                    ))
+                };
+                let mut tail = Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(Label(6)),
+                    SourceLocation::new(16, 16, 4, 9),
+                    Some(0),
+                );
+                tail.jump_policy.mark_original_match_success();
+                tail.jump_policy.mark_interruptible();
+                let extra = if case.starts_with("opaque loop") {
+                    assembler.python_version = if case == "opaque loop 315" {
+                        crate::PythonVersion::Py315
+                    } else {
+                        crate::PythonVersion::Py314
+                    };
+                    let depth =
+                        1 + u32::from(assembler.python_version == crate::PythonVersion::Py315);
+                    tail.jump_policy.mark_borrow_empty_block();
+                    if case.starts_with("opaque loop deferred") {
+                        tail.jump_policy.defer_removal();
+                        if case.ends_with("retained") {
+                            tail.jump_policy.retain_redundant_nop_after_threading();
+                        }
+                    }
+                    assembler.record_exception_owner_block_boundary(Label(9));
+                    let mut extra = vec![
+                        Item::Label(Label(8)),
+                        record(FOR_ITER, Operand::Forward(Label(9)), 16, depth + 1),
+                        Item::Label(Label(10)),
+                        record(STORE_FAST, Operand::Value(3), 16, depth),
+                        record(JUMP_BACKWARD, Operand::Backward(Label(8)), 16, depth),
+                        Item::Label(Label(9)),
+                        record(END_FOR, Operand::Value(0), 16, depth),
+                        record(POP_ITER, Operand::Value(0), 16, 0),
+                        Item::Instruction(tail),
+                    ];
+                    match case {
+                        "opaque loop iterator span" => {
+                            let Item::Instruction(iter) = &mut extra[1] else {
+                                unreachable!()
+                            };
+                            iter.location = SourceLocation::new(17, 17, 4, 9);
+                        }
+                        "opaque loop extra entry" => {
+                            extra[4] =
+                                record(JUMP_FORWARD, Operand::Forward(Label(9)), 16, depth + 1);
+                            extra.insert(4, record(LOAD_CONST, Operand::Value(0), 16, depth + 1));
+                        }
+                        "opaque loop fallthrough" => {
+                            extra[4] = record(LOAD_CONST, Operand::Value(0), 16, depth + 1);
+                        }
+                        "opaque loop hidden cleanup" => {
+                            let Item::Instruction(cleanup) = &mut extra[6] else {
+                                unreachable!()
+                            };
+                            cleanup.local_policy.add_hidden_exception_owner_slots(1);
+                        }
+                        _ => {}
+                    }
+                    extra
+                } else {
+                    let truth = case.starts_with("opaque truth");
+                    let copied_truth = case == "opaque truth copy producer";
+                    let branch_depth = u32::from(!truth || copied_truth);
+                    let mut marker = Instruction::new(
+                        NOT_TAKEN,
+                        Operand::Value(0),
+                        SourceLocation::new(15, 15, 4, 9),
+                        Some(branch_depth),
+                    );
+                    if truth {
+                        marker.set_exception_policy(
+                            super::super::super::ExceptionPolicy::NoneDynamicCondition,
+                        );
+                        tail.jump_policy.defer_removal();
+                    }
+                    let mut extra = vec![Item::Label(Label(8))];
+                    if truth {
+                        extra.push(record(LOAD_FAST, Operand::Value(0), 15, 1));
+                        if copied_truth {
+                            extra.push(record(COPY, Operand::Value(1), 15, 2));
+                        }
+                        extra.extend([
+                            record(TO_BOOL, Operand::Value(0), 15, branch_depth + 1),
+                            record(
+                                POP_JUMP_IF_TRUE,
+                                Operand::Forward(Label(9)),
+                                15,
+                                branch_depth,
+                            ),
+                        ]);
+                    } else {
+                        let mut copy = Instruction::new(
+                            COPY,
+                            Operand::Value(1),
+                            SourceLocation::new(15, 15, 4, 9),
+                            Some(2),
+                        );
+                        copy.local_policy.add_hidden_exception_owner_slots(2);
+                        extra.extend([
+                            record(LOAD_FAST, Operand::Value(0), 15, 1),
+                            record(LOAD_FAST, Operand::Value(1), 15, 2),
+                            record(LOAD_CONST, Operand::Value(0), 15, 3),
+                            record(MATCH_CLASS, Operand::Value(0), 15, 1),
+                            Item::Instruction(copy),
+                            record(POP_JUMP_IF_NONE, Operand::Forward(Label(9)), 15, 1),
+                        ]);
+                    }
+                    let marker_index = extra.len();
+                    extra.push(Item::Instruction(marker));
+                    if branch_depth != 0 {
+                        extra.push(record(POP_TOP, Operand::Value(0), 15, 0));
+                    }
+                    let load_index = extra.len();
+                    extra.extend([
+                        record(LOAD_FAST, Operand::Value(0), 16, 1),
+                        record(STORE_FAST, Operand::Value(2), 16, 0),
+                    ]);
+                    match case {
+                        "opaque class hidden" | "opaque class folded" | "opaque class owner" => {
+                            let Item::Instruction(work) = &mut extra[load_index] else {
+                                unreachable!()
+                            };
+                            match case {
+                                "opaque class hidden" => {
+                                    work.local_policy.add_hidden_exception_owner_slots(1);
+                                }
+                                "opaque class folded" => work.add_pre_fold_extra_instructions(1),
+                                "opaque class owner" => work.set_exception_policy(
+                                    super::super::super::ExceptionPolicy::NonePresent,
+                                ),
+                                _ => unreachable!(),
+                            }
+                        }
+                        "opaque class suspension" => {
+                            extra.insert(
+                                load_index + 1,
+                                record(YIELD_VALUE, Operand::Value(0), 16, 1),
+                            );
+                        }
+                        "opaque class marker span" => {
+                            let Item::Instruction(marker) = &mut extra[marker_index] else {
+                                unreachable!()
+                            };
+                            marker.location = SourceLocation::new(16, 16, 4, 9);
+                        }
+                        "opaque class marker owner" => {
+                            let Item::Instruction(marker) = &mut extra[marker_index] else {
+                                unreachable!()
+                            };
+                            marker.set_exception_policy(
+                                super::super::super::ExceptionPolicy::NoneDynamicCondition,
+                            );
+                        }
+                        "opaque owned donor" => {
+                            let Item::Instruction(pop) = &mut extra[marker_index + 1] else {
+                                unreachable!()
+                            };
+                            pop.location = SourceLocation::new(16, 16, 4, 9);
+                            pop.fusion_policy.mark_location_from_next();
+                            let Item::Instruction(load) = &mut extra[load_index] else {
+                                unreachable!()
+                            };
+                            load.local_policy =
+                                super::super::super::ir::LocalPolicy::for_load(true, false);
+                        }
+                        "opaque external donor" => {
+                            extra.push(record(LOAD_FAST, Operand::Value(0), 16, 1));
+                            let mut pop = Instruction::new(
+                                POP_TOP,
+                                Operand::Value(0),
+                                SourceLocation::new(16, 16, 4, 9),
+                                Some(0),
+                            );
+                            pop.fusion_policy.mark_location_from_next();
+                            extra.push(Item::Instruction(pop));
+                        }
+                        _ => {}
+                    }
+                    if matches!(case, "opaque class labelled" | "opaque class incoming") {
+                        extra.insert(marker_index, Item::Label(Label(11)));
+                    }
+                    extra.extend([Item::Instruction(tail), Item::Label(Label(9))]);
+                    if branch_depth != 0 {
+                        extra.push(record(POP_TOP, Operand::Value(0), 17, 0));
+                    }
+                    extra.extend([
+                        record(LOAD_CONST, Operand::Value(0), 17, 1),
+                        record(RETURN_VALUE, Operand::Value(0), 17, 0),
+                    ]);
+                    extra
+                };
+                let UnoptimizedCode::Linear(items) = &mut assembler.code else {
+                    unreachable!()
+                };
+                let footer = items
+                    .iter()
+                    .position(|item| *item == Item::Label(Label(6)))
+                    .unwrap();
+                items.splice(footer..footer, extra);
+                assembler.next_label = 12;
+                if case == "opaque class region" {
+                    assembler
+                        .exception_regions
+                        .push(region(Label(8), Label(9), Label(0), true));
+                }
+                if case == "opaque class incoming" {
+                    items[3] = record(JUMP_FORWARD, Operand::Forward(Label(11)), 9, 1);
+                    items.insert(3, record(LOAD_CONST, Operand::Value(0), 9, 1));
+                }
+            }
+            let mut pipeline = assembler.into_optimization_pipeline();
+            let condition = pipeline.graph.label_block(Label(2)).unwrap();
+            let body = pipeline.graph.label_block(Label(3)).unwrap();
+            let join = pipeline.graph.label_block(Label(5)).unwrap();
+            let footer = pipeline.graph.label_block(Label(6)).unwrap();
+            match case {
+                "ordinary"
+                | "generic return head"
+                | "independent tail"
+                | "independent tail generic head" => {}
+                "no match end" => pipeline
+                    .exception_owner_provenance
+                    .original_match_join_boundaries
+                    .clear(),
+                "borrow return" => {
+                    pipeline.borrow_block_aliases.insert(Label(6));
+                }
+                "hidden return" => pipeline
+                    .graph
+                    .instructions_mut(footer)
+                    .next()
+                    .unwrap()
+                    .add_pre_fold_extra_instructions(1),
+                "borrow join" => {
+                    pipeline
+                        .graph
+                        .insert_item(ItemPosition::new(join, 0), Item::Label(Label(7)));
+                    pipeline.borrow_block_aliases.insert(Label(7));
+                }
+                "hidden condition" => pipeline
+                    .graph
+                    .instructions_mut(condition)
+                    .next()
+                    .unwrap()
+                    .local_policy
+                    .add_hidden_exception_owner_slots(1),
+                "folded condition" => {
+                    pipeline
+                        .folded_original_predecessor_targets
+                        .insert(Label(2));
+                }
+                "marker owner" | "marker fusion" => {
+                    pipeline.graph.for_each_instruction_mut(|instruction| {
+                        if instruction.opcode == NOT_TAKEN {
+                            if case == "marker owner" {
+                                instruction.set_exception_policy(
+                                    super::super::super::ExceptionPolicy::NonePresent,
+                                );
+                            } else {
+                                instruction.fusion_policy.prevent_with_previous();
+                            }
+                        }
+                    });
+                }
+                "body no store" => {
+                    pipeline
+                        .graph
+                        .instructions_mut(body)
+                        .next_back()
+                        .unwrap()
+                        .opcode = POP_TOP;
+                }
+                "hidden body" => pipeline
+                    .graph
+                    .instructions_mut(body)
+                    .next()
+                    .unwrap()
+                    .add_pre_fold_extra_instructions(1),
+                "protected body" => {
+                    pipeline
+                        .exception_regions
+                        .push(region(Label(3), Label(5), Label(0), false));
+                }
+                "retained join" => pipeline
+                    .graph
+                    .instructions_mut(join)
+                    .next_back()
+                    .unwrap()
+                    .jump_policy
+                    .retain_redundant_nop_after_threading(),
+                "wide tuple" => pipeline.graph.for_each_instruction_mut(|instruction| {
+                    if instruction.opcode == BUILD_TUPLE {
+                        instruction.set_operand(Operand::Value(3));
+                    }
+                }),
+                "independent tail borrowed" => {
+                    let tail = pipeline.graph.label_block(Label(9)).unwrap();
+                    pipeline
+                        .graph
+                        .insert_item(ItemPosition::new(tail, 0), Item::Label(Label(11)));
+                    pipeline.borrow_block_aliases.insert(Label(11));
+                }
+                "independent tail no producer" => pipeline.conditional_threading_targets.clear(),
+                "independent tail hidden"
+                | "independent tail retained"
+                | "independent tail wrong target" => {
+                    let tail = pipeline.graph.label_block(Label(9)).unwrap();
+                    let jump = pipeline.graph.instructions_mut(tail).next_back().unwrap();
+                    match case {
+                        "independent tail hidden" => {
+                            jump.local_policy.add_hidden_exception_owner_slots(1);
+                        }
+                        "independent tail retained" => {
+                            jump.jump_policy.retain_redundant_nop_after_threading();
+                        }
+                        "independent tail wrong target" => {
+                            jump.set_operand(Operand::Forward(Label(5)));
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                "independent tail incoming" => {
+                    let source = pipeline.graph.label_block(Label(0)).unwrap();
+                    pipeline
+                        .graph
+                        .instructions_mut(source)
+                        .next_back()
+                        .unwrap()
+                        .set_operand(Operand::Forward(Label(9)));
+                }
+                _ if case.starts_with("opaque") => {}
+                _ => unreachable!(),
+            }
+            let before = pipeline.graph.iter_items().copied().collect::<Vec<_>>();
+            let opaque_before = pipeline
+                .graph
+                .order()
+                .iter()
+                .copied()
+                .skip_while(|block| pipeline.graph[*block].first_label() != Some(Label(8)))
+                .take_while(|block| *block != footer)
+                .map(|block| (block, pipeline.graph[block].items().to_vec()))
+                .collect::<Vec<_>>();
+            let condition_before = pipeline.graph[condition].items().to_vec();
+            let body_before = pipeline.graph[body].items().to_vec();
+            let footer_before = pipeline.graph[footer].items().to_vec();
+            pipeline.prepare_plain_tuple_copy_plan();
+            if matches!(
+                case,
+                "ordinary"
+                    | "generic return head"
+                    | "independent tail"
+                    | "independent tail generic head"
+                    | "opaque loop"
+                    | "opaque loop 315"
+                    | "opaque loop deferred"
+                    | "opaque class"
+                    | "opaque truth"
+                    | "opaque owned donor"
+            ) {
+                // The original ascending rounds see O only after it has grown to
+                // NOP + four return slots. A must keep its jump to that five-slot O.
+                assert_eq!(
+                    pipeline.exception_owner_provenance.normal_try_copy_steps,
+                    [
+                        (Label(0), Label(1), 1),
+                        (Label(1), Label(5), 1),
+                        (Label(5), Label(6), 4),
+                        (Label(1), Label(6), 4),
+                    ],
+                    "{case}"
+                );
+                assert_eq!(pipeline.graph[condition].items(), condition_before);
+                assert_eq!(pipeline.graph[body].items(), body_before);
+                assert_eq!(pipeline.graph[footer].items(), footer_before);
+                if case.starts_with("opaque") {
+                    for (block, items) in opaque_before {
+                        assert_eq!(pipeline.graph[block].items(), items, "{case}");
+                    }
+                }
+                let planned_join = pipeline.graph[join].last_instruction().unwrap();
+                assert_eq!(planned_join.location, SourceLocation::NONE);
+                assert!(!planned_join.jump_policy.defers_redundant_removal());
+            } else {
+                assert!(
+                    pipeline
+                        .exception_owner_provenance
+                        .normal_try_copy_steps
+                        .is_empty(),
+                    "{case}"
+                );
+                assert_eq!(
+                    pipeline.graph.iter_items().copied().collect::<Vec<_>>(),
+                    before,
+                    "{case}"
+                );
             }
         }
     }

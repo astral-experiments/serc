@@ -519,8 +519,8 @@ pub(super) struct ConditionState {
     // Source-proven conditions can reuse slots removed while lowering the condition itself.
     pub(super) allow_compacted_condition_owner: bool,
     pub(super) include_assert_none_condition_owner: bool,
-    // Folded success edges are conditional during native small-exit copying.
-    pub(super) uncopied_assertion_success: Option<Label>,
+    // Folded assertion-condition exits are conditional during native small-exit copying.
+    pub(super) uncopied_assertion_condition_target: Option<Label>,
     // Protected multi-branch chains and None-condition tuple branches relocate their source
     // jump; the final else assertion cannot reuse the stale owner slot.
     suppress_else_assert_none_condition_owner: bool,
@@ -13577,6 +13577,33 @@ impl Compiler<'_> {
             && self.control.finally.active_overriding_finally_returns == 0
     }
 
+    /// Keeps match-tail alias descent within an ordinary, unprotected return budget.
+    pub(super) fn can_descend_match_tail_wrappers(&self) -> bool {
+        self.context.python_version >= crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && !self.has_active_control_flow_region()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self
+                .control
+                .finally
+                .active_return_finally_contexts
+                .is_empty()
+            && self
+                .control
+                .finally
+                .preserved_return_value_contexts
+                .is_empty()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_overriding_finally_returns == 0
+    }
+
     fn has_active_control_flow_region(&self) -> bool {
         self.control.generators.generator_region_start.is_some()
             || !self.control.withs.active_with_region_exclusions.is_empty()
@@ -18194,7 +18221,7 @@ impl Compiler<'_> {
             );
             self.assembler.mark_assertion_side_exit_candidate();
             self.with_control_override(
-                |control| &mut control.conditions.uncopied_assertion_success,
+                |control| &mut control.conditions.uncopied_assertion_condition_target,
                 Some(end),
                 |compiler| compiler.compile_linear_assert_condition(&statement.test, end),
             )?;
@@ -18662,6 +18689,39 @@ impl Compiler<'_> {
                 .as_except_handler()
                 .is_some_and(|handler| handler.type_.is_none())
         });
+        let preserve_empty_try_setup = self.context.python_version >= crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && !terminal
+            && emit_statement_nop
+            && loop_tail.is_none()
+            && else_loop_tail.is_none()
+            && else_match_tail.is_none()
+            && self.control.statements.current_statement_has_following
+            && statement.orelse.is_empty()
+            && statement.finalbody.is_empty()
+            && matches!(statement.body.as_slice(), [Stmt::Pass(pass)]
+                if self.source_location(pass.range).line
+                    == self.source_location(statement.range).line)
+            && matches!(statement.handlers.as_slice(), [handler]
+            if handler.as_except_handler().is_some_and(|handler| {
+                handler.type_.is_none()
+                    && handler.name.is_none()
+                    && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+            }))
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0;
         let has_tuple_handler = statement.handlers.iter().any(|handler| {
             handler
                 .as_except_handler()
@@ -19776,6 +19836,18 @@ impl Compiler<'_> {
             }
             location
         };
+        if preserve_empty_try_setup && body_noop_location.is_some() {
+            // SETUP survives native reachability and same-line Pass compaction.
+            // Keep its actual record through our earlier normal-jump emission;
+            // removing it would thread past the empty body and strand its handler.
+            self.assembler.preserve_original_empty_try_setup(
+                try_start,
+                try_end,
+                handler_start,
+                self.source_location_including_trailing_semicolon(statement.range),
+                base_depth.cast_unsigned(),
+            );
+        }
         let body_ends_in_nop = self.assembler.last_instruction_is_nop();
         let _try_marker_slots = self
             .control
@@ -20218,12 +20290,37 @@ impl Compiler<'_> {
                         clause.test.is_none()
                             && suite_terminates_before_constant_folding(&clause.body)
                     }));
+            // An enclosing try need not forward its later source successor to this else.
+            // The actual original false-edge join still cannot inherit a returning arm's
+            // line: multiple conditional entries and no physical fallthrough authenticate it.
+            let original_shared_else_exit = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && !statement.is_star
+                && statement.finalbody.is_empty()
+                && !statement.orelse.is_empty()
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && matches!(statement.orelse.last(), Some(Stmt::If(branch))
+                    if branch.elif_else_clauses.is_empty()
+                        && matches!(branch.test.as_ref(), Expr::BoolOp(_))
+                        && condition_has_only_runtime_tests(&branch.test)
+                        && !expression_contains_chained_comparison(&branch.test)
+                        && condition_jump_target_count(&branch.test, false) > 1
+                        && suite_terminates_before_constant_folding(&branch.body))
+                && self.assembler.at_original_jump_only_conditional_join();
             let shared_conditional_exit = shared_assertion_exit
                 || folded_false_try_exit
                 || terminal_else_orphan_exit
                 || forwarded_conditional_exit.is_none()
                     && guarded_finally_exit_location.is_none()
-                    && (statement.orelse.is_empty()
+                    && (original_shared_else_exit
+                        || statement.orelse.is_empty()
                         || self.control.loops.contexts.is_empty()
                         || (loop_tail.is_none()
                             // An extracted loop-tail statement is still a source successor.

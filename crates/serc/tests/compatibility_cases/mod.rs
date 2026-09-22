@@ -102,6 +102,7 @@ mod dynamic_while_call_attribute_condition_owner_compatibility;
 mod dynamic_while_condition_owner_compatibility;
 mod earlier_exception_owner_slots;
 mod empty_try_else_donors;
+mod empty_try_setup;
 mod entry_and_cleanup_owner_slots;
 mod exceptional_finally_conditional_prefix_exits;
 mod exceptional_finally_handler_copy_locations;
@@ -757,3 +758,5 @@ mod shared_handler_cleanup_copies;
 mod normal_try_discard_copies;
 
 mod non_final_loop_exit_barriers;
+
+mod match_tuple_tail_wrappers;

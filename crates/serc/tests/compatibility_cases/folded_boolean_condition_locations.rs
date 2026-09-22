@@ -59,3 +59,16 @@ fn preserves_folded_boolean_loop_exit_locations() {
         }
     }
 }
+
+#[test]
+fn keeps_folded_assertion_failure_after_nested_boolean_tests() {
+    for condition in [
+        "(a or False) and (b or True)",
+        "(a or False) and True",
+        "((a or False) and (b or False)) or c",
+        "not ((a and True) or (b and False))",
+    ] {
+        let source = format!("assert {condition}\nresult = a\n");
+        common::assert_matches_cpython_marshal(&source, "nested_folded_assertion_failure.py");
+    }
+}

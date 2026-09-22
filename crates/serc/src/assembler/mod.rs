@@ -12585,6 +12585,46 @@ impl Assembler {
         instruction.jump_policy.preserve_explicit_nop();
     }
 
+    /// Keeps the original setup of an empty, same-line ordinary try through compaction.
+    pub(crate) fn preserve_original_empty_try_setup(
+        &mut self,
+        setup: Label,
+        body_end: Label,
+        handler: Label,
+        location: SourceLocation,
+        depth: u32,
+    ) {
+        let items = self.linear_items();
+        let Some(index) = items
+            .iter()
+            .rposition(|item| matches!(item, Item::Instruction(_)))
+        else {
+            return;
+        };
+        let mut expected = Instruction::new(NOP, Operand::Value(0), location, Some(depth));
+        expected.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+        let provenance = &self.exception_owner_provenance;
+        if location.line < 0
+            || items[index] != Item::Instruction(expected)
+            || provenance.ordinary_try_setups.get(&setup) != Some(&handler)
+            || !provenance.setups.contains(&(setup, Some(location)))
+            || items.last() != Some(&Item::Label(body_end))
+            || !items[index + 1..].contains(&Item::Label(setup))
+            || items[index + 1..]
+                .iter()
+                .any(|item| !matches!(item, Item::Label(_)))
+            || !provenance.setup_nop_ranges.iter().any(|(start, end)| {
+                index.checked_sub(1).is_some_and(|previous| {
+                    items[previous] == Item::Label(*start)
+                        && items.get(index + 1) == Some(&Item::Label(*end))
+                })
+            })
+        {
+            return;
+        }
+        self.preserve_last_nop();
+    }
+
     /// Allows compaction of an assertion's original `POP_BLOCK` before its matching exit.
     pub(crate) fn allow_original_assertion_pop_compaction(&mut self, emitted: EmittedJump) {
         let emitted_jump = *self.emitted_jump_mut(emitted, "checking an assertion's normal exit");
