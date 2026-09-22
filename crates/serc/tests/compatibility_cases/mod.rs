@@ -556,6 +556,7 @@ mod folded_while_import_borrow;
 mod intervening_try_finally_copy;
 
 mod async_generator_finally_owner;
+mod async_generator_pop_block_slots;
 mod conditional_finally_return_owner;
 
 mod located_manager_handler_join;

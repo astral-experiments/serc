@@ -4611,8 +4611,17 @@ impl Compiler<'_> {
         self.assembler.mark(send_end);
         self.set_depth(loop_depth + 2 + self.iterator_extra_slots());
         self.emit(END_SEND, 0, -self.iterator_slots())?;
+        if self.context.python_version == PythonVersion::Py314 {
+            // Native compaction erases the POP_BLOCK between END_SEND and target storage.
+            // Its vacant record remains in the original array used by later markers.
+            self.assembler.add_last_hidden_exception_owner_slots(1);
+        }
         self.assembler.mark(protected_end);
         self.compile_store_target(&generator.target)?;
+        if self.context.python_version == PythonVersion::Py314 {
+            self.assembler
+                .transfer_linear_try_pop_block_slot(protected_end);
+        }
 
         for condition in &generator.ifs {
             let accepted = self.assembler.label();
