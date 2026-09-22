@@ -1,5 +1,5 @@
 use crate::code_object::{
-    CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance,
+    CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance, MetadataId,
 };
 
 use super::encode_code;
@@ -8,7 +8,7 @@ use super::key::{
     ObjectKey, code_bytes_key, code_key, constant_key, constant_sort_key, constants_tuple_key,
     local_kinds_key, locals_tuple_key, slice_member_uses_identity, strings_tuple_key,
 };
-use super::plan::{MarshalVisitor, ReferenceMode, traverse_code};
+use super::plan::{MarshalVisitor, ObjectId, ReferenceMode, traverse_code};
 
 fn code_object(constants: Vec<Constant>) -> CodeObject {
     CodeObject {
@@ -31,13 +31,19 @@ fn code_object(constants: Vec<Constant>) -> CodeObject {
         marshal_provenance: MarshalProvenance {
             metadata_ids: MarshalMetadataIds {
                 domain_len: 2,
-                filename: 1,
+                filename: MetadataId::from_u32(1),
                 ..MarshalMetadataIds::default()
             },
             subtree_has_frozenset_constants: true,
             ..MarshalProvenance::default()
         },
     }
+}
+
+#[test]
+fn optional_marshal_ids_remain_four_bytes() {
+    assert_eq!(std::mem::size_of::<Option<MetadataId>>(), 4);
+    assert_eq!(std::mem::size_of::<Option<ObjectId>>(), 4);
 }
 
 #[test]
@@ -162,7 +168,10 @@ fn cached_scalar_graph_routes_constants_metadata_and_structural_bytes() {
     ]);
     code.constants.resize(32, Constant::None);
     code.names.push("é".to_string());
-    code.marshal_provenance.metadata_ids.names.push(0);
+    code.marshal_provenance
+        .metadata_ids
+        .names
+        .push(MetadataId::from_u32(0));
     code.line_table.push(0);
     code.exception_table.push(0);
     let graph = ObjectGraph::for_code(&code);
@@ -206,7 +215,10 @@ fn tracks_interned_strings_from_constants_and_metadata() {
         .explicitly_interned_strings
         .insert("méthode".to_string());
     code.names.push("metadata name with spaces".to_string());
-    code.marshal_provenance.metadata_ids.names.push(0);
+    code.marshal_provenance
+        .metadata_ids
+        .names
+        .push(MetadataId::from_u32(0));
     let graph = ObjectGraph::for_code(&code);
 
     assert!(graph.is_interned("identifier"));
@@ -259,11 +271,11 @@ fn dense_metadata_ids_preserve_nested_and_constant_string_identity() {
     nested.qualified_name = "shared_after".to_string();
     nested.marshal_provenance.metadata_ids = MarshalMetadataIds {
         domain_len: 8,
-        names: vec![1, 2],
-        locals: vec![3],
-        filename: 7,
-        name: Some(0),
-        qualified_name: Some(1),
+        names: vec![MetadataId::from_u32(1), MetadataId::from_u32(2)],
+        locals: vec![MetadataId::from_u32(3)],
+        filename: MetadataId::from_u32(7),
+        name: Some(MetadataId::from_u32(0)),
+        qualified_name: Some(MetadataId::from_u32(1)),
     };
     let mut hinted = code_object(vec![
         Constant::String("shared_before".to_string()),
@@ -278,21 +290,21 @@ fn dense_metadata_ids_preserve_nested_and_constant_string_identity() {
     hinted.qualified_name = "shared_before".to_string();
     hinted.marshal_provenance.metadata_ids = MarshalMetadataIds {
         domain_len: 8,
-        names: vec![0, 1],
-        locals: vec![3],
-        filename: 7,
-        name: Some(1),
-        qualified_name: Some(0),
+        names: vec![MetadataId::from_u32(0), MetadataId::from_u32(1)],
+        locals: vec![MetadataId::from_u32(3)],
+        filename: MetadataId::from_u32(7),
+        name: Some(MetadataId::from_u32(1)),
+        qualified_name: Some(MetadataId::from_u32(0)),
     };
 
     let mut fallback = hinted.clone();
     fallback.marshal_provenance.metadata_ids.domain_len = u32::MAX;
-    fallback.marshal_provenance.metadata_ids.filename = u32::MAX - 1;
+    fallback.marshal_provenance.metadata_ids.filename = MetadataId::from_u32(u32::MAX - 1);
     let Constant::Code(nested) = &mut fallback.constants[1] else {
         unreachable!();
     };
     nested.marshal_provenance.metadata_ids.domain_len = u32::MAX;
-    nested.marshal_provenance.metadata_ids.filename = u32::MAX - 1;
+    nested.marshal_provenance.metadata_ids.filename = MetadataId::from_u32(u32::MAX - 1);
 
     assert_eq!(encode_code(&hinted), encode_code(&fallback));
     let graph = ObjectGraph::for_code(&hinted);
@@ -324,7 +336,8 @@ fn rejects_mismatched_metadata_id_lengths() {
 fn rejects_colliding_metadata_ids() {
     let mut code = code_object(Vec::new());
     code.names = vec!["first".to_string(), "second".to_string()];
-    code.marshal_provenance.metadata_ids.names = vec![0, 0];
+    code.marshal_provenance.metadata_ids.names =
+        vec![MetadataId::from_u32(0), MetadataId::from_u32(0)];
     ObjectGraph::for_code(&code);
 }
 
@@ -358,7 +371,11 @@ fn bypasses_value_lookup_for_structurally_unique_objects() {
     }]);
     inner.bytecode.push(0);
     inner.locals.push("value".to_string());
-    inner.marshal_provenance.metadata_ids.locals.push(0);
+    inner
+        .marshal_provenance
+        .metadata_ids
+        .locals
+        .push(MetadataId::from_u32(0));
     inner.local_kinds.push(1);
     inner.marshal_provenance.locals_identity = LocalsIdentity::Fresh;
 
@@ -677,7 +694,7 @@ impl<'a> MarshalVisitor<'a> for RecordingVisitor<'a> {
 
     fn local_kinds(&mut self, _code: &'a CodeObject) {}
 
-    fn metadata_string(&mut self, _value: &'a str, _metadata_id: Option<u32>) {}
+    fn metadata_string(&mut self, _value: &'a str, _metadata_id: Option<MetadataId>) {}
 
     fn first_line(&mut self, _value: u32) {}
 
@@ -1552,7 +1569,10 @@ fn partial_absence_is_invalidated_by_discarded_mortal_metadata() {
         // A later immortal metadata phase can resolve possible membership,
         // provided no earlier ordinary query has already made the origin unknown.
         code.names.push(marker.to_string());
-        code.marshal_provenance.metadata_ids.names.push(0);
+        code.marshal_provenance
+            .metadata_ids
+            .names
+            .push(MetadataId::from_u32(0));
         code.marshal_provenance
             .generated_mangled_strings
             .insert(marker.to_string());
@@ -1716,7 +1736,7 @@ fn metadata_tuple_aliases_intern_only_the_shared_constant_slots() {
     use crate::{InitialInternState, PythonVersion};
     let mut child = code_object(vec![Constant::None]);
     child.names = vec!["café".to_string()];
-    child.marshal_provenance.metadata_ids.names = vec![0];
+    child.marshal_provenance.metadata_ids.names = vec![MetadataId::from_u32(0)];
     let code = code_object(vec![
         Constant::String("café".to_string()),
         Constant::Code(Box::new(child)),
@@ -1751,7 +1771,7 @@ fn metadata_tuple_aliases_do_not_intern_equal_frozenset_members() {
         "café".to_string(),
     )])]);
     code.names = vec!["café".to_string()];
-    code.marshal_provenance.metadata_ids.names = vec![0];
+    code.marshal_provenance.metadata_ids.names = vec![MetadataId::from_u32(0)];
     for version in [PythonVersion::Py314, PythonVersion::Py315] {
         let bytes = encode_code_with_options(&code, version, &InitialInternState::default());
         let plain_member = [b'u' | 0x80, 5, 0, 0, 0, b'c', b'a', b'f', 0xc3, 0xa9];

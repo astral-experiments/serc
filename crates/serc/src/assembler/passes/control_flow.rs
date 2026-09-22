@@ -720,8 +720,7 @@ impl OptimizationPipeline {
                 if pop.opcode != POP_TOP {
                     continue;
                 }
-                let target = &mut conditional_targets
-                    [usize::try_from(label.0).expect("label index fits in usize")];
+                let target = &mut conditional_targets[label.index()];
                 conditional_target_count += usize::from(
                     target
                         .replace(ConditionalTarget {
@@ -746,10 +745,7 @@ impl OptimizationPipeline {
                         let Operand::Forward(target) = instruction.operand() else {
                             return None;
                         };
-                        let target = conditional_targets
-                            .get(usize::try_from(target.0).expect("label index fits in usize"))
-                            .copied()
-                            .flatten()?;
+                        let target = conditional_targets.get(target.index()).copied().flatten()?;
                         (instruction.opcode != target.opcode).then_some(target.fallthrough_index)
                     })
                     .collect::<Vec<_>>();
@@ -785,10 +781,7 @@ impl OptimizationPipeline {
                     };
                     let mut replaced = false;
                     for _ in 0..conditional_target_count {
-                        let Some(next) = conditional_targets
-                            .get(usize::try_from(target.0).expect("label index fits in usize"))
-                            .copied()
-                            .flatten()
+                        let Some(next) = conditional_targets.get(target.index()).copied().flatten()
                         else {
                             break;
                         };
@@ -1051,7 +1044,7 @@ impl OptimizationPipeline {
         // Aliased labels containing work or omitted authored NOPs cannot certify it.
         let mut nested_join_sources = FxHashMap::<usize, Vec<(Label, Instruction)>>::default();
         let mut nested_join_blocks: Vec<_> = nested_join_blocks.into_iter().collect();
-        nested_join_blocks.sort_unstable_by_key(|label| label.0);
+        nested_join_blocks.sort_unstable_by_key(|label| label.as_u32());
         for entry in nested_join_blocks {
             let Some(&index) = label_offsets.get(&entry) else {
                 continue;
@@ -1473,8 +1466,7 @@ impl OptimizationPipeline {
                                         .contains(&label_offsets[label])
                                         || self.original_nop_targets.contains(label))))
                             .then_some(label_offsets[label]);
-                            let target = &mut jump_targets
-                                [usize::try_from(label.0).expect("label index fits in usize")];
+                            let target = &mut jump_targets[label.index()];
                             jump_target_count += usize::from(
                                 target
                                     .replace((
@@ -1542,8 +1534,7 @@ impl OptimizationPipeline {
             let Operand::Forward(target) = instruction.operand() else {
                 continue;
             };
-            if jump_targets[usize::try_from(target.0).expect("label index fits in usize")].is_none()
-            {
+            if jump_targets[target.index()].is_none() {
                 surviving_heads.push(block);
             } else {
                 dependent_heads.entry(target).or_default().push(block);
@@ -1552,9 +1543,7 @@ impl OptimizationPipeline {
         while let Some(block) = surviving_heads.pop() {
             if let Some(labels) = nop_targets.remove(&block) {
                 for label in labels {
-                    if jump_targets[usize::try_from(label.0).expect("label index fits in usize")]
-                        .take()
-                        .is_some()
+                    if jump_targets[label.index()].take().is_some()
                         && let Some(dependents) = dependent_heads.remove(&label)
                     {
                         surviving_heads.extend(dependents);
@@ -2048,10 +2037,8 @@ impl OptimizationPipeline {
                     && backedge.local_policy.hidden_exception_owner_slots() == 0
                     && backedge.depth_after().is_some()
                     && backedge.depth_after() == jump.depth_after()
-                    && jump_targets[usize::try_from(entry.0).expect("label index fits in usize")]
-                        .is_some()
-                    && jump_targets[usize::try_from(target.0).expect("label index fits in usize")]
-                        .is_none())
+                    && jump_targets[entry.index()].is_some()
+                    && jump_targets[target.index()].is_none())
                 .then_some(source_index)
             })
             .collect::<FxHashSet<_>>();
@@ -2139,8 +2126,8 @@ impl OptimizationPipeline {
                     })
                     || planned_sources.contains(&entry_index)
                     || pop_block_offsets.contains(&entry_index)
-                    || jump_targets[usize::try_from(entry.0).expect("label index fits in usize")].is_none()
-                    || jump_targets[usize::try_from(target.0).expect("label index fits in usize")].is_some()
+                    || jump_targets[entry.index()].is_none()
+                    || jump_targets[target.index()].is_some()
                 {
                     return None;
                 }
@@ -2571,10 +2558,7 @@ impl OptimizationPipeline {
                     next_retains_nop,
                     next_normal_try_exit,
                     next_original_nop,
-                )) = jump_targets
-                    .get(usize::try_from(target.0).expect("label index fits in usize"))
-                    .copied()
-                    .flatten()
+                )) = jump_targets.get(target.index()).copied().flatten()
                 else {
                     break;
                 };
@@ -2759,8 +2743,8 @@ impl OptimizationPipeline {
             let mut exclusions = vec![Vec::new(); self.exception_regions.len()];
             let mut copied_regions = Vec::new();
             for &(source, target) in copied_owners.iter().rev() {
-                let start = Label(self.next_label);
-                let end = Label(self.next_label + 1);
+                let start = Label::from_u32(self.next_label);
+                let end = Label::from_u32(self.next_label + 1);
                 self.next_label += 2;
                 let (block, offset) = instruction_positions[source];
                 graph.insert_label(block, offset + 1, end);
@@ -3946,7 +3930,7 @@ impl OptimizationPipeline {
             .iter()
             .copied()
             .collect::<Vec<_>>();
-        entries.sort_unstable_by_key(|entry| entry.0);
+        entries.sort_unstable_by_key(|entry| entry.as_u32());
         for entry in entries {
             let Some(block) = self.graph.label_block(entry) else {
                 continue;
@@ -5703,10 +5687,10 @@ mod tests {
 
     #[test]
     fn setup_nop_requires_its_original_predecessor_to_survive() {
-        let start = Label(0);
-        let exclusion = Label(1);
-        let setup = Label(2);
-        let handler = Label(3);
+        let start = Label::from_u32(0);
+        let exclusion = Label::from_u32(1);
+        let setup = Label::from_u32(2);
+        let handler = Label::from_u32(3);
         let location = SourceLocation::new(7, 7, 20, 21);
         let instruction = |opcode, line, column| {
             Item::Instruction(Instruction::new(

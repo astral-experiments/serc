@@ -1,23 +1,15 @@
+use ruff_index::newtype_index;
+
 use crate::PythonVersion;
-use crate::code_object::{CodeObject, Constant};
+use crate::code_object::{CodeObject, Constant, MetadataId};
 
 use super::key::{
     FrozenSetMembers, frozen_set_members_in_wire_order, slice_member_uses_identity_for,
 };
 
 // Equal value keys share an ID; identity-based keys remain distinct exactly as `ObjectKey` does.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct ObjectId(u32);
-
-impl ObjectId {
-    pub(super) fn from_index(index: usize) -> Self {
-        Self(index.try_into().expect("marshal object limit exceeded"))
-    }
-
-    pub(super) fn index(self) -> usize {
-        self.0 as usize
-    }
-}
+#[newtype_index]
+pub(super) struct ObjectId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ReferenceMode {
@@ -40,14 +32,14 @@ pub(super) trait MarshalVisitor<'a> {
     fn strings(&mut self, values: &'a [String]) -> bool;
     fn locals(&mut self, code: &'a CodeObject) -> bool;
     fn local_kinds(&mut self, code: &'a CodeObject);
-    fn metadata_string(&mut self, value: &'a str, metadata_id: Option<u32>);
-    fn code_filename(&mut self, code: &'a CodeObject, metadata_id: Option<u32>) {
+    fn metadata_string(&mut self, value: &'a str, metadata_id: Option<MetadataId>);
+    fn code_filename(&mut self, code: &'a CodeObject, metadata_id: Option<MetadataId>) {
         self.metadata_string(&code.filename, metadata_id);
     }
-    fn code_name(&mut self, code: &'a CodeObject, metadata_id: Option<u32>) {
+    fn code_name(&mut self, code: &'a CodeObject, metadata_id: Option<MetadataId>) {
         self.metadata_string(&code.name, metadata_id);
     }
-    fn code_qualified_name(&mut self, code: &'a CodeObject, metadata_id: Option<u32>) {
+    fn code_qualified_name(&mut self, code: &'a CodeObject, metadata_id: Option<MetadataId>) {
         self.metadata_string(&code.qualified_name, metadata_id);
     }
     fn first_line(&mut self, value: u32);
@@ -130,7 +122,7 @@ where
 #[inline]
 fn traverse_metadata_strings<'a, V>(
     values: &'a [String],
-    metadata_ids: Option<&[u32]>,
+    metadata_ids: Option<&[MetadataId]>,
     visitor: &mut V,
 ) where
     V: MarshalVisitor<'a>,

@@ -2905,7 +2905,7 @@ fn python_312_match_tail_condition_does_not_locate_a_copied_exit_nop() {
             76, 136, 53, 128, 76
         ]
     );
-    assert_eq!(function.exception_table, []);
+    assert!(function.exception_table.is_empty());
 }
 
 #[test]
@@ -2930,7 +2930,7 @@ fn python_312_terminal_chained_comparison_has_no_located_success_nop() {
             3, 0, 8, 30, 241, 6, 0, 16, 20
         ]
     );
-    assert_eq!(function.exception_table, []);
+    assert!(function.exception_table.is_empty());
 }
 
 #[test]
@@ -3853,7 +3853,7 @@ fn python312_folded_false_if_preserves_shared_literal_footer() {
             240, 3, 1, 1, 1, 217, 3, 7, 216, 7, 11, 217, 8, 11, 140, 5, 216, 7, 12, 225, 0, 8
         ]
     );
-    assert_eq!(module.exception_table, []);
+    assert!(module.exception_table.is_empty());
 }
 
 #[test]

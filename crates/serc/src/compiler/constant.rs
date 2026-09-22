@@ -20,7 +20,7 @@ use super::Compiler;
 use super::expression::{jump_constant_truthiness, literal_truthiness};
 use super::scope::NameId;
 use super::symbol::{mangle_name, to_u32};
-use crate::code_object::{CodeObject, Constant, NonReflexiveRemap};
+use crate::code_object::{CodeObject, Constant, MetadataId, NonReflexiveRemap};
 
 #[derive(Debug, Default)]
 pub(super) struct ConstantPool {
@@ -247,7 +247,7 @@ pub(super) struct OutputState {
     pub(super) has_untracked_discarded_collection: bool,
     pub(super) deferred_names: Vec<(OperandPatchId, String)>,
     pub(super) names: Vec<String>,
-    pub(super) name_ids: Vec<u32>,
+    pub(super) name_ids: Vec<MetadataId>,
     name_indices: FxHashMap<NameId, u32>,
     pub(super) interned_constant_strings: FxHashSet<String>,
     pub(super) qualified_name_constant_index: Option<u32>,
@@ -953,7 +953,7 @@ impl Compiler<'_> {
             Entry::Vacant(entry) => {
                 let index = to_u32(self.output.names.len(), "name count")?;
                 self.output.names.push(name.into_owned());
-                self.output.name_ids.push(name_id.0);
+                self.output.name_ids.push(MetadataId::from(name_id));
                 entry.insert(index);
                 Ok(index)
             }
@@ -3799,7 +3799,7 @@ mod tests {
         constant_pool_fingerprint,
     };
     use crate::code_object::{
-        CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance,
+        CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance, MetadataId,
     };
 
     fn code_object(constants: Vec<Constant>) -> CodeObject {
@@ -3823,8 +3823,8 @@ mod tests {
             marshal_provenance: MarshalProvenance {
                 metadata_ids: MarshalMetadataIds {
                     domain_len: 2,
-                    locals: vec![0],
-                    filename: 1,
+                    locals: vec![MetadataId::from_u32(0)],
+                    filename: MetadataId::from_u32(1),
                     ..MarshalMetadataIds::default()
                 },
                 subtree_has_frozenset_constants: true,

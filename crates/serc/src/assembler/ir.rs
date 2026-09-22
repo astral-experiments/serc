@@ -1,6 +1,7 @@
 use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use ruff_index::newtype_index;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::block_graph::BlockGraph;
@@ -79,11 +80,11 @@ impl AssemblerStage {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct Label(pub(super) u32);
+#[newtype_index]
+pub(crate) struct Label;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct OperandPatchId(pub(super) u32);
+#[newtype_index]
+pub(crate) struct OperandPatchId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct EmissionStreamId(u64);
@@ -436,9 +437,9 @@ impl FusionPolicy {
     const fn operand(self, payload: u32) -> Operand {
         match self.0 & Self::OPERAND_KIND_MASK {
             Self::VALUE_OPERAND => Operand::Value(payload),
-            Self::DEFERRED_OPERAND => Operand::Deferred(OperandPatchId(payload)),
-            Self::FORWARD_OPERAND => Operand::Forward(Label(payload)),
-            Self::BACKWARD_OPERAND => Operand::Backward(Label(payload)),
+            Self::DEFERRED_OPERAND => Operand::Deferred(OperandPatchId::from_u32(payload)),
+            Self::FORWARD_OPERAND => Operand::Forward(Label::from_u32(payload)),
+            Self::BACKWARD_OPERAND => Operand::Backward(Label::from_u32(payload)),
             _ => unreachable!(),
         }
     }
@@ -446,9 +447,9 @@ impl FusionPolicy {
     fn set_operand(&mut self, operand: Operand) -> u32 {
         let (kind, payload) = match operand {
             Operand::Value(payload) => (Self::VALUE_OPERAND, payload),
-            Operand::Deferred(OperandPatchId(payload)) => (Self::DEFERRED_OPERAND, payload),
-            Operand::Forward(Label(payload)) => (Self::FORWARD_OPERAND, payload),
-            Operand::Backward(Label(payload)) => (Self::BACKWARD_OPERAND, payload),
+            Operand::Deferred(id) => (Self::DEFERRED_OPERAND, id.as_u32()),
+            Operand::Forward(id) => (Self::FORWARD_OPERAND, id.as_u32()),
+            Operand::Backward(id) => (Self::BACKWARD_OPERAND, id.as_u32()),
         };
         self.0 = (self.0 & !Self::OPERAND_KIND_MASK) | kind;
         payload
@@ -1934,7 +1935,7 @@ mod initial_borrow_metadata_tests {
     fn fusion_owner_fields_preserve_every_normal_metadata_combination() {
         let original = Instruction::new(
             JUMP_FORWARD,
-            Operand::Forward(Label(1)),
+            Operand::Forward(Label::from_u32(1)),
             SourceLocation::NONE,
             None,
         );
@@ -1964,9 +1965,14 @@ mod initial_borrow_metadata_tests {
     #[test]
     fn fusion_owner_fields_compare_packed_operands_depth_and_other_policies() {
         let source = SourceLocation::new(1, 1, 0, 1);
-        let original = Instruction::new(JUMP_FORWARD, Operand::Forward(Label(1)), source, None);
+        let original = Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(Label::from_u32(1)),
+            source,
+            None,
+        );
         let mut changes = [original; 7];
-        changes[0].set_operand(Operand::Forward(Label(2)));
+        changes[0].set_operand(Operand::Forward(Label::from_u32(2)));
         changes[1].location = SourceLocation::new(2, 2, 0, 1);
         changes[2].depth_after = 0;
         changes[3].local_policy.mark_force_borrowed_load();
@@ -1983,9 +1989,9 @@ mod initial_borrow_metadata_tests {
 
         let operands = [
             Operand::Value(1),
-            Operand::Deferred(OperandPatchId(1)),
-            Operand::Forward(Label(1)),
-            Operand::Backward(Label(1)),
+            Operand::Deferred(OperandPatchId::from_u32(1)),
+            Operand::Forward(Label::from_u32(1)),
+            Operand::Backward(Label::from_u32(1)),
         ];
         for first in operands {
             for second in operands {
@@ -2042,7 +2048,7 @@ mod initial_borrow_metadata_tests {
             for raw in 1..=276 {
                 let mut original = Instruction::synthetic(
                     JUMP_FORWARD,
-                    Operand::Forward(Label(1)),
+                    Operand::Forward(Label::from_u32(1)),
                     SourceLocation::NONE,
                     None,
                 );
@@ -2054,7 +2060,7 @@ mod initial_borrow_metadata_tests {
                 assert_eq!(original.legacy_initial_jump_width(), width);
                 for policy in POLICIES {
                     let mut retargeted = original;
-                    retargeted.retarget(Operand::Forward(Label(999)));
+                    retargeted.retarget(Operand::Forward(Label::from_u32(999)));
                     retargeted.set_exception_policy(policy);
                     retargeted.add_pre_fold_extra_instructions(1);
                     assert_eq!(retargeted.legacy_initial_jump_width(), width);
@@ -2124,7 +2130,7 @@ mod initial_borrow_metadata_tests {
             let metadata = InstructionMetadata(NonZeroU16::new(raw).unwrap());
             let mut original = Instruction::synthetic(
                 JUMP_FORWARD,
-                Operand::Forward(Label(1)),
+                Operand::Forward(Label::from_u32(1)),
                 SourceLocation::NONE,
                 None,
             );
@@ -2174,9 +2180,9 @@ mod initial_borrow_metadata_tests {
                 );
             }
             let mut retargeted = original;
-            retargeted.set_operand(Operand::Forward(Label(1)));
+            retargeted.set_operand(Operand::Forward(Label::from_u32(1)));
             assert_eq!(retargeted.metadata.has_initial_borrow_entry(), origin);
-            retargeted.set_operand(Operand::Forward(Label(2)));
+            retargeted.set_operand(Operand::Forward(Label::from_u32(2)));
             assert!(!retargeted.metadata.has_initial_borrow_entry());
             assert_eq!(retargeted.exception_policy(), original.exception_policy());
             assert_eq!(

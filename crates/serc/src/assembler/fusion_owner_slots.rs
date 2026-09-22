@@ -16,7 +16,7 @@ use smallvec::SmallVec;
 use std::cell::OnceCell;
 use std::cmp::Reverse;
 
-type Key = (i32, i32, i32, i32, u8, u32);
+type Key = (i32, i32, i32, i32, u8, Label);
 type Owner = Option<(Label, u32, bool)>;
 
 fn same_instruction(a: Instruction, b: Instruction, borrow: bool) -> bool {
@@ -55,7 +55,7 @@ fn key(condition: Instruction, marker: Instruction) -> Option<Key> {
         l.column,
         l.end_column,
         condition.opcode.code(),
-        target.0,
+        target,
     ))
 }
 
@@ -102,9 +102,7 @@ impl LabelPositions {
 
     #[inline]
     fn insert(&mut self, label: Label, position: (usize, usize)) -> Option<(usize, usize)> {
-        let Ok(index) = usize::try_from(label.0) else {
-            return self.sparse.insert(label, position);
-        };
+        let index = label.index();
         if index >= self.dense_limit {
             return self.sparse.insert(label, position);
         }
@@ -122,9 +120,7 @@ impl LabelPositions {
 
     #[inline]
     fn get(&self, label: Label) -> Option<&(usize, usize)> {
-        let Ok(index) = usize::try_from(label.0) else {
-            return self.sparse.get(&label);
-        };
+        let index = label.index();
         if index >= self.dense_limit {
             return self.sparse.get(&label);
         }
@@ -2699,7 +2695,7 @@ mod tests {
         )
     }
     fn certificate() -> (Certificate, Vec<Item>) {
-        let mut condition = instruction(POP_JUMP_IF_TRUE, Operand::Forward(Label(1)));
+        let mut condition = instruction(POP_JUMP_IF_TRUE, Operand::Forward(Label::from_u32(1)));
         condition.exclude_from_exception_table(ExceptionExclusion::Always);
         let marker = instruction(NOT_TAKEN, Operand::Value(0));
         let items = vec![
@@ -2728,17 +2724,28 @@ mod tests {
 
     #[test]
     fn interval_boundaries_match_whole_view_membership() {
-        let boundaries = [Label(1), Label(3), Label(u32::MAX)].into_iter().collect();
+        let boundaries = [
+            Label::from_u32(1),
+            Label::from_u32(3),
+            Label::from_u32(u32::MAX - 1),
+        ]
+        .into_iter()
+        .collect();
         let items = [
-            Item::Label(Label(4)),
-            Item::Label(Label(3)),
-            Item::Instruction(instruction(JUMP_FORWARD, Operand::Forward(Label(1)))),
-            Item::Label(Label(u32::MAX)),
-            Item::Label(Label(3)),
+            Item::Label(Label::from_u32(4)),
+            Item::Label(Label::from_u32(3)),
+            Item::Instruction(instruction(
+                JUMP_FORWARD,
+                Operand::Forward(Label::from_u32(1)),
+            )),
+            Item::Label(Label::from_u32(u32::MAX - 1)),
+            Item::Label(Label::from_u32(3)),
         ];
         assert_eq!(
             boundaries_in(&items, &boundaries),
-            [Label(3), Label(u32::MAX)].into_iter().collect()
+            [Label::from_u32(3), Label::from_u32(u32::MAX - 1)]
+                .into_iter()
+                .collect()
         );
         assert!(boundaries_in(&items[..1], &boundaries).is_empty());
         assert!(boundaries_in(&items, &FxHashSet::default()).is_empty());
@@ -2749,23 +2756,23 @@ mod tests {
         let provenance = ExceptionOwnerProvenance::default();
         let preserved = FxHashSet::default();
         let items = [
-            Item::Label(Label(0)),
-            Item::Label(Label(1)),
+            Item::Label(Label::from_u32(0)),
+            Item::Label(Label::from_u32(1)),
             Item::Instruction(instruction(NOP, Operand::Value(0))),
-            Item::Label(Label(2)),
+            Item::Label(Label::from_u32(2)),
             Item::Instruction(instruction(NOP, Operand::Value(0))),
             Item::Instruction(instruction(NOP, Operand::Value(0))),
-            Item::Label(Label(3)),
+            Item::Label(Label::from_u32(3)),
         ];
         let view = View::new(&items, &[], &provenance, &preserved).unwrap();
         let positions: Vec<_> = (0..=items.len())
             .map(|index| view.instruction_position(index))
             .collect();
         assert_eq!(positions, [0, 0, 0, 1, 1, 2, 3, 3]);
-        assert_eq!(view.label_position(Label(2)), Some(&1));
+        assert_eq!(view.label_position(Label::from_u32(2)), Some(&1));
 
         let mut duplicate = items.to_vec();
-        duplicate.push(Item::Label(Label(2)));
+        duplicate.push(Item::Label(Label::from_u32(2)));
         assert!(View::new(&duplicate, &[], &provenance, &preserved).is_none());
         assert_eq!(
             View::new(&[], &[], &provenance, &preserved)
@@ -2779,22 +2786,22 @@ mod tests {
     fn marker_candidates_preserve_instruction_order_across_labels() {
         let provenance = ExceptionOwnerProvenance::default();
         let preserved = FxHashSet::default();
-        let condition = instruction(POP_JUMP_IF_TRUE, Operand::Forward(Label(99)));
+        let condition = instruction(POP_JUMP_IF_TRUE, Operand::Forward(Label::from_u32(99)));
         let marker = instruction(NOT_TAKEN, Operand::Value(0));
         let items = [
             Item::Instruction(marker),
             Item::Instruction(condition),
-            Item::Label(Label(1)),
-            Item::Label(Label(2)),
+            Item::Label(Label::from_u32(1)),
+            Item::Label(Label::from_u32(2)),
             Item::Instruction(marker),
             Item::Instruction(marker),
             Item::Instruction(condition),
             Item::Instruction(instruction(NOP, Operand::Value(0))),
             Item::Instruction(marker),
             Item::Instruction(condition),
-            Item::Label(Label(3)),
+            Item::Label(Label::from_u32(3)),
             Item::Instruction(marker),
-            Item::Label(Label(99)),
+            Item::Label(Label::from_u32(99)),
         ];
         let view = View::new(&items[..9], &[], &provenance, &preserved).unwrap();
         assert_eq!(view.endpoint(condition, marker), Some((1, 4)));
@@ -2811,48 +2818,51 @@ mod tests {
     fn label_positions_keep_dense_and_sparse_memberships_exact() {
         let mut labels = LabelPositions::default();
         labels.prepare(3);
-        assert_eq!(labels.insert(Label(0), (0, 0)), None);
-        assert_eq!(labels.insert(Label(5), (1, 0)), None);
-        assert_eq!(labels.insert(Label(90), (2, 1)), None);
-        assert_eq!(labels.insert(Label(u32::MAX), (3, 1)), None);
+        assert_eq!(labels.insert(Label::from_u32(0), (0, 0)), None);
+        assert_eq!(labels.insert(Label::from_u32(5), (1, 0)), None);
+        assert_eq!(labels.insert(Label::from_u32(90), (2, 1)), None);
+        assert_eq!(labels.insert(Label::from_u32(u32::MAX - 1), (3, 1)), None);
         assert_eq!(labels.dense.len(), 6);
-        assert_eq!(labels.get(Label(0)), Some(&(0, 0)));
-        assert_eq!(labels.get(Label(5)), Some(&(1, 0)));
-        assert_eq!(labels.get(Label(90)), Some(&(2, 1)));
-        assert_eq!(labels.get(Label(u32::MAX)), Some(&(3, 1)));
-        assert_eq!(labels.get(Label(4)), None);
-        assert_eq!(labels.get(Label(91)), None);
-        assert_eq!(labels.insert(Label(5), (4, 2)), Some((1, 0)));
-        assert_eq!(labels.insert(Label(90), (5, 2)), Some((2, 1)));
-        assert_eq!(labels.insert(Label(u32::MAX), (6, 3)), Some((3, 1)));
+        assert_eq!(labels.get(Label::from_u32(0)), Some(&(0, 0)));
+        assert_eq!(labels.get(Label::from_u32(5)), Some(&(1, 0)));
+        assert_eq!(labels.get(Label::from_u32(90)), Some(&(2, 1)));
+        assert_eq!(labels.get(Label::from_u32(u32::MAX - 1)), Some(&(3, 1)));
+        assert_eq!(labels.get(Label::from_u32(4)), None);
+        assert_eq!(labels.get(Label::from_u32(91)), None);
+        assert_eq!(labels.insert(Label::from_u32(5), (4, 2)), Some((1, 0)));
+        assert_eq!(labels.insert(Label::from_u32(90), (5, 2)), Some((2, 1)));
+        assert_eq!(
+            labels.insert(Label::from_u32(u32::MAX - 1), (6, 3)),
+            Some((3, 1))
+        );
 
         // The same label moves from sparse to dense, then back on a shorter graph.
         labels.clear();
         labels.prepare(100);
-        assert_eq!(labels.get(Label(5)), None);
-        assert_eq!(labels.get(Label(90)), None);
-        assert_eq!(labels.get(Label(u32::MAX)), None);
-        assert_eq!(labels.insert(Label(90), (4, 2)), None);
-        assert_eq!(labels.get(Label(90)), Some(&(4, 2)));
+        assert_eq!(labels.get(Label::from_u32(5)), None);
+        assert_eq!(labels.get(Label::from_u32(90)), None);
+        assert_eq!(labels.get(Label::from_u32(u32::MAX - 1)), None);
+        assert_eq!(labels.insert(Label::from_u32(90), (4, 2)), None);
+        assert_eq!(labels.get(Label::from_u32(90)), Some(&(4, 2)));
         assert_eq!(labels.dense.len(), 91);
         labels.clear();
         labels.prepare(3);
-        assert_eq!(labels.get(Label(90)), None);
-        assert_eq!(labels.insert(Label(90), (1, 1)), None);
-        assert_eq!(labels.get(Label(90)), Some(&(1, 1)));
+        assert_eq!(labels.get(Label::from_u32(90)), None);
+        assert_eq!(labels.insert(Label::from_u32(90), (1, 1)), None);
+        assert_eq!(labels.get(Label::from_u32(90)), Some(&(1, 1)));
         assert_eq!(labels.dense.len(), 91);
 
         let provenance = ExceptionOwnerProvenance::default();
         let preserved = FxHashSet::default();
         let items = [
-            Item::Label(Label(u32::MAX)),
+            Item::Label(Label::from_u32(u32::MAX - 1)),
             Item::Instruction(instruction(NOP, Operand::Value(0))),
-            Item::Label(Label(1)),
+            Item::Label(Label::from_u32(1)),
         ];
         let view = View::new(&items, &[], &provenance, &preserved).unwrap();
-        assert_eq!(view.label_index(Label(u32::MAX)), Some(&0));
-        assert_eq!(view.label_position(Label(1)), Some(&1));
-        for duplicate in [Label(1), Label(u32::MAX)] {
+        assert_eq!(view.label_index(Label::from_u32(u32::MAX - 1)), Some(&0));
+        assert_eq!(view.label_position(Label::from_u32(1)), Some(&1));
+        for duplicate in [Label::from_u32(1), Label::from_u32(u32::MAX - 1)] {
             let mut duplicate_items = items.to_vec();
             duplicate_items.push(Item::Label(duplicate));
             assert!(View::new(&duplicate_items, &[], &provenance, &preserved).is_none());
@@ -2862,44 +2872,44 @@ mod tests {
     fn label_position_generation_wrap_cannot_revive_stale_records() {
         let mut labels = LabelPositions::default();
         labels.prepare(3);
-        assert_eq!(labels.insert(Label(1), (1, 1)), None);
-        assert_eq!(labels.insert(Label(u32::MAX), (9, 9)), None);
+        assert_eq!(labels.insert(Label::from_u32(1), (1, 1)), None);
+        assert_eq!(labels.insert(Label::from_u32(u32::MAX - 1), (9, 9)), None);
         // Simulate a record left from the generation to which a wrap returns.
         labels.dense[1].generation = 1;
         labels.generation = u32::MAX;
-        assert_eq!(labels.insert(Label(2), (2, 2)), None);
+        assert_eq!(labels.insert(Label::from_u32(2), (2, 2)), None);
         labels.clear();
         assert_eq!(labels.generation, 1);
-        assert_eq!(labels.get(Label(1)), None);
-        assert_eq!(labels.get(Label(2)), None);
-        assert_eq!(labels.get(Label(u32::MAX)), None);
-        assert_eq!(labels.insert(Label(1), (3, 3)), None);
-        assert_eq!(labels.get(Label(1)), Some(&(3, 3)));
-        assert_eq!(labels.insert(Label(1), (4, 4)), Some((3, 3)));
+        assert_eq!(labels.get(Label::from_u32(1)), None);
+        assert_eq!(labels.get(Label::from_u32(2)), None);
+        assert_eq!(labels.get(Label::from_u32(u32::MAX - 1)), None);
+        assert_eq!(labels.insert(Label::from_u32(1), (3, 3)), None);
+        assert_eq!(labels.get(Label::from_u32(1)), Some(&(3, 3)));
+        assert_eq!(labels.insert(Label::from_u32(1), (4, 4)), Some((3, 3)));
     }
     #[test]
     fn references_include_control_flow_and_supplementary_provenance() {
         let mut provenance = ExceptionOwnerProvenance::default();
-        provenance.source_boundaries.insert(Label(2));
-        let preserved = FxHashSet::from_iter([Label(1)]);
+        provenance.source_boundaries.insert(Label::from_u32(2));
+        let preserved = FxHashSet::from_iter([Label::from_u32(1)]);
         let items = [Item::Instruction(instruction(
             JUMP_FORWARD,
-            Operand::Forward(Label(3)),
+            Operand::Forward(Label::from_u32(3)),
         ))];
         let view = View::new(&items, &[], &provenance, &preserved).unwrap();
-        assert!(view.is_reference(Label(1)));
-        assert!(view.is_reference(Label(3)));
-        assert!(view.is_reference(Label(2)));
-        assert!(!view.is_reference(Label(4)));
+        assert!(view.is_reference(Label::from_u32(1)));
+        assert!(view.is_reference(Label::from_u32(3)));
+        assert!(view.is_reference(Label::from_u32(2)));
+        assert!(!view.is_reference(Label::from_u32(4)));
     }
     #[test]
     fn reused_view_tables_rebuild_all_boundary_memberships() {
-        let sparse = Label(u32::MAX);
-        let new_sparse = Label(u32::MAX - 1);
+        let sparse = Label::from_u32(u32::MAX - 1);
+        let new_sparse = Label::from_u32(u32::MAX - 2);
         let make_regions = |target| {
             [ExceptionRegion {
-                start: Label(10),
-                end: Label(20),
+                start: Label::from_u32(10),
+                end: Label::from_u32(20),
                 target,
                 depth: 0,
                 preserve_lasti: false,
@@ -2909,18 +2919,22 @@ mod tests {
         };
         let make_items = |target, duplicate| {
             [
-                Item::Label(Label(1)),
+                Item::Label(Label::from_u32(1)),
                 Item::Instruction(instruction(JUMP_FORWARD, Operand::Forward(target))),
                 Item::Label(sparse),
                 Item::Instruction(instruction(JUMP_FORWARD, Operand::Forward(duplicate))),
             ]
         };
         let mut first_provenance = ExceptionOwnerProvenance::default();
-        first_provenance.block_boundaries.extend([Label(1), sparse]);
-        first_provenance.source_boundaries.insert(Label(5));
-        let first_preserved = FxHashSet::from_iter([Label(2), sparse]);
-        let first_items = make_items(Label(3), sparse);
-        let first_regions = make_regions(Label(4));
+        first_provenance
+            .block_boundaries
+            .extend([Label::from_u32(1), sparse]);
+        first_provenance
+            .source_boundaries
+            .insert(Label::from_u32(5));
+        let first_preserved = FxHashSet::from_iter([Label::from_u32(2), sparse]);
+        let first_items = make_items(Label::from_u32(3), sparse);
+        let first_regions = make_regions(Label::from_u32(4));
         let first = View::new(
             &first_items,
             &first_regions,
@@ -2930,17 +2944,23 @@ mod tests {
         .unwrap();
         assert_eq!(
             first.boundaries,
-            FxHashSet::from_iter([Label(1), Label(2), Label(3), Label(4), sparse])
+            FxHashSet::from_iter([
+                Label::from_u32(1),
+                Label::from_u32(2),
+                Label::from_u32(3),
+                Label::from_u32(4),
+                sparse
+            ])
         );
-        assert!(first.is_reference(Label(5)));
+        assert!(first.is_reference(Label::from_u32(5)));
 
         let mut next_provenance = ExceptionOwnerProvenance::default();
         next_provenance
             .block_boundaries
-            .extend([Label(11), new_sparse]);
-        next_provenance.source_boundaries.insert(Label(6));
-        let next_preserved = FxHashSet::from_iter([Label(12), new_sparse]);
-        let next_items = make_items(Label(13), new_sparse);
+            .extend([Label::from_u32(11), new_sparse]);
+        next_provenance.source_boundaries.insert(Label::from_u32(6));
+        let next_preserved = FxHashSet::from_iter([Label::from_u32(12), new_sparse]);
+        let next_items = make_items(Label::from_u32(13), new_sparse);
         let next_regions = make_regions(new_sparse);
         let next = View::with_tables(
             &next_items,
@@ -2952,12 +2972,17 @@ mod tests {
         .unwrap();
         assert_eq!(
             next.boundaries,
-            FxHashSet::from_iter([Label(11), Label(12), Label(13), new_sparse])
+            FxHashSet::from_iter([
+                Label::from_u32(11),
+                Label::from_u32(12),
+                Label::from_u32(13),
+                new_sparse
+            ])
         );
         assert_eq!(next.label_index(sparse), Some(&2));
         assert!(!next.is_reference(sparse));
-        assert!(!next.is_reference(Label(5)));
-        assert!(next.is_reference(Label(6)));
+        assert!(!next.is_reference(Label::from_u32(5)));
+        assert!(next.is_reference(Label::from_u32(6)));
 
         let mut tables = next.into_tables();
         tables.clear();
@@ -2968,7 +2993,7 @@ mod tests {
         assert!(empty.boundaries.is_empty());
         assert!(!empty.is_reference(new_sparse));
 
-        for duplicate in [Label(1), sparse] {
+        for duplicate in [Label::from_u32(1), sparse] {
             let clean = View::new(&first_items, &[], &empty_provenance, &empty_preserved).unwrap();
             let mut duplicate_items = first_items.to_vec();
             duplicate_items.push(Item::Label(duplicate));
@@ -2991,22 +3016,22 @@ mod tests {
         let provenance = ExceptionOwnerProvenance::default();
         let preserved = FxHashSet::default();
         let items = [
-            Item::Label(Label(10)),
+            Item::Label(Label::from_u32(10)),
             Item::Instruction(instruction(NOP, Operand::Value(0))),
-            Item::Label(Label(100)),
+            Item::Label(Label::from_u32(100)),
             Item::Instruction(instruction(NOP, Operand::Value(0))),
-            Item::Label(Label(500)),
+            Item::Label(Label::from_u32(500)),
             Item::Instruction(instruction(NOP, Operand::Value(0))),
-            Item::Label(Label(1_000)),
+            Item::Label(Label::from_u32(1_000)),
             Item::Instruction(instruction(NOP, Operand::Value(0))),
-            Item::Label(Label(50_000)),
+            Item::Label(Label::from_u32(50_000)),
             Item::Instruction(instruction(NOP, Operand::Value(0))),
-            Item::Label(Label(1_000_000)),
+            Item::Label(Label::from_u32(1_000_000)),
         ];
         let make_region = |start, end, target, priority| ExceptionRegion {
-            start: Label(start),
-            end: Label(end),
-            target: Label(target),
+            start: Label::from_u32(start),
+            end: Label::from_u32(end),
+            target: Label::from_u32(target),
             depth: 1,
             preserve_lasti: true,
             is_scope_fallback: false,
@@ -3047,9 +3072,10 @@ mod tests {
             1_000,
             50_000,
             100,
-            OriginalRange(Label(u32::MAX), Label(u32::MAX - 1)),
+            OriginalRange(Label::from_u32(u32::MAX - 1), Label::from_u32(u32::MAX - 2)),
         );
-        let missing_bounds = make_region(u32::MAX, 1_000_000, 100, Resolved { start: 4, end: 5 });
+        let missing_bounds =
+            make_region(u32::MAX - 1, 1_000_000, 100, Resolved { start: 4, end: 5 });
         assert_interval(&[base, missing_priority], &base, 0, 3, true);
         assert_interval(&[base, missing_priority], &base, 0, 4, false);
         assert_interval(&[base, missing_bounds], &base, 0, 1, false);
@@ -3059,11 +3085,11 @@ mod tests {
         assert_interval(&[], &base, 3, 2, true);
 
         let mut inverted = missing_priority;
-        inverted.start = Label(1_000);
-        inverted.end = Label(100);
+        inverted.start = Label::from_u32(1_000);
+        inverted.end = Label::from_u32(100);
         let mut empty = missing_priority;
-        empty.start = Label(500);
-        empty.end = Label(500);
+        empty.start = Label::from_u32(500);
+        empty.end = Label::from_u32(500);
         assert_interval(&[inverted, base, empty], &base, 0, 5, true);
     }
     #[test]
@@ -3091,16 +3117,16 @@ mod tests {
     #[test]
     fn permits_unused_bookkeeping_label() {
         let (c, mut items) = certificate();
-        items.insert(2, Item::Label(Label(2)));
+        items.insert(2, Item::Label(Label::from_u32(2)));
         assert!(valid(&c, &items, false));
     }
     #[test]
     fn rejects_referenced_added_label() {
         let (c, mut items) = certificate();
-        items.insert(2, Item::Label(Label(2)));
+        items.insert(2, Item::Label(Label::from_u32(2)));
         items.push(Item::Instruction(instruction(
             JUMP_FORWARD,
-            Operand::Forward(Label(2)),
+            Operand::Forward(Label::from_u32(2)),
         )));
         assert!(!valid(&c, &items, false));
     }
@@ -3116,7 +3142,7 @@ mod tests {
         let Item::Instruction(i) = &mut items[1] else {
             unreachable!()
         };
-        i.retarget(Operand::Forward(Label(3)));
+        i.retarget(Operand::Forward(Label::from_u32(3)));
         assert!(!valid(&c, &items, false));
     }
 
@@ -3148,9 +3174,9 @@ mod tests {
             true,
         ));
 
-        let original = instruction(JUMP_FORWARD, Operand::Forward(Label(4)));
+        let original = instruction(JUMP_FORWARD, Operand::Forward(Label::from_u32(4)));
         let mut tagged = original;
-        tagged.mark_initial_borrow_jump_target(Label(4));
+        tagged.mark_initial_borrow_jump_target(Label::from_u32(4));
         assert!(same_instruction(original, tagged, false));
         assert!(same_instruction(tagged, original, false));
         tagged.set_exception_policy(ExceptionPolicy::NonePresent);
@@ -3184,35 +3210,38 @@ mod tests {
     fn protected_pipeline(excluded: bool, owner: NormalizedExceptionOwner) -> OptimizationPipeline {
         use crate::assembler::{Assembler, UnoptimizedCode};
         use crate::target::opcodes::RETURN_VALUE;
-        let mut condition = instruction(POP_JUMP_IF_TRUE, Operand::Forward(Label(2)));
+        let mut condition = instruction(POP_JUMP_IF_TRUE, Operand::Forward(Label::from_u32(2)));
         if excluded {
             condition.exclude_from_exception_table(ExceptionExclusion::Always);
         }
         let mut marker = instruction(NOT_TAKEN, Operand::Value(0));
         marker.set_exception_owner(owner);
         let items = vec![
-            Item::Label(Label(0)),
+            Item::Label(Label::from_u32(0)),
             Item::Instruction(instruction(LOAD_FAST, Operand::Value(2))),
             Item::Instruction(instruction(LOAD_FAST, Operand::Value(3))),
             Item::Instruction(condition),
             Item::Instruction(marker),
-            Item::Label(Label(1)),
+            Item::Label(Label::from_u32(1)),
             Item::Instruction(instruction(RETURN_VALUE, Operand::Value(0))),
-            Item::Label(Label(2)),
+            Item::Label(Label::from_u32(2)),
             Item::Instruction(instruction(RETURN_VALUE, Operand::Value(0))),
-            Item::Label(Label(3)),
+            Item::Label(Label::from_u32(3)),
             Item::Instruction(instruction(RETURN_VALUE, Operand::Value(0))),
         ];
         Assembler {
             code: UnoptimizedCode::Linear(items),
             exception_regions: vec![ExceptionRegion {
-                start: Label(0),
-                end: Label(1),
-                target: Label(3),
+                start: Label::from_u32(0),
+                end: Label::from_u32(1),
+                target: Label::from_u32(3),
                 depth: 0,
                 preserve_lasti: true,
                 is_scope_fallback: false,
-                priority: ExceptionRegionPriority::OriginalRange(Label(0), Label(1)),
+                priority: ExceptionRegionPriority::OriginalRange(
+                    Label::from_u32(0),
+                    Label::from_u32(1),
+                ),
             }],
             next_label: 4,
             ..Assembler::default()
@@ -3225,11 +3254,11 @@ mod tests {
         pipeline
             .exception_owner_provenance
             .block_boundaries
-            .insert(Label(0));
+            .insert(Label::from_u32(0));
         pipeline
             .exception_owner_provenance
             .source_boundaries
-            .insert(Label(0));
+            .insert(Label::from_u32(0));
         edit_singleton(&mut pipeline, |items| {
             for item in items {
                 if let Item::Instruction(marker) = item
@@ -3366,7 +3395,7 @@ mod tests {
                 7 => pipeline
                     .exception_owner_provenance
                     .setups
-                    .push((Label(0), None)),
+                    .push((Label::from_u32(0), None)),
                 8 => {
                     edit_singleton(&mut pipeline, |items| {
                         let marker = items
@@ -3376,12 +3405,12 @@ mod tests {
                             Item::Instruction(i) if i.opcode == NOT_TAKEN)
                             })
                             .unwrap();
-                        items.insert(marker, Item::Label(Label(4)));
+                        items.insert(marker, Item::Label(Label::from_u32(4)));
                     });
                     pipeline
                         .exception_owner_provenance
                         .block_boundaries
-                        .insert(Label(4));
+                        .insert(Label::from_u32(4));
                 }
                 9 => edit_singleton(&mut pipeline, |items| {
                     let Item::Instruction(first) = &mut items[1] else {
@@ -3547,13 +3576,16 @@ mod tests {
         let mut pipeline =
             protected_pipeline(true, NormalizedExceptionOwner::DynamicConditionStrict);
         pipeline.exception_regions.push(ExceptionRegion {
-            start: Label(2),
-            end: Label(3),
-            target: Label(3),
+            start: Label::from_u32(2),
+            end: Label::from_u32(3),
+            target: Label::from_u32(3),
             depth: 2,
             preserve_lasti: true,
             is_scope_fallback: true,
-            priority: ExceptionRegionPriority::OriginalRange(Label(2), Label(3)),
+            priority: ExceptionRegionPriority::OriginalRange(
+                Label::from_u32(2),
+                Label::from_u32(3),
+            ),
         });
         let before = FusionOwnerCertificates::snapshot(&pipeline);
         pipeline.fuse_superinstructions();
@@ -3578,12 +3610,12 @@ mod tests {
     ) -> OptimizationPipeline {
         use crate::assembler::{Assembler, UnoptimizedCode};
         use crate::target::opcodes::{IS_OP, LOAD_CONST, RETURN_VALUE, UNPACK_SEQUENCE};
-        let mut items = vec![Item::Label(Label(0))];
+        let mut items = vec![Item::Label(Label::from_u32(0))];
         if fallthrough {
             items.push(Item::Instruction(instruction(LOAD_FAST, Operand::Value(0))));
             items.push(Item::Instruction(instruction(
                 POP_JUMP_IF_FALSE,
-                Operand::Forward(Label(2)),
+                Operand::Forward(Label::from_u32(2)),
             )));
             let mut marker = instruction(NOT_TAKEN, Operand::Value(0));
             marker.set_exception_policy(ExceptionPolicy::NoneDynamicConditionStrict);
@@ -3598,7 +3630,7 @@ mod tests {
         for (op, arg) in [
             (LOAD_CONST, Operand::Value(1)),
             (IS_OP, Operand::Value(0)),
-            (POP_JUMP_IF_FALSE, Operand::Forward(Label(2))),
+            (POP_JUMP_IF_FALSE, Operand::Forward(Label::from_u32(2))),
             (NOT_TAKEN, Operand::Value(0)),
         ] {
             let mut item = instruction(op, arg);
@@ -3608,7 +3640,7 @@ mod tests {
             }
             items.push(Item::Instruction(item));
         }
-        for label in [Label(1), Label(2), Label(3)] {
+        for label in [Label::from_u32(1), Label::from_u32(2), Label::from_u32(3)] {
             items.push(Item::Label(label));
             items.push(Item::Instruction(instruction(
                 RETURN_VALUE,
@@ -3618,13 +3650,16 @@ mod tests {
         let mut p = Assembler {
             code: UnoptimizedCode::Linear(items),
             exception_regions: vec![ExceptionRegion {
-                start: Label(0),
-                end: Label(1),
-                target: Label(3),
+                start: Label::from_u32(0),
+                end: Label::from_u32(1),
+                target: Label::from_u32(3),
                 depth: 0,
                 preserve_lasti: true,
                 is_scope_fallback: true,
-                priority: ExceptionRegionPriority::OriginalRange(Label(0), Label(1)),
+                priority: ExceptionRegionPriority::OriginalRange(
+                    Label::from_u32(0),
+                    Label::from_u32(1),
+                ),
             }],
             next_label: 4,
             ..Assembler::default()
@@ -3632,7 +3667,7 @@ mod tests {
         .into_optimization_pipeline();
         p.exception_owner_provenance
             .block_boundaries
-            .insert(Label(0));
+            .insert(Label::from_u32(0));
         p
     }
 
@@ -3744,7 +3779,7 @@ mod tests {
         );
         p.exception_owner_provenance
             .synchronous_with_setups
-            .insert(Label(0));
+            .insert(Label::from_u32(0));
         let mut certificates = FusionOwnerCertificates::capture_original_owners(&p);
         assert_eq!(certificates.fresh_singleton_certificates.len(), 1);
         p.exception_regions[0].depth += 1;
@@ -3761,7 +3796,7 @@ mod tests {
             p.exception_regions[0].depth = 2;
             p.exception_owner_provenance
                 .synchronous_with_setups
-                .insert(Label(0));
+                .insert(Label::from_u32(0));
             edit_singleton(&mut p, |items| {
                 let index = items
                     .iter()
@@ -3770,16 +3805,16 @@ mod tests {
                             if instruction.opcode == crate::target::opcodes::UNPACK_SEQUENCE)
                     })
                     .unwrap();
-                items.insert(index, Item::Label(Label(4)));
+                items.insert(index, Item::Label(Label::from_u32(4)));
             });
             p.next_label = 5;
             let mut split = p.exception_regions[0];
-            p.exception_regions[0].end = Label(4);
-            split.start = Label(4);
+            p.exception_regions[0].end = Label::from_u32(4);
+            split.start = Label::from_u32(4);
             match mode {
                 1 => p.exception_owner_provenance.synchronous_with_setups.clear(),
                 2 => split.priority = ExceptionRegionPriority::Resolved { start: 0, end: 1 },
-                3 => split.target = Label(2),
+                3 => split.target = Label::from_u32(2),
                 5 => split.depth += 1,
                 6 => split.preserve_lasti = false,
                 _ => {}
@@ -3805,7 +3840,7 @@ mod tests {
             p.exception_regions[0].depth = 2;
             p.exception_owner_provenance
                 .synchronous_with_setups
-                .insert(Label(0));
+                .insert(Label::from_u32(0));
             edit_singleton(&mut p, |items| {
                 let index = items
                     .iter()
@@ -3814,7 +3849,7 @@ mod tests {
                         if instruction.opcode == crate::target::opcodes::UNPACK_SEQUENCE)
                     })
                     .unwrap();
-                items.insert(index, Item::Label(Label(4)));
+                items.insert(index, Item::Label(Label::from_u32(4)));
             });
             p.next_label = 5;
             let mut certificates = FusionOwnerCertificates::capture_original_owners(&p);
@@ -3822,7 +3857,7 @@ mod tests {
             assert!(certificates.has_manager_setup_certificates());
             let original = p.exception_regions[0];
             let mut rebuilt = original;
-            rebuilt.start = Label(4);
+            rebuilt.start = Label::from_u32(4);
             if mode == 2 {
                 rebuilt.depth += 1;
             } else if mode == 3 {
@@ -3831,7 +3866,7 @@ mod tests {
             p.exception_regions[0] = rebuilt;
             let mut reported_original = original;
             if mode == 4 {
-                reported_original.end = Label(2);
+                reported_original.end = Label::from_u32(2);
             }
             if mode == 0 {
                 certificates.retain_after_cold_regions(&p, &[]);
@@ -3888,7 +3923,7 @@ mod tests {
         edit_singleton(&mut p, |items| {
             items.push(Item::Instruction(instruction(
                 JUMP_FORWARD,
-                Operand::Forward(Label(0)),
+                Operand::Forward(Label::from_u32(0)),
             )));
         });
         assert!(
@@ -3903,7 +3938,7 @@ mod tests {
             let Item::Instruction(i) = &mut items[2] else {
                 unreachable!()
             };
-            i.retarget(Operand::Forward(Label(3)));
+            i.retarget(Operand::Forward(Label::from_u32(3)));
         });
         cert.retain_pipeline(&p);
         assert!(cert.fresh_singleton_certificates.is_empty());
@@ -4014,12 +4049,14 @@ mod tests {
                         .is_empty()
                 );
             } else if mode == 1 {
-                edit_singleton(&mut p, |items| items.insert(10, Item::Label(Label(4))));
+                edit_singleton(&mut p, |items| {
+                    items.insert(10, Item::Label(Label::from_u32(4)));
+                });
                 p.exception_owner_provenance
                     .block_boundaries
-                    .insert(Label(4));
+                    .insert(Label::from_u32(4));
             } else {
-                p.exception_regions[0].target = Label(2);
+                p.exception_regions[0].target = Label::from_u32(2);
             }
             certificates.retain_pipeline(&p);
             assert!(certificates.fresh_singleton_certificates.is_empty());
@@ -4105,10 +4142,10 @@ mod tests {
     fn fallback_pipeline(globals: usize, policy: ExceptionPolicy) -> OptimizationPipeline {
         use crate::assembler::{Assembler, UnoptimizedCode};
         use crate::target::opcodes::{LOAD_CONST, LOAD_GLOBAL, RETURN_VALUE};
-        let condition = instruction(POP_JUMP_IF_TRUE, Operand::Forward(Label(2)));
+        let condition = instruction(POP_JUMP_IF_TRUE, Operand::Forward(Label::from_u32(2)));
         let mut marker = instruction(NOT_TAKEN, Operand::Value(0));
         marker.set_exception_policy(policy);
-        let mut items = vec![Item::Label(Label(0))];
+        let mut items = vec![Item::Label(Label::from_u32(0))];
         for _ in 0..globals {
             items.push(Item::Instruction(instruction(
                 LOAD_GLOBAL,
@@ -4119,23 +4156,26 @@ mod tests {
             Item::Instruction(instruction(LOAD_CONST, Operand::Value(0))),
             Item::Instruction(condition),
             Item::Instruction(marker),
-            Item::Label(Label(1)),
+            Item::Label(Label::from_u32(1)),
             Item::Instruction(instruction(RETURN_VALUE, Operand::Value(0))),
-            Item::Label(Label(2)),
+            Item::Label(Label::from_u32(2)),
             Item::Instruction(instruction(RETURN_VALUE, Operand::Value(0))),
-            Item::Label(Label(3)),
+            Item::Label(Label::from_u32(3)),
             Item::Instruction(instruction(RETURN_VALUE, Operand::Value(0))),
         ]);
         let mut pipeline = Assembler {
             code: UnoptimizedCode::Linear(items),
             exception_regions: vec![ExceptionRegion {
-                start: Label(0),
-                end: Label(1),
-                target: Label(3),
+                start: Label::from_u32(0),
+                end: Label::from_u32(1),
+                target: Label::from_u32(3),
                 depth: 0,
                 preserve_lasti: true,
                 is_scope_fallback: true,
-                priority: ExceptionRegionPriority::OriginalRange(Label(0), Label(1)),
+                priority: ExceptionRegionPriority::OriginalRange(
+                    Label::from_u32(0),
+                    Label::from_u32(1),
+                ),
             }],
             next_label: 4,
             ..Assembler::default()
@@ -4144,7 +4184,7 @@ mod tests {
         pipeline
             .exception_owner_provenance
             .block_boundaries
-            .insert(Label(0));
+            .insert(Label::from_u32(0));
         pipeline
     }
     #[test]
@@ -4254,11 +4294,13 @@ mod tests {
                 match variant {
                     0 => items.push(Item::Instruction(instruction(
                         crate::target::opcodes::JUMP_BACKWARD,
-                        Operand::Backward(Label(0)),
+                        Operand::Backward(Label::from_u32(0)),
                     ))),
-                    1 => pipeline.exception_regions[0].target = Label(0),
+                    1 => pipeline.exception_regions[0].target = Label::from_u32(0),
                     _ => {
-                        pipeline.preserved_block_boundaries.insert(Label(0));
+                        pipeline
+                            .preserved_block_boundaries
+                            .insert(Label::from_u32(0));
                     }
                 }
                 let view = View::new(
@@ -4268,7 +4310,7 @@ mod tests {
                     &pipeline.preserved_block_boundaries,
                 )
                 .unwrap();
-                assert!(view.boundaries.contains(&Label(0)));
+                assert!(view.boundaries.contains(&Label::from_u32(0)));
                 let (condition, marker) = *view.markers.values().next().unwrap().first().unwrap();
                 let Item::Instruction(condition_instruction) = items[condition] else {
                     unreachable!();
@@ -4292,7 +4334,13 @@ mod tests {
         for globals in [0, 1] {
             let pipeline = fallback_pipeline(globals, ExceptionPolicy::NoneAbsent);
             let mut items = pipeline.graph.into_items();
-            items.splice(0..0, [Item::Label(Label(4)), Item::Label(Label(5))]);
+            items.splice(
+                0..0,
+                [
+                    Item::Label(Label::from_u32(4)),
+                    Item::Label(Label::from_u32(5)),
+                ],
+            );
             let mut provenance = pipeline.exception_owner_provenance;
             let view = View::new(
                 &items,
@@ -4315,7 +4363,7 @@ mod tests {
             .unwrap();
             assert!(matches!(
                 certificate.interval.anchor,
-                Anchor::Label(Label(0))
+                Anchor::Label(label) if label == Label::from_u32(0)
             ));
             assert_eq!(
                 certificate.valid(&view, false),
@@ -4324,12 +4372,12 @@ mod tests {
                     if globals == 0 {
                         None
                     } else {
-                        Some((Label(3), 0, true))
+                        Some((Label::from_u32(3), 0, true))
                     }
                 ))
             );
             // A second original boundary is ambiguous both at capture and later.
-            provenance.block_boundaries.insert(Label(4));
+            provenance.block_boundaries.insert(Label::from_u32(4));
             let changed = View::new(
                 &items,
                 &pipeline.exception_regions,
@@ -4367,7 +4415,7 @@ mod tests {
                         _ => None,
                     })
                     .unwrap();
-                condition.retarget(Operand::Forward(Label(3)));
+                condition.retarget(Operand::Forward(Label::from_u32(3)));
             } else {
                 items.insert(1, Item::Instruction(instruction(NOP, Operand::Value(0))));
             }
@@ -4465,7 +4513,7 @@ mod tests {
                     let Item::Instruction(condition) = &mut items[2] else {
                         unreachable!()
                     };
-                    condition.retarget(Operand::Forward(Label(3)));
+                    condition.retarget(Operand::Forward(Label::from_u32(3)));
                 } else {
                     let start = items
                         .iter()
@@ -4531,7 +4579,7 @@ mod tests {
         edit_singleton(&mut pipeline, |items| {
             let target = items
                 .iter()
-                .position(|item| matches!(item, Item::Label(Label(2))))
+                .position(|item| matches!(item, Item::Label(label) if matches!(label.as_u32(), 2)))
                 .unwrap();
             let Item::Instruction(exit) = &mut items[target + 1] else {
                 unreachable!()
