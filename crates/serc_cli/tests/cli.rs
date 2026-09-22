@@ -212,6 +212,7 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
             .join(format!("__pycache__/module.cpython-3{minor}.pyc"));
         let mut sources = vec![
             scalar_source.as_str(),
+            include_str!("../../serc/tests/fixtures/complex_division_signed_zeros.py"),
             "def answer():\n    return 42\n",
             "café = 'café'\n",
             "# coding: utf--8-sig\nvalue = 'é'\n",
