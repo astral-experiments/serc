@@ -926,7 +926,7 @@ dependencies = [
  "cpu-time",
  "encoding_rs",
  "fs-err",
- "serc_workloads",
+ "serc_fixtures",
  "rayon",
  "ruff_index",
  "ruff_python_ast",
@@ -964,11 +964,11 @@ dependencies = [
  "criterion",
  "mimalloc",
  "serc",
- "serc_workloads",
+ "serc_fixtures",
 ]
 
 [[package]]
-name = "serc_workloads"
+name = "serc_fixtures"
 version = "0.0.0"
 
 [[package]]
