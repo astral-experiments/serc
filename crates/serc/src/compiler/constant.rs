@@ -1706,10 +1706,6 @@ pub(super) fn fold_constant_for_version(
 }
 
 /// Folds the same expression shapes using source-aware literal values when supplied.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "CPython mixed integer/float folding rounds integer operands to binary64"
-)]
 pub(super) fn fold_constant_with_literals(
     expression: &Expr,
     python_version: PythonVersion,
@@ -1878,15 +1874,11 @@ pub(super) fn fold_constant_with_literals(
                 {
                     fold_float_remainder(&left, &right).map(Constant::Float)
                 }
-                (
-                    left,
-                    Operator::Pow,
-                    right @ (Constant::Bool(_)
-                    | Constant::Int(_)
-                    | Constant::BigInt {
-                        negative: false, ..
-                    }),
-                ) if is_integer_constant(&left) => fold_integer_power(&left, &right),
+                (left, Operator::Pow, right)
+                    if is_integer_constant(&left) && is_integer_constant(&right) =>
+                {
+                    fold_integer_power(&left, &right)
+                }
                 (left, operator @ (Operator::LShift | Operator::RShift), right)
                     if is_integer_constant(&left) && is_integer_constant(&right) =>
                 {
@@ -1910,20 +1902,6 @@ pub(super) fn fold_constant_with_literals(
                 }
                 (Constant::Float(left), Operator::Div, Constant::Float(right)) if right != 0.0 => {
                     Some(Constant::Float(left / right))
-                }
-                (
-                    left @ (Constant::Bool(_) | Constant::Int(_) | Constant::SignedInt(_)),
-                    Operator::Pow,
-                    Constant::SignedInt(right),
-                ) if right < 0 => {
-                    let left = match left {
-                        Constant::Bool(value) => f64::from(value),
-                        Constant::Int(value) => value as f64,
-                        Constant::SignedInt(value) => value as f64,
-                        _ => unreachable!(),
-                    };
-                    let result = left.powf(right as f64);
-                    result.is_finite().then_some(Constant::Float(result))
                 }
                 (
                     left,
@@ -2363,16 +2341,18 @@ fn fold_integer_arithmetic(
 fn fold_integer_power(left: &Constant, right: &Constant) -> Option<Constant> {
     const MAX_INT_SIZE: usize = 128;
 
+    let exponent = folded_integer(right)?;
+    if exponent.negative {
+        return fold_float_power(constant_as_float(left)?, constant_as_float(right)?);
+    }
     let left = folded_integer(left)?;
-    let right = folded_integer(right)?;
-    debug_assert!(!right.negative);
-    if right.digits.is_empty() {
+    if exponent.digits.is_empty() {
         return Some(Constant::Int(1));
     }
     if left.digits.is_empty() {
         return Some(Constant::Int(0));
     }
-    let mut exponent = magnitude_to_usize(&right.digits)?;
+    let mut exponent = magnitude_to_usize(&exponent.digits)?;
     if magnitude_bit_length(&left.digits) > MAX_INT_SIZE / exponent {
         return None;
     }

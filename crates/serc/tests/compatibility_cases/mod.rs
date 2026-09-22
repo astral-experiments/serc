@@ -159,6 +159,7 @@ mod high_local_folded_blocks;
 mod high_local_source_block_joins;
 mod initial_intern_state;
 mod inner_try_handler_return_owner;
+mod integer_power;
 mod integer_true_division;
 mod iterator_boolean_condition_owner_compatibility;
 mod iterator_join_locations;
