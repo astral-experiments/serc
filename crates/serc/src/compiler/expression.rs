@@ -920,11 +920,12 @@ impl Compiler<'_> {
                         }
                         if index + 1 == matched_cases
                             && (!context.fail_pop.is_empty()
-                                || context.direct_loop_failure.is_some())
+                                || context.direct_loop_failure.is_some()
+                                || assertion_success_join)
                         {
                             // CPython duplicates small exits before removing this jump across
-                            // the empty final pattern-failure block. A directly normalized
-                            // loop failure still leaves the case-success exit to be copied.
+                            // the empty final pattern-failure block. An assertion success
+                            // also keeps its original jump until conditional threading.
                             self.assembler.defer_jump_removal(success_exit);
                         }
                         let subject_pop_is_optimized_away = !copied_subject
