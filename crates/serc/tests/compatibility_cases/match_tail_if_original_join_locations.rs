@@ -178,3 +178,74 @@ fn matches_cpython_match_if_iterator_cleanup_boundary() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_match_exit_jump_line_slots() {
+    for (filename, source) in [
+        (
+            "match_exit_eq_try_return.py",
+            r"def f(subject, state, flag):
+    match subject:
+        case Kind.OTHER:
+            return None
+        case Kind.WANTED:
+            if state is not None:
+                try:
+                    return convert(state.value)
+                except ValueError:
+                    pass
+    return None
+",
+        ),
+        (
+            "match_exit_arch_async.py",
+            r"async def f(subject, first, second, value):
+    match subject:
+        case Kind.OTHER:
+            return None
+        case Kind.WANTED:
+            if first:
+                value = await read()
+                if value:
+                    return convert(value)
+            elif second:
+                await work()
+                return convert(value)
+    return None
+",
+        ),
+        (
+            "match_exit_seq_captures.py",
+            r"def f(value, ready):
+    try:
+        match value:
+            case (value, aid, sid):
+                return (int(aid), int(sid))
+            case (value, aid):
+                return (int(aid), None)
+    except ValueError:
+        pass
+    return None
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_match_cleanup_exit_over_budget_interruptibility() {
+    let source = r"def f(subject, state, flag):
+    match subject:
+        case Kind.OTHER:
+            return None
+        case Kind.WANTED:
+            if state is not None:
+                try:
+                    return convert(state.value)
+                except ValueError:
+                    pass
+    return finish(state, flag)
+";
+    common::assert_matches_cpython_marshal(source, "match_cleanup_exit_large_return.py");
+}

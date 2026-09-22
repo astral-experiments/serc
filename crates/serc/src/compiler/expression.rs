@@ -57,7 +57,8 @@ use super::source::{
     statement_execution_range, strip_expression_comments, synthetic_condition_exit_range,
 };
 use super::statement::{
-    condition_jump_target_count, final_chained_comparison_jump, is_wildcard_pattern,
+    NestedIfExitLocation, condition_jump_target_count, final_chained_comparison_jump,
+    final_terminating_arm_fallthrough_test, is_wildcard_pattern, nested_if_exit_location,
     suite_has_linear_borrow_fallthrough, suite_terminates,
     terminal_for_break_exit_inherits_predecessor, unique_condition_jump_target,
 };
@@ -848,9 +849,35 @@ impl Compiler<'_> {
                                         && unique_condition_jump_target(&assertion.test, true)
                                             .is_some())
                             });
+                        // Earlier tested arms copy the unlocated jump-only success array
+                        // onto their unconditional exits before line propagation, even if
+                        // the later continuation is too large to copy. A terminating final
+                        // elif leaves its false condition as the original jump's sole donor.
+                        let final_condition_join = (self.context.python_version
+                            >= PythonVersion::Py314
+                            && original_unlocated_head)
+                            .then(|| match case.body.last()? {
+                                Stmt::If(tail) if !tail.elif_else_clauses.is_empty() => {
+                                    final_terminating_arm_fallthrough_test(tail)
+                                        .and_then(|test| unique_condition_jump_target(test, false))
+                                }
+                                _ => None,
+                            })
+                            .flatten()
+                            .filter(|test| {
+                                self.assembler.at_original_unconditional_join()
+                                    || self.assembler.original_return_guard_has_false_donor(
+                                        self.source_location(test.range()),
+                                    )
+                            });
+                        if let Some(test) = final_condition_join {
+                            self.assembler
+                                .set_location(self.source_location(test.range()));
+                        }
                         let original_empty_join = self.assembler.at_original_match_join()
                             || fallthrough_if_join
-                            || assertion_success_join;
+                            || assertion_success_join
+                            || final_condition_join.is_some();
                         // The final async-for exhaustion falls directly into the following
                         // match continuation before cold blocks move. Its surviving bridge
                         // represents that fallthrough, not an interruptible case-success jump.
@@ -1255,7 +1282,17 @@ impl Compiler<'_> {
             // The body and false edge share CPython's case-exit block. Small return exits
             // replace its jump before conditional threading is considered.
             let terminating_body = suite_terminates(&statement.body);
-            let unique_false_edge = terminating_body
+            // An ordinary try's normal and handled exits also leave this join by
+            // unconditional jumps. Early small-return copying removes those edges
+            // before the false condition donates its line to the original jump slot.
+            let cleanup_exit = self.context.python_version >= PythonVersion::Py314
+                && matches!(statement.body.last(), Some(Stmt::Try(tail))
+                    if !tail.is_star && tail.finalbody.is_empty())
+                && matches!(
+                    nested_if_exit_location(statement, false),
+                    Some(NestedIfExitLocation::Located(_))
+                );
+            let unique_false_edge = (terminating_body || cleanup_exit)
                 .then(|| unique_condition_jump_target(&statement.test, false))
                 .flatten();
             // 3.12 copies the following small return before resolving lines.
@@ -1275,13 +1312,17 @@ impl Compiler<'_> {
             );
             let original_unlocated_head = self.assembler.at_jump_target();
             let success_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, match_end)?;
-            if final_case {
-                // The final case's jump crosses an empty pattern-failure block. Delay its
-                // removal until exit copying and retain its NOP after conditional threading.
+            if final_case || (cleanup_exit && unique_false_edge.is_some()) {
+                // The final case crosses an empty pattern failure; cleanup predecessors
+                // also need the original empty-join slot after threading. Record it before
+                // small-return copying, while keeping a surviving case JUMP interruptible.
                 self.assembler
                     .preserve_redundant_jump_nop_after_threading(success_exit);
             }
-            if unique_false_edge.is_some() && self.context.python_version != PythonVersion::Py313 {
+            if unique_false_edge.is_some()
+                && !cleanup_exit
+                && self.context.python_version != PythonVersion::Py313
+            {
                 // Only the false edge reaches this original empty block. Preserve its
                 // condition slot even when a containing match retargets the case exit
                 // before a small return replaces the jump.

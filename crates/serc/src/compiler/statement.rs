@@ -19802,9 +19802,39 @@ impl Compiler<'_> {
         // Every successful case exits the suite, leaving the final pattern failure
         // as the sole predecessor of the original normal POP_BLOCK. Keep that
         // instruction unlocated until its predecessor supplies the pattern line.
+        // Flat sequence captures leave exactly one subject-pop failure chain.
+        // Bind its emitted POP and original match end before using that physical
+        // predecessor to resolve the normal POP_BLOCK and exit-jump slots.
+        let sequence_failure_location = (self.context.python_version
+            >= crate::PythonVersion::Py314
+            && statement.orelse.is_empty()
+            && self.assembler.at_original_match_join()
+            && self
+                .assembler
+                .instruction_opcode_at(self.assembler.instruction_count().saturating_sub(1))
+                == Some(POP_TOP))
+        .then(|| {
+            let Stmt::Match(matched) = statement.body.last()? else {
+                return None;
+            };
+            let case = matched.cases.last()?;
+            let Pattern::MatchSequence(pattern) = &case.pattern else {
+                return None;
+            };
+            (case.guard.is_none()
+                    && !pattern.patterns.is_empty()
+                    && pattern.patterns.iter().all(|pattern| {
+                        matches!(pattern, Pattern::MatchAs(capture) if capture.pattern.is_none())
+                    }))
+                .then(|| self.source_location(pattern.range))
+        })
+        .flatten();
         let match_body_pop_block = !statement.is_star
             && statement.finalbody.is_empty()
-            && suite_match_failure_range(&statement.body).is_some()
+            && (suite_match_failure_range(&statement.body).is_some()
+                || sequence_failure_location.is_some_and(|location| {
+                    self.assembler.original_fallthrough_join_location() == Some(location)
+                }))
             && matches!(statement.body.last(), Some(Stmt::Match(matched))
             if matched.cases.iter().all(|case| {
                 suite_terminates_before_constant_folding(&case.body)
@@ -19832,8 +19862,9 @@ impl Compiler<'_> {
                 || (self.context.python_version == crate::PythonVersion::Py312
                     && (self.assembler.at_empty_borrow_block()
                         || self.assembler.at_original_match_join())));
-        let sole_else_pop_location = (removed_try_pop_block
-            && suite_ends_in_sole_else_fallthrough(&statement.body))
+        let sole_fallthrough_pop_location = (removed_try_pop_block
+            && (suite_ends_in_sole_else_fallthrough(&statement.body)
+                || sequence_failure_location.is_some()))
         .then(|| self.assembler.original_fallthrough_join_location())
         .flatten();
         // 3.12 keeps every original POP_BLOCK through both small-exit copy
@@ -19842,15 +19873,15 @@ impl Compiler<'_> {
         let deferred_try_pop_block = removed_try_pop_block
             && (self.context.python_version == crate::PythonVersion::Py312
                 || self.assembler.at_jump_target()
-                || sole_else_pop_location.is_some());
+                || sole_fallthrough_pop_location.is_some());
         let removed_shared_try_pop_block =
             deferred_try_pop_block && self.assembler.has_folded_shared_conditional_entry();
         let deferred_try_pop_instruction = self.assembler.instruction_count();
         if deferred_try_pop_block && !removed_shared_try_pop_block {
-            // An original normal-exit array can have a sole physical else donor
+            // An original normal-exit array can have a sole physical fallthrough donor
             // even when every earlier arm terminates. Other incoming edges still
             // defer their POP_BLOCK location to CFG propagation and NOP removal.
-            let location = sole_else_pop_location.or_else(|| {
+            let location = sole_fallthrough_pop_location.or_else(|| {
                 if self.context.python_version == crate::PythonVersion::Py312
                     && let Some(Stmt::Pass(pass)) = statement.body.last()
                 {
@@ -19866,7 +19897,7 @@ impl Compiler<'_> {
                 .set_location(location.unwrap_or(SourceLocation::NONE));
             self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
             self.assembler.mark_last_as_converted_pop_block();
-            if sole_else_pop_location.is_some() {
+            if sole_fallthrough_pop_location.is_some() {
                 self.assembler.record_original_fallthrough_pop_block();
             }
         }
@@ -36226,7 +36257,9 @@ fn terminal_assert_split_success_ranges(
 }
 
 /// Finds a final terminating arm whose unique false edge keeps a source location.
-fn final_terminating_arm_fallthrough_test(statement: &ruff_python_ast::StmtIf) -> Option<&Expr> {
+pub(super) fn final_terminating_arm_fallthrough_test(
+    statement: &ruff_python_ast::StmtIf,
+) -> Option<&Expr> {
     let mut test = statement.test.as_ref();
     let mut body = statement.body.as_slice();
     for clause in &statement.elif_else_clauses {
