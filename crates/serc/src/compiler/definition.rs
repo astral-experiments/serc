@@ -613,7 +613,7 @@ impl Compiler<'_> {
         if !closure_names.is_empty() {
             flags |= FunctionAttribute::CLOSURE.argument();
         }
-        if function_has_annotations(definition) {
+        if function_annotation_expressions(definition).next().is_some() {
             flags |= if self.has_deferred_annotations() {
                 FunctionAttribute::ANNOTATE.argument()
             } else {
@@ -2030,24 +2030,6 @@ fn function_annotations(
     annotations
 }
 
-fn function_has_annotations(definition: &StmtFunctionDef) -> bool {
-    let parameters = &definition.parameters;
-    definition.returns.is_some()
-        || parameters
-            .posonlyargs
-            .iter()
-            .chain(&parameters.args)
-            .chain(&parameters.kwonlyargs)
-            .any(|parameter| parameter.parameter.annotation.is_some())
-        || parameters
-            .vararg
-            .as_ref()
-            .is_some_and(|parameter| parameter.annotation.is_some())
-        || parameters
-            .kwarg
-            .as_ref()
-            .is_some_and(|parameter| parameter.annotation.is_some())
-}
 pub(super) fn clean_doc(docstring: &str) -> String {
     let mut expanded = String::with_capacity(docstring.len());
     let mut column = 0_usize;

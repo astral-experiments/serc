@@ -457,19 +457,7 @@ impl FunctionPlan {
             eager_function_annotations: eager_annotations,
             ..LocalCollector::default()
         };
-        for parameter in definition
-            .parameters
-            .posonlyargs
-            .iter()
-            .chain(&definition.parameters.args)
-            .chain(&definition.parameters.kwonlyargs)
-        {
-            locals.insert(parameter.name().as_str());
-        }
-        if let Some(parameter) = &definition.parameters.vararg {
-            locals.insert(parameter.name.as_str());
-        }
-        if let Some(parameter) = &definition.parameters.kwarg {
+        for parameter in parameters_in_locals_order(&definition.parameters) {
             locals.insert(parameter.name.as_str());
         }
         let parameter_names = locals.names.iter().cloned().collect::<FxHashSet<_>>();
@@ -1550,18 +1538,7 @@ impl<'a, 'ast> ModuleNameCollector<'a, 'ast> {
     }
 
     fn collect_parameters(&mut self, parameters: &ruff_python_ast::Parameters) {
-        for parameter in parameters
-            .posonlyargs
-            .iter()
-            .chain(&parameters.args)
-            .chain(&parameters.kwonlyargs)
-        {
-            self.intern(parameter.name().as_str());
-        }
-        if let Some(parameter) = &parameters.vararg {
-            self.intern(parameter.name.as_str());
-        }
-        if let Some(parameter) = &parameters.kwarg {
+        for parameter in parameters_in_locals_order(parameters) {
             self.intern(parameter.name.as_str());
         }
     }
@@ -1613,19 +1590,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                             .iter()
                             .any(|parameter| parameter.annotation().is_some()),
                 };
-                for parameter in definition
-                    .parameters
-                    .posonlyargs
-                    .iter()
-                    .chain(&definition.parameters.args)
-                    .chain(&definition.parameters.kwonlyargs)
-                {
-                    flat.record(self.intern(parameter.name().as_str()), true);
-                }
-                if let Some(parameter) = &definition.parameters.vararg {
-                    flat.record(self.intern(parameter.name.as_str()), true);
-                }
-                if let Some(parameter) = &definition.parameters.kwarg {
+                for parameter in parameters_in_locals_order(&definition.parameters) {
                     flat.record(self.intern(parameter.name.as_str()), true);
                 }
                 self.collect_type_parameters(definition.type_params.as_deref());
@@ -1941,6 +1906,23 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
     }
 }
 
+/// Visits parameters in CPython's local-slot order: positional-only, positional,
+/// keyword-only, then variadic positional and keyword parameters. Keyword-only
+/// parameters precede `*args` even though they follow it in the source.
+///
+/// ```python
+/// def f(x, *args, flag=False, **kwargs): ...  # locals: x, flag, args, kwargs
+/// ```
+fn parameters_in_locals_order(
+    parameters: &ruff_python_ast::Parameters,
+) -> impl Iterator<Item = &ruff_python_ast::Parameter> {
+    parameters
+        .iter_non_variadic_params()
+        .map(|parameter| &parameter.parameter)
+        .chain(parameters.vararg.as_deref())
+        .chain(parameters.kwarg.as_deref())
+}
+
 fn function_default_expressions(definition: &StmtFunctionDef) -> impl Iterator<Item = &Expr> {
     parameter_default_expressions(&definition.parameters)
 }
@@ -1984,16 +1966,8 @@ pub(super) fn parameter_default_expressions(
     parameters: &ruff_python_ast::Parameters,
 ) -> impl Iterator<Item = &Expr> {
     parameters
-        .posonlyargs
-        .iter()
-        .chain(&parameters.args)
+        .iter_non_variadic_params()
         .filter_map(|parameter| parameter.default.as_deref())
-        .chain(
-            parameters
-                .kwonlyargs
-                .iter()
-                .filter_map(|parameter| parameter.default.as_deref()),
-        )
 }
 
 fn visit_lambda_defaults<'ast>(
@@ -3402,18 +3376,7 @@ fn analyze_expression_scope(
     body: &Expr,
 ) -> LambdaScopeAnalysis {
     let mut locals = LocalCollector::default();
-    for parameter in parameters
-        .posonlyargs
-        .iter()
-        .chain(&parameters.args)
-        .chain(&parameters.kwonlyargs)
-    {
-        locals.insert(parameter.name().as_str());
-    }
-    if let Some(parameter) = &parameters.vararg {
-        locals.insert(parameter.name.as_str());
-    }
-    if let Some(parameter) = &parameters.kwarg {
+    for parameter in parameters_in_locals_order(parameters) {
         locals.insert(parameter.name.as_str());
     }
     let parameter_names = locals.names.iter().cloned().collect::<FxHashSet<_>>();

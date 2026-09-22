@@ -813,18 +813,14 @@ fn compare(
     };
     let source = match source {
         Ok(source) => source,
-        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-            return Outcome {
-                path: path.to_path_buf(),
-                kind: OutcomeKind::NonUtf8,
-                detail: error.to_string(),
-                oracle_rejected,
-            };
-        }
         Err(error) => {
             return Outcome {
                 path: path.to_path_buf(),
-                kind: OutcomeKind::OracleFailure,
+                kind: if error.kind() == std::io::ErrorKind::InvalidData {
+                    OutcomeKind::NonUtf8
+                } else {
+                    OutcomeKind::OracleFailure
+                },
                 detail: error.to_string(),
                 oracle_rejected,
             };

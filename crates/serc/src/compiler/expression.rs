@@ -49,7 +49,7 @@ use super::scope::{
     collect_self_iterated_nested_comprehension_targets, collect_target_names,
     comprehension_cell_names, comprehension_name_bindings, comprehension_temporary_names,
     generator_cellvars, generator_required_names, inlined_comprehension_cell_names_in_expression,
-    legacy_class_comprehension_names,
+    legacy_class_comprehension_names, parameter_default_expressions,
 };
 use super::source::{
     debug_text_range, first_expression_instruction_range, fstring_literal_range,
@@ -320,15 +320,8 @@ impl<'ast> Visitor<'ast> for ComprehensionScopeFacts {
             }
             Expr::Lambda(lambda) => {
                 if let Some(parameters) = lambda.parameters.as_deref() {
-                    for parameter in parameters
-                        .posonlyargs
-                        .iter()
-                        .chain(&parameters.args)
-                        .chain(&parameters.kwonlyargs)
-                    {
-                        if let Some(default) = parameter.default.as_deref() {
-                            self.visit_expr(default);
-                        }
+                    for default in parameter_default_expressions(parameters) {
+                        self.visit_expr(default);
                     }
                 }
                 return;
@@ -9065,15 +9058,8 @@ pub(super) fn expression_suspends_current_scope(expression: &Expr) -> bool {
                 }
                 Expr::Lambda(lambda) => {
                     if let Some(parameters) = lambda.parameters.as_deref() {
-                        for parameter in parameters
-                            .posonlyargs
-                            .iter()
-                            .chain(&parameters.args)
-                            .chain(&parameters.kwonlyargs)
-                        {
-                            if let Some(default) = parameter.default.as_deref() {
-                                self.visit_expr(default);
-                            }
+                        for default in parameter_default_expressions(parameters) {
+                            self.visit_expr(default);
                         }
                     }
                     return;

@@ -1238,26 +1238,22 @@ fn print_summaries(blocks: &[[Timings; 4]], phase: Phase) -> Result<(), String> 
         let rust_summary = summarize(&rust)?;
         let cpython_summary = summarize(&cpython)?;
         let ratio_statistics = ratio_statistics(&blocks)?;
-        println!(
-            "metric={} phase={} engine=rust median_ns={:.0} p95_ns={} mad_ns={:.0} relative_mad={:.6} half_delta={:.6}",
-            metric.label(),
-            phase.label(),
-            rust_summary.median,
-            rust_summary.p95.round(),
-            rust_summary.mad,
-            rust_summary.relative_mad,
-            rust_summary.half_delta,
-        );
-        println!(
-            "metric={} phase={} engine=cpython median_ns={:.0} p95_ns={} mad_ns={:.0} relative_mad={:.6} half_delta={:.6}",
-            metric.label(),
-            phase.label(),
-            cpython_summary.median,
-            cpython_summary.p95.round(),
-            cpython_summary.mad,
-            cpython_summary.relative_mad,
-            cpython_summary.half_delta,
-        );
+        for (engine, summary) in [
+            (Engine::Rust, rust_summary),
+            (Engine::Cpython, cpython_summary),
+        ] {
+            println!(
+                "metric={} phase={} engine={} median_ns={:.0} p95_ns={} mad_ns={:.0} relative_mad={:.6} half_delta={:.6}",
+                metric.label(),
+                phase.label(),
+                engine.label(),
+                summary.median,
+                summary.p95.round(),
+                summary.mad,
+                summary.relative_mad,
+                summary.half_delta,
+            );
+        }
         println!(
             "metric={} phase={} block_ratio_median={:.6} block_ratio_p95={:.6} block_ratio_mad={:.6} block_ratio_relative_mad={:.6} block_ratio_half_delta={:.6} bootstrap95_low={:.6} bootstrap95_high={:.6} abba_median={} baab_median={} order_delta={} stable={}",
             metric.label(),
