@@ -387,7 +387,7 @@ fn classify_utf8_encoding(name: &str) -> Option<Utf8Encoding> {
     let normalized = normalize_codec_name(name);
     if matches!(
         normalized.as_str(),
-        "utf" | "u8" | "utf8" | "utf_8" | "utf8_ucs2" | "utf8_ucs4" | "cp65001"
+        "utf" | "u8" | "utf8" | "utf_8" | "utf_8_sig" | "utf8_ucs2" | "utf8_ucs4" | "cp65001"
     ) {
         return Some(Utf8Encoding::Alias);
     }
@@ -626,6 +626,9 @@ mod tests {
             "utf8",
             "utf--8",
             "utf__8",
+            "utf--8-sig",
+            "utf__8_sig",
+            "-utf-8-sig",
             "utf8_ucs2",
             "utf8_ucs4",
             "utf8.ucs2",
@@ -639,6 +642,17 @@ mod tests {
             decode_source(b"# coding: utf.8\npass\n"),
             Err(SourceDecodeError::UnsupportedEncoding(encoding)) if encoding == "utf.8"
         ));
+    }
+
+    #[test]
+    fn rejects_bom_for_normalized_utf8_sig_codec_aliases() {
+        for encoding in ["utf--8-sig", "utf__8_sig", "-utf-8-sig"] {
+            let source = format!("\u{feff}# coding: {encoding}\nvalue = 'é'\n");
+            assert_eq!(
+                decode_source(source.as_bytes()),
+                Err(SourceDecodeError::Utf8BomConflict(encoding.to_string())),
+            );
+        }
     }
 
     #[test]
