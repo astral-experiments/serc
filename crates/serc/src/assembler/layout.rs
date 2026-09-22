@@ -170,7 +170,7 @@ impl LayoutAssembler {
                     let dynamic_owner = (!instruction.jump_policy.is_authored_branch_marker())
                         .then(|| dynamic_exception_owners.get(&instruction_index))
                         .flatten();
-                    if let Some(region) = dynamic_owner.and_then(|owner| owner.source_region) {
+                    if let Some(region) = dynamic_owner.and_then(|owner| owner.source_region()) {
                         late_source_exception_owners.push((position, end, region));
                     } else {
                         if instruction
@@ -180,13 +180,13 @@ impl LayoutAssembler {
                         {
                             late_exception_exclusions.push((position, end));
                         }
-                        if let Some(has_owner) = dynamic_owner {
-                            if has_owner.has_owner {
-                                if has_owner.override_existing {
+                        if let Some(decision) = dynamic_owner {
+                            if decision.has_owner() {
+                                if decision.overrides_existing() {
                                     late_exception_overrides.push((position, end));
                                 }
                                 late_exception_inclusions.push((position, end));
-                            } else if has_owner.definitive {
+                            } else if decision.is_definitive() {
                                 late_exception_exclusions.push((position, end));
                             }
                         }
@@ -196,7 +196,7 @@ impl LayoutAssembler {
                             == NormalizedExceptionOwner::Absent
                             || (instruction.exception_policy().owner()
                                 == NormalizedExceptionOwner::DynamicCondition
-                                && !dynamic_owner.is_some_and(|owner| owner.has_owner))
+                                && !dynamic_owner.is_some_and(|owner| owner.has_owner()))
                         {
                             if block_has_applied_comprehension_swap {
                                 late_exception_inclusions.push((position, end));

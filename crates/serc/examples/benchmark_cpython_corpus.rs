@@ -280,10 +280,32 @@ struct PythonRunner {
 
 #[derive(Debug)]
 struct PythonManifest {
-    accepted_indices: Vec<usize>,
-    marshaled: Vec<Vec<u8>>,
+    accepted: Vec<AcceptedFile>,
     rejected: usize,
     source_bytes: usize,
+}
+
+impl PythonManifest {
+    fn into_counts(self) -> ManifestCounts {
+        ManifestCounts {
+            accepted: self.accepted.len(),
+            rejected: self.rejected,
+            source_bytes: self.source_bytes,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ManifestCounts {
+    accepted: usize,
+    rejected: usize,
+    source_bytes: usize,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct AcceptedFile {
+    source_index: usize,
+    marshaled: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -352,22 +374,25 @@ fn run() -> Result<(), String> {
     let identity = ArtifactIdentity::capture(&options.python, &sources)?;
 
     let mut python = PythonRunner::start(&options.python)?;
-    let mut manifest = python.initialize(&sources)?;
-    if manifest.accepted_indices.len() + manifest.rejected != sources.len() {
+    let manifest = python.initialize(&sources)?;
+    if manifest.accepted.len() + manifest.rejected != sources.len() {
         return Err(format!(
             "CPython manifest is incomplete: {} accepted + {} rejected != {} discovered",
-            manifest.accepted_indices.len(),
+            manifest.accepted.len(),
             manifest.rejected,
             sources.len()
         ));
     }
     let accepted = manifest
-        .accepted_indices
+        .accepted
         .iter()
-        .map(|&index| {
-            sources
-                .get(index)
-                .ok_or_else(|| format!("CPython returned invalid accepted index {index}"))
+        .map(|file| {
+            sources.get(file.source_index).ok_or_else(|| {
+                format!(
+                    "CPython returned invalid accepted index {}",
+                    file.source_index
+                )
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let accepted_source_bytes = accepted
@@ -392,9 +417,8 @@ fn run() -> Result<(), String> {
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    verify_exact_marshal(&accepted, &precompiled, &manifest.marshaled)?;
-    manifest.marshaled.clear();
-    manifest.marshaled.shrink_to_fit();
+    verify_exact_marshal(&accepted, &precompiled, &manifest.accepted)?;
+    let manifest = manifest.into_counts();
 
     let mut blocks = Vec::with_capacity(expected_row_count(&options)? / 4);
     run_blocks(
@@ -423,7 +447,6 @@ fn run() -> Result<(), String> {
         &sources,
         discovered_source_bytes,
         &manifest,
-        accepted_source_bytes,
     )?;
     write_raw(&options, &metadata, &accepted, &blocks)?;
     print_summaries(&blocks[options.warmups..], options.phase)?;
@@ -562,8 +585,7 @@ impl PythonRunner {
     fn initialize(&mut self, sources: &[SourceFile]) -> Result<PythonManifest, String> {
         writeln!(self.stdin, "INIT\t{}", sources.len())
             .map_err(|error| format!("failed to initialize CPython: {error}"))?;
-        let mut accepted_indices = Vec::new();
-        let mut marshaled = Vec::new();
+        let mut accepted_files = Vec::new();
         for (index, source) in sources.iter().enumerate() {
             writeln!(
                 self.stdin,
@@ -591,8 +613,10 @@ impl PythonRunner {
                     self.stdout.read_exact(&mut bytes).map_err(|error| {
                         format!("failed to read CPython marshal output: {error}")
                     })?;
-                    accepted_indices.push(index);
-                    marshaled.push(bytes);
+                    accepted_files.push(AcceptedFile {
+                        source_index: index,
+                        marshaled: bytes,
+                    });
                 }
                 ["REJECT", rejected_index] if rejected_index.parse::<usize>() == Ok(index) => {}
                 _ => {
@@ -611,15 +635,14 @@ impl PythonRunner {
         let accepted = accepted
             .parse::<usize>()
             .map_err(|_| format!("invalid manifest: {line}"))?;
-        if accepted != accepted_indices.len() {
+        if accepted != accepted_files.len() {
             return Err(format!(
                 "CPython reported {accepted} accepted files but sent {} indices",
-                accepted_indices.len()
+                accepted_files.len()
             ));
         }
         Ok(PythonManifest {
-            accepted_indices,
-            marshaled,
+            accepted: accepted_files,
             rejected: rejected
                 .parse::<usize>()
                 .map_err(|_| format!("invalid manifest: {line}"))?,
@@ -668,20 +691,21 @@ impl PythonRunner {
 fn verify_exact_marshal(
     accepted: &[&SourceFile],
     precompiled: &[CompiledModule],
-    cpython_marshaled: &[Vec<u8>],
+    cpython_accepted: &[AcceptedFile],
 ) -> Result<(), String> {
     if accepted.is_empty() {
         return Err("exact-marshal preflight has no CPython-accepted files".to_string());
     }
-    if precompiled.len() != accepted.len() || cpython_marshaled.len() != accepted.len() {
+    if precompiled.len() != accepted.len() || cpython_accepted.len() != accepted.len() {
         return Err(format!(
             "exact-marshal preflight is incomplete: {} sources, {} Rust modules, {} CPython outputs",
             accepted.len(),
             precompiled.len(),
-            cpython_marshaled.len(),
+            cpython_accepted.len(),
         ));
     }
-    for ((source, module), cpython) in accepted.iter().zip(precompiled).zip(cpython_marshaled) {
+    for ((source, module), file) in accepted.iter().zip(precompiled).zip(cpython_accepted) {
+        let cpython = &file.marshaled;
         let rust = module.marshal();
         if rust != *cpython {
             let difference = rust
@@ -1031,8 +1055,7 @@ fn metadata(
     identity: &ArtifactIdentity,
     sources: &[SourceFile],
     discovered_source_bytes: usize,
-    manifest: &PythonManifest,
-    accepted_source_bytes: usize,
+    manifest: &ManifestCounts,
 ) -> Result<Vec<(String, String)>, String> {
     let command_output = |program: &str, arguments: &[&str]| -> Result<String, String> {
         let output = Command::new(program)
@@ -1095,7 +1118,7 @@ fn metadata(
         ),
         (
             "accepted_files".to_string(),
-            manifest.accepted_indices.len().to_string(),
+            manifest.accepted.to_string(),
         ),
         (
             "cpython_rejected".to_string(),
@@ -1103,7 +1126,7 @@ fn metadata(
         ),
         (
             "accepted_source_bytes".to_string(),
-            accepted_source_bytes.to_string(),
+            manifest.source_bytes.to_string(),
         ),
         (
             "exact_marshal_preflight".to_string(),
@@ -1111,7 +1134,7 @@ fn metadata(
         ),
         (
             "exact_marshal_files".to_string(),
-            manifest.accepted_indices.len().to_string(),
+            manifest.accepted.to_string(),
         ),
         ("hash_scheme".to_string(), identity.hash_scheme.clone()),
         (
@@ -1432,10 +1455,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BOOTSTRAP_SEED, BlockSample, Engine, Metric, Options, Phase, PythonRunner, SourceFile,
-        Timings, block_order, block_samples, bootstrap_median_ci, cooldown_metadata, discover,
-        expected_row_count, parse_sample_response, process_timer_result, profile_from_executable,
-        ratio_statistics, summarize, verify_exact_marshal, write_raw,
+        AcceptedFile, BOOTSTRAP_SEED, BlockSample, Engine, Metric, Options, Phase, PythonRunner,
+        SourceFile, Timings, block_order, block_samples, bootstrap_median_ci, cooldown_metadata,
+        discover, expected_row_count, parse_sample_response, process_timer_result,
+        profile_from_executable, ratio_statistics, summarize, verify_exact_marshal, write_raw,
     };
 
     #[test]
@@ -1500,23 +1523,29 @@ mod tests {
         .map(|phase| runner.run_phase(phase).unwrap());
         runner.finish().unwrap();
 
-        assert_eq!(manifest.accepted_indices, [0, 3]);
         assert_eq!(manifest.rejected, 2);
         assert_eq!(
             manifest.source_bytes,
             sources[0].source.len() + sources[3].source.len()
         );
-        let expected_marshal = [0, 3].map(|index| {
-            serc::compile(&sources[index].source, &sources[index].filename)
-                .unwrap()
-                .marshal()
+        let expected_files = [0, 3].map(|source_index| AcceptedFile {
+            source_index,
+            marshaled: serc::compile(
+                &sources[source_index].source,
+                &sources[source_index].filename,
+            )
+            .unwrap()
+            .marshal(),
         });
-        assert_eq!(manifest.marshaled, expected_marshal);
+        assert_eq!(manifest.accepted, expected_files);
         for sample in samples {
             assert_eq!(sample.count, 2);
             assert!(sample.observed > 0);
         }
-        let marshaled_bytes = expected_marshal.iter().map(Vec::len).sum::<usize>();
+        let marshaled_bytes = expected_files
+            .iter()
+            .map(|file| file.marshaled.len())
+            .sum::<usize>();
         assert_eq!(samples[1].observed, marshaled_bytes);
         assert_eq!(samples[2].observed, marshaled_bytes);
     }
@@ -1575,17 +1604,19 @@ mod tests {
             source: "pass\n".to_string(),
         };
         let module = serc::compile(&source.source, &source.filename).expect("compile source");
-        let expected = module.marshal();
+        let mut expected = AcceptedFile {
+            source_index: 0,
+            marshaled: module.marshal(),
+        };
         verify_exact_marshal(
             &[&source],
             std::slice::from_ref(&module),
-            &[expected.clone()],
+            std::slice::from_ref(&expected),
         )
         .expect("identical marshal output");
 
-        let mut mismatched = expected;
-        mismatched[0] ^= 1;
-        let error = verify_exact_marshal(&[&source], &[module], &[mismatched])
+        expected.marshaled[0] ^= 1;
+        let error = verify_exact_marshal(&[&source], &[module], &[expected])
             .expect_err("different marshal output must fail");
         assert!(error.contains("exact-marshal preflight failed for source.py at byte 0"));
     }
