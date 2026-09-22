@@ -16259,6 +16259,42 @@ impl Compiler<'_> {
                     self.assembler
                         .allow_borrow_surviving_break_at_trailing_loop_exit();
                 }
+                // Threading the inner loop's empty exit can merge its marker with
+                // the outer loop's continuation. A surviving outer break still
+                // enters that populated continuation inside one direct finalizer.
+                if self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && self.control.statements.current_statement_has_following
+                    && statement.orelse.is_empty()
+                    && self.control.loops.contexts.is_empty()
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.withs.active_with_region_exclusions.is_empty()
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.finally.active_finally_try_bodies == 1
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self
+                        .control
+                        .finally
+                        .innermost_finally_exception_exclusion_depth
+                        == Some(1)
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+                        == 1
+                    && suite_has_direct_nonterminal_break_guard(&statement.body)
+                    && matches!(statement.body.last(), Some(Stmt::While(inner))
+                        if early_condition_truthiness(&inner.test) == Some(true)
+                            && inner.orelse.is_empty()
+                            && suite_contains_loop_break(&inner.body))
+                    && self.assembler.has_authored_forward_break_to(end)
+                {
+                    self.assembler
+                        .allow_borrow_surviving_break_at_trailing_loop_exit();
+                }
                 // A terminal inner loop can leave the same disconnected alias inside
                 // one async manager's protected finally body. Direct runtime break
                 // guards may follow recovery work; traversal still has to reach their

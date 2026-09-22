@@ -9060,6 +9060,25 @@ def leading_comparisons(a, b, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_nested_loop_finally_borrow_entry() {
+        for inner in [
+            "if flag:\n    owner.work()\nelse:\n    break\n",
+            "try:\n    owner.work()\nexcept Error:\n    continue\nelse:\n    if flag:\n        owner.work()\n    else:\n        break\n",
+        ] {
+            for tail in ["return flag", "owner.work()"] {
+                let mut indented = String::new();
+                for line in inner.lines() {
+                    writeln!(indented, "                {line}").unwrap();
+                }
+                let source = format!(
+                    "def f(owner, flag):\n    try:\n        while True:\n            if flag:\n                break\n            while True:\n{indented}        {tail}\n    finally:\n        if owner.ready:\n            owner.finish()\n"
+                );
+                assert_matches_cpython_marshal(&source, "nested_loop_finally_borrow_entry.py");
+            }
+        }
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_retained_try_else_borrow_fallthrough() {
         let source = r"def terminal_else_if(value, flag):
     try:
