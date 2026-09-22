@@ -1,0 +1,18 @@
+---
+source: crates/serc/src/compiler/scope/snapshots.rs
+expression: snapshot
+---
+module globals: ["external"]
+scope 0 children=[ScopeId(1)]
+  module
+scope 1 children=[ScopeId(2)]
+  function locals=["value", "captured", "C"]
+  cells=["captured", "value"] free=[] globals=[]
+  annotation references=[] free=[]
+scope 2 children=[ScopeId(3)]
+  class bound=["field", "method"] required=["captured", "value"]
+  classcell=true classdict=true
+scope 3 children=[]
+  function locals=["self"]
+  cells=[] free=[] globals=[]
+  annotation references=[] free=[]

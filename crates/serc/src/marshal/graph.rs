@@ -2366,3 +2366,6 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
             .record_unique_value(OccurrenceKind::SliceMember, ObjectKey::SliceMember(address));
     }
 }
+
+#[cfg(test)]
+mod snapshots;

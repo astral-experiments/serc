@@ -27,6 +27,7 @@ rustc-hash = "2.0.0"
 smallvec = "1.15.2"
 
 # Utility and development dependencies.
+insta = { version = "1.46.0", default-features = false }
 cpu-time = "1.0.0"
 fs-err = "3.2.2"
 serc_fixtures = { path = "crates/serc_fixtures" }
