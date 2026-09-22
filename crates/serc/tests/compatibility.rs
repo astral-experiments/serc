@@ -67,6 +67,48 @@ mod tests {
     }
 
     #[test]
+    fn rejects_null_characters_in_text_source() {
+        use serc::{
+            CompileOptions, InitialInternState, PythonVersion, SourceDecodeError,
+            compile_with_intern_state, compile_with_options,
+        };
+
+        let expected = CompileError::Decode(SourceDecodeError::NullByte);
+        for source in [
+            "\0value = 1\n",
+            "# generated comment\0\nvalue = 1\n",
+            "value = 'before\0after'\n",
+            "value = 1\n\0",
+            "\u{feff}# generated comment\0\r\nvalue = 1\r\n",
+        ] {
+            assert_eq!(compile(source, "null.py").unwrap_err(), expected);
+            assert_eq!(compile_to_pyc(source, "null.py", 0).unwrap_err(), expected);
+            assert_eq!(
+                compile_with_intern_state(source, "null.py", &InitialInternState::default())
+                    .unwrap_err(),
+                expected
+            );
+            for python_version in [
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ] {
+                let options = CompileOptions {
+                    python_version,
+                    ..CompileOptions::default()
+                };
+                assert_eq!(
+                    compile_with_options(source, "null.py", &options).unwrap_err(),
+                    expected
+                );
+            }
+        }
+
+        assert_matches_cpython_marshal("value = '\\0'\n", "escaped_null.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_supported_source_encodings() {
         let cases: [(&str, &[u8]); 9] = [
             ("latin_1.py", b"# coding: latin-1\nvalue = '\xe9'\n"),

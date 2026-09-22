@@ -24,7 +24,7 @@ resources. Ruff's dependencies, lockfile, and clean submodule must all match rev
 | --- | ---: | ---: | ---: | ---: | ---: |
 | 3.12.14 | 2,174 | 277 | 210 | 61 | 6 |
 | 3.13.15 | 2,193 | 258 | 196 | 55 | 7 |
-| 3.14.5 | 2,230 | 221 | 151 | 56 | 14 |
+| 3.14.5 | 2,230 | 221 | 152 | 55 | 14 |
 | 3.15.0rc2 | 2,249 | 202 | 133 | 55 | 14 |
 
 The last three columns partition CPython-rejected inputs and expose existing rejection
