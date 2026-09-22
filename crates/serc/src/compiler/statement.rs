@@ -612,6 +612,8 @@ pub(super) struct StatementState {
     // This exact statement reaches a source successor without crossing a compound
     // statement's cleanup. Only conditional arms inherit that continuation.
     same_region_continuation: Option<TextRange>,
+    // This trailing while shares its empty exit with an enclosing conditional's false edge.
+    while_before_conditional_join: Option<TextRange>,
     // The final conditional arm's Pass falls through to a separate original join array.
     retained_branch_pass: Option<TextRange>,
     // Whether an enclosing statement has a sibling successor after its nested suite.
@@ -8683,6 +8685,10 @@ impl Compiler<'_> {
                     // POP_BLOCK becomes an unowned NOP before line-number cleanup. A return
                     // expression with multiple exits can leave this marker at their join.
                     let starts_jump_target = self.assembler.at_jump_target();
+                    // A copied finalizer's conditional and continuing body share this
+                    // original POP_BLOCK. Neither predecessor can donate its location.
+                    let shared_copied_cleanup_join = unwind_location == SourceLocation::NONE
+                        && self.assembler.at_original_shared_cleanup_join();
                     self.assembler.set_location(unwind_location);
                     // This surrounding loop stays live until after the copied finally.
                     // A while and a retained iterator both contribute no unwind record
@@ -9776,6 +9782,7 @@ impl Compiler<'_> {
                         .map(|start| (start, self.assembler.item_count()));
                     self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
                     if !starts_jump_target
+                        || shared_copied_cleanup_join
                         || copied_guard_exit_location.is_some()
                         || matches!(finally_context.body.as_slice(), [Stmt::Pass(_)])
                         // A preceding copied finalizer can finish at a conditional join.
@@ -9858,9 +9865,10 @@ impl Compiler<'_> {
                             finally_context.handler,
                         );
                     }
-                    if starts_jump_target
-                        && unwind_location.line < 0
-                        && matches!(finally_context.body.as_slice(), [Stmt::Pass(_)])
+                    if shared_copied_cleanup_join
+                        || (starts_jump_target
+                            && unwind_location.line < 0
+                            && matches!(finally_context.body.as_slice(), [Stmt::Pass(_)]))
                     {
                         self.assembler.preserve_last_no_location();
                     }
@@ -12487,7 +12495,11 @@ impl Compiler<'_> {
                                                         compiler.with_control_override(
                                                             |control| &mut control.conditions.include_assert_none_condition_owner,
                                                             include_assert_none_condition_owner,
-                                                            |compiler| compiler.compile_if_branch_suite(statement, body),
+                                                            |compiler| compiler.compile_if_branch_suite(
+                                                                statement,
+                                                                body,
+                                                                next == end && condition_has_only_runtime_tests(test),
+                                                            ),
                                                         )
                                                     },
                                                 )
@@ -12984,7 +12996,7 @@ impl Compiler<'_> {
                                         &mut control.conditions.suppress_else_assert_none_condition_owner
                                     },
                                     suppress_else_assert_none_condition_owner,
-                                    |compiler| compiler.compile_if_branch_suite(statement, body),
+                                    |compiler| compiler.compile_if_branch_suite(statement, body, false),
                                 )
                             },
                         )
@@ -13049,7 +13061,25 @@ impl Compiler<'_> {
         &mut self,
         statement: &ruff_python_ast::StmtIf,
         body: &[Stmt],
+        shares_false_join: bool,
     ) -> Result<(), CompileError> {
+        // No native record separates a final while's empty anchors from this
+        // handler-final conditional's false/end label. Defer its cleanup marker
+        // to that join; a nested conditional retains its existing donor policy.
+        let while_before_conditional_join = (self.context.python_version
+            >= crate::PythonVersion::Py314
+            && shares_false_join
+            && self
+                .control
+                .exceptions
+                .active_exception_handlers
+                .last()
+                .is_some_and(|handler| handler.trailing_statement == Some(statement.range)))
+        .then(|| match body.last() {
+            Some(Stmt::While(tail)) => Some(tail.range),
+            _ => None,
+        })
+        .flatten();
         let fallthrough_body = statement
             .elif_else_clauses
             .last()
@@ -13092,7 +13122,13 @@ impl Compiler<'_> {
                         compiler.with_control_override(
                             |control| &mut control.statements.retained_branch_pass,
                             retained_branch_pass,
-                            |compiler| compiler.compile_suite(body),
+                            |compiler| {
+                                compiler.with_control_override(
+                                    |control| &mut control.statements.while_before_conditional_join,
+                                    while_before_conditional_join,
+                                    |compiler| compiler.compile_suite(body),
+                                )
+                            },
                         )
                     },
                 )
@@ -17094,6 +17130,7 @@ impl Compiler<'_> {
         if statement.orelse.is_empty()
             && !self.control.statements.current_statement_has_following
             && self.control.statements.same_region_continuation != Some(statement.range)
+            && self.control.statements.while_before_conditional_join != Some(statement.range)
             && self.control.loops.split_loop_tail_prefix_end != Some(statement.range)
             && !innermost_async_with
             && self
@@ -20027,11 +20064,14 @@ impl Compiler<'_> {
                 && matches!(statement.body.last(), Some(Stmt::While(loop_statement))
                 if loop_statement.orelse.is_empty()
                     && !is_break_only_loop(loop_statement)
-                    && condition_jump_target_count(&loop_statement.test, false) == 1
-                    && !original_condition_has_unique_jump_target(
-                        &loop_statement.test,
-                        false,
-                    ));
+                    && ((condition_jump_target_count(&loop_statement.test, false) == 1
+                        && !original_condition_has_unique_jump_target(
+                            &loop_statement.test,
+                            false,
+                        ))
+                        || (condition_jump_target_count(&loop_statement.test, false) > 1
+                            && condition_has_only_runtime_tests(&loop_statement.test)
+                            && !suite_contains_loop_break(&loop_statement.body))));
             let loop_exit_location = statement
                 .orelse
                 .is_empty()

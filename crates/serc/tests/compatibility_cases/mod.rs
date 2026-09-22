@@ -396,6 +396,7 @@ mod match_case_condition_backedge_locations;
 mod nonlocal_comprehension_shadow;
 mod original_match_jump_heads;
 mod pass_finalizer_unwind_markers;
+mod protected_cleanup_join_locations;
 mod protected_loop_condition_exit_locations;
 mod terminating_handler_shared_false_join_locations;
 

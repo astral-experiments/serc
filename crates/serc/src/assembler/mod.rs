@@ -2051,6 +2051,11 @@ impl Assembler {
         conditional_edges > 0 && conditional_edges + usize::from(falls_through) > 1
     }
 
+    /// Certifies an empty cleanup join, including a recorded specialized None guard.
+    pub(crate) fn at_original_shared_cleanup_join(&self) -> bool {
+        self.original_shared_conditional_join(true)
+    }
+
     /// Certifies a shared conditional source join without a physical fallthrough donor.
     pub(crate) fn at_original_jump_only_conditional_join(&self) -> bool {
         // Specializing a recorded None guard removes LOAD_CONST, IS_OP, and
