@@ -16,7 +16,7 @@ mod target;
 use std::error::Error;
 use std::fmt;
 
-use code_object::{CodeObject, CodeObjectValidationError};
+use code_object::CodeObject;
 use compiler::Compiler;
 pub use config::{CompileOptions, ParsePythonVersionError, PythonVersion};
 pub use initial_intern_state::InitialInternState;
@@ -204,12 +204,6 @@ impl Error for CompileError {
             | Self::UnresolvedInternState { .. }
             | Self::Internal(_) => None,
         }
-    }
-}
-
-impl From<CodeObjectValidationError> for CompileError {
-    fn from(error: CodeObjectValidationError) -> Self {
-        Self::Internal(error.to_string())
     }
 }
 
