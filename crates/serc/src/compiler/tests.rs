@@ -3207,3 +3207,74 @@ fn mapping_pattern_lengths_use_the_full_integer_value() {
         }
     }
 }
+
+#[test]
+fn class_explicit_globals_reset_definition_qualified_names_for_all_targets() {
+    fn collect_qualified_names(
+        code: &CodeObject,
+        names: &mut Vec<String>,
+        annotations: &mut Vec<String>,
+    ) {
+        for constant in &code.constants {
+            if let Constant::Code(child) = constant {
+                if child.name == "__annotate__" {
+                    annotations.push(child.qualified_name.clone());
+                } else if !child.name.starts_with('<') {
+                    names.push(child.qualified_name.clone());
+                }
+                collect_qualified_names(child, names, annotations);
+            }
+        }
+    }
+
+    let source = include_str!("../../tests/fixtures/class_global_qualnames.py");
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        let module = crate::compile_with_options(
+            source,
+            "class_global_qualnames.py",
+            &crate::CompileOptions {
+                python_version,
+                ..crate::CompileOptions::default()
+            },
+        )
+        .unwrap();
+        let mut names = Vec::new();
+        let mut annotations = Vec::new();
+        collect_qualified_names(&module.code, &mut names, &mut annotations);
+        let expected_annotations: &[&str] = match python_version {
+            crate::PythonVersion::Py312 | crate::PythonVersion::Py313 => &[],
+            crate::PythonVersion::Py314 => &["Parent.__annotate__", "Parent.__annotate__"],
+            crate::PythonVersion::Py315 => &[
+                "Parent.function.__annotate__",
+                "Parent.generic.__annotate__",
+            ],
+        };
+        assert_eq!(annotations, expected_annotations, "{python_version:?}");
+        assert_eq!(
+            names,
+            [
+                "Parent",
+                "function",
+                "Child",
+                "Child.method",
+                "generic",
+                "Parent.local",
+                "Parent.Local",
+                "Outer",
+                "Outer.Inner",
+                "nested_function",
+                "NestedChild",
+                "enclosing",
+                "enclosing.<locals>.Parent",
+                "enclosed_function",
+                "enclosing.<locals>.Parent.local",
+            ],
+            "{python_version:?}",
+        );
+    }
+}

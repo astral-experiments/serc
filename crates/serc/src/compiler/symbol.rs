@@ -732,12 +732,12 @@ impl Compiler<'_> {
         }
         match &self.unit.scope {
             Scope::Module => name.to_string(),
-            Scope::Class { .. } => format!("{}.{}", self.unit.qualified_name, name),
-            Scope::Function { globals, .. }
+            Scope::Class { globals, .. } | Scope::Function { globals, .. }
                 if honor_explicit_global && self.contains_name(globals, name) =>
             {
                 name.to_string()
             }
+            Scope::Class { .. } => format!("{}.{}", self.unit.qualified_name, name),
             Scope::Function { .. } => format!("{}.<locals>.{name}", self.unit.qualified_name),
         }
     }
