@@ -31567,6 +31567,27 @@ fn with_body_has_cold_normal_donor(body: &[Stmt]) -> bool {
 // POP_BLOCK. Keep this source witness separate from general suite termination;
 // the assembler certifies the actual cold footer and original join identity.
 fn with_body_has_terminal_manager_suppression(body: &[Stmt]) -> bool {
+    fn raises_through_finally(body: &[Stmt]) -> bool {
+        match body.last() {
+            Some(Stmt::Raise(_)) => true,
+            Some(Stmt::Try(statement)) => {
+                !statement.is_star
+                    && statement.orelse.is_empty()
+                    // A finally return or loop exit can replace the pending raise.
+                    && !suite_any_statement(&statement.finalbody, |statement| {
+                        matches!(statement, Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_))
+                    })
+                    && (raises_through_finally(&statement.finalbody)
+                        || (raises_through_finally(&statement.body)
+                            && statement.handlers.iter().all(|handler| {
+                                handler.as_except_handler().is_some_and(|handler| {
+                                    raises_through_finally(&handler.body)
+                                })
+                            })))
+            }
+            _ => false,
+        }
+    }
     fn raises(body: &[Stmt]) -> bool {
         match body.last() {
             Some(Stmt::Raise(_)) => true,
@@ -31584,6 +31605,13 @@ fn with_body_has_terminal_manager_suppression(body: &[Stmt]) -> bool {
             }
             _ => false,
         }
+    }
+    if let Some(Stmt::With(manager)) = body.last() {
+        // Recursive raising try/finally paths have no original normal exit, even
+        // when exceptional finalizers await. The manager's sole suppression edge
+        // locates the following outer POP_BLOCK before NOP compaction. Multiple
+        // manager items can also complete normally through inner suppression.
+        return manager.items.len() == 1 && raises_through_finally(&manager.body);
     }
     let Some(Stmt::Try(statement)) = body.last() else {
         return false;
