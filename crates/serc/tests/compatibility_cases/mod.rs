@@ -280,6 +280,7 @@ mod terminal_break_deferred_none_compatibility;
 mod terminal_chained_comparison_returns_compatibility;
 mod terminal_chained_exit_nops;
 mod terminal_chained_none_compatibility;
+mod terminal_condition_exits;
 mod terminal_ifexp_call_compatibility;
 mod terminal_none_and_raise_compatibility;
 mod terminal_synchronous_with_condition_owner_compatibility;

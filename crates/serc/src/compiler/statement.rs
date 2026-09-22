@@ -3521,6 +3521,8 @@ impl Compiler<'_> {
                         // Native 3.12 resolves the implicit return after static swaps,
                         // so its donor is the final emitted store after reordering.
                         self.assembler.set_location(SourceLocation::NONE);
+                    } else if suite_has_shared_terminal_condition_exit(body) {
+                        self.assembler.set_location(SourceLocation::NONE);
                     } else if let Some(range) = suite_assert_success_fallthrough_range(body) {
                         self.assembler.set_location(self.source_location(range));
                     } else if let Some(range) = suite_unary_not_fallthrough_range(body) {
@@ -3599,6 +3601,8 @@ impl Compiler<'_> {
                     {
                         // Native 3.12 resolves the implicit return after static swaps,
                         // so its donor is the final emitted store after reordering.
+                        self.assembler.set_location(SourceLocation::NONE);
+                    } else if suite_has_shared_terminal_condition_exit(body) {
                         self.assembler.set_location(SourceLocation::NONE);
                     } else if let Some(range) = suite_assert_success_fallthrough_range(body) {
                         self.assembler.set_location(self.source_location(range));
@@ -19493,6 +19497,8 @@ impl Compiler<'_> {
                 && let Some(location) = body_noop_location
             {
                 self.assembler.set_location(location);
+            } else if suite_has_shared_terminal_condition_exit(normal_exit_suite) {
+                self.assembler.set_location(SourceLocation::NONE);
             } else if (statement.orelse.is_empty()
                 || matches!(statement.orelse.last(), Some(Stmt::Assert(assertion))
                     if assertion_has_only_runtime_tests(&assertion.test)))
@@ -35082,6 +35088,19 @@ fn suite_unary_not_fallthrough_range(body: &[Stmt]) -> Option<TextRange> {
             terminating_if_fallthrough_test(statement).and_then(unary_not_condition_exit_range)
         }
         _ => None,
+    }
+}
+
+/// Keeps shared condition exits unlocated until each incoming edge receives its own copy.
+fn suite_has_shared_terminal_condition_exit(body: &[Stmt]) -> bool {
+    match body.last() {
+        Some(Stmt::Assert(statement)) => condition_jump_target_count(&statement.test, true) > 1,
+        Some(Stmt::While(statement)) => {
+            statement.orelse.is_empty()
+                && !suite_contains_loop_break(&statement.body)
+                && condition_jump_target_count(&statement.test, false) > 1
+        }
+        _ => false,
     }
 }
 
