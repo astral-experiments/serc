@@ -704,3 +704,25 @@ fn preserves_pass_finalizer_before_copied_return() {
         }
     }
 }
+
+#[test]
+fn completed_value_join_preserves_later_manager_finally_owners() {
+    for (definition, body) in [
+        ("def", "work()"),
+        ("def", "yield work()"),
+        ("async def", "await work()"),
+    ] {
+        for value in [
+            "value if enabled else None",
+            "work() if value is not None else 0",
+        ] {
+            let source = format!(
+                "{definition} f(manager, value, enabled):\n    with manager:\n        try:\n            {body}\n        except Error:\n            raise\n        finally:\n            if value:\n                item = {value}\n                with manager:\n                    work(item)\n",
+            );
+            common::assert_matches_cpython_marshal(
+                &source,
+                "completed_value_join_manager_finally.py",
+            );
+        }
+    }
+}

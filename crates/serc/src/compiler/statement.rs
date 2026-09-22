@@ -27156,7 +27156,23 @@ impl Compiler<'_> {
                             && !expression_suspends_current_scope(&tail.test)
                             && !suite_contains_abrupt_control_flow(&tail.body)
                             && tail.body.split_last().is_some_and(|(cleanup, leading)| {
-                                (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
+                                // A completed conditional value joins before its assignment.
+                                // It cannot leave a cleanup POP in this later empty array.
+                                let completed_value_prefix = leading.iter().all(|statement| {
+                                    suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                                        || matches!(statement, Stmt::Assign(assignment)
+                                            if assignment.targets.iter().all(|target| matches!(target, Expr::Name(_)))
+                                                && matches!(assignment.value.as_ref(), Expr::If(value)
+                                                    if condition_has_only_runtime_tests(&value.test)
+                                                        && condition_has_linear_runtime_leaves(&value.test)
+                                                        && !expression_suspends_current_scope(&value.test)
+                                                        && [&value.body, &value.orelse].iter().all(|arm|
+                                                            !expression_contains_inline_branch(arm)
+                                                                && !expression_suspends_current_scope(arm))))
+                                });
+                                (leading.is_empty()
+                                    || suite_has_linear_borrow_fallthrough(leading)
+                                    || completed_value_prefix)
                                     && match cleanup {
                                         Stmt::Try(recovery) => {
                                             !recovery.is_star
