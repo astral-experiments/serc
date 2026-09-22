@@ -2162,8 +2162,15 @@ fn fold_float_power(base: f64, exponent: f64) -> Option<Constant> {
         let imag = magnitude * phase.sin();
         return (real.is_finite() && imag.is_finite()).then_some(Constant::Complex { real, imag });
     }
+    // CPython handles nonfinite inputs before calling libm: their infinite or
+    // NaN results are successful powers, unlike overflow from finite operands.
+    // Keep zero to a finite negative power as a runtime ZeroDivisionError.
+    if base == 0.0 && exponent.is_finite() && exponent < 0.0 {
+        return None;
+    }
     let result = base.powf(exponent);
-    result.is_finite().then_some(Constant::Float(result))
+    (result.is_finite() || !base.is_finite() || !exponent.is_finite())
+        .then_some(Constant::Float(result))
 }
 
 /// Match CPython's `float_rem`: a nonzero remainder and zero both take the divisor's sign.
