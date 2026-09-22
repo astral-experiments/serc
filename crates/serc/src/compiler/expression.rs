@@ -604,8 +604,21 @@ impl Compiler<'_> {
                         } else {
                             guard.range()
                         };
-                        self.assembler.set_location(self.source_location(range));
+                        let location = self.source_location(range);
+                        let redundant_capture_line = truthiness
+                            && !context.stores.is_empty()
+                            && self.source_location(case.pattern.range()).line == location.line;
+                        self.assembler.set_location(if redundant_capture_line {
+                            SourceLocation::NONE
+                        } else {
+                            location
+                        });
                         self.emit(NOP, 0, 0)?;
+                        if redundant_capture_line {
+                            // Native constant folding removes the guard's line after the
+                            // same-line capture store. Keep its slot for original block sizing.
+                            self.assembler.preserve_last_no_location();
+                        }
                     }
                     if !truthiness {
                         self.ensure_match_fail_pop(&mut context, 0);

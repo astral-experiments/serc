@@ -56,3 +56,77 @@ fn matches_cpython_kw3_assign_body() {
 ";
     common::assert_matches_cpython_marshal(source, "match_capture_kw3_assign_body.py");
 }
+
+#[test]
+fn drops_constant_true_guard_line_after_same_line_capture() {
+    for (filename, source) in [
+        (
+            "match_capture_true_guard.py",
+            r"def f(value):
+    match value:
+        case [item] if True:
+            pass
+        case _:
+            pass
+",
+        ),
+        (
+            "match_capture_copied_true_guard.py",
+            r"def f(value):
+    match value:
+        case [item] if True:
+            pass
+        case [other] if ready(other):
+            pass
+        case _:
+            pass
+",
+        ),
+        (
+            "match_capture_true_guard_return.py",
+            r"def f(value):
+    match value:
+        case Thing(item) if 1:
+            return item
+        case _:
+            return None
+",
+        ),
+        (
+            "match_capture_multiline_pattern_guard.py",
+            r"def f(value):
+    match value:
+        case [
+            item,
+        ] if True:
+            pass
+        case _:
+            pass
+",
+        ),
+        (
+            "match_capture_multiline_true_guard.py",
+            r"def f(value):
+    match value:
+        case [item] if (
+            True
+        ):
+            pass
+        case _:
+            pass
+",
+        ),
+        (
+            "match_capture_runtime_guard.py",
+            r"def f(value):
+    match value:
+        case [item] if ready(item):
+            pass
+        case _:
+            pass
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
