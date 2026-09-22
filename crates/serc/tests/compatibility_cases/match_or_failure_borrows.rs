@@ -225,3 +225,24 @@ fn matches_cpython_match_arm_for_exit_borrow_boundaries() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_borrow_aliased_or_pattern_fallback_copy_boundaries() {
+    for (success, fallback) in [
+        ("value", "raise Error(f'Unsupported: {type(transform)}')"),
+        ("value", "return transform"),
+        (
+            "rank if False else value",
+            "raise Error(f'Unsupported: {type(transform)}')",
+        ),
+        (
+            "value",
+            "record(transform, rank)\n            return transform if rank else value",
+        ),
+    ] {
+        let source = format!(
+            "def f(transform, rank):\n    match transform:\n        case A():\n            return make(transform, rank)\n        case B() | C() as value:\n            return {success}\n        case _:\n            {fallback}\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "aliased_or_pattern_fallback.py");
+    }
+}

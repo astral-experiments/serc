@@ -5,7 +5,7 @@ use rustc_hash::{FxHashMap, FxHasher};
 use smallvec::SmallVec;
 
 use crate::PythonVersion;
-use crate::code_object::{CodeObject, Constant, LocalsIdentity};
+use crate::code_object::{CodeObject, Constant, LocalsIdentity, NonReflexiveKey};
 use crate::target::small_int_bounds_for;
 
 use super::v5::{
@@ -24,6 +24,7 @@ pub(super) enum ObjectKey<'a> {
     Int(u64),
     SignedInt(i64),
     BigInt(bool, &'a [u16]),
+    NonReflexive(NonReflexiveKey),
     Float(u64),
     Complex(u64, u64),
     // A noninterned constant does not share identity with an equal metadata string. CPython's
@@ -252,6 +253,7 @@ fn constants_equal(left: &Constant, right: &Constant) -> bool {
                 digits: right_digits,
             },
         ) => left_negative == right_negative && left_digits == right_digits,
+        (Constant::NonReflexive(left), Constant::NonReflexive(right)) => left.key() == right.key(),
         (Constant::Float(left), Constant::Float(right)) => left.to_bits() == right.to_bits(),
         (
             Constant::Complex {
@@ -322,6 +324,10 @@ fn hash_constant<H: Hasher>(value: &Constant, state: &mut H) {
             5_u8.hash(state);
             negative.hash(state);
             digits.hash(state);
+        }
+        Constant::NonReflexive(number) => {
+            15_u8.hash(state);
+            number.key().hash(state);
         }
         Constant::Float(value) => {
             6_u8.hash(state);
@@ -398,7 +404,10 @@ pub(super) fn slice_member_uses_identity_for(
     match value {
         Constant::Int(value) => *value > maximum.cast_unsigned(),
         Constant::SignedInt(value) => !(minimum..=maximum).contains(value),
-        Constant::BigInt { .. } | Constant::Float(_) | Constant::Complex { .. } => true,
+        Constant::BigInt { .. }
+        | Constant::Float(_)
+        | Constant::Complex { .. }
+        | Constant::NonReflexive(_) => true,
         Constant::String(value) => !is_cached_character(value),
         Constant::SurrogateString(_) => true,
         Constant::Bytes(value) => value.len() > 1,
@@ -421,6 +430,7 @@ pub(super) fn constant_key(value: &Constant) -> ObjectKey<'_> {
         Constant::Int(value) => ObjectKey::Int(*value),
         Constant::SignedInt(value) => ObjectKey::SignedInt(*value),
         Constant::BigInt { negative, digits } => ObjectKey::BigInt(*negative, digits),
+        Constant::NonReflexive(number) => ObjectKey::NonReflexive(number.key()),
         Constant::Float(value) => ObjectKey::Float(value.to_bits()),
         Constant::Complex { real, imag } => ObjectKey::Complex(real.to_bits(), imag.to_bits()),
         Constant::String(value) => ObjectKey::String(value),
@@ -546,6 +556,18 @@ fn constant_sort_key_with_properties<'a>(
                     output.extend_from_slice(&digit.to_le_bytes());
                 }
             }
+            Constant::NonReflexive(number) => match number.value() {
+                Constant::Float(value) => {
+                    output.push(TYPE_BINARY_FLOAT | flag);
+                    output.extend_from_slice(&value.to_le_bytes());
+                }
+                Constant::Complex { real, imag } => {
+                    output.push(TYPE_BINARY_COMPLEX | flag);
+                    output.extend_from_slice(&real.to_le_bytes());
+                    output.extend_from_slice(&imag.to_le_bytes());
+                }
+                _ => unreachable!("non-reflexive values are NaN-bearing numbers"),
+            },
             Constant::Float(value) => {
                 output.push(TYPE_BINARY_FLOAT | flag);
                 output.extend_from_slice(&value.to_le_bytes());

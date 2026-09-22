@@ -36,8 +36,12 @@ const PARTIAL_MODE: &str = "pathlib-posix-source-bytes-partial-v2";
 const PARTIAL_BASELINE_SEMANTICS: &str = "guaranteed-positive";
 const UNKNOWN_DEFAULT: &str = "unknown";
 const DEPENDENCY_POLICY: &str = "fail-if-marshal-depends-on-unknown";
-const RETAINED_NATIVE_POSITIVE_SHA256: Option<&str> =
-    Some("7c4035bbc11d5b0de867d7ac53cd11b1848287134fcf6e3c2ca7aad5da575486");
+// Both reviewed certificates establish the same 804 retained names. The second
+// restores lost proof artifacts from pinned sources; all other identity checks apply.
+const RETAINED_NATIVE_POSITIVE_SHA256S: &[&str] = &[
+    "7c4035bbc11d5b0de867d7ac53cd11b1848287134fcf6e3c2ca7aad5da575486",
+    "c87be884f078331cdbea552567d7fdd8119e016ef2ba0e6d788e07f925c0a2c9",
+];
 const ABSENCE_MODE: &str = "pathlib-posix-source-bytes-partial-v3";
 const EXACT_ABSENCE_MODE: &str = "pathlib-posix-source-bytes-partial-v4";
 const COOKIE_EVIDENCE_SHA256: &str =
@@ -516,7 +520,7 @@ impl Descriptor {
                 "retained native positives require a Python 3.13 guaranteed-positive caller model",
             )?;
             require(
-                RETAINED_NATIVE_POSITIVE_SHA256.is_some_and(|expected| item.sha256 == expected),
+                RETAINED_NATIVE_POSITIVE_SHA256S.contains(&item.sha256.as_str()),
                 "unadmitted retained native positive evidence",
             )?;
         }

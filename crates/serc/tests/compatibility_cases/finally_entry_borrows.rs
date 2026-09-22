@@ -626,3 +626,48 @@ fn matches_cpython_awaited_terminal_if_finally_borrows() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_conditional_body_while_finalizer_borrows() {
+    for body in [
+        "work(value)",
+        "if flag:\n            work(value)",
+        "if flag:\n            work(value)\n        else:\n            other(value)",
+    ] {
+        let source = format!(
+            "def f(value, flag):
+    try:
+        {body}
+    finally:
+        while value.pending:
+            item = value.pending.pop()
+            close(item)
+    report(value)
+"
+        );
+        common::assert_matches_cpython_marshal(&source, "conditional_body_while_finalizer.py");
+    }
+}
+
+#[test]
+fn matches_cpython_nested_conditional_named_recovery_finalizer_borrows() {
+    for prefix in ["", "prepare(value)\n            "] {
+        for recovery in ["a, b, c = error.args", "report(error)", "value = error"] {
+            let source = format!(
+                "def f(value, flag):
+    try:
+        value.state = flag
+        try:
+            {prefix}if flag:
+                work(value)
+        except Exception as error:
+            {recovery}
+    finally:
+        close(value)
+    report(value)
+"
+            );
+            common::assert_matches_cpython_marshal(&source, "nested_named_recovery_finalizer.py");
+        }
+    }
+}

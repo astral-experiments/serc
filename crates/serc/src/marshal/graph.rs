@@ -175,6 +175,7 @@ pub(super) struct ObjectGraph<'a> {
     cached_empty_tuple: Option<ObjectId>,
     cached_scalar_ids: Option<Box<[u32]>>,
     cache_scalars: bool,
+    uncached_percent_constant: bool,
     needs_reference_sorting: bool,
     legacy_qualified_name_aliases: FxHashSet<usize>,
     objects_by_id: Vec<Object>,
@@ -217,6 +218,7 @@ impl<'a> ObjectGraph<'a> {
         let frozenset_recreation_need = collect_explicitly_interned(
             code,
             python_version,
+            initial_intern_state,
             &mut explicitly_interned,
             &mut metadata_tuples,
         );
@@ -246,6 +248,7 @@ impl<'a> ObjectGraph<'a> {
             },
             metadata_aliased_constants: collect_metadata_aliased_constants(code, &metadata_tuples),
             cache_scalars: code.constants.len() >= MIN_CACHED_SCALAR_CONSTANTS,
+            uncached_percent_constant: code.marshal_provenance.uncached_percent_constant,
             metadata_slots,
             ..Self::default()
         };
@@ -671,6 +674,7 @@ fn collect_metadata_tuple_keys<'a>(
 fn collect_explicitly_interned<'a>(
     code: &'a CodeObject,
     python_version: PythonVersion,
+    initial_intern_state: &InitialInternState,
     values: &mut FxHashSet<&'a str>,
     metadata_tuples: &mut FxHashSet<HashedObjectKey<'a>>,
 ) -> FrozensetRecreationNeed {
@@ -717,10 +721,13 @@ fn collect_explicitly_interned<'a>(
         &mut ordinary_first,
     );
     values.extend(qualified_name_values.into_iter().filter(|value| {
+        // Interning metadata replaces its pointer when an equal canonical object
+        // already exists; the class's fresh constant remains a separate plain string.
         recorded_origins
             .get(value)
             .copied()
             .unwrap_or_else(|| !ordinary_first.contains(value))
+            && (should_intern(value) || !initial_intern_state.contains_for(python_version, value))
     }));
     frozenset_recreation_need
 }
@@ -951,6 +958,7 @@ fn collect_qualified_name_origin_from_constant<'a>(
         | Constant::Int(_)
         | Constant::SignedInt(_)
         | Constant::BigInt { .. }
+        | Constant::NonReflexive(_)
         | Constant::Float(_)
         | Constant::Complex { .. }
         | Constant::String(_)
@@ -1065,6 +1073,9 @@ pub(crate) fn validate_initial_intern_state(
     if !initial_intern_state.has_unknown_entries() {
         return Ok(());
     }
+    if python_version != PythonVersion::Py312 {
+        validate_qualified_name_intern_state(code, python_version, initial_intern_state)?;
+    }
     collect_recreated_frozensets(
         code,
         frozenset_recreation_need(code, python_version),
@@ -1072,6 +1083,29 @@ pub(crate) fn validate_initial_intern_state(
         initial_intern_state,
         &mut FxHashSet::default(),
     )
+}
+
+fn validate_qualified_name_intern_state(
+    code: &CodeObject,
+    python_version: PythonVersion,
+    initial_intern_state: &InitialInternState,
+) -> Result<(), CompileError> {
+    if code.marshal_provenance.qualified_name_is_canonical == Some(true)
+        && !should_intern(&code.qualified_name)
+        && initial_intern_state
+            .membership_for(python_version, &code.qualified_name)
+            .is_none()
+    {
+        return Err(CompileError::UnresolvedInternState {
+            value: code.qualified_name.clone(),
+        });
+    }
+    for constant in &code.constants {
+        if let Constant::Code(child) = constant {
+            validate_qualified_name_intern_state(child, python_version, initial_intern_state)?;
+        }
+    }
+    Ok(())
 }
 
 /// Initial canonical identity matters for direct frozen-set string members unless
@@ -1107,7 +1141,8 @@ fn frozenset_intern_dependencies(
             Constant::Tuple(members) | Constant::FrozenSet(members) => {
                 members.iter().all(safe_tuple_member)
             }
-            Constant::Float(_)
+            Constant::NonReflexive(_)
+            | Constant::Float(_)
             | Constant::Complex { .. }
             | Constant::Slice { .. }
             | Constant::Code(_) => false,
@@ -1414,6 +1449,7 @@ fn constant_frozenset_recreation_need(
         | Constant::Int(_)
         | Constant::SignedInt(_)
         | Constant::BigInt { .. }
+        | Constant::NonReflexive(_)
         | Constant::Float(_)
         | Constant::Complex { .. }
         | Constant::String(_)
@@ -1456,6 +1492,7 @@ fn constant_string_recreation_need(
         | Constant::Int(_)
         | Constant::SignedInt(_)
         | Constant::BigInt { .. }
+        | Constant::NonReflexive(_)
         | Constant::Float(_)
         | Constant::Complex { .. }
         | Constant::SurrogateString(_)
@@ -1518,6 +1555,7 @@ fn constant_has_identifier_or_explicit_dependent_frozenset(
         | Constant::Int(_)
         | Constant::SignedInt(_)
         | Constant::BigInt { .. }
+        | Constant::NonReflexive(_)
         | Constant::Float(_)
         | Constant::Complex { .. }
         | Constant::String(_)
@@ -1564,6 +1602,7 @@ fn constant_contains_identifier_or_explicit_dependent_string(
         | Constant::Int(_)
         | Constant::SignedInt(_)
         | Constant::BigInt { .. }
+        | Constant::NonReflexive(_)
         | Constant::Float(_)
         | Constant::Complex { .. }
         | Constant::SurrogateString(_)
@@ -1642,6 +1681,7 @@ fn collect_preinterned_recreated_constant(
         | Constant::Int(_)
         | Constant::SignedInt(_)
         | Constant::BigInt { .. }
+        | Constant::NonReflexive(_)
         | Constant::Float(_)
         | Constant::Complex { .. }
         | Constant::SurrogateString(_)
@@ -1982,6 +2022,7 @@ fn intern_code_constant<'a>(
         | Constant::Int(_)
         | Constant::SignedInt(_)
         | Constant::BigInt { .. }
+        | Constant::NonReflexive(_)
         | Constant::Float(_)
         | Constant::Complex { .. }
         | Constant::SurrogateString(_)
@@ -2188,6 +2229,10 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
         if let Constant::FrozenSet(values) = value {
             self.graph.needs_reference_sorting |=
                 (self.graph.python_version == PythonVersion::Py312 && values.len() > 1)
+                    || (self.graph.uncached_percent_constant
+                        && values
+                            .iter()
+                            .any(|value| matches!(value, Constant::String(value) if value == "%")))
                     || values
                         .iter()
                         .any(|value| matches!(value, Constant::Tuple(_) | Constant::FrozenSet(_)));
@@ -2198,6 +2243,11 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
                 unreachable!("tuple and code constants have dedicated traversal methods")
             }
             Constant::String(value) => {
+                if self.graph.uncached_percent_constant && value == "%" {
+                    return self
+                        .graph
+                        .record_keyed(OccurrenceKind::Constant, ObjectKey::ConstantString(value));
+                }
                 if self.graph.cache_scalars
                     && let Some(character) = CachedObject::character(value)
                 {
@@ -2270,6 +2320,23 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
             graph.frozen_set_members(values)
         } else {
             frozen_set_members_in_wire_order(values)
+        }
+    }
+
+    fn cached_slice_string(&mut self, value: &'code Constant) {
+        if self.graph.uncached_percent_constant
+            && matches!(value, Constant::String(value) if value == "%")
+        {
+            // Slice members bypass the scalar constant cache. The parsed percent
+            // singleton stays distinct from a fresh PyUnicode_Replace winner.
+            self.graph.record_cached_value(
+                OccurrenceKind::Constant,
+                CachedObject::character("%").expect("percent is a Latin-1 character"),
+            );
+        } else {
+            // Other characters retain ordinary canonical interning and can alias
+            // previously emitted names, literals, and other slice members.
+            self.constant(value, ReferenceMode::IfShared);
         }
     }
 

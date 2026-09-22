@@ -1172,3 +1172,45 @@ fn matches_cpython_retained_setup_after_unprotected_record_work() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_retained_setup_after_named_handler_value_return() {
+    for asynchronous in [false, true] {
+        for nested_calls in ["make(value(arg))", "make(value(extra(arg)))"] {
+            let source = format!(
+                "{}def f(flag, other, arg):
+    try:
+        return {}original()
+    except Error as error:
+        if not flag:
+            raise
+        effect(0 if flag else 1, first(arg))
+        return [
+            {nested_calls}
+        ]
+    finally:
+        try:
+            if flag:
+                assert arg is not None
+                {}cleanup(arg)
+        finally:
+            try:
+                if other:
+                    assert arg is not None
+                    {}other_cleanup(arg)
+            finally:
+                {}finish()
+",
+                if asynchronous { "async " } else { "" },
+                if asynchronous { "await " } else { "" },
+                if asynchronous { "await " } else { "" },
+                if asynchronous { "await " } else { "" },
+                if asynchronous { "await " } else { "" },
+            );
+            common::assert_matches_cpython_marshal(
+                &source,
+                &format!("retained_setup_named_value_{asynchronous}_{nested_calls}.py"),
+            );
+        }
+    }
+}

@@ -132,3 +132,102 @@ fn matches_cpython_normalized_except_star_raise_loop() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_except_star_else_footer_locations() {
+    for (filename, source) in [
+        (
+            "except_star_else_footer.py",
+            r"def f():
+    try:
+        work()
+    except* ValueError:
+        recover()
+    else:
+        success()
+",
+        ),
+        (
+            "except_star_named_else_pass_footer.py",
+            r"def f():
+    try:
+        work()
+    except* ValueError as error:
+        recover(error)
+    else:
+        pass
+",
+        ),
+        (
+            "except_star_raising_else_footer.py",
+            r#"def f():
+    try:
+        raise ExceptionGroup("group", [ValueError()])
+    except* ValueError as error:
+        recover(error)
+    else:
+        success()
+"#,
+        ),
+        (
+            "except_star_else_following_work_control.py",
+            r"def f():
+    try:
+        work()
+    except* ValueError:
+        recover()
+    else:
+        success()
+    after()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_except_star_trailing_pass_cleanup_locations() {
+    for (filename, source) in [
+        (
+            "except_star_named_nested_trailing_pass.py",
+            r"def f():
+    try:
+        try:
+            work()
+        except* ValueError as error:
+            recover(error)
+            pass
+    except Exception as caught:
+        finish(caught)
+    after()
+",
+        ),
+        (
+            "except_star_unnamed_nested_trailing_pass.py",
+            r"def f():
+    try:
+        try:
+            work()
+        except* ValueError:
+            recover()
+            pass
+    except Exception as caught:
+        finish(caught)
+    after()
+",
+        ),
+        (
+            "except_star_trailing_pass_control.py",
+            r"def f():
+    try:
+        work()
+    except* ValueError as error:
+        recover(error)
+        pass
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

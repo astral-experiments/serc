@@ -49,16 +49,48 @@ rejections for every CPython-rejected input. Use `--dump-mismatches DIR` to insp
 ## Public corpus compatibility
 
 The separately pinned [mypy_primer snapshot](../corpora/README.md) covers 73,537 `.py` and `.pyi`
-files. Its opt-in CPython 3.14.5 comparison currently freezes 67,850 byte-identical outputs and
-5,527 byte mismatches: **92.47% of 73,377 CPython-accepted inputs**. Of 160 CPython-rejected
-files, Serc rejects 67, accepts 84, and fails internally on 9. Every other failure category is
-zero.
+files. Its opt-in CPython 3.14.5 comparison supplements the required Ruff gate:
 
 ```console
 ./scripts/setup-mypy-primer-corpus
 ./scripts/check-mypy-primer-compatibility /path/to/python3.14.5
 ```
 
+The September 22, 2026 measurements use CPython 3.14.5 and Serc
+[`d479b28`](https://github.com/astral-sh/serc/commit/d479b28776485057ef889ab3d4959cb07cb82eac).
+Corpus revisions and membership are unchanged. The
+[results summary](../corpora/results/compatibility-2026-09-22-public-followup.json) records
+compiler and corpus identities, every outcome category, and evidence hashes.
+
+| Corpus | Files | CPython-rejected | Byte-identical accepted | Byte mismatches | Accepted-input compiler failures | Accepted-input match rate |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Ruff fixtures | 2,451 | 221 | 2,230 | 0 | 0 | 100% |
+| NumPy `v2.4.6` | 505 | 0 | 505 | 0 | 0 | 100% |
+| mypy-primer snapshot | 73,537 | 160 | 73,244 | 133 | 0 | 99.82% |
+| **Combined** | **76,493** | **381** | **75,979** | **133** | **0** | **99.83%** |
+
+Of the 160 CPython-rejected mypy-primer files, Serc matches 123 rejections, accepts 29, and
+fails internally on 8. There are no compiler failures on accepted inputs, unsupported inputs,
+parse/decode mismatches, non-UTF-8 inputs, or oracle failures. Comparisons use default intern
+state and raw marshal bytes, without caller profiles, normalization, or nondeterminism exclusions.
+
 The check verifies the snapshot before comparing source bytes and freezes each outcome category
-independently. Append `--limit 100` for a prefix diagnostic without the full outcome baseline. Snapshot identity and update instructions live in the
-[corpus guide](../corpora/README.md).
+independently. Append `--limit 100` for a prefix diagnostic without the full outcome baseline. Snapshot identity
+and update instructions live in the [corpus guide](../corpora/README.md).
+
+## Holdout compatibility
+
+The same September 22 compiler and CPython target were tested against four OSS projects absent
+from the mypy-primer snapshot. Revisions and membership are unchanged: tracked regular `.py`
+files, excluding symlinks and stubs. Every CPython-accepted file matched byte for byte.
+
+| Holdout project | Files | CPython-rejected | Byte-identical accepted | Byte mismatches | Accepted-input match rate |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| [Django `bf5e73c`](https://github.com/django/django/tree/bf5e73c576c8c7d8b3ef1c03a22cf724dbb2f306) | 2,927 | 1 | 2,926 | 0 | 100% |
+| [Airflow `cad6220`](https://github.com/apache/airflow/tree/cad6220034e87c586eb87e14b5a75f4b82984fd0) | 7,621 | 0 | 7,621 | 0 | 100% |
+| [Transformers `ab1771c`](https://github.com/huggingface/transformers/tree/ab1771c9e42891d893189978a8009426d70b4688) | 4,643 | 0 | 4,643 | 0 | 100% |
+| [Ansible `3217c35`](https://github.com/ansible/ansible/tree/3217c352bb7b77392317aac0cf8b859d7d43b5b5) | 1,810 | 0 | 1,810 | 0 | 100% |
+| **Combined holdout** | **17,001** | **1** | **17,000** | **0** | **100%** |
+
+Serc matched the one CPython-rejected Django input. All other failure categories were zero.
+This holdout comparison is a separate diagnostic, not part of the required CI gate.

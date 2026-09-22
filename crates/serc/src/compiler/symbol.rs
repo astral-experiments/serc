@@ -858,9 +858,29 @@ impl Compiler<'_> {
         // its defaults, decorators, and nested scopes; the disposable parent is never assembled.
         enum SkippedAction<'ast> {
             Origins(Vec<(Constant, bool)>),
+            StaticAttribute(&'ast str),
             Statement(&'ast Stmt),
             Expression(&'ast Expr),
             FirstExpression(&'ast Expr),
+        }
+
+        #[derive(Default)]
+        struct UnwindExitDetector(bool);
+
+        impl<'ast> Visitor<'ast> for UnwindExitDetector {
+            fn visit_stmt(&mut self, statement: &'ast Stmt) {
+                if self.0 || matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                    return;
+                }
+                if matches!(
+                    statement,
+                    Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_)
+                ) {
+                    self.0 = true;
+                } else {
+                    walk_stmt(self, statement);
+                }
+            }
         }
 
         #[derive(Default)]
@@ -871,6 +891,7 @@ impl Compiler<'_> {
             constants: Vec<Constant>,
             folded_expressions: Vec<&'ast Expr>,
             has_untracked_collection: bool,
+            reorder_try_suites: bool,
             register_literals: bool,
             register_folds: bool,
             string_origin_constants: Vec<(Constant, bool)>,
@@ -1126,6 +1147,19 @@ impl Compiler<'_> {
                     {
                         return;
                     }
+                    Stmt::AugAssign(assignment) => {
+                        // Augmented assignment evaluates its target but does not lower it
+                        // through the ordinary attribute Store path.
+                        match assignment.target.as_ref() {
+                            Expr::Attribute(attribute) => {
+                                self.visit_expr(&attribute.value);
+                                self.names.push((attribute.attr.as_str().to_string(), true));
+                            }
+                            target => self.visit_expr(target),
+                        }
+                        self.visit_expr(&assignment.value);
+                        return;
+                    }
                     Stmt::AnnAssign(assignment) => {
                         let build = self.build_discarded
                             && self.legacy_compiler.is_some()
@@ -1138,7 +1172,9 @@ impl Compiler<'_> {
                         if let Some(value) = &assignment.value {
                             self.visit_expr(value);
                             self.visit_expr(&assignment.target);
-                        } else if self.legacy_compiler.is_some() {
+                        } else {
+                            // Even an unevaluated annotation still evaluates the
+                            // owner or index of a complex assignment target.
                             match assignment.target.as_ref() {
                                 Expr::Attribute(attribute) => self.visit_expr(&attribute.value),
                                 Expr::Subscript(subscript) => {
@@ -1193,6 +1229,17 @@ impl Compiler<'_> {
                         self.visit_expr(&statement.target);
                         self.visit_body(&statement.body);
                         self.visit_body(&statement.orelse);
+                        return;
+                    }
+                    Stmt::Try(statement) if self.reorder_try_suites && !statement.is_star => {
+                        // Ordinary try codegen visits the else suite before handlers.
+                        // Except-star keeps the AST order: handlers before else.
+                        self.visit_body(&statement.body);
+                        self.visit_body(&statement.orelse);
+                        for handler in &statement.handlers {
+                            self.visit_except_handler(handler);
+                        }
+                        self.visit_body(&statement.finalbody);
                         return;
                     }
                     Stmt::FunctionDef(definition) => {
@@ -1622,6 +1669,13 @@ impl Compiler<'_> {
                         }
                     }
                     Expr::Attribute(attribute) => {
+                        if self.record_string_origins
+                            && attribute.ctx == ExprContext::Store
+                            && matches!(attribute.value.as_ref(), Expr::Name(name) if name.id.as_str() == "self")
+                        {
+                            self.actions
+                                .push(SkippedAction::StaticAttribute(attribute.attr.as_str()));
+                        }
                         self.visit_expr(&attribute.value);
                         self.names.push((attribute.attr.as_str().to_string(), true));
                         return;
@@ -1762,7 +1816,13 @@ impl Compiler<'_> {
             }
         }
 
+        // Returns and loop exits can compile an enclosing finalizer before later
+        // suites. Preserve the existing admission traversal until those copies are
+        // replayed; raises do not inline finalizers during code generation.
+        let mut unwind_exits = UnwindExitDetector::default();
+        unwind_exits.visit_body(body);
         let mut collector = Collector {
+            reorder_try_suites: !unwind_exits.0,
             register_literals,
             register_folds,
             build_discarded: self.context.requires_discarded_builders(),
@@ -1805,6 +1865,12 @@ impl Compiler<'_> {
             (build_discarded || first_expression.is_some()).then(|| self.discarded_builder());
         for action in actions {
             match action {
+                SkippedAction::StaticAttribute(name) => {
+                    self.context.record_static_attribute(
+                        name,
+                        matches!(self.unit.scope, Scope::Class { .. }),
+                    );
+                }
                 SkippedAction::Origins(origins) => {
                     for (constant, interned) in origins {
                         self.context

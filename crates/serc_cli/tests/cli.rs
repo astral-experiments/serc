@@ -176,6 +176,19 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
             // Preserve legacy boolean inversion during recursive literal-aware folding.
             "value = ((~True,),)",
             r#"value = ((~False,), "\ud800")"#,
+            // Recursive source-aware folding keeps target-specific tuple truth steps.
+            r"value = not ()",
+            r#"value = not ("\ud800",)"#,
+            r#"value = ((not ("\ud800",)), "\udfff")"#,
+            r"value = (not (),) * 2",
+            r#"value = (not (), "\ud800")[0]"#,
+            r"value = (17, 23)[not ()]",
+            r#"value = (not ("\ud800",)) + 1"#,
+            r#"value = (not (),) + ("\ud800",)"#,
+            r#"value = not (runtime(), "\ud800")"#,
+            // Preserve numeric allocation origins through the same recursive path.
+            r#"value = (((1e309 - 1e309), "\ud800"),) * 2"#,
+            r"value = (-(1e309 - 1e309), +(1e309 - 1e309))",
             // Preserve surrogate code points through composite constant folding.
             "value = \"\\ud800\"[0]",
             "value = \"\\ud800x\"[-1]",

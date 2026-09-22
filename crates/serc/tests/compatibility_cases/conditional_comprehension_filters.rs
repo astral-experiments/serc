@@ -62,3 +62,24 @@ fn matches_cpython_generator_conditional_filter_true_locations() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn conditional_loop_filters_preserve_copied_exit_join_lines() {
+    for source in [
+        r"def check_type(obj, checks):
+    for check in checks:
+        if isinstance(obj, check) if isinstance(check, type) else check(obj):
+            return True
+    return False
+",
+        r#"def validate(rows):
+    for check in rows:
+        assert not (
+            all(check) if (hasattr(check, "__iter__") and len(check) > 0) else check
+        )
+    done()
+"#,
+    ] {
+        common::assert_matches_cpython_marshal(source, "conditional_loop_exit_join_lines.py");
+    }
+}

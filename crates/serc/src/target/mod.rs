@@ -291,6 +291,36 @@ mod tests {
     }
 
     #[test]
+    fn neutral_bootstrap_lookup_covers_source_derived_families() {
+        use super::cpython_3_14_5::BOOTSTRAP_INTERNED_STRINGS;
+
+        assert!(
+            BOOTSTRAP_INTERNED_STRINGS
+                .windows(2)
+                .all(|values| values[0] < values[1])
+        );
+        for value in BOOTSTRAP_INTERNED_STRINGS {
+            assert!(
+                is_preinterned_string(value) || !cfg!(target_os = "linux"),
+                "missing source-derived bootstrap string {value:?}",
+            );
+        }
+        for value in [
+            "location",
+            "_WeakValueDictionary.__init__.<locals>.KeyedRef",
+            "FileFinder.path_hook.<locals>.path_hook_for_FileFinder",
+            "normalize_encoding",
+            "us",
+        ] {
+            assert!(BOOTSTRAP_INTERNED_STRINGS.binary_search(&value).is_ok());
+            assert_eq!(is_preinterned_string(value), cfg!(target_os = "linux"));
+        }
+        for value in ["auto", "not", "char", "function"] {
+            assert!(!is_preinterned_string(value));
+        }
+    }
+
+    #[test]
     fn preinterned_lookup_preserves_exact_membership() {
         assert!(
             PREINTERNED_STRINGS

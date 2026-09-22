@@ -25,11 +25,11 @@ DEFAULT_CORPUS = REPO_ROOT / "target" / "corpora" / "mypy-primer"
 CATALOG_URL = "https://github.com/hauntsaninja/mypy_primer"
 SOURCE_SUFFIXES = (".py", ".pyi")
 LOCK_FORMAT = 1
-EXPECTED_BYTE_MISMATCHES = 5_527
+EXPECTED_BYTE_MISMATCHES = 133
 EXPECTED_CPYTHON_REJECTED = 160
-EXPECTED_MATCHED_REJECTIONS = 67
-EXPECTED_REJECTION_MISMATCHES = 84
-EXPECTED_COMPILER_FAILURES = 9
+EXPECTED_MATCHED_REJECTIONS = 123
+EXPECTED_REJECTION_MISMATCHES = 29
+EXPECTED_COMPILER_FAILURES = 8
 HEX_REVISION = re.compile(r"[0-9a-f]{40}\Z")
 SAFE_ID = re.compile(r"[A-Za-z0-9._-]+\Z")
 
@@ -610,7 +610,15 @@ def compatibility_command(
         "pyi",
     ]
     if limit is None:
-        expected_exact = files - EXPECTED_BYTE_MISMATCHES - EXPECTED_CPYTHON_REJECTED
+        # Compiler failures can occur on accepted or rejected inputs. Subtract
+        # disjoint outcomes; the CPython rejection count is checked separately.
+        expected_exact = (
+            files
+            - EXPECTED_BYTE_MISMATCHES
+            - EXPECTED_MATCHED_REJECTIONS
+            - EXPECTED_REJECTION_MISMATCHES
+            - EXPECTED_COMPILER_FAILURES
+        )
         expected_outcomes = [
             ("exact", expected_exact),
             ("byte-mismatch", EXPECTED_BYTE_MISMATCHES),

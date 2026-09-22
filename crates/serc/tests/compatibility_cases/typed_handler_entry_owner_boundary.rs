@@ -55,3 +55,22 @@ fn matches_cpython_marshal_for_unnamed_handler_continuations_into_retained_setup
         }
     }
 }
+
+#[test]
+fn matches_cpython_marshal_for_zero_argument_method_handler_dispatch() {
+    for (declaration, suspension) in [
+        ("def", ""),
+        ("async def", ""),
+        ("def", "    yield None\n"),
+        ("async def", "    yield None\n"),
+    ] {
+        for expression in ["tuple(mapping.keys())", "tuple(mapping.owner.keys())"] {
+            for binding in ["", " as error"] {
+                let source = format!(
+                    "{declaration} f(mapping):\n{suspension}    try:\n        work()\n    except FirstError:\n        return\n    except {expression}{binding}:\n        recover()\n    return\n"
+                );
+                assert_matches_cpython_marshal(&source, "method_handler_dispatch.py");
+            }
+        }
+    }
+}

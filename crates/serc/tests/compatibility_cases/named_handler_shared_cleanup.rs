@@ -302,3 +302,58 @@ fn named_except_star_conditional_exits_copy_name_cleanup() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn protected_copy_plans_include_predecessors_of_handler_cleanup_sources() {
+    for handler in ["Exception as error", "Exception"] {
+        for returned in ["left, right", "left, right, enabled"] {
+            let source = format!(
+                "def read(a, b, c, enabled):
+    left = []
+    right = []
+    try:
+        if a:
+            left.append(a)
+        elif b:
+            right.append(b)
+        elif c:
+            left.append(c)
+    except {handler}:
+        if enabled:
+            left.append(a)
+        else:
+            right.append(b)
+    return {returned}
+"
+            );
+            common::assert_matches_cpython_marshal(&source, "handler_cleanup_copy_order.py");
+        }
+    }
+}
+
+#[test]
+fn protected_copy_plan_preserves_inner_branch_and_handler_cleanup_order() {
+    common::assert_matches_cpython_marshal(
+        "def read(a, b, c, inner, enabled):
+    left = []
+    right = []
+    try:
+        if a:
+            left.append(a)
+        elif b:
+            if inner:
+                left.append(b)
+            else:
+                right.append(b)
+        elif c:
+            left.append(c)
+    except Exception as error:
+        if enabled:
+            left.append(a)
+        else:
+            right.append(b)
+    return left, right
+",
+        "nested_handler_cleanup_copy_order.py",
+    );
+}

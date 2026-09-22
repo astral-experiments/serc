@@ -641,3 +641,108 @@ fn matches_cpython_async_generator_and_nested_raising_manager_join_owners() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn preserves_trailing_pass_after_compound_try_body() {
+    for definition in ["def", "async def"] {
+        for body in [
+            "if flag:\n    work()",
+            "with manager():\n    work()",
+            "try:\n    work()\nexcept Error:\n    other()",
+        ] {
+            let source = format!(
+                "{definition} f(flag):\n    try:\n        {}\n        pass\n    finally:\n        cleanup()\n",
+                body.replace('\n', "\n        "),
+            );
+            common::assert_matches_cpython_marshal(&source, "compound_try_body_trailing_pass.py");
+        }
+    }
+}
+
+#[test]
+fn normal_finally_comparisons_reuse_their_original_owned_slots() {
+    for (scope, suspension) in [
+        ("def", "work()"),
+        ("def", "yield work()"),
+        ("async def", "await work()"),
+        ("async def", "yield await work()"),
+    ] {
+        for protected in [
+            format!("while value:\n    {suspension}\n"),
+            format!("try:\n    {suspension}\nexcept Error as error:\n    raise error\n"),
+        ] {
+            for comparison in ["value > 0", "value == limit", "state.inner.value == ACTIVE"] {
+                let body = format!(
+                    "try:\n{}finally:\n    if {comparison}:\n        clean()\n",
+                    indent(&protected),
+                );
+                let source = format!(
+                    "{scope} f(manager, value, limit, state):\n    with manager:\n{}",
+                    indent(&indent(&body)),
+                );
+                common::assert_matches_cpython_marshal(
+                    &source,
+                    "normal_finally_comparison_slot.py",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn preserves_pass_finalizer_before_copied_return() {
+    for (definition, body) in [
+        ("def", "work()"),
+        ("def", "yield work()"),
+        ("async def", "await work()"),
+    ] {
+        for returned in ["None", "value", "42", "work()"] {
+            let source = format!(
+                "{definition} f(value):\n    try:\n        {body}\n    finally:\n        pass\n    return {returned}\n",
+            );
+            common::assert_matches_cpython_marshal(&source, "pass_finalizer_copied_return.py");
+        }
+    }
+}
+
+#[test]
+fn completed_value_join_preserves_later_manager_finally_owners() {
+    for (definition, body) in [
+        ("def", "work()"),
+        ("def", "yield work()"),
+        ("async def", "await work()"),
+    ] {
+        for value in [
+            "value if enabled else None",
+            "work() if value is not None else 0",
+        ] {
+            let source = format!(
+                "{definition} f(manager, value, enabled):\n    with manager:\n        try:\n            {body}\n        except Error:\n            raise\n        finally:\n            if value:\n                item = {value}\n                with manager:\n                    work(item)\n",
+            );
+            common::assert_matches_cpython_marshal(
+                &source,
+                "completed_value_join_manager_finally.py",
+            );
+        }
+    }
+}
+
+#[test]
+fn completed_recovery_preserves_later_manager_finally_owners() {
+    for (definition, body) in [
+        ("def", "work()"),
+        ("def", "yield work()"),
+        ("async def", "await work()"),
+    ] {
+        for recovery in ["poll()", "while poll():\n    pass"] {
+            let source = format!(
+                "{definition} f(manager, value):\n    with manager:\n        try:\n            {body}\n        finally:\n            if value:\n                try:\n{}                except Error:\n                    pass\n                try:\n                    work()\n                except Error:\n                    pass\n",
+                indent(&indent(&indent(&indent(&indent(&format!("{recovery}\n")))))),
+            );
+            common::assert_matches_cpython_marshal(
+                &source,
+                "completed_recovery_manager_finally.py",
+            );
+        }
+    }
+}

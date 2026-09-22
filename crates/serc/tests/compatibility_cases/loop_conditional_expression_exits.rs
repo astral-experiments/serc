@@ -141,3 +141,16 @@ fn matches_cpython_shared_conditional_discard_at_loop_branch_tail() {
         common::assert_matches_cpython_marshal(&source, "loop_branch_conditional_discard.py");
     }
 }
+
+#[test]
+fn matches_cpython_borrow_runtime_conditional_loop_branch_entry() {
+    for condition in [
+        "value < other if flag else value > other",
+        "check(value) if check(flag) else check(other)",
+    ] {
+        let source = format!(
+            "def f(flag, value, other, owner, items, check):\n    for item in items:\n        if {condition}:\n            owner.append(value)\n        else:\n            owner.append(other)\n    return owner\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "runtime_if_expression_loop_entry.py");
+    }
+}

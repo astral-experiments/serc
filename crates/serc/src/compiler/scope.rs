@@ -333,6 +333,7 @@ pub(super) struct ScopeBodyFacts {
     pub(super) nested_lambda_requirements: BTreeSet<String>,
     pub(super) nested_generator_requirements: BTreeSet<String>,
     pub(super) nested_annotation_scope_requirements: BTreeSet<String>,
+    nested_annotation_class_closure: bool,
     pub(super) generator_named_targets: FxHashSet<String>,
     pub(super) inlined_comprehension_cellvars: FxHashSet<String>,
     pub(super) has_function_definition: bool,
@@ -736,6 +737,7 @@ struct ClassPlan {
     comprehension_targets: Vec<(NameId, bool)>,
     comprehension_cells: FxHashSet<NameId>,
     required: FxHashSet<NameId>,
+    type_parameter_names: FxHashSet<NameId>,
     enclosing_names: FxHashMap<NameId, NameId>,
     needs_class_closure: bool,
     needs_classdict: bool,
@@ -783,6 +785,7 @@ impl ClassPlan {
             nested_lambda_requirements,
             nested_generator_requirements,
             nested_annotation_scope_requirements: annotation_scope_requirements,
+            nested_annotation_class_closure,
             has_function_definition,
             has_generic_definition,
             has_type_alias,
@@ -889,8 +892,9 @@ impl ClassPlan {
         }
         required.remove("__conditional_annotations__");
 
-        let needs_class_closure =
-            child_needs_class_closure || nested_lambda_requirements.contains("__class__");
+        let needs_class_closure = child_needs_class_closure
+            || nested_lambda_requirements.contains("__class__")
+            || nested_annotation_class_closure;
         let needs_classdict = has_type_alias
             || has_generic_definition
             || deferred_annotations
@@ -919,6 +923,12 @@ impl ClassPlan {
             comprehension_targets,
             comprehension_cells: names.intern_set(inlined_comprehension_cellvars),
             required: names.intern_set(required),
+            type_parameter_names: definition
+                .type_params
+                .iter()
+                .flat_map(|parameters| parameters.iter())
+                .map(|parameter| names.intern(parameter.name().as_str()))
+                .collect(),
             enclosing_names: FxHashMap::default(),
             needs_class_closure,
             needs_classdict,
@@ -1083,6 +1093,12 @@ impl ScopeArena {
             .any(|node| matches!(node.plan, ScopePlan::Class(_)))
     }
 
+    pub(super) fn has_nested_class_scopes(&self) -> bool {
+        self.by_parent_and_origin
+            .keys()
+            .any(|(parent, origin)| parent.0 != 0 && matches!(origin, ScopeOrigin::Class(_, _)))
+    }
+
     pub(super) fn analyze(body: &[Stmt]) -> Self {
         Self::analyze_with_python_version(body, PythonVersion::Py314)
     }
@@ -1235,18 +1251,9 @@ impl ScopeArena {
         enclosing_private_name: Option<&str>,
     ) {
         let facts = if !self.deferred_annotations && !future_annotations {
-            ScopeBodyFactsCollector::collect(
-                &definition.body,
-                false,
-                ScopeBodyContext::LegacyClass,
-                true,
-            )
+            ScopeBodyFactsCollector::collect(&definition.body, false, ScopeBodyContext::Class, true)
         } else {
-            ScopeBodyFacts::for_class(
-                &definition.body,
-                future_annotations,
-                !self.deferred_annotations,
-            )
+            ScopeBodyFacts::for_class(&definition.body, future_annotations)
         };
         let (method_requirements, method_annotation_references) =
             self.nested_function_requirements(id);
@@ -1342,6 +1349,8 @@ impl ScopeArena {
             .flat_map(|plan| {
                 plan.required
                     .iter()
+                    // The synthetic generic scope provides these cells to the class.
+                    .filter(|name| !plan.type_parameter_names.contains(*name))
                     .map(|name| plan.enclosing_names.get(name).copied().unwrap_or(*name))
             })
             .collect()
@@ -2334,7 +2343,8 @@ impl LocalCollector {
                     if let Expr::Name(name) = statement.name.as_ref() {
                         self.insert(name.id.as_str());
                     }
-                    self.collect_expression(&statement.value);
+                    // The value executes in its own annotation scope, so its
+                    // comprehension targets cannot claim enclosing local slots.
                 }
                 Stmt::For(statement) => {
                     self.collect_expression(&statement.iter);
@@ -2759,17 +2769,8 @@ impl ScopeBodyFacts {
         ScopeBodyFactsCollector::collect(body, true, ScopeBodyContext::Function, false)
     }
 
-    pub(super) fn for_class(
-        body: &[Stmt],
-        future_annotations: bool,
-        legacy_class_scope: bool,
-    ) -> Self {
-        let context = if legacy_class_scope {
-            ScopeBodyContext::LegacyClass
-        } else {
-            ScopeBodyContext::Class
-        };
-        ScopeBodyFactsCollector::collect(body, future_annotations, context, false)
+    pub(super) fn for_class(body: &[Stmt], future_annotations: bool) -> Self {
+        ScopeBodyFactsCollector::collect(body, future_annotations, ScopeBodyContext::Class, false)
     }
 }
 
@@ -2777,7 +2778,6 @@ impl ScopeBodyFacts {
 enum ScopeBodyContext {
     Function,
     Class,
-    LegacyClass,
 }
 
 struct ScopeBodyFactsCollector<'ast> {
@@ -2787,7 +2787,7 @@ struct ScopeBodyFactsCollector<'ast> {
     skip_annotations: bool,
     collect_function_scope_facts: bool,
     eager_function_annotations: bool,
-    legacy_class_scope: bool,
+    class_scope: bool,
     generator_depth: usize,
     inlined_comprehension_depth: usize,
     seen_inlined_comprehension_targets: FxHashSet<String>,
@@ -2820,7 +2820,7 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
         eager_function_annotations: bool,
     ) -> ScopeBodyFacts {
         let collect_function_scope_facts = matches!(context, ScopeBodyContext::Function);
-        let legacy_class_scope = matches!(context, ScopeBodyContext::LegacyClass);
+        let class_scope = matches!(context, ScopeBodyContext::Class);
         let mut collector = Self {
             facts: ScopeBodyFacts::default(),
             references: FxHashSet::default(),
@@ -2828,7 +2828,7 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
             skip_annotations,
             collect_function_scope_facts,
             eager_function_annotations,
-            legacy_class_scope,
+            class_scope,
             generator_depth: 0,
             inlined_comprehension_depth: 0,
             seen_inlined_comprehension_targets: FxHashSet::default(),
@@ -2970,6 +2970,32 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
 
     fn collect_type_alias(&mut self, statement: &'ast ruff_python_ast::StmtTypeAlias) {
         self.facts.has_type_alias = true;
+        if self.class_scope
+            && !statement.type_params.iter().any(|parameters| {
+                parameters
+                    .iter()
+                    .any(|parameter| parameter.name().as_str() == "__class__")
+            })
+        {
+            let bounds_and_defaults = statement
+                .type_params
+                .iter()
+                .flat_map(|parameters| parameters.iter())
+                .flat_map(|parameter| {
+                    let bound = match parameter {
+                        TypeParam::TypeVar(parameter) => parameter.bound.as_deref(),
+                        TypeParam::TypeVarTuple(_) | TypeParam::ParamSpec(_) => None,
+                    };
+                    bound.into_iter().chain(parameter.default())
+                });
+            // Nested functions bypass the class namespace and still need its
+            // synthetic cell, even when a class attribute shadows `__class__`.
+            self.facts.nested_annotation_class_closure |= std::iter::once(statement.value.as_ref())
+                .chain(bounds_and_defaults)
+                .any(|expression| {
+                    nested_expression_required_names(expression).contains("__class__")
+                });
+        }
         let mut required = expression_required_names(&statement.value);
         if let Some(type_params) = statement.type_params.as_deref() {
             let type_names: BTreeSet<_> = type_params
@@ -3015,7 +3041,12 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
                 self.collect_class_header(definition);
                 return;
             }
-            Stmt::TypeAlias(statement) => self.collect_type_alias(statement),
+            Stmt::TypeAlias(statement) => {
+                // The alias value and type parameters own annotation scopes. Their
+                // free requirements were collected after filtering bound parameters.
+                self.collect_type_alias(statement);
+                return;
+            }
             Stmt::Assign(assignment) if self.collect_function_scope_facts => {
                 for target in &assignment.targets {
                     self.visit_expr(target);
@@ -3090,7 +3121,7 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
             );
             return;
         }
-        if self.legacy_class_scope
+        if self.class_scope
             && let Expr::Generator(generator) = expression
         {
             // A generator owns its iteration targets. Only its free references escape
@@ -3534,50 +3565,6 @@ pub(super) fn type_parameter_required_names(
         }
     }
     required
-}
-
-pub(super) fn class_static_attributes(body: &[Stmt]) -> Vec<String> {
-    #[derive(Default)]
-    struct Collector {
-        attributes: BTreeSet<String>,
-    }
-
-    impl<'ast> Visitor<'ast> for Collector {
-        fn visit_stmt(&mut self, statement: &'ast Stmt) {
-            // A nested class becomes the nearest enclosing class compiler for
-            // any `self.attr` stores in its body.
-            if matches!(statement, Stmt::ClassDef(_)) {
-                return;
-            }
-            // CPython's augmented-assignment lowering and an annotation without
-            // a value never pass the attribute through the ordinary Store path.
-            if matches!(statement, Stmt::AugAssign(_))
-                || matches!(statement, Stmt::AnnAssign(annotation) if annotation.value.is_none())
-            {
-                return;
-            }
-            walk_stmt(self, statement);
-        }
-
-        fn visit_expr(&mut self, expression: &'ast Expr) {
-            if let Expr::Attribute(attribute) = expression
-                && attribute.ctx == ExprContext::Store
-                && matches!(
-                    attribute.value.as_ref(),
-                    Expr::Name(name) if name.id.as_str() == "self"
-                )
-            {
-                self.attributes.insert(attribute.attr.as_str().to_string());
-            }
-            walk_expr(self, expression);
-        }
-    }
-
-    let mut collector = Collector::default();
-    for statement in body {
-        collector.visit_stmt(statement);
-    }
-    collector.attributes.into_iter().collect()
 }
 
 pub(super) fn collect_target_names(target: &Expr, names: &mut Vec<String>) {

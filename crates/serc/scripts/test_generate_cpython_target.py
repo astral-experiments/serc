@@ -169,7 +169,14 @@ class TargetSelectionTest(unittest.TestCase):
                     len(generator.read_startup_strings()), supplement_count
                 )
         generator.select_target_version("3.14")
-        self.assertEqual(generator.TARGET_INPUTS, generator.MODERN_TARGET_INPUTS)
+        self.assertEqual(
+            generator.TARGET_INPUTS,
+            tuple(
+                dict.fromkeys(
+                    (*generator.MODERN_TARGET_INPUTS, *generator.BOOTSTRAP_INPUTS)
+                )
+            ),
+        )
 
     def test_shared_legacy_semantic_properties_are_source_checked(self) -> None:
         from generate_legacy_target import render_legacy_opcodes
@@ -268,6 +275,71 @@ const struct opcode_metadata _PyOpcode_opcode_metadata[271] = {
             generator.parse_opcode_flags(source),
             {"RESUME": {"HAS_ARG_FLAG", "HAS_EVAL_BREAK_FLAG"}},
         )
+
+
+class BootstrapDerivationTest(unittest.TestCase):
+    def test_retained_functions_own_all_nested_code_and_constants(self) -> None:
+        from generate_cpython_bootstrap import derive_module
+
+        result = derive_module(
+            "def owner():\n"
+            "    class Nested:\n"
+            "        def method(self):\n"
+            "            return ('retained_identifier',)\n"
+            "    return Nested\n"
+            "raise RuntimeError('must never execute')\n",
+            "<frozen example>",
+        )
+        self.assertIn("owner.<locals>.Nested", result["retained_code_strings"])
+        self.assertIn("owner.<locals>.Nested.method", result["retained_code_strings"])
+        self.assertIn("retained_identifier", result["retained_code_strings"])
+        self.assertIn("<frozen example>", result["retained_code_strings"])
+        self.assertEqual(result["retained_code_owners"], ["owner:1"])
+
+    def test_unexecuted_branch_names_are_immortal_but_constants_are_not(self) -> None:
+        from generate_cpython_bootstrap import derive_module
+
+        result = derive_module(
+            "if _MS_WINDOWS:\n"
+            "    def unused(unused_argument):\n"
+            "        return 'transient_identifier'\n"
+            "else:\n"
+            "    def retained(retained_argument):\n"
+            "        return 'live_identifier'\n",
+            "<frozen example>",
+        )
+        self.assertIn("unused_argument", result["immortal_identifiers"])
+        self.assertNotIn("transient_identifier", result["retained_code_strings"])
+        self.assertIn("live_identifier", result["retained_code_strings"])
+        self.assertEqual(result["retained_code_owners"], ["retained:5"])
+
+    def test_literal_owners_retain_complete_dictionary_keys_and_values(self) -> None:
+        from generate_cpython_bootstrap import derive_module
+
+        result = derive_module(
+            "aliases = {'first_alias': 'first_codec', 'second_alias': 'second_codec'}\n"
+            "discarded = 'released_identifier'\n"
+            "discarded = None\n",
+            "encodings/example.py",
+        )
+        self.assertEqual(
+            result["retained_literal_strings"],
+            ["first_alias", "first_codec", "second_alias", "second_codec"],
+        )
+        self.assertNotIn("encodings/example.py", result["retained_code_strings"])
+
+    def test_unverified_lifetimes_fail_closed(self) -> None:
+        from generate_cpython_bootstrap import derive_module
+
+        for source in [
+            "def owner(): pass\nowner = None",
+            "def owner(): pass\ndel owner",
+            "def owner(): pass\ndef replace():\n    global owner\n    owner = None",
+            "@unknown_decorator\ndef owner(): pass",
+            "if unknown_condition:\n    def owner(): pass",
+        ]:
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                derive_module(source, "<frozen example>")
 
 
 if __name__ == "__main__":

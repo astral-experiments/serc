@@ -1370,10 +1370,52 @@ impl OptimizationPipeline {
                             );
                             instruction == original
                         })();
+                        // A nested source join can contain an authored Pass followed only by
+                        // its enclosing branch's jump. CPython still sees that NOP when it
+                        // visits the earlier incoming jump; compaction transfers the Pass's
+                        // location to the branch jump only after all blocks were optimized.
+                        let original_forward_pass_head = (|| {
+                            if self.python_version < crate::PythonVersion::Py314
+                                || !self.original_nop_targets.contains(label)
+                                || instruction.opcode != JUMP_FORWARD
+                                || instruction.location.line < 0
+                            {
+                                return false;
+                            }
+                            let (Some(depth), Operand::Forward(target)) =
+                                (instruction.depth_after(), instruction.operand())
+                            else {
+                                return false;
+                            };
+                            let Some((Item::Instruction(tail), labels)) =
+                                graph[block].items().split_last()
+                            else {
+                                return false;
+                            };
+                            if *tail != instruction
+                                || !labels.iter().any(|item| matches!(item, Item::Label(entry)
+                                    if self.exception_owner_provenance.source_boundaries.contains(entry)
+                                        && self.exception_owner_provenance.block_boundaries.contains(entry)))
+                                || !labels.iter().all(|item| matches!(item, Item::Label(entry)
+                                    if self.original_nop_targets.contains(entry)
+                                        && self.exception_owner_provenance.omitted_nop_counts.get(entry) == Some(&1)
+                                        && self.exception_owner_provenance.omitted_nop_locations.get(entry) == Some(&instruction.location)))
+                            {
+                                return false;
+                            }
+                            instruction
+                                == Instruction::new(
+                                    JUMP_FORWARD,
+                                    Operand::Forward(target),
+                                    instruction.location,
+                                    Some(depth),
+                                )
+                        })();
                         // A jump retained as a source-position NOP remains a CFG boundary.
                         if instruction.jump_policy.allows_threading_target()
                             && !instruction.jump_policy.always_retains_nop()
                             && !original_loop_tail_nop
+                            && !original_forward_pass_head
                             // This alias enters an authored Pass before the inner try/except's
                             // POP_BLOCK/JUMP pair. Its later try-end alias still enters the
                             // pair itself; only that alias can copy the cleanup's owner.
@@ -1657,8 +1699,8 @@ impl OptimizationPipeline {
             }));
         }
         // A cleanup-free break first copies its original loop-exit bridge, then
-        // the local return. Keep that break's requested NOP through our earlier
-        // threading only when all three original arrays still match this path.
+        // the small local or tuple return. Keep that break's requested NOP through
+        // our earlier threading only when all three original arrays still match.
         let original_break_return_bridges = instruction_positions
             .iter()
             .enumerate()
@@ -1705,7 +1747,9 @@ impl OptimizationPipeline {
                     || !bridge.jump_policy.allows_threading_target()
                     || bridge.jump_policy.is_interruptible()
                     || bridge.depth_after() != Some(0)
-                    || labels.len() < 2
+                    // A constant loop has only its exit label; a dynamic loop can
+                    // add an alias. Both identify the same intact native jump array.
+                    || labels.is_empty()
                     || !labels.iter().all(clean_label)
                     || !labels.iter().any(|item| matches!(item, Item::Label(label)
                         if self.exception_owner_provenance.source_boundaries.contains(label)))
@@ -1722,24 +1766,37 @@ impl OptimizationPipeline {
                 let first = target_items
                     .iter()
                     .position(|item| matches!(item, Item::Instruction(_)))?;
-                let [Item::Instruction(load), Item::Instruction(return_)] = &target_items[first..]
-                else {
+                let return_items = &target_items[first..];
+                let local_return = matches!(return_items,
+                    [Item::Instruction(load), Item::Instruction(return_)]
+                        if matches!(load.opcode, crate::target::opcodes::LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
+                            && load.depth_after() == Some(1)
+                            && return_.opcode == RETURN_VALUE);
+                let tuple_return = super::normal_try_copies::original_local_tuple_return(return_items)
+                    .is_some()
+                    && return_items.iter().zip([1, 2, 1, 0]).all(|(item, depth)| {
+                        matches!(item, Item::Instruction(instruction)
+                            if instruction.depth_after() == Some(depth))
+                    });
+                let Some(Item::Instruction(return_)) = return_items.last() else {
                     return None;
                 };
-                if !target_items[..first].iter().all(clean_label)
-                    || !matches!(load.opcode, crate::target::opcodes::LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
-                    || load.depth_after() != Some(1)
-                    || return_.opcode != RETURN_VALUE
+                if !(local_return || tuple_return)
+                    || !target_items[..first].iter().all(clean_label)
                     || return_.depth_after() != Some(0)
                     || return_.location.line < 0
-                    || load.location.line != return_.location.line
                     || source.location.line == return_.location.line
-                    || !matches!(load.operand(), Operand::Value(_))
                     || return_.operand() != Operand::Value(0)
-                    || [bridge, load, return_]
-                        .iter()
-                        .any(|instruction| instruction.pre_fold_extra_instructions() != 0)
-                    || [&source, bridge, load, return_].iter().any(|instruction| {
+                    || !return_items.iter().all(|item| matches!(item,
+                        Item::Instruction(instruction)
+                            if instruction.location.line == return_.location.line
+                                && matches!(instruction.operand(), Operand::Value(_))
+                                && instruction.pre_fold_extra_instructions() == 0
+                                && instruction.local_policy.hidden_exception_owner_slots() == 0
+                                && instruction.exception_policy()
+                                    == super::super::ExceptionPolicy::default()))
+                    || bridge.pre_fold_extra_instructions() != 0
+                    || [&source, bridge].iter().any(|instruction| {
                         instruction.local_policy.hidden_exception_owner_slots() != 0
                             || instruction.exception_policy()
                                 != super::super::ExceptionPolicy::default()
@@ -1751,10 +1808,11 @@ impl OptimizationPipeline {
                 let return_index = label_offsets[&target];
                 if !(source_index < join_index && join_index < return_index)
                     || self.exception_regions.iter().zip(&region_ranges).any(|(region, range)| {
-                        let covered = [source_index, join_index, return_index, return_index + 1]
-                            .map(|index| range.contains(&index));
-                        covered.iter().any(|covered| *covered)
-                            && (!region.is_scope_fallback || !covered.iter().all(|covered| *covered))
+                        let mut covered = [source_index, join_index].into_iter()
+                            .chain(return_index..return_index + return_items.len());
+                        let any_covered = covered.clone().any(|index| range.contains(&index));
+                        any_covered
+                            && (!region.is_scope_fallback || !covered.all(|index| range.contains(&index)))
                     })
                 {
                     return None;
@@ -4344,9 +4402,16 @@ impl OptimizationPipeline {
                         let Item::Instruction(instruction) = *graph.item(previous) else {
                             unreachable!();
                         };
-                        // A raising predecessor cannot supply the line for another path's
-                        // exit. Keep ordinary jump and copied-return location handling.
-                        (!matches!(instruction.opcode, RAISE_VARARGS | RERAISE))
+                        // CPython compacts an empty block's removable NOP before
+                        // redundant jumps. Its same-line successor keeps its own
+                        // span, including an authored Pass donor.
+                        let removable_empty_block_nop = instruction.opcode == NOP
+                            && instruction.no_location_policy.borrow_fallthrough()
+                                == BorrowFallthrough::BarrierIfRemoved
+                            && !instruction.jump_policy.preserves_explicit_nop();
+                        // A raising predecessor cannot supply another path's line.
+                        (!matches!(instruction.opcode, RAISE_VARARGS | RERAISE)
+                            && !removable_empty_block_nop)
                             .then_some(instruction.location.line)
                     });
                     let next_line = next.map(|next| {
@@ -4577,9 +4642,12 @@ impl OptimizationPipeline {
                             && let Some(next) = next
                         {
                             let next = graph.instruction_mut(next).unwrap();
+                            // Synthesized percent literals have a separate predecessor-aware
+                            // writer. A removed jump must not donate its line to a shared join.
                             if next.location.line < 0
                                 && !next.no_location_policy.preserves_location()
                                 && !next.no_location_policy.allows_block_inlining()
+                                && next.no_location_policy.percent_target_location == 0
                             {
                                 next.location = instruction.location;
                             }

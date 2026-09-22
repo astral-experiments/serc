@@ -1777,12 +1777,14 @@ impl Compiler<'_> {
         collect_conditional_simple_annotations(body, &mut conditional_annotations);
         let mut conditional_annotations = VecDeque::from(conditional_annotations);
 
-        let mut references = ReferenceCollector::default();
+        // Annotation thunks must pass enclosing cells through to nested lambdas
+        // and generators, even when the annotation itself never loads the name.
+        let mut references = FxHashSet::default();
         for annotation in &annotations {
-            references.visit_expr(&annotation.annotation);
+            references.extend(expression_required_names(&annotation.annotation));
         }
         let available_freevars: FxHashSet<_> = self.symbols.free_names.iter().copied().collect();
-        let reference_ids = self.name_id_set(&references.references);
+        let reference_ids = self.name_id_set(&references);
         let mut freevars = Vec::new();
         for name in reference_ids
             .iter()

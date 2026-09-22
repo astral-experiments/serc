@@ -1,6 +1,22 @@
 use crate::common;
 
 #[test]
+fn keyword_and_import_names_preserve_the_first_constant_object() {
+    for name in ["אבגד", "aaאבגדcc", "name"] {
+        for source in [
+            format!("f({name}='{name}')\n"),
+            format!("saved = '{name}'\nf({name}=1)\n"),
+            format!("f({name}=1)\nsaved = '{name}'\n"),
+            format!("saved = ('{name}',)\ndef nested():\n    f({name}=1)\n"),
+            format!("saved = '{name}'\nfrom module import {name}\n"),
+            format!("from module import {name}\nsaved = '{name}'\n"),
+        ] {
+            common::assert_matches_cpython_marshal(&source, "unicode_keyword_origins.py");
+        }
+    }
+}
+
+#[test]
 fn annotation_and_default_keys_preserve_identifier_origin() {
     for name in ["ω", "ω_tail", "名", "é", "name"] {
         for future in ["", "from __future__ import annotations\n"] {

@@ -12045,6 +12045,80 @@ def before_conditional_return(values, required):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_early_boolean_admissions_before_late_folds() {
+        let source = r#"def straight():
+    a = -1.0
+    b = not 1
+    c = not ""
+    return a, b, c
+
+def reversed():
+    a = -1.0
+    b = not ""
+    c = not 1
+    return a, b, c
+
+def literal_first():
+    a = False
+    b = -1.0
+    c = not 1
+    d = not ""
+    return a, b, c, d
+
+def nested():
+    a = -1.0
+    b = (not 1, not "", not 2)
+    return a, b
+
+def linear():
+    return (-1.0, not 1, not "")
+"#;
+        assert_matches_cpython_marshal(source, "early_boolean_admissions.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_early_boolean_admissions_in_copied_exits() {
+        let source = r#"def copied_false_first(flag):
+    if flag:
+        pass
+    else:
+        x = not 1
+    return not ""
+
+def copied_true_first(flag):
+    if flag:
+        pass
+    else:
+        x = not ""
+    return not 1
+"#;
+        assert_matches_cpython_marshal(source, "early_boolean_copied_exits.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_early_boolean_admissions_with_discarded_owners() {
+        let source = r#"def discarded_and():
+    unused = 0 and not 1
+    a = not ""
+    b = not 1
+    return a, b
+
+def discarded_or():
+    unused = 1 or not ""
+    a = not 1
+    b = not ""
+    return a, b
+
+def discarded_arm():
+    unused = not 1 if 0 else 5
+    a = not ""
+    b = not 1
+    return a, b
+"#;
+        assert_matches_cpython_marshal(source, "early_boolean_discarded_owners.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_folded_boolean_addition() {
         let source = "seed = 'seed'\nvalue = True + False\n";
         assert_matches_cpython_marshal(source, "folded_boolean_addition.py");

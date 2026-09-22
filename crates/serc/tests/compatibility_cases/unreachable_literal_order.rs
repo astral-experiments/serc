@@ -71,3 +71,59 @@ fn matches_cpython_constants_first_visited_in_discarded_suites() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_names_in_unreachable_try_suites() {
+    for handler in ["except", "except*"] {
+        for terminal in ["raise NotImplementedError", "return"] {
+            let source = format!(
+                "def f(obj):\n    {terminal}\n    try:\n        obj.body_name('body-value')\n    {handler} HandlerError:\n        obj.handler_name('handler-value')\n    else:\n        obj.else_name('else-value')\n    finally:\n        obj.final_name('final-value')\n"
+            );
+            common::assert_matches_cpython_marshal(&source, "unreachable_try_names.py");
+        }
+    }
+}
+
+#[test]
+fn preserves_unreachable_try_admissions_with_finally_unwinds() {
+    for exit in [
+        "return body_name('reused')",
+        "body_name('reused')\n    break",
+    ] {
+        for outer in [false, true] {
+            let inner = format!(
+                "try:\n    {exit}\nexcept HandlerError:\n    handler_name('reused')\nelse:\n    else_name('reused')\n"
+            );
+            let mut suite = if outer {
+                let mut suite = String::from("try:\n");
+                for line in inner.lines() {
+                    suite.push_str("    ");
+                    suite.push_str(line);
+                    suite.push('\n');
+                }
+                suite
+            } else {
+                inner
+            };
+            suite.push_str("finally:\n    HandlerError('reused')\n    handler_name('reused')\n");
+            if exit.contains("break") {
+                let mut loop_suite = String::from("while loop_test:\n");
+                for line in suite.lines() {
+                    loop_suite.push_str("    ");
+                    loop_suite.push_str(line);
+                    loop_suite.push('\n');
+                }
+                suite = loop_suite;
+            }
+            let mut source =
+                String::from("def f(flag):\n    if flag:\n        raise NotImplementedError\n");
+            for line in suite.lines() {
+                source.push_str("        ");
+                source.push_str(line);
+                source.push('\n');
+            }
+            source.push_str("    return ('reused',)\n");
+            common::assert_matches_cpython_marshal(&source, "unreachable_try_finally_unwind.py");
+        }
+    }
+}

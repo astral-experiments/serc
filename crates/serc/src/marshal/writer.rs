@@ -329,6 +329,9 @@ impl Writer<'_, '_, '_> {
                 self.big_integer(object, digits, *negative, reference_mode);
                 true
             }
+            Constant::NonReflexive(number) => {
+                self.write_constant_value(&number.value(), reference_mode, kind)
+            }
             Constant::Float(float) => {
                 let object = self.next_object(kind);
                 let Some(flag) = self.begin_object(object, reference_mode) else {
@@ -551,6 +554,7 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
             Constant::Int(_)
             | Constant::SignedInt(_)
             | Constant::BigInt { .. }
+            | Constant::NonReflexive(_)
             | Constant::Float(_)
             | Constant::Complex { .. }
             | Constant::String(_)

@@ -5092,3 +5092,321 @@ fn loop_try_continue_break_live_tail_control() {
     );
     common::assert_matches_cpython_marshal(&source, "loop_try_continue_break_live_tail_control.py");
 }
+
+#[test]
+fn matches_cpython_terminal_assertion_handler_borrow_entries() {
+    for handler in ["except Exception:", "except Exception as error:", "except:"] {
+        for assertion in [
+            "assert False",
+            "assert False, 'unreachable'",
+            "assert 0",
+            "assert ()",
+            "assert flag",
+            "raise RuntimeError",
+        ] {
+            let source = format!(
+                "def f(value, flag):
+    try:
+        result = work(value)
+    {handler}
+        report(value)
+        {assertion}
+    assert valid(result)
+    report(value)
+    return result
+"
+            );
+            common::assert_matches_cpython_marshal(&source, "terminal_assert_handler_entry.py");
+        }
+    }
+    for following in ["return result", "raise RuntimeError"] {
+        let source = format!(
+            "def f(value, flag):
+    try:
+        result = work(value)
+    except Exception:
+        if flag:
+            report(value)
+        assert False
+    {following}
+"
+        );
+        common::assert_matches_cpython_marshal(&source, "terminal_assert_handler_small_exit.py");
+    }
+}
+
+#[test]
+fn matches_cpython_partial_terminal_match_handler_borrow_entries() {
+    for (definition, operation) in [
+        ("def", "work(value)"),
+        ("def", "yield value"),
+        ("async def", "await work(value)"),
+        ("async def", "yield value"),
+    ] {
+        for handler in ["except Exception:", "except Exception as error:"] {
+            for terminal in ["raise", "return", "report(value)"] {
+                let source = format!(
+                    "{definition} f(value, action, flag):
+    try:
+        {operation}
+    {handler}
+        match action:
+            case Mode.WARNING:
+                report(value)
+            case Mode.ERROR:
+                {terminal}
+            case _:
+                pass
+    if flag:
+        report(value)
+"
+                );
+                common::assert_matches_cpython_marshal(
+                    &source,
+                    "partial_terminal_match_handler.py",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn preserves_copied_pass_recovery_borrow_fallthrough_and_independent_jumps() {
+    let source = r"def f(flag, value):
+    try:
+        current = lookup(value)
+    except LookupError:
+        try:
+            current = lookup(value)
+        except LookupError:
+            pass
+    else:
+        if flag:
+            try:
+                try:
+                    change(value)
+                except ValueError:
+                    try:
+                        fallback(value)
+                    except ValueError:
+                        raise
+                reset(value)
+            except AttributeError as error:
+                report(error)
+    consume(value)
+    return value
+";
+    for terminal in ["raise", "pass", "report(value)"] {
+        common::assert_matches_cpython_marshal(
+            &source.replace(
+                "                        raise",
+                &format!("                        {terminal}"),
+            ),
+            "copied_pass_recovery_entry.py",
+        );
+    }
+    let live_bypass = source.replace(
+        "                try:
+                    change(value)
+                except ValueError:
+                    try:
+                        fallback(value)
+                    except ValueError:
+                        raise
+",
+        "                change(value)\n",
+    );
+    common::assert_matches_cpython_marshal(&live_bypass, "copied_pass_recovery_live_bypass.py");
+}
+
+#[test]
+fn borrows_through_named_plain_companions_of_guarded_handlers() {
+    use std::fmt::Write as _;
+
+    for (name_plain, name_guard) in [(false, false), (true, true), (false, true), (true, false)] {
+        for guard_index in 0..3 {
+            for cleanup in [
+                "owner.state = marker\n",
+                "if owner.ready:\n    finish(owner)\n",
+            ] {
+                let mut recovery = String::from("try:\n    work(value)\n");
+                for index in 0..3 {
+                    let guarded = index == guard_index;
+                    let named = if guarded { name_guard } else { name_plain };
+                    let name = if named { " as error" } else { "" };
+                    let body = if guarded {
+                        "if flag:\n    raise\nrecover(value)\n"
+                    } else {
+                        "consume(value)\n"
+                    };
+                    write!(
+                        recovery,
+                        "except Error{index}{name}:\n{}",
+                        indent_finally_borrow_case(body),
+                    )
+                    .unwrap();
+                }
+                recovery.push_str("finally:\n");
+                recovery.push_str(&indent_finally_borrow_case(cleanup));
+                let source = format!(
+                    "def function(owner, flag, value, marker):\n{}    return value\n",
+                    indent_finally_borrow_case(&recovery),
+                );
+                common::assert_matches_cpython_marshal(&source, "named_companion_finally.py");
+            }
+        }
+    }
+}
+
+#[test]
+fn preserves_empty_try_exit_after_returning_elif_arms() {
+    for declaration in ["def", "async def"] {
+        for earlier_chain in ["", "elif value:\n    return value\n"] {
+            for continuation in [
+                "finish(value)\nreturn value\n",
+                "return value\n",
+                "return False\n",
+            ] {
+                for handler in ["pass\n", "report(value)\nvalue = work(value)\n"] {
+                    let body = format!(
+                        "try:\n    value = work(value)\n{}except Error:\n{}{continuation}",
+                        indent_finally_borrow_case(&format!(
+                            "if flag:\n    report(value)\n    return False\n{earlier_chain}elif other:\n    report(value)\n    value = work(value)\n",
+                        )),
+                        indent_finally_borrow_case(handler),
+                    );
+                    let source = format!(
+                        "{declaration} function(value, flag, other):\n{}",
+                        indent_finally_borrow_case(&body),
+                    );
+                    common::assert_matches_cpython_marshal(&source, "returning_elif_try_exit.py");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn borrows_through_named_recovery_inside_normal_finally() {
+    for protected in [
+        "file = owner.file\nowner.file = None\nfile.close()\n",
+        "file = owner.file\nowner.file = None\nif file is not None:\n    file.close()\n",
+    ] {
+        for test in [
+            "owner.flag",
+            "owner.flag and getattr(owner, 'other', 0) != 2",
+        ] {
+            let cleanup = format!(
+                "sock = owner.sock\nowner.sock = None\nif sock is not None:\n    try:\n        sock.shutdown(2)\n    except Error as error:\n        if {test}:\n            raise\n    finally:\n        sock.close()\n",
+            );
+            let body = format!(
+                "try:\n{}finally:\n{}",
+                indent_finally_borrow_case(protected),
+                indent_finally_borrow_case(&cleanup),
+            );
+            let source = format!(
+                "def function(owner):\n{}",
+                indent_finally_borrow_case(&body)
+            );
+            common::assert_matches_cpython_marshal(&source, "normal_finally_named_recovery.py");
+        }
+    }
+}
+
+#[test]
+fn borrows_chained_stores_only_without_fast_local_transfers() {
+    for binding in ["local", "global", "nonlocal", "cell"] {
+        for assignment in ["owner.slot = output = value", "output = owner.slot = value"] {
+            let prefix = match binding {
+                "global" => "global output\n",
+                "nonlocal" => "nonlocal output\n",
+                "cell" => "output = None\ndef capture():\n    return output\n",
+                _ => "",
+            };
+            let body = format!("{prefix}{assignment}\nreturn value\n");
+            let function = format!(
+                "def function(value, owner):\n{}",
+                indent_finally_borrow_case(&body),
+            );
+            let source = if binding == "nonlocal" {
+                format!(
+                    "def outer():\n    output = None\n{}",
+                    indent_finally_borrow_case(&function)
+                )
+            } else {
+                function
+            };
+            common::assert_matches_cpython_marshal(&source, "chained_name_store.py");
+        }
+    }
+    for assignment in [
+        "owner.slot = output = alias = value",
+        "alias = output = owner.slot = value",
+        "(owner if flag else replacement).slot = output = value",
+        "output = (owner if flag else replacement).slot = value",
+    ] {
+        let source = format!(
+            "def function(value, owner, flag, replacement):\n    global output\n    {assignment}\n    return value\n",
+        );
+        common::assert_matches_cpython_marshal(&source, "chained_store_owned_control.py");
+    }
+}
+
+#[test]
+fn borrows_after_surviving_for_break_through_nested_try_exits() {
+    for handler_binding in ["", " as error"] {
+        for prefix in [
+            "",
+            "value = work()\nif check(value):\n    response.result = value\n    return work(response)\n",
+        ] {
+            for test in ["check(item)", "item and check(item)"] {
+                let recovery = format!(
+                    "try:\n    values = work(items)\n    for item in values:\n        if {test}:\n            result = work(item)\n            break\nexcept ValueError{handler_binding}:\n    result = 'inner'\n",
+                );
+                let protected = format!("{prefix}{recovery}");
+                let source = format!(
+                    "def function(items, response, check, work):\n    result = 'ok'\n    try:\n{}    except Exception{handler_binding}:\n        result = 'outer'\n    response.result = result\n    return work(response)\n",
+                    indent_finally_borrow_case(&indent_finally_borrow_case(&protected)),
+                );
+                common::assert_matches_cpython_marshal(&source, "nested_for_break_entry.py");
+            }
+        }
+    }
+}
+
+#[test]
+fn borrows_normal_cleanup_after_branched_bare_return_handler_prefix() {
+    for binding in ["", " as error"] {
+        for leading in ["", "            action(key)\n"] {
+            for condition in ["check(owner)", "owner.ready"] {
+                let source = format!(
+                    "def function(owner, key, action, check):\n    try:\n        owner.data[key] = action()\n    except LoginError{binding}:\n        if check(key):\n{leading}            if {condition}:\n                action(key)\n            else:\n                action(owner)\n            return\n        owner.remove(key)\n    except OtherError as error:\n        if check(error):\n            raise\n        owner.remove(key)\n    finally:\n        owner.discard(key)\n        action(owner, key)\n",
+                );
+                common::assert_matches_cpython_marshal(&source, "handler_return_branch_prefix.py");
+            }
+        }
+    }
+}
+
+#[test]
+fn borrows_linear_else_cleanup_with_returning_and_plain_handlers() {
+    for binding in ["", " as error"] {
+        for leading in ["", "        action(owner)\n"] {
+            for plain_first in [false, true] {
+                let plain = "    except PlainError as error:\n        action(error)\n";
+                let recovery = format!(
+                    "    except RecoverableError{binding}:\n{leading}        if check(value):\n            owner.value = value\n            return\n        action(owner, value)\n",
+                );
+                let handlers = if plain_first {
+                    format!("{plain}{recovery}")
+                } else {
+                    format!("{recovery}{plain}")
+                };
+                let source = format!(
+                    "def function(owner, value, action, check):\n    try:\n        result = action(value)\n{handlers}    else:\n        action(result)\n    finally:\n        owner.updated = value\n",
+                );
+                common::assert_matches_cpython_marshal(&source, "linear_else_return_recovery.py");
+            }
+        }
+    }
+}

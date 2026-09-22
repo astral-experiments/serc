@@ -3489,13 +3489,51 @@ fn redundant_swap_removal_preserves_distinct_pop_lines() {
         if retain_rotation {
             expected.push(pass_instruction(SWAP, 2, 4));
         }
-        expected.extend(pops_and_store);
+        if retain_rotation {
+            expected.extend(pops_and_store);
+        } else {
+            expected.extend([
+                pass_instruction(POP_TOP, 0, second_pop_line),
+                pass_instruction(POP_TOP, 0, first_pop_line),
+                pops_and_store[2],
+            ]);
+        }
         assert_eq!(
             assembler.graph.iter_items().copied().collect::<Vec<_>>(),
             expected,
             "pop lines {first_pop_line} and {second_pop_line}"
         );
     }
+}
+
+#[test]
+fn redundant_swap_removal_permutates_pop_spans_without_moving_slot_metadata() {
+    let first_location = SourceLocation::new(5, 5, 18, 68);
+    let last_location = SourceLocation::new(5, 5, 17, 73);
+    let mut first = Instruction::new(POP_TOP, Operand::Value(0), first_location, Some(2));
+    let mut last = Instruction::new(POP_TOP, Operand::Value(0), last_location, Some(1));
+    first.set_exception_policy(ExceptionPolicy::NonePresent);
+    last.set_exception_policy(ExceptionPolicy::NoneAbsent);
+    let outer_swap = pass_instruction(SWAP, 3, 5);
+    let mut assembler = optimization_pipeline(vec![
+        outer_swap,
+        pass_instruction(SWAP, 2, 5),
+        Item::Instruction(first),
+        Item::Instruction(last),
+    ]);
+
+    assert!(assembler.remove_redundant_swaps_before_pops());
+    first.location = last_location;
+    last.location = first_location;
+    assert_eq!(
+        assembler.graph.copy_items(),
+        [
+            outer_swap,
+            Item::Instruction(first),
+            Item::Instruction(last)
+        ]
+    );
+    assert!(!assembler.remove_redundant_swaps_before_pops());
 }
 
 #[test]

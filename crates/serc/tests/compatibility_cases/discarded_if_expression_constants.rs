@@ -66,3 +66,21 @@ fn matches_cpython_discarded_if_expression_folds_through_copied_exits() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_nested_discarded_if_expression_exit_locations() {
+    for header in ["", "def f():\n"] {
+        for expression in [
+            "f1 if c1 else f2 if c2 else f3 if c3 else None",
+            "(f1 if c1 else f2) if c2 else f3",
+            "(f1 if c1 else f2) if c2 else (f3 if c3 else None)",
+            "f1() if c1 else f2() if c2 else None",
+            "[x for x in items] if c1 else f2 if c2 else None",
+            "f1 if c1 else f2",
+        ] {
+            let indentation = if header.is_empty() { "" } else { "    " };
+            let source = format!("{header}{indentation}{expression}\n");
+            common::assert_matches_cpython_marshal(&source, "nested_discarded_if.py");
+        }
+    }
+}

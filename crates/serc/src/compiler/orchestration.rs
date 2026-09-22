@@ -31,9 +31,8 @@ use crate::{CompileError, PythonVersion};
 use super::constant::{DeferredConstantTarget, OutputState, fold_constant};
 use super::definition::clean_doc;
 use super::scope::{
-    LoweringFunctionPlan, NameId, NameSet, ScopeId, class_static_attributes,
-    collect_conditional_simple_annotations, collect_simple_annotations, has_annotations,
-    has_simple_annotations,
+    LoweringFunctionPlan, NameId, NameSet, ScopeId, collect_conditional_simple_annotations,
+    collect_simple_annotations, has_annotations, has_simple_annotations,
 };
 use super::source::{CompilationContext, implicit_return_range};
 use super::statement::{
@@ -97,6 +96,14 @@ impl ConstantTable for InterningConstantTable<'_, '_> {
         self.output.intern(constant)
     }
 
+    fn reallocate_non_reflexive_constant(
+        &mut self,
+        index: u32,
+        remap: &mut crate::code_object::NonReflexiveRemap,
+    ) -> Result<u32, CompileError> {
+        self.output.reallocate_non_reflexive_constant(index, remap)
+    }
+
     fn fold_sequence(&mut self, values: Vec<Constant>, is_set: bool) -> Result<u32, CompileError> {
         let index = self.output.fold_sequence(values, is_set)?;
         self.context
@@ -112,8 +119,13 @@ impl ConstantTable for InterningConstantTable<'_, '_> {
         self.output.retain_used_in_order(used)
     }
 
-    fn retain_used(&mut self, used: &[bool], order: &[u32]) -> Vec<Option<u32>> {
-        self.output.retain_used(used, order)
+    fn retain_used(
+        &mut self,
+        used: &[bool],
+        order: &[u32],
+        early_booleans: &[bool],
+    ) -> Vec<Option<u32>> {
+        self.output.retain_used(used, order, early_booleans)
     }
 }
 
@@ -498,13 +510,9 @@ impl<'source> Compiler<'source> {
                     } else {
                         Constant::String(clean_doc(string.value.to_str()))
                     })?;
-                let location = if self.context.python_version <= PythonVersion::Py313 {
-                    // Native docstring loads use the literal expression, excluding
-                    // parentheses belonging to the enclosing expression statement.
-                    self.source_location(string.range)
-                } else {
-                    self.source_location(expression.range)
-                };
+                // Native docstring loads use the literal expression, excluding
+                // parentheses belonging to the enclosing expression statement.
+                let location = self.source_location(string.range);
                 self.assembler.set_location(location);
                 self.emit(LOAD_CONST, constant, 1)?;
                 if self.context.python_version == PythonVersion::Py312 {
@@ -650,6 +658,9 @@ impl<'source> Compiler<'source> {
     }
 
     pub(super) fn compile_class_body(mut self, body: &Suite) -> Result<CodeObject, CompileError> {
+        if self.context.python_version != PythonVersion::Py312 {
+            self.context.begin_class_static_attributes();
+        }
         self.assembler.reserve_items(body.len().saturating_mul(16));
         let has_classdict_cell = self.is_cell("__classdict__");
         let has_class_cell = self.is_cell("__class__");
@@ -753,13 +764,9 @@ impl<'source> Compiler<'source> {
                     } else {
                         Constant::String(clean_doc(string.value.to_str()))
                     })?;
-                let location = if self.context.python_version <= PythonVersion::Py313 {
-                    // Native docstring loads use the literal expression, excluding
-                    // parentheses belonging to the enclosing expression statement.
-                    self.source_location(string.range)
-                } else {
-                    self.source_location(expression.range)
-                };
+                // Native docstring loads use the literal expression, excluding
+                // parentheses belonging to the enclosing expression statement.
+                let location = self.source_location(string.range);
                 self.assembler.set_location(location);
                 self.emit(LOAD_CONST, docstring, 1)?;
                 if self.context.python_version == PythonVersion::Py312 {
@@ -783,7 +790,11 @@ impl<'source> Compiler<'source> {
             && fold_constant(&expression.value).is_some()
         {
             let range = if let Expr::FString(fstring) = expression.value.as_ref() {
-                Self::fstring_result_range(fstring)
+                self.fstring_result_range(fstring)
+            } else if self.context.python_version >= PythonVersion::Py314
+                && matches!(expression.value.as_ref(), Expr::BinOp(_) | Expr::UnaryOp(_))
+            {
+                expression.value.range()
             } else {
                 expression.range
             };
@@ -805,10 +816,14 @@ impl<'source> Compiler<'source> {
         {
             self.assembler.set_location(location);
         } else if let Some(statement) = body.last() {
-            if !matches!(
-                statement,
-                Stmt::AnnAssign(annotation) if annotation.simple && annotation.value.is_none()
-            ) {
+            // Declarations emit no instruction and cannot donate a new location
+            // to the artificial class epilogue.
+            if !matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))
+                && !matches!(
+                    statement,
+                    Stmt::AnnAssign(annotation) if annotation.simple && annotation.value.is_none()
+                )
+            {
                 self.assembler
                     .set_location(self.source_location(statement.range()));
                 self.emit(NOP, 0, 0)?;
@@ -832,10 +847,7 @@ impl<'source> Compiler<'source> {
 
         self.assembler.set_location(footer_location);
         if self.context.python_version != PythonVersion::Py312 {
-            let static_attributes = class_static_attributes(body)
-                .into_iter()
-                .map(Constant::String)
-                .collect::<Vec<_>>();
+            let static_attributes = self.context.finish_class_static_attributes();
             self.context
                 .record_static_attribute_tuple(&static_attributes);
             let static_attributes = self
@@ -1145,6 +1157,7 @@ impl<'source> Compiler<'source> {
                 canonical_constant_strings,
                 qualified_name_constant_index: self.output.qualified_name_constant_index,
                 qualified_name_is_canonical: self.output.qualified_name_is_canonical,
+                uncached_percent_constant: self.context.has_uncached_percent_constant(),
                 metadata_ids,
                 subtree_has_frozenset_constants: self.output.has_frozenset_constants,
             },

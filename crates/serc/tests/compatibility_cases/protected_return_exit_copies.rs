@@ -198,3 +198,20 @@ fn matches_cpython_protected_conditional_local_return_copy() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_private_try_before_nested_tuple_join() {
+    for prefix in ["", "async "] {
+        for binding in ["", " as error"] {
+            for value in ["left, right", "left, right, value", "left"] {
+                let source = format!(
+                    "{prefix}def select(value, first, second, recover, left, right):\n    if first:\n        left = value\n    elif second:\n        if recover:\n            try:\n                left = prepare(value)\n            except ValueError{binding}:\n                left = fallback(value)\n        else:\n            left = fallback(value)\n    else:\n        raise ValueError(value)\n    return {value}\n",
+                );
+                common::assert_matches_cpython_marshal(
+                    &source,
+                    "private_try_before_nested_tuple_join.py",
+                );
+            }
+        }
+    }
+}

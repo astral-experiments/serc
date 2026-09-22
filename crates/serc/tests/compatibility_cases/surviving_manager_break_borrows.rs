@@ -50,3 +50,39 @@ fn borrows_through_surviving_breaks_into_manager_cleanup() {
         }
     }
 }
+
+#[test]
+fn borrows_through_surviving_breaks_into_structured_manager_cleanup() {
+    for manager in ["with", "async with"] {
+        for enclosing_recovery in [false, true] {
+            for cleanup in [
+                "if value in pending:\n    await close(value)\n    pending.remove(value)\nfor item in pending:\n    item.close()\n",
+                "try:\n    await close(value)\nexcept Exception as error:\n    report(error)\n    if other:\n        raise error\n",
+                "try:\n    await close(value)\nexcept Exception:\n    raise\n",
+            ] {
+                let protected = "while True:\n    await work(value)\n    if flag:\n        break\n    if other:\n        value = work(value)\n        break\n";
+                let managed = format!(
+                    "{manager} manager:\n{}",
+                    indent(&format!(
+                        "try:\n{}finally:\n{}",
+                        indent(protected),
+                        indent(cleanup)
+                    )),
+                );
+                let body = if enclosing_recovery {
+                    format!(
+                        "try:\n{}except RuntimeError:\n    report(value)\n",
+                        indent(&managed)
+                    )
+                } else {
+                    managed
+                };
+                let source = format!(
+                    "async def function(manager, flag, other, value, pending):\n{}    return value\n",
+                    indent(&body),
+                );
+                common::assert_matches_cpython_marshal(&source, "structured_manager_cleanup.py");
+            }
+        }
+    }
+}

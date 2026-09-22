@@ -17,10 +17,10 @@ use crate::target::operands::Conversion;
 use crate::{CompileError, PythonVersion};
 
 use super::Compiler;
-use super::expression::literal_truthiness;
+use super::expression::{jump_constant_truthiness, literal_truthiness};
 use super::scope::NameId;
 use super::symbol::{mangle_name, to_u32};
-use crate::code_object::{CodeObject, Constant};
+use crate::code_object::{CodeObject, Constant, NonReflexiveRemap};
 
 #[derive(Debug, Default)]
 pub(super) struct ConstantPool {
@@ -165,6 +165,7 @@ fn constant_pool_fingerprint(constant: &Constant) -> Option<u64> {
                 negative.hash(&mut hasher);
                 digits.hash(&mut hasher);
             }
+            Constant::NonReflexive(number) => number.key().hash(&mut hasher),
             Constant::Float(value) => value.to_bits().hash(&mut hasher),
             Constant::Complex { real, imag } => {
                 real.to_bits().hash(&mut hasher);
@@ -269,6 +270,20 @@ impl crate::assembler::ConstantTable for OutputState {
         self.constants.intern(constant)
     }
 
+    fn reallocate_non_reflexive_constant(
+        &mut self,
+        index: u32,
+        remap: &mut NonReflexiveRemap,
+    ) -> Result<u32, CompileError> {
+        let constant = &self.constants.values[index as usize];
+        if !constant.has_non_reflexive_number() {
+            return Ok(index);
+        }
+        let constant = constant.clone();
+        let constant = self.reallocate_non_reflexive_value(constant, remap);
+        self.constants.intern(constant)
+    }
+
     fn fold_sequence(&mut self, values: Vec<Constant>, is_set: bool) -> Result<u32, CompileError> {
         let result = if is_set {
             self.has_frozenset_constants = true;
@@ -306,7 +321,12 @@ impl crate::assembler::ConstantTable for OutputState {
         indices
     }
 
-    fn retain_used(&mut self, used: &[bool], order: &[u32]) -> Vec<Option<u32>> {
+    fn retain_used(
+        &mut self,
+        used: &[bool],
+        order: &[u32],
+        early_booleans: &[bool],
+    ) -> Vec<Option<u32>> {
         fn append_folded_dependencies(
             constant: &Constant,
             pool: &ConstantPool,
@@ -375,6 +395,20 @@ impl crate::assembler::ConstantTable for OutputState {
         // allowing independent constants to follow the copied block order.
         let mut construction_order = Vec::with_capacity(order.len());
         let mut seen = vec![false; self.constants.len()];
+        // CPython completes every block's early TO_BOOL pass before creating any
+        // unary, arithmetic, or tuple-fold results. Code-generation literals still
+        // precede these admissions, and unused intermediates are filtered normally.
+        for value in early_booleans {
+            if let Some(index) = self.constants.values.iter().position(
+                |constant| matches!(constant, Constant::Bool(boolean) if boolean == value),
+            ) && index >= self.first_flowgraph_constant
+                && used[index]
+                && !seen[index]
+            {
+                seen[index] = true;
+                construction_order.push(u32::try_from(index).expect("constant index fits in u32"));
+            }
+        }
         for index in order {
             if seen[*index as usize] {
                 continue;
@@ -429,6 +463,124 @@ impl crate::assembler::ConstantTable for OutputState {
     }
 }
 
+/// Certifies owners retained by ordinary value lowering and dynamic branch emission.
+///
+/// Literal tests, discarded expressions, and compound control constructs can remove an
+/// original `TO_BOOL` owner before the assembler sees it. Keep their existing ordering
+/// until those native lifetimes have an instruction-level representation as well.
+pub(super) fn can_order_early_boolean_admissions(body: &[Stmt]) -> bool {
+    struct Owners {
+        certified: bool,
+    }
+
+    impl Owners {
+        fn suite(&mut self, body: &[Stmt]) {
+            for (index, statement) in body.iter().enumerate() {
+                if matches!(statement, Stmt::Return(_)) && index + 1 != body.len() {
+                    self.certified = false;
+                }
+                self.visit_stmt(statement);
+            }
+        }
+
+        fn dynamic_test(expression: &Expr) -> bool {
+            match expression {
+                Expr::Name(name) => name.id.as_str() != "__debug__",
+                Expr::Attribute(_) | Expr::Call(_) | Expr::Compare(_) => true,
+                Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => {
+                    Self::dynamic_test(&unary.operand)
+                }
+                _ => false,
+            }
+        }
+    }
+
+    impl<'ast> Visitor<'ast> for Owners {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            match statement {
+                Stmt::Assign(_) | Stmt::Return(_) | Stmt::Pass(_) => walk_stmt(self, statement),
+                Stmt::Expr(expression) if fold_constant(&expression.value).is_none() => {
+                    walk_stmt(self, statement);
+                }
+                Stmt::If(conditional) => {
+                    self.certified &= Self::dynamic_test(&conditional.test);
+                    self.visit_expr(&conditional.test);
+                    self.suite(&conditional.body);
+                    for clause in &conditional.elif_else_clauses {
+                        if let Some(test) = &clause.test {
+                            self.certified &= Self::dynamic_test(test);
+                            self.visit_expr(test);
+                        }
+                        self.suite(&clause.body);
+                    }
+                }
+                _ => self.certified = false,
+            }
+        }
+
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            match expression {
+                Expr::UnaryOp(unary)
+                    if unary.op == UnaryOp::Not
+                        && literal_constant(&unary.operand).is_some()
+                        && fold_constant(expression).is_none() =>
+                {
+                    // An early native Boolean with no folded owner (currently Ellipsis)
+                    // cannot contribute an instruction witness to the copied graph.
+                    self.certified = false;
+                }
+                Expr::Name(_)
+                | Expr::NoneLiteral(_)
+                | Expr::BooleanLiteral(_)
+                | Expr::NumberLiteral(_)
+                | Expr::StringLiteral(_)
+                | Expr::BytesLiteral(_)
+                | Expr::EllipsisLiteral(_)
+                | Expr::Attribute(_)
+                | Expr::Call(_)
+                | Expr::Compare(_)
+                | Expr::UnaryOp(_)
+                | Expr::BinOp(_)
+                | Expr::Tuple(_)
+                | Expr::List(_)
+                | Expr::Set(_)
+                | Expr::Dict(_)
+                | Expr::Subscript(_)
+                | Expr::Slice(_)
+                | Expr::Starred(_) => walk_expr(self, expression),
+                _ => self.certified = false,
+            }
+        }
+    }
+
+    let mut owners = Owners { certified: true };
+    owners.suite(body);
+    owners.certified
+}
+
+/// Records only `TO_BOOL` operands already loaded as constants before late folding.
+fn collect_early_boolean_admissions(expression: &Expr, admissions: &mut Vec<bool>) {
+    struct Collector<'a>(&'a mut Vec<bool>);
+    impl<'ast> Visitor<'ast> for Collector<'_> {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            walk_expr(self, expression);
+            if let Expr::UnaryOp(unary) = expression
+                && unary.op == UnaryOp::Not
+                && let Some(value) = literal_constant(&unary.operand).or_else(|| {
+                    matches!(unary.operand.as_ref(), Expr::Name(name) if name.id.as_str() == "__debug__")
+                        .then_some(Constant::Bool(true))
+                })
+            {
+                let value = value.is_truthy();
+                if !self.0.contains(&value) {
+                    self.0.push(value);
+                }
+            }
+        }
+    }
+    Collector(admissions).visit_expr(expression);
+}
+
 impl Compiler<'_> {
     pub(super) fn emit_folded_constant(
         &mut self,
@@ -462,6 +614,12 @@ impl Compiler<'_> {
             self.emit(LOAD_SMALL_INT, u32::from(value), 1)?;
         } else {
             self.emit_deferred_constant(constant)?;
+        }
+        if self.assembler.early_boolean_admissions_certified() {
+            let mut admissions = Vec::new();
+            collect_early_boolean_admissions(expression, &mut admissions);
+            self.assembler
+                .record_last_early_boolean_admissions(&admissions);
         }
         self.assembler
             .add_last_constant_fold_slots(hidden_owner_slots);
@@ -575,6 +733,60 @@ impl Compiler<'_> {
 }
 
 impl OutputState {
+    /// Keeps each fold result and its construction dependencies in one allocation event.
+    fn reallocate_non_reflexive_value(
+        &mut self,
+        mut constant: Constant,
+        remap: &mut NonReflexiveRemap,
+    ) -> Constant {
+        fn collect(
+            constant: &Constant,
+            dependencies: &[(Constant, Vec<Constant>)],
+            seen: &mut Vec<Constant>,
+            collected: &mut Vec<(Constant, Vec<Constant>)>,
+        ) {
+            if seen
+                .iter()
+                .any(|value| ConstantEquality::PoolKey.equal(value, constant))
+            {
+                return;
+            }
+            seen.push(constant.clone());
+            if let Some((result, operands)) = dependencies
+                .iter()
+                .find(|(result, _)| ConstantEquality::PoolKey.equal(result, constant))
+            {
+                for operand in operands {
+                    collect(operand, dependencies, seen, collected);
+                }
+                if result.has_non_reflexive_number() {
+                    collected.push((result.clone(), operands.clone()));
+                }
+            }
+            if let Constant::Tuple(values) | Constant::FrozenSet(values) = constant {
+                for value in values {
+                    collect(value, dependencies, seen, collected);
+                }
+            }
+        }
+        let mut dependencies = Vec::new();
+        collect(
+            &constant,
+            &self.folded_constant_dependencies,
+            &mut Vec::new(),
+            &mut dependencies,
+        );
+        constant.reallocate_non_reflexive_numbers(remap);
+        for (result, operands) in &mut dependencies {
+            result.reallocate_non_reflexive_numbers(remap);
+            for operand in operands {
+                operand.reallocate_non_reflexive_numbers(remap);
+            }
+        }
+        self.folded_constant_dependencies.extend(dependencies);
+        constant
+    }
+
     /// Preserves operand admissions for containers created by late graph folding.
     fn record_folded_constant_dependencies(
         &mut self,
@@ -770,6 +982,14 @@ impl Compiler<'_> {
     }
 
     pub(super) fn add_constant(&mut self, constant: Constant) -> Result<u32, CompileError> {
+        let constant = if self.context.python_version >= PythonVersion::Py314
+            && constant.has_source_non_reflexive_number()
+        {
+            self.output
+                .reallocate_non_reflexive_value(constant, &mut NonReflexiveRemap::default())
+        } else {
+            constant
+        };
         self.context
             .record_constant_string_origins(&constant, false);
         self.output.has_frozenset_constants |= matches!(constant, Constant::FrozenSet(_));
@@ -810,10 +1030,13 @@ impl Compiler<'_> {
             _ => None,
         }) {
             self.context.record_constant_string_origin(value, true);
-            if !self
-                .output
-                .interned_constant_strings
-                .contains(value.as_str())
+            // Recursive constant-cache insertion can replace a parser-interned name
+            // with an earlier equal literal. Preserve the winning object's identity.
+            if self.context.constant_string_origin_is_interned(value)
+                && !self
+                    .output
+                    .interned_constant_strings
+                    .contains(value.as_str())
             {
                 self.output.interned_constant_strings.insert(value.clone());
             }
@@ -1024,7 +1247,7 @@ pub(super) fn explicit_surrogate_string(value: &str, source: &str) -> Option<Vec
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConstantEquality {
-    /// Equality for CPython's constant table, including type and floating-point bit identity.
+    /// Constant-table equality, including type, signed zeros, and NaN allocation identity.
     PoolKey,
     /// Python value equality used while folding set-like literals and membership tests.
     PythonValue,
@@ -1036,6 +1259,9 @@ impl ConstantEquality {
         reason = "CPython constant deduplication uses exact numeric equality"
     )]
     fn equal(self, left: &Constant, right: &Constant) -> bool {
+        if let (Constant::NonReflexive(left), Constant::NonReflexive(right)) = (left, right) {
+            return left.key() == right.key();
+        }
         if matches!(self, Self::PythonValue)
             && let (Some((left_real, left_imag)), Some((right_real, right_imag))) =
                 (numeric_parts(left), numeric_parts(right))
@@ -1137,6 +1363,7 @@ fn numeric_parts(value: &Constant) -> Option<(NumericReal, f64)> {
             },
             0.0,
         )),
+        Constant::NonReflexive(number) => numeric_parts(&number.value()),
         Constant::Float(value) => Some((NumericReal::Float(*value), 0.0)),
         Constant::Complex { real, imag } => Some((NumericReal::Float(*real), *imag)),
         _ => None,
@@ -1425,7 +1652,7 @@ pub(super) fn fold_constant_with_literals(
     if let Some(constant) = literal(expression) {
         return Some(constant);
     }
-    match expression {
+    let result = match expression {
         Expr::Name(name) if name.ctx == ExprContext::Load && name.id.as_str() == "__debug__" => {
             Some(Constant::Bool(true))
         }
@@ -1463,11 +1690,19 @@ pub(super) fn fold_constant_with_literals(
                 | Constant::SignedInt(_)
                 | Constant::BigInt { .. }
                 | Constant::Float(_)
-                | Constant::Complex { .. }) => Some(constant),
+                | Constant::Complex { .. }
+                | Constant::NonReflexive(_)) => Some(constant),
                 _ => None,
             },
-            UnaryOp::Not => literal_truthiness(&unary.operand).map(|value| Constant::Bool(!value)),
-            UnaryOp::USub => fold_constant_with_literals(&unary.operand, literal)?.negated(),
+            UnaryOp::Not => {
+                if matches!(unary.operand.as_ref(), Expr::Tuple(_)) {
+                    fold_constant_with_literals(&unary.operand, literal)?;
+                }
+                literal_truthiness(&unary.operand).map(|value| Constant::Bool(!value))
+            }
+            UnaryOp::USub => fold_constant_with_literals(&unary.operand, literal)?
+                .into_numeric_value()
+                .negated(),
             UnaryOp::Invert => {
                 let operand = fold_constant_with_literals(&unary.operand, literal)?;
                 // CPython leaves boolean inversion at runtime for its deprecation warning.
@@ -1485,8 +1720,8 @@ pub(super) fn fold_constant_with_literals(
             }
         },
         Expr::BinOp(binary) => {
-            let left = fold_constant_with_literals(&binary.left, literal)?;
-            let right = fold_constant_with_literals(&binary.right, literal)?;
+            let left = fold_constant_with_literals(&binary.left, literal)?.into_numeric_value();
+            let right = fold_constant_with_literals(&binary.right, literal)?.into_numeric_value();
             match (left, binary.op, right) {
                 (left, operator @ (Operator::Add | Operator::Sub | Operator::Mult), right)
                     if is_integer_constant(&left) && is_integer_constant(&right) =>
@@ -1498,8 +1733,19 @@ pub(super) fn fold_constant_with_literals(
                 {
                     fold_integer_true_divide(&left, &right).map(Constant::Float)
                 }
-                (Constant::Int(left), Operator::FloorDiv, Constant::Int(right)) if right != 0 => {
-                    Some(Constant::Int(left / right))
+                (
+                    Constant::Int(left),
+                    operator @ (Operator::FloorDiv | Operator::Mod),
+                    Constant::Int(right),
+                ) if right != 0 => Some(Constant::Int(if operator == Operator::FloorDiv {
+                    left / right
+                } else {
+                    left % right
+                })),
+                (left, operator @ (Operator::FloorDiv | Operator::Mod), right)
+                    if is_integer_constant(&left) && is_integer_constant(&right) =>
+                {
+                    fold_integer_divmod(&left, operator, &right)
                 }
                 (left, Operator::FloorDiv, right)
                     if matches!(left, Constant::Float(_))
@@ -1507,37 +1753,21 @@ pub(super) fn fold_constant_with_literals(
                 {
                     fold_float_floor_divide(&left, &right).map(Constant::Float)
                 }
-                (Constant::Int(left), Operator::Mod, Constant::Int(right)) if right != 0 => {
-                    Some(Constant::Int(left % right))
-                }
-                (Constant::Int(left), Operator::Pow, Constant::Int(right)) => {
-                    const MAX_INT_SIZE: u64 = 128;
-
-                    if left != 0 && right > 0 {
-                        let left_bits = u64::from(u64::BITS - left.leading_zeros());
-                        if left_bits > MAX_INT_SIZE / right {
-                            return None;
-                        }
-                    }
-                    let right = u32::try_from(right).ok()?;
-                    if let Some(value) = left.checked_pow(right) {
-                        Some(Constant::Int(value))
-                    } else {
-                        u128::from(left)
-                            .checked_pow(right)
-                            .map(|value| Constant::BigInt {
-                                negative: false,
-                                digits: big_integer_digits(&value.to_string()),
-                            })
-                    }
+                (left, Operator::Mod, right)
+                    if matches!(left, Constant::Float(_))
+                        || matches!(right, Constant::Float(_)) =>
+                {
+                    fold_float_remainder(&left, &right).map(Constant::Float)
                 }
                 (
-                    Constant::Int(0) | Constant::Bool(false),
+                    left,
                     Operator::Pow,
-                    Constant::BigInt {
+                    right @ (Constant::Bool(_)
+                    | Constant::Int(_)
+                    | Constant::BigInt {
                         negative: false, ..
-                    },
-                ) => Some(Constant::Int(0)),
+                    }),
+                ) if is_integer_constant(&left) => fold_integer_power(&left, &right),
                 (left, operator @ (Operator::LShift | Operator::RShift), right)
                     if is_integer_constant(&left) && is_integer_constant(&right) =>
                 {
@@ -1584,45 +1814,23 @@ pub(super) fn fold_constant_with_literals(
                     | Operator::Div
                     | Operator::Pow),
                     right,
-                ) if matches!(left, Constant::Float(_))
-                    && matches!(
-                        right,
-                        Constant::Bool(_) | Constant::Int(_) | Constant::SignedInt(_)
-                    )
-                    || matches!(right, Constant::Float(_))
-                        && matches!(
-                            left,
-                            Constant::Bool(_) | Constant::Int(_) | Constant::SignedInt(_)
-                        ) =>
+                ) if matches!(left, Constant::Float(_)) && is_integer_constant(&right)
+                    || matches!(right, Constant::Float(_)) && is_integer_constant(&left) =>
                 {
-                    let to_float = |constant: Constant| match constant {
-                        Constant::Bool(value) => Some(f64::from(value)),
-                        Constant::Int(value) => Some(value as f64),
-                        Constant::SignedInt(value) => Some(value as f64),
-                        Constant::Float(value) => Some(value),
-                        _ => None,
-                    };
-                    let left = to_float(left)?;
-                    let right = to_float(right)?;
+                    let left = constant_as_float(&left)?;
+                    let right = constant_as_float(&right)?;
                     match operator {
                         Operator::Add => Some(Constant::Float(left + right)),
                         Operator::Sub => Some(Constant::Float(left - right)),
                         Operator::Mult => Some(Constant::Float(left * right)),
                         Operator::Div if right != 0.0 => Some(Constant::Float(left / right)),
-                        Operator::Pow => {
-                            let result = left.powf(right);
-                            result.is_finite().then_some(Constant::Float(result))
-                        }
+                        Operator::Pow => fold_float_power(left, right),
                         Operator::Div => None,
                         _ => unreachable!(),
                     }
                 }
                 (Constant::Float(left), Operator::Pow, Constant::Float(right)) => {
-                    let result = left.powf(right);
-                    result.is_finite().then_some(Constant::Float(result))
-                }
-                (Constant::Bool(left), Operator::Pow, Constant::Bool(right)) => {
-                    Some(Constant::Int(u64::from(left).pow(u32::from(right))))
+                    fold_float_power(left, right)
                 }
                 (left, operator @ (Operator::Add | Operator::Sub | Operator::Mult), right)
                     if matches!(left, Constant::Complex { .. })
@@ -1711,7 +1919,10 @@ pub(super) fn fold_constant_with_literals(
             }
         }
         _ => None,
-    }
+    };
+    let origin = (u64::from(expression.range().start().to_u32()) << 32)
+        | u64::from(expression.range().end().to_u32());
+    result.map(|constant| constant.with_non_reflexive_origin(origin))
 }
 
 fn fold_integer_bitwise(left: &Constant, operator: Operator, right: &Constant) -> Option<Constant> {
@@ -1797,15 +2008,62 @@ fn integer_digits(mut value: u64) -> Vec<u16> {
     digits
 }
 
-/// Match the quotient from CPython's `_float_div_mod`, including rounding and signed zero.
-fn fold_float_floor_divide(left: &Constant, right: &Constant) -> Option<f64> {
-    let to_float = |constant: &Constant| match constant {
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "CPython mixed float folding rounds integer operands to binary64"
+)]
+fn constant_as_float(constant: &Constant) -> Option<f64> {
+    match constant {
+        Constant::Bool(value) => Some(f64::from(*value)),
+        Constant::Int(value) => Some(*value as f64),
+        Constant::SignedInt(value) => Some(*value as f64),
+        Constant::NonReflexive(number) => constant_as_float(&number.value()),
         Constant::Float(value) => Some(*value),
         // Dividing an integer by one provides PyLong_AsDouble's rounding and overflow checks.
         constant => fold_integer_true_divide(constant, &Constant::Int(1)),
-    };
-    let left = to_float(left)?;
-    let right = to_float(right)?;
+    }
+}
+
+#[expect(
+    clippy::float_cmp,
+    reason = "CPython checks real exponents for exact binary64 integrality"
+)]
+fn fold_float_power(base: f64, exponent: f64) -> Option<Constant> {
+    if base.is_finite() && exponent.is_finite() && base < 0.0 && exponent != exponent.floor() {
+        // float_pow delegates negative fractional powers to complex_pow. Follow
+        // _Py_c_pow with positive imaginary zeros for both real operands.
+        let magnitude = base.hypot(0.0).powf(exponent);
+        let phase = 0.0_f64.atan2(base) * exponent;
+        let real = magnitude * phase.cos();
+        let imag = magnitude * phase.sin();
+        return (real.is_finite() && imag.is_finite()).then_some(Constant::Complex { real, imag });
+    }
+    let result = base.powf(exponent);
+    result.is_finite().then_some(Constant::Float(result))
+}
+
+/// Match CPython's `float_rem`: a nonzero remainder and zero both take the divisor's sign.
+fn fold_float_remainder(left: &Constant, right: &Constant) -> Option<f64> {
+    let left = constant_as_float(left)?;
+    let right = constant_as_float(right)?;
+    if right == 0.0 {
+        return None;
+    }
+    let mut remainder = left % right;
+    if remainder != 0.0 {
+        if (right < 0.0) != (remainder < 0.0) {
+            remainder += right;
+        }
+    } else {
+        remainder = 0.0_f64.copysign(right);
+    }
+    Some(remainder)
+}
+
+/// Match the quotient from CPython's `_float_div_mod`, including rounding and signed zero.
+fn fold_float_floor_divide(left: &Constant, right: &Constant) -> Option<f64> {
+    let left = constant_as_float(left)?;
+    let right = constant_as_float(right)?;
     if right == 0.0 {
         return None;
     }
@@ -1953,6 +2211,72 @@ fn fold_integer_arithmetic(
         _ => unreachable!(),
     };
     Some(integer_constant(result.negative, result.digits))
+}
+
+/// Apply CPython's constant-power bit budget to the magnitude, independently of its sign.
+fn fold_integer_power(left: &Constant, right: &Constant) -> Option<Constant> {
+    const MAX_INT_SIZE: usize = 128;
+
+    let left = folded_integer(left)?;
+    let right = folded_integer(right)?;
+    debug_assert!(!right.negative);
+    if right.digits.is_empty() {
+        return Some(Constant::Int(1));
+    }
+    if left.digits.is_empty() {
+        return Some(Constant::Int(0));
+    }
+    let mut exponent = magnitude_to_usize(&right.digits)?;
+    if magnitude_bit_length(&left.digits) > MAX_INT_SIZE / exponent {
+        return None;
+    }
+    let negative = left.negative && exponent & 1 != 0;
+    let mut power = left.digits;
+    let mut result = vec![1];
+    while exponent != 0 {
+        if exponent & 1 != 0 {
+            result = multiply_magnitudes(&result, &power);
+        }
+        exponent >>= 1;
+        if exponent != 0 {
+            power = multiply_magnitudes(&power, &power);
+        }
+    }
+    Some(integer_constant(negative, result))
+}
+
+/// Divide integer magnitudes, then use CPython's floor quotient and divisor-signed remainder.
+fn fold_integer_divmod(left: &Constant, operator: Operator, right: &Constant) -> Option<Constant> {
+    let left = folded_integer(left)?;
+    let right = folded_integer(right)?;
+    if right.digits.is_empty() {
+        return None;
+    }
+    let mut remainder = left.digits;
+    let mut quotient = Vec::new();
+    if let Some(top_bit) =
+        magnitude_bit_length(&remainder).checked_sub(magnitude_bit_length(&right.digits))
+    {
+        quotient.resize(top_bit / 15 + 1, 0);
+        for bit in (0..=top_bit).rev() {
+            let divisor = left_shift_magnitude(&right.digits, bit);
+            if !compare_magnitudes(&remainder, &divisor).is_lt() {
+                remainder = subtract_magnitudes(&remainder, &divisor);
+                quotient[bit / 15] |= 1 << (bit % 15);
+            }
+        }
+        quotient = normalized_digits(quotient);
+    }
+    let negative = left.negative != right.negative;
+    if negative && !remainder.is_empty() {
+        quotient = add_magnitudes(&quotient, &[1]);
+        remainder = subtract_magnitudes(&right.digits, &remainder);
+    }
+    Some(match operator {
+        Operator::FloorDiv => integer_constant(negative, quotient),
+        Operator::Mod => integer_constant(right.negative, remainder),
+        _ => unreachable!(),
+    })
 }
 
 fn add_folded_integers(left: &FoldedInteger, right: &FoldedInteger) -> FoldedInteger {
@@ -2315,7 +2639,10 @@ fn surrogate_string_constant(value: Vec<u8>) -> Constant {
     }
 }
 
-pub(super) fn folded_bool_operand(expression: &Expr) -> Option<(&Expr, Constant)> {
+pub(super) fn folded_bool_operand(
+    expression: &Expr,
+    python_version: PythonVersion,
+) -> Option<(&Expr, Constant)> {
     let Expr::BoolOp(boolean) = expression else {
         return fold_constant(expression).map(|constant| (expression, constant));
     };
@@ -2325,7 +2652,13 @@ pub(super) fn folded_bool_operand(expression: &Expr) -> Option<(&Expr, Constant)
             return None;
         }
         let constant = fold_constant(value)?;
-        let truthiness = constant.is_truthy();
+        let truthiness = if python_version <= PythonVersion::Py313 {
+            constant.is_truthy()
+        } else {
+            // The early LOAD_CONST pass precedes arithmetic and tuple folding. Its
+            // Boolean shortcuts cannot consume values produced by those later rewrites.
+            jump_constant_truthiness(value)?
+        };
         if matches!(boolean.op, BoolOp::And) && !truthiness
             || matches!(boolean.op, BoolOp::Or) && truthiness
         {
@@ -2351,6 +2684,7 @@ fn constant_complex_parts(constant: &Constant) -> Option<(f64, f64)> {
         Constant::BigInt { .. } => {
             fold_integer_true_divide(constant, &Constant::Int(1)).map(|real| (real, 0.0))
         }
+        Constant::NonReflexive(number) => constant_complex_parts(&number.value()),
         Constant::Float(value) => Some((*value, 0.0)),
         Constant::Complex { real, imag } => Some((*real, *imag)),
         _ => None,

@@ -280,3 +280,15 @@ fn matches_cpython_terminal_while_else_shared_return_footer() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn constant_loop_bridges_preserve_small_return_line_events() {
+    for prefix in ["", "async "] {
+        for returned in ["x", "(x, flag)", "(x, flag, x)"] {
+            let source = format!(
+                "{prefix}def f(x, flag):\n    if flag:\n        while True:\n            x = g(x)\n            if x:\n                break\n    else:\n        x = h(x)\n    return {returned}\n",
+            );
+            common::assert_matches_cpython_marshal(&source, "constant_loop_bridge_return.py");
+        }
+    }
+}

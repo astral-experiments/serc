@@ -1,0 +1,243 @@
+{
+  "schema": 1,
+  "measurement_date": "2026-09-21",
+  "provenance": {
+    "basis": "Reconstructed from completed comparison results and independent review recorded in task tool outputs before reconnection.",
+    "raw_evidence_status": "Raw logs and full run records were in ephemeral /tmp and /var/tmp storage and were unavailable after reconnect. This summary preserves the verified observations; it does not recreate the missing raw records.",
+    "prior_checks": "Compiler and interpreter identities verified; corpus pins, membership and contents checked before and after comparisons; outcome arithmetic independently reviewed."
+  },
+  "compiler": {
+    "repository": "astral-sh/serc",
+    "measured_commit": "671f35cade80d4bab3e41f111b69e31077bdc483",
+    "build_commit": "237a0da6eb497d6c26d8e318ba77a5945144619e",
+    "source_binding": "783 non-documentation source files verified unchanged; only README.md and crates/serc/README.md changed between build and measured commits.",
+    "comparison_binary": "compare_cpython_corpus",
+    "binary_sha256": "e3e66fb2a1d2f44c1fecaf47684d25a37bf7812c803f0b47d9f936e5fbd9f13c"
+  },
+  "cpython": {
+    "implementation": "cpython",
+    "version": "3.14.5",
+    "release_level": "final",
+    "release_serial": 0,
+    "magic": "2b0e0d0a",
+    "binary_sha256": "c27397da5541f67655be462e128ca3d3eb6e0a8eb0d39036896c9042529f4304"
+  },
+  "protocol": {
+    "native_process": "Fresh subprocess per file: python -I -S -c ORACLE PATH",
+    "native_startup": "import marshal; import pathlib; import sys",
+    "native_input": "path = pathlib.Path(sys.argv[1]); source = path.read_bytes()",
+    "native_compile": "compile(source, str(path), 'exec', dont_inherit=True, optimize=0)",
+    "native_output": "marshal.dumps(code)",
+    "comparison": "Raw byte-for-byte equality; corpus code is compiled, never executed.",
+    "serc_source_mode": "text means UTF-8 text input; bytes means --source-bytes.",
+    "state": "Default intern state; no caller model, initial-intern profile, native-output cache, normalization or nondeterminism exclusions.",
+    "filenames": "Absolute input filenames passed unchanged to both compilers. Original historical holdout filenames were not recovered; reruns used new checkout paths.",
+    "membership": "Regular files only, without following symlinks; no submodule source traversal.",
+    "holdout_scope": "Historical file counts match .py-only membership. Prior README prose claiming stubs was inaccurate: 11 Airflow and 2 Ansible .pyi files were excluded by extension before compilation."
+  },
+  "corpora": [
+    {
+      "id": "ruff",
+      "group": "public",
+      "repository": "astral-sh/ruff",
+      "commit": "e4a063a136ae0e3d6801bd0dad47d09a0f419530",
+      "source_mode": "text",
+      "membership": ".py files in the five fixture roots named by scripts/check-cpython-compatibility.",
+      "files": 2451,
+      "cpython_rejected": 221,
+      "accepted_compiler_failures": 0,
+      "outcomes": {
+        "exact": 2230,
+        "byte-mismatch": 0,
+        "unsupported": 0,
+        "parse-mismatch": 0,
+        "compiler-failure": 14,
+        "matched-rejection": 151,
+        "rejection-mismatch": 56,
+        "non-utf8": 0,
+        "oracle-failure": 0
+      },
+      "measured_roots": [
+        "/var/tmp/serc-legacy-main-integration-20260921/vendor/ruff/crates/ty_python_semantic/resources/corpus",
+        "/var/tmp/serc-legacy-main-integration-20260921/vendor/ruff/crates/ruff_python_parser/resources/valid",
+        "/var/tmp/serc-legacy-main-integration-20260921/vendor/ruff/crates/ruff_python_parser/resources/inline/ok",
+        "/var/tmp/serc-legacy-main-integration-20260921/vendor/ruff/crates/ruff_linter/resources/test/fixtures",
+        "/var/tmp/serc-legacy-main-integration-20260921/vendor/ruff/crates/ruff_python_formatter/resources/test/fixtures"
+      ]
+    },
+    {
+      "id": "numpy",
+      "group": "public",
+      "repository": "numpy/numpy",
+      "commit": "b832a09cf2a169c833dd2371e7c07aa00b293242",
+      "tag": "v2.4.6",
+      "source_mode": "text",
+      "membership": ".py files under the numpy/ package.",
+      "files": 505,
+      "cpython_rejected": 0,
+      "accepted_compiler_failures": 0,
+      "outcomes": {
+        "exact": 505,
+        "byte-mismatch": 0,
+        "unsupported": 0,
+        "parse-mismatch": 0,
+        "compiler-failure": 0,
+        "matched-rejection": 0,
+        "rejection-mismatch": 0,
+        "non-utf8": 0,
+        "oracle-failure": 0
+      },
+      "measured_roots": [
+        "/home/dev-user/.codex/worktrees/0b2a/serc/target/benchmarks/numpy/numpy"
+      ]
+    },
+    {
+      "id": "mypy-primer",
+      "group": "public",
+      "repository": "hauntsaninja/mypy_primer",
+      "catalog_commit": "ff3d9531335dad605d43fcc208c9c159bb09fa81",
+      "project_revisions": "corpora/mypy-primer.lock.json",
+      "lock_sha256": "d72172de57d547219c667b2219640908c9fa37a75f292a4e7b7876c2860e26aa",
+      "source_content_sha256": "58699031040d02c1a4d18c9a5425d0250393316b04e0bee4819474c188f6484b",
+      "source_bytes": 691638412,
+      "source_mode": "bytes",
+      "membership": "Tracked .py and .pyi files from 162 logical catalog entries across 160 locked repositories; content digest uses the lock's domain-separated aggregate.",
+      "files": 73537,
+      "cpython_rejected": 160,
+      "accepted_compiler_failures": 2,
+      "outcomes": {
+        "exact": 73097,
+        "byte-mismatch": 278,
+        "unsupported": 0,
+        "parse-mismatch": 0,
+        "compiler-failure": 10,
+        "matched-rejection": 123,
+        "rejection-mismatch": 29,
+        "non-utf8": 0,
+        "oracle-failure": 0
+      },
+      "measured_roots": [
+        "/home/dev-user/.codex/worktrees/0b2a/serc/target/corpora/mypy-primer/checkouts/<locked repository id>"
+      ]
+    },
+    {
+      "id": "django",
+      "group": "holdout",
+      "repository": "django/django",
+      "commit": "bf5e73c576c8c7d8b3ef1c03a22cf724dbb2f306",
+      "source_mode": "bytes",
+      "membership": "Tracked .py files throughout the repository.",
+      "files": 2927,
+      "cpython_rejected": 1,
+      "accepted_compiler_failures": 0,
+      "outcomes": {
+        "exact": 2921,
+        "byte-mismatch": 5,
+        "unsupported": 0,
+        "parse-mismatch": 0,
+        "compiler-failure": 0,
+        "matched-rejection": 1,
+        "rejection-mismatch": 0,
+        "non-utf8": 0,
+        "oracle-failure": 0
+      },
+      "measured_roots": [
+        "/tmp/serc-public-compatibility-results-20260921/holdouts/django/checkout"
+      ]
+    },
+    {
+      "id": "airflow",
+      "group": "holdout",
+      "repository": "apache/airflow",
+      "commit": "cad6220034e87c586eb87e14b5a75f4b82984fd0",
+      "source_mode": "bytes",
+      "membership": "Tracked .py files throughout the repository.",
+      "files": 7621,
+      "cpython_rejected": 0,
+      "accepted_compiler_failures": 0,
+      "outcomes": {
+        "exact": 7610,
+        "byte-mismatch": 11,
+        "unsupported": 0,
+        "parse-mismatch": 0,
+        "compiler-failure": 0,
+        "matched-rejection": 0,
+        "rejection-mismatch": 0,
+        "non-utf8": 0,
+        "oracle-failure": 0
+      },
+      "measured_roots": [
+        "/tmp/serc-public-compatibility-results-20260921/holdouts/airflow/checkout"
+      ]
+    },
+    {
+      "id": "transformers",
+      "group": "holdout",
+      "repository": "huggingface/transformers",
+      "commit": "ab1771c9e42891d893189978a8009426d70b4688",
+      "source_mode": "bytes",
+      "membership": "Tracked .py files throughout the repository.",
+      "files": 4643,
+      "cpython_rejected": 0,
+      "accepted_compiler_failures": 0,
+      "outcomes": {
+        "exact": 4639,
+        "byte-mismatch": 4,
+        "unsupported": 0,
+        "parse-mismatch": 0,
+        "compiler-failure": 0,
+        "matched-rejection": 0,
+        "rejection-mismatch": 0,
+        "non-utf8": 0,
+        "oracle-failure": 0
+      },
+      "measured_roots": [
+        "/tmp/serc-public-compatibility-results-20260921/holdouts/transformers/checkout"
+      ]
+    },
+    {
+      "id": "ansible",
+      "group": "holdout",
+      "repository": "ansible/ansible",
+      "commit": "3217c352bb7b77392317aac0cf8b859d7d43b5b5",
+      "source_mode": "bytes",
+      "membership": "Tracked .py files throughout the repository.",
+      "files": 1810,
+      "cpython_rejected": 0,
+      "accepted_compiler_failures": 0,
+      "outcomes": {
+        "exact": 1795,
+        "byte-mismatch": 15,
+        "unsupported": 0,
+        "parse-mismatch": 0,
+        "compiler-failure": 0,
+        "matched-rejection": 0,
+        "rejection-mismatch": 0,
+        "non-utf8": 0,
+        "oracle-failure": 0
+      },
+      "measured_roots": [
+        "/tmp/serc-public-compatibility-results-20260921/holdouts/ansible/checkout"
+      ]
+    }
+  ],
+  "accounting": "Each outcomes object is disjoint and sums to files. cpython_rejected is an independent overlapping total. Accepted-input rate is exact / (files - cpython_rejected); accepted compiler failures remain in that denominator.",
+  "totals": {
+    "public": {
+      "files": 76493,
+      "cpython_rejected": 381,
+      "exact": 75832,
+      "byte_mismatches": 278,
+      "accepted_compiler_failures": 2,
+      "accepted_input_match_rate": "99.63%"
+    },
+    "holdout": {
+      "files": 17001,
+      "cpython_rejected": 1,
+      "exact": 16965,
+      "byte_mismatches": 35,
+      "accepted_compiler_failures": 0,
+      "accepted_input_match_rate": "99.79%"
+    }
+  }
+}
