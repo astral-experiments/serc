@@ -3857,7 +3857,10 @@ pub(super) fn global_comprehension_temporary_names(
                     .iter()
                     .any(|other| mangle_name(other, private_name) == canonical)
         })
-        .map(|name| mangle_name(&name, private_name).into_owned())
+        .map(|name| match private_name {
+            Some(private_name) => mangle_name(&name, Some(private_name)).into_owned(),
+            None => name,
+        })
         .collect::<FxHashSet<_>>();
     if walrus_targets.is_empty() {
         return None;
@@ -3937,11 +3940,12 @@ fn comprehension_symbol_names(
             for (index, generator) in generators.iter().enumerate() {
                 let mut targets = Vec::new();
                 collect_target_names(&generator.target, &mut targets);
-                collector.targets.extend(
-                    targets
-                        .into_iter()
-                        .map(|name| mangle_name(&name, private_name).into_owned()),
-                );
+                collector
+                    .targets
+                    .extend(targets.into_iter().map(|name| match private_name {
+                        Some(private_name) => mangle_name(&name, Some(private_name)).into_owned(),
+                        None => name,
+                    }));
                 collector.visit_expr(&generator.target);
                 if index > 0 {
                     collector.visit_expr(&generator.iter);
