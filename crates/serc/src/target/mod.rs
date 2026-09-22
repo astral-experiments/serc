@@ -73,37 +73,6 @@ impl Opcode {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) const fn has_argument_for(self, version: PythonVersion) -> bool {
-        match version {
-            PythonVersion::Py312 => cpython_3_12_14::has_argument(self),
-            PythonVersion::Py313 => cpython_3_13_15::has_argument(self),
-            PythonVersion::Py314 => self.code() <= 128 && self.has_argument(),
-            PythonVersion::Py315 => cpython_3_15_0rc2::has_argument(self),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) const fn has_constant_for(self, version: PythonVersion) -> bool {
-        match version {
-            PythonVersion::Py312 => cpython_3_12_14::has_constant(self),
-            PythonVersion::Py313 => cpython_3_13_15::has_constant(self),
-            PythonVersion::Py314 => self.code() <= 128 && self.has_constant(),
-            PythonVersion::Py315 => cpython_3_15_0rc2::has_constant(self),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) const fn has_name_for(self, version: PythonVersion) -> bool {
-        match version {
-            PythonVersion::Py312 => cpython_3_12_14::has_name(self),
-            PythonVersion::Py313 => cpython_3_13_15::has_name(self),
-            PythonVersion::Py314 => self.code() <= 128 && self.has_name(),
-            PythonVersion::Py315 => cpython_3_15_0rc2::has_name(self),
-        }
-    }
-
-    #[allow(dead_code)]
     pub(crate) const fn has_jump_for(self, version: PythonVersion) -> bool {
         match version {
             PythonVersion::Py312 => cpython_3_12_14::has_jump(self),
@@ -112,29 +81,8 @@ impl Opcode {
             PythonVersion::Py315 => cpython_3_15_0rc2::has_jump(self),
         }
     }
-
-    #[allow(dead_code)]
-    pub(crate) const fn has_free_for(self, version: PythonVersion) -> bool {
-        match version {
-            PythonVersion::Py312 => cpython_3_12_14::has_free(self),
-            PythonVersion::Py313 => cpython_3_13_15::has_free(self),
-            PythonVersion::Py314 => self.code() <= 128 && self.has_free(),
-            PythonVersion::Py315 => cpython_3_15_0rc2::has_free(self),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) const fn has_local_for(self, version: PythonVersion) -> bool {
-        match version {
-            PythonVersion::Py312 => cpython_3_12_14::has_local(self),
-            PythonVersion::Py313 => cpython_3_13_15::has_local(self),
-            PythonVersion::Py314 => self.code() <= 128 && self.has_local(),
-            PythonVersion::Py315 => cpython_3_15_0rc2::has_local(self),
-        }
-    }
 }
 
-#[allow(dead_code)]
 pub(crate) const fn is_scope_exit_for(version: PythonVersion, opcode: Opcode) -> bool {
     match version {
         PythonVersion::Py312 => cpython_3_12_14::is_scope_exit(opcode),
@@ -144,17 +92,6 @@ pub(crate) const fn is_scope_exit_for(version: PythonVersion, opcode: Opcode) ->
     }
 }
 
-#[allow(dead_code)]
-pub(crate) const fn is_unconditional_jump_for(version: PythonVersion, opcode: Opcode) -> bool {
-    match version {
-        PythonVersion::Py312 => cpython_3_12_14::is_unconditional_jump(opcode),
-        PythonVersion::Py313 => cpython_3_13_15::is_unconditional_jump(opcode),
-        PythonVersion::Py314 => cpython_3_14_5::is_unconditional_jump(opcode),
-        PythonVersion::Py315 => cpython_3_15_0rc2::is_unconditional_jump(opcode),
-    }
-}
-
-#[allow(dead_code)]
 pub(crate) const fn is_conditional_jump_for(version: PythonVersion, opcode: Opcode) -> bool {
     match version {
         PythonVersion::Py312 => cpython_3_12_14::is_conditional_jump(opcode),
@@ -227,7 +164,7 @@ mod tests {
     #[test]
     fn legacy_targets_keep_semantic_identity_and_exact_stack_shapes() {
         use super::{is_scope_exit, opcodes, stack_counts_for};
-        use crate::PythonVersion::{Py312, Py313, Py314, Py315};
+        use crate::PythonVersion::{Py312, Py313, Py314};
 
         assert_eq!(opcodes::LOAD_CONST.code(), 82);
         assert_eq!(opcodes::RETURN_CONST.code_for(Py312), 121);
@@ -236,9 +173,6 @@ mod tests {
         assert_eq!(opcodes::BEFORE_WITH.code_for(Py312), 53);
         assert_eq!(opcodes::BEFORE_WITH.code_for(Py313), 2);
         assert!(is_scope_exit(opcodes::RETURN_CONST));
-        assert!(opcodes::RETURN_CONST.has_constant());
-        assert!(opcodes::KW_NAMES.has_constant());
-        assert!(opcodes::LOAD_CLOSURE.has_free());
         assert_eq!(stack_counts_for(Py312, opcodes::END_FOR, 0), (2, 0));
         assert_eq!(stack_counts_for(Py313, opcodes::END_FOR, 0), (1, 0));
         assert_eq!(stack_counts_for(Py312, opcodes::MAKE_FUNCTION, 15), (5, 1));
@@ -249,8 +183,6 @@ mod tests {
         assert!(!opcodes::END_ASYNC_FOR.has_jump_for(Py312));
         assert!(!opcodes::END_ASYNC_FOR.has_jump_for(Py313));
         assert!(opcodes::END_ASYNC_FOR.has_jump_for(Py314));
-        assert!(opcodes::GET_ITER.has_argument_for(Py315));
-        assert!(!opcodes::GET_ITER.has_argument_for(Py314));
     }
 
     #[test]

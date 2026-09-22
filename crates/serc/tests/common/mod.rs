@@ -91,6 +91,20 @@ pub(crate) fn python_3145_command() -> Command {
     command
 }
 
+fn python_3145_output(arguments: &[&str], input: &[u8]) -> std::process::Output {
+    python_3145_command()
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child.stdin.take().unwrap().write_all(input)?;
+            child.wait_with_output()
+        })
+        .unwrap()
+}
+
 fn python_text_stdout(stdout: Vec<u8>) -> String {
     String::from_utf8(stdout)
         .expect("CPython text oracle should emit UTF-8")
@@ -106,17 +120,7 @@ fn python_text_stdout_normalizes_windows_newlines() {
 }
 
 fn cpython_pop_except_positions(input: &[u8], mode: &str, filename: &str) -> std::process::Output {
-    python_3145_command()
-        .args(["-c", CPYTHON_POP_EXCEPT_POSITIONS, mode, filename])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            child.stdin.take().unwrap().write_all(input)?;
-            child.wait_with_output()
-        })
-        .unwrap()
+    python_3145_output(&["-c", CPYTHON_POP_EXCEPT_POSITIONS, mode, filename], input)
 }
 
 pub(crate) fn assert_matches_cpython_pop_except_positions(source: &str, filename: &str) {
@@ -148,24 +152,17 @@ fn cpython_has_pop_except_at(
     line: u32,
 ) -> std::process::Output {
     let line = line.to_string();
-    python_3145_command()
-        .args([
+    python_3145_output(
+        &[
             "-c",
             CPYTHON_POP_EXCEPT_POSITIONS,
             mode,
             filename,
             qualified_name,
             line.as_str(),
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            child.stdin.take().unwrap().write_all(input)?;
-            child.wait_with_output()
-        })
-        .unwrap()
+        ],
+        input,
+    )
 }
 
 pub(crate) fn assert_cpython_and_serc_have_pop_except_at(
@@ -201,17 +198,7 @@ pub(crate) fn assert_cpython_and_serc_have_pop_except_at(
 }
 
 pub(crate) fn assert_matches_cpython_marshal(source: &str, filename: &str) {
-    let expected = python_3145_command()
-        .args(["-c", CPYTHON_MARSHAL, filename])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            child.stdin.take().unwrap().write_all(source.as_bytes())?;
-            child.wait_with_output()
-        })
-        .unwrap();
+    let expected = python_3145_output(&["-c", CPYTHON_MARSHAL, filename], source.as_bytes());
     assert!(
         expected.status.success(),
         "CPython marshal oracle failed for {filename}: {}",
@@ -225,17 +212,7 @@ pub(crate) fn assert_matches_cpython_marshal(source: &str, filename: &str) {
 }
 
 pub(crate) fn assert_matches_cpython_marshal_bytes(source: &[u8], filename: &str) {
-    let expected = python_3145_command()
-        .args(["-c", CPYTHON_MARSHAL_BYTES, filename])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            child.stdin.take().unwrap().write_all(source)?;
-            child.wait_with_output()
-        })
-        .unwrap();
+    let expected = python_3145_output(&["-c", CPYTHON_MARSHAL_BYTES, filename], source);
     assert!(
         expected.status.success(),
         "CPython byte-source marshal oracle failed for {filename}: {}",

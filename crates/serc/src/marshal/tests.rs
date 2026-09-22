@@ -448,6 +448,47 @@ fn distinguishes_cached_slice_members_from_fresh_objects() {
 }
 
 #[test]
+fn non_reflexive_slice_members_preserve_scalar_bytes_and_occurrence_identity() {
+    for scalar in [
+        Constant::Float(f64::NAN),
+        Constant::Complex {
+            real: f64::NAN,
+            imag: -0.0,
+        },
+        Constant::Complex {
+            real: 0.0,
+            imag: f64::NAN,
+        },
+    ] {
+        let tracked = scalar.clone().with_non_reflexive_origin(17);
+        assert!(tracked.is_truthy());
+        let slice_code = |value: Constant| {
+            code_object(vec![Constant::Slice {
+                lower: Box::new(value.clone()),
+                upper: Box::new(value),
+                step: Box::new(Constant::None),
+            }])
+        };
+        let plain = slice_code(scalar);
+        let tracked = slice_code(tracked);
+        for python_version in [crate::PythonVersion::Py314, crate::PythonVersion::Py315] {
+            assert_eq!(
+                super::writer::encode_code_with_options(
+                    &tracked,
+                    python_version,
+                    &crate::InitialInternState::default(),
+                ),
+                super::writer::encode_code_with_options(
+                    &plain,
+                    python_version,
+                    &crate::InitialInternState::default(),
+                ),
+            );
+        }
+    }
+}
+
+#[test]
 fn frozen_set_keys_and_reference_order_ignore_input_order() {
     let values = vec![
         Constant::Int(1),

@@ -1,20 +1,20 @@
 #[cfg(any(test, debug_assertions))]
 use super::super::AssemblerStage;
 use super::super::{
-    Assembler, COMPARE_OP, CONTAINS_OP, DELETE_FAST, IS_OP, Instruction, Item, LOAD_FAST,
-    LOAD_FAST_AND_CLEAR, LOAD_FAST_CHECK, LayoutAssembler, NOP, Operand, POP_JUMP_IF_FALSE,
-    POP_JUMP_IF_TRUE, POP_TOP, STORE_FAST, STORE_FAST_STORE_FAST, TO_BOOL, UNARY_NOT,
-    UNPACK_SEQUENCE, UnoptimizedCode, ends_scope, is_unconditional_jump,
+    Assembler, COMPARE_OP, DELETE_FAST, Instruction, Item, LOAD_FAST, LOAD_FAST_AND_CLEAR,
+    LOAD_FAST_CHECK, LayoutAssembler, NOP, Operand, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE,
+    STORE_FAST, STORE_FAST_STORE_FAST, TO_BOOL, UNARY_NOT, UNPACK_SEQUENCE, UnoptimizedCode,
+    ends_scope, is_unconditional_jump,
 };
 use crate::CompileError;
 use crate::assembler::ConstantTable;
 use crate::assembler::block_graph::{ItemMut, fuse_adjacent_instructions};
 use crate::target::opcodes::{POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE};
-use crate::target::operands::ComparisonOperation;
 
-use super::control_flow::clear_redundant_boolean_nop_location;
-use super::control_flow::redundant_copy_pop_indices;
-use super::control_flow::remove_none_comparison_boolean_conversions;
+use super::control_flow::{
+    clear_redundant_boolean_nop_location, optimize_boolean_pair, optimize_redundant_store_pair,
+    redundant_copy_pop_indices, remove_none_comparison_boolean_conversions,
+};
 use super::locals::{fuse_pair, optimize_linear_assertion_load_fast};
 
 fn optimize_boolean_conversions_and_redundant_stores(
@@ -42,73 +42,9 @@ fn optimize_boolean_conversions_and_redundant_stores(
         else {
             continue;
         };
-        if current.opcode == STORE_FAST
-            && next.opcode == STORE_FAST
-            // STORE_FAST_MAYBE_NULL remains a distinct pseudo-op through this pass.
-            && !current.local_policy.may_store_null()
-            && !next.local_policy.may_store_null()
-            && matches!(
-                (current.operand(), next.operand()),
-                (Operand::Value(current), Operand::Value(next)) if current == next
-            )
-            && current.location.line == next.location.line
-        {
-            current.opcode = POP_TOP;
-            current.set_operand(Operand::Value(0));
-            continue;
+        if !optimize_redundant_store_pair(current, next) {
+            optimize_boolean_pair(current, next, false);
         }
-        match (current.opcode, next.opcode) {
-            (TO_BOOL, TO_BOOL) => {
-                current.opcode = NOP;
-                current.set_operand(Operand::Value(0));
-                continue;
-            }
-            (UNARY_NOT, TO_BOOL) => {
-                current.opcode = NOP;
-                current.set_operand(Operand::Value(0));
-                next.opcode = UNARY_NOT;
-                next.set_operand(Operand::Value(0));
-                continue;
-            }
-            (UNARY_NOT, UNARY_NOT) => {
-                current.opcode = NOP;
-                current.set_operand(Operand::Value(0));
-                next.opcode = NOP;
-                next.set_operand(Operand::Value(0));
-                continue;
-            }
-            (CONTAINS_OP | IS_OP, UNARY_NOT) => {
-                let Operand::Value(argument) = current.operand() else {
-                    continue;
-                };
-                let opcode = current.opcode;
-                current.opcode = NOP;
-                current.set_operand(Operand::Value(0));
-                next.opcode = opcode;
-                next.set_operand(Operand::Value(argument ^ 1));
-                continue;
-            }
-            _ => {}
-        }
-        if next.opcode != TO_BOOL {
-            continue;
-        }
-        let Operand::Value(argument) = current.operand() else {
-            continue;
-        };
-        let replacement = match current.opcode {
-            COMPARE_OP => Some((COMPARE_OP, ComparisonOperation::force_boolean(argument))),
-            CONTAINS_OP => Some((CONTAINS_OP, argument)),
-            IS_OP => Some((IS_OP, argument)),
-            _ => None,
-        };
-        let Some((opcode, argument)) = replacement else {
-            continue;
-        };
-        current.opcode = NOP;
-        current.set_operand(Operand::Value(0));
-        next.opcode = opcode;
-        next.set_operand(Operand::Value(argument));
     }
     let mut previous_line = None;
     for (item, was_boolean_conversion) in items.iter_mut().zip(was_boolean_conversion) {

@@ -26,9 +26,9 @@ use crate::target::operands::{
 };
 
 use super::constant::{
-    FirstConstant, constant_truthiness, first_expression_constant, first_literal_constant,
-    first_suite_constant, first_suite_literal_constant, fold_constant, folded_bool_operand,
-    folded_constant_owner_slots, is_literal_constant, literal_constant, optimized_percent_format,
+    FirstConstant, first_expression_constant, first_literal_constant, first_suite_constant,
+    first_suite_literal_constant, fold_constant, folded_bool_operand, folded_constant_owner_slots,
+    is_literal_constant, literal_constant, optimized_percent_format,
     two_element_slice_optimization,
 };
 use super::expression::{
@@ -2994,17 +2994,16 @@ impl Compiler<'_> {
                 compiler.compile_jump_if(&statement.test, false, condition_false)
             })?;
         }
-        let body_entry = if fold_constant(&statement.test)
-            .is_some_and(|constant| constant_truthiness(&constant))
-        {
-            // The folded test and authored body retain separate original instruction arrays.
-            let body = self.assembler.label();
-            self.assembler.record_exception_owner_block_boundary(body);
-            self.assembler.mark(body);
-            Some(body)
-        } else {
-            None
-        };
+        let body_entry =
+            if fold_constant(&statement.test).is_some_and(|constant| constant.is_truthy()) {
+                // The folded test and authored body retain separate original instruction arrays.
+                let body = self.assembler.label();
+                self.assembler.record_exception_owner_block_boundary(body);
+                self.assembler.mark(body);
+                Some(body)
+            } else {
+                None
+            };
         if self.output.constants.is_empty()
             && let Some(FirstConstant::Literal(constant)) =
                 first_suite_constant(self, &statement.body)
@@ -3679,22 +3678,7 @@ impl Compiler<'_> {
         let cleanup = self.assembler.label();
         let body = self.assembler.label();
         let condition_false = self.assembler.label();
-        self.compile_expression(&comparison.left)?;
-        for (operator, comparator) in comparison
-            .ops
-            .iter()
-            .zip(&comparison.comparators)
-            .take(comparison.ops.len() - 1)
-        {
-            self.compile_expression(comparator)?;
-            self.assembler
-                .set_location(self.source_location(comparison.range));
-            self.emit(SWAP, 2, 0)?;
-            self.emit(COPY, 2, 1)?;
-            self.emit_boolean_comparison(*operator)?;
-            self.emit_jump_forward(POP_JUMP_IF_FALSE, cleanup, -1)?;
-            self.emit(NOT_TAKEN, 0, 0)?;
-        }
+        self.compile_conditional_comparison_prefix(comparison, cleanup)?;
         let final_comparator = comparison.comparators.last().unwrap();
         let final_operator = *comparison.ops.last().unwrap();
         let specialized_none_jump = matches!(final_comparator, Expr::NoneLiteral(_))
@@ -3809,22 +3793,7 @@ impl Compiler<'_> {
         let cleanup = self.assembler.label();
         let body = self.assembler.label();
         let otherwise = self.assembler.label();
-        self.compile_expression(&comparison.left)?;
-        for (operator, comparator) in comparison
-            .ops
-            .iter()
-            .zip(&comparison.comparators)
-            .take(comparison.ops.len() - 1)
-        {
-            self.compile_expression(comparator)?;
-            self.assembler
-                .set_location(self.source_location(comparison.range));
-            self.emit(SWAP, 2, 0)?;
-            self.emit(COPY, 2, 1)?;
-            self.emit_boolean_comparison(*operator)?;
-            self.emit_jump_forward(POP_JUMP_IF_FALSE, cleanup, -1)?;
-            self.emit(NOT_TAKEN, 0, 0)?;
-        }
+        self.compile_conditional_comparison_prefix(comparison, cleanup)?;
 
         let final_comparator = comparison.comparators.last().unwrap();
         let final_operator = *comparison.ops.last().unwrap();
@@ -14645,22 +14614,7 @@ impl Compiler<'_> {
         let cleanup = self.assembler.label();
         let failure = self.assembler.label();
         let failure_body = self.assembler.label();
-        self.compile_expression(&comparison.left)?;
-        for (operator, comparator) in comparison
-            .ops
-            .iter()
-            .zip(&comparison.comparators)
-            .take(comparison.ops.len() - 1)
-        {
-            self.compile_expression(comparator)?;
-            self.assembler
-                .set_location(self.source_location(comparison.range));
-            self.emit(SWAP, 2, 0)?;
-            self.emit(COPY, 2, 1)?;
-            self.emit_boolean_comparison(*operator)?;
-            self.emit_jump_forward(POP_JUMP_IF_FALSE, cleanup, -1)?;
-            self.emit(NOT_TAKEN, 0, 0)?;
-        }
+        self.compile_conditional_comparison_prefix(comparison, cleanup)?;
         let last = comparison.comparators.last().unwrap();
         let operator = *comparison.ops.last().unwrap();
         let none_jump =
@@ -15956,22 +15910,7 @@ impl Compiler<'_> {
         let cleanup = self.assembler.label();
         let success = self.assembler.label();
 
-        self.compile_expression(&comparison.left)?;
-        for (operator, comparator) in comparison
-            .ops
-            .iter()
-            .zip(&comparison.comparators)
-            .take(comparison.ops.len() - 1)
-        {
-            self.compile_expression(comparator)?;
-            self.assembler
-                .set_location(self.source_location(comparison.range));
-            self.emit(SWAP, 2, 0)?;
-            self.emit(COPY, 2, 1)?;
-            self.emit_boolean_comparison(*operator)?;
-            self.emit_jump_forward(POP_JUMP_IF_FALSE, cleanup, -1)?;
-            self.emit(NOT_TAKEN, 0, 0)?;
-        }
+        self.compile_conditional_comparison_prefix(comparison, cleanup)?;
 
         let final_comparator = comparison.comparators.last().unwrap();
         let final_operator = *comparison.ops.last().unwrap();
@@ -16761,7 +16700,7 @@ impl Compiler<'_> {
                     .retain_last_not_taken_structural_exception_owner();
             }
         }
-        if fold_constant(&statement.test).is_some_and(|constant| constant_truthiness(&constant)) {
+        if fold_constant(&statement.test).is_some_and(|constant| constant.is_truthy()) {
             // The authored body starts a separate original array after the constant test.
             let body = self.assembler.label();
             self.assembler.record_exception_owner_block_boundary(body);
@@ -30205,25 +30144,9 @@ fn try_has_fallthrough_body_and_handler(
 }
 
 fn suite_contains_nested_exception_cleanup(body: &[Stmt]) -> bool {
-    #[derive(Default)]
-    struct Detector {
-        found: bool,
-    }
-
-    impl<'ast> Visitor<'ast> for Detector {
-        fn visit_stmt(&mut self, statement: &'ast Stmt) {
-            match statement {
-                Stmt::Try(_) | Stmt::With(_) => self.found = true,
-                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
-                _ if !self.found => walk_stmt(self, statement),
-                _ => {}
-            }
-        }
-    }
-
-    let mut detector = Detector::default();
-    detector.visit_body(body);
-    detector.found
+    suite_any_statement(body, |statement| {
+        matches!(statement, Stmt::Try(_) | Stmt::With(_))
+    })
 }
 
 fn is_call_expression_suite(body: &[Stmt]) -> bool {
@@ -32598,59 +32521,46 @@ fn suite_has_located_finally_arm(body: &[Stmt]) -> bool {
                 && suite_has_linear_borrow_fallthrough(rest))
 }
 
-/// Detect returns in this function while leaving nested function/class bodies separate.
-fn suite_contains_return(body: &[Stmt]) -> bool {
-    #[derive(Default)]
-    struct ReturnDetector(bool);
+/// Searches statements in the current scope, excluding nested function and class bodies.
+fn suite_any_statement(body: &[Stmt], predicate: impl Fn(&Stmt) -> bool) -> bool {
+    struct Detector<F> {
+        predicate: F,
+        found: bool,
+    }
 
-    impl<'ast> Visitor<'ast> for ReturnDetector {
+    impl<'ast, F: Fn(&Stmt) -> bool> Visitor<'ast> for Detector<F> {
         fn visit_stmt(&mut self, statement: &'ast Stmt) {
-            if self.0 || matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+            if self.found || matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
                 return;
             }
-            if matches!(statement, Stmt::Return(_)) {
-                self.0 = true;
+            if (self.predicate)(statement) {
+                self.found = true;
             } else {
                 walk_stmt(self, statement);
             }
         }
     }
 
-    let mut detector = ReturnDetector::default();
-    for statement in body {
-        detector.visit_stmt(statement);
-    }
-    detector.0
+    let mut detector = Detector {
+        predicate,
+        found: false,
+    };
+    detector.visit_body(body);
+    detector.found
+}
+
+/// Detect returns in this function while leaving nested function/class bodies separate.
+fn suite_contains_return(body: &[Stmt]) -> bool {
+    suite_any_statement(body, |statement| matches!(statement, Stmt::Return(_)))
 }
 
 fn suite_contains_abrupt_control_flow(body: &[Stmt]) -> bool {
-    #[derive(Default)]
-    struct AbruptControlFlowDetector {
-        found: bool,
-    }
-
-    impl<'ast> Visitor<'ast> for AbruptControlFlowDetector {
-        fn visit_stmt(&mut self, statement: &'ast Stmt) {
-            if self.found {
-                return;
-            }
-            match statement {
-                Stmt::Break(_) | Stmt::Continue(_) | Stmt::Raise(_) | Stmt::Return(_) => {
-                    self.found = true;
-                    return;
-                }
-                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => return,
-                _ => {}
-            }
-            walk_stmt(self, statement);
-        }
-    }
-
-    let mut detector = AbruptControlFlowDetector::default();
-    for statement in body {
-        detector.visit_stmt(statement);
-    }
-    detector.found
+    suite_any_statement(body, |statement| {
+        matches!(
+            statement,
+            Stmt::Break(_) | Stmt::Continue(_) | Stmt::Raise(_) | Stmt::Return(_)
+        )
+    })
 }
 
 pub(super) fn suite_contains_yield(body: &[Stmt]) -> bool {
@@ -35520,55 +35430,16 @@ pub(super) fn is_wildcard_pattern(pattern: &Pattern) -> bool {
 
 /// Finds async loops whose exception-only exhaustion cannot certify a normal borrow edge.
 fn suite_contains_async_for(body: &[Stmt]) -> bool {
-    #[derive(Default)]
-    struct AsyncForDetector {
-        found: bool,
-    }
-
-    impl<'ast> Visitor<'ast> for AsyncForDetector {
-        fn visit_stmt(&mut self, statement: &'ast Stmt) {
-            if self.found || matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
-                return;
-            }
-            if matches!(statement, Stmt::For(loop_statement) if loop_statement.is_async) {
-                self.found = true;
-                return;
-            }
-            walk_stmt(self, statement);
-        }
-    }
-
-    let mut detector = AsyncForDetector::default();
-    for statement in body {
-        detector.visit_stmt(statement);
-    }
-    detector.found
+    suite_any_statement(
+        body,
+        |statement| matches!(statement, Stmt::For(loop_statement) if loop_statement.is_async),
+    )
 }
 
 fn suite_contains_loop(body: &[Stmt]) -> bool {
-    #[derive(Default)]
-    struct LoopDetector {
-        found: bool,
-    }
-
-    impl<'ast> Visitor<'ast> for LoopDetector {
-        fn visit_stmt(&mut self, statement: &'ast Stmt) {
-            if self.found || matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
-                return;
-            }
-            if matches!(statement, Stmt::For(_) | Stmt::While(_)) {
-                self.found = true;
-                return;
-            }
-            walk_stmt(self, statement);
-        }
-    }
-
-    let mut detector = LoopDetector::default();
-    for statement in body {
-        detector.visit_stmt(statement);
-    }
-    detector.found
+    suite_any_statement(body, |statement| {
+        matches!(statement, Stmt::For(_) | Stmt::While(_))
+    })
 }
 
 /// Finds the terminal loop whose manager cleanup leaves an empty normal-finally entry.

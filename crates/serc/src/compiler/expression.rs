@@ -2962,37 +2962,7 @@ impl Compiler<'_> {
         if call.arguments.keywords.is_empty() && !starred_argument_pushed_null {
             self.emit(PUSH_NULL, 0, 1)?;
         } else {
-            let mut have_dict = false;
-            let mut named_start = 0;
-            for (index, keyword) in call.arguments.keywords.iter().enumerate() {
-                if keyword.arg.is_some() {
-                    continue;
-                }
-                if named_start < index {
-                    self.compile_keyword_map(
-                        call_location,
-                        &call.arguments.keywords[named_start..index],
-                    )?;
-                    if have_dict {
-                        self.emit(DICT_MERGE, 1, -1)?;
-                    }
-                    have_dict = true;
-                }
-                if !have_dict {
-                    self.emit(BUILD_MAP, 0, 1)?;
-                    have_dict = true;
-                }
-                self.compile_simple_expression_operand(&keyword.value)?;
-                self.assembler.set_location(call_location);
-                self.emit(DICT_MERGE, 1, -1)?;
-                named_start = index + 1;
-            }
-            if named_start < call.arguments.keywords.len() {
-                self.compile_keyword_map(call_location, &call.arguments.keywords[named_start..])?;
-                if have_dict {
-                    self.emit(DICT_MERGE, 1, -1)?;
-                }
-            }
+            self.compile_call_keyword_dict(call_location, &call.arguments.keywords)?;
         }
         if (!shape.has_starred && !shape.has_keyword_unpack) || starred_argument_pushed_null {
             self.assembler.set_location(call_location);
@@ -3100,37 +3070,7 @@ impl Compiler<'_> {
                 }
                 arguments => self.compile_collection(arguments, CollectionKind::Tuple)?,
             }
-            let mut have_dict = false;
-            let mut named_start = 0;
-            for (index, keyword) in call.arguments.keywords.iter().enumerate() {
-                if keyword.arg.is_some() {
-                    continue;
-                }
-                if named_start < index {
-                    self.compile_keyword_map(
-                        call_location,
-                        &call.arguments.keywords[named_start..index],
-                    )?;
-                    if have_dict {
-                        self.emit(DICT_MERGE, 1, -1)?;
-                    }
-                    have_dict = true;
-                }
-                if !have_dict {
-                    self.emit(BUILD_MAP, 0, 1)?;
-                    have_dict = true;
-                }
-                self.compile_expression(&keyword.value)?;
-                self.assembler.set_location(call_location);
-                self.emit(DICT_MERGE, 1, -1)?;
-                named_start = index + 1;
-            }
-            if named_start < call.arguments.keywords.len() {
-                self.compile_keyword_map(call_location, &call.arguments.keywords[named_start..])?;
-                if have_dict {
-                    self.emit(DICT_MERGE, 1, -1)?;
-                }
-            }
+            self.compile_call_keyword_dict(call_location, &call.arguments.keywords)?;
             self.assembler.set_location(call_location);
             let has_keywords = !call.arguments.keywords.is_empty();
             self.emit(
@@ -3304,6 +3244,47 @@ impl Compiler<'_> {
         self.assembler.record_exception_owner_block_boundary(end);
         self.assembler.mark(end);
         self.set_depth(base_depth + 1);
+        Ok(())
+    }
+
+    /// Builds the keyword dictionary for an expanded call in source evaluation order.
+    fn compile_call_keyword_dict(
+        &mut self,
+        call_location: SourceLocation,
+        keywords: &[Keyword],
+    ) -> Result<(), CompileError> {
+        let mut have_dict = false;
+        let mut named_start = 0;
+        for (index, keyword) in keywords.iter().enumerate() {
+            if keyword.arg.is_some() {
+                continue;
+            }
+            if named_start < index {
+                self.compile_keyword_map(call_location, &keywords[named_start..index])?;
+                if have_dict {
+                    self.emit(DICT_MERGE, 1, -1)?;
+                }
+                have_dict = true;
+            }
+            if !have_dict {
+                self.emit(BUILD_MAP, 0, 1)?;
+                have_dict = true;
+            }
+            if self.context.python_version <= PythonVersion::Py313 {
+                self.compile_expression(&keyword.value)?;
+            } else {
+                self.compile_simple_expression_operand(&keyword.value)?;
+            }
+            self.assembler.set_location(call_location);
+            self.emit(DICT_MERGE, 1, -1)?;
+            named_start = index + 1;
+        }
+        if named_start < keywords.len() {
+            self.compile_keyword_map(call_location, &keywords[named_start..])?;
+            if have_dict {
+                self.emit(DICT_MERGE, 1, -1)?;
+            }
+        }
         Ok(())
     }
 
@@ -5280,21 +5261,7 @@ impl Compiler<'_> {
         let cleanup = self.assembler.label();
         let residue = self.assembler.label();
         let comparison_location = self.source_location(comparison.range);
-        self.compile_expression(&comparison.left)?;
-        for (operator, comparator) in comparison
-            .ops
-            .iter()
-            .zip(&comparison.comparators)
-            .take(comparison.ops.len() - 1)
-        {
-            self.compile_expression(comparator)?;
-            self.assembler.set_location(comparison_location);
-            self.emit(SWAP, 2, 0)?;
-            self.emit(COPY, 2, 1)?;
-            self.emit_boolean_comparison(*operator)?;
-            self.emit_jump_forward(POP_JUMP_IF_FALSE, cleanup, -1)?;
-            self.emit(NOT_TAKEN, 0, 0)?;
-        }
+        self.compile_conditional_comparison_prefix(comparison, cleanup)?;
 
         let last = comparison.comparators.last().unwrap();
         let operator = *comparison.ops.last().unwrap();
@@ -7652,6 +7619,31 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    /// Emits the shared short-circuit prefix, leaving the final comparison to its caller.
+    pub(super) fn compile_conditional_comparison_prefix(
+        &mut self,
+        comparison: &ruff_python_ast::ExprCompare,
+        cleanup: Label,
+    ) -> Result<(), CompileError> {
+        self.compile_expression(&comparison.left)?;
+        for (operator, comparator) in comparison
+            .ops
+            .iter()
+            .zip(&comparison.comparators)
+            .take(comparison.ops.len() - 1)
+        {
+            self.compile_expression(comparator)?;
+            self.assembler
+                .set_location(self.source_location(comparison.range));
+            self.emit(SWAP, 2, 0)?;
+            self.emit(COPY, 2, 1)?;
+            self.emit_boolean_comparison(*operator)?;
+            self.emit_jump_forward(POP_JUMP_IF_FALSE, cleanup, -1)?;
+            self.emit(NOT_TAKEN, 0, 0)?;
+        }
+        Ok(())
+    }
+
     fn compile_compare_expression(
         &mut self,
         expression: &ruff_python_ast::ExprCompare,
@@ -8241,7 +8233,7 @@ impl Compiler<'_> {
         let constant_truthiness = if legacy_constant {
             self.source_aware_fold_constant(expression)
                 .as_ref()
-                .map(super::constant::constant_truthiness)
+                .map(Constant::is_truthy)
         } else {
             jump_constant_truthiness(expression)
         };
@@ -8373,22 +8365,7 @@ impl Compiler<'_> {
                 super::legacy_native_labels::NativeRole::ConditionCompareCleanup(comparison.range),
                 cleanup,
             );
-            self.compile_expression(&comparison.left)?;
-            for (operator, comparator) in comparison
-                .ops
-                .iter()
-                .zip(&comparison.comparators)
-                .take(comparison.ops.len() - 1)
-            {
-                self.compile_expression(comparator)?;
-                self.assembler
-                    .set_location(self.source_location(comparison.range));
-                self.emit(SWAP, 2, 0)?;
-                self.emit(COPY, 2, 1)?;
-                self.emit_boolean_comparison(*operator)?;
-                self.emit_jump_forward(POP_JUMP_IF_FALSE, cleanup, -1)?;
-                self.emit(NOT_TAKEN, 0, 0)?;
-            }
+            self.compile_conditional_comparison_prefix(comparison, cleanup)?;
 
             let final_comparator = comparison.comparators.last().unwrap();
             let final_operator = *comparison.ops.last().unwrap();

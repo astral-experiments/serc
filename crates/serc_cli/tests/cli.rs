@@ -1,5 +1,6 @@
 mod common;
 
+use std::fmt::Write as _;
 use std::process::Command;
 use std::time::UNIX_EPOCH;
 
@@ -108,6 +109,47 @@ fn compile_rejects_unsupported_python_version() {
 fn compile_matches_cpython_for_version_specific_marshal_identity() {
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("module.py");
+    // Equal ordinary and slice constants must keep their distinct ownership and string tags.
+    let mut scalar_source = String::new();
+    for (index, value) in [
+        "-2147483649",
+        "-2147483648",
+        "2147483647",
+        "2147483648",
+        "-9223372036854775808",
+        "18446744073709551615",
+        "18446744073709551616",
+        "-18446744073709551616",
+        "-0.0",
+        "2 + 3j",
+        "''",
+        "'x'",
+        "'é'",
+        "'Ā'",
+        "'identifier'",
+        "'not interned'",
+        r"'\ud800'",
+        "b''",
+        "b'x'",
+        r"b'\xff\x00'",
+        &format!("{:?}", "x".repeat(255)),
+        &format!("{:?}", "x".repeat(256)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // Constant slices currently mishandle empty-string identity and surrogate bounds.
+        // Keep both scalar values covered through ordinary constants and tuples.
+        if matches!(value, "''" | r"'\ud800'") {
+            writeln!(
+                scalar_source,
+                "def scalar_{index}(a):\n    return {value}, ({value}, {value})"
+            )
+            .unwrap();
+        } else {
+            writeln!(scalar_source, "def scalar_{index}(a):\n    return {value}, a[{value}:{value}:{value}], a[{value}:{value}:{value}]").unwrap();
+        }
+    }
     for version in [
         serc::PythonVersion::Py312,
         serc::PythonVersion::Py313,
@@ -119,6 +161,7 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
             .path()
             .join(format!("__pycache__/module.cpython-3{minor}.pyc"));
         for source in [
+            scalar_source.as_str(),
             "def answer():\n    return 42\n",
             "café = 'café'\n",
             "s = 'café'\nt = ('café',)\ndef f():\n    return café\n",
@@ -134,18 +177,18 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
             "value = ((~True,),)",
             r#"value = ((~False,), "\ud800")"#,
             // Recursive source-aware folding keeps target-specific tuple truth steps.
-            r#"value = not ()"#,
+            r"value = not ()",
             r#"value = not ("\ud800",)"#,
             r#"value = ((not ("\ud800",)), "\udfff")"#,
-            r#"value = (not (),) * 2"#,
+            r"value = (not (),) * 2",
             r#"value = (not (), "\ud800")[0]"#,
-            r#"value = (17, 23)[not ()]"#,
+            r"value = (17, 23)[not ()]",
             r#"value = (not ("\ud800",)) + 1"#,
             r#"value = (not (),) + ("\ud800",)"#,
             r#"value = not (runtime(), "\ud800")"#,
             // Preserve numeric allocation origins through the same recursive path.
             r#"value = (((1e309 - 1e309), "\ud800"),) * 2"#,
-            r#"value = (-(1e309 - 1e309), +(1e309 - 1e309))"#,
+            r"value = (-(1e309 - 1e309), +(1e309 - 1e309))",
             // Preserve surrogate code points through composite constant folding.
             "value = \"\\ud800\"[0]",
             "value = \"\\ud800x\"[-1]",

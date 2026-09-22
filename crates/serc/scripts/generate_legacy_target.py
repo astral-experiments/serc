@@ -60,29 +60,6 @@ def render_legacy_opcodes(metadata: dict) -> str:
     ]
     for code, name in enumerate(LEGACY_OPCODES, 129):
         lines.append(f"pub(crate) const {name}: Opcode = Opcode::new({code});")
-    for method, flag in (
-        ("has_argument", "HAS_ARG_FLAG"),
-        ("has_constant", "HAS_CONST_FLAG"),
-        ("has_name", "HAS_NAME_FLAG"),
-        ("has_jump", "HAS_JUMP_FLAG"),
-        ("has_free", "HAS_FREE_FLAG"),
-        ("has_local", "HAS_LOCAL_FLAG"),
-    ):
-        names = sorted(
-            name
-            for name in LEGACY_OPCODES
-            if flag in LEGACY_PROPERTIES.get(name, set())
-        )
-        expression = "matches!(opcode, " + " | ".join(names) + ")" if names else "false"
-        argument = "opcode" if names else "_opcode"
-        lines.extend(
-            [
-                "",
-                f"pub(super) const fn {method}({argument}: Opcode) -> bool {{",
-                f"    {expression}",
-                "}",
-            ]
-        )
     return "\n".join(lines) + "\n"
 
 
@@ -165,28 +142,20 @@ def render_legacy_target(sources: dict[str, str], g) -> str:
         if width := metadata["caches"].get(name, 0):
             lines.append(f"        opcodes::{name} => {width},")
     lines.extend(["        _ => 0,", "    }", "}", ""])
-    for method, flag in (
-        ("has_argument", "HAS_ARG_FLAG"),
-        ("has_constant", "HAS_CONST_FLAG"),
-        ("has_name", "HAS_NAME_FLAG"),
-        ("has_jump", "HAS_JUMP_FLAG"),
-        ("has_free", "HAS_FREE_FLAG"),
-        ("has_local", "HAS_LOCAL_FLAG"),
-    ):
-        classified = {name for name in names if flag in metadata["flags"][name]}
-        lines.extend(
-            [
-                "#[allow(dead_code)]",
-                f"pub(crate) const fn {method}(opcode: Opcode) -> bool {{",
-                f"    {g.opcode_match_expression(opcodes, classified)}",
-                "}",
-                "",
-            ]
-        )
+    jumps = {name for name in names if "HAS_JUMP_FLAG" in metadata["flags"][name]}
+    lines.extend(
+        [
+            "pub(crate) const fn has_jump(opcode: Opcode) -> bool {",
+            f"    {g.opcode_match_expression(opcodes, jumps)}",
+            "}",
+            "",
+        ]
+    )
     for method, classified in metadata["predicates"].items():
+        if method == "is_unconditional_jump":
+            continue
         lines.extend(
             [
-                "#[allow(dead_code)]",
                 f"pub(crate) const fn {method}(opcode: Opcode) -> bool {{",
                 f"    {g.opcode_match_expression(opcodes, classified)}",
                 "}",

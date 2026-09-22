@@ -18,6 +18,93 @@ use crate::target::opcodes::{
 };
 use crate::target::operands::ComparisonOperation;
 
+/// Replaces the earlier of two same-line stores to the same local with a stack pop.
+pub(super) fn optimize_redundant_store_pair(first: &mut Instruction, second: &Instruction) -> bool {
+    if first.opcode == STORE_FAST
+        && second.opcode == STORE_FAST
+        // STORE_FAST_MAYBE_NULL remains a distinct pseudo-op through this pass.
+        && !first.local_policy.may_store_null()
+        && !second.local_policy.may_store_null()
+        && matches!(
+            (first.operand(), second.operand()),
+            (Operand::Value(first), Operand::Value(second)) if first == second
+        )
+        && first.location.line == second.location.line
+    {
+        first.opcode = POP_TOP;
+        first.set_operand(Operand::Value(0));
+        true
+    } else {
+        false
+    }
+}
+
+/// Folds one adjacent Boolean pair while preserving its original instruction slots.
+pub(super) fn optimize_boolean_pair(
+    current: &mut Instruction,
+    next: &mut Instruction,
+    retain_contains: bool,
+) {
+    match (current.opcode, next.opcode) {
+        (TO_BOOL, TO_BOOL) => {
+            current.opcode = NOP;
+            current.set_operand(Operand::Value(0));
+            return;
+        }
+        (UNARY_NOT, TO_BOOL) => {
+            current.opcode = NOP;
+            current.set_operand(Operand::Value(0));
+            next.opcode = UNARY_NOT;
+            next.set_operand(Operand::Value(0));
+            return;
+        }
+        (UNARY_NOT, UNARY_NOT) => {
+            current.opcode = NOP;
+            current.set_operand(Operand::Value(0));
+            next.opcode = NOP;
+            next.set_operand(Operand::Value(0));
+            return;
+        }
+        (CONTAINS_OP | IS_OP, UNARY_NOT) => {
+            let Operand::Value(argument) = current.operand() else {
+                return;
+            };
+            let opcode = current.opcode;
+            if retain_contains && opcode == CONTAINS_OP {
+                current.mark_retired_contains();
+            }
+            current.opcode = NOP;
+            current.set_operand(Operand::Value(0));
+            next.opcode = opcode;
+            next.set_operand(Operand::Value(argument ^ 1));
+            return;
+        }
+        _ => {}
+    }
+    if next.opcode != TO_BOOL {
+        return;
+    }
+    let Operand::Value(argument) = current.operand() else {
+        return;
+    };
+    let replacement = match current.opcode {
+        COMPARE_OP => Some((COMPARE_OP, ComparisonOperation::force_boolean(argument))),
+        CONTAINS_OP => Some((CONTAINS_OP, argument)),
+        IS_OP => Some((IS_OP, argument)),
+        _ => None,
+    };
+    let Some((opcode, argument)) = replacement else {
+        return;
+    };
+    if retain_contains && opcode == CONTAINS_OP {
+        current.mark_retired_contains();
+    }
+    current.opcode = NOP;
+    current.set_operand(Operand::Value(0));
+    next.opcode = opcode;
+    next.set_operand(Operand::Value(argument));
+}
+
 /// Drops a folded Boolean slot's line event when the original block already records that line.
 pub(super) fn clear_redundant_boolean_nop_location(
     instruction: &mut Instruction,
@@ -284,21 +371,7 @@ impl OptimizationPipeline {
         }
         let mut changed = false;
         graph.for_each_adjacent_instruction_pair_mut(|first, second| {
-            if first.opcode == STORE_FAST
-                && second.opcode == STORE_FAST
-                // STORE_FAST_MAYBE_NULL remains a distinct pseudo-op through this pass.
-                && !first.local_policy.may_store_null()
-                && !second.local_policy.may_store_null()
-                && matches!(
-                    (first.operand(), second.operand()),
-                    (Operand::Value(first), Operand::Value(second)) if first == second
-                )
-                && first.location.line == second.location.line
-            {
-                first.opcode = POP_TOP;
-                first.set_operand(Operand::Value(0));
-                changed = true;
-            }
+            changed |= optimize_redundant_store_pair(first, second);
         });
         changed
     }
@@ -526,64 +599,7 @@ impl OptimizationPipeline {
             }
         }
         graph.for_each_adjacent_instruction_pair_mut(|current, next| {
-            match (current.opcode, next.opcode) {
-                (TO_BOOL, TO_BOOL) => {
-                    current.opcode = NOP;
-                    current.set_operand(Operand::Value(0));
-                    return;
-                }
-                (UNARY_NOT, TO_BOOL) => {
-                    current.opcode = NOP;
-                    current.set_operand(Operand::Value(0));
-                    next.opcode = UNARY_NOT;
-                    next.set_operand(Operand::Value(0));
-                    return;
-                }
-                (UNARY_NOT, UNARY_NOT) => {
-                    current.opcode = NOP;
-                    current.set_operand(Operand::Value(0));
-                    next.opcode = NOP;
-                    next.set_operand(Operand::Value(0));
-                    return;
-                }
-                (CONTAINS_OP | IS_OP, UNARY_NOT) => {
-                    let Operand::Value(argument) = current.operand() else {
-                        return;
-                    };
-                    let opcode = current.opcode;
-                    if retain_contains && opcode == CONTAINS_OP {
-                        current.mark_retired_contains();
-                    }
-                    current.opcode = NOP;
-                    current.set_operand(Operand::Value(0));
-                    next.opcode = opcode;
-                    next.set_operand(Operand::Value(argument ^ 1));
-                    return;
-                }
-                _ => {}
-            }
-            if next.opcode != TO_BOOL {
-                return;
-            }
-            let Operand::Value(argument) = current.operand() else {
-                return;
-            };
-            let replacement = match current.opcode {
-                COMPARE_OP => Some((COMPARE_OP, ComparisonOperation::force_boolean(argument))),
-                CONTAINS_OP => Some((CONTAINS_OP, argument)),
-                IS_OP => Some((IS_OP, argument)),
-                _ => None,
-            };
-            let Some((opcode, argument)) = replacement else {
-                return;
-            };
-            if retain_contains && opcode == CONTAINS_OP {
-                current.mark_retired_contains();
-            }
-            current.opcode = NOP;
-            current.set_operand(Operand::Value(0));
-            next.opcode = opcode;
-            next.set_operand(Operand::Value(argument));
+            optimize_boolean_pair(current, next, retain_contains);
         });
         let mut was_boolean_conversion = was_boolean_conversion.into_iter();
         for block in graph.order().to_vec() {

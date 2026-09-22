@@ -31,12 +31,12 @@ fn matches_cpython_surrogate_string_constant_folding() {
 #[test]
 fn preserves_tuple_truth_runtime_steps_during_surrogate_folding() {
     for expression in [
-        r#"not ()"#,
+        r"not ()",
         r#"not ("\ud800",)"#,
         r#"((not ("\ud800",)), "\udfff")"#,
-        r#"(not (),) * 2"#,
+        r"(not (),) * 2",
         r#"(not (), "\ud800")[0]"#,
-        r#"(17, 23)[not ()]"#,
+        r"(17, 23)[not ()]",
         r#"(not ("\ud800",)) + 1"#,
         r#"(not (),) + ("\ud800",)"#,
         r#"not (runtime(), "\ud800")"#,

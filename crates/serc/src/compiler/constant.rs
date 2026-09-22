@@ -571,7 +571,7 @@ fn collect_early_boolean_admissions(expression: &Expr, admissions: &mut Vec<bool
                         .then_some(Constant::Bool(true))
                 })
             {
-                let value = constant_truthiness(&value);
+                let value = value.is_truthy();
                 if !self.0.contains(&value) {
                     self.0.push(value);
                 }
@@ -1370,12 +1370,8 @@ fn numeric_parts(value: &Constant) -> Option<(NumericReal, f64)> {
     }
 }
 
-fn integer_numeric_real(mut value: u64, negative: bool) -> NumericReal {
-    let mut digits = Vec::new();
-    while value != 0 {
-        digits.push((value & 0x7fff) as u16);
-        value >>= 15;
-    }
+fn integer_numeric_real(value: u64, negative: bool) -> NumericReal {
+    let digits = integer_digits(value);
     NumericReal::Integer {
         negative: negative && !digits.is_empty(),
         digits,
@@ -1441,28 +1437,10 @@ fn float_integer_numeric_real(value: f64) -> Option<NumericReal> {
         return Some(integer_numeric_real(mantissa, negative));
     }
 
-    let mut digits = match integer_numeric_real(mantissa, negative) {
-        NumericReal::Integer { digits, .. } => digits,
-        NumericReal::Float(_) => unreachable!(),
-    };
-    let shift = u32::try_from(exponent).ok()?;
-    let digit_shift = usize::try_from(shift / 15).ok()?;
-    let bit_shift = shift % 15;
-    if digit_shift > 0 {
-        digits.splice(0..0, std::iter::repeat_n(0, digit_shift));
-    }
-    if bit_shift > 0 {
-        let mut carry = 0_u32;
-        for digit in &mut digits {
-            let shifted = (u32::from(*digit) << bit_shift) | carry;
-            *digit = (shifted & 0x7fff) as u16;
-            carry = shifted >> 15;
-        }
-        if carry != 0 {
-            digits.push(u16::try_from(carry).expect("base-2^15 carry fits in u16"));
-        }
-    }
-    Some(NumericReal::Integer { negative, digits })
+    Some(NumericReal::Integer {
+        negative,
+        digits: left_shift_magnitude(&integer_digits(mantissa), usize::try_from(exponent).ok()?),
+    })
 }
 
 fn code_objects_equal(left: &CodeObject, right: &CodeObject) -> bool {
@@ -2675,7 +2653,7 @@ pub(super) fn folded_bool_operand(
         }
         let constant = fold_constant(value)?;
         let truthiness = if python_version <= PythonVersion::Py313 {
-            constant_truthiness(&constant)
+            constant.is_truthy()
         } else {
             // The early LOAD_CONST pass precedes arithmetic and tuple folding. Its
             // Boolean shortcuts cannot consume values produced by those later rewrites.
@@ -2853,24 +2831,6 @@ fn fold_complex_integer_power(base: &Constant, exponent: &Constant) -> Option<Co
         real: result.0,
         imag: result.1,
     })
-}
-
-pub(super) fn constant_truthiness(constant: &Constant) -> bool {
-    match constant {
-        Constant::None => false,
-        Constant::Bool(value) => *value,
-        Constant::Ellipsis | Constant::Slice { .. } | Constant::Code(_) => true,
-        Constant::Int(value) => *value != 0,
-        Constant::SignedInt(value) => *value != 0,
-        Constant::BigInt { digits, .. } => !digits.is_empty(),
-        Constant::NonReflexive(_) => true,
-        Constant::Float(value) => *value != 0.0,
-        Constant::Complex { real, imag } => *real != 0.0 || *imag != 0.0,
-        Constant::String(value) => !value.is_empty(),
-        Constant::SurrogateString(value) => !value.is_empty(),
-        Constant::Bytes(value) => !value.is_empty(),
-        Constant::Tuple(value) | Constant::FrozenSet(value) => !value.is_empty(),
-    }
 }
 
 pub(super) fn constant_slice(slice: &ruff_python_ast::ExprSlice) -> Option<Constant> {
