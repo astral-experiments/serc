@@ -8837,6 +8837,74 @@ impl Compiler<'_> {
                                 && loop_context.exception_region_depth
                                     == finally_context.exception_region_depth + 1);
                     let mut copied_return_none_pop_pair = None;
+                    let mut nested_finally_method_pop = None;
+                    // Unwind only the ordinary tries entered since the next inner
+                    // finalizer. The global active-try count still includes already
+                    // unwound scopes while these copied bodies are compiled.
+                    let restores_nested_finalizer_try_pops = self.context.python_version
+                        == crate::PythonVersion::Py314
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == 0
+                        && preserve_tos
+                        && !return_is_overridden
+                        && handler_count == 0
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.loops.contexts.is_empty()
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self
+                            .control
+                            .finally
+                            .preserved_return_value_contexts
+                            .is_empty()
+                        && matches!(statement.value.as_deref(), Some(Expr::Call(call))
+                            if matches!(call.func.as_ref(), Expr::Name(_))
+                                && matches!(call.arguments.args.as_ref(), [Expr::Name(_)])
+                                && call.arguments.keywords.is_empty())
+                        && matches!(return_finally_contexts.as_slice(), [outer, inner]
+                            if outer.handler_depth == 0 && inner.handler_depth == 0
+                                && outer.loop_depth == 0 && inner.loop_depth == 0
+                                && outer.with_depth == 0 && inner.with_depth == 0
+                                && outer.try_body_depth == 0 && inner.try_body_depth <= 1
+                                && outer.exception_region_depth == 0
+                                && !suite_contains_abrupt_control_flow(&outer.body)
+                                && !suite_contains_yield(&outer.body)
+                                && inner.exception_region_depth == inner.try_body_depth + 1
+                                && self.control.exceptions.active_try_marker_slots.len()
+                                    == inner.try_body_depth + 1
+                                && matches!(inner.body.as_slice(), [Stmt::Expr(expression)]
+                                    if matches!(expression.value.as_ref(), Expr::Call(call)
+                                        if call.arguments.args.is_empty()
+                                            && call.arguments.keywords.is_empty()
+                                            && matches!(call.func.as_ref(), Expr::Attribute(attribute)
+                                                if matches!(attribute.value.as_ref(), Expr::Name(_)))))
+                                && matches!(outer.body.first(), Some(Stmt::If(guard))
+                                    if matches!(guard.test.as_ref(), Expr::Compare(test)
+                                        if matches!(test.left.as_ref(), Expr::Name(_))
+                                            && matches!(test.ops.as_ref(), [CmpOp::Is | CmpOp::IsNot])
+                                            && matches!(test.comparators.as_ref(), [Expr::NoneLiteral(_)]))));
+                    if restores_nested_finalizer_try_pops {
+                        let before = return_finally_contexts.get(context_index + 1).map_or(
+                            self.control.exceptions.active_try_marker_slots.len(),
+                            |inner| inner.try_body_depth,
+                        );
+                        if context_index == 1 {
+                            nested_finally_method_pop = Some(self.assembler.item_count());
+                            let anchor = self.assembler.label();
+                            self.assembler.mark(anchor);
+                        }
+                        for _ in finally_context.try_body_depth..before {
+                            self.emit_with_exception_policy(
+                                NOP,
+                                0,
+                                0,
+                                ExceptionPolicy::EXCLUDE_ALWAYS,
+                            )?;
+                            self.assembler.mark_last_as_converted_pop_block();
+                        }
+                    }
                     if return_finally_contexts.len() == 1
                         && handler_count == 0
                         && let Some(ordinary_try_count) = self
@@ -9898,6 +9966,15 @@ impl Compiler<'_> {
                     {
                         self.assembler
                             .record_copied_handler_finally_pop_prefix(pop_item);
+                    }
+                    if result.is_ok()
+                        && let Some(start) = nested_finally_method_pop
+                    {
+                        self.assembler.record_copied_method_cleanup_pop_span(start);
+                    }
+                    if result.is_ok() && restores_nested_finalizer_try_pops && context_index == 0 {
+                        self.assembler
+                            .extend_copied_method_cleanup_pop_span(copied_handler_return_item);
                     }
                     if result.is_ok()
                         && let Some((first_pop_item, allow_additional_pop)) =

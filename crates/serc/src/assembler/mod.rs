@@ -12462,6 +12462,155 @@ impl Assembler {
             .push(origin);
     }
 
+    /// Captures the two source POPs and intact method cleanup copied by a return.
+    pub(crate) fn record_copied_method_cleanup_pop_span(&mut self, start: usize) {
+        let items = self.linear_items();
+        let Some(entry) = items[..start].iter().rev().find_map(|item| match item {
+            Item::Label(label)
+                if self
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .contains(label)
+                    && self
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .contains(label) =>
+            {
+                Some(*label)
+            }
+            _ => None,
+        }) else {
+            return;
+        };
+        let original = &items[start..];
+        let records = original
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(record) => Some(*record),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let [first, second, receiver, method, call, discard] = records.as_slice() else {
+            return;
+        };
+        if [first, second].iter().any(|pop| {
+            pop.opcode != NOP
+                || pop.operand() != Operand::Value(0)
+                || !pop.fusion_policy.is_converted_pop_block()
+                || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+        }) || receiver.opcode != LOAD_FAST
+            || method.opcode != LOAD_ATTR
+            || !matches!(method.operand(), Operand::Value(argument) if argument & 1 != 0)
+            || call.opcode != crate::target::opcodes::CALL
+            || call.operand() != Operand::Value(0)
+            || discard.opcode != POP_TOP
+            || discard.operand() != Operand::Value(0)
+            || records.iter().any(|record| {
+                record.local_policy.hidden_exception_owner_slots() != 0
+                    || record.pre_fold_extra_instructions() != 0
+                    || record.no_location_policy.borrow_fallthrough()
+                        != BorrowFallthrough::Reachable
+                    || record.jump_policy.borrow_empty_block()
+            })
+            || records[2..]
+                .iter()
+                .any(|record| record.exception_policy() != ExceptionPolicy::NoneUnchanged)
+            || records
+                .iter()
+                .map(Instruction::depth_after)
+                .ne([1, 1, 2, 3, 2, 1].map(Some))
+        {
+            return;
+        }
+        let origin = exception_owners::OriginalPopBlockSpan {
+            entry,
+            items: original.to_vec(),
+        };
+        self.exception_owner_provenance
+            .copied_method_cleanup_pop_spans
+            .push(origin);
+    }
+
+    /// Extends the same copied cleanup through the outer POPs and first None marker.
+    pub(crate) fn extend_copied_method_cleanup_pop_span(&mut self, return_item: usize) {
+        let Some(origin) = self
+            .exception_owner_provenance
+            .copied_method_cleanup_pop_spans
+            .last()
+        else {
+            return;
+        };
+        let items = self.linear_items();
+        let Some(start) = items[return_item..]
+            .iter()
+            .position(|item| Some(item) == origin.items.first())
+            .map(|offset| return_item + offset)
+        else {
+            return;
+        };
+        let Some(end) = items[start..]
+            .iter()
+            .position(|item| {
+                matches!(item,
+            Item::Instruction(instruction) if instruction.opcode == NOT_TAKEN)
+            })
+            .map(|offset| start + offset + 1)
+        else {
+            return;
+        };
+        let prefix = &items[start..end];
+        if !prefix.starts_with(&origin.items) {
+            return;
+        }
+        let suffix = prefix[origin.items.len()..]
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let (pops, tail) = suffix.split_at(suffix.len().saturating_sub(3));
+        let [load, condition, marker] = tail else {
+            return;
+        };
+        if !(1..=2).contains(&pops.len())
+            || pops.iter().any(|pop| {
+                pop.opcode != NOP
+                    || pop.operand() != Operand::Value(0)
+                    || !pop.fusion_policy.is_converted_pop_block()
+                    || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+                    || pop.location != SourceLocation::NONE
+                    || pop.depth_after() != Some(1)
+            })
+            || load.opcode != LOAD_FAST
+            || load.depth_after() != Some(2)
+            || load.exception_policy() != ExceptionPolicy::NoneUnchanged
+            || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.local_policy.hidden_exception_owner_slots() != 3
+            || condition.exception_policy() != ExceptionPolicy::NoneUnchanged
+            || condition.depth_after() != Some(1)
+            || marker.exception_policy() != ExceptionPolicy::NonePresent
+            || marker.depth_after() != Some(1)
+            || suffix.iter().any(|record| {
+                record.pre_fold_extra_instructions() != 0
+                    || record.opcode != condition.opcode
+                        && record.local_policy.hidden_exception_owner_slots() != 0
+                    || record.jump_policy.borrow_empty_block()
+                    || record.no_location_policy.borrow_fallthrough()
+                        != BorrowFallthrough::Reachable
+            })
+        {
+            return;
+        }
+        let prefix = prefix[..prefix.len() - 1].to_vec();
+        self.exception_owner_provenance
+            .copied_method_cleanup_pop_spans
+            .last_mut()
+            .unwrap()
+            .items = prefix;
+    }
+
     /// Captures the two original NULL POP records around a saved handler return value.
     pub(crate) fn record_named_handler_pop_pair(&mut self, start: usize) {
         let items = self.linear_items();

@@ -925,3 +925,36 @@ fn matches_cpython_bare_returns_through_two_try_cleanups() {
         assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_nested_finalizer_method_cleanup_donors() {
+    let source = r#"def f(config, previous, env):
+    try:
+        if env:
+            prepare()
+        try:
+            value = config.read()
+            try:
+                return convert(value)
+            except ValueError:
+                return value
+        finally:
+            config.close()
+    except UsageError as error:
+        report(error)
+        return status.usage
+    finally:
+        if previous is None:
+            env.pop("KEY", None)
+        else:
+            env["KEY"] = previous
+"#;
+    for (filename, source) in [
+        ("copied_method_cleanup_original_entry.py", source.to_owned()),
+        ("copied_method_cleanup_named_handler.py", source.replace("except ValueError:", "except ValueError as error:")),
+        ("copied_method_cleanup_one_ordinary_try.py", source.replace("    except UsageError as error:\n        report(error)\n        return status.usage\n", "")),
+        ("copied_method_cleanup_nested_condition.py", source.replace("            env.pop(\"KEY\", None)", "            if env:\n                env.pop(\"KEY\", None)")),
+    ] {
+        assert_matches_cpython_marshal(&source, filename);
+    }
+}
