@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hasher;
 
+use hashbrown::HashTable;
 use ruff_index::{IndexVec, newtype_index};
 use ruff_python_ast::name::Name;
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
@@ -168,7 +169,7 @@ const SCOPE_SEED_NAMES: [&str; 26] = [
 #[derive(Debug, Default)]
 pub(super) struct NameInterner {
     names: IndexVec<NameId, Cow<'static, str>>,
-    slots: Vec<Option<NameId>>,
+    reverse: HashTable<NameId>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -237,74 +238,49 @@ impl FromIterator<NameId> for NameSet {
 
 impl NameInterner {
     fn seeded(seeds: &[&'static str]) -> Self {
-        let mut names = IndexVec::with_capacity(seeds.len());
-        let mut slots = vec![None; seeds.len().saturating_mul(2).max(8).next_power_of_two()];
+        let mut interner = Self {
+            names: IndexVec::with_capacity(seeds.len()),
+            reverse: HashTable::with_capacity(seeds.len()),
+        };
         for &name in seeds {
-            let id = names.next_index();
-            let mut slot = Self::hash(name) & (slots.len() - 1);
-            while slots[slot].is_some() {
-                slot = (slot + 1) & (slots.len() - 1);
-            }
-            slots[slot] = Some(id);
-            names.push(Cow::Borrowed(name));
+            interner.insert(Cow::Borrowed(name));
         }
-        Self { names, slots }
+        interner
     }
 
     pub(super) fn intern(&mut self, name: &str) -> NameId {
         if let Some(id) = self.get(name) {
             return id;
         }
-        self.insert_owned(name.to_string())
+        self.insert(Cow::Owned(name.to_owned()))
     }
 
     fn intern_owned(&mut self, name: String) -> NameId {
-        if let Some(id) = self.get(name.as_str()) {
+        if let Some(id) = self.get(&name) {
             return id;
         }
-        self.insert_owned(name)
+        self.insert(Cow::Owned(name))
     }
 
-    fn insert_owned(&mut self, name: String) -> NameId {
-        if self.names.len() * 2 >= self.slots.len() {
-            let mut slots = vec![None; self.slots.len().max(8) * 2];
-            for (index, name) in self.names.iter().enumerate() {
-                let mut slot = Self::hash(name.as_ref()) & (slots.len() - 1);
-                while slots[slot].is_some() {
-                    slot = (slot + 1) & (slots.len() - 1);
-                }
-                slots[slot] = Some(NameId::from_usize(index));
-            }
-            self.slots = slots;
-        }
+    /// Stores each spelling once; reverse lookup retains only its stable name ID.
+    fn insert(&mut self, name: Cow<'static, str>) -> NameId {
         let id = self.names.next_index();
-        let mut slot = Self::hash(&name) & (self.slots.len() - 1);
-        while self.slots[slot].is_some() {
-            slot = (slot + 1) & (self.slots.len() - 1);
-        }
-        self.slots[slot] = Some(id);
-        self.names.push(Cow::Owned(name));
+        self.reverse
+            .insert_unique(Self::hash(&name), id, |id| Self::hash(&self.names[*id]));
+        self.names.push(name);
         id
     }
 
     pub(super) fn get(&self, name: &str) -> Option<NameId> {
-        if self.slots.is_empty() {
-            return None;
-        }
-        let mut slot = Self::hash(name) & (self.slots.len() - 1);
-        loop {
-            let id = self.slots[slot]?;
-            if self.names[id].as_ref() == name {
-                return Some(id);
-            }
-            slot = (slot + 1) & (self.slots.len() - 1);
-        }
+        self.reverse
+            .find(Self::hash(name), |id| self.names[*id].as_ref() == name)
+            .copied()
     }
 
-    fn hash(name: &str) -> usize {
+    fn hash(name: &str) -> u64 {
         let mut hasher = FxHasher::default();
         hasher.write(name.as_bytes());
-        usize::try_from(hasher.finish()).expect("FxHasher output should fit in usize")
+        hasher.finish()
     }
 
     fn intern_set(&mut self, names: impl IntoIterator<Item = String>) -> FxHashSet<NameId> {
@@ -5225,7 +5201,6 @@ mod tests {
     fn seeded_name_interner_preserves_ids_order_and_borrowed_storage() {
         let mut names = NameInterner::seeded(&SCOPE_SEED_NAMES);
 
-        assert_eq!(names.slots.len(), 64);
         for (index, name) in SCOPE_SEED_NAMES.into_iter().enumerate() {
             let id = NameId::from_usize(index);
             assert_eq!(names.get(name), Some(id));
@@ -5236,6 +5211,32 @@ mod tests {
         assert_eq!(names.intern("__user_name__"), NameId::from_u32(26));
         assert!(matches!(names.names[NameId::from_u32(26)], Cow::Owned(_)));
         assert_eq!(names.intern("super"), NameId::from_u32(25));
+    }
+
+    #[test]
+    fn name_interner_preserves_ids_through_growth_and_repeated_lookup() {
+        let mut names = NameInterner::seeded(&SCOPE_SEED_NAMES);
+        for index in 0..2048 {
+            let spelling = format!("name_{index}_名");
+            let expected = NameId::from_usize(SCOPE_SEED_NAMES.len() + index);
+            assert_eq!(names.intern_owned(spelling), expected);
+        }
+        for index in (0..2048).rev() {
+            let spelling = format!("name_{index}_名");
+            let expected = NameId::from_usize(SCOPE_SEED_NAMES.len() + index);
+            assert_eq!(names.get(&spelling), Some(expected));
+            assert_eq!(names.intern(&spelling), expected);
+            assert_eq!(names.resolve(expected), spelling);
+        }
+        for (index, seed) in SCOPE_SEED_NAMES.iter().enumerate() {
+            assert_eq!(names.intern(seed), NameId::from_usize(index));
+            assert!(matches!(
+                names.names[NameId::from_usize(index)],
+                Cow::Borrowed(_)
+            ));
+        }
+        assert_eq!(names.len(), SCOPE_SEED_NAMES.len() + 2048);
+        assert_eq!(names.get("missing"), None);
     }
 
     #[test]
