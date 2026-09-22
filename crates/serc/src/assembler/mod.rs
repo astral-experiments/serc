@@ -1755,6 +1755,144 @@ impl Assembler {
             })
     }
 
+    /// Certifies a value-match failure left after copying an unlocated normal exit.
+    pub(crate) fn original_match_failure_after_success_copy(
+        &self,
+        try_end: Label,
+        final_pattern_location: SourceLocation,
+        depth: u32,
+    ) -> bool {
+        let Some(end) = self.original_match_join else {
+            return false;
+        };
+        self.original_match_failure_after_success_copy_at(
+            end,
+            try_end,
+            final_pattern_location,
+            depth,
+            self.item_count(),
+        )
+    }
+
+    /// Rechecks the original closed match edges after later arrays have been emitted.
+    fn original_match_failure_after_success_copy_at(
+        &self,
+        end: Label,
+        try_end: Label,
+        final_pattern_location: SourceLocation,
+        depth: u32,
+        prefix_end: usize,
+    ) -> bool {
+        let items = self.linear_items();
+        let Some(prefix) = items.get(..prefix_end) else {
+            return false;
+        };
+        let [
+            ..,
+            Item::Instruction(previous),
+            Item::Label(failure),
+            Item::Label(join),
+            Item::Label(region_end),
+        ] = prefix
+        else {
+            return false;
+        };
+        let aliases = [*failure, *join, *region_end];
+        if *join != end
+            || *region_end != try_end
+            || failure == join
+            || failure == region_end
+            || join == region_end
+            || final_pattern_location.line < 0
+            || !self
+                .exception_owner_provenance
+                .original_match_join_boundaries
+                .contains(&end)
+            || self.join_labels_have_authored_location(&aliases)
+            || aliases.iter().any(|label| {
+                items
+                    .iter()
+                    .filter(|item| **item == Item::Label(*label))
+                    .count()
+                    != 1
+                    || self.folded_away_condition_targets.contains(label)
+                    || self.folded_away_loop_else_targets.contains(label)
+                    || self.folded_condition_exit_targets.contains(label)
+                    || self
+                        .exception_owner_provenance
+                        .omitted_nop_counts
+                        .contains_key(label)
+                    || self
+                        .exception_owner_provenance
+                        .omitted_nop_locations
+                        .contains_key(label)
+            })
+        {
+            return false;
+        }
+        let success_record = |location, deferred| {
+            let mut success =
+                Instruction::new(JUMP_FORWARD, Operand::Forward(end), location, Some(depth));
+            success.jump_policy.mark_original_match_success();
+            success.jump_policy.mark_interruptible();
+            if deferred {
+                success.jump_policy.defer_removal();
+            }
+            success
+        };
+        // The final successful case ends before the adjacent zero-pop failure
+        // and match-end labels; no physical POP or cleanup donates to this join.
+        if previous.location.line < 0 || *previous != success_record(previous.location, true) {
+            return false;
+        }
+        let mut has_failure = false;
+        let mut has_success = false;
+        for (index, item) in items.iter().enumerate() {
+            let Item::Instruction(edge) = item else {
+                continue;
+            };
+            let (Operand::Forward(target) | Operand::Backward(target)) = edge.operand() else {
+                continue;
+            };
+            if !aliases.contains(&target) {
+                continue;
+            }
+            // Historical rechecks must not accept a later edge into these aliases.
+            if index >= prefix_end - aliases.len() {
+                return false;
+            }
+            if *edge
+                == Instruction::new(
+                    POP_JUMP_IF_FALSE,
+                    Operand::Forward(*failure),
+                    final_pattern_location,
+                    Some(depth),
+                )
+            {
+                if has_failure
+                    || items.get(index + 1)
+                        != Some(&Item::Instruction(Instruction::new(
+                            NOT_TAKEN,
+                            Operand::Value(0),
+                            final_pattern_location,
+                            Some(depth),
+                        )))
+                {
+                    return false;
+                }
+                has_failure = true;
+            } else if edge.location.line >= 0
+                && (*edge == success_record(edge.location, false)
+                    || *edge == success_record(edge.location, true))
+            {
+                has_success = true;
+            } else {
+                return false;
+            }
+        }
+        has_failure && has_success
+    }
+
     /// Resolves a sole failure donor or an authenticated shared match-failure cleanup.
     pub(crate) fn original_match_failure_location(&self) -> Option<SourceLocation> {
         let end = self.original_match_join?;
@@ -5009,6 +5147,278 @@ impl Assembler {
         }
         // The marker is still the exact original source record, before threading
         // or copying. Only its own normal-finally alias loses the empty-entry guard.
+        self.borrow_unreachable_blocks.remove(&entry);
+        self.borrow_finally_entries.remove(&entry);
+        self.borrow_jump_entry_labels.remove(&entry);
+        self.preserve_block_boundary_alias(entry);
+    }
+
+    /// Proves a named handler's artificial normal exit has no original incoming path.
+    fn is_original_unreachable_named_cleanup_exit(&self, index: usize, target: Label) -> bool {
+        let items = self.linear_items();
+        let Some(
+            [
+                Item::Instruction(raise),
+                Item::Label(entry),
+                Item::Instruction(pop),
+                Item::Instruction(load),
+                Item::Instruction(store),
+                Item::Instruction(delete),
+                Item::Instruction(jump),
+            ],
+        ) = index
+            .checked_sub(6)
+            .and_then(|start| items.get(start..=index))
+        else {
+            return false;
+        };
+        let [
+            Operand::Value(raise_argument),
+            Operand::Value(constant),
+            Operand::Value(binding),
+        ] = [raise.operand(), load.operand(), store.operand()]
+        else {
+            return false;
+        };
+        let location = jump.location;
+        let mut expected_jump =
+            Instruction::new(JUMP_FORWARD, Operand::Forward(target), location, Some(0));
+        expected_jump.jump_policy.prevent_small_exit_inlining();
+        if raise_argument > 2
+            || location.line < 0
+            || [*raise, *pop, *load, *store, *delete, *jump]
+                != [
+                    Instruction::new(RAISE_VARARGS, Operand::Value(raise_argument), location, Some(1)),
+                    Instruction::new(POP_EXCEPT, Operand::Value(0), location, Some(0)),
+                    Instruction::new(LOAD_CONST, Operand::Value(constant), location, Some(1)),
+                    Instruction::new(STORE_FAST, Operand::Value(binding), location, Some(0)),
+                    Instruction::new(DELETE_FAST, Operand::Value(binding), location, Some(0)),
+                    expected_jump,
+                ]
+            || !self.original_unlocated_cleanup_targets.contains(entry)
+            || self.join_labels_have_authored_location(&[*entry])
+            || self.preserved_block_boundaries.contains(entry)
+            || self.folded_away_condition_targets.contains(entry)
+            || self.folded_away_loop_else_targets.contains(entry)
+            || self.folded_condition_exit_targets.contains(entry)
+            || self.exception_owner_provenance.omitted_nop_counts.contains_key(entry)
+            || self.exception_owner_provenance.omitted_nop_locations.contains_key(entry)
+            || items.iter().any(|item| matches!(item,
+                Item::Instruction(instruction)
+                    if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                        if label == *entry)))
+        {
+            return false;
+        }
+        let mut regions = self.exception_regions.iter().filter(|region| {
+            region.end == *entry
+                && self
+                    .exception_owner_provenance
+                    .named_handler_cleanup_targets
+                    .contains(&region.target)
+        });
+        let (Some(region), None) = (regions.next(), regions.next()) else {
+            return false;
+        };
+        if region.is_scope_fallback
+            || region.depth != 1
+            || !region.preserve_lasti
+            || !matches!(region.priority, ExceptionRegionPriority::OriginalRange(start, end)
+                if start == region.start && end == *entry)
+        {
+            return false;
+        }
+        let unique_position = |label| {
+            let mut positions = items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| (*item == Item::Label(label)).then_some(index));
+            match (positions.next(), positions.next()) {
+                (Some(position), None) => Some(position),
+                _ => None,
+            }
+        };
+        // The exceptional name cleanup has its own later target. No branch or
+        // setup enters this normal cleanup, and the preceding raise cannot fall
+        // through. Native removes its complete original array before counting
+        // the predecessors that donate lines and admit borrowed-load traversal.
+        unique_position(*entry) == Some(index - 5)
+            && unique_position(region.start).is_some_and(|start| start < index - 6)
+            && unique_position(region.target).is_some_and(|cleanup| cleanup > index)
+    }
+
+    /// Admits the retained match-failure edge into its actual nonempty normal cleanup.
+    pub(crate) fn admit_retained_match_finally_entry(
+        &mut self,
+        entry: Label,
+        pop_ordinal: usize,
+        pattern_location: SourceLocation,
+    ) {
+        if self.python_version != crate::PythonVersion::Py314
+            || !self.borrow_unreachable_blocks.contains(&entry)
+            || self.borrow_finally_entries.get(&entry) != Some(&None)
+            || !self.borrow_jump_entry_labels.contains(&entry)
+            || !self.has_large_linear_prefix_since(pop_ordinal + 1)
+        {
+            return;
+        }
+        let items = self.linear_items();
+        let Some(pop_index) = items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| matches!(item, Item::Instruction(_)))
+            .nth(pop_ordinal)
+            .map(|(index, _)| index)
+        else {
+            return;
+        };
+        let Some(
+            [
+                ..,
+                Item::Instruction(previous),
+                Item::Label(target),
+                Item::Label(actual_entry),
+            ],
+        ) = items.get(..pop_index)
+        else {
+            return;
+        };
+        let aliases = [*target, *actual_entry];
+        if *actual_entry != entry
+            || *target == entry
+            || !ends_scope(previous.opcode)
+            || !self
+                .exception_owner_provenance
+                .block_boundaries
+                .contains(target)
+            || self
+                .exception_owner_provenance
+                .block_boundaries
+                .contains(&entry)
+            || self.borrow_unreachable_blocks.contains(target)
+            || self.borrow_finally_entries.contains_key(target)
+            || self.borrow_jump_entry_labels.contains(target)
+            || self.join_labels_have_authored_location(&aliases)
+            || aliases.iter().any(|label| {
+                items
+                    .iter()
+                    .filter(|item| **item == Item::Label(*label))
+                    .count()
+                    != 1
+                    || self.preserved_block_boundaries.contains(label)
+                    || self.folded_away_condition_targets.contains(label)
+                    || self.folded_away_loop_else_targets.contains(label)
+                    || self.folded_condition_exit_targets.contains(label)
+                    || self
+                        .exception_owner_provenance
+                        .omitted_nop_counts
+                        .contains_key(label)
+                    || self
+                        .exception_owner_provenance
+                        .omitted_nop_locations
+                        .contains_key(label)
+            })
+        {
+            return;
+        }
+        let mut origins = self
+            .exception_owner_provenance
+            .compound_try_owner_exits
+            .iter()
+            .filter(|(_, endpoint)| aliases.contains(endpoint));
+        let (Some(&(source, endpoint)), None) = (origins.next(), origins.next()) else {
+            return;
+        };
+        if endpoint != *target {
+            return;
+        }
+        let mut positions = items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| (*item == Item::Label(source)).then_some(index));
+        let (Some(source_index), None) = (positions.next(), positions.next()) else {
+            return;
+        };
+        let Some(Item::Label(join)) = source_index
+            .checked_sub(1)
+            .and_then(|index| items.get(index))
+        else {
+            return;
+        };
+        if !self.original_match_failure_after_success_copy_at(
+            *join,
+            source,
+            pattern_location,
+            0,
+            source_index + 1,
+        ) {
+            return;
+        }
+        let mut pop = Instruction::new(NOP, Operand::Value(0), SourceLocation::NONE, Some(0));
+        pop.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+        pop.fusion_policy.mark_converted_pop_block();
+        let mut jump = Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(*target),
+            SourceLocation::NONE,
+            Some(0),
+        );
+        jump.jump_policy.prevent_threading_target();
+        jump.jump_policy.prevent_small_exit_inlining();
+        jump.allow_unconditional_block_inlining();
+        if items.get(source_index + 1) != Some(&Item::Instruction(pop))
+            || items.get(source_index + 2) != Some(&Item::Instruction(jump))
+            || !matches!(items.get(source_index + 3), Some(Item::Label(_)))
+            || items.get(pop_index) != Some(&Item::Instruction(pop))
+        {
+            return;
+        }
+        // Native predecessor recount removes the artificial normal cleanup after a
+        // raising named handler. Keep the exact match exit as the sole live edge.
+        let mut incoming = items.iter().enumerate().filter_map(|(index, item)| match item {
+            Item::Instruction(instruction)
+                if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                    if aliases.contains(&label)) => Some((index, instruction)),
+            _ => None,
+        });
+        if incoming.next() != Some((source_index + 2, &jump)) {
+            return;
+        }
+        if let Some((index, _)) = incoming.next()
+            && (!self.is_original_unreachable_named_cleanup_exit(index, *target)
+                || incoming.next().is_some())
+        {
+            return;
+        }
+        let Some(Item::Instruction(first)) = items.get(pop_index + 1) else {
+            return;
+        };
+        let Operand::Value(argument) = first.operand() else {
+            return;
+        };
+        if !matches!(
+            first.opcode,
+            LOAD_FAST
+                | LOAD_GLOBAL
+                | crate::target::opcodes::LOAD_DEREF
+                | crate::target::opcodes::LOAD_NAME
+        ) || first.location.line < 0
+            || first.location.line == pattern_location.line
+        {
+            return;
+        }
+        let Ok(depth) = u32::try_from(opcode_stack_effect(
+            self.python_version,
+            first.opcode,
+            argument,
+        )) else {
+            return;
+        };
+        if *first != Instruction::new(first.opcode, first.operand(), first.location, Some(depth)) {
+            return;
+        }
+        // The original POP/JUMP source remains populated by its donated jump NOP.
+        // Only its own normal-finally range marker loses the empty-entry guard.
         self.borrow_unreachable_blocks.remove(&entry);
         self.borrow_finally_entries.remove(&entry);
         self.borrow_jump_entry_labels.remove(&entry);

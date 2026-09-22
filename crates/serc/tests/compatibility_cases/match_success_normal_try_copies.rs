@@ -360,3 +360,31 @@ fn matches_cpython_direct_match_elif_name_return_control() {
 ";
     common::assert_matches_cpython_marshal(source, "direct_match_elif_name_return_control.py");
 }
+
+#[test]
+fn matches_cpython_value_match_failure_before_finally() {
+    for suspension in ["", "await "] {
+        let prefix = if suspension.is_empty() { "" } else { "async " };
+        let source = format!(
+            "{prefix}def choose(value):\n    try:\n        match value:\n            case Choices.first:\n                {suspension}first()\n            case Choices.second:\n                {suspension}second()\n    except Error as error:\n        raise OtherError() from error\n    finally:\n        {suspension}cleanup()\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "value_match_finally.py");
+    }
+}
+
+#[test]
+fn matches_cpython_value_match_finally_receiver_borrow() {
+    let source = r"async def choose(self, mode):
+    try:
+        match self.kind:
+            case Choices.first:
+                await self.first(mode)
+            case Choices.second:
+                await self.second(mode)
+    except Error as error:
+        raise OtherError() from error
+    finally:
+        await self.coordinator.refresh()
+";
+    common::assert_matches_cpython_marshal(source, "value_match_finally_receiver_borrow.py");
+}
