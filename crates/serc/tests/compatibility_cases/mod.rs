@@ -341,6 +341,7 @@ mod protected_loop_chained_returns;
 mod protected_return_exit_copies;
 mod protected_singleton_patterns;
 mod protected_while_call_folds;
+mod pruned_qualified_name_origins;
 mod short_circuit_nested_loop_backedges;
 mod terminal_handler_prefix_copies;
 mod terminal_while_constant_order;
