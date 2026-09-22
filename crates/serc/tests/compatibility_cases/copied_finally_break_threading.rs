@@ -405,3 +405,53 @@ fn matches_cpython_copied_finally_global_call_array_boundaries() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_shared_copied_finally_break_conditions() {
+    for (filename, source) in [
+        (
+            "same_head_two_sync.py",
+            r"def process(self, work, active, response):
+    while active:
+        try:
+            try:
+                response = work()
+            except ConnectionError:
+                break
+            if response is None:
+                break
+            self.consume(response)
+        finally:
+            self.task = None
+            if self.transport is None and response is not None:
+                self.report(response)
+        self.advance()
+    self.finish()
+    return response
+",
+        ),
+        (
+            "same_head_two_async.py",
+            r"async def process(self, work, active, response):
+    while active:
+        try:
+            try:
+                response = await work()
+            except ConnectionError:
+                break
+            if response is None:
+                break
+            self.consume(response)
+        finally:
+            self.task = None
+            if self.transport is None and response is not None:
+                self.report(response)
+        self.advance()
+    self.finish()
+    return response
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

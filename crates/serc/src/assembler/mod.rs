@@ -9020,6 +9020,7 @@ impl Assembler {
         emitted: EmittedJump,
         target: Label,
         unwind_start: usize,
+        original_shared_join: bool,
     ) {
         let jump = *self.emitted_jump_mut(emitted, "recording a copied-finally break head");
         if jump.opcode != JUMP_FORWARD
@@ -9029,9 +9030,12 @@ impl Assembler {
         {
             return;
         }
-        let Some((Item::Instruction(_), head)) = self.linear_items().split_last() else {
+        let Some((Item::Instruction(last), head)) = self.linear_items().split_last() else {
             return;
         };
+        if *last != jump {
+            return;
+        }
         let Some(unwind) = head.get(unwind_start..) else {
             return;
         };
@@ -9060,7 +9064,8 @@ impl Assembler {
         let Some(label) = matching.next() else {
             return;
         };
-        if matching.next().is_some()
+        let multiple_conditions = matching.next().is_some();
+        if (multiple_conditions && !original_shared_join)
             || !self
                 .exception_owner_provenance
                 .source_boundaries
@@ -9071,6 +9076,35 @@ impl Assembler {
                 .contains(&label)
             || self.borrow_block_aliases.contains(&label)
             || self.original_nop_targets.contains(&label)
+        {
+            return;
+        }
+        if multiple_conditions
+            && head.iter().enumerate().any(|(index, item)| {
+                let Item::Instruction(instruction) = item else {
+                    return false;
+                };
+                let target = match instruction.operand() {
+                    Operand::Forward(target) | Operand::Backward(target)
+                        if labels.contains(&target) =>
+                    {
+                        target
+                    }
+                    _ => return false,
+                };
+                // The pre-emission certificate authenticates every incoming record.
+                // Restrict its shared entry to this exact copied-finalizer head.
+                index < unwind_start
+                    || target != label
+                    || instruction.operand() != Operand::Forward(label)
+                    || !matches!(
+                        instruction.opcode,
+                        POP_JUMP_IF_FALSE
+                            | POP_JUMP_IF_TRUE
+                            | POP_JUMP_IF_NONE
+                            | POP_JUMP_IF_NOT_NONE
+                    )
+            })
         {
             return;
         }

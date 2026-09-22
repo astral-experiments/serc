@@ -4914,6 +4914,10 @@ impl Compiler<'_> {
                         start
                     });
                     let has_no_emitted_cleanup = self.assembler.instruction_count() == marker_end;
+                    let original_shared_break_join = self.context.python_version
+                        >= crate::PythonVersion::Py314
+                        && !has_no_emitted_cleanup
+                        && self.assembler.at_original_shared_cleanup_join();
                     let break_jump =
                         self.emit_jump_forward_instruction(JUMP_FORWARD, context.break_label)?;
                     // The authored break NOP precedes unwinding. A legacy finalizer's
@@ -4928,6 +4932,7 @@ impl Compiler<'_> {
                         break_jump,
                         context.break_label,
                         finally_unwind_start,
+                        original_shared_break_join,
                     );
                     if copied_finally_with_join {
                         // Both manager exits copy this synthetic loop cleanup before copying
