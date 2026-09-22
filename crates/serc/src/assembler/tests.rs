@@ -2166,6 +2166,92 @@ fn optimization_pipeline(items: Vec<Item>) -> super::OptimizationPipeline {
     assembler.into_optimization_pipeline()
 }
 
+fn mapping_capture_items(captures: u32, wildcards: u32) -> Vec<Item> {
+    let unpacked = captures + wildcards;
+    let depth = unpacked + 2;
+    let mut items = vec![pass_instruction(UNPACK_SEQUENCE, unpacked, 3)];
+    for _ in 0..captures {
+        for depth in (2..=depth).rev() {
+            items.push(pass_instruction(SWAP, depth, 3));
+        }
+    }
+    for _ in 0..wildcards + 2 {
+        items.push(pass_instruction(POP_TOP, 0, 3));
+    }
+    for local in 0..captures {
+        items.push(pass_instruction(STORE_FAST, local, 3));
+    }
+    items.push(pass_instruction(LOAD_CONST, 0, 4));
+    items
+}
+
+#[test]
+fn mapping_capture_rotations_preserve_arrays_and_predict_native_compaction() {
+    for (captures, wildcards) in [(1, 1), (1, 2), (2, 1), (2, 2), (3, 1), (4, 1)] {
+        let items = mapping_capture_items(captures, wildcards);
+        let swaps = captures * (captures + wildcards + 1);
+        let assembler = Assembler::from_linear_items(items.clone());
+        assert_eq!(
+            assembler.current_block_dynamic_exception_owner_slots(),
+            usize::try_from(swaps + captures / 2).unwrap(),
+        );
+        let mut pipeline = optimization_pipeline(items.clone());
+        let (blocks, cleanup, _) = pipeline.optimize_swap_runs();
+        let gaps = pipeline.apply_static_swaps((blocks, cleanup));
+        assert!(gaps.is_empty());
+        assert_eq!(pipeline.graph.iter_items().count(), items.len());
+        let actual = pipeline
+            .graph
+            .iter_items()
+            .filter(
+                |item| !matches!(item, Item::Instruction(instruction) if instruction.opcode == NOP),
+            )
+            .copied()
+            .collect::<Vec<_>>();
+        let consumers = 1 + usize::try_from(swaps).unwrap();
+        let stores = items.len() - 1 - usize::try_from(captures).unwrap();
+        let expected = std::iter::once(items[0])
+            .chain(items[stores..items.len() - 1].iter().copied())
+            .chain(items[consumers..stores].iter().copied())
+            .chain(std::iter::once(*items.last().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn mapping_capture_rotations_require_complete_unchanged_same_line_shapes() {
+    for mutation in 0..9 {
+        let mut items = mapping_capture_items(2, 1);
+        match mutation {
+            0 => items[0] = pass_instruction(UNPACK_SEQUENCE, 4, 3),
+            1 => items[4] = pass_instruction(SWAP, 3, 3),
+            2 => items[4] = pass_instruction(SWAP, 2, 5),
+            3 => items[10] = pass_instruction(POP_TOP, 0, 5),
+            4 => items[13] = pass_instruction(STORE_FAST, 0, 3),
+            5 => items[13] = pass_instruction(STORE_DEREF, 1, 3),
+            6 => {
+                let Item::Instruction(instruction) = &mut items[4] else {
+                    unreachable!()
+                };
+                instruction.no_location_policy.preserve_location();
+            }
+            7 => items[14] = pass_instruction(LOAD_CONST, 0, 3),
+            8 => {
+                items.insert(9, Item::Label(super::Label(0)));
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            super::mapping_capture_cleanup_rotation(&items).is_none(),
+            "mutation {mutation}"
+        );
+    }
+    let mut incomplete = mapping_capture_items(2, 1);
+    incomplete.pop();
+    assert!(super::mapping_capture_cleanup_rotation(&incomplete).is_none());
+}
+
 fn pattern_capture_swap_pipeline() -> super::OptimizationPipeline {
     optimization_pipeline(
         [

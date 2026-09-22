@@ -172,10 +172,101 @@ fn single_capture_cleanup_vacancies(items: &[Item]) -> Option<usize> {
 struct CaptureCleanupRotation<'a> {
     swap_count: usize,
     removed_slots: usize,
+    consumer_rotation: usize,
     consumers: &'a [Item],
 }
 
+/// Captures followed by mapping wildcards emit repeated full rotations before cleanup.
+/// Their complete same-line array proves both the pop exchanges and removed slot count.
+fn mapping_capture_cleanup_rotation(items: &[Item]) -> Option<CaptureCleanupRotation<'_>> {
+    let [Item::Instruction(prefix), Item::Instruction(first), ..] = items else {
+        return None;
+    };
+    let (UNPACK_SEQUENCE, Operand::Value(unpacked)) = (prefix.opcode, prefix.operand()) else {
+        return None;
+    };
+    let depth = usize::try_from(unpacked).ok()?.checked_add(2)?;
+    if unpacked < 2
+        || depth > items.len()
+        || prefix.location.line < 0
+        || first.opcode != SWAP
+        || first.operand() != Operand::Value(u32::try_from(depth).ok()?)
+    {
+        return None;
+    }
+    let swap_count = items[1..]
+        .iter()
+        .take_while(
+            |item| matches!(item, Item::Instruction(instruction) if instruction.opcode == SWAP),
+        )
+        .count();
+    if !swap_count.is_multiple_of(depth - 1) {
+        return None;
+    }
+    let captures = swap_count / (depth - 1);
+    if captures == 0 || captures >= usize::try_from(unpacked).ok()? {
+        return None;
+    }
+    for (index, item) in items[1..=swap_count].iter().enumerate() {
+        let Item::Instruction(instruction) = item else {
+            return None;
+        };
+        if instruction.operand() != Operand::Value(u32::try_from(depth - index % (depth - 1)).ok()?)
+        {
+            return None;
+        }
+    }
+    let consumed = 1 + swap_count + depth;
+    let consumers = items.get(1 + swap_count..consumed)?;
+    let pops = depth - captures;
+    let mut stores = Vec::with_capacity(captures);
+    for (index, item) in consumers.iter().enumerate() {
+        let Item::Instruction(instruction) = item else {
+            return None;
+        };
+        match (instruction.opcode, instruction.operand()) {
+            (POP_TOP, Operand::Value(0)) if index < pops => {}
+            (STORE_FAST, Operand::Value(local))
+                if index >= pops
+                    && !instruction.local_policy.may_store_null()
+                    && !stores.contains(&local) =>
+            {
+                stores.push(local);
+            }
+            _ => return None,
+        }
+    }
+    // Close the original array before predicting compaction. Keep unknown spans,
+    // interposed labels and capture guards on the existing conservative path.
+    if !matches!(items.get(consumed), Some(Item::Instruction(following))
+        if following.location.line >= 0 && following.location.line != prefix.location.line)
+    {
+        return None;
+    }
+    for item in &items[..consumed] {
+        let Item::Instruction(instruction) = item else {
+            return None;
+        };
+        if instruction.location.line != prefix.location.line
+            || instruction.no_location_policy != ir::NoLocationPolicy::default()
+            || instruction.fusion_policy != ir::FusionPolicy::default()
+            || instruction.jump_policy != ir::JumpPolicy::default()
+        {
+            return None;
+        }
+    }
+    Some(CaptureCleanupRotation {
+        swap_count,
+        removed_slots: swap_count,
+        consumer_rotation: captures,
+        consumers,
+    })
+}
+
 fn capture_cleanup_rotation(items: &[Item]) -> Option<CaptureCleanupRotation<'_>> {
+    if let Some(rotation) = mapping_capture_cleanup_rotation(items) {
+        return Some(rotation);
+    }
     let [Item::Instruction(prefix), Item::Instruction(first_swap), ..] = items else {
         return None;
     };
@@ -317,6 +408,7 @@ fn capture_cleanup_rotation(items: &[Item]) -> Option<CaptureCleanupRotation<'_>
     Some(CaptureCleanupRotation {
         swap_count,
         removed_slots: consumer_count - 1 - usize::from(retained_line_nop),
+        consumer_rotation: 1,
         consumers,
     })
 }
@@ -3433,13 +3525,12 @@ impl Assembler {
                     };
                     slots += usize::from(instruction.local_policy.hidden_exception_owner_slots());
                 }
-                // Applying descending swaps rotates the last capture ahead of all other
+                // Each complete descending run rotates one capture ahead of the other
                 // consumers. Preserve that order when predicting greedy local-pair fusion.
-                let reordered = rotation
-                    .consumers
-                    .last()
-                    .into_iter()
-                    .chain(rotation.consumers[..rotation.consumers.len() - 1].iter())
+                let split = rotation.consumers.len() - rotation.consumer_rotation;
+                let reordered = rotation.consumers[split..]
+                    .iter()
+                    .chain(rotation.consumers[..split].iter())
                     .map(|item| {
                         let Item::Instruction(instruction) = item else {
                             unreachable!("certified rotation contains only instructions");
