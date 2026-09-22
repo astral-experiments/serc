@@ -1,10 +1,9 @@
 #[cfg(any(test, debug_assertions))]
 use super::super::AssemblerStage;
 use super::super::{
-    Assembler, COMPARE_OP, DELETE_FAST, Instruction, Item, LOAD_FAST, LOAD_FAST_AND_CLEAR,
-    LOAD_FAST_CHECK, LayoutAssembler, NOP, Operand, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE,
-    STORE_FAST, STORE_FAST_STORE_FAST, TO_BOOL, UNARY_NOT, UNPACK_SEQUENCE, UnoptimizedCode,
-    ends_scope, is_unconditional_jump,
+    Assembler, COMPARE_OP, Instruction, Item, LayoutAssembler, NOP, Operand, POP_JUMP_IF_FALSE,
+    POP_JUMP_IF_TRUE, STORE_FAST, STORE_FAST_STORE_FAST, TO_BOOL, UNARY_NOT, UNPACK_SEQUENCE,
+    UnoptimizedCode, ends_scope, is_unconditional_jump,
 };
 use crate::CompileError;
 use crate::assembler::ConstantTable;
@@ -15,7 +14,9 @@ use super::control_flow::{
     clear_redundant_boolean_nop_location, optimize_boolean_pair, optimize_redundant_store_pair,
     redundant_copy_pop_indices, remove_none_comparison_boolean_conversions,
 };
-use super::locals::{fuse_pair, optimize_linear_assertion_load_fast};
+use super::locals::{
+    fuse_pair, optimize_linear_assertion_load_fast, update_assertion_local_checks,
+};
 
 fn optimize_boolean_conversions_and_redundant_stores(
     items: &mut [Item],
@@ -130,53 +131,12 @@ fn add_checks_for_uninitialized_loads(
             Item::Instruction(instruction) => instruction,
         };
         block_has_instruction = true;
-        if matches!(
-            instruction.opcode,
-            DELETE_FAST | LOAD_FAST_AND_CLEAR | STORE_FAST | LOAD_FAST_CHECK | LOAD_FAST
-        ) && !instruction.local_policy.is_post_analysis_closure_load()
-            && !instruction.local_policy.is_known_initialized_load()
-            && let Operand::Value(argument) = instruction.operand()
-            && let Ok(local) = usize::try_from(argument)
-            && local < local_count
-        {
-            match instruction.opcode {
-                DELETE_FAST | LOAD_FAST_AND_CLEAR => {
-                    if local < 64 {
-                        unsafe_locals |= 1 << local;
-                    } else {
-                        unsafe_high_locals[local - 64] = true;
-                    }
-                }
-                STORE_FAST => {
-                    let may_store_null = instruction.local_policy.may_store_null();
-                    if local < 64 {
-                        if may_store_null {
-                            unsafe_locals |= 1 << local;
-                        } else {
-                            unsafe_locals &= !(1 << local);
-                        }
-                    } else {
-                        unsafe_high_locals[local - 64] = may_store_null;
-                    }
-                }
-                LOAD_FAST_CHECK | LOAD_FAST => {
-                    let is_unsafe = if local < 64 {
-                        let bit = 1 << local;
-                        let is_unsafe = unsafe_locals & bit != 0;
-                        unsafe_locals &= !bit;
-                        is_unsafe
-                    } else {
-                        std::mem::replace(&mut unsafe_high_locals[local - 64], false)
-                    };
-                    instruction.opcode = if is_unsafe {
-                        LOAD_FAST_CHECK
-                    } else {
-                        LOAD_FAST
-                    };
-                }
-                _ => unreachable!(),
-            }
-        }
+        update_assertion_local_checks(
+            instruction,
+            local_count,
+            &mut unsafe_locals,
+            &mut unsafe_high_locals,
+        );
         if !matches!(instruction.operand(), Operand::Value(_)) || ends_scope(instruction.opcode) {
             unsafe_high_locals.fill(true);
             block_has_instruction = false;
