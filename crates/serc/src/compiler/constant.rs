@@ -2896,7 +2896,7 @@ fn complex_product(left: (f64, f64), right: (f64, f64)) -> (f64, f64) {
     )
 }
 
-fn complex_quotient(left: (f64, f64), right: (f64, f64)) -> Option<(f64, f64)> {
+fn complex_quotient(left: (f64, f64), right: (f64, f64), contract: bool) -> Option<(f64, f64)> {
     let abs_real = right.0.abs();
     let abs_imag = right.1.abs();
     let result = if abs_real >= abs_imag {
@@ -2904,6 +2904,13 @@ fn complex_quotient(left: (f64, f64), right: (f64, f64)) -> Option<(f64, f64)> {
             return None;
         }
         let ratio = right.1 / right.0;
+        if contract {
+            let denominator = right.1.mul_add(ratio, right.0);
+            return Some((
+                left.1.mul_add(ratio, left.0) / denominator,
+                (-left.0).mul_add(ratio, left.1) / denominator,
+            ));
+        }
         let denominator = right.0 + right.1 * ratio;
         (
             (left.0 + left.1 * ratio) / denominator,
@@ -2911,6 +2918,13 @@ fn complex_quotient(left: (f64, f64), right: (f64, f64)) -> Option<(f64, f64)> {
         )
     } else if abs_imag >= abs_real {
         let ratio = right.0 / right.1;
+        if contract {
+            let denominator = right.0.mul_add(ratio, right.1);
+            return Some((
+                left.0.mul_add(ratio, left.1) / denominator,
+                left.1.mul_add(ratio, -left.0) / denominator,
+            ));
+        }
         let denominator = right.0 * ratio + right.1;
         (
             (left.0 * ratio + left.1) / denominator,
@@ -2929,15 +2943,18 @@ fn fold_complex_division(
 ) -> Option<Constant> {
     let left_parts = constant_complex_parts(left)?;
     let right_parts = constant_complex_parts(right)?;
+    // Apple's CPython builds contract the general quotient expressions, including
+    // the negation of a NaN addend in the imaginary numerator.
+    let contract = cfg!(all(target_os = "macos", target_arch = "aarch64"));
     let (mut real, mut imag) = match (left, right) {
         _ if python_version <= PythonVersion::Py313 => {
             // Legacy CPython converts real operands to complex with imaginary +0.0.
             // Its quotient formula can produce different signed zeros from the mixed
             // real/complex division introduced in 3.14.
-            complex_quotient(left_parts, right_parts)?
+            complex_quotient(left_parts, right_parts, contract)?
         }
         (Constant::Complex { .. }, Constant::Complex { .. }) => {
-            complex_quotient(left_parts, right_parts)?
+            complex_quotient(left_parts, right_parts, contract)?
         }
         (Constant::Complex { .. }, _) => {
             if right_parts.0 == 0.0 {
@@ -3031,7 +3048,7 @@ fn fold_complex_integer_power(base: &Constant, exponent: &Constant) -> Option<Co
         power = complex_product(power, power);
     }
     if exponent < 0 {
-        result = complex_quotient((1.0, 0.0), result)?;
+        result = complex_quotient((1.0, 0.0), result, false)?;
     }
     (result.0.is_finite() && result.1.is_finite()).then_some(Constant::Complex {
         real: result.0,
