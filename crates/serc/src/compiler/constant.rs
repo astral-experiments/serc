@@ -865,21 +865,9 @@ impl Compiler<'_> {
             self.add_constant(Constant::Bool(true))?;
             return Ok(());
         }
-        if let Expr::FString(fstring) = expression
-            && self.source_aware_fold_constant(expression).is_some()
+        if matches!(expression, Expr::FString(_))
+            && let Some(constant) = self.source_aware_fold_constant(expression)
         {
-            let constant = match super::expression::fstring_components(fstring, self.context.source)
-                .into_iter()
-                .next()
-            {
-                Some(super::expression::InterpolatedStringComponent::Literal(literal)) => {
-                    literal.into_constant()
-                }
-                None => Constant::String(String::new()),
-                Some(super::expression::InterpolatedStringComponent::Interpolation(_, _)) => {
-                    unreachable!("a folded f-string has no interpolated expressions")
-                }
-            };
             self.add_constant(constant)?;
             return Ok(());
         }

@@ -1244,14 +1244,7 @@ impl Compiler<'_> {
         if attribute_location.line == attribute_location.end_line {
             return self.source_location(call.range);
         }
-        if self.call_shape(call).direct_method.is_some() {
-            self.source_location(ruff_text_size::TextRange::new(
-                attribute.attr.range().start(),
-                call.range.end(),
-            ))
-        } else {
-            self.source_location(call.range)
-        }
+        self.call_opcode_location_with_method(call, self.call_shape(call).direct_method)
     }
 
     pub(super) fn call_opcode_location_with_method(
