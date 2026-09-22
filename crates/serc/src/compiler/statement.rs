@@ -26803,7 +26803,7 @@ impl Compiler<'_> {
                     let has_instructions =
                         compiler.assembler.instruction_count() > instruction_count;
                     if let Some(Stmt::Expr(tail)) = statement.body.last()
-                        && fold_constant_for_version(&tail.value, self.context.python_version)
+                        && fold_constant_for_version(&tail.value, compiler.context.python_version)
                             .is_some()
                         && compiler.assembler.last_instruction_is_nop()
                     {
