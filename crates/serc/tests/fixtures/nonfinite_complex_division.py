@@ -24,3 +24,6 @@ zero_real_divisor = 1e309j / 0
 negative_zero_real_divisor = 1e309j / -0.0
 zero_complex_divisor = 1e309 / 0j
 negative_zero_complex_divisor = 1e309 / -0j
+# Negative powers exercise both denominator branches of the shared quotient.
+reciprocal_real_dominant = (1 + 2j) ** -3
+reciprocal_imaginary_dominant = (2 + 1j) ** -3
