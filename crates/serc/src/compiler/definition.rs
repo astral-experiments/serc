@@ -1817,11 +1817,11 @@ impl Compiler<'_> {
             ..LoweringFunctionPlan::default()
         };
         let parameter_flags =
-            if self.child_function_is_nested() || !self.symbols.free_names.is_empty() {
+            (if self.child_function_is_nested() || !self.symbols.free_names.is_empty() {
                 CO_NESTED
             } else {
                 0
-            };
+            }) | (self.unit.flags & SUPPORTED_FUTURE_FLAGS);
         let mut child = Self::function(
             Rc::clone(&self.context),
             "__annotate__",
@@ -1944,7 +1944,7 @@ impl Compiler<'_> {
             1,
             1,
             0,
-            0,
+            self.unit.flags & SUPPORTED_FUTURE_FLAGS,
         )?;
         child.unit.private_name.clone_from(&self.unit.private_name);
         child
