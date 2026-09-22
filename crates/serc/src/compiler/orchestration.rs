@@ -244,11 +244,18 @@ impl<'source> Compiler<'source> {
             .collect();
         cell_only_locals.sort_by(|left, right| names.resolve(*left).cmp(names.resolve(*right)));
         locals.extend(cell_only_locals);
-        let indices = locals
+        let mut indices = locals
             .iter()
             .enumerate()
             .map(|(index, name)| Ok((*name, to_u32(index, "local variable count")?)))
             .collect::<Result<FxHashMap<_, _>, CompileError>>()?;
+        let mut temporary_indices = FxHashMap::default();
+        for &(alias, original) in &plan.local_aliases {
+            let index = indices[&original];
+            indices.insert(alias, index);
+            temporary_indices.insert(alias, index);
+            temporary_indices.insert(original, index);
+        }
         let local_count = locals.len();
         let free_indices = plan
             .freevars
@@ -269,6 +276,7 @@ impl<'source> Compiler<'source> {
             cell_names: cell_names.clone(),
             free_names,
             initialized_locals,
+            temporary_indices,
             ..SymbolState::default()
         };
         let unit = CodeUnit::from_spec(CodeUnitSpec {

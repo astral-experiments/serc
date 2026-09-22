@@ -48,8 +48,8 @@ use super::scope::{
     collect_nested_comprehension_target_names, collect_self_iterated_nested_comprehension_targets,
     collect_target_names, comprehension_cell_names, comprehension_name_bindings,
     comprehension_scope_facts, comprehension_temporary_names, generator_cellvars,
-    generator_required_names, inlined_comprehension_cell_names_in_expression,
-    legacy_class_comprehension_names, module_comprehension_temporary_names,
+    generator_required_names, global_comprehension_temporary_names,
+    inlined_comprehension_cell_names_in_expression, legacy_class_comprehension_names,
     parameter_default_expressions,
 };
 use super::source::{
@@ -3786,12 +3786,25 @@ impl Compiler<'_> {
                 .map(|(name, _)| name)
                 .collect();
         }
-        if matches!(self.unit.scope, Scope::Module)
-            && let Some(module_saves) = module_comprehension_temporary_names(generators, key, value)
-        {
-            // Save module walrus slots in symbol order, but keep their accesses global.
+        let global_saves = match &self.unit.scope {
+            Scope::Module => {
+                global_comprehension_temporary_names(generators, key, value, |_| true, None)
+            }
+            Scope::Function { globals, .. } if globals.iter_unordered().next().is_some() => {
+                global_comprehension_temporary_names(
+                    generators,
+                    key,
+                    value,
+                    |name| globals.contains(self.required_name_id(name)),
+                    self.unit.private_name.as_deref(),
+                )
+            }
+            _ => None,
+        };
+        if let Some(global_saves) = global_saves {
+            // Save explicit-global walrus slots in symbol order without changing their accesses.
             // Only iteration targets belong in active_temporary_names above.
-            temporary_names = module_saves;
+            temporary_names = global_saves;
         }
         // An inner target read by its own iterable must keep the enclosing value live until the
         // inner comprehension starts and takes ownership of its save/restore.
@@ -3833,7 +3846,16 @@ impl Compiler<'_> {
         }
 
         let mut seen_temporaries = FxHashSet::default();
-        temporary_names.retain(|name| seen_temporaries.insert(name.clone()));
+        temporary_names.retain(|name| {
+            let key = if matches!(&self.unit.scope, Scope::Function { globals, .. }
+                if globals.contains(self.required_name_id(name)))
+            {
+                self.mangled_name(name)
+            } else {
+                name.clone()
+            };
+            seen_temporaries.insert(key)
+        });
         // CPython saves the hidden fast slot, but creates and accesses a captured
         // target's cell through its existing free slot while the comprehension is active.
         let mut comprehension_free_cell_indices = FxHashMap::default();
