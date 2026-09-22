@@ -57,17 +57,17 @@ files. Its opt-in CPython 3.14.5 comparison supplements the required Ruff gate:
 ```
 
 The September 22, 2026 measurements use CPython 3.14.5 and Serc
-[`623b068`](https://github.com/astral-sh/serc/commit/623b068972f279e7e113da431455ea18f84b360e).
+`df954af`.
 Corpus revisions and membership are unchanged. The
-[results summary](../corpora/results/compatibility-2026-09-22-public-623b068.json) records
+[results summary](../corpora/results/compatibility-2026-09-22-public-df954af.json) records
 compiler and corpus identities, every outcome category, and evidence hashes.
 
 | Corpus | Files | CPython-rejected | Byte-identical accepted | Byte mismatches | Accepted-input compiler failures | Accepted-input match rate |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Ruff fixtures | 2,451 | 221 | 2,230 | 0 | 0 | 100% |
 | NumPy `v2.4.6` | 505 | 0 | 505 | 0 | 0 | 100% |
-| mypy-primer snapshot | 73,537 | 160 | 73,300 | 77 | 0 | 99.90% |
-| **Combined** | **76,493** | **381** | **76,035** | **77** | **0** | **99.90%** |
+| mypy-primer snapshot | 73,537 | 160 | 73,310 | 67 | 0 | 99.91% |
+| **Combined** | **76,493** | **381** | **76,045** | **67** | **0** | **99.91%** |
 
 Of the 160 CPython-rejected mypy-primer files, Serc matches 123 rejections, accepts 29, and
 fails internally on 8. There are no compiler failures on accepted inputs, unsupported inputs,
