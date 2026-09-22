@@ -59,7 +59,7 @@ impl OptimizationPipeline {
                 let next = *self.graph.instruction_mut(next_position).unwrap();
                 match next.opcode {
                     POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE => {
-                        let truth = legacy_constant_truthiness(constants.get(argument));
+                        let truth = constants.get(argument).is_truthy();
                         legacy_nop(self.graph.instruction_mut(position).unwrap());
                         let jump = self.graph.instruction_mut(next_position).unwrap();
                         if truth == (next.opcode == POP_JUMP_IF_TRUE) {
@@ -111,7 +111,7 @@ impl OptimizationPipeline {
                         index += 1;
                     }
                     TO_BOOL if self.python_version == PythonVersion::Py313 => {
-                        let truth = legacy_constant_truthiness(constants.get(argument));
+                        let truth = constants.get(argument).is_truthy();
                         let argument = constants.intern(Constant::Bool(truth))?;
                         legacy_nop(self.graph.instruction_mut(position).unwrap());
                         let conversion = self.graph.instruction_mut(next_position).unwrap();
@@ -186,22 +186,6 @@ impl OptimizationPipeline {
 fn legacy_nop(instruction: &mut Instruction) {
     instruction.opcode = NOP;
     instruction.set_operand(Operand::Value(0));
-}
-
-fn legacy_constant_truthiness(constant: &Constant) -> bool {
-    match constant {
-        Constant::None => false,
-        Constant::Bool(value) => *value,
-        Constant::Ellipsis | Constant::Slice { .. } | Constant::Code(_) => true,
-        Constant::Int(value) => *value != 0,
-        Constant::SignedInt(value) => *value != 0,
-        Constant::BigInt { digits, .. } => !digits.is_empty(),
-        Constant::Float(value) => *value != 0.0,
-        Constant::Complex { real, imag } => *real != 0.0 || *imag != 0.0,
-        Constant::String(value) => !value.is_empty(),
-        Constant::SurrogateString(value) | Constant::Bytes(value) => !value.is_empty(),
-        Constant::Tuple(value) | Constant::FrozenSet(value) => !value.is_empty(),
-    }
 }
 
 /// Folds only adjacent loads; NOPs still occupy native CFG instruction slots.

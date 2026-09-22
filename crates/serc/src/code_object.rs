@@ -267,6 +267,23 @@ pub(crate) enum Constant {
 }
 
 impl Constant {
+    /// Returns the Python truth value of this constant.
+    pub(crate) fn is_truthy(&self) -> bool {
+        match self {
+            Self::None => false,
+            Self::Bool(value) => *value,
+            Self::Ellipsis | Self::Slice { .. } | Self::Code(_) => true,
+            Self::Int(value) => *value != 0,
+            Self::SignedInt(value) => *value != 0,
+            Self::BigInt { digits, .. } => !digits.is_empty(),
+            Self::Float(value) => *value != 0.0,
+            Self::Complex { real, imag } => *real != 0.0 || *imag != 0.0,
+            Self::String(value) => !value.is_empty(),
+            Self::SurrogateString(value) | Self::Bytes(value) => !value.is_empty(),
+            Self::Tuple(value) | Self::FrozenSet(value) => !value.is_empty(),
+        }
+    }
+
     /// Applies Python numeric negation, leaving nonnumeric operands to raise at runtime.
     pub(crate) fn negated(self) -> Option<Self> {
         match self {
