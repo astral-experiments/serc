@@ -162,3 +162,68 @@ fn retains_cpython_expression_try_at_end_of_if() {
 ";
     common::assert_matches_cpython_marshal(source, "if_tail_try_expression_control.py");
 }
+
+#[test]
+fn matches_cpython_single_comparison_asserted_else_exit() {
+    let source = r"def f(value, enabled):
+    if enabled:
+        try:
+            work()
+        except Error as error:
+            if error.code:
+                raise
+        else:
+            try:
+                value = get_value()
+                assert value == EXPECTED
+            except BaseException:
+                cancel()
+                raise
+            _, error = result()
+            assert error == 0
+    else:
+        other()
+    return value
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "matches_cpython_single_comparison_asserted_else_exit.py",
+    );
+}
+
+#[test]
+fn matches_cpython_comparison_asserted_else_copy_limits() {
+    for (filename, source) in [
+        (
+            "mypy_over_budget.py",
+            r"def f(value):
+    try:
+        work()
+    except Error as error:
+        if error.code:
+            raise
+    else:
+        prepare()
+        assert value == 0
+    return finish(value, other())
+",
+        ),
+        (
+            "mypy_with.py",
+            r"def f(value, manager):
+    with manager:
+        try:
+            work()
+        except Error as error:
+            if error.code:
+                raise
+        else:
+            prepare()
+            assert value == 0
+        return value
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -5332,6 +5332,12 @@ impl Compiler<'_> {
                 self.emit(NOP, 0, 0)?;
                 self.assembler.set_location(comparison_location);
                 self.emit(NOP, 0, 0)?;
+            } else if element_location.line != comparison_location.line {
+                // The preceding comparison starts a new original fallthrough array.
+                // Threading its final None test through the filter backedge replaces
+                // that conditional with this owned NOP before appending the element-line jump.
+                self.assembler.set_location(comparison_location);
+                self.emit(NOP, 0, 0)?;
             }
             if (operator == CmpOp::Is) == negated {
                 POP_JUMP_IF_NOT_NONE

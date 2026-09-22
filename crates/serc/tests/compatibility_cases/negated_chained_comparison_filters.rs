@@ -35,3 +35,15 @@ fn matches_cpython_multiline_chained_none_filters() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_chained_none_filter_separate_element_line() {
+    let source = r"def f(items, left):
+    return [item for item in items
+            if left is item is None]
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "matches_cpython_chained_none_filter_separate_element_line.py",
+    );
+}

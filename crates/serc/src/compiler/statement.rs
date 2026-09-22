@@ -20363,6 +20363,37 @@ impl Compiler<'_> {
                         self.source_location(location.test.range()),
                     )
                 });
+            // A final runtime comparison assertion has one original success array
+            // after its failure RAISE. The try's POP_BLOCK precedes the else suite;
+            // this array contains only the existing unlocated normal-exit jump.
+            let retained_comparison_asserted_else_exit = self.context.python_version >= crate::PythonVersion::Py314
+                    // The same authored continuation fits this original jump array;
+                    // pending cleanup or intervening work must retain their borrow path.
+                    && self.following_name_return_fits_match_copy_budget()
+                    && matches!(self.unit.scope, Scope::Function { .. })
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && !statement.is_star
+                    && statement.finalbody.is_empty()
+                    && !statement.orelse.is_empty()
+                    && matches!(statement.orelse.last(), Some(Stmt::Assert(assertion))
+                    if assertion.msg.is_none()
+                        && matches!(assertion.test.as_ref(), Expr::Compare(comparison)
+                            if comparison.ops.len() == 1)
+                        && assertion_has_only_runtime_tests(&assertion.test)
+                        && original_condition_has_unique_jump_target(&assertion.test, true)
+                        && !expression_contains_inline_branch(&assertion.test)
+                        && !expression_suspends_current_scope(&assertion.test)
+                        && self.assembler.last_instruction_location()
+                            == Some(self.source_location(assertion.test.range())))
+                    && self.assembler.at_empty_borrow_block()
+                    && self
+                        .assembler
+                        .current_block_last_instruction_location()
+                        .is_none()
+                    && self.assembler.current_block_starts_at_source_boundary()
+                    && self.assembler.instruction_opcode_at(
+                        self.assembler.instruction_count().saturating_sub(1),
+                    ) == Some(RAISE_VARARGS);
             let chained_assertion_exit_location = (!statement.orelse.is_empty())
                 .then(|| match normal_exit_suite.last()? {
                     Stmt::Assert(assertion)
@@ -20772,6 +20803,15 @@ impl Compiler<'_> {
                     exception_policy,
                 )?
             };
+            if retained_comparison_asserted_else_exit {
+                // Keep the actual jump replacement through eligible return copying
+                // and cold-handler relocation; the existing original-join verifier
+                // retains its source boundary, alias and unique-predecessor checks.
+                self.assembler
+                    .preserve_empty_join_inlined_jump_nop(normal_exit);
+                self.assembler
+                    .preserve_redundant_jump_nop_after_threading(normal_exit);
+            }
             if retained_return_guard_exit {
                 // POP_BLOCK disappears beside the same-line normal jump. Cold
                 // handler placement later converts this original jump to a NOP.
