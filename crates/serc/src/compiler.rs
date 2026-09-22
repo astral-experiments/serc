@@ -68,7 +68,7 @@ pub(crate) struct Compiler<'source> {
     unit: CodeUnit,
     output: OutputState,
     symbols: SymbolState,
-    control: ControlFlowState,
+    control: ControlFlowState<'source>,
     assembler: Assembler,
     native_label_plan: Option<Box<legacy_native_labels::NativeLabelPlan>>,
 }

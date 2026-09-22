@@ -85,7 +85,7 @@ struct AsyncForEndPopRecorder {
 }
 
 impl AsyncForEndPopRecorder {
-    fn scope_depths(control: &ControlFlowState) -> (usize, usize, usize, usize, usize, usize) {
+    fn scope_depths(control: &ControlFlowState<'_>) -> (usize, usize, usize, usize, usize, usize) {
         (
             control.finally.active_finally_try_bodies,
             control.finally.active_normal_finally_bodies,
@@ -96,7 +96,7 @@ impl AsyncForEndPopRecorder {
         )
     }
 
-    fn new(control: &ControlFlowState) -> Self {
+    fn new(control: &ControlFlowState<'_>) -> Self {
         Self {
             scope_depths: Self::scope_depths(control),
             origin: None,
@@ -145,10 +145,10 @@ struct FinallyProtectedLoopRanges {
     borrow_reachable_exit: Option<TextRange>,
 }
 
-#[derive(Clone, Debug)]
-struct FinallyExitContext {
+#[derive(Clone, Copy, Debug)]
+struct FinallyExitContext<'ast> {
     source_range: TextRange,
-    body: Vec<Stmt>,
+    body: &'ast [Stmt],
     enclosing_finally_try_depth: usize,
     pass_finally_depth: usize,
     loop_depth: usize,
@@ -459,7 +459,7 @@ pub(super) struct ExceptionState {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct FinallyState {
+pub(super) struct FinallyState<'ast> {
     // Certified direct and nested finalizers use recursive native return
     // unwinding even when cleanup replaces the pending return.
     copies_terminating_finally_returns: bool,
@@ -474,8 +474,8 @@ pub(super) struct FinallyState {
     captured_finally_manager_pop: Option<(SourceLocation, Label)>,
     // The delegated normal edge awaits its completed original finally target.
     pending_name_return_borrow_exit: Option<NameReturnBorrowExit>,
-    active_return_finally_contexts: Vec<FinallyExitContext>,
-    active_loop_finally_contexts: Vec<FinallyExitContext>,
+    active_return_finally_contexts: Vec<FinallyExitContext<'ast>>,
+    active_loop_finally_contexts: Vec<FinallyExitContext<'ast>>,
     // A loop control inside a copied finalizer replaces the pending exit and has its own unwind.
     pub(super) active_copied_finally_bodies: usize,
     // A sole copied finally condition can duplicate the preserved return onto its false edge.
@@ -512,7 +512,7 @@ pub(super) struct FinallyState {
     async_for_end_pop_recorders: Vec<AsyncForEndPopRecorder>,
 }
 
-impl FinallyState {
+impl FinallyState<'_> {
     /// No finally cleanup or preserved return value must be interleaved with this unwind.
     fn is_inactive_for_return_unwind(&self) -> bool {
         self.active_return_finally_contexts.is_empty()
@@ -703,11 +703,11 @@ pub(super) struct StackState {
 /// Keeping scoped contexts and layout hints in construct-specific groups makes their invariants
 /// visible without changing CPython's bytecode or pass ordering.
 #[derive(Debug, Default)]
-pub(super) struct ControlFlowState {
+pub(super) struct ControlFlowState<'ast> {
     pub(super) comprehensions: ComprehensionState,
     pub(super) withs: WithState,
     pub(super) exceptions: ExceptionState,
-    pub(super) finally: FinallyState,
+    pub(super) finally: FinallyState<'ast>,
     pub(super) conditions: ConditionState,
     pub(super) loops: LoopState,
     pub(super) generators: GeneratorState,
@@ -715,7 +715,7 @@ pub(super) struct ControlFlowState {
     pub(super) stack: StackState,
 }
 
-impl ControlFlowState {
+impl ControlFlowState<'_> {
     fn collected_exception_depth(&self) -> usize {
         self.exceptions.active_exception_region_exclusions.len()
             + self.withs.active_with_region_exclusions.len()
@@ -947,7 +947,7 @@ impl ControlFlowState {
     }
 }
 
-impl Compiler<'_> {
+impl<'source> Compiler<'source> {
     /// Keeps the native setup depth independent of collectors retained for range exclusions.
     fn with_suspension_exception_depth<T>(
         &mut self,
@@ -1263,7 +1263,7 @@ impl Compiler<'_> {
 
     fn with_control_stack<T, R>(
         &mut self,
-        select: for<'a> fn(&'a mut ControlFlowState) -> &'a mut Vec<T>,
+        select: for<'a> fn(&'a mut ControlFlowState<'source>) -> &'a mut Vec<T>,
         value: T,
         compile: impl FnOnce(&mut Self) -> Result<R, CompileError>,
     ) -> Result<(R, T), CompileError> {
@@ -1284,7 +1284,7 @@ impl Compiler<'_> {
 
     fn with_control_counter<R>(
         &mut self,
-        select: for<'a> fn(&'a mut ControlFlowState) -> &'a mut usize,
+        select: for<'a> fn(&'a mut ControlFlowState<'source>) -> &'a mut usize,
         compile: impl FnOnce(&mut Self) -> Result<R, CompileError>,
     ) -> Result<R, CompileError> {
         let previous = *select(&mut self.control);
@@ -1300,7 +1300,7 @@ impl Compiler<'_> {
         overriding_return: bool,
         loop_ranges: FinallyProtectedLoopRanges,
         preserves_none_condition_owner: bool,
-        return_context: Option<FinallyExitContext>,
+        return_context: Option<FinallyExitContext<'source>>,
         compile: impl FnOnce(&mut Self) -> Result<T, CompileError>,
     ) -> Result<(T, Vec<(Label, Label)>), CompileError> {
         let exclusion_depth = self
@@ -1330,7 +1330,7 @@ impl Compiler<'_> {
                 self.control
                     .finally
                     .active_return_finally_contexts
-                    .push(context.clone());
+                    .push(context);
             }
             self.control
                 .finally
@@ -1432,7 +1432,7 @@ impl Compiler<'_> {
 
     fn with_region_exclusion_collector<T>(
         &mut self,
-        select: for<'a> fn(&'a mut ControlFlowState) -> &'a mut RegionExclusionStack,
+        select: for<'a> fn(&'a mut ControlFlowState<'source>) -> &'a mut RegionExclusionStack,
         compile: impl FnOnce(&mut Self) -> Result<T, CompileError>,
     ) -> Result<(T, RegionExclusions), CompileError> {
         let (value, exclusions) = self.with_control_stack(select, Vec::new(), compile)?;
@@ -1467,7 +1467,7 @@ impl Compiler<'_> {
 
     pub(super) fn with_control_override<T, R>(
         &mut self,
-        select: for<'a> fn(&'a mut ControlFlowState) -> &'a mut T,
+        select: for<'a> fn(&'a mut ControlFlowState<'source>) -> &'a mut T,
         value: T,
         compile: impl FnOnce(&mut Self) -> Result<R, CompileError>,
     ) -> Result<R, CompileError> {
@@ -4694,7 +4694,7 @@ impl Compiler<'_> {
                         && self.control.loops.contexts.len() == 1
                         && context.exception_region_depth == 0
                         && matches!(self.control.finally.active_loop_finally_contexts.as_slice(), [finally]
-                            if matches!(finally.body.as_slice(), [Stmt::If(guard)]
+                            if matches!(finally.body, [Stmt::If(guard)]
                                 if guard.elif_else_clauses.is_empty()
                                     && matches!(guard.body.as_slice(), [Stmt::Expr(expression)]
                                         if matches!(expression.value.as_ref(), Expr::Await(_)))))))
@@ -4723,7 +4723,7 @@ impl Compiler<'_> {
                             && finally.with_depth == context.with_depth
                             && finally.handler_depth == 0
                             && finally.exception_region_depth == context.exception_region_depth
-                            && matches!(finally.body.as_slice(), [Stmt::If(guard)]
+                            && matches!(finally.body, [Stmt::If(guard)]
                                 if guard.elif_else_clauses.is_empty()));
                 // This finalizer's normal and handler exits share the original iterator
                 // discard. The join is checked again after every unwind has been emitted.
@@ -4746,7 +4746,7 @@ impl Compiler<'_> {
                             && finally.with_depth == context.with_depth
                             && finally.handler_depth == 0
                             && finally.exception_region_depth == context.exception_region_depth
-                            && copied_finally_has_joined_try_cleanup(&finally.body));
+                            && copied_finally_has_joined_try_cleanup(finally.body));
                 self.emit_with_exception_policy(
                     NOP,
                     0,
@@ -4759,7 +4759,7 @@ impl Compiler<'_> {
                         .active_loop_finally_contexts
                         .iter()
                         .rev()
-                        .find(|context| !matches!(context.body.as_slice(), [Stmt::Pass(_)]))
+                        .find(|context| !matches!(context.body, [Stmt::Pass(_)]))
                         .is_some_and(|context| {
                             context.loop_depth >= self.control.loops.contexts.len()
                                 && !(context.with_depth
@@ -5152,7 +5152,7 @@ impl Compiler<'_> {
                                     && finally.loop_depth == handler.loop_depth
                                     && finally.exception_region_depth + 1 == handler.exception_region_depth
                                     && finally.exception_region_depth == context.exception_region_depth
-                                    && matches!(finally.body.as_slice(), [Stmt::If(guard)]
+                                    && matches!(finally.body, [Stmt::If(guard)]
                                         if guard.elif_else_clauses.is_empty()
                                             && matches!(guard.test.as_ref(), Expr::Compare(comparison)
                                                 if matches!(comparison.left.as_ref(), Expr::Name(_))
@@ -5173,7 +5173,7 @@ impl Compiler<'_> {
                         else {
                             return None;
                         };
-                        self.copied_finally_starts_local_none_cleanup(&finally.body)
+                        self.copied_finally_starts_local_none_cleanup(finally.body)
                             .then_some(finally.handler)
                     })
                     .flatten();
@@ -5212,7 +5212,7 @@ impl Compiler<'_> {
                     && matches!(self.control.finally.active_loop_finally_contexts.as_slice(), [finally]
                         if finally.handler_depth == 0 && finally.with_depth == 0
                             && finally.loop_depth == 1 && finally.exception_region_depth == 0
-                            && matches!(finally.body.as_slice(), [Stmt::Try(cleanup)]
+                            && matches!(finally.body, [Stmt::Try(cleanup)]
                                 if !cleanup.is_star && cleanup.finalbody.is_empty()
                                     && cleanup.orelse.is_empty()
                                     && matches!(cleanup.body.as_slice(), [Stmt::If(guard)]
@@ -5243,7 +5243,7 @@ impl Compiler<'_> {
                         .active_loop_finally_contexts
                         .iter()
                         .rev()
-                        .find(|context| !matches!(context.body.as_slice(), [Stmt::Pass(_)]))
+                        .find(|context| !matches!(context.body, [Stmt::Pass(_)]))
                         .is_some_and(|context| {
                             context.loop_depth >= self.control.loops.contexts.len()
                                 && !(context.with_depth
@@ -5389,7 +5389,7 @@ impl Compiler<'_> {
                         else {
                             return None;
                         };
-                        let [Stmt::If(tail)] = finally.body.as_slice() else {
+                        let [Stmt::If(tail)] = finally.body else {
                             return None;
                         };
                         (finally.loop_depth >= self.control.loops.contexts.len()
@@ -5467,7 +5467,7 @@ impl Compiler<'_> {
                         else {
                             return None;
                         };
-                        let [Stmt::If(tail)] = finally.body.as_slice() else {
+                        let [Stmt::If(tail)] = finally.body else {
                             return None;
                         };
                         // The handler has already popped before this copied await. The
@@ -5583,7 +5583,7 @@ impl Compiler<'_> {
                         .active_loop_finally_contexts
                         .iter()
                         .rev()
-                        .find(|context| !matches!(context.body.as_slice(), [Stmt::Pass(_)]))
+                        .find(|context| !matches!(context.body, [Stmt::Pass(_)]))
                         .is_some_and(|context| {
                             context.loop_depth >= self.control.loops.contexts.len()
                         })
@@ -5724,7 +5724,7 @@ impl Compiler<'_> {
                         .active_return_finally_contexts
                         .last()
                         .is_some_and(|context| {
-                            matches!(context.body.as_slice(), [Stmt::Expr(expression)]
+                            matches!(context.body, [Stmt::Expr(expression)]
                             if matches!(expression.value.as_ref(), Expr::Call(_)))
                         })
                     && (self
@@ -5752,7 +5752,7 @@ impl Compiler<'_> {
                         .active_return_finally_contexts
                         .last()
                         .is_some_and(|context| {
-                            matches!(context.body.as_slice(), [Stmt::Expr(expression)]
+                            matches!(context.body, [Stmt::Expr(expression)]
                                 if matches!(expression.value.as_ref(), Expr::Call(call)
                                     if call.arguments.args.is_empty()
                                         && call.arguments.keywords.is_empty()
@@ -6805,8 +6805,8 @@ impl Compiler<'_> {
                                     })
                                     && self.control.finally.active_pass_finally_locations.is_empty()
                                     && self.control.finally.copied_return_finally_preserved_values == 0
-                                    && !suite_contains_abrupt_control_flow(&finally.body)
-                                    && !suite_contains_yield(&finally.body)))
+                                    && !suite_contains_abrupt_control_flow(finally.body)
+                                    && !suite_contains_yield(finally.body)))
                                 && finally.handler_depth == 0
                                 && finally.exception_region_depth > 0
                                 && finally.exception_region_depth == finally.try_body_depth
@@ -6914,10 +6914,10 @@ impl Compiler<'_> {
                                     IteratorCleanup::None | IteratorCleanup::Sync
                                 )
                                 && loop_context.exception_region_depth == inner.exception_region_depth
-                                && !suite_contains_abrupt_control_flow(&inner.body)
-                                && !suite_contains_yield(&inner.body)
-                                && !suite_contains_abrupt_control_flow(&outer.body)
-                                && !suite_contains_yield(&outer.body)
+                                && !suite_contains_abrupt_control_flow(inner.body)
+                                && !suite_contains_yield(inner.body)
+                                && !suite_contains_abrupt_control_flow(outer.body)
+                                && !suite_contains_yield(outer.body)
                     );
                 // The handler exits before the inner finalizer, but the ordinary
                 // try between these finalizers remains active until the outer copy.
@@ -6965,10 +6965,10 @@ impl Compiler<'_> {
                                 && handler.try_body_depth == 1
                                 && self.control.exceptions.active_try_marker_slots.len() == 1
                                 && self.control.exceptions.active_exception_region_exclusions.len() == 4
-                                && !suite_contains_abrupt_control_flow(&inner.body)
-                                && !suite_contains_yield(&inner.body)
-                                && !suite_contains_abrupt_control_flow(&outer.body)
-                                && !suite_contains_yield(&outer.body)
+                                && !suite_contains_abrupt_control_flow(inner.body)
+                                && !suite_contains_yield(inner.body)
+                                && !suite_contains_abrupt_control_flow(outer.body)
+                                && !suite_contains_yield(outer.body)
                     );
                 let tracks_finally_region_unwinds = !return_is_overridden
                     && (handler_count == 0
@@ -8028,7 +8028,7 @@ impl Compiler<'_> {
                                     && inner.exception_region_depth
                                         == outer.exception_region_depth + 1
                                     && inner.try_body_depth == outer.try_body_depth
-                                    && let [Stmt::Assign(assignment)] = inner.body.as_slice()
+                                    && let [Stmt::Assign(assignment)] = inner.body
                                     && matches!(assignment.value.as_ref(), Expr::NoneLiteral(_))
                                     && let [Expr::Name(assigned)] = assignment.targets.as_slice()
                                     && let Some(Stmt::If(entry)) = outer.body.first()
@@ -8409,9 +8409,9 @@ impl Compiler<'_> {
                                 && inner.loop_depth == next_loop
                                 && inner.exception_region_depth
                                     == finally_context.exception_region_depth + 1
-                                && copied_finally_has_guarded_pass_cleanup(&inner.body)
+                                && copied_finally_has_guarded_pass_cleanup(inner.body)
                         })
-                        && matches!(finally_context.body.as_slice(), [Stmt::Try(cleanup)]
+                        && matches!(finally_context.body, [Stmt::Try(cleanup)]
                             if !cleanup.is_star
                                 && cleanup.finalbody.is_empty()
                                 && !cleanup.handlers.is_empty())
@@ -8894,12 +8894,12 @@ impl Compiler<'_> {
                                 && outer.with_depth == 0 && inner.with_depth == 0
                                 && outer.try_body_depth == 0 && inner.try_body_depth <= 1
                                 && outer.exception_region_depth == 0
-                                && !suite_contains_abrupt_control_flow(&outer.body)
-                                && !suite_contains_yield(&outer.body)
+                                && !suite_contains_abrupt_control_flow(outer.body)
+                                && !suite_contains_yield(outer.body)
                                 && inner.exception_region_depth == inner.try_body_depth + 1
                                 && self.control.exceptions.active_try_marker_slots.len()
                                     == inner.try_body_depth + 1
-                                && matches!(inner.body.as_slice(), [Stmt::Expr(expression)]
+                                && matches!(inner.body, [Stmt::Expr(expression)]
                                     if matches!(expression.value.as_ref(), Expr::Call(call)
                                         if call.arguments.args.is_empty()
                                             && call.arguments.keywords.is_empty()
@@ -9746,7 +9746,7 @@ impl Compiler<'_> {
                     if !starts_jump_target
                         || shared_copied_cleanup_join
                         || copied_guard_exit_location.is_some()
-                        || matches!(finally_context.body.as_slice(), [Stmt::Pass(_)])
+                        || matches!(finally_context.body, [Stmt::Pass(_)])
                         // A preceding copied finalizer can finish at a conditional join.
                         // Its outer POP_BLOCK must survive 3.12's early NOP cleanup so
                         // final line propagation can inherit the continuing edge's span.
@@ -9763,7 +9763,7 @@ impl Compiler<'_> {
                         // the inner normal and handled exits. Preserve its original kind
                         // so shared-head location repair can keep that POP_BLOCK unlocated.
                         || (unwind_location == SourceLocation::NONE
-                            && matches!(finally_context.body.as_slice(), [Stmt::Try(cleanup)]
+                            && matches!(finally_context.body, [Stmt::Try(cleanup)]
                                 if !cleanup.is_star
                                     && !cleanup.handlers.is_empty()
                                     && cleanup.orelse.is_empty()
@@ -9772,7 +9772,7 @@ impl Compiler<'_> {
                                 inner.loop_depth == finally_context.loop_depth
                                     && inner.with_depth == finally_context.with_depth
                                     && inner.handler_depth == finally_context.handler_depth
-                                    && matches!(inner.body.as_slice(), [Stmt::Try(cleanup)]
+                                    && matches!(inner.body, [Stmt::Try(cleanup)]
                                         if !cleanup.is_star
                                             && !cleanup.handlers.is_empty()
                                             && cleanup.orelse.is_empty()
@@ -9830,7 +9830,7 @@ impl Compiler<'_> {
                     if shared_copied_cleanup_join
                         || (starts_jump_target
                             && unwind_location.line < 0
-                            && matches!(finally_context.body.as_slice(), [Stmt::Pass(_)]))
+                            && matches!(finally_context.body, [Stmt::Pass(_)]))
                     {
                         self.assembler.preserve_last_no_location();
                     }
@@ -9921,7 +9921,7 @@ impl Compiler<'_> {
                                                     ),
                                                     |compiler| {
                                                         compiler.compile_copied_finally_body(
-                                                            &finally_context.body,
+                                                            finally_context.body,
                                                             None,
                                                         )
                                                     },
@@ -10202,7 +10202,7 @@ impl Compiler<'_> {
                             && self.control.finally.active_finally_end_blocks == 0
                             && self.control.finally.active_normal_finally_bodies == 0
                             && self.control.finally.active_copied_finally_bodies == 0
-                            && copied_finally_has_guarded_raise_cleanup(&finally_context.body);
+                            && copied_finally_has_guarded_raise_cleanup(finally_context.body);
                         // A manager entered between these finally contexts still owns
                         // this copy. Its existing region supplies the handler and stack
                         // depth; a synthetic outer-finally region would hide that owner.
@@ -10218,8 +10218,8 @@ impl Compiler<'_> {
                                     manager.exception_region_depth
                                         == finally_context.exception_region_depth
                                 })
-                            && !suite_contains_abrupt_control_flow(&finally_context.body)
-                            && !suite_contains_yield(&finally_context.body);
+                            && !suite_contains_abrupt_control_flow(finally_context.body)
+                            && !suite_contains_yield(finally_context.body);
                         // The intervening ordinary try likewise supplies its existing
                         // owner until the outer finalizer starts. Do not mask that region
                         // with a synthetic outer-finally owner for this inner copy. Loops
@@ -10264,8 +10264,8 @@ impl Compiler<'_> {
                             && handler_region_unwind_starts.as_ref().is_some_and(|starts| {
                                 starts.len() == 5 && starts[1].is_none() && starts[2].is_none()
                             })
-                            && !suite_contains_abrupt_control_flow(&finally_context.body)
-                            && !suite_contains_yield(&finally_context.body);
+                            && !suite_contains_abrupt_control_flow(finally_context.body)
+                            && !suite_contains_yield(finally_context.body);
                         let retained_try_owns_copy = retained_iterator_try_owns_copy
                             || ((tracks_try_between_finally_unwinds
                                 || tracks_handler_between_plain_finalizers)
@@ -10299,9 +10299,9 @@ impl Compiler<'_> {
                                         starts.get(outer_context.exception_region_depth + 1)
                                     })
                                     .is_some_and(Option::is_none)
-                                && (!suite_contains_abrupt_control_flow(&finally_context.body)
+                                && (!suite_contains_abrupt_control_flow(finally_context.body)
                                     || guarded_raise_cleanup)
-                                && !suite_contains_yield(&finally_context.body));
+                                && !suite_contains_yield(finally_context.body));
                         // This inner finally runs before the enclosing named handler's
                         // POP_EXCEPT and name clearing. Its existing body-cleanup region
                         // must keep ownership until those records execute; an outer-finally
@@ -10332,7 +10332,7 @@ impl Compiler<'_> {
                             && self.control.finally.active_normal_finally_bodies == 0
                             && self.control.finally.active_copied_finally_bodies == 0
                             && (guarded_raise_cleanup
-                                || matches!(finally_context.body.as_slice(), [Stmt::Expr(expression)]
+                                || matches!(finally_context.body, [Stmt::Expr(expression)]
                                     if matches!(expression.value.as_ref(), Expr::Call(_))))
                             && matches!(
                                 &self.control.exceptions.active_exception_handlers[..next_handler],
@@ -10402,7 +10402,7 @@ impl Compiler<'_> {
                             copied_finally_iterator_region_unwind = self.unit.flags
                                 & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                                 == 0
-                                && matches!(finally_context.body.as_slice(), [Stmt::Try(cleanup)]
+                                && matches!(finally_context.body, [Stmt::Try(cleanup)]
                                     if !cleanup.is_star
                                         && cleanup.orelse.is_empty()
                                         && cleanup.finalbody.is_empty()
@@ -10417,7 +10417,7 @@ impl Compiler<'_> {
                                                         !expression_contains_inline_branch(test)
                                                             && !expression_suspends_current_scope(test))
                                                     && matches!(handler.body.as_slice(), [Stmt::Pass(_)]))));
-                            if matches!(finally_context.body.as_slice(), [Stmt::Expr(expression)]
+                            if matches!(finally_context.body, [Stmt::Expr(expression)]
                                 if matches!(expression.value.as_ref(), Expr::Call(_)))
                             {
                                 copied_finally_iterator_location =
@@ -10917,7 +10917,7 @@ impl Compiler<'_> {
                                     && context.loop_depth == 0
                                     && context.try_body_depth == 0
                                     && context.preserves_conditional_exit_owner
-                                    && matches!(context.body.as_slice(), [Stmt::If(branch)]
+                                    && matches!(context.body, [Stmt::If(branch)]
                                         if matches!(branch.test.as_ref(), Expr::Name(_))
                                             && early_condition_truthiness(&branch.test).is_none()
                                             && matches!(branch.body.as_slice(), [Stmt::Expr(expression)]
@@ -10936,7 +10936,7 @@ impl Compiler<'_> {
                                 .iter()
                                 .any(|context| {
                                     context.handler_depth > 0
-                                        && matches!(context.body.as_slice(), [Stmt::Pass(_)])
+                                        && matches!(context.body, [Stmt::Pass(_)])
                                 }))
                     {
                         self.assembler.allow_last_no_location_block_inlining();
@@ -13852,7 +13852,7 @@ impl Compiler<'_> {
             || finally.loop_depth != self.control.loops.contexts.len()
             || (retained_manager && finally.with_depth != context.with_depth)
             || finally.exception_region_depth != context.exception_region_depth
-            || matches!(finally.body.as_slice(), [Stmt::Pass(_)])
+            || matches!(finally.body, [Stmt::Pass(_)])
         {
             return 0;
         }
@@ -13874,7 +13874,7 @@ impl Compiler<'_> {
             || (context.iterator_cleanup == IteratorCleanup::Sync
                 && !(guarded_none_cleanup
                     || (retained_manager_break && pop_blocks == 1)
-                    || copied_finally_tail_can_inline_continue(&finally.body)))
+                    || copied_finally_tail_can_inline_continue(finally.body)))
             || !(1..=2).contains(&pop_blocks)
             || self
                 .control
@@ -13984,7 +13984,7 @@ impl Compiler<'_> {
                 )?;
                 if self.context.python_version == crate::PythonVersion::Py312
                     || (index + 1 == finally_contexts.len()
-                        && matches!(context.body.as_slice(), [Stmt::Pass(_)]))
+                        && matches!(context.body, [Stmt::Pass(_)]))
                 {
                     // 3.12 retains every unwinding POP_BLOCK until pseudo-op conversion;
                     // its span can outlive the preceding SETUP and authored break NOPs.
@@ -14010,7 +14010,7 @@ impl Compiler<'_> {
                     self.assembler.set_location(SourceLocation::NONE);
                     self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
                     self.assembler.mark_last_as_converted_pop_block();
-                    if starts_jump_target && matches!(context.body.as_slice(), [Stmt::Pass(_)]) {
+                    if starts_jump_target && matches!(context.body, [Stmt::Pass(_)]) {
                         self.assembler.preserve_last_no_location();
                     }
                 }
@@ -14087,7 +14087,7 @@ impl Compiler<'_> {
                         .is_empty()
                     && preserved_values.is_empty()
                     && preserved_value_count == 0
-                    && !matches!(context.body.as_slice(), [Stmt::Pass(_)])
+                    && !matches!(context.body, [Stmt::Pass(_)])
                 {
                     // Manager cleanup makes the remaining unwind artificial. The ordinary
                     // try and its finalizer each still contribute one original POP_BLOCK
@@ -14138,12 +14138,12 @@ impl Compiler<'_> {
                     self.control
                         .finally
                         .active_loop_finally_contexts
-                        .push(outer.clone());
+                        .push(*outer);
                     if outer.copy_on_return {
                         self.control
                             .finally
                             .active_return_finally_contexts
-                            .push(outer.clone());
+                            .push(*outer);
                     }
                 }
                 // The enclosing ordinary try still owns a copied linear finalizer.
@@ -14189,7 +14189,7 @@ impl Compiler<'_> {
                             && outer.try_body_depth == 0
                             && outer.exception_region_depth == 0
                             && outer.depth == 0)
-                    && matches!(context.body.as_slice(), [Stmt::Expr(expression)]
+                    && matches!(context.body, [Stmt::Expr(expression)]
                         if matches!(expression.value.as_ref(), Expr::Call(call)
                             if matches!(call.func.as_ref(), Expr::Name(_))
                                 && call.arguments.is_empty())))
@@ -14200,72 +14200,72 @@ impl Compiler<'_> {
                 });
                 // Only the last copied finalizer can jump directly to the pending continue.
                 // Its remaining handler, manager, and preserved-value cleanup must be empty.
-                let continue_tail =
-                    continue_target.filter(|_| {
-                        index == 0
-                            && self
-                                .control
-                                .loops
-                                .contexts
-                                .last()
-                                .is_some_and(|loop_context| {
-                                    self.control.finally.active_finally_end_blocks
+                let continue_tail = continue_target.filter(|_| {
+                    index == 0
+                        && self
+                            .control
+                            .loops
+                            .contexts
+                            .last()
+                            .is_some_and(|loop_context| {
+                                self.control.finally.active_finally_end_blocks
                                     == loop_context.finally_end_depth
                                     // A still-pending outer POP_BLOCK becomes a NOP until
                                     // after jump threading, so it blocks this inversion.
                                     && context.exception_region_depth
                                         == loop_context.exception_region_depth
-                                })
-                            && self.control.exceptions.active_exception_handlers.len()
-                                == first_handler
-                            && next_with == with_depth
-                            && self
+                            })
+                        && self.control.exceptions.active_exception_handlers.len() == first_handler
+                        && next_with == with_depth
+                        && self
+                            .control
+                            .finally
+                            .preserved_return_value_contexts
+                            .is_empty()
+                        && self.control.finally.copied_return_finally_preserved_values == 0
+                        && (copied_finally_tail_can_inline_continue(context.body)
+                            || (self
                                 .control
-                                .finally
-                                .preserved_return_value_contexts
-                                .is_empty()
-                            && self.control.finally.copied_return_finally_preserved_values == 0
-                            && (copied_finally_tail_can_inline_continue(&context.body)
-                                || (self.control.loops.contexts.last().is_some_and(
+                                .loops
+                                .contexts
+                                .last()
+                                .is_some_and(|loop_context| {
+                                    copied_finally_has_closed_none_continue(
+                                        context.body,
+                                        self.unit.flags,
+                                        loop_context.iterator_cleanup,
+                                    )
+                                }))
+                            || (self.unit.flags
+                                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                == CO_COROUTINE
+                                && self.control.loops.contexts.last().is_some_and(
                                     |loop_context| {
-                                        copied_finally_has_closed_none_continue(
-                                            &context.body,
-                                            self.unit.flags,
+                                        loop_context.iterator_cleanup == IteratorCleanup::Sync
+                                    },
+                                )
+                                && copied_finally_has_guarded_linear_cleanup(
+                                    context.body,
+                                    captured_none_prefix
+                                        && self
+                                            .copied_finally_starts_local_none_cleanup(context.body),
+                                ))
+                            || (self.unit.flags
+                                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                == 0
+                                && self.control.loops.contexts.last().is_some_and(
+                                    |loop_context| {
+                                        matches!(
                                             loop_context.iterator_cleanup,
+                                            IteratorCleanup::None | IteratorCleanup::Sync
                                         )
                                     },
-                                ))
-                                || (self.unit.flags
-                                    & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                                    == CO_COROUTINE
-                                    && self.control.loops.contexts.last().is_some_and(
-                                        |loop_context| {
-                                            loop_context.iterator_cleanup == IteratorCleanup::Sync
-                                        },
-                                    )
-                                    && copied_finally_has_guarded_linear_cleanup(
-                                        &context.body,
-                                        captured_none_prefix
-                                            && self.copied_finally_starts_local_none_cleanup(
-                                                &context.body,
-                                            ),
-                                    ))
-                                || (self.unit.flags
-                                    & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                                    == 0
-                                    && self.control.loops.contexts.last().is_some_and(
-                                        |loop_context| {
-                                            matches!(
-                                                loop_context.iterator_cleanup,
-                                                IteratorCleanup::None | IteratorCleanup::Sync
-                                            )
-                                        },
-                                    )
-                                    && copied_finally_has_guarded_pass_cleanup(&context.body)))
-                            && matches!(context.body.last(), Some(Stmt::If(tail))
+                                )
+                                && copied_finally_has_guarded_pass_cleanup(context.body)))
+                        && matches!(context.body.last(), Some(Stmt::If(tail))
                             if tail.elif_else_clauses.is_empty()
                                 && !suite_contains_loop_break(&tail.body))
-                    });
+                });
                 // A loop-exit copy has left every protected finalizer inside it,
                 // including terminal finalizers without a registered exit context.
                 let outer_overriding_returns = context
@@ -14303,7 +14303,7 @@ impl Compiler<'_> {
                             loop_context.break_policy.returns()
                                 && loop_context.iterator_cleanup == IteratorCleanup::None
                         })
-                    && matches!(context.body.as_slice(), [Stmt::Try(cleanup)]
+                    && matches!(context.body, [Stmt::Try(cleanup)]
                     if !cleanup.is_star
                         && cleanup.orelse.is_empty()
                         && cleanup.finalbody.is_empty()
@@ -14341,7 +14341,7 @@ impl Compiler<'_> {
                                             prevent_try_exit_inlining,
                                             |compiler| {
                                                 compiler.compile_copied_finally_body(
-                                                    &context.body,
+                                                    context.body,
                                                     continue_tail,
                                                 )
                                             },
@@ -16924,7 +16924,7 @@ impl Compiler<'_> {
                             && context.handler_depth == 0
                             && context.exception_region_depth + 1
                                 == self.control.exceptions.active_exception_region_exclusions.len()
-                            && matches!(context.body.as_slice(), [Stmt::Try(cleanup)]
+                            && matches!(context.body, [Stmt::Try(cleanup)]
                                 if !cleanup.is_star
                                     && cleanup.handlers.is_empty()
                                     && cleanup.orelse.is_empty()
@@ -16959,8 +16959,8 @@ impl Compiler<'_> {
                             && context.handler_depth == 0
                             && context.exception_region_depth + 1
                                 == self.control.exceptions.active_exception_region_exclusions.len()
-                            && !suite_contains_yield(&context.body)
-                            && (self.suite_has_nonempty_borrow_entry(&context.body)
+                            && !suite_contains_yield(context.body)
+                            && (self.suite_has_nonempty_borrow_entry(context.body)
                                 // This surviving jump enters the retained setup NOP,
                                 // even when a later cleanup handler exits abruptly.
                                 || matches!(context.body.first(), Some(Stmt::Try(cleanup))
@@ -16975,7 +16975,7 @@ impl Compiler<'_> {
                                 || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                                     && !self.control.withs.active_with_exits[0].is_async
                                     && suite_has_live_conditional_break(&statement.body, true)
-                                    && matches!(context.body.as_slice(), [Stmt::Try(cleanup)]
+                                    && matches!(context.body, [Stmt::Try(cleanup)]
                                         if !cleanup.is_star
                                             && cleanup.orelse.is_empty()
                                             && cleanup.finalbody.is_empty()
@@ -18885,7 +18885,7 @@ impl Compiler<'_> {
                                     .active_exception_region_exclusions
                                     .len(),
                             )
-                        && matches!(context.body.as_slice(), [Stmt::Expr(cleanup)]
+                        && matches!(context.body, [Stmt::Expr(cleanup)]
                         if matches!(cleanup.value.as_ref(), Expr::Call(_))
                             && !expression_contains_inline_branch(&cleanup.value)
                             && !expression_suspends_current_scope(&cleanup.value))
@@ -21379,15 +21379,15 @@ impl Compiler<'_> {
                 .active_return_finally_contexts
                 .last()
                 .is_some_and(|context| {
-                    matches!(context.body.as_slice(), [Stmt::Expr(expression)]
+                    matches!(context.body, [Stmt::Expr(expression)]
                         if matches!(expression.value.as_ref(), Expr::Call(_))
                             && !expression_contains_inline_branch(&expression.value))
-                        || matches!(context.body.as_slice(), [Stmt::Expr(expression)]
+                        || matches!(context.body, [Stmt::Expr(expression)]
                             if matches!(expression.value.as_ref(), Expr::Await(awaited)
                                 if matches!(awaited.value.as_ref(), Expr::Call(_))
                                     && !expression_contains_inline_branch(&awaited.value)
                                     && !expression_suspends_current_scope(&awaited.value)))
-                        || matches!(context.body.as_slice(), [Stmt::If(conditional)]
+                        || matches!(context.body, [Stmt::If(conditional)]
                             if conditional.elif_else_clauses.is_empty()
                                 && matches!(conditional.test.as_ref(), Expr::Compare(comparison)
                                     if matches!(comparison.left.as_ref(), Expr::Name(_))
@@ -21399,7 +21399,7 @@ impl Compiler<'_> {
                                     if matches!(expression.value.as_ref(), Expr::Call(_))
                                         && !expression_contains_inline_branch(&expression.value)
                                         && !expression_suspends_current_scope(&expression.value)))
-                        || matches!(context.body.as_slice(), [Stmt::If(conditional)]
+                        || matches!(context.body, [Stmt::If(conditional)]
                             if conditional.elif_else_clauses.is_empty()
                                 && condition_has_linear_runtime_leaves(&conditional.test)
                                 && !expression_suspends_current_scope(&conditional.test)
@@ -21407,7 +21407,7 @@ impl Compiler<'_> {
                                     if matches!(expression.value.as_ref(), Expr::Call(_))
                                         && !expression_contains_inline_branch(&expression.value)
                                         && !expression_suspends_current_scope(&expression.value)))
-                        || matches!(context.body.as_slice(), [Stmt::For(loop_statement)]
+                        || matches!(context.body, [Stmt::For(loop_statement)]
                             if !loop_statement.is_async
                                 && matches!(loop_statement.target.as_ref(), Expr::Name(_))
                                 && matches!(loop_statement.iter.as_ref(), Expr::Name(_))
@@ -21442,7 +21442,7 @@ impl Compiler<'_> {
                     .active_return_finally_contexts
                     .last()
                     .is_some_and(|context| {
-                        copied_finally_has_terminal_named_recovery(&context.body)
+                        copied_finally_has_terminal_named_recovery(context.body)
                     });
             if !compound_match_pop_block
                 && ((terminal_handler_exit
@@ -25222,7 +25222,7 @@ impl Compiler<'_> {
                     && context.handler_depth == 0
                     && context.exception_region_depth == 0
                     && context.enclosing_finally_try_depth == 0
-                    && matches!(context.body.as_slice(), [Stmt::Expr(cleanup)]
+                    && matches!(context.body, [Stmt::Expr(cleanup)]
                         if simple_cleanup_call(&cleanup.value)
                             && matches!(cleanup.value.as_ref(), Expr::Call(call)
                                 if call.arguments.is_empty())));
@@ -27346,7 +27346,7 @@ impl Compiler<'_> {
         let return_context =
             (copy_finally_on_exit || copy_finally_on_loop_exit).then(|| FinallyExitContext {
                 source_range: statement.range,
-                body: statement.finalbody.to_vec(),
+                body: self.context.finally_body(statement),
                 enclosing_finally_try_depth: self.control.finally.active_finally_try_bodies,
                 pass_finally_depth: self.control.finally.active_pass_finally_locations.len(),
                 loop_depth: self.control.loops.contexts.len(),
