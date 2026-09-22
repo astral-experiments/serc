@@ -20071,6 +20071,7 @@ impl Compiler<'_> {
                         ))
                         || (condition_jump_target_count(&loop_statement.test, false) > 1
                             && condition_has_only_runtime_tests(&loop_statement.test)
+                            && !expression_contains_chained_comparison(&loop_statement.test)
                             && !suite_contains_loop_break(&loop_statement.body))));
             let loop_exit_location = statement
                 .orelse
