@@ -259,6 +259,10 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
                 "'x' * 0\nvalue = (1000 + 1, not 0)\n",
                 // Newly discarded folds retain annotation and class-footer locations.
                 "'x' * False\nvalue: int\n",
+                "False * 'x'\nvalue: int\n",
+                "b'x' * False\nvalue: int\n",
+                "(1,) * False\nvalue: int\n",
+                "'x' * True\nvalue: int\n",
                 "'x' * 0\nvalue: int\n",
                 "class C:\n    ('x' * False)\n",
                 "class C:\n    ('x' * 0)\n",

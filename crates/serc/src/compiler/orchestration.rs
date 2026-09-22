@@ -29,7 +29,7 @@ use crate::target::operands::{FunctionAttribute, ResumeLocation, UnaryIntrinsic}
 use crate::{CompileError, PythonVersion};
 
 use super::constant::{
-    DeferredConstantTarget, OutputState, fold_constant, fold_constant_for_version,
+    DeferredConstantTarget, OutputState, fold_constant, fold_constant_for_version, literal_constant,
 };
 use super::definition::clean_doc;
 use super::scope::{
@@ -528,6 +528,17 @@ impl<'source> Compiler<'source> {
                     || fold_constant_for_version(&expression.value, self.context.python_version)
                         .is_some())
             {
+                if self.context.python_version >= PythonVersion::Py314
+                    && literal_constant(&expression.value).is_none()
+                {
+                    // Late folds still admit their original operands before the
+                    // annotation setup absorbs the discarded expression's NOP.
+                    let first_fold = self.output.deferred_constants.len();
+                    self.record_folded_value(&expression.value)?;
+                    if self.context.python_version == PythonVersion::Py315 {
+                        self.record_discarded_fold_admissions(first_fold, None);
+                    }
+                }
                 &body[1..]
             } else {
                 body.as_slice()
@@ -815,7 +826,14 @@ impl<'source> Compiler<'source> {
         {
             if statement.elif_else_clauses.is_empty() {
                 // Without an exit jump, the footer inherits the final expression's location.
-                footer_location = self.source_location(expression.range);
+                let range = if self.context.python_version >= PythonVersion::Py314
+                    && matches!(expression.value.as_ref(), Expr::BinOp(_) | Expr::UnaryOp(_))
+                {
+                    expression.value.range()
+                } else {
+                    expression.range
+                };
+                footer_location = self.source_location(range);
             }
             // A discarded else leaves an exit jump to the originally unlocated footer.
             // Keep it unlocated until exit copying transfers the predecessor's location.
