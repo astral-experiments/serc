@@ -2040,6 +2040,8 @@ impl Compiler<'_> {
                     || index + 1 < body.len()
                     || (!final_expression_becomes_return
                         && (!matches!(self.unit.scope, Scope::Class { .. })
+                            // A nested class suite can still have an authored continuation.
+                            || inherited_statement_has_following
                             // Legacy CFG propagation needs the authored marker before
                             // case exits and loop backedges can inherit its location.
                             || self.context.python_version <= crate::PythonVersion::Py313))

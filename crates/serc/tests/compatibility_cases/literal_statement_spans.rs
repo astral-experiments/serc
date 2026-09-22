@@ -47,3 +47,17 @@ fn assert_scope_matches(header: &str, body: &str, filename: &str) {
     }
     common::assert_matches_cpython_marshal(&source, filename);
 }
+
+#[test]
+fn retains_nested_class_literal_before_outer_continuation() {
+    for wrapper in ["if active:", "if True:", "with manager:"] {
+        for marker in ["\"unused documentation\"", "17", "1 + 2"] {
+            for assignment in ["value: int = make_value()", "value = make_value()"] {
+                let source = format!(
+                    "class C:\n    {wrapper}\n        {assignment}\n        {marker}\n    after: int = 1\n"
+                );
+                common::assert_matches_cpython_marshal(&source, "class_nested_literal_marker.py");
+            }
+        }
+    }
+}
