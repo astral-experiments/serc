@@ -2989,9 +2989,10 @@ fn fold_complex_power(base: &Constant, exponent: &Constant) -> Option<Constant> 
             magnitude *= (-angle * exponent_imag).exp();
             phase += exponent_imag * absolute.ln();
         }
-        // sin/cos of infinity set EDOM. NaNs produced by arithmetic do not,
-        // and _Py_ADJUST_ERANGE2 only retains overflow for infinite outputs.
-        if phase.is_infinite() {
+        // macOS libm returns NaNs for sin/cos of infinity without setting errno;
+        // other supported platforms set EDOM, so CPython leaves the power unfolded.
+        // _Py_ADJUST_ERANGE2 only retains overflow for infinite outputs.
+        if phase.is_infinite() && !cfg!(target_os = "macos") {
             return None;
         }
         let real = magnitude * phase.cos();

@@ -36,6 +36,21 @@ fn matches_cpython_complex_power_limits() {
 }
 
 #[test]
+fn matches_cpython_complex_power_infinite_phase() {
+    // CPython follows the platform libm's errno behavior for sin/cos of infinity.
+    // Cover both infinite exponents and overflow in a phase from finite inputs.
+    for expression in [
+        "1j ** (-1e309)",
+        "2j ** (1e309j)",
+        "(-1+1j) ** 1e308",
+        "(-1+1j) ** -1e308",
+    ] {
+        let source = format!("def power():\n    return {expression}\n");
+        common::assert_matches_cpython_marshal(&source, "complex_power_infinite_phase.py");
+    }
+}
+
+#[test]
 fn executes_complex_powers_and_preserves_errors() {
     common::assert_executes(
         r"
