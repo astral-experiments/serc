@@ -1572,32 +1572,21 @@ impl Compiler<'_> {
         definition: &StmtFunctionDef,
         location: SourceLocation,
     ) -> Result<(), CompileError> {
-        let parameters = &definition.parameters;
-        let mut annotations = Vec::new();
-        for parameter in parameters.args.iter().chain(&parameters.posonlyargs) {
-            if let Some(annotation) = parameter.parameter.annotation.as_deref() {
-                annotations.push((parameter.name().as_str(), annotation));
-            }
+        let annotations = function_annotations(definition, self.context.python_version);
+        self.compile_function_annotation_entries(&annotations, location)?;
+        if !annotations.is_empty() {
+            self.assembler.set_location(location);
+            self.emit_build(BUILD_TUPLE, annotations.len() * 2)?;
         }
-        if let Some(parameter) = &parameters.vararg
-            && let Some(annotation) = parameter.annotation.as_deref()
-        {
-            annotations.push((parameter.name.as_str(), annotation));
-        }
-        for parameter in &parameters.kwonlyargs {
-            if let Some(annotation) = parameter.parameter.annotation.as_deref() {
-                annotations.push((parameter.name().as_str(), annotation));
-            }
-        }
-        if let Some(parameter) = &parameters.kwarg
-            && let Some(annotation) = parameter.annotation.as_deref()
-        {
-            annotations.push((parameter.name.as_str(), annotation));
-        }
-        if let Some(annotation) = definition.returns.as_deref() {
-            annotations.push(("return", annotation));
-        }
-        for (name, annotation) in &annotations {
+        Ok(())
+    }
+
+    fn compile_function_annotation_entries(
+        &mut self,
+        annotations: &[(&str, &Expr)],
+        location: SourceLocation,
+    ) -> Result<(), CompileError> {
+        for (name, annotation) in annotations {
             self.assembler.set_location(location);
             let mangled = self.mangled_name(name);
             self.context
@@ -1615,10 +1604,6 @@ impl Compiler<'_> {
                 self.compile_expression(annotation)?;
             }
         }
-        if !annotations.is_empty() {
-            self.assembler.set_location(location);
-            self.emit_build(BUILD_TUPLE, annotations.len() * 2)?;
-        }
         Ok(())
     }
 
@@ -1627,36 +1612,7 @@ impl Compiler<'_> {
         definition: &StmtFunctionDef,
         function_plan: &LoweringFunctionPlan,
     ) -> Result<Option<(CodeObject, Vec<NameId>)>, CompileError> {
-        let parameters = &definition.parameters;
-        let mut annotations = Vec::<(String, &Expr)>::new();
-        let positional_groups = if self.context.python_version == PythonVersion::Py315 {
-            [&parameters.posonlyargs, &parameters.args]
-        } else {
-            [&parameters.args, &parameters.posonlyargs]
-        };
-        for parameter in positional_groups.into_iter().flatten() {
-            if let Some(annotation) = parameter.parameter.annotation.as_deref() {
-                annotations.push((parameter.name().as_str().to_string(), annotation));
-            }
-        }
-        if let Some(parameter) = &parameters.vararg
-            && let Some(annotation) = parameter.annotation.as_deref()
-        {
-            annotations.push((parameter.name.as_str().to_string(), annotation));
-        }
-        for parameter in &parameters.kwonlyargs {
-            if let Some(annotation) = parameter.parameter.annotation.as_deref() {
-                annotations.push((parameter.name().as_str().to_string(), annotation));
-            }
-        }
-        if let Some(parameter) = &parameters.kwarg
-            && let Some(annotation) = parameter.annotation.as_deref()
-        {
-            annotations.push((parameter.name.as_str().to_string(), annotation));
-        }
-        if let Some(annotation) = definition.returns.as_deref() {
-            annotations.push(("return".to_string(), annotation));
-        }
+        let annotations = function_annotations(definition, self.context.python_version);
         if annotations.is_empty() {
             return Ok(None);
         }
@@ -1799,28 +1755,7 @@ impl Compiler<'_> {
             globals.extend(annotation_globals);
         }
 
-        let future_annotations = self.unit.flags & CO_FUTURE_ANNOTATIONS != 0;
-        for (name, annotation) in &annotations {
-            child.assembler.set_location(location);
-            let mangled = child.mangled_name(name);
-            child
-                .context
-                .record_identifier_constant_origin(name, &mangled);
-            child.load_string_constant(&mangled)?;
-            if future_annotations {
-                child
-                    .assembler
-                    .set_location(child.source_location(annotation.range()));
-                child
-                    .load_string_constant(&unparse_annotation(annotation, child.context.source))?;
-            } else if let Expr::Starred(starred) = annotation {
-                child.compile_expression(&starred.value)?;
-                child.assembler.set_location(location);
-                child.emit(UNPACK_SEQUENCE, 1, 0)?;
-            } else {
-                child.compile_expression(annotation)?;
-            }
-        }
+        child.compile_function_annotation_entries(&annotations, location)?;
         child.assembler.set_location(location);
         let count = to_u32(annotations.len(), "annotation count")?;
         child.emit(BUILD_MAP, count, 1 - i32::try_from(count).unwrap() * 2)?;
@@ -1919,7 +1854,7 @@ impl Compiler<'_> {
             let annotation_conditional = conditional_annotations
                 .front()
                 .is_some_and(|candidate| std::ptr::eq(*candidate, annotation));
-            if annotation_conditional {
+            let skip = if annotation_conditional {
                 conditional_annotations.pop_front();
                 child
                     .assembler
@@ -1932,31 +1867,10 @@ impl Compiler<'_> {
                 let skip = child.assembler.label();
                 child.emit_jump_forward(POP_JUMP_IF_FALSE, skip, -1)?;
                 child.emit(NOT_TAKEN, 0, 0)?;
-                child
-                    .assembler
-                    .set_location(child.source_location(annotation.annotation.range()));
-                child.compile_expression(&annotation.annotation)?;
-                child
-                    .assembler
-                    .set_location(child.source_location(annotation.range));
-                child.emit(COPY, 2, 1)?;
-                let raw = annotation
-                    .target
-                    .as_name_expr()
-                    .ok_or_else(|| unsupported("simple annotation target"))?
-                    .id
-                    .as_str();
-                let target = child.mangled_name(raw);
-                child
-                    .context
-                    .record_identifier_constant_origin(raw, &target);
-                child.load_string_constant(&target)?;
-                child.assembler.set_location(setup_location);
-                child.emit(STORE_SUBSCR, 0, -3)?;
-                child.assembler.mark(skip);
-                child.set_depth(1);
-                continue;
-            }
+                Some(skip)
+            } else {
+                None
+            };
             let Expr::Name(target) = annotation.target.as_ref() else {
                 return Err(unsupported("simple annotation target"));
             };
@@ -1975,6 +1889,10 @@ impl Compiler<'_> {
             child.load_string_constant(&mangled)?;
             child.assembler.set_location(setup_location);
             child.emit(STORE_SUBSCR, 0, -3)?;
+            if let Some(skip) = skip {
+                child.assembler.mark(skip);
+                child.set_depth(1);
+            }
         }
         debug_assert!(conditional_annotations.is_empty());
         child.assembler.set_location(setup_location);
@@ -2038,17 +1956,7 @@ impl Compiler<'_> {
         child.emit_function_prologue()?;
         let setup_location = self.source_location(body.first().map_or(first.range, Ranged::range));
         child.assembler.set_location(setup_location);
-        child.load_name("format")?;
-        child.add_constant(Constant::Int(2))?;
-        child.emit(LOAD_SMALL_INT, 2, 1)?;
-        child.emit_comparison(ComparisonOperation::GT, ComparisonMode::Value)?;
-        let supported = child.assembler.label();
-        child.emit_jump_forward(POP_JUMP_IF_FALSE, supported, -1)?;
-        child.emit(NOT_TAKEN, 0, 0)?;
-        child.emit_common_constant(CommonConstant::NOTIMPLEMENTEDERROR)?;
-        child.emit(RAISE_VARARGS, 1, -1)?;
-        child.assembler.mark(supported);
-        child.set_depth(0);
+        child.emit_annotation_format_guard("format")?;
         child.emit(BUILD_MAP, 0, 1)?;
 
         for (index, annotation) in annotations.iter().enumerate() {
@@ -2080,6 +1988,44 @@ impl Compiler<'_> {
         child.emit(RETURN_VALUE, 0, -1)?;
         child.finish_inner(false)
     }
+}
+
+/// Collect function annotations in the target's code-generation order.
+fn function_annotations(
+    definition: &StmtFunctionDef,
+    python_version: PythonVersion,
+) -> Vec<(&str, &Expr)> {
+    let parameters = &definition.parameters;
+    let mut annotations = Vec::new();
+    let positional_groups = if python_version == PythonVersion::Py315 {
+        [&parameters.posonlyargs, &parameters.args]
+    } else {
+        [&parameters.args, &parameters.posonlyargs]
+    };
+    for parameter in positional_groups.into_iter().flatten() {
+        if let Some(annotation) = parameter.parameter.annotation.as_deref() {
+            annotations.push((parameter.name().as_str(), annotation));
+        }
+    }
+    if let Some(parameter) = &parameters.vararg
+        && let Some(annotation) = parameter.annotation.as_deref()
+    {
+        annotations.push((parameter.name.as_str(), annotation));
+    }
+    for parameter in &parameters.kwonlyargs {
+        if let Some(annotation) = parameter.parameter.annotation.as_deref() {
+            annotations.push((parameter.name().as_str(), annotation));
+        }
+    }
+    if let Some(parameter) = &parameters.kwarg
+        && let Some(annotation) = parameter.annotation.as_deref()
+    {
+        annotations.push((parameter.name.as_str(), annotation));
+    }
+    if let Some(annotation) = definition.returns.as_deref() {
+        annotations.push(("return", annotation));
+    }
+    annotations
 }
 
 fn function_has_annotations(definition: &StmtFunctionDef) -> bool {
