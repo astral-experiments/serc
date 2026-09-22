@@ -1291,142 +1291,284 @@ fn assertion_borrow_block_ranges(items: &[Item]) -> Vec<Range<usize>> {
     ranges
 }
 
+#[derive(Clone, Copy)]
+struct Reference {
+    producer: u32,
+    local: u32,
+}
+
+impl Reference {
+    const NONE: u32 = u32::MAX;
+
+    fn new(producer: usize, local: Option<u32>) -> Self {
+        let producer = u32::try_from(producer)
+            .expect("assembler item offset should fit in a compact borrow reference");
+        debug_assert_ne!(
+            producer,
+            Self::NONE,
+            "assembler item offset should leave the compact borrow sentinel available"
+        );
+        debug_assert_ne!(local, Some(Self::NONE));
+        let local = local.unwrap_or(Self::NONE);
+        Self { producer, local }
+    }
+
+    fn from_candidate(producer: Option<usize>, local: Option<u32>) -> Self {
+        Self {
+            producer: producer.map_or(Self::NONE, |producer| {
+                u32::try_from(producer).expect("borrow candidate index should fit in u32")
+            }),
+            local: local.unwrap_or(Self::NONE),
+        }
+    }
+
+    const fn producer(self) -> Option<usize> {
+        if self.producer == Self::NONE {
+            None
+        } else {
+            Some(self.producer as usize)
+        }
+    }
+
+    const fn local(self) -> Option<u32> {
+        if self.local == Self::NONE {
+            None
+        } else {
+            Some(self.local)
+        }
+    }
+
+    const fn is_empty(self) -> bool {
+        self.producer == Self::NONE && self.local == Self::NONE
+    }
+}
+
+impl Default for Reference {
+    fn default() -> Self {
+        Self {
+            producer: Self::NONE,
+            local: Self::NONE,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ReferenceStack {
+    depth: usize,
+    references: SmallVec<[(usize, Reference); 16]>,
+}
+
+impl ReferenceStack {
+    fn reset(&mut self, depth: usize) {
+        self.depth = depth;
+        self.references.clear();
+    }
+
+    fn push(&mut self, reference: Reference) {
+        if !reference.is_empty() {
+            self.references.push((self.depth, reference));
+        }
+        self.depth += 1;
+    }
+
+    fn push_unknown(&mut self, count: usize) {
+        self.depth += count;
+    }
+
+    fn pop(&mut self) -> Reference {
+        if self.depth == 0 {
+            return Reference::default();
+        }
+        self.depth -= 1;
+        if self
+            .references
+            .last()
+            .is_some_and(|(slot, _)| *slot == self.depth)
+        {
+            self.references.pop().unwrap().1
+        } else {
+            Reference::default()
+        }
+    }
+
+    fn pop_many(&mut self, count: usize) {
+        self.depth = self.depth.saturating_sub(count);
+        while self
+            .references
+            .last()
+            .is_some_and(|(slot, _)| *slot >= self.depth)
+        {
+            self.references.pop();
+        }
+    }
+
+    fn get(&self, slot: usize) -> Reference {
+        self.references
+            .binary_search_by_key(&slot, |(candidate, _)| *candidate)
+            .ok()
+            .map_or_else(Reference::default, |index| self.references[index].1)
+    }
+
+    fn set(&mut self, slot: usize, reference: Reference) {
+        match self
+            .references
+            .binary_search_by_key(&slot, |(candidate, _)| *candidate)
+        {
+            Ok(index) if reference.is_empty() => {
+                self.references.remove(index);
+            }
+            Ok(index) => self.references[index].1 = reference,
+            Err(index) if !reference.is_empty() => {
+                self.references.insert(index, (slot, reference));
+            }
+            Err(_) => {}
+        }
+    }
+
+    fn copy_from_top_linear(&self, distance: u32) -> Reference {
+        let Some(slot) = self.depth.checked_sub(usize::try_from(distance).unwrap()) else {
+            return Reference::default();
+        };
+        self.references
+            .iter()
+            .rev()
+            .find_map(|(candidate, reference)| (*candidate == slot).then_some(*reference))
+            .unwrap_or_default()
+    }
+
+    fn copy_from_top(&self, distance: u32) -> Reference {
+        self.depth
+            .checked_sub(usize::try_from(distance).unwrap())
+            .map_or_else(Reference::default, |slot| self.get(slot))
+    }
+
+    fn swap_from_top(&mut self, distance: u32) {
+        let Some(slot) = self.depth.checked_sub(usize::try_from(distance).unwrap()) else {
+            return;
+        };
+        let top = self.depth.saturating_sub(1);
+        if slot >= self.depth {
+            return;
+        }
+        let left = self.get(slot);
+        let right = self.get(top);
+        self.set(slot, right);
+        self.set(top, left);
+    }
+}
+
+fn kill_local(unsafe_loads: &mut [bool], stack: &ReferenceStack, local: u32) {
+    for (_, reference) in &stack.references {
+        if reference.local() == Some(local)
+            && let Some(producer) = reference.producer()
+        {
+            unsafe_loads[producer] = true;
+        }
+    }
+}
+
+fn store_local(
+    unsafe_loads: &mut [bool],
+    stack: &ReferenceStack,
+    local: u32,
+    reference: Reference,
+) {
+    kill_local(unsafe_loads, stack, local);
+    if let Some(producer) = reference.producer() {
+        unsafe_loads[producer] = true;
+    }
+}
+
+/// Whether the following live instructions consume an otherwise owned local load.
+fn directly_consumes_owned_load(items: &[Item]) -> bool {
+    let mut following = items.iter().filter_map(|item| match *item {
+        Item::Instruction(instruction) if instruction.opcode != NOP => Some(instruction.opcode),
+        _ => None,
+    });
+    let first = following.next();
+    let second = following.next();
+    matches!(first, Some(RETURN_VALUE | STORE_DEREF | STORE_GLOBAL))
+        || matches!((first, second), (Some(POP_TOP), Some(next)) if next != POP_EXCEPT)
+        || matches!(
+            (first, second),
+            (
+                Some(LOAD_COMMON_CONSTANT | LOAD_CONST | LOAD_SMALL_INT),
+                Some(COMPARE_OP)
+            )
+        )
+}
+
+/// Applies the shared local-state transition for assertion-only success paths.
+pub(super) fn update_assertion_local_checks(
+    instruction: &mut Instruction,
+    local_count: usize,
+    unsafe_locals: &mut u64,
+    unsafe_high_locals: &mut [bool],
+) {
+    if !matches!(
+        instruction.opcode,
+        DELETE_FAST | LOAD_FAST_AND_CLEAR | STORE_FAST | LOAD_FAST_CHECK | LOAD_FAST
+    ) {
+        return;
+    }
+    if instruction.local_policy.is_post_analysis_closure_load()
+        || instruction.local_policy.is_known_initialized_load()
+    {
+        return;
+    }
+    let Operand::Value(argument) = instruction.operand() else {
+        return;
+    };
+    let Ok(local) = usize::try_from(argument) else {
+        return;
+    };
+    if local >= local_count {
+        return;
+    }
+
+    match instruction.opcode {
+        DELETE_FAST | LOAD_FAST_AND_CLEAR => {
+            if local < 64 {
+                *unsafe_locals |= 1 << local;
+            } else {
+                unsafe_high_locals[local - 64] = true;
+            }
+        }
+        STORE_FAST => {
+            let may_store_null = instruction.local_policy.may_store_null();
+            if local < 64 {
+                if may_store_null {
+                    *unsafe_locals |= 1 << local;
+                } else {
+                    *unsafe_locals &= !(1 << local);
+                }
+            } else {
+                unsafe_high_locals[local - 64] = may_store_null;
+            }
+        }
+        LOAD_FAST_CHECK | LOAD_FAST => {
+            let is_unsafe = if local < 64 {
+                let bit = 1 << local;
+                let is_unsafe = *unsafe_locals & bit != 0;
+                *unsafe_locals &= !bit;
+                is_unsafe
+            } else {
+                std::mem::replace(&mut unsafe_high_locals[local - 64], false)
+            };
+            if is_unsafe {
+                instruction.opcode = LOAD_FAST_CHECK;
+            } else {
+                instruction.opcode = LOAD_FAST;
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(in crate::assembler) fn optimize_linear_assertion_load_fast(
     python_version: crate::PythonVersion,
     items: &mut [Item],
 ) {
-    #[derive(Clone, Copy)]
-    struct Reference {
-        producer: u32,
-        local: u32,
-    }
-
-    impl Reference {
-        const NONE: u32 = u32::MAX;
-
-        fn new(producer: Option<usize>, local: Option<u32>) -> Self {
-            Self {
-                producer: producer.map_or(Self::NONE, |producer| {
-                    u32::try_from(producer).expect("borrow candidate index should fit in u32")
-                }),
-                local: local.unwrap_or(Self::NONE),
-            }
-        }
-
-        const fn producer(self) -> Option<usize> {
-            if self.producer == Self::NONE {
-                None
-            } else {
-                Some(self.producer as usize)
-            }
-        }
-
-        const fn local(self) -> Option<u32> {
-            if self.local == Self::NONE {
-                None
-            } else {
-                Some(self.local)
-            }
-        }
-
-        const fn is_empty(self) -> bool {
-            self.producer == Self::NONE && self.local == Self::NONE
-        }
-    }
-
-    impl Default for Reference {
-        fn default() -> Self {
-            Self {
-                producer: Self::NONE,
-                local: Self::NONE,
-            }
-        }
-    }
-
-    #[derive(Default)]
-    struct ReferenceStack {
-        depth: usize,
-        references: SmallVec<[(usize, Reference); 16]>,
-    }
-
-    impl ReferenceStack {
-        fn reset(&mut self, depth: usize) {
-            self.depth = depth;
-            self.references.clear();
-        }
-
-        fn push(&mut self, reference: Reference) {
-            if !reference.is_empty() {
-                self.references.push((self.depth, reference));
-            }
-            self.depth += 1;
-        }
-
-        fn push_unknown(&mut self, count: usize) {
-            self.depth += count;
-        }
-
-        fn pop(&mut self) -> Reference {
-            if self.depth == 0 {
-                return Reference::default();
-            }
-            self.depth -= 1;
-            if self
-                .references
-                .last()
-                .is_some_and(|(slot, _)| *slot == self.depth)
-            {
-                self.references.pop().unwrap().1
-            } else {
-                Reference::default()
-            }
-        }
-
-        fn pop_many(&mut self, count: usize) {
-            self.depth = self.depth.saturating_sub(count);
-            while self
-                .references
-                .last()
-                .is_some_and(|(slot, _)| *slot >= self.depth)
-            {
-                self.references.pop();
-            }
-        }
-
-        fn copy_from_top(&self, distance: u32) -> Reference {
-            let Some(slot) = self.depth.checked_sub(usize::try_from(distance).unwrap()) else {
-                return Reference::default();
-            };
-            self.references
-                .iter()
-                .rev()
-                .find_map(|(candidate, reference)| (*candidate == slot).then_some(*reference))
-                .unwrap_or_default()
-        }
-    }
-
-    fn kill_local(unsafe_loads: &mut [bool], stack: &ReferenceStack, local: u32) {
-        for (_, reference) in &stack.references {
-            if reference.local() == Some(local)
-                && let Some(producer) = reference.producer()
-            {
-                unsafe_loads[producer] = true;
-            }
-        }
-    }
-
-    fn store_local(
-        unsafe_loads: &mut [bool],
-        stack: &ReferenceStack,
-        local: u32,
-        reference: Reference,
-    ) {
-        kill_local(unsafe_loads, stack, local);
-        if let Some(producer) = reference.producer() {
-            unsafe_loads[producer] = true;
-        }
-    }
-
     let mut start = 0;
     let mut stack = ReferenceStack::default();
     let mut candidates = SmallVec::<[usize; 16]>::new();
@@ -1540,17 +1682,23 @@ pub(in crate::assembler) fn optimize_linear_assertion_load_fast(
                 DELETE_FAST => kill_local(&mut unsafe_loads, &stack, argument),
                 LOAD_FAST => {
                     debug_assert_eq!(candidates[candidate], offset);
-                    stack.push(Reference::new(Some(candidate), Some(argument)));
+                    stack.push(Reference::from_candidate(Some(candidate), Some(argument)));
                     candidate += 1;
                 }
                 LOAD_FAST_AND_CLEAR => {
                     kill_local(&mut unsafe_loads, &stack, argument);
-                    stack.push(Reference::new(None, Some(argument)));
+                    stack.push(Reference::from_candidate(None, Some(argument)));
                 }
                 LOAD_FAST_LOAD_FAST => {
                     debug_assert_eq!(candidates[candidate], offset);
-                    stack.push(Reference::new(Some(candidate), Some(argument >> 4)));
-                    stack.push(Reference::new(Some(candidate), Some(argument & 15)));
+                    stack.push(Reference::from_candidate(
+                        Some(candidate),
+                        Some(argument >> 4),
+                    ));
+                    stack.push(Reference::from_candidate(
+                        Some(candidate),
+                        Some(argument & 15),
+                    ));
                     candidate += 1;
                 }
                 STORE_FAST => {
@@ -1560,7 +1708,7 @@ pub(in crate::assembler) fn optimize_linear_assertion_load_fast(
                 STORE_FAST_LOAD_FAST => {
                     let reference = stack.pop();
                     store_local(&mut unsafe_loads, &stack, argument >> 4, reference);
-                    stack.push(Reference::new(None, Some(argument & 15)));
+                    stack.push(Reference::from_candidate(None, Some(argument & 15)));
                 }
                 STORE_FAST_STORE_FAST => {
                     let reference = stack.pop();
@@ -1568,7 +1716,7 @@ pub(in crate::assembler) fn optimize_linear_assertion_load_fast(
                     let reference = stack.pop();
                     store_local(&mut unsafe_loads, &stack, argument & 15, reference);
                 }
-                COPY => stack.push(stack.copy_from_top(argument)),
+                COPY => stack.push(stack.copy_from_top_linear(argument)),
                 SWAP => unreachable!("linear assertion borrowing requires a SWAP-free stream"),
                 opcode
                     if matches!(
@@ -1589,8 +1737,10 @@ pub(in crate::assembler) fn optimize_linear_assertion_load_fast(
                         opcode_stack_counts(python_version, instruction.opcode, argument);
                     if python_version == crate::PythonVersion::Py315 {
                         for _ in 0..pushed.saturating_sub(popped) {
-                            stack
-                                .push(Reference::new(candidates.binary_search(&offset).ok(), None));
+                            stack.push(Reference::from_candidate(
+                                candidates.binary_search(&offset).ok(),
+                                None,
+                            ));
                         }
                     } else {
                         for (producer, _) in items[range.clone()]
@@ -1599,7 +1749,7 @@ pub(in crate::assembler) fn optimize_linear_assertion_load_fast(
                             .filter(|(_, item)| matches!(item, Item::Instruction(_)))
                             .take(pushed.saturating_sub(popped))
                         {
-                            stack.push(Reference::new(
+                            stack.push(Reference::from_candidate(
                                 candidates.binary_search(&producer).ok(),
                                 None,
                             ));
@@ -1667,32 +1817,10 @@ pub(in crate::assembler) fn optimize_linear_assertion_load_fast(
             if instruction.local_policy.strict_owned_load() {
                 continue;
             }
-            if instruction.local_policy.force_owned_load() {
-                let mut following =
-                    items[start + offset + 1..end]
-                        .iter()
-                        .filter_map(|item| match *item {
-                            Item::Instruction(instruction) if instruction.opcode != NOP => {
-                                Some(instruction.opcode)
-                            }
-                            _ => None,
-                        });
-                let first = following.next();
-                let second = following.next();
-                let directly_consumed = matches!(
-                    first,
-                    Some(RETURN_VALUE | STORE_DEREF | STORE_GLOBAL)
-                ) || matches!((first, second), (Some(POP_TOP), Some(next)) if next != POP_EXCEPT)
-                    || matches!(
-                        (first, second),
-                        (
-                            Some(LOAD_COMMON_CONSTANT | LOAD_CONST | LOAD_SMALL_INT),
-                            Some(COMPARE_OP)
-                        )
-                    );
-                if !directly_consumed {
-                    continue;
-                }
+            if instruction.local_policy.force_owned_load()
+                && !directly_consumes_owned_load(&items[start + offset + 1..end])
+            {
+                continue;
             }
             let Item::Instruction(instruction) = &mut items[start + offset] else {
                 unreachable!();
@@ -2296,64 +2424,12 @@ impl OptimizationPipeline {
         for block in order {
             unsafe_high_locals.fill(true);
             for instruction in self.graph.instructions_mut(block) {
-                if !matches!(
-                    instruction.opcode,
-                    DELETE_FAST | LOAD_FAST_AND_CLEAR | STORE_FAST | LOAD_FAST_CHECK | LOAD_FAST
-                ) {
-                    continue;
-                }
-                if instruction.local_policy.is_post_analysis_closure_load()
-                    || instruction.local_policy.is_known_initialized_load()
-                {
-                    continue;
-                }
-                let Operand::Value(argument) = instruction.operand() else {
-                    continue;
-                };
-                let Ok(local) = usize::try_from(argument) else {
-                    continue;
-                };
-                if local >= local_count {
-                    continue;
-                }
-
-                match instruction.opcode {
-                    DELETE_FAST | LOAD_FAST_AND_CLEAR => {
-                        if local < 64 {
-                            unsafe_locals |= 1 << local;
-                        } else {
-                            unsafe_high_locals[local - 64] = true;
-                        }
-                    }
-                    STORE_FAST => {
-                        let may_store_null = instruction.local_policy.may_store_null();
-                        if local < 64 {
-                            if may_store_null {
-                                unsafe_locals |= 1 << local;
-                            } else {
-                                unsafe_locals &= !(1 << local);
-                            }
-                        } else {
-                            unsafe_high_locals[local - 64] = may_store_null;
-                        }
-                    }
-                    LOAD_FAST_CHECK | LOAD_FAST => {
-                        let is_unsafe = if local < 64 {
-                            let bit = 1 << local;
-                            let is_unsafe = unsafe_locals & bit != 0;
-                            unsafe_locals &= !bit;
-                            is_unsafe
-                        } else {
-                            std::mem::replace(&mut unsafe_high_locals[local - 64], false)
-                        };
-                        if is_unsafe {
-                            instruction.opcode = LOAD_FAST_CHECK;
-                        } else {
-                            instruction.opcode = LOAD_FAST;
-                        }
-                    }
-                    _ => {}
-                }
+                update_assertion_local_checks(
+                    instruction,
+                    local_count,
+                    &mut unsafe_locals,
+                    &mut unsafe_high_locals,
+                );
             }
         }
     }
@@ -3292,174 +3368,6 @@ impl OptimizationPipeline {
         assertion_side_exits: bool,
         retained_finally_entries: &FxHashMap<Label, Label>,
     ) {
-        #[derive(Clone, Copy)]
-        struct Reference {
-            producer: u32,
-            local: u32,
-        }
-
-        impl Reference {
-            const NONE: u32 = u32::MAX;
-
-            fn new(producer: usize, local: Option<u32>) -> Self {
-                let producer = u32::try_from(producer)
-                    .expect("assembler item offset should fit in a compact borrow reference");
-                debug_assert_ne!(
-                    producer,
-                    Self::NONE,
-                    "assembler item offset should leave the compact borrow sentinel available"
-                );
-                debug_assert_ne!(local, Some(Self::NONE));
-                let local = local.unwrap_or(Self::NONE);
-                Self { producer, local }
-            }
-
-            const fn producer(self) -> Option<usize> {
-                if self.producer == Self::NONE {
-                    None
-                } else {
-                    Some(self.producer as usize)
-                }
-            }
-
-            const fn local(self) -> Option<u32> {
-                if self.local == Self::NONE {
-                    None
-                } else {
-                    Some(self.local)
-                }
-            }
-
-            const fn is_empty(self) -> bool {
-                self.producer == Self::NONE && self.local == Self::NONE
-            }
-        }
-
-        impl Default for Reference {
-            fn default() -> Self {
-                Self {
-                    producer: Self::NONE,
-                    local: Self::NONE,
-                }
-            }
-        }
-
-        #[derive(Default)]
-        struct ReferenceStack {
-            depth: usize,
-            references: SmallVec<[(usize, Reference); 16]>,
-        }
-
-        impl ReferenceStack {
-            fn reset(&mut self, depth: usize) {
-                self.depth = depth;
-                self.references.clear();
-            }
-
-            fn push(&mut self, reference: Reference) {
-                if !reference.is_empty() {
-                    self.references.push((self.depth, reference));
-                }
-                self.depth += 1;
-            }
-
-            fn push_unknown(&mut self, count: usize) {
-                self.depth += count;
-            }
-
-            fn pop(&mut self) -> Reference {
-                if self.depth == 0 {
-                    return Reference::default();
-                }
-                self.depth -= 1;
-                if self
-                    .references
-                    .last()
-                    .is_some_and(|(slot, _)| *slot == self.depth)
-                {
-                    self.references.pop().unwrap().1
-                } else {
-                    Reference::default()
-                }
-            }
-
-            fn pop_many(&mut self, count: usize) {
-                self.depth = self.depth.saturating_sub(count);
-                while self
-                    .references
-                    .last()
-                    .is_some_and(|(slot, _)| *slot >= self.depth)
-                {
-                    self.references.pop();
-                }
-            }
-
-            fn get(&self, slot: usize) -> Reference {
-                self.references
-                    .binary_search_by_key(&slot, |(candidate, _)| *candidate)
-                    .ok()
-                    .map_or_else(Reference::default, |index| self.references[index].1)
-            }
-
-            fn set(&mut self, slot: usize, reference: Reference) {
-                match self
-                    .references
-                    .binary_search_by_key(&slot, |(candidate, _)| *candidate)
-                {
-                    Ok(index) if reference.is_empty() => {
-                        self.references.remove(index);
-                    }
-                    Ok(index) => self.references[index].1 = reference,
-                    Err(index) if !reference.is_empty() => {
-                        self.references.insert(index, (slot, reference));
-                    }
-                    Err(_) => {}
-                }
-            }
-
-            fn copy_from_top(&self, distance: u32) -> Reference {
-                self.depth
-                    .checked_sub(usize::try_from(distance).unwrap())
-                    .map_or_else(Reference::default, |slot| self.get(slot))
-            }
-
-            fn swap_from_top(&mut self, distance: u32) {
-                let Some(slot) = self.depth.checked_sub(usize::try_from(distance).unwrap()) else {
-                    return;
-                };
-                let top = self.depth.saturating_sub(1);
-                if slot >= self.depth {
-                    return;
-                }
-                let left = self.get(slot);
-                let right = self.get(top);
-                self.set(slot, right);
-                self.set(top, left);
-            }
-        }
-
-        fn kill_local(unsafe_loads: &mut [bool], stack: &ReferenceStack, local: u32) {
-            for (_, reference) in &stack.references {
-                if reference.local() == Some(local)
-                    && let Some(producer) = reference.producer()
-                {
-                    unsafe_loads[producer] = true;
-                }
-            }
-        }
-
-        fn store_local(
-            unsafe_loads: &mut [bool],
-            stack: &ReferenceStack,
-            local: u32,
-            reference: Reference,
-        ) {
-            kill_local(unsafe_loads, stack, local);
-            if let Some(producer) = reference.producer() {
-                unsafe_loads[producer] = true;
-            }
-        }
-
         let BorrowEntryLabels {
             unreachable: borrow_unreachable_labels,
             loop_exits: borrow_loop_exit_labels,
@@ -4366,31 +4274,10 @@ impl OptimizationPipeline {
                 if local_policy.strict_owned_load() {
                     continue;
                 }
-                if local_policy.force_owned_load() {
-                    let mut following = items[range.start + offset + 1..range.end]
-                        .iter()
-                        .filter_map(|item| match *item {
-                            Item::Instruction(instruction) if instruction.opcode != NOP => {
-                                Some(instruction.opcode)
-                            }
-                            _ => None,
-                        });
-                    let first = following.next();
-                    let second = following.next();
-                    let directly_consumed = matches!(
-                        first,
-                        Some(RETURN_VALUE | STORE_DEREF | STORE_GLOBAL)
-                    ) || matches!((first, second), (Some(POP_TOP), Some(next)) if next != POP_EXCEPT)
-                        || matches!(
-                            (first, second),
-                            (
-                                Some(LOAD_COMMON_CONSTANT | LOAD_CONST | LOAD_SMALL_INT),
-                                Some(COMPARE_OP)
-                            )
-                        );
-                    if !directly_consumed {
-                        continue;
-                    }
+                if local_policy.force_owned_load()
+                    && !directly_consumes_owned_load(&items[range.start + offset + 1..range.end])
+                {
+                    continue;
                 }
                 let Item::Instruction(instruction) = &mut items[range.start + offset] else {
                     unreachable!();
