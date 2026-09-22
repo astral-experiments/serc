@@ -72,3 +72,31 @@ would preserve the byte-for-byte contract.
 This draft adds diagnostic coverage only. It does not fix #576 or extend existing corpus
 results to arbitrary CPython builds. The separate nonfinite-folding issue [#559](https://github.com/astral-sh/serc/issues/559)
 and its macOS correction retain their own regressions.
+
+## Linux CI reference builds for 3.12 and 3.13
+
+The Linux CI jobs use these concrete Ubuntu 24.04 x86-64 artifacts for CPython 3.12.14
+and 3.13.15. The shared setup action verifies each archive's SHA256 before extraction,
+binds the relocated interpreter to its own shared library, and checks the exact release
+and magic number. The jobs run on `ubuntu-24.04`; the installer also checks the OS and
+architecture.
+
+| Release artifact | Archive SHA256 |
+| --- | --- |
+| [3.12.14-31661455385](https://github.com/actions/python-versions/releases/download/3.12.14-31661455385/python-3.12.14-linux-24.04-x64.tar.gz) | `5a03168292516f6dd6dcf630f4bf5369b108abd7c699a7e1db37f1e622257fff` |
+| [3.13.15-31064747964](https://github.com/actions/python-versions/releases/download/3.13.15-31064747964/python-3.13.15-linux-24.04-x64.tar.gz) | `4e544242f8a4ef647a6f511b67f9b00eefc9ef366644e3c40a27a6eff709ae2b` |
+
+Both artifacts report GCC 13.3.0. For `(1e309 - 1e309) / 1j` and
+`(1e309 - 1e309) / (2 + 1j)`, their imaginary NaN bits are `fff8000000000000`.
+The corresponding uv 0.12.17 Linux interpreters (python-build-standalone build 20260901,
+Clang 22.1.3) produce `7ff8000000000000`. This caused the strict marshal comparison in
+the Linux CI job
+to fail after the provisioning change. The complete nonfinite-division fixture was
+compared across all four target versions: the two pinned GCC artifacts match the
+existing local 3.12/3.13 oracles, while the uv 3.14/3.15 fixtures match their local oracles.
+
+The other CI interpreters still come from uv. Every original fixture and byte comparison
+remains enabled. These pins define the concrete Linux CI references only: they do not
+replace independently pinned full-corpus oracles, establish binary identity with those
+oracles, or extend their results to other builds. Selecting a general target-build policy
+remains open in #576.
