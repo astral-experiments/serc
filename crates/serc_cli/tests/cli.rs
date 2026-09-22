@@ -232,18 +232,34 @@ for template, expected in cases:
 }
 
 #[test]
-fn generic_signature_cells_preserve_class_lookup_before_deferred_annotations() {
+fn class_globals_preserve_type_parameter_wrapper_cells() {
     for version in [
         serc::PythonVersion::Py312,
         serc::PythonVersion::Py313,
         serc::PythonVersion::Py314,
         serc::PythonVersion::Py315,
     ] {
-        for source in [
+        let mut sources = vec![
             "T = 'global'\nclass C:\n global T\n locals()['T'] = 'class'\n def f[T](arg: T): return T\n",
             "T = lambda: 'global'\nclass C:\n global T\n locals()['T'] = lambda: 'class'\n def f[T](arg: T()): return T\n",
             "T = 'global'\nclass C:\n global T\n locals()['T'] = 'class'\n def f[T: T](arg: T): return T\n",
-        ] {
+            "T = int\nclass C:\n global T\n type Alias[T] = T\n",
+            "T = int\nclass C:\n global T\n def method[T: T](): pass\n",
+            "T = int\nclass C:\n global T\n class Inner[T: T]: pass\n",
+        ];
+        if version >= serc::PythonVersion::Py313 {
+            sources.extend([
+                "T = int\nclass C:\n global T\n type Alias[T] = (T, lambda: T)\n",
+                "T = int\nclass C:\n global T\n type Alias[T = T] = T\n",
+                "T = int\nclass C:\n global T\n def method[T = T](): pass\n",
+                "T = int\nclass C:\n global T\n class Inner[T = T]: pass\n",
+                "T = int\nclass C:\n global T\n type Alias[T] = (T, [T for _ in (0,)])\n",
+                "T = int\nclass C:\n global T\n type Alias[T] = [T for T in (0,)]\n",
+                "T = int\nclass C:\n global T\n def method[T: (T, [T for _ in (0,)])](): pass\n",
+                "T = int\nclass C:\n global T\n class Inner[T: (T, [T for _ in (0,)])]: pass\n",
+            ]);
+        }
+        for source in sources {
             let mut oracle = match version {
                 serc::PythonVersion::Py312 => common::python_312_command(),
                 serc::PythonVersion::Py313 => common::python_313_command(),
@@ -259,7 +275,7 @@ fn generic_signature_cells_preserve_class_lookup_before_deferred_annotations() {
                 ])
                 .output()
                 .unwrap();
-            assert!(native.status.success(), "{version}: {native:?}");
+            assert!(native.status.success(), "{version}: {source}: {native:?}");
             let compiled = serc::compile_with_options(
                 source,
                 "generic_signature.py",

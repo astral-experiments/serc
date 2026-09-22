@@ -25,7 +25,14 @@ fn type_parameter_scopes_honor_explicit_class_globals() {
 
 #[test]
 fn explicit_class_globals_do_not_hide_nested_type_parameter_captures() {
-    for expression in ["T", "lambda: T", "(T, lambda: T)"] {
+    for expression in [
+        "T",
+        "lambda: T",
+        "(T, lambda: T)",
+        "[T for _ in (0,)]",
+        "(T, [T for _ in (0,)])",
+        "[T for T in (0,)]",
+    ] {
         for definition in [
             format!("type Alias[T] = {expression}"),
             format!("def method[T: {expression}](): pass"),
@@ -36,7 +43,7 @@ fn explicit_class_globals_do_not_hide_nested_type_parameter_captures() {
         }
     }
     common::assert_executes(
-        "T = int\nclass C:\n global T\n type Alias[T] = (T, lambda: T)\nprint(C.Alias.__value__[0] is int)\nprint(C.Alias.__value__[1]() is C.Alias.__type_params__[0])\n",
-        "True\nTrue\n",
+        "T = int\nclass C:\n global T\n type Alias[T] = (T, lambda: T, [T for _ in (0,)])\nprint(C.Alias.__value__[0] is int)\nprint(C.Alias.__value__[1]() is C.Alias.__type_params__[0])\nprint(C.Alias.__value__[2] == [C.Alias.__type_params__[0]])\n",
+        "True\nTrue\nTrue\n",
     );
 }
