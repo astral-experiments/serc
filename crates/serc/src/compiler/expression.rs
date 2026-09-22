@@ -3569,9 +3569,6 @@ impl Compiler<'_> {
         &mut self,
         expression: &Expr,
     ) -> Result<SpecializedLowering, CompileError> {
-        if self.unit.annotation_classdict_index.is_some() {
-            return Ok(SpecializedLowering::NotApplicable);
-        }
         let Expr::Name(name) = expression else {
             return Ok(SpecializedLowering::NotApplicable);
         };
@@ -3580,6 +3577,11 @@ impl Compiler<'_> {
             return Ok(SpecializedLowering::NotApplicable);
         }
         let name_id = self.required_name_id(name.id.as_str());
+        if self.unit.annotation_classdict_index.is_some()
+            && (!self.unit.annotation_thunk || !self.class_scope_declares_global(name_id))
+        {
+            return Ok(SpecializedLowering::NotApplicable);
+        }
         if self.symbols.active_temporaries.contains(name_id) {
             return Ok(SpecializedLowering::NotApplicable);
         }

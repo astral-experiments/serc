@@ -225,7 +225,10 @@ impl Compiler<'_> {
                 1,
             );
         }
-        let annotation_classdict_index = self.unit.annotation_classdict_index;
+        let annotation_classdict_index = self
+            .unit
+            .annotation_classdict_index
+            .filter(|_| !self.unit.annotation_thunk || !self.class_scope_declares_global(name_id));
         match &self.unit.scope {
             Scope::Module => {
                 let index = self.name_index_with_id(name, name_id)?;

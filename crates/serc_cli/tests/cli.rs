@@ -240,6 +240,14 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
             r#"value = (not ("\ud800",)) + 1"#,
             r#"value = (not (),) + ("\ud800",)"#,
             r#"value = not (runtime(), "\ud800")"#,
+            // Deferred class-visible annotations preserve explicit global lookup.
+            "x = 'global'\nclass C:\n global x\n locals()['x'] = 'class'\n def f(arg: x) -> x: pass\n",
+            "x = 'global'\nclass C:\n x = 'class'\n def f(arg: x) -> x: pass\n",
+            "x = 'global'\ndef outer():\n x = 'outer'\n class C:\n  global x\n  locals()['x'] = 'class'\n  def f(arg: x): pass\n return C\n",
+            "T = 'global'\nclass C:\n global T\n locals()['T'] = 'class'\n def f[T](arg: T): pass\n",
+            "T = 'global'\nclass C:\n global T\n locals()['T'] = 'class'\n def f[T](arg: T): return T\n",
+            "def x(): return 'global'\nclass C:\n global x\n locals()['x'] = lambda: 'class'\n def f(arg: x()): pass\n",
+            "x = 'global'\nclass C:\n global x\n locals()['x'] = 'class'\n field: x\n",
             // Preserve numeric allocation origins through the same recursive path.
             r#"value = (((1e309 - 1e309), "\ud800"),) * 2"#,
             r"value = (-(1e309 - 1e309), +(1e309 - 1e309))",

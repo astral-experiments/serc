@@ -717,6 +717,7 @@ mod named_elif_cleanup_locations;
 
 mod class_and_percent_constant_origins;
 mod class_annotation_captures;
+mod class_annotation_globals;
 mod shared_exit_target_owners;
 mod shared_handler_cleanup_join_locations;
 
