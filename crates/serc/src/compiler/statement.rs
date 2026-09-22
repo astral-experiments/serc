@@ -19911,8 +19911,7 @@ impl Compiler<'_> {
                     || (body_noop_location.is_some()
                         && self.context.python_version >= crate::PythonVersion::Py314
                         && (self.control.finally.active_overriding_finally_returns > 0
-                            || (pass_only_handlers
-                                && !self.control.exceptions.prevent_try_exit_inlining))))
+                            || !self.control.exceptions.prevent_try_exit_inlining)))
             {
                 let start = self.assembler.label();
                 self.assembler.mark(start);
@@ -20977,7 +20976,6 @@ impl Compiler<'_> {
                 if body_noop_location.is_some()
                     && statement.orelse.is_empty()
                     && statement.finalbody.is_empty()
-                    && pass_only_handlers
                     && exception_policy == ExceptionPolicy::EXCLUDE_ALWAYS
                     && self.control.finally.active_overriding_finally_returns == 0
                 {

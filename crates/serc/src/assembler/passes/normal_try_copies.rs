@@ -832,7 +832,122 @@ impl OptimizationPipeline {
         labels
     }
 
-    /// Restores the owner of an empty try's unchanged jump into a large live prefix.
+    /// Recognizes an original unlocated handler cleanup before a live continuation.
+    fn empty_try_cleanup_successor(&self, block: BasicBlockId) -> Option<BasicBlockId> {
+        use crate::target::opcodes::{
+            DELETE_FAST, DELETE_NAME, LOAD_CONST, STORE_FAST, STORE_NAME,
+        };
+
+        let graph = &self.graph;
+        let items = graph[block].items();
+        let head_len = items
+            .iter()
+            .take_while(|item| matches!(item, Item::Label(_)))
+            .count();
+        let intact_label = |label: &Label| {
+            !self.original_nop_targets.contains(label)
+                && !self.folded_original_predecessor_targets.contains(label)
+                && !self.folded_condition_exit_targets.contains(label)
+                && !self.borrow_block_aliases.contains(label)
+                && !self
+                    .exception_owner_provenance
+                    .omitted_nop_counts
+                    .contains_key(label)
+                && !self
+                    .exception_owner_provenance
+                    .omitted_nop_locations
+                    .contains_key(label)
+                && !self
+                    .exception_owner_provenance
+                    .setups
+                    .iter()
+                    .any(|(entry, _)| entry == label)
+                && !self
+                    .exception_regions
+                    .iter()
+                    .any(|region| region.target == *label)
+        };
+        if !items[..head_len].iter().any(|item| {
+            matches!(item, Item::Label(label)
+            if self.exception_owner_provenance.source_boundaries.contains(label)
+                && self.exception_owner_provenance.block_boundaries.contains(label))
+        }) || items[..head_len].iter().any(|item| {
+            matches!(item, Item::Label(label)
+                if !intact_label(label))
+        }) {
+            return None;
+        }
+        let records = items[head_len..]
+            .iter()
+            .map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction),
+                Item::Label(_) => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let pop = match records.as_slice() {
+            [pop] if pop.opcode == POP_EXCEPT => *pop,
+            [pop, load, store, delete]
+                if pop.opcode == POP_EXCEPT
+                    && load.opcode == LOAD_CONST
+                    && ((store.opcode == STORE_FAST && delete.opcode == DELETE_FAST)
+                        || (store.opcode == STORE_NAME && delete.opcode == DELETE_NAME))
+                    && store.operand() == delete.operand()
+                    && store.depth_after() == pop.depth_after()
+                    && delete.depth_after() == pop.depth_after() =>
+            {
+                *pop
+            }
+            _ => return None,
+        };
+        if records.iter().any(|instruction| {
+            instruction.location != SourceLocation::NONE
+                || !matches!(instruction.operand(), Operand::Value(_))
+                || instruction.pre_fold_extra_instructions() != 0
+                || instruction.local_policy.hidden_exception_owner_slots() != 0
+                || instruction.exception_policy() != super::super::ExceptionPolicy::default()
+                || instruction.fusion_policy.is_converted_pop_block()
+                || instruction.fusion_policy.is_authored_break()
+        }) {
+            return None;
+        }
+        let position = graph
+            .order()
+            .iter()
+            .position(|candidate| *candidate == block)?;
+        let tail = *graph.order().get(position + 1)?;
+        let (Item::Instruction(jump), labels) = graph[tail].items().split_last()? else {
+            return None;
+        };
+        let mut original_policy = super::super::ir::JumpPolicy::default();
+        original_policy.prevent_threading_target();
+        if labels.is_empty()
+            || labels.iter().any(|item| !matches!(item, Item::Label(_)))
+            || jump.opcode != JUMP_FORWARD
+            || jump.location != SourceLocation::NONE
+            || jump.depth_after() != pop.depth_after()
+            || jump.pre_fold_extra_instructions() != 0
+            || jump.local_policy.hidden_exception_owner_slots() != 0
+            || jump.exception_policy() != super::super::ExceptionPolicy::default()
+            || !jump.no_location_policy.allows_block_inlining()
+            || jump.jump_policy != original_policy
+            || labels.iter().any(|item| matches!(item, Item::Label(label)
+                if !intact_label(label)
+                    || self.exception_owner_provenance.source_boundaries.contains(label)
+                    || self.exception_owner_provenance.block_boundaries.contains(label)
+                    || self.preserved_block_boundaries.contains(label)
+                    || graph.iter_items().any(|item| matches!(item, Item::Instruction(instruction)
+                        if matches!(instruction.operand(), Operand::Forward(target) | Operand::Backward(target)
+                            if target == *label)))))
+        {
+            return None;
+        }
+        let Operand::Forward(target) = jump.operand() else {
+            return None;
+        };
+        graph.label_block(target)
+    }
+
+    /// Restores original empty-try owners before a live prefix or its cleanup copy.
     fn restore_uncopied_empty_try_jump_owners(&mut self) {
         let graph = &self.graph;
         if !self
@@ -910,9 +1025,15 @@ impl OptimizationPipeline {
             {
                 continue;
             }
-            let Some(target_block) = graph.label_block(target) else {
+            let Some(mut target_block) = graph.label_block(target) else {
                 continue;
             };
+            // A wholly unlocated handler cleanup is copied before its final jump
+            // reaches the same large runtime prefix. Preserve the original source
+            // owners until the ordinary copier transports the cleanup's owners.
+            if let Some(continuation) = self.empty_try_cleanup_successor(target_block) {
+                target_block = continuation;
+            }
             let mut prefix = 0;
             for item in graph[target_block].items() {
                 match item {

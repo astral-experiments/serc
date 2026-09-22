@@ -57,3 +57,19 @@ fn empty_try_nop_owner_nonempty_control() {
 "#;
     common::assert_matches_cpython_marshal(source, "empty_try_nop_nonempty_control.py");
 }
+
+#[test]
+fn empty_try_cleanup_copies_retain_outer_handler_owners() {
+    for middle in [" as middle", ""] {
+        for inner in [" as inner", ""] {
+            for work in ["pass", "work()"] {
+                let body = format!(
+                    "try:\n    pass\nexcept Error as outer:\n    try:\n        {work}\n    except Error{middle}:\n        try:\n            pass\n        except Error{inner}:\n            pass\n    report(outer)\n"
+                );
+                for source in [body.clone(), format!("class C:\n{}", common::indent(&body))] {
+                    common::assert_matches_cpython_marshal(&source, "empty_try_cleanup_owner.py");
+                }
+            }
+        }
+    }
+}
