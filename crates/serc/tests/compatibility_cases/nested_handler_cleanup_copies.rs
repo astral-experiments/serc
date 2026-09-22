@@ -194,6 +194,18 @@ fn matches_cpython_shared_unnamed_handler_local_return_copies() {
 }
 
 #[test]
+fn matches_cpython_nested_handler_shared_global_return_copies() {
+    for returned in ["value", "other"] {
+        for prefix in ["", "                    notify()\n"] {
+            let source = format!(
+                "def f():\n    global value\n    if value is None:\n        try:\n            value = first()\n        except Error:\n            try:\n                with manager():\n{prefix}                    value = second()\n            except Error:\n                value = third()\n                done(value)\n    return {returned}\n"
+            );
+            common::assert_matches_cpython_marshal(&source, "nested_handler_global_return.py");
+        }
+    }
+}
+
+#[test]
 fn matches_cpython_nested_manager_terminating_handler_return_copies() {
     for (filename, source) in [
         (

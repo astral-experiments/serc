@@ -471,7 +471,11 @@ fn unnamed_cleanup_has_short_return(
     let [Item::Instruction(value), Item::Instruction(exit)] = &returned[entry_len..] else {
         return false;
     };
-    matches!(value.opcode, LOAD_FAST | LOAD_CONST)
+    // A bare global load occupies one original slot. The low-bit NULL form
+    // also represents PUSH_NULL and cannot use this two-record certificate.
+    (matches!(value.opcode, LOAD_FAST | LOAD_CONST)
+        || (value.opcode == LOAD_GLOBAL
+            && matches!(value.operand(), Operand::Value(argument) if argument & 1 == 0)))
         && exit.opcode == RETURN_VALUE
         && [value, exit].iter().all(|instruction| {
             instruction.location.line >= 0
