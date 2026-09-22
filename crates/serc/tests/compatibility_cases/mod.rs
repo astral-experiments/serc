@@ -264,6 +264,7 @@ mod protected_none_condition_owner_compatibility;
 mod protected_pass_continuations;
 mod protected_tail_boolean_backedges;
 mod protected_while_none_condition_owner_compatibility;
+mod raising_finally_return;
 mod redundant_copy_pop_pairs;
 mod removed_nop_jump_slots;
 mod return_debug_compatibility;
