@@ -213,7 +213,7 @@ mod tests {
         };
         assert_eq!(message, "alternative patterns bind different names");
         assert_eq!(error.range(), Some(*range));
-        assert_eq!(&source[*range], "[right]");
+        assert_eq!(&source[*range], "[left] | [right]");
         assert!(error.source().is_none());
         assert_eq!(
             error.to_string(),

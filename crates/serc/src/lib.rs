@@ -303,7 +303,7 @@ fn compile_normalized(
     if let Some(error) = parsed.unsupported_syntax_errors().first() {
         return Err(CompileError::invalid_syntax(error.to_string(), error.range));
     }
-    Compiler::validate_lazy_imports(parsed.suite(), options.python_version)?;
+    compiler::syntax::validate(source, parsed.suite(), options.python_version)?;
     let code = Compiler::module_with_python_version(
         filename,
         source,
