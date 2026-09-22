@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
+use ruff_python_ast::token::TokenKind;
 use ruff_python_ast::visitor::{Visitor, walk_expr};
 use ruff_python_ast::{
     BoolOp, CmpOp, ConversionFlag, Expr, ExprBinOp, ExprContext, ExprIf, FStringPart, Identifier,
@@ -2571,10 +2572,10 @@ impl Compiler<'_> {
             && interpolation.conversion == ConversionFlag::None
             && let Expr::Compare(comparison) = interpolation.expression.as_ref()
             && comparison.ops.contains(&CmpOp::NotEq)
-            && let Some(offset) = self.context.source[start..expression_end].find("!=")
+            && let Some(operator) = self.interpolation_top_level_not_equal(interpolation)
         {
             return strip_expression_comments(
-                self.context.source[start..start + offset].trim_end(),
+                self.context.source[start..usize::from(operator)].trim_end(),
             );
         }
         if interpolation.debug_text.is_some() {
@@ -2595,6 +2596,36 @@ impl Compiler<'_> {
         strip_expression_comments(&self.context.source[start..end])
             .trim_end()
             .to_string()
+    }
+
+    /// Find the native expression-text truncation point without matching grouped operators or
+    /// tokens inside a nested interpolated string.
+    fn interpolation_top_level_not_equal(
+        &self,
+        interpolation: &ruff_python_ast::InterpolatedElement,
+    ) -> Option<ruff_text_size::TextSize> {
+        let range = ruff_text_size::TextRange::new(
+            interpolation.range.start() + ruff_text_size::TextSize::new(1),
+            interpolation.expression.range().end(),
+        );
+        let mut depth = 0_u32;
+        for token in self.context.tokens.in_range(range) {
+            match token.kind() {
+                TokenKind::Lpar
+                | TokenKind::Lsqb
+                | TokenKind::Lbrace
+                | TokenKind::FStringStart
+                | TokenKind::TStringStart => depth += 1,
+                TokenKind::Rpar
+                | TokenKind::Rsqb
+                | TokenKind::Rbrace
+                | TokenKind::FStringEnd
+                | TokenKind::TStringEnd => depth -= 1,
+                TokenKind::NotEqual if depth == 0 => return Some(token.start()),
+                _ => {}
+            }
+        }
+        None
     }
 
     fn compile_interpolated_elements(
