@@ -3,7 +3,7 @@
 The [compatibility guide](../docs/compatibility.md) owns comparison commands, outcome baselines,
 and limitations. The required Ruff gate uses `vendor/ruff`; this directory pins the larger,
 opt-in mypy_primer diagnostic corpus.
-The [latest measurement summary](results/compatibility-2026-09-22-public-3a09916.json) records
+The [latest measurement summary](results/compatibility-2026-09-22-public-623b068.json) records
 the compiler and corpus identities, complete outcome counts, and evidence hashes.
 
 ## mypy_primer snapshot
