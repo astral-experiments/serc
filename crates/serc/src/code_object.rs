@@ -1,116 +1,10 @@
-use std::error::Error;
-use std::fmt;
 use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::CompileError;
 use crate::target::code_flags::{CO_VARARGS, CO_VARKEYWORDS};
 use crate::target::local_kinds::CO_FAST_LOCAL;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CodeObjectValidationError {
-    qualified_name: String,
-    invariant: CodeObjectInvariant,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum CodeObjectInvariant {
-    SignedFieldRange {
-        field: CodeObjectField,
-        value: u32,
-    },
-    BytecodeSize {
-        bytes: usize,
-    },
-    BytecodeAlignment {
-        bytes: usize,
-    },
-    LocalsShape {
-        names: usize,
-        kinds: usize,
-    },
-    PositionalOnlyArguments {
-        positional_only: u32,
-        positional: u32,
-    },
-    ParameterSlots {
-        parameters: u64,
-        local_slots: usize,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CodeObjectField {
-    ArgumentCount,
-    PositionalOnlyArgumentCount,
-    KeywordOnlyArgumentCount,
-    StackSize,
-    Flags,
-}
-
-impl CodeObjectField {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::ArgumentCount => "argument count",
-            Self::PositionalOnlyArgumentCount => "positional-only argument count",
-            Self::KeywordOnlyArgumentCount => "keyword-only argument count",
-            Self::StackSize => "stack size",
-            Self::Flags => "flags",
-        }
-    }
-}
-
-impl CodeObjectValidationError {
-    fn new(code: &CodeObject, invariant: CodeObjectInvariant) -> Self {
-        Self {
-            qualified_name: code.qualified_name.clone(),
-            invariant,
-        }
-    }
-}
-
-impl fmt::Display for CodeObjectValidationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "invalid code object `{}`: ", self.qualified_name)?;
-        match self.invariant {
-            CodeObjectInvariant::SignedFieldRange { field, value } => write!(
-                formatter,
-                "{} {value} exceeds CPython's signed 32-bit limit",
-                field.name()
-            ),
-            CodeObjectInvariant::BytecodeSize { bytes } => write!(
-                formatter,
-                "bytecode length {bytes} exceeds CPython's signed 32-bit limit"
-            ),
-            CodeObjectInvariant::BytecodeAlignment { bytes } => {
-                write!(
-                    formatter,
-                    "bytecode length {bytes} is not divisible by CPython's two-byte code unit"
-                )
-            }
-            CodeObjectInvariant::LocalsShape { names, kinds } => write!(
-                formatter,
-                "locals metadata has {names} names but {kinds} kind entries"
-            ),
-            CodeObjectInvariant::PositionalOnlyArguments {
-                positional_only,
-                positional,
-            } => write!(
-                formatter,
-                "declares {positional_only} positional-only arguments but only {positional} total positional arguments"
-            ),
-            CodeObjectInvariant::ParameterSlots {
-                parameters,
-                local_slots,
-            } => write!(
-                formatter,
-                "declares {parameters} parameter slots but only {local_slots} local-variable slots"
-            ),
-        }
-    }
-}
-
-impl Error for CodeObjectValidationError {}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum LocalsIdentity {
@@ -493,48 +387,45 @@ pub(crate) struct CodeObject {
 
 impl CodeObject {
     /// Checks the model invariants required before a code object can escape the compiler.
-    pub(crate) fn validate(&self) -> Result<(), CodeObjectValidationError> {
+    pub(crate) fn validate(&self) -> Result<(), CompileError> {
+        let invalid = |message| {
+            CompileError::Internal(format!(
+                "invalid code object `{}`: {message}",
+                self.qualified_name
+            ))
+        };
         // Marshal writes these as 32-bit words that CPython reads into signed integer fields.
         for (field, value) in [
-            (CodeObjectField::ArgumentCount, self.arg_count),
+            ("argument count", self.arg_count),
             (
-                CodeObjectField::PositionalOnlyArgumentCount,
+                "positional-only argument count",
                 self.positional_only_arg_count,
             ),
-            (
-                CodeObjectField::KeywordOnlyArgumentCount,
-                self.keyword_only_arg_count,
-            ),
-            (CodeObjectField::StackSize, self.stack_size),
-            (CodeObjectField::Flags, self.flags),
+            ("keyword-only argument count", self.keyword_only_arg_count),
+            ("stack size", self.stack_size),
+            ("flags", self.flags),
         ] {
             if value > i32::MAX as u32 {
-                return Err(CodeObjectValidationError::new(
-                    self,
-                    CodeObjectInvariant::SignedFieldRange { field, value },
-                ));
+                return Err(invalid(format!(
+                    "{field} {value} exceeds CPython's signed 32-bit limit"
+                )));
             }
         }
-        if let Some(invariant) = bytecode_length_invariant(self.bytecode.len()) {
-            return Err(CodeObjectValidationError::new(self, invariant));
+        if let Some(message) = bytecode_length_error(self.bytecode.len()) {
+            return Err(invalid(message));
         }
         if self.locals.len() != self.local_kinds.len() {
-            return Err(CodeObjectValidationError::new(
-                self,
-                CodeObjectInvariant::LocalsShape {
-                    names: self.locals.len(),
-                    kinds: self.local_kinds.len(),
-                },
-            ));
+            return Err(invalid(format!(
+                "locals metadata has {} names but {} kind entries",
+                self.locals.len(),
+                self.local_kinds.len()
+            )));
         }
         if self.positional_only_arg_count > self.arg_count {
-            return Err(CodeObjectValidationError::new(
-                self,
-                CodeObjectInvariant::PositionalOnlyArguments {
-                    positional_only: self.positional_only_arg_count,
-                    positional: self.arg_count,
-                },
-            ));
+            return Err(invalid(format!(
+                "declares {} positional-only arguments but only {} total positional arguments",
+                self.positional_only_arg_count, self.arg_count
+            )));
         }
         let parameter_count = u64::from(self.arg_count)
             + u64::from(self.keyword_only_arg_count)
@@ -551,23 +442,23 @@ impl CodeObject {
             .ok()
             .is_none_or(|count| count > local_slots)
         {
-            return Err(CodeObjectValidationError::new(
-                self,
-                CodeObjectInvariant::ParameterSlots {
-                    parameters: parameter_count,
-                    local_slots,
-                },
-            ));
+            return Err(invalid(format!(
+                "declares {parameter_count} parameter slots but only {local_slots} local-variable slots"
+            )));
         }
         Ok(())
     }
 }
 
-fn bytecode_length_invariant(bytes: usize) -> Option<CodeObjectInvariant> {
+fn bytecode_length_error(bytes: usize) -> Option<String> {
     if bytes > i32::MAX as usize {
-        Some(CodeObjectInvariant::BytecodeSize { bytes })
+        Some(format!(
+            "bytecode length {bytes} exceeds CPython's signed 32-bit limit"
+        ))
     } else if !bytes.is_multiple_of(2) {
-        Some(CodeObjectInvariant::BytecodeAlignment { bytes })
+        Some(format!(
+            "bytecode length {bytes} is not divisible by CPython's two-byte code unit"
+        ))
     } else {
         None
     }
@@ -576,8 +467,8 @@ fn bytecode_length_invariant(bytes: usize) -> Option<CodeObjectInvariant> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodeObject, CodeObjectField, CodeObjectInvariant, CodeObjectValidationError, Constant,
-        LocalsIdentity, MarshalMetadataIds, MarshalProvenance, bytecode_length_invariant,
+        CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance,
+        bytecode_length_error,
     };
     use crate::CompileError;
     use crate::target::local_kinds::CO_FAST_FREE;
@@ -641,16 +532,8 @@ mod tests {
         let mut code = code_object();
         code.bytecode.push(0);
 
-        let error = code.validate().unwrap_err();
         assert_eq!(
-            error,
-            CodeObjectValidationError {
-                qualified_name: "<module>".to_string(),
-                invariant: CodeObjectInvariant::BytecodeAlignment { bytes: 1 },
-            }
-        );
-        assert_eq!(
-            CompileError::from(error),
+            code.validate().unwrap_err(),
             CompileError::Internal(
                 "invalid code object `<module>`: bytecode length 1 is not divisible by CPython's two-byte code unit"
                     .to_string()
@@ -662,8 +545,10 @@ mod tests {
     fn rejects_bytecode_larger_than_cpython_can_index() {
         let bytes = i32::MAX as usize + 1;
         assert_eq!(
-            bytecode_length_invariant(bytes),
-            Some(CodeObjectInvariant::BytecodeSize { bytes })
+            bytecode_length_error(bytes),
+            Some(format!(
+                "bytecode length {bytes} exceeds CPython's signed 32-bit limit"
+            ))
         );
     }
 
@@ -671,27 +556,27 @@ mod tests {
     fn rejects_code_fields_that_marshal_as_negative() {
         let value = i32::MAX as u32 + 1;
         let invalid = [
-            (CodeObjectField::ArgumentCount, {
+            ("argument count", {
                 let mut code = code_object();
                 code.arg_count = value;
                 code
             }),
-            (CodeObjectField::PositionalOnlyArgumentCount, {
+            ("positional-only argument count", {
                 let mut code = code_object();
                 code.positional_only_arg_count = value;
                 code
             }),
-            (CodeObjectField::KeywordOnlyArgumentCount, {
+            ("keyword-only argument count", {
                 let mut code = code_object();
                 code.keyword_only_arg_count = value;
                 code
             }),
-            (CodeObjectField::StackSize, {
+            ("stack size", {
                 let mut code = code_object();
                 code.stack_size = value;
                 code
             }),
-            (CodeObjectField::Flags, {
+            ("flags", {
                 let mut code = code_object();
                 code.flags = value;
                 code
@@ -699,13 +584,12 @@ mod tests {
         ];
 
         for (field, code) in invalid {
-            assert!(matches!(
-                code.validate().unwrap_err().invariant,
-                CodeObjectInvariant::SignedFieldRange {
-                    field: actual,
-                    value: actual_value,
-                } if actual == field && actual_value == value
-            ));
+            assert_eq!(
+                code.validate().unwrap_err(),
+                CompileError::Internal(format!(
+                    "invalid code object `<module>`: {field} {value} exceeds CPython's signed 32-bit limit"
+                ))
+            );
         }
     }
 
@@ -714,10 +598,13 @@ mod tests {
         let mut code = code_object();
         code.locals.push("value".to_string());
 
-        assert!(matches!(
-            code.validate().unwrap_err().invariant,
-            CodeObjectInvariant::LocalsShape { names: 1, kinds: 0 }
-        ));
+        assert_eq!(
+            code.validate().unwrap_err(),
+            CompileError::Internal(
+                "invalid code object `<module>`: locals metadata has 1 names but 0 kind entries"
+                    .to_string()
+            )
+        );
     }
 
     #[test]
@@ -725,13 +612,12 @@ mod tests {
         let mut code = code_object();
         code.positional_only_arg_count = 1;
 
-        assert!(matches!(
-            code.validate().unwrap_err().invariant,
-            CodeObjectInvariant::PositionalOnlyArguments {
-                positional_only: 1,
-                positional: 0
-            }
-        ));
+        assert_eq!(
+            code.validate().unwrap_err(),
+            CompileError::Internal(
+                "invalid code object `<module>`: declares 1 positional-only arguments but only 0 total positional arguments".to_string()
+            )
+        );
     }
 
     #[test]
@@ -741,12 +627,11 @@ mod tests {
         code.locals.push("captured".to_string());
         code.local_kinds.push(CO_FAST_FREE);
 
-        assert!(matches!(
-            code.validate().unwrap_err().invariant,
-            CodeObjectInvariant::ParameterSlots {
-                parameters: 1,
-                local_slots: 0
-            }
-        ));
+        assert_eq!(
+            code.validate().unwrap_err(),
+            CompileError::Internal(
+                "invalid code object `<module>`: declares 1 parameter slots but only 0 local-variable slots".to_string()
+            )
+        );
     }
 }
