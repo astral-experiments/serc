@@ -255,6 +255,7 @@ mod protected_while_none_condition_owner_compatibility;
 mod redundant_copy_pop_pairs;
 mod removed_nop_jump_slots;
 mod return_debug_compatibility;
+mod return_marker_admission;
 mod return_try_manager_nop_owners;
 mod shadowed_comprehension_assignment;
 mod shared_try_exit_locations;

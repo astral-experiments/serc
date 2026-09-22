@@ -5862,8 +5862,9 @@ impl Compiler<'_> {
                                             && loop_context.with_depth
                                                 == self.control.withs.active_with_exits.len()
                                             && loop_context.finally_end_depth == 0
-                                            && loop_context.exception_region_depth
-                                                == self.control.exceptions.active_exception_region_exclusions.len()
+                                            && (context.exception_region_depth
+                                                ..=self.control.exceptions.active_exception_region_exclusions.len())
+                                                .contains(&loop_context.exception_region_depth)
                                     })))
                     {
                         // Each ordinary try exits before this manager changes the return
@@ -19883,7 +19884,6 @@ impl Compiler<'_> {
             && !removed_shared_try_pop_block
             && !statement.is_star
             && statement.finalbody.is_empty()
-            && !try_body_suspended
         {
             self.assembler
                 .record_copied_return_fallthrough_pop(deferred_try_pop_instruction);
@@ -27809,10 +27809,18 @@ impl Compiler<'_> {
             {
                 conditional_exit = Some(NestedIfExitLocation::Located(&tail.test));
             }
-            let loop_break_exit = statement.finalbody.last().and_then(|tail| {
+            let copied_loop_exit = statement.finalbody.last().and_then(|tail| {
                 let Stmt::While(tail) = tail else {
                     return None;
                 };
+                // The no-break case has only the condition's false edge at the
+                // original exit. Keep suspension and hidden branch arrays outside
+                // this additional admission.
+                let linear_loop_exit = !expression_suspends_current_scope(&tail.test)
+                    && matches!(tail.body.as_slice(), [Stmt::Expr(work)]
+                        if matches!(work.value.as_ref(), Expr::Call(_))
+                            && !expression_contains_inline_branch(&work.value)
+                            && !expression_suspends_current_scope(&work.value));
                 (!preserve_exit_nop
                     && self.context.python_version >= crate::PythonVersion::Py314
                     && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
@@ -27841,18 +27849,21 @@ impl Compiler<'_> {
                     && tail.orelse.is_empty()
                     && condition_has_linear_runtime_leaves(&tail.test)
                     && original_condition_has_unique_jump_target(&tail.test, false)
-                    && tail.body.split_last().is_some_and(|(last, leading)| {
-                        matches!(last, Stmt::If(branch)
+                    && (linear_loop_exit
+                        || tail.body.split_last().is_some_and(|(last, leading)| {
+                            matches!(last, Stmt::If(branch)
                             if branch.elif_else_clauses.is_empty()
                                 && condition_has_linear_runtime_leaves(&branch.test)
                                 && matches!(branch.body.as_slice(), [Stmt::Break(_)]))
-                            && (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
-                    }))
+                                && (leading.is_empty()
+                                    || suite_has_linear_borrow_fallthrough(leading))
+                        })))
                 .then(|| while_condition_exit_range(&tail.test))
             });
-            if let Some(range) = loop_break_exit {
-                // Small-exit copying removes the break's incoming edge first. The
-                // remaining condition edge donates this empty original array's line.
+            if let Some(range) = copied_loop_exit {
+                // The condition is the sole remaining edge, either originally or
+                // after small-exit copying removes the break's incoming edge. It
+                // donates this empty original array's line.
                 self.assembler.set_location(self.source_location(range));
             } else if let Some(NestedIfExitLocation::Located(test)) = conditional_exit {
                 self.assembler
@@ -28193,7 +28204,7 @@ impl Compiler<'_> {
                 end,
                 exception_policy,
             )?;
-            if loop_break_exit.is_some() {
+            if copied_loop_exit.is_some() {
                 self.assembler.preserve_direct_inlined_jump_nop(normal_exit);
             }
             if discarded_if_exit
