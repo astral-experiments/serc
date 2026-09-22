@@ -13,35 +13,3 @@ pub(crate) const KW_NAMES: Opcode = Opcode::new(135);
 pub(crate) const LOAD_ASSERTION_ERROR: Opcode = Opcode::new(136);
 pub(crate) const LOAD_CLOSURE: Opcode = Opcode::new(137);
 pub(crate) const RETURN_CONST: Opcode = Opcode::new(138);
-
-pub(super) const fn has_argument(opcode: Opcode) -> bool {
-    matches!(
-        opcode,
-        BUILD_CONST_KEY_MAP
-            | ENTER_EXECUTOR
-            | FORMAT_VALUE
-            | KW_NAMES
-            | LOAD_CLOSURE
-            | RETURN_CONST
-    )
-}
-
-pub(super) const fn has_constant(opcode: Opcode) -> bool {
-    matches!(opcode, KW_NAMES | RETURN_CONST)
-}
-
-pub(super) const fn has_name(_opcode: Opcode) -> bool {
-    false
-}
-
-pub(super) const fn has_jump(_opcode: Opcode) -> bool {
-    false
-}
-
-pub(super) const fn has_free(opcode: Opcode) -> bool {
-    matches!(opcode, LOAD_CLOSURE)
-}
-
-pub(super) const fn has_local(_opcode: Opcode) -> bool {
-    false
-}
