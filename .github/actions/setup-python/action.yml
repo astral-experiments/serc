@@ -1,0 +1,29 @@
+name: Set up Python oracles
+description: Install the pinned CPython interpreters used by tests and compatibility checks.
+
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        version: "0.12.17"
+        enable-cache: false
+    - name: Install pinned CPython interpreters
+      shell: bash
+      run: |
+        uv python install --no-bin 3.12.14 3.13.15 3.14.5 3.15.0rc2
+
+        python312="$(uv python find --managed-python 3.12.14)"
+        python313="$(uv python find --managed-python 3.13.15)"
+        python314="$(uv python find --managed-python 3.14.5)"
+        python315="$(uv python find --managed-python 3.15.0rc2)"
+        {
+          echo "SERC_TEST_PYTHON_312=$python312"
+          echo "SERC_TEST_PYTHON_313=$python313"
+          echo "SERC_TEST_PYTHON=$python314"
+          echo "SERC_TEST_PYTHON_315=$python315"
+        } >> "$GITHUB_ENV"
+    - name: Verify CPython 3.12.14 oracle
+      shell: bash
+      run: |
+        "$SERC_TEST_PYTHON_312" -B -I -S -c "import compileall, importlib.util, json, marshal, py_compile, struct, sys; assert sys.implementation.name == 'cpython'; assert sys.version_info == (3, 12, 14, 'final', 0); assert importlib.util.MAGIC_NUMBER.hex() == 'cb0d0d0a'"
