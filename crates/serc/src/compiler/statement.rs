@@ -6333,6 +6333,47 @@ impl Compiler<'_> {
                                             <= outer.exception_region_depth
                                 })
                     );
+                // A newer ordinary try retires before this contiguous unnamed handler
+                // chain. Its SWAPs therefore belong to each handler's own cleanup, even
+                // when older managers, loops, or finally blocks still need unwinding.
+                let inner_try_before_nested_handlers = !return_is_overridden
+                    && handler_count > 1
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.exceptions.active_try_marker_slots.len() == 1
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self
+                        .control
+                        .finally
+                        .active_return_finally_contexts
+                        .iter()
+                        .all(|context| context.handler_depth == 0)
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_handlers
+                        .iter()
+                        .enumerate()
+                        .all(|(index, handler)| {
+                            handler.name.is_none()
+                                && handler.try_body_depth == 0
+                                && handler.with_depth == self.control.withs.active_with_exits.len()
+                                && handler.loop_depth == self.control.loops.contexts.len()
+                                && handler.exception_region_depth
+                                    == self.control.exceptions.active_exception_handlers[0]
+                                        .exception_region_depth
+                                        + index
+                                && handler.body_cleanup == handler.common_cleanup
+                        })
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+                        == self.control.exceptions.active_exception_handlers[handler_count - 1]
+                            .exception_region_depth
+                            + 2;
                 // Two contiguous handlers retire their own collectors before the ordinary
                 // try surrounding them. Each name is cleared after its own handler exits,
                 // while the enclosing handler or try still owns the cleanup.
@@ -7553,7 +7594,8 @@ impl Compiler<'_> {
                                         && handler_count == 2
                                         && handler_index == 1)
                                     || (nested_handlers_inside_older_iterator
-                                        && handler_index + 1 == handler_count))
+                                        && handler_index + 1 == handler_count)
+                                    || inner_try_before_nested_handlers)
                                     && self
                                         .control
                                         .exceptions
