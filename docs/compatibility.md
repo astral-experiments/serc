@@ -1,7 +1,7 @@
 # CPython compatibility
 
 Serc targets exact CPython releases, not arbitrary versions or inputs. Python 3.14 is the
-default; the 3.12, 3.13, and 3.15 targets are experimental. See the
+default. See the
 [target pins](../crates/serc/README.md#updating-the-cpython-target) for commits and magic numbers.
 
 ## Required Ruff gate

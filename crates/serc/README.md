@@ -53,10 +53,10 @@ Generated opcode, stack, code-object, marshal, and startup metadata use these ex
 
 | Target | CPython tag | Commit | Magic number |
 | --- | --- | --- | --- |
-| `3.12` (experimental) | `v3.12.14` | `2abcf904b8dac8c999d2b3aac76681abb333798a` | `cb0d0d0a` |
-| `3.13` (experimental) | `v3.13.15` | `4061bc4c35f7c26f25264666d4ba083b93d2f6f9` | `f30d0d0a` |
-| `3.14` (default) | `v3.14.5` | `5607950ef232dad16d75c0cf53101d9649d89115` | `2b0e0d0a` |
-| `3.15` (experimental) | `v3.15.0rc2` | `435c9e5a798c99653e3ab64ce29baed0e4f3dfee` | `520e0d0a` |
+| `3.12` | `v3.12.14` | `2abcf904b8dac8c999d2b3aac76681abb333798a` | `cb0d0d0a` |
+| `3.13` | `v3.13.15` | `4061bc4c35f7c26f25264666d4ba083b93d2f6f9` | `f30d0d0a` |
+| `3.14` | `v3.14.5` | `5607950ef232dad16d75c0cf53101d9649d89115` | `2b0e0d0a` |
+| `3.15` | `v3.15.0rc2` | `435c9e5a798c99653e3ab64ce29baed0e4f3dfee` | `520e0d0a` |
 
 From the repository root, regenerate a target from its pinned CPython checkout:
 
