@@ -3253,16 +3253,66 @@ impl Compiler<'_> {
         let Some(Stmt::If(tail)) = statement.orelse.last() else {
             return false;
         };
-        condition_has_only_runtime_tests(&statement.test)
+        if !(condition_has_only_runtime_tests(&statement.test)
             && suite_contains_loop_break(&statement.body)
             && !suite_contains_nested_exception_cleanup(&statement.body)
             && !suite_contains_nested_exception_cleanup(&statement.orelse)
             && tail.elif_else_clauses.is_empty()
             && condition_has_only_runtime_tests(&tail.test)
-            && suite_has_linear_borrow_fallthrough(&tail.body)
-            && self.assembler.at_original_while_else_break_join(
-                self.source_location(condition_fallthrough_range(&tail.test)),
-            )
+            && suite_has_linear_borrow_fallthrough(&tail.body))
+        {
+            return false;
+        }
+        if self.assembler.at_original_while_else_break_join(
+            self.source_location(condition_fallthrough_range(&tail.test)),
+        ) {
+            return true;
+        }
+        if self.context.python_version < crate::PythonVersion::Py314 {
+            return false;
+        }
+        let Expr::BoolOp(boolean) = tail.test.as_ref() else {
+            return false;
+        };
+        if boolean.op != BoolOp::And || boolean.values.len() < 2 {
+            return false;
+        }
+        // Native sends each AND operand to the same empty exit, retaining that
+        // operand's span and polarity. Internal branches have separate original
+        // joins and cannot be certified by this one-edge-per-operand sequence.
+        let mut conditions = Vec::with_capacity(boolean.values.len());
+        for value in &boolean.values {
+            if expression_contains_inline_branch(value) {
+                return false;
+            }
+            let mut value = value;
+            let mut jump_on = false;
+            while let Expr::UnaryOp(unary) = value {
+                if unary.op != UnaryOp::Not {
+                    break;
+                }
+                value = &unary.operand;
+                jump_on = !jump_on;
+            }
+            let opcode = if let Expr::Compare(comparison) = value
+                && comparison.ops.len() == 1
+                && matches!(comparison.comparators[0], Expr::NoneLiteral(_))
+                && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
+            {
+                if jump_on == (comparison.ops[0] == CmpOp::Is) {
+                    POP_JUMP_IF_NONE
+                } else {
+                    POP_JUMP_IF_NOT_NONE
+                }
+            } else if jump_on {
+                POP_JUMP_IF_TRUE
+            } else {
+                POP_JUMP_IF_FALSE
+            };
+            conditions.push((self.source_location(value.range()), opcode));
+        }
+        self.assembler
+            .at_original_while_else_break_conjunction_join(&conditions)
     }
 
     fn compile_terminal_if(
@@ -12769,6 +12819,28 @@ impl Compiler<'_> {
                         } else {
                             self.assembler.preserve_direct_inlined_jump_nop(branch_exit);
                         }
+                    } else if branch_index == 0
+                        && self
+                            .control
+                            .statements
+                            .current_statement_followed_by_literal_return
+                        && self.can_descend_match_tail_wrappers()
+                        && self
+                            .control
+                            .finally
+                            .active_pass_finally_locations
+                            .is_empty()
+                        && condition_has_only_runtime_tests(&statement.test)
+                        && let Some(patterns) = single_pop_class_match_return_patterns(body)
+                    {
+                        // The final class failure POP falls into a distinct original
+                        // match-end array before this small return is copied onto it.
+                        let patterns = patterns
+                            .into_iter()
+                            .map(|(range, positional)| (self.source_location(range), positional))
+                            .collect::<Vec<_>>();
+                        self.assembler
+                            .preserve_class_match_failure_return_join(branch_exit, &patterns);
                     } else if ((branch_index == 0
                         && self
                             .control
@@ -17432,6 +17504,10 @@ impl Compiler<'_> {
                 // An emitted break targets a separate original array after END_FOR
                 // and POP_ITER. Its cleanup conditions cannot borrow earlier slots.
                 self.assembler.record_exception_owner_block_boundary(end);
+                if !statement.orelse.is_empty() {
+                    self.assembler
+                        .record_sync_for_else_end(end, base_depth.cast_unsigned());
+                }
             }
             self.assembler.mark(end);
         }
@@ -24815,6 +24891,42 @@ impl Compiler<'_> {
         }
     }
 
+    /// Certifies a generator return whose sole cleanup raises outside its protected body.
+    fn can_copy_generator_raising_finally_return(
+        &self,
+        statement: &ruff_python_ast::StmtTry,
+    ) -> bool {
+        let finally = &self.control.finally;
+        self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_GENERATOR
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.exceptions.active_try_marker_slots.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self
+                .control
+                .comprehensions
+                .active_comprehension_region_exclusions
+                .is_empty()
+            && finally.active_return_finally_contexts.is_empty()
+            && finally.active_loop_finally_contexts.is_empty()
+            && finally.active_pass_finally_locations.is_empty()
+            && finally.preserved_return_value_contexts.is_empty()
+            && finally.copied_return_finally_preserved_values == 0
+            && finally.active_finally_try_bodies == 0
+            && finally.active_normal_finally_bodies == 0
+            && finally.active_copied_finally_bodies == 0
+            && finally.active_finally_end_blocks == 0
+            && finally.active_overriding_finally_returns == 0
+            && supports_generator_raising_finally_return(statement)
+    }
+
     fn compile_try_finally(
         &mut self,
         statement: &ruff_python_ast::StmtTry,
@@ -24844,7 +24956,11 @@ impl Compiler<'_> {
                             && context.finally_end_depth == 0
                             && context.exception_region_depth == 0
                     })
-                    && supports_direct_terminating_finally_returns(statement)))
+                    && (supports_direct_terminating_finally_returns(statement)
+                        || (matches!(self.unit.scope, Scope::Function { .. })
+                            && matches!(self.control.loops.contexts.as_slice(), [iterator]
+                                if iterator.iterator_cleanup == IteratorCleanup::Sync)
+                            && supports_loop_break_terminating_finally_returns(statement)))))
         {
             return self.with_control_override(
                 |control| &mut control.finally.copies_terminating_finally_returns,
@@ -24862,6 +24978,8 @@ impl Compiler<'_> {
     ) -> Result<(), CompileError> {
         use super::legacy_native_labels::{FinallyCopy, NativeRole};
 
+        let copy_generator_raising_finally =
+            self.can_copy_generator_raising_finally_return(statement);
         let preserve_exit_nop =
             std::mem::take(&mut self.control.finally.preserve_next_finally_exit_nop);
         let capture_manager_pop =
@@ -27169,6 +27287,7 @@ impl Compiler<'_> {
         // discards the pending value. The certified forms use the existing
         // copied-return contexts for terminating and falling-through cleanup.
         let copy_finally_on_exit = self.control.finally.copies_terminating_finally_returns
+            || copy_generator_raising_finally
             || !suite_terminates(&statement.finalbody);
         let noop_finally_body = statement.finalbody.iter().all(|statement| {
             matches!(statement, Stmt::Pass(_))
@@ -28520,6 +28639,61 @@ impl Compiler<'_> {
                     exception_policy,
                 )?
             };
+            if self.context.python_version >= crate::PythonVersion::Py314
+                && !preserve_exit_nop
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && !statement.is_star
+                && statement.handlers.is_empty()
+                && statement.orelse.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && self.control.finally.active_overriding_finally_returns == 0
+                && let [Stmt::For(tail)] = statement.finalbody.as_slice()
+                && !tail.is_async
+                && !expression_contains_inline_branch(&tail.iter)
+                && !expression_suspends_current_scope(&tail.iter)
+                && !expression_contains_inline_branch(&tail.target)
+                && !expression_suspends_current_scope(&tail.target)
+                && let Some(Stmt::Expr(discard)) = tail.orelse.last()
+                && let Expr::Call(call) = discard.value.as_ref()
+                && !expression_contains_inline_branch(&discard.value)
+                && !expression_suspends_current_scope(&discard.value)
+            {
+                let authored_break = match tail.body.as_slice() {
+                    [Stmt::Break(authored)] => Some(authored),
+                    [Stmt::If(branch)]
+                        if branch.elif_else_clauses.is_empty()
+                            && early_condition_truthiness(&branch.test) != Some(false)
+                            && !expression_contains_inline_branch(&branch.test)
+                            && !expression_suspends_current_scope(&branch.test) =>
+                    {
+                        match branch.body.as_slice() {
+                            [Stmt::Break(authored)] => Some(authored),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(authored_break) = authored_break {
+                    self.assembler.preserve_sync_for_else_finally_exit(
+                        normal_exit,
+                        self.source_location(authored_break.range),
+                        self.call_opcode_location(call),
+                    );
+                }
+            }
             if copied_loop_exit.is_some() {
                 self.assembler.preserve_direct_inlined_jump_nop(normal_exit);
             }
@@ -33271,6 +33445,35 @@ fn finalizer_tail_has_matching_linear_copies(body: &[Stmt]) -> bool {
         })
 }
 
+/// Keeps the return value live while a non-suspending, branch-free finalizer raises.
+fn supports_generator_raising_finally_return(statement: &ruff_python_ast::StmtTry) -> bool {
+    let Some((Stmt::Return(returned), leading)) = statement.body.split_last() else {
+        return false;
+    };
+    let [Stmt::Raise(raised)] = statement.finalbody.as_slice() else {
+        return false;
+    };
+    let Some(exception) = raised.exc.as_deref() else {
+        return false;
+    };
+    let linear_value = |value: &Expr| {
+        !expression_contains_inline_branch(value)
+            && !expression_suspends_current_scope(value)
+            && !expression_yields_in_current_scope(value)
+    };
+    !statement.is_star
+        && statement.handlers.is_empty()
+        && statement.orelse.is_empty()
+        && returned.value.as_deref().is_none_or(linear_value)
+        && linear_value(exception)
+        && raised.cause.as_deref().is_none_or(linear_value)
+        && leading.iter().all(|statement| {
+            matches!(statement, Stmt::Expr(expression)
+                if matches!(expression.value.as_ref(), Expr::Yield(yielded)
+                    if yielded.value.as_deref().is_none_or(linear_value)))
+        })
+}
+
 /// A direct finalizer return unwinds the pending value before enclosing iterators.
 /// Both expressions stay in one block, with no newly entered cleanup scope.
 fn supports_direct_terminating_finally_returns(statement: &ruff_python_ast::StmtTry) -> bool {
@@ -33289,6 +33492,64 @@ fn supports_direct_terminating_finally_returns(statement: &ruff_python_ast::Stmt
                     && !expression_suspends_current_scope(value)
             })
         })
+}
+
+/// Keeps a pending return live until a finalizer's conditional break or return.
+/// Both exits cross the same enclosing iterator, with no newly entered cleanup.
+fn supports_loop_break_terminating_finally_returns(statement: &ruff_python_ast::StmtTry) -> bool {
+    fn linear_value(value: &Expr) -> bool {
+        !expression_contains_inline_branch(value) && !expression_suspends_current_scope(value)
+    }
+
+    fn runtime_break(statement: &Stmt) -> bool {
+        matches!(statement, Stmt::If(branch)
+            if branch.elif_else_clauses.is_empty()
+                && matches!(branch.body.as_slice(), [Stmt::Break(_)])
+                && condition_has_only_runtime_tests(&branch.test)
+                && condition_has_linear_runtime_leaves(&branch.test)
+                && linear_value(&branch.test))
+    }
+
+    fn linear_work(statement: &Stmt) -> bool {
+        match statement {
+            Stmt::Assign(assignment) => {
+                assignment
+                    .targets
+                    .iter()
+                    .all(|target| matches!(target, Expr::Name(_)))
+                    && linear_value(&assignment.value)
+            }
+            Stmt::AugAssign(assignment) => {
+                matches!(assignment.target.as_ref(), Expr::Name(_))
+                    && linear_value(&assignment.value)
+            }
+            Stmt::Expr(expression) => {
+                matches!(expression.value.as_ref(), Expr::Call(_))
+                    && linear_value(&expression.value)
+            }
+            _ => false,
+        }
+    }
+
+    let Some((Stmt::Return(body), leading)) = statement.body.split_last() else {
+        return false;
+    };
+    let [branch, Stmt::Return(finalizer)] = statement.finalbody.as_slice() else {
+        return false;
+    };
+    let leading = if leading.last().is_some_and(runtime_break) {
+        &leading[..leading.len() - 1]
+    } else {
+        leading
+    };
+    !statement.is_star
+        && statement.handlers.is_empty()
+        && statement.orelse.is_empty()
+        && runtime_break(branch)
+        && leading.iter().all(linear_work)
+        && [body, finalizer]
+            .iter()
+            .all(|returned| returned.value.as_deref().is_none_or(linear_value))
 }
 
 /// Certifies the two adjacent finally frames covered by the existing return
@@ -36307,6 +36568,42 @@ fn suite_has_shared_guarded_match_failure(body: &[Stmt]) -> bool {
         && matches!(case.body.as_slice(), [Stmt::Assign(_) | Stmt::Expr(_)])
 }
 
+/// Finds a returning class-pattern chain whose failures all discard one subject.
+fn single_pop_class_match_return_patterns(body: &[Stmt]) -> Option<Vec<(TextRange, u32)>> {
+    let Stmt::Match(statement) = body.last()? else {
+        return None;
+    };
+    let [case] = statement.cases.as_slice() else {
+        return None;
+    };
+    if case.guard.is_some() || !matches!(case.body.as_slice(), [Stmt::Return(_)]) {
+        return None;
+    }
+    let mut pattern = &case.pattern;
+    let mut patterns = Vec::new();
+    loop {
+        let Pattern::MatchClass(class) = pattern else {
+            return None;
+        };
+        if expression_contains_inline_branch(&class.cls) {
+            return None;
+        }
+        patterns.push((
+            class.range,
+            u32::try_from(class.arguments.patterns.len()).ok()?,
+        ));
+        pattern = match (
+            class.arguments.patterns.as_slice(),
+            class.arguments.keywords.as_slice(),
+        ) {
+            ([], []) => return Some(patterns),
+            ([child], []) => child,
+            ([], [keyword]) => &keyword.pattern,
+            _ => return None,
+        };
+    }
+}
+
 // Once case-success exits have been copied, the last refutable pattern is the
 // sole predecessor of the original match-failure continuation.
 fn suite_match_failure_range(body: &[Stmt]) -> Option<TextRange> {
@@ -38920,6 +39217,51 @@ mod tests {
             true,
         ));
     }
+    #[test]
+    fn raising_generator_finalizer_rejects_eager_branches_and_suspensions() {
+        for (returned, cleanup, expected) in [
+            ("payload", "raise error", true),
+            ("produce()", "raise create_error() from cause", true),
+            ("(lambda: (yield payload))()", "raise error", true),
+            (
+                "(lambda value=(yield payload): value)()",
+                "raise error",
+                false,
+            ),
+            (
+                "(lambda value=(first if flag else second): value)()",
+                "raise error",
+                false,
+            ),
+            ("(yield from items)", "raise error", false),
+            (
+                "payload",
+                "raise (lambda value=(yield error): value)()",
+                false,
+            ),
+            ("payload", "raise error from (yield cause)", false),
+            ("payload", "raise (error if flag else other)", false),
+            ("payload", "raise", false),
+            ("payload", "yield error\n        raise error", false),
+        ] {
+            let source = format!(
+                "def f():\n    try:\n        yield item\n        return {returned}\n    finally:\n        {cleanup}\n"
+            );
+            let parsed = parse_module(&source).unwrap();
+            let Stmt::FunctionDef(function) = &parsed.suite()[0] else {
+                panic!("expected function");
+            };
+            let Stmt::Try(statement) = &function.body[0] else {
+                panic!("expected try/finally");
+            };
+            assert_eq!(
+                super::supports_generator_raising_finally_return(statement),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
     #[test]
     fn loop_exit_yield_guard_visits_only_eager_scope_parts() {
         for (expression, expected) in [

@@ -1392,6 +1392,30 @@ impl Assembler {
     /// The break owns one original NOP slot; the separate false edge owns none. Keeping
     /// the footer unlocated lets the existing exit copier inherit each edge's location.
     pub(crate) fn at_original_while_else_break_join(&self, condition: SourceLocation) -> bool {
+        self.at_original_while_else_break_join_conditions([(condition, None)])
+    }
+
+    /// Certifies the ordered failure edges of a branch-free runtime conjunction.
+    pub(crate) fn at_original_while_else_break_conjunction_join(
+        &self,
+        conditions: &[(SourceLocation, Opcode)],
+    ) -> bool {
+        conditions.len() >= 2
+            && self.at_original_while_else_break_join_conditions(
+                conditions
+                    .iter()
+                    .map(|&(location, opcode)| (location, Some(opcode))),
+            )
+    }
+
+    fn at_original_while_else_break_join_conditions(
+        &self,
+        conditions: impl IntoIterator<Item = (SourceLocation, Option<Opcode>)>,
+    ) -> bool {
+        let mut conditions = conditions.into_iter().peekable();
+        // Only the conjunction producer supplies exact opcodes. Keep the existing
+        // singleton certificate's metadata admission unchanged.
+        let exact_records = matches!(conditions.peek(), Some((_, Some(_))));
         let items = self.linear_items();
         let labels = items
             .iter()
@@ -1421,6 +1445,11 @@ impl Assembler {
             || previous.depth_after() != Some(0)
             || previous.pre_fold_extra_instructions() != 0
             || previous.local_policy.hidden_exception_owner_slots() != 0
+        {
+            return false;
+        }
+        if exact_records
+            && *previous != Instruction::new(POP_TOP, Operand::Value(0), previous.location, Some(0))
         {
             return false;
         }
@@ -1455,14 +1484,28 @@ impl Assembler {
                 && instruction.jump_policy.retained_nop() == ir::RetainedJumpNop::DirectTarget
                 && instruction.pre_fold_extra_instructions() == 1
             {
+                if exact_records {
+                    let mut expected = Instruction::new(
+                        JUMP_FORWARD,
+                        Operand::Forward(target),
+                        instruction.location,
+                        Some(0),
+                    );
+                    expected.fusion_policy.mark_authored_break();
+                    expected.jump_policy.prevent_threading_target();
+                    expected.jump_policy.retain_nop_for_direct_target();
+                    expected.add_pre_fold_extra_instructions(1);
+                    if *instruction != expected {
+                        return false;
+                    }
+                }
                 if break_target.replace(target).is_some() {
                     return false;
                 }
             } else if matches!(
                 instruction.opcode,
                 POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
-            ) && instruction.location == condition
-                && instruction.pre_fold_extra_instructions() == 0
+            ) && instruction.pre_fold_extra_instructions() == 0
                 && self
                     .exception_owner_provenance
                     .source_boundaries
@@ -1472,15 +1515,27 @@ impl Assembler {
                     .block_boundaries
                     .contains(&target)
             {
-                if false_target.replace(target).is_some() {
+                let Some((location, opcode)) = conditions.next() else {
+                    return false;
+                };
+                if instruction.location != location
+                    || opcode.is_some_and(|opcode| {
+                        *instruction
+                            != Instruction::new(opcode, Operand::Forward(target), location, Some(0))
+                    })
+                    || false_target
+                        .replace(target)
+                        .is_some_and(|previous| previous != target)
+                {
                     return false;
                 }
             } else {
                 return false;
             }
         }
-        matches!((break_target, false_target), (Some(break_target), Some(false_target))
-            if break_target != false_target)
+        conditions.next().is_none()
+            && matches!((break_target, false_target), (Some(break_target), Some(false_target))
+                if break_target != false_target)
     }
 
     /// Keeps a cleanup-free while break until the shared handler exit can be copied.
@@ -6670,6 +6725,127 @@ impl Assembler {
             .allow_transitive_small_exit_inlining();
     }
 
+    /// Binds an authored synchronous for-else end to its original stack depth.
+    pub(crate) fn record_sync_for_else_end(&mut self, end: Label, depth: u32) {
+        if self.python_version >= crate::PythonVersion::Py314 {
+            self.original_sync_for_else_ends.insert(end, depth);
+        }
+    }
+
+    /// Retains the original normal-finally slot after a for-else call fallthrough.
+    pub(crate) fn preserve_sync_for_else_finally_exit(
+        &mut self,
+        emitted: EmittedJump,
+        break_location: SourceLocation,
+        call_location: SourceLocation,
+    ) {
+        let jump = *self.emitted_jump_mut(emitted, "certifying a for-else finally exit");
+        let Operand::Forward(target) = jump.operand() else {
+            return;
+        };
+        let index = usize::try_from(emitted.instruction().item_index)
+            .expect("emitted instruction index should fit in usize");
+        let items = &self.linear_items()[..index];
+        let [head @ .., Item::Instruction(pop), Item::Label(end)] = items else {
+            return;
+        };
+        let Some(&depth) = self.original_sync_for_else_ends.get(end) else {
+            return;
+        };
+        if self.python_version < crate::PythonVersion::Py314
+            || !self.exception_regions.is_empty()
+            || index + 1 != self.linear_items().len()
+            || *end == target
+            || break_location.line < 0
+            || call_location.line < 0
+            || jump
+                != Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(target),
+                    call_location,
+                    Some(depth),
+                )
+            || *pop != Instruction::new(POP_TOP, Operand::Value(0), call_location, Some(depth))
+            || !self
+                .exception_owner_provenance
+                .source_boundaries
+                .contains(end)
+            || !self
+                .exception_owner_provenance
+                .block_boundaries
+                .contains(end)
+            || self.join_labels_have_authored_location(&[*end])
+            || self.folded_away_condition_targets.contains(end)
+            || self.folded_away_loop_else_targets.contains(end)
+            || self.folded_condition_exit_targets.contains(end)
+            || self.conditional_threading_targets.contains_key(end)
+            || self
+                .exception_owner_provenance
+                .omitted_nop_counts
+                .contains_key(end)
+            || self
+                .exception_owner_provenance
+                .omitted_nop_locations
+                .contains_key(end)
+            || head.contains(&Item::Label(*end))
+        {
+            return;
+        }
+        let mut incoming = None;
+        for (index, item) in head.iter().enumerate() {
+            let Item::Instruction(instruction) = item else {
+                continue;
+            };
+            if !matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label) if label == *end)
+            {
+                continue;
+            }
+            if incoming.replace(index).is_some() {
+                return;
+            }
+            let mut expected = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(*end),
+                break_location,
+                Some(depth),
+            );
+            expected.fusion_policy.mark_authored_break();
+            expected.jump_policy.prevent_threading_target();
+            if *instruction != expected {
+                return;
+            }
+        }
+        let Some(incoming) = incoming else {
+            return;
+        };
+        let slots = 1 + usize::from(self.python_version == crate::PythonVersion::Py315);
+        let Some(cleanup) = incoming
+            .checked_sub(slots)
+            .and_then(|start| head.get(start..incoming))
+        else {
+            return;
+        };
+        for (index, item) in cleanup.iter().enumerate() {
+            let Some(pop_depth) = depth.checked_add(u32::try_from(slots - index - 1).unwrap())
+            else {
+                return;
+            };
+            if *item
+                != Item::Instruction(Instruction::new(
+                    POP_TOP,
+                    Operand::Value(0),
+                    break_location,
+                    Some(pop_depth),
+                ))
+            {
+                return;
+            }
+        }
+        // Initial exit copying can bypass this original block. Only its else
+        // fallthrough donates the line retained by late redundant-jump removal.
+        self.preserve_redundant_jump_nop_after_threading(emitted);
+    }
+
     pub(crate) fn preserve_redundant_jump_nop_after_threading(&mut self, emitted: EmittedJump) {
         let index = usize::try_from(emitted.instruction().item_index)
             .expect("emitted instruction index should fit in usize");
@@ -6802,6 +6978,143 @@ impl Assembler {
         // The final guard is this original empty block's sole predecessor. Native
         // line propagation supplies the retained NOP span after early exit copying.
         jump.location = donor;
+        jump.jump_policy.mark_original_empty_join();
+        jump.jump_policy.retain_redundant_nop_after_threading();
+        jump.jump_policy.prevent_threading_target();
+    }
+
+    /// Retains the original empty match end after an authenticated class-failure POP.
+    pub(crate) fn preserve_class_match_failure_return_join(
+        &mut self,
+        emitted: EmittedJump,
+        patterns: &[(SourceLocation, u32)],
+    ) {
+        let Some(&(location, _)) = patterns.first() else {
+            return;
+        };
+        let jump = *self.emitted_jump_mut(emitted, "retaining a class failure join");
+        let Operand::Forward(target) = jump.operand() else {
+            return;
+        };
+        if self.python_version < crate::PythonVersion::Py314
+            || !self.exception_regions.is_empty()
+            || location.line < 0
+            || jump != Instruction::new(JUMP_FORWARD, Operand::Forward(target), location, Some(0))
+        {
+            return;
+        }
+        let index = usize::try_from(emitted.instruction().item_index)
+            .expect("emitted instruction index should fit in usize");
+        let items = &self.linear_items()[..index];
+        let [
+            head @ ..,
+            Item::Instruction(ret),
+            Item::Label(failure),
+            Item::Instruction(pop),
+            Item::Label(zero_pop),
+            Item::Label(end),
+        ] = items
+        else {
+            return;
+        };
+        let labels = [*failure, *zero_pop, *end];
+        if failure == zero_pop
+            || failure == end
+            || zero_pop == end
+            || labels.contains(&target)
+            || ret.location.line < 0
+            || *ret != Instruction::new(RETURN_VALUE, Operand::Value(0), ret.location, Some(0))
+            || *pop != Instruction::new(POP_TOP, Operand::Value(0), location, Some(0))
+            || !self
+                .exception_owner_provenance
+                .original_match_join_boundaries
+                .contains(end)
+            || !self
+                .exception_owner_provenance
+                .source_boundaries
+                .contains(end)
+            || !self
+                .exception_owner_provenance
+                .block_boundaries
+                .contains(end)
+            || self.join_labels_have_authored_location(&labels)
+            || labels.iter().any(|label| {
+                items
+                    .iter()
+                    .filter(|item| **item == Item::Label(*label))
+                    .count()
+                    != 1
+                    || self.folded_away_condition_targets.contains(label)
+                    || self.folded_away_loop_else_targets.contains(label)
+                    || self
+                        .exception_owner_provenance
+                        .omitted_nop_counts
+                        .contains_key(label)
+                    || self
+                        .exception_owner_provenance
+                        .omitted_nop_locations
+                        .contains_key(label)
+            })
+        {
+            return;
+        }
+        let mut expected = patterns.iter();
+        for (index, item) in head.iter().enumerate() {
+            let Item::Instruction(condition) = item else {
+                continue;
+            };
+            let (Operand::Forward(label) | Operand::Backward(label)) = condition.operand() else {
+                continue;
+            };
+            if !labels.contains(&label) {
+                continue;
+            }
+            let Some(&(pattern_location, positional)) = expected.next() else {
+                return;
+            };
+            let Some(prefix) = index
+                .checked_sub(2)
+                .and_then(|start| head.get(start..index))
+            else {
+                return;
+            };
+            let [Item::Instruction(class), Item::Instruction(copy)] = prefix else {
+                return;
+            };
+            let mut original_copy =
+                Instruction::new(COPY, Operand::Value(1), pattern_location, Some(2));
+            // Class failure specializes LOAD_CONST(None), IS_OP into its None jump.
+            original_copy
+                .local_policy
+                .add_hidden_exception_owner_slots(2);
+            if pattern_location.line < 0
+                || label != *failure
+                || *condition
+                    != Instruction::new(
+                        POP_JUMP_IF_NONE,
+                        Operand::Forward(*failure),
+                        pattern_location,
+                        Some(1),
+                    )
+                || *class
+                    != Instruction::new(
+                        crate::target::opcodes::MATCH_CLASS,
+                        Operand::Value(positional),
+                        pattern_location,
+                        Some(1),
+                    )
+                || *copy != original_copy
+            {
+                return;
+            }
+        }
+        if expected.next().is_some() {
+            return;
+        }
+        // Native labels fail_pop[0] and match end after the POP. Its outer jump
+        // becomes a NOP before line propagation; the preceding POP is in another
+        // original array and cannot remove that same-line NOP.
+        let jump = self.emitted_jump_mut(emitted, "retaining a class failure join");
         jump.jump_policy.mark_original_empty_join();
         jump.jump_policy.retain_redundant_nop_after_threading();
         jump.jump_policy.prevent_threading_target();

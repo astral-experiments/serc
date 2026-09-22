@@ -672,12 +672,18 @@ fn is_metadata_range_entry(
         && original_setups.iter().all(|(setup, _)| *setup != label)
 }
 
-/// Finds original SETUP records already represented by a retained NOP in this target chain.
+#[derive(Default)]
+struct RepresentedSetupNops {
+    setups: FxHashSet<Label>,
+    labels: FxHashSet<Label>,
+}
+
+/// Finds retained SETUP records and their exact metadata-only NOP boundaries.
 fn represented_setup_nops(
     graph: &BlockGraph,
     blocks: &[BasicBlockId],
     provenance: &ExceptionOwnerProvenance,
-) -> FxHashSet<Label> {
+) -> RepresentedSetupNops {
     if blocks.len() <= 1
         || provenance.setup_nop_ranges.is_empty()
         || !blocks.iter().any(|block| {
@@ -686,7 +692,7 @@ fn represented_setup_nops(
             )
         })
     {
-        return FxHashSet::default();
+        return RepresentedSetupNops::default();
     }
     let mut positions = FxHashMap::default();
     let mut instructions = Vec::new();
@@ -718,21 +724,28 @@ fn represented_setup_nops(
                     .filter(|(label, _)| positions.get(label) == Some(&index))
                     .count()
                     != 1
-                || provenance
-                    .setup_nop_ranges
-                    .iter()
-                    .filter(|(start, end)| {
-                        positions.get(start) == Some(&nop_index)
-                            && positions.get(end) == Some(&index)
-                    })
-                    .count()
-                    != 1
             {
                 return None;
             }
-            Some(setup)
+            let mut ranges = provenance.setup_nop_ranges.iter().filter(|(start, end)| {
+                positions.get(start) == Some(&nop_index) && positions.get(end) == Some(&index)
+            });
+            let &(start, end) = ranges.next()?;
+            if ranges.next().is_some() {
+                return None;
+            }
+            Some((setup, start, end))
         })
-        .collect()
+        .fold(
+            RepresentedSetupNops::default(),
+            |mut represented, (setup, start, end)| {
+                represented.setups.insert(setup);
+                // The retained NOP already contributes the original SETUP slot. Its
+                // registered exclusion boundaries do not add another original record.
+                represented.labels.extend([setup, start, end]);
+                represented
+            },
+        )
 }
 
 /// Reconstructs one original exit array across exception-table-only splits.
@@ -929,7 +942,7 @@ fn exit_block_analysis(
                     target_chain_end > target_position
                         && exception_split_labels.contains(label)
                         && !provenance.return_region_reentries.contains(label)
-                        && !represented_setups.contains(label)
+                        && !represented_setups.labels.contains(label)
                         && !(at_target_entry
                             && is_metadata_range_entry(
                                 *label,
@@ -1363,7 +1376,7 @@ fn block_is_original_setup_nop(
         .items()
         .iter()
         .take_while(|item| matches!(item, Item::Label(_)))
-        .any(|item| matches!(item, Item::Label(label) if setups.contains(label)))
+        .any(|item| matches!(item, Item::Label(label) if setups.setups.contains(label)))
 }
 
 // Exception accounting can split an original block before a located cleanup suffix.
@@ -4894,7 +4907,7 @@ impl OptimizationPipeline {
                                 .exception_owner_provenance
                                 .return_region_reentries
                                 .contains(label)
-                            && !represented_setups.contains(label)
+                            && !represented_setups.labels.contains(label)
                             && !(at_target_entry
                                 && is_metadata_range_entry(
                                     *label,
@@ -8476,6 +8489,244 @@ mod copied_match_guard_subject_tests {
                 assert_eq!(records[0], subject);
                 assert!(records[0].fusion_policy.location_from_next());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod represented_setup_nop_tests {
+    use super::*;
+    use crate::assembler::ExceptionRegionPriority;
+
+    fn setup_nop(location: SourceLocation) -> Instruction {
+        let mut nop = Instruction::new(NOP, Operand::Value(0), location, Some(0));
+        nop.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+        nop
+    }
+
+    // The producer emits distinct NOP boundaries and setup labels. Each nested
+    // NOP splits its surrounding exception regions, including an empty prefix.
+    fn nested_raise(count: u32) -> (BlockGraph, ExceptionOwnerProvenance, Vec<ExceptionRegion>) {
+        let mut items = vec![
+            Item::Label(Label(0)),
+            Item::Instruction(Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(Label(10)),
+                SourceLocation::new(2, 2, 4, 8),
+                Some(0),
+            )),
+        ];
+        let mut provenance = ExceptionOwnerProvenance::default();
+        for index in 0..count {
+            let start = Label(10 + 3 * index);
+            let end = Label(11 + 3 * index);
+            let setup = Label(12 + 3 * index);
+            let line = i32::try_from(index + 4).unwrap();
+            let location = SourceLocation::new(line, line + 4, 4, 16);
+            items.extend([
+                Item::Label(start),
+                Item::Instruction(setup_nop(location)),
+                Item::Label(end),
+                Item::Label(setup),
+            ]);
+            provenance.setups.push((setup, Some(location)));
+            provenance
+                .ordinary_try_setups
+                .insert(setup, Label(200 + index));
+            provenance.setup_nop_ranges.push((start, end));
+        }
+        let raised = SourceLocation::new(9, 9, 8, 23);
+        items.extend([
+            Item::Instruction(Instruction::new(
+                LOAD_GLOBAL,
+                Operand::Value(0),
+                raised,
+                Some(1),
+            )),
+            Item::Instruction(Instruction::new(
+                RAISE_VARARGS,
+                Operand::Value(1),
+                raised,
+                Some(0),
+            )),
+            Item::Label(Label(100)),
+        ]);
+        let mut regions = Vec::new();
+        for index in 0..count {
+            let setup = Label(12 + 3 * index);
+            let handler = Label(200 + index);
+            let mut start = setup;
+            for nested in index + 1..count {
+                regions.push(ExceptionRegion {
+                    priority: ExceptionRegionPriority::OriginalRange(setup, Label(100)),
+                    is_scope_fallback: false,
+                    start,
+                    end: Label(10 + 3 * nested),
+                    target: handler,
+                    depth: 0,
+                    preserve_lasti: false,
+                });
+                start = Label(11 + 3 * nested);
+            }
+            regions.push(ExceptionRegion {
+                priority: ExceptionRegionPriority::OriginalRange(setup, Label(100)),
+                is_scope_fallback: false,
+                start,
+                end: Label(100),
+                target: handler,
+                depth: 0,
+                preserve_lasti: false,
+            });
+            items.extend([
+                Item::Label(handler),
+                Item::Instruction(Instruction::new(
+                    RERAISE,
+                    Operand::Value(0),
+                    SourceLocation::NONE,
+                    Some(0),
+                )),
+            ]);
+        }
+        (
+            BlockGraph::from_items(items, &FxHashSet::default()),
+            provenance,
+            regions,
+        )
+    }
+
+    #[test]
+    fn nested_setup_boundaries_preserve_four_slot_exit_limit() {
+        for count in [2, 3] {
+            let (graph, provenance, regions) = nested_raise(count);
+            let analysis = exit_block_analysis(
+                &graph,
+                graph.order(),
+                &regions,
+                &FxHashSet::default(),
+                &FxHashSet::default(),
+                &provenance,
+            );
+            assert_eq!(analysis.requires_copy, count == 2, "{count} setup records");
+        }
+    }
+
+    #[test]
+    fn boundaries_require_unique_full_setup_nop_certificate() {
+        for mutation in [
+            "none",
+            "missing_range",
+            "duplicate_range",
+            "duplicate_setup",
+            "not_ordinary",
+            "location",
+            "policy",
+            "operand",
+            "prefold",
+        ] {
+            let (mut graph, mut provenance, _) = nested_raise(2);
+            let setup = Label(15);
+            let range = (Label(13), Label(14));
+            match mutation {
+                "missing_range" => provenance
+                    .setup_nop_ranges
+                    .retain(|candidate| *candidate != range),
+                "duplicate_range" => provenance.setup_nop_ranges.push(range),
+                "duplicate_setup" => provenance.setups.push(provenance.setups[1]),
+                "not_ordinary" => {
+                    provenance.ordinary_try_setups.remove(&setup);
+                }
+                "location" | "policy" | "operand" | "prefold" => {
+                    let block = graph.label_block(range.0).unwrap();
+                    let nop = graph.instructions_mut(block).next().unwrap();
+                    match mutation {
+                        "location" => nop.location.column += 1,
+                        "policy" => {
+                            *nop = Instruction::new(NOP, Operand::Value(0), nop.location, Some(0));
+                        }
+                        "operand" => {
+                            *nop = Instruction::new(NOP, Operand::Value(1), nop.location, Some(0));
+                            nop.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+                        }
+                        "prefold" => nop.add_pre_fold_extra_instructions(1),
+                        _ => unreachable!(),
+                    }
+                }
+                _ => {}
+            }
+            let represented = represented_setup_nops(&graph, graph.order(), &provenance);
+            for label in [setup, range.0, range.1] {
+                assert_eq!(
+                    represented.labels.contains(&label),
+                    mutation == "none",
+                    "{mutation}: {label:?}"
+                );
+            }
+            assert_eq!(
+                represented.setups.contains(&setup),
+                mutation == "none",
+                "{mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn boundary_alias_does_not_certify_a_different_original_setup() {
+        let first = SourceLocation::new(4, 7, 4, 20);
+        let second = SourceLocation::new(8, 11, 4, 20);
+        for first_is_certified in [false, true] {
+            let items = vec![
+                Item::Label(Label(0)),
+                Item::Instruction(setup_nop(first)),
+                // This label is both an uncertified original setup and the exact
+                // start of a different, certified NOP's range.
+                Item::Label(Label(1)),
+                Item::Label(Label(9)),
+                Item::Instruction(setup_nop(second)),
+                Item::Label(Label(2)),
+                Item::Label(Label(3)),
+                Item::Instruction(Instruction::new(
+                    RAISE_VARARGS,
+                    Operand::Value(0),
+                    second,
+                    Some(0),
+                )),
+            ];
+            let graph = BlockGraph::from_items(items, &[Label(1)].into_iter().collect());
+            let mut provenance = ExceptionOwnerProvenance {
+                setups: vec![
+                    (
+                        Label(1),
+                        Some(if first_is_certified { first } else { second }),
+                    ),
+                    (Label(3), Some(second)),
+                ],
+                ..ExceptionOwnerProvenance::default()
+            };
+            provenance.ordinary_try_setups.insert(Label(1), Label(20));
+            provenance.ordinary_try_setups.insert(Label(3), Label(21));
+            provenance.setup_nop_ranges.push((Label(1), Label(2)));
+            if first_is_certified {
+                provenance.setup_nop_ranges.push((Label(0), Label(1)));
+            }
+            let represented = represented_setup_nops(&graph, graph.order(), &provenance);
+            assert!(represented.labels.contains(&Label(1)));
+            assert!(represented.setups.contains(&Label(3)));
+            assert!(!represented.labels.contains(&Label(9)));
+            assert_eq!(represented.setups.contains(&Label(1)), first_is_certified);
+            let mut positions = vec![0; graph.len()];
+            for (position, block) in graph.order().iter().enumerate() {
+                positions[block.index()] = position;
+            }
+            assert_eq!(
+                block_is_original_setup_nop(
+                    &graph,
+                    graph.order(),
+                    &positions,
+                    graph.order()[0],
+                    &provenance
+                ),
+                first_is_certified
+            );
         }
     }
 }

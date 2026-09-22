@@ -1368,6 +1368,37 @@ impl OptimizationPipeline {
                             original.add_pre_fold_extra_instructions(
                                 instruction.pre_fold_extra_instructions(),
                             );
+                            // A folded condition can leave its source NOP on an excluded
+                            // loop backedge. Authenticate that producer before accepting its
+                            // exact policy; folded while headers and copied aliases differ.
+                            if self.python_version >= crate::PythonVersion::Py314
+                                && iterator_head
+                                && instruction.pre_fold_extra_instructions() == 0
+                                && instruction.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+                                && self
+                                    .folded_predecessor_sources
+                                    .iter()
+                                    .filter(|(source, target, location)| {
+                                        labels.contains(&Item::Label(*source))
+                                            && self.original_nop_targets.contains(source)
+                                            && *location == instruction.location
+                                            && !self
+                                                .exception_owner_provenance
+                                                .block_boundaries
+                                                .contains(source)
+                                            && self
+                                                .folded_original_predecessor_targets
+                                                .contains(target)
+                                            && *target != head
+                                            && !labels.contains(&Item::Label(*target))
+                                            && !self.folded_loop_exit_anchors.contains(target)
+                                    })
+                                    .take(2)
+                                    .count()
+                                    == 1
+                            {
+                                original.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+                            }
                             instruction == original
                         })();
                         // A nested source join can contain an authored Pass followed only by

@@ -282,6 +282,37 @@ fn matches_cpython_terminal_while_else_shared_return_footer() {
 }
 
 #[test]
+fn matches_cpython_terminal_while_else_conjunction_return_copies() {
+    common::assert_matches_cpython_marshal(
+        r"def run(short, items, work):
+    if short:
+        work(items)
+    else:
+        j = 0
+        while j < len(items):
+            a, b = items[j]
+            if a > 0 and b > 0:
+                work(a)
+                work(b)
+                break
+            j += 1
+        else:
+            if a > 0:
+                work(a)
+            if (
+                a > 0
+                and b > 0
+                and not work(a)
+                and work(b)
+                and not work(a, b)
+            ):
+                work(a, b)
+",
+        "terminal_while_else_conjunction_return_copies.py",
+    );
+}
+
+#[test]
 fn constant_loop_bridges_preserve_small_return_line_events() {
     for prefix in ["", "async "] {
         for returned in ["x", "(x, flag)", "(x, flag, x)"] {

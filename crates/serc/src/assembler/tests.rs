@@ -2253,6 +2253,487 @@ fn mapping_capture_rotations_require_complete_unchanged_same_line_shapes() {
 }
 
 #[test]
+fn while_else_conjunction_footer_requires_exact_ordered_failure_edges() {
+    let failure = super::Label(0);
+    let end = super::Label(1);
+    let first_location = SourceLocation::new(10, 10, 15, 20);
+    let second_location = SourceLocation::new(11, 11, 19, 24);
+    let conditions = [
+        (first_location, POP_JUMP_IF_FALSE),
+        (second_location, POP_JUMP_IF_TRUE),
+    ];
+    let mut break_jump = Instruction::new(
+        JUMP_FORWARD,
+        Operand::Forward(end),
+        SourceLocation::new(6, 6, 12, 17),
+        Some(0),
+    );
+    break_jump.fusion_policy.mark_authored_break();
+    break_jump.jump_policy.prevent_threading_target();
+    break_jump.jump_policy.retain_nop_for_direct_target();
+    break_jump.add_pre_fold_extra_instructions(1);
+    let first = Instruction::new(
+        POP_JUMP_IF_FALSE,
+        Operand::Forward(failure),
+        first_location,
+        Some(0),
+    );
+    let second = Instruction::new(
+        POP_JUMP_IF_TRUE,
+        Operand::Forward(failure),
+        second_location,
+        Some(0),
+    );
+    for mutation in [
+        "original",
+        "swapped conditions",
+        "wrong polarity",
+        "missing condition",
+        "extra condition",
+        "foreign jump",
+        "shared break target",
+        "second break",
+        "condition depth",
+        "hidden condition slot",
+        "condition location policy",
+        "condition owner",
+        "condition jump policy",
+        "condition fusion policy",
+        "condition early admission",
+        "footer owner",
+        "break policy",
+        "folded target",
+        "missing original boundary",
+        "extra footer alias",
+        "singleton",
+        "singleton foreign policies",
+    ] {
+        let mut changed = second;
+        match mutation {
+            "wrong polarity" => changed.opcode = POP_JUMP_IF_FALSE,
+            "shared break target" => changed.set_operand(Operand::Forward(end)),
+            "condition depth" => {
+                changed =
+                    Instruction::new(second.opcode, second.operand(), second.location, Some(1));
+            }
+            "hidden condition slot" => changed.local_policy.add_hidden_exception_owner_slots(1),
+            "condition location policy" => changed.no_location_policy.preserve_location(),
+            "condition owner" => changed.set_exception_owner(NormalizedExceptionOwner::Absent),
+            "condition jump policy" => changed.jump_policy.prevent_threading_target(),
+            "condition fusion policy" => {
+                changed.fusion_policy.allow_transitive_small_exit_inlining();
+            }
+            "condition early admission" => changed.early_boolean_admissions.append(true),
+            _ => {}
+        }
+        let mut items = vec![
+            Item::Instruction(break_jump),
+            Item::Instruction(first),
+            Item::Instruction(changed),
+            Item::Instruction(Instruction::new(
+                POP_TOP,
+                Operand::Value(0),
+                SourceLocation::new(12, 12, 12, 19),
+                Some(0),
+            )),
+            Item::Label(failure),
+            Item::Label(end),
+        ];
+        if matches!(mutation, "break policy" | "singleton foreign policies") {
+            let Item::Instruction(jump) = &mut items[0] else {
+                unreachable!()
+            };
+            jump.jump_policy.defer_removal();
+        }
+        if matches!(mutation, "footer owner" | "singleton foreign policies") {
+            let Item::Instruction(pop) = &mut items[3] else {
+                unreachable!()
+            };
+            pop.set_exception_owner(NormalizedExceptionOwner::Absent);
+        }
+        if mutation == "singleton foreign policies" {
+            let Item::Instruction(condition) = &mut items[1] else {
+                unreachable!()
+            };
+            condition.set_exception_owner(NormalizedExceptionOwner::Absent);
+            condition.early_boolean_admissions.append(true);
+        }
+        match mutation {
+            "swapped conditions" => items.swap(1, 2),
+            "missing condition" | "singleton" | "singleton foreign policies" => {
+                items.remove(2);
+            }
+            "extra condition" => items.insert(3, Item::Instruction(second)),
+            "foreign jump" => items.insert(
+                3,
+                Item::Instruction(Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(failure),
+                    second_location,
+                    Some(0),
+                )),
+            ),
+            "second break" => items.insert(1, Item::Instruction(break_jump)),
+            "extra footer alias" => items.push(Item::Label(super::Label(2))),
+            _ => {}
+        }
+        let mut assembler = Assembler::from_linear_items(items);
+        assembler.record_exception_owner_block_boundary(failure);
+        if mutation == "folded target" {
+            assembler.folded_away_condition_targets.insert(failure);
+        } else if mutation == "missing original boundary" {
+            assembler
+                .exception_owner_provenance
+                .source_boundaries
+                .remove(&failure);
+        }
+        let original_items = assembler.linear_items().to_vec();
+        assert_eq!(
+            assembler.at_original_while_else_break_conjunction_join(&conditions),
+            mutation == "original",
+            "{mutation}",
+        );
+        if matches!(mutation, "singleton" | "singleton foreign policies") {
+            assert!(assembler.at_original_while_else_break_join(first_location));
+        }
+        assert_eq!(assembler.linear_items(), original_items, "{mutation}");
+    }
+}
+
+#[test]
+fn sync_for_else_finally_exit_requires_exact_producer_and_records() {
+    for version in [crate::PythonVersion::Py314, crate::PythonVersion::Py315] {
+        for mutation in [
+            "intact",
+            "legacy 312",
+            "legacy 313",
+            "missing producer",
+            "wrong producer depth",
+            "missing source boundary",
+            "extra alias",
+            "repeated end",
+            "folded end",
+            "omitted nop",
+            "borrow alias",
+            "foreign edge",
+            "extra break",
+            "break policy",
+            "break owner",
+            "break hidden slot",
+            "break folded slot",
+            "cleanup owner",
+            "call owner",
+            "call policy",
+            "exit owner",
+            "exit policy",
+            "exit location",
+            "outer owner",
+        ] {
+            let mut assembler = Assembler::with_python_version(version);
+            let end = assembler.label();
+            let target = assembler.label();
+            let else_entry = assembler.label();
+            let break_location = SourceLocation::new(5, 5, 12, 17);
+            let call_location = SourceLocation::new(7, 7, 8, 17);
+            let slots = 1 + u32::from(version == crate::PythonVersion::Py315);
+            let depth = slots;
+            assembler.set_location(break_location);
+            for remaining in (0..slots).rev() {
+                assembler.emit_with_depth(
+                    POP_TOP,
+                    0,
+                    depth + remaining,
+                    if mutation == "cleanup owner" {
+                        ExceptionPolicy::EXCLUDE_ALWAYS
+                    } else {
+                        ExceptionPolicy::default()
+                    },
+                );
+            }
+            let authored = assembler.emit_forward_with_depth(
+                JUMP_FORWARD,
+                end,
+                depth,
+                ExceptionPolicy::default(),
+            );
+            assembler.mark_jump_as_authored_break(authored);
+            assembler.prevent_jump_threading_target(authored);
+            let jump = assembler.emitted_jump_mut(authored, "mutating the break control");
+            match mutation {
+                "break policy" => jump.jump_policy.defer_removal(),
+                "break owner" => jump.set_exception_owner(NormalizedExceptionOwner::Absent),
+                "break hidden slot" => jump.local_policy.add_hidden_exception_owner_slots(1),
+                "break folded slot" => jump.add_pre_fold_extra_instructions(1),
+                _ => {}
+            }
+            if matches!(mutation, "foreign edge" | "extra break") {
+                let extra = assembler.emit_forward_with_depth(
+                    if mutation == "foreign edge" {
+                        POP_JUMP_IF_FALSE
+                    } else {
+                        JUMP_FORWARD
+                    },
+                    end,
+                    depth,
+                    ExceptionPolicy::default(),
+                );
+                if mutation == "extra break" {
+                    assembler.mark_jump_as_authored_break(extra);
+                    assembler.prevent_jump_threading_target(extra);
+                }
+            }
+            if mutation == "repeated end" {
+                assembler.mark(end);
+            }
+            assembler.mark(else_entry);
+            assembler.set_location(call_location);
+            assembler.emit_with_depth(CALL, 0, depth + 1, ExceptionPolicy::default());
+            let call_pop = assembler.emit_with_depth(
+                POP_TOP,
+                0,
+                depth,
+                if mutation == "call owner" {
+                    ExceptionPolicy::EXCLUDE_ALWAYS
+                } else {
+                    ExceptionPolicy::default()
+                },
+            );
+            if mutation == "call policy" {
+                assembler
+                    .emitted_instruction_mut(call_pop, "mutating the donor control")
+                    .fusion_policy
+                    .prevent_with_next();
+            }
+            if mutation == "extra alias" {
+                let alias = assembler.label();
+                assembler.mark(alias);
+            }
+            assembler.record_exception_owner_block_boundary(end);
+            if mutation != "missing producer" {
+                assembler.record_sync_for_else_end(
+                    end,
+                    depth + u32::from(mutation == "wrong producer depth"),
+                );
+            }
+            assembler.mark(end);
+            match mutation {
+                "missing source boundary" => {
+                    assembler
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .remove(&end);
+                }
+                "folded end" => {
+                    assembler.folded_away_condition_targets.insert(end);
+                }
+                "omitted nop" => {
+                    assembler
+                        .exception_owner_provenance
+                        .omitted_nop_counts
+                        .insert(end, 1);
+                }
+                "borrow alias" => {
+                    assembler.borrow_block_aliases.insert(end);
+                }
+                "outer owner" => {
+                    assembler.add_exception_region(else_entry, target, target, depth, false);
+                }
+                _ => {}
+            }
+            let exit = assembler.emit_forward_with_depth(
+                JUMP_FORWARD,
+                target,
+                depth,
+                if mutation == "exit owner" {
+                    ExceptionPolicy::EXCLUDE_ALWAYS
+                } else {
+                    ExceptionPolicy::default()
+                },
+            );
+            match mutation {
+                "exit policy" => {
+                    assembler
+                        .emitted_jump_mut(exit, "mutating the exit control")
+                        .no_location_policy
+                        .allow_block_inlining();
+                }
+                "exit location" => {
+                    assembler
+                        .emitted_jump_mut(exit, "mutating the exit control")
+                        .location = break_location;
+                }
+                "legacy 312" => assembler.python_version = crate::PythonVersion::Py312,
+                "legacy 313" => assembler.python_version = crate::PythonVersion::Py313,
+                _ => {}
+            }
+            let original = assembler.linear_items().to_vec();
+            assembler.preserve_sync_for_else_finally_exit(exit, break_location, call_location);
+            if mutation != "intact" {
+                assert_eq!(assembler.linear_items(), original, "{version:?}/{mutation}");
+                continue;
+            }
+            let retained = assembler.emitted_jump_mut(exit, "checking the certified exit");
+            assert!(retained.jump_policy.is_original_empty_join());
+            assert!(retained.jump_policy.preserves_nop_after_threading());
+            assert!(retained.jump_policy.allows_threading_target());
+            // The ordinary finalizer borrowing rule still runs after this request.
+            retained.jump_policy.mark_borrow_empty_block();
+            assembler.mark(target);
+            assembler.set_location(SourceLocation::new(8, 8, 4, 10));
+            assembler.emit_with_depth(LOAD_CONST, 0, depth + 1, ExceptionPolicy::default());
+            assembler.emit_with_depth(RETURN_VALUE, 0, depth, ExceptionPolicy::default());
+            let mut pipeline = assembler.into_optimization_pipeline();
+            pipeline.thread_forward_jumps();
+            assert!(
+                pipeline.graph.iter_items().any(|item| {
+                    matches!(item, Item::Instruction(jump)
+                    if jump.fusion_policy.is_authored_break()
+                        && jump.operand() == Operand::Forward(target))
+                }),
+                "the break must bypass the original donor block on {version:?}"
+            );
+            // Match the production early pass that resolves deferred retention.
+            pipeline.remove_redundant_forward_jumps(false);
+            pipeline.remove_redundant_forward_jumps(true);
+            pipeline.remove_redundant_nops();
+            let donor_opcodes = pipeline
+                .graph
+                .iter_items()
+                .filter_map(|item| match item {
+                    Item::Instruction(instruction) if instruction.location == call_location => {
+                        Some(instruction.opcode)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(donor_opcodes, [CALL, POP_TOP, NOP], "{version:?}");
+        }
+    }
+}
+
+#[test]
+fn class_failure_return_join_requires_original_pop_and_class_edges() {
+    for mutation in [
+        "intact",
+        "legacy",
+        "extra join edge",
+        "wrong condition",
+        "missing class fold slots",
+        "foreign pop owner",
+        "wrong pop depth",
+        "extra alias",
+        "missing match boundary",
+        "omitted join nop",
+        "extra class edge",
+        "reversed patterns",
+        "foreign exit owner",
+    ] {
+        let mut assembler = Assembler::with_python_version(if mutation == "legacy" {
+            crate::PythonVersion::Py313
+        } else {
+            crate::PythonVersion::Py314
+        });
+        let failure = assembler.label();
+        let zero_pop = assembler.label();
+        let end = assembler.label();
+        let target = assembler.label();
+        let mut patterns = vec![
+            (SourceLocation::new(3, 3, 13, 36), 0),
+            (SourceLocation::new(3, 3, 26, 35), 0),
+        ];
+        if mutation == "extra join edge" {
+            assembler.set_location(patterns[0].0);
+            assembler.emit_forward_with_depth(
+                POP_JUMP_IF_FALSE,
+                zero_pop,
+                0,
+                ExceptionPolicy::default(),
+            );
+        }
+        for &(location, positional) in &patterns {
+            assembler.set_location(location);
+            assembler.emit_with_depth(MATCH_CLASS, positional, 1, ExceptionPolicy::default());
+            assembler.emit_with_depth(COPY, 1, 2, ExceptionPolicy::default());
+            if mutation != "missing class fold slots" {
+                assembler.add_last_hidden_exception_owner_slots(2);
+            }
+            assembler.emit_forward_with_depth(
+                if mutation == "wrong condition" {
+                    POP_JUMP_IF_FALSE
+                } else {
+                    POP_JUMP_IF_NONE
+                },
+                failure,
+                1,
+                ExceptionPolicy::default(),
+            );
+            assembler.emit_with_depth(NOT_TAKEN, 0, 1, ExceptionPolicy::default());
+        }
+        if mutation == "extra class edge" {
+            assembler.emit_forward_with_depth(
+                POP_JUMP_IF_NONE,
+                failure,
+                1,
+                ExceptionPolicy::default(),
+            );
+        }
+        assembler.set_location(SourceLocation::new(4, 4, 19, 23));
+        assembler.emit_with_depth(RETURN_VALUE, 0, 0, ExceptionPolicy::default());
+        assembler.mark(failure);
+        assembler.set_location(patterns[0].0);
+        assembler.emit_with_depth(
+            POP_TOP,
+            0,
+            u32::from(mutation == "wrong pop depth"),
+            if mutation == "foreign pop owner" {
+                ExceptionPolicy::EXCLUDE_ALWAYS
+            } else {
+                ExceptionPolicy::default()
+            },
+        );
+        assembler.mark(zero_pop);
+        if mutation == "extra alias" {
+            let extra = assembler.label();
+            assembler.mark(extra);
+        }
+        if mutation == "missing match boundary" {
+            assembler.mark(end);
+        } else {
+            assembler.mark_original_match_join(end);
+        }
+        if mutation == "omitted join nop" {
+            assembler
+                .exception_owner_provenance
+                .omitted_nop_counts
+                .insert(end, 1);
+        }
+        let exit = assembler.emit_forward_with_depth(
+            JUMP_FORWARD,
+            target,
+            0,
+            if mutation == "foreign exit owner" {
+                ExceptionPolicy::EXCLUDE_ALWAYS
+            } else {
+                ExceptionPolicy::default()
+            },
+        );
+        if mutation == "reversed patterns" {
+            patterns.reverse();
+        }
+        let original = assembler.linear_items().to_vec();
+        assembler.preserve_class_match_failure_return_join(exit, &patterns);
+        if mutation == "intact" {
+            let jump = assembler.emitted_jump_mut(exit, "checking certified failure exit");
+            assert!(jump.jump_policy.is_original_empty_join());
+            assert!(jump.jump_policy.preserves_nop_after_threading());
+            assert_eq!(assembler.linear_items().len(), original.len());
+        } else {
+            assert_eq!(assembler.linear_items(), original, "{mutation}");
+        }
+    }
+}
+
+#[test]
 fn shared_match_failure_join_requires_original_aliases_and_equal_depths() {
     let failure = super::Label(0);
     let end = super::Label(1);
@@ -3095,6 +3576,165 @@ fn threads_unconditional_forward_jumps_without_conditional_jumps() {
         })
         .unwrap();
     assert!(matches!(first.operand(), Operand::Forward(label) if label == final_target));
+}
+
+#[test]
+fn folded_condition_loop_tails_require_original_provenance_before_threading() {
+    for version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        for source_opcode in [JUMP_FORWARD, JUMP_BACKWARD_NO_INTERRUPT] {
+            for case in [
+                "excluded condition",
+                "default policy",
+                "missing marker",
+                "source in another array",
+                "different marker span",
+                "while source boundary",
+                "while exit anchor",
+                "ambiguous sources",
+                "changed exception owner",
+                "changed jump policy",
+                "changed location policy",
+                "hidden original slot",
+                "hidden owner slot",
+            ] {
+                let mut assembler = Assembler {
+                    python_version: version,
+                    ..Assembler::default()
+                };
+                let head = assembler.label();
+                let incoming = assembler.label();
+                let continuation = assembler.label();
+                let marker = assembler.label();
+                let fallthrough = assembler.label();
+                let discarded = assembler.label();
+                let end = assembler.label();
+                let location = SourceLocation::new(20, 21, 8, 19);
+                assembler.record_folded_condition_predecessor(discarded);
+                if case == "while exit anchor" {
+                    assembler.record_folded_loop_exit_anchor(discarded);
+                }
+                if case == "source in another array" {
+                    let foreign = assembler.label();
+                    let foreign_end = assembler.label();
+                    assembler.mark(foreign);
+                    assembler.set_location(location);
+                    assembler.emit_with_depth(NOP, 0, 1, ExceptionPolicy::default());
+                    assembler.record_folded_predecessor_source(foreign, discarded);
+                    assembler.mark(foreign_end);
+                    let removed = assembler.take_trailing_nop_location().unwrap();
+                    assert_eq!(removed.original_slots, 0);
+                    assembler.emit_with_depth(LOAD_CONST, 0, 2, ExceptionPolicy::default());
+                    assembler.emit_with_depth(POP_TOP, 0, 1, ExceptionPolicy::default());
+                }
+                assembler.mark(head);
+                assembler.record_exception_owner_block_boundary(head);
+                assembler.set_location(SourceLocation::new(2, 2, 4, 12));
+                assembler.emit_forward_with_depth(FOR_ITER, end, 2, ExceptionPolicy::default());
+                assembler.mark(incoming);
+                let source = Instruction::new(
+                    source_opcode,
+                    Operand::Forward(continuation),
+                    SourceLocation::new(10, 10, 8, 15),
+                    Some(1),
+                );
+                assembler.push_linear_item(Item::Instruction(source));
+                assembler.mark(continuation);
+                assembler.record_exception_owner_block_boundary(continuation);
+                assembler.mark(marker);
+                if case == "while source boundary" {
+                    assembler.record_exception_owner_block_boundary(marker);
+                }
+                let second_marker = (case == "ambiguous sources").then(|| assembler.label());
+                if let Some(second_marker) = second_marker {
+                    assembler.mark(second_marker);
+                }
+                assembler.set_location(location);
+                assembler.emit_with_depth(NOP, 0, 1, ExceptionPolicy::default());
+                if !matches!(
+                    case,
+                    "default policy" | "missing marker" | "source in another array"
+                ) {
+                    assembler.record_folded_predecessor_source(marker, discarded);
+                }
+                if let Some(second_marker) = second_marker {
+                    assembler.record_folded_predecessor_source(second_marker, discarded);
+                }
+                assembler.record_exception_owner_block_boundary(fallthrough);
+                assembler.mark(fallthrough);
+                // Exercise the same early NOP removal that exposes the loop backedge.
+                // Reuse this IR on legacy targets to check that the new policy stays modern.
+                let removed = assembler.take_trailing_nop_location().unwrap();
+                assert_eq!(removed.location, location);
+                assert_eq!(removed.original_slots, 0);
+                let tail_location = if case == "different marker span" {
+                    SourceLocation::new(20, 21, 9, 19)
+                } else {
+                    removed.location
+                };
+                let mut tail = Instruction::new(
+                    JUMP_BACKWARD,
+                    Operand::Backward(head),
+                    tail_location,
+                    Some(1),
+                );
+                tail.set_exception_policy(if case == "default policy" {
+                    ExceptionPolicy::default()
+                } else {
+                    ExceptionPolicy::EXCLUDE_ALWAYS
+                });
+                match case {
+                    "changed exception owner" => {
+                        tail.set_exception_policy(ExceptionPolicy::AlwaysAbsent);
+                    }
+                    "changed jump policy" => tail.jump_policy.prevent_small_exit_inlining(),
+                    "changed location policy" => tail.no_location_policy.preserve_location(),
+                    "hidden original slot" => tail.add_pre_fold_extra_instructions(1),
+                    "hidden owner slot" => tail.local_policy.add_hidden_exception_owner_slots(1),
+                    _ => {}
+                }
+                assembler.push_linear_item(Item::Instruction(tail));
+                assembler.mark(discarded);
+                assembler.mark(end);
+                assembler.emit_with_depth(RETURN_VALUE, 0, 0, ExceptionPolicy::default());
+
+                let mut pipeline = assembler.into_optimization_pipeline();
+                let source_block = pipeline.graph.label_block(incoming).unwrap();
+                let tail_block = pipeline.graph.label_block(continuation).unwrap();
+                let original_tail = pipeline.graph[tail_block].items().to_vec();
+                let retained = case == "default policy"
+                    || (case == "excluded condition" && version >= crate::PythonVersion::Py314);
+                assert_eq!(
+                    pipeline.thread_forward_jumps(),
+                    !retained,
+                    "{version:?}, {source_opcode:?}, {case}",
+                );
+                let mut expected = source;
+                if !retained {
+                    expected.retarget(Operand::Backward(head));
+                    expected.opcode = JUMP_BACKWARD;
+                    expected.add_pre_fold_extra_instructions(1);
+                    if source_opcode != JUMP_FORWARD {
+                        expected.jump_policy.mark_interruptible();
+                    }
+                }
+                assert_eq!(
+                    pipeline.graph[source_block].last_instruction(),
+                    Some(&expected),
+                    "incoming jump: {version:?}, {source_opcode:?}, {case}",
+                );
+                assert_eq!(
+                    pipeline.graph[tail_block].items(),
+                    original_tail,
+                    "tail array: {version:?}, {source_opcode:?}, {case}",
+                );
+            }
+        }
+    }
 }
 
 #[test]

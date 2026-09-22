@@ -194,3 +194,40 @@ fn matches_cpython_pending_values_before_direct_finally_returns() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_pending_return_through_conditional_finalizer_break() {
+    for (filename, source) in [
+        (
+            "pending_return_conditional_finalizer_break.py",
+            r"def f(items, value, stop):
+    for item in items:
+        try:
+            value += item
+            if item < 0:
+                break
+            return value
+        finally:
+            if stop:
+                break
+            return value
+    return None
+",
+        ),
+        (
+            "pending_call_conditional_finalizer_break.py",
+            r"def f(items, factory, value, stop):
+    for item in items:
+        try:
+            return factory()
+        finally:
+            if stop:
+                break
+            return value
+    return None
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -409,3 +409,37 @@ fn keeps_match_manager_donor_boundaries() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn preserves_class_failure_join_before_outer_literal_return() {
+    for (filename, source) in [
+        (
+            "class_failure_outer_return.py",
+            r"def f(flag, subject):
+    if flag:
+        match subject:
+            case Item():
+                return True
+    elif subject:
+        return True
+    return False
+",
+        ),
+        (
+            "nested_class_failure_after_returning_prefix.py",
+            r"def f(flag, subject, probe):
+    if flag:
+        if probe(subject):
+            return False
+        match subject:
+            case Item(parent=Parent()):
+                return True
+    elif subject:
+        return True
+    return False
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
