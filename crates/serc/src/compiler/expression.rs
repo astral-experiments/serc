@@ -1627,6 +1627,10 @@ impl Compiler<'_> {
                 .empty_success_blocks
                 .append(&mut alternative_context.empty_success_blocks);
 
+            // Capture reordering belongs to the whole alternative, rather than
+            // the last nested pattern compiled above.
+            self.assembler
+                .set_location(self.source_location(alternative.range()));
             if index != 0 {
                 let control = control.as_ref().unwrap();
                 if alternative_context.stores.len() != control.len() {
@@ -1662,8 +1666,6 @@ impl Compiler<'_> {
                 }
             }
 
-            self.assembler
-                .set_location(self.source_location(alternative.range()));
             let success_starts_block = self
                 .assembler
                 .instruction_opcode_at(self.assembler.instruction_count() - 1)
