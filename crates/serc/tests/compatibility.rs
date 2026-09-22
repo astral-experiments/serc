@@ -442,6 +442,21 @@ def paired_classes(value):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_or_pattern_failure_cleanup_boundaries() {
+        for (pattern, guard) in [
+            ("([capture] | [_, capture]) as whole", ""),
+            ("([capture] | [_, capture]) as whole", " if subject"),
+            ("(([capture] | [_, capture]) as middle) as whole", ""),
+            ("(0 | 1) as whole", ""),
+        ] {
+            let source = format!(
+                "def capture(subject):\n    match subject:\n        case {pattern}{guard}:\n            pass\n        case _:\n            return subject\n"
+            );
+            assert_matches_cpython_marshal(&source, "or_pattern_failure_cleanup.py");
+        }
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_match_success_next_locations() {
         let source = r"def tuple_result(subject):
     match subject:
