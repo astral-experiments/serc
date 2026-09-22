@@ -32,7 +32,7 @@ use super::constant::{
     two_element_slice_optimization,
 };
 use super::expression::{
-    binary_operator, comparison_operator, early_condition_truthiness,
+    binary_operator, comparison_operator, early_condition_truthiness, expression_contains_yield,
     expression_suspends_current_scope, jump_constant_truthiness, optimized_generator_callable,
     optimized_generator_callable_for_target,
 };
@@ -14713,10 +14713,21 @@ impl Compiler<'_> {
                     if unary.op == UnaryOp::Not
                         && matches!(unary.operand.as_ref(), Expr::BoolOp(boolean)
                             if boolean.op == BoolOp::And));
+        // A conditional expression also has one authored success edge per runtime arm.
+        // Keep its shared unlocated exit until each edge receives a located backedge copy.
+        let success_conditional = non_final_branch
+            && statement.msg.is_none()
+            && matches!(statement.test.as_ref(), Expr::If(conditional)
+                if [&conditional.test, &conditional.body, &conditional.orelse]
+                    .into_iter()
+                    .all(|operand| condition_has_only_runtime_tests(operand)
+                        && !expression_contains_inline_branch(operand)
+                        && !expression_suspends_current_scope(operand)
+                        && !expression_contains_yield(operand)));
         let copy_success_backedge = non_final_branch
-            && success_disjunction
             && condition_jump_target_count(&statement.test, true) > 1
-            && condition_has_linear_runtime_leaves(&statement.test);
+            && (success_conditional
+                || (success_disjunction && condition_has_linear_runtime_leaves(&statement.test)));
         let original_try_exit = statement.msg.is_none()
             && self.preserves_original_try_loop_tail_exit(&statement.test, restart, false);
         if (non_final_branch || original_try_exit)
