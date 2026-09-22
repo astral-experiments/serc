@@ -757,3 +757,5 @@ mod shared_handler_cleanup_copies;
 mod normal_try_discard_copies;
 
 mod non_final_loop_exit_barriers;
+
+mod match_tuple_tail_wrappers;

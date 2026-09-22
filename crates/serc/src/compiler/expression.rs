@@ -911,7 +911,10 @@ impl Compiler<'_> {
                                     .control
                                     .statements
                                     .match_successor_fills_small_exit_copy_budget
-                                    && match_case_has_nested_jump_predecessor(tail))
+                                    && match_case_has_nested_jump_predecessor(
+                                        tail,
+                                        self.can_descend_match_tail_wrappers(),
+                                    ))
                                 && early_condition_truthiness(&tail.test).is_none()
                                 && (tail
                                     .elif_else_clauses
@@ -9336,7 +9339,10 @@ pub(super) fn comparison_operator_boolean(
 }
 
 /// Finds earlier case arms whose nested conditional retains an original jump into the join.
-fn match_case_has_nested_jump_predecessor(statement: &ruff_python_ast::StmtIf) -> bool {
+fn match_case_has_nested_jump_predecessor(
+    statement: &ruff_python_ast::StmtIf,
+    allow_wrapper_descent: bool,
+) -> bool {
     std::iter::once(statement.body.as_slice())
         .chain(
             statement
@@ -9349,6 +9355,18 @@ fn match_case_has_nested_jump_predecessor(statement: &ruff_python_ast::StmtIf) -
             let Some(Stmt::If(nested)) = body.last() else {
                 return false;
             };
+            let mut nested = nested;
+            // Runtime ifs without an else emit no exit jump. Their tail labels
+            // alias the nested conditional's original join before exit copying.
+            while allow_wrapper_descent
+                && nested.elif_else_clauses.is_empty()
+                && early_condition_truthiness(&nested.test).is_none()
+            {
+                let Some(Stmt::If(tail)) = nested.body.last() else {
+                    return false;
+                };
+                nested = tail;
+            }
             !nested.elif_else_clauses.is_empty()
                 && early_condition_truthiness(&nested.test).is_none()
                 && std::iter::once(nested.body.as_slice())

@@ -13577,6 +13577,33 @@ impl Compiler<'_> {
             && self.control.finally.active_overriding_finally_returns == 0
     }
 
+    /// Keeps match-tail alias descent within an ordinary, unprotected return budget.
+    pub(super) fn can_descend_match_tail_wrappers(&self) -> bool {
+        self.context.python_version >= crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && !self.has_active_control_flow_region()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self
+                .control
+                .finally
+                .active_return_finally_contexts
+                .is_empty()
+            && self
+                .control
+                .finally
+                .preserved_return_value_contexts
+                .is_empty()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_overriding_finally_returns == 0
+    }
+
     fn has_active_control_flow_region(&self) -> bool {
         self.control.generators.generator_region_start.is_some()
             || !self.control.withs.active_with_region_exclusions.is_empty()
