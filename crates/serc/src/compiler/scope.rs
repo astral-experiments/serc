@@ -345,6 +345,7 @@ pub(super) struct ScopeBodyFacts {
     pub(super) nested_generator_requirements: BTreeSet<String>,
     pub(super) nested_annotation_scope_requirements: BTreeSet<String>,
     nested_annotation_class_closure: bool,
+    annotation_comprehension_requirements: AnnotationComprehensionRequirements,
     pub(super) generator_named_targets: FxHashSet<String>,
     pub(super) inlined_comprehension_cellvars: FxHashSet<String>,
     pub(super) has_function_definition: bool,
@@ -867,6 +868,7 @@ impl ClassPlan {
             nested_generator_requirements,
             nested_annotation_scope_requirements: annotation_scope_requirements,
             nested_annotation_class_closure,
+            annotation_comprehension_requirements,
             has_function_definition,
             has_generic_definition,
             has_type_alias,
@@ -973,9 +975,26 @@ impl ClassPlan {
         }
         required.remove("__conditional_annotations__");
 
+        let comprehension_needs_class = annotation_comprehension_requirements
+            .captures
+            .contains("__class__")
+            || annotation_comprehension_requirements.first_iterable_needs_class
+                && !is_global("__class__");
+        // The annotation captures the class being defined, not an outer __class__ binding.
+        if comprehension_needs_class && !locals.nonlocals.contains("__class__") {
+            required.remove("__class__");
+        }
+        // Separate comprehensions skip class bindings when capturing enclosing locals.
         let needs_class_closure = child_needs_class_closure
             || nested_lambda_requirements.contains("__class__")
-            || nested_annotation_class_closure;
+            || nested_annotation_class_closure
+            || comprehension_needs_class;
+        required.extend(
+            annotation_comprehension_requirements
+                .captures
+                .into_iter()
+                .filter(|name| name != "__class__"),
+        );
         let needs_classdict = has_type_alias
             || has_generic_definition
             || deferred_annotations
@@ -1082,6 +1101,7 @@ pub(super) struct ScopeArena {
     nodes: Vec<ScopeNode>,
     by_parent_and_origin: FxHashMap<(ScopeId, ScopeOrigin), ScopeId>,
     deferred_annotations: bool,
+    python_version: PythonVersion,
 }
 
 #[derive(Debug, Default)]
@@ -1168,6 +1188,7 @@ impl Default for ScopeArena {
             }],
             by_parent_and_origin: FxHashMap::default(),
             deferred_annotations: true,
+            python_version: PythonVersion::Py314,
         }
     }
 }
@@ -1201,6 +1222,7 @@ impl ScopeArena {
         let mut arena = Self {
             names: NameInterner::seeded(&SCOPE_SEED_NAMES),
             deferred_annotations,
+            python_version,
             ..Self::default()
         };
         // The name walk also records scope definitions in preorder. Allocating their nodes first
@@ -1347,11 +1369,16 @@ impl ScopeArena {
         future_annotations: bool,
         enclosing_private_name: Option<&str>,
     ) {
-        let facts = if !self.deferred_annotations && !future_annotations {
+        let mut facts = if !self.deferred_annotations && !future_annotations {
             ScopeBodyFactsCollector::collect(&definition.body, false, ScopeBodyContext::Class, true)
         } else {
             ScopeBodyFacts::for_class(&definition.body, future_annotations)
         };
+        if self.python_version == PythonVersion::Py312 {
+            // Python 3.12 rejects comprehensions in class-visible annotation scopes.
+            facts.annotation_comprehension_requirements =
+                AnnotationComprehensionRequirements::default();
+        }
         let (method_requirements, method_annotation_references) =
             self.nested_function_requirements(id);
         let nested_class_requirements = self.nested_class_requirements(id);
@@ -3006,6 +3033,49 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
         collector.facts
     }
 
+    fn collect_annotation_comprehensions(
+        &mut self,
+        expression: &Expr,
+        type_params: Option<&ruff_python_ast::TypeParams>,
+    ) {
+        if !self.collect_function_scope_facts {
+            let requirements = annotation_comprehension_requirements(expression);
+            let is_type_parameter = |name: &str| {
+                type_params.is_some_and(|parameters| {
+                    parameters
+                        .iter()
+                        .any(|parameter| parameter.name().as_str() == name)
+                })
+            };
+            self.facts
+                .annotation_comprehension_requirements
+                .first_iterable_needs_class |=
+                requirements.first_iterable_needs_class && !is_type_parameter("__class__");
+            self.facts
+                .annotation_comprehension_requirements
+                .captures
+                .extend(
+                    requirements
+                        .captures
+                        .into_iter()
+                        .filter(|name| !is_type_parameter(name)),
+                );
+        }
+    }
+
+    fn collect_type_parameter_comprehensions(&mut self, parameters: &ruff_python_ast::TypeParams) {
+        for parameter in parameters {
+            if let TypeParam::TypeVar(parameter) = parameter
+                && let Some(bound) = &parameter.bound
+            {
+                self.collect_annotation_comprehensions(bound, Some(parameters));
+            }
+            if let Some(default) = parameter.default() {
+                self.collect_annotation_comprehensions(default, Some(parameters));
+            }
+        }
+    }
+
     fn collect_function_header(&mut self, definition: &'ast StmtFunctionDef) {
         if !self.skip_annotations && !self.eager_function_annotations {
             for annotation in function_annotation_expressions(definition) {
@@ -3019,6 +3089,16 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
                                     .any(|parameter| parameter.name().as_str() == name)
                             })
                         }),
+                );
+            }
+        }
+        if !self.skip_annotations
+            && (!self.eager_function_annotations || definition.type_params.is_some())
+        {
+            for annotation in function_annotation_expressions(definition) {
+                self.collect_annotation_comprehensions(
+                    annotation,
+                    definition.type_params.as_deref(),
                 );
             }
         }
@@ -3065,6 +3145,7 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
             return;
         };
         self.facts.has_generic_definition = true;
+        self.collect_type_parameter_comprehensions(type_params);
         let type_names: BTreeSet<_> = type_params
             .iter()
             .map(|parameter| parameter.name().as_str().to_string())
@@ -3115,6 +3196,7 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
             return;
         };
         self.facts.has_generic_definition = true;
+        self.collect_type_parameter_comprehensions(type_params);
         let type_names: BTreeSet<_> = type_params
             .iter()
             .map(|parameter| parameter.name().as_str().to_string())
@@ -3122,9 +3204,11 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
         let mut required = type_parameter_required_names(type_params);
         if let Some(arguments) = definition.arguments.as_deref() {
             for argument in &arguments.args {
+                self.collect_annotation_comprehensions(argument, Some(type_params));
                 required.extend(expression_required_names(argument));
             }
             for keyword in &arguments.keywords {
+                self.collect_annotation_comprehensions(&keyword.value, Some(type_params));
                 required.extend(expression_required_names(&keyword.value));
             }
         }
@@ -3160,6 +3244,10 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
                 .any(|expression| {
                     nested_expression_required_names(expression).contains("__class__")
                 });
+        }
+        self.collect_annotation_comprehensions(&statement.value, statement.type_params.as_deref());
+        if let Some(parameters) = statement.type_params.as_deref() {
+            self.collect_type_parameter_comprehensions(parameters);
         }
         let mut required = expression_required_names(&statement.value);
         if let Some(type_params) = statement.type_params.as_deref() {
@@ -3233,6 +3321,9 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
             }
             Stmt::AnnAssign(annotation) => {
                 self.facts.has_annotations = true;
+                if !self.skip_annotations && !self.eager_function_annotations {
+                    self.collect_annotation_comprehensions(&annotation.annotation, None);
+                }
                 if self.skip_annotations {
                     self.visit_expr(&annotation.target);
                     if let Some(value) = &annotation.value {
@@ -3622,6 +3713,66 @@ pub(super) fn expression_required_names(expression: &Expr) -> BTreeSet<String> {
     required
 }
 
+#[derive(Debug, Default)]
+pub(super) struct AnnotationComprehensionRequirements {
+    pub(super) captures: BTreeSet<String>,
+    first_iterable_needs_class: bool,
+}
+
+/// Separate child captures from the first iterable, which uses annotation lookup rules.
+pub(super) fn annotation_comprehension_requirements(
+    expression: &Expr,
+) -> AnnotationComprehensionRequirements {
+    #[derive(Default)]
+    struct Collector(AnnotationComprehensionRequirements);
+
+    impl<'ast> Visitor<'ast> for Collector {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            let (generators, key, value) = match expression {
+                Expr::ListComp(comprehension) => {
+                    (&comprehension.generators, None, comprehension.elt.as_ref())
+                }
+                Expr::SetComp(comprehension) => {
+                    (&comprehension.generators, None, comprehension.elt.as_ref())
+                }
+                Expr::DictComp(comprehension) => (
+                    &comprehension.generators,
+                    comprehension.key.as_deref(),
+                    comprehension.value.as_ref(),
+                ),
+                Expr::Lambda(lambda) => {
+                    visit_lambda_defaults(self, lambda);
+                    return;
+                }
+                Expr::Generator(generator) => {
+                    if let Some(first) = generator.generators.first() {
+                        self.visit_expr(&first.iter);
+                    }
+                    return;
+                }
+                _ => {
+                    walk_expr(self, expression);
+                    return;
+                }
+            };
+            self.0.captures.extend(
+                comprehension_name_bindings(generators, key, value)
+                    .into_iter()
+                    .filter_map(|(name, bound)| (!bound).then_some(name)),
+            );
+            if let Some(first) = generators.first() {
+                self.visit_expr(&first.iter);
+                self.0.first_iterable_needs_class |=
+                    expression_required_names(&first.iter).contains("__class__");
+            }
+        }
+    }
+
+    let mut collector = Collector::default();
+    collector.visit_expr(expression);
+    collector.0
+}
+
 pub(super) fn expression_requirements_outside_comprehensions(
     expression: &Expr,
 ) -> BTreeSet<String> {
@@ -3684,14 +3835,16 @@ pub(super) fn inlined_comprehension_local_names_in_expression(expression: &Expr)
         .collect()
 }
 
-/// Enclosing bindings passed through an annotation to its nested lambdas and generators.
+/// Enclosing bindings passed through an annotation to its nested functions and comprehensions.
 pub(super) fn annotation_nested_required_names(expression: &Expr) -> BTreeSet<String> {
     let required =
         analyze_expression_scope(&ruff_python_ast::Parameters::default(), expression).required;
-    nested_expression_required_names(expression)
+    let mut nested: BTreeSet<_> = nested_expression_required_names(expression)
         .intersection(&required)
         .cloned()
-        .collect()
+        .collect();
+    nested.extend(annotation_comprehension_requirements(expression).captures);
+    nested
 }
 
 pub(super) fn nested_expression_required_names(expression: &Expr) -> BTreeSet<String> {

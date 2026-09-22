@@ -284,6 +284,7 @@ impl Compiler<'_> {
                 if globals.contains(name_id) {
                     if let Some(classdict) = annotation_classdict_index
                         && name != "__classdict__"
+                        && !self.class_scope_declares_global(name_id)
                     {
                         self.emit(LOAD_DEREF, classdict, 1)?;
                         let name = self.annotation_mangled_name(name);

@@ -1373,6 +1373,7 @@ impl Compiler<'_> {
         local_names.retain(|name| seen.insert(name.clone()));
         let locals = self.name_ids(&local_names);
         let required_names = self.name_ids(expression_required_names(expression));
+        let nested_requirements = self.name_id_set(annotation_nested_required_names(expression));
         let outside_requirements =
             self.name_id_set(expression_requirements_outside_comprehensions(expression));
         let mut freevars: Vec<_> = required_names
@@ -1380,6 +1381,9 @@ impl Compiler<'_> {
             .filter(|name| !locals.contains(name) || outside_requirements.contains(name))
             .filter(|name| !self.unit.pending_private_type_parameters.contains(*name))
             .filter(|name| self.is_type_parameter_id(**name) || self.can_provide_closure_id(**name))
+            .filter(|name| {
+                !self.class_scope_declares_global(**name) || nested_requirements.contains(*name)
+            })
             .copied()
             .collect();
         if can_see_class_scope {
@@ -1391,7 +1395,7 @@ impl Compiler<'_> {
             .references
             .iter()
             .map(|name| self.required_name_id(name))
-            .filter(|name| !freevar_set.contains(name))
+            .filter(|name| !freevar_set.contains(name) || self.class_scope_declares_global(*name))
             .collect();
         let cellvars = self.name_id_set(inlined_cellvars);
         let plan = LoweringFunctionPlan {

@@ -3619,7 +3619,7 @@ impl Compiler<'_> {
         }
         let name_id = self.required_name_id(name.id.as_str());
         if self.unit.annotation_classdict_index.is_some()
-            && (!self.unit.annotation_thunk || !self.class_scope_declares_global(name_id))
+            && !self.class_scope_declares_global(name_id)
         {
             return Ok(SpecializedLowering::NotApplicable);
         }
@@ -3878,6 +3878,18 @@ impl Compiler<'_> {
             return Err(CompileError::Internal(
                 "comprehension has no generators".to_string(),
             ));
+        }
+        if self.unit.annotation_classdict_index.is_some()
+            && self.context.python_version >= PythonVersion::Py313
+        {
+            return self.compile_annotation_comprehension(
+                generators,
+                key,
+                value,
+                build_opcode,
+                add_opcode,
+                discard_result,
+            );
         }
         let comprehension_cell_names = comprehension_cell_names(generators, key, value);
         let base_depth = self.control.stack.depth;
@@ -4432,6 +4444,98 @@ impl Compiler<'_> {
                     i32::from(!discard_result)
                 },
         );
+        Ok(())
+    }
+
+    /// Class-visible annotation scopes keep comprehensions in a separate function.
+    fn compile_annotation_comprehension(
+        &mut self,
+        generators: &[ruff_python_ast::Comprehension],
+        key: Option<&Expr>,
+        value: &Expr,
+        build_opcode: Opcode,
+        add_opcode: Opcode,
+        discard_result: bool,
+    ) -> Result<(), CompileError> {
+        let location = self.assembler.location();
+        let name = match build_opcode {
+            BUILD_LIST => "<listcomp>",
+            BUILD_SET => "<setcomp>",
+            BUILD_MAP => "<dictcomp>",
+            _ => unreachable!("comprehension collection opcode"),
+        };
+        let mut locals = vec![".0".to_string()];
+        locals.extend(comprehension_temporary_names(generators, key, value));
+        let mut globals = FxHashSet::default();
+        let mut freevars = Vec::new();
+        for (name, bound) in comprehension_name_bindings(generators, key, value) {
+            if !bound {
+                if self.can_provide_closure(&name) {
+                    freevars.push(name);
+                } else {
+                    globals.insert(name);
+                }
+            }
+        }
+        let mut inlined_cellvars = inlined_comprehension_cell_names_in_expression(value);
+        if let Some(key) = key {
+            inlined_cellvars.extend(inlined_comprehension_cell_names_in_expression(key));
+        }
+        for (index, generator) in generators.iter().enumerate() {
+            if index > 0 {
+                inlined_cellvars.extend(inlined_comprehension_cell_names_in_expression(
+                    &generator.iter,
+                ));
+            }
+            for condition in &generator.ifs {
+                inlined_cellvars.extend(inlined_comprehension_cell_names_in_expression(condition));
+            }
+        }
+        let plan = LoweringFunctionPlan {
+            locals: self.name_ids(locals),
+            globals: self.name_id_set(globals),
+            cellvars: self.name_id_set(comprehension_cell_names(generators, key, value)),
+            inlined_comprehension_cellvars: self.name_id_set(inlined_cellvars),
+            freevars: self.name_ids(freevars),
+            ..LoweringFunctionPlan::default()
+        };
+        let mut child = Self::function(
+            Rc::clone(&self.context),
+            name,
+            self.child_qualified_name(name),
+            location.line.cast_unsigned(),
+            &plan,
+            self.unit.scope_id,
+            1,
+            0,
+            0,
+            CO_NESTED | (self.unit.flags & SUPPORTED_FUTURE_FLAGS),
+        )?;
+        child.inherit_lexical_context(self);
+        child.unit.child_qualified_name_parent = Some(child.unit.qualified_name.clone());
+        child.emit_function_prologue()?;
+        child.assembler.set_location(location);
+        child.emit(build_opcode, 0, 1)?;
+        child.emit_owned_fast(0, 1)?;
+        child.compile_comprehension_generator(generators, 0, key, value, add_opcode, 0)?;
+        child.assembler.set_location(location);
+        child.emit(RETURN_VALUE, 0, -1)?;
+        let child = child.finish_inner(false)?;
+
+        self.emit_function_with_closure(child, &plan.freevars)?;
+        if self.context.python_version == PythonVersion::Py315 {
+            self.compile_expression(&generators[0].iter)?;
+        } else {
+            self.compile_iterable_expression(&generators[0].iter)?;
+            self.assembler
+                .set_location(self.source_location(generators[0].iter.range()));
+            self.emit_comprehension_iterator(false)?;
+        }
+        self.assembler.set_location(location);
+        self.emit(CALL, 0, -1)?;
+        if discard_result {
+            self.emit(POP_TOP, 0, -1)?;
+        }
         Ok(())
     }
 
