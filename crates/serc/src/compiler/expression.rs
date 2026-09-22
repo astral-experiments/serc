@@ -8382,6 +8382,14 @@ impl Compiler<'_> {
                 && matches!(final_operator, CmpOp::Is | CmpOp::IsNot);
             if specialized_none_jump {
                 self.add_constant(Constant::None)?;
+                let none_location = self.source_location(final_comparator.range());
+                if self.context.python_version >= PythonVersion::Py314
+                    && none_location.line != self.source_location(comparison.range).line
+                {
+                    // Specializing None leaves its original operand-line cell until NOP cleanup.
+                    self.assembler.set_location(none_location);
+                    self.emit(NOP, 0, 0)?;
+                }
             } else {
                 self.compile_comparison_rhs(final_operator, final_comparator)?;
             }

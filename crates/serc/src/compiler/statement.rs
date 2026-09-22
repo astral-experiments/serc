@@ -3418,9 +3418,11 @@ impl Compiler<'_> {
                 // The final comparison's fallthrough jump becomes a located NOP when
                 // CPython copies a small terminal return or raise onto that edge.
                 let retained_chained_comparison_exit =
-                    matches!(body, [Stmt::Return(_) | Stmt::Raise(_)])
-                        .then(|| final_chained_comparison_jump(test))
-                        .flatten();
+                    (matches!(body, [Stmt::Return(_) | Stmt::Raise(_)])
+                        || (branch_index < statement.elif_else_clauses.len()
+                            && matches!(body, [Stmt::Pass(_)])))
+                    .then(|| final_chained_comparison_jump(test))
+                    .flatten();
                 self.with_control_override(
                     |control| &mut control.conditions.exclude_terminal_if_not_taken,
                     exclude_not_taken,
@@ -15011,7 +15013,7 @@ impl Compiler<'_> {
                     preserve_first_yielding_iterator_boolean_owner.then(|| statement.test.range()),
                     |compiler| {
                         let retained_exit = (!non_final_branch
-                            && matches!(body, [Stmt::Return(_)]))
+                            && matches!(body, [Stmt::Return(_) | Stmt::Break(_)]))
                         .then(|| final_chained_comparison_jump(&statement.test))
                         .flatten();
                         compiler.with_control_override(
@@ -15927,7 +15929,11 @@ impl Compiler<'_> {
             restart,
             body,
             negated,
-            preserve_return_nop && matches!(statement.body.as_slice(), [Stmt::Return(_)]),
+            preserve_return_nop
+                && matches!(
+                    statement.body.as_slice(),
+                    [Stmt::Return(_) | Stmt::Break(_)]
+                ),
         )?;
 
         self.assembler.mark(body);
@@ -29962,14 +29968,7 @@ fn final_chained_comparison(expression: &Expr) -> Option<&ruff_python_ast::ExprC
 }
 
 pub(super) fn final_chained_comparison_jump(expression: &Expr) -> Option<TextRange> {
-    final_chained_comparison(expression)
-        .filter(|comparison| {
-            !comparison
-                .ops
-                .iter()
-                .any(|operator| matches!(operator, CmpOp::Is | CmpOp::IsNot))
-        })
-        .map(|comparison| comparison.range)
+    final_chained_comparison(expression).map(|comparison| comparison.range)
 }
 
 pub(super) fn suite_terminates(body: &[Stmt]) -> bool {

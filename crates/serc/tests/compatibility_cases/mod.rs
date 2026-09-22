@@ -14,6 +14,7 @@ mod boolean_original_prefix_owners;
 mod boolean_value_end_owner_boundary;
 mod branch_expression_name_scopes;
 mod chained_boolean_return_copies;
+mod chained_comparison_original_exit_copies;
 mod chained_comparison_owner_slots;
 mod chained_conditional_expression_returns;
 mod chained_else_return_copies;
