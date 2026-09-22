@@ -930,7 +930,15 @@ impl Assembler {
             .iter()
             .rev()
             .find_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction.location),
+                Item::Instruction(instruction) => {
+                    Some(if instruction.fusion_policy.location_from_next() {
+                        // CPython resolves NEXT_LOCATION after line-sensitive NOP removal.
+                        // Its temporary source span cannot donate the preceding line.
+                        SourceLocation::NONE
+                    } else {
+                        instruction.location
+                    })
+                }
                 Item::Label(_) => None,
             })
     }

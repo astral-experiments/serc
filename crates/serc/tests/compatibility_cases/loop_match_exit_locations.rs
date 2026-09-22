@@ -178,3 +178,17 @@ fn terminal_match_iterator_breaks_keep_their_own_return_locations() {
         }
     }
 }
+
+#[test]
+fn unresolved_match_pop_does_not_erase_break_line() {
+    for pattern in ["None", "0", "Failed()", "None if active"] {
+        for loop_header in ["while True:", "while active:", "for item in items:"] {
+            for body in ["break", "consume(value); break"] {
+                let source = format!(
+                    "def f(value, active, items):\n    {loop_header}\n        match next_value(value):\n            case {pattern}:\n                {body}\n            case State() as new_value:\n                value = new_value\n            case _ as invalid:\n                fail(invalid)\n    return value\n"
+                );
+                common::assert_matches_cpython_marshal(&source, "match_break_next_location.py");
+            }
+        }
+    }
+}
