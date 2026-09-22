@@ -5373,3 +5373,17 @@ fn borrows_after_surviving_for_break_through_nested_try_exits() {
         }
     }
 }
+
+#[test]
+fn borrows_normal_cleanup_after_branched_bare_return_handler_prefix() {
+    for binding in ["", " as error"] {
+        for leading in ["", "            action(key)\n"] {
+            for condition in ["check(owner)", "owner.ready"] {
+                let source = format!(
+                    "def function(owner, key, action, check):\n    try:\n        owner.data[key] = action()\n    except LoginError{binding}:\n        if check(key):\n{leading}            if {condition}:\n                action(key)\n            else:\n                action(owner)\n            return\n        owner.remove(key)\n    except OtherError as error:\n        if check(error):\n            raise\n        owner.remove(key)\n    finally:\n        owner.discard(key)\n        action(owner, key)\n",
+                );
+                common::assert_matches_cpython_marshal(&source, "handler_return_branch_prefix.py");
+            }
+        }
+    }
+}

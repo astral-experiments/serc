@@ -25362,6 +25362,17 @@ impl Compiler<'_> {
                                                             || matches!(statement, Stmt::Assert(assertion)
                                                                 if condition_has_linear_runtime_leaves(&assertion.test)
                                                                     && assertion.msg.is_none())
+                                                            // Both populated arms join before the bare return.
+                                                            // The outer guard's false recovery path stays live.
+                                                            || matches!(statement, Stmt::If(branch)
+                                                                if self.control.finally.active_copied_finally_bodies == 0
+                                                                    && condition_has_only_runtime_tests(&branch.test)
+                                                                    && !expression_contains_inline_branch(&branch.test)
+                                                                    && !expression_suspends_current_scope(&branch.test)
+                                                                    && suite_has_linear_borrow_fallthrough(&branch.body)
+                                                                    && matches!(branch.elif_else_clauses.as_slice(), [otherwise]
+                                                                        if otherwise.test.is_none()
+                                                                            && suite_has_linear_borrow_fallthrough(&otherwise.body)))
                                                     })
                                             }))
                                         || ((!trailing.is_empty()
