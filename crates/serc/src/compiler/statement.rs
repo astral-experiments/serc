@@ -512,6 +512,22 @@ pub(super) struct FinallyState {
     async_for_end_pop_recorders: Vec<AsyncForEndPopRecorder>,
 }
 
+impl FinallyState {
+    /// No finally cleanup or preserved return value must be interleaved with this unwind.
+    fn is_inactive_for_return_unwind(&self) -> bool {
+        self.active_return_finally_contexts.is_empty()
+            && self.active_loop_finally_contexts.is_empty()
+            && self.active_pass_finally_locations.is_empty()
+            && self.preserved_return_value_contexts.is_empty()
+            && self.copied_return_finally_preserved_values == 0
+            && self.active_finally_try_bodies == 0
+            && self.active_normal_finally_bodies == 0
+            && self.active_copied_finally_bodies == 0
+            && self.active_finally_end_blocks == 0
+            && self.active_overriding_finally_returns == 0
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct ConditionState {
     pub(super) exclude_terminal_if_not_taken: bool,
@@ -2758,16 +2774,7 @@ impl Compiler<'_> {
             && exceptions.active_exception_group_handlers == 0
             && self.control.withs.active_with_exits.is_empty()
             && self.control.loops.contexts.is_empty()
-            && finally.active_return_finally_contexts.is_empty()
-            && finally.active_loop_finally_contexts.is_empty()
-            && finally.active_pass_finally_locations.is_empty()
-            && finally.preserved_return_value_contexts.is_empty()
-            && finally.copied_return_finally_preserved_values == 0
-            && finally.active_finally_try_bodies == 0
-            && finally.active_normal_finally_bodies == 0
-            && finally.active_copied_finally_bodies == 0
-            && finally.active_finally_end_blocks == 0
-            && finally.active_overriding_finally_returns == 0
+            && finally.is_inactive_for_return_unwind()
             && handlers.iter().enumerate().all(|(index, handler)| {
                 handler.try_body_depth == 1
                     && handler.exception_region_depth == index + 1
@@ -6059,28 +6066,7 @@ impl Compiler<'_> {
                             .len()
                             == 1
                         && self.control.withs.active_with_exits.is_empty()
-                        && self
-                            .control
-                            .finally
-                            .active_return_finally_contexts
-                            .is_empty()
-                        && self.control.finally.active_loop_finally_contexts.is_empty()
-                        && self
-                            .control
-                            .finally
-                            .active_pass_finally_locations
-                            .is_empty()
-                        && self
-                            .control
-                            .finally
-                            .preserved_return_value_contexts
-                            .is_empty()
-                        && self.control.finally.copied_return_finally_preserved_values == 0
-                        && self.control.finally.active_finally_try_bodies == 0
-                        && self.control.finally.active_finally_end_blocks == 0
-                        && self.control.finally.active_normal_finally_bodies == 0
-                        && self.control.finally.active_copied_finally_bodies == 0
-                        && self.control.finally.active_overriding_finally_returns == 0
+                        && self.control.finally.is_inactive_for_return_unwind()
                         && self.control.loops.contexts.last().is_some_and(|context| {
                             context.iterator_cleanup == IteratorCleanup::None
                         })
@@ -6203,28 +6189,7 @@ impl Compiler<'_> {
                     && self.control.exceptions.active_exception_group_handlers == 0
                     && self.control.withs.active_with_exits.is_empty()
                     && self.control.loops.contexts.is_empty()
-                    && self
-                        .control
-                        .finally
-                        .active_return_finally_contexts
-                        .is_empty()
-                    && self.control.finally.active_loop_finally_contexts.is_empty()
-                    && self
-                        .control
-                        .finally
-                        .active_pass_finally_locations
-                        .is_empty()
-                    && self
-                        .control
-                        .finally
-                        .preserved_return_value_contexts
-                        .is_empty()
-                    && self.control.finally.copied_return_finally_preserved_values == 0
-                    && self.control.finally.active_finally_try_bodies == 0
-                    && self.control.finally.active_normal_finally_bodies == 0
-                    && self.control.finally.active_copied_finally_bodies == 0
-                    && self.control.finally.active_finally_end_blocks == 0
-                    && self.control.finally.active_overriding_finally_returns == 0
+                    && self.control.finally.is_inactive_for_return_unwind()
                     && self
                         .control
                         .exceptions
@@ -6274,28 +6239,7 @@ impl Compiler<'_> {
                         == 3
                     && self.control.withs.active_with_exits.is_empty()
                     && self.control.loops.contexts.is_empty()
-                    && self
-                        .control
-                        .finally
-                        .active_return_finally_contexts
-                        .is_empty()
-                    && self.control.finally.active_loop_finally_contexts.is_empty()
-                    && self
-                        .control
-                        .finally
-                        .active_pass_finally_locations
-                        .is_empty()
-                    && self
-                        .control
-                        .finally
-                        .preserved_return_value_contexts
-                        .is_empty()
-                    && self.control.finally.copied_return_finally_preserved_values == 0
-                    && self.control.finally.active_finally_try_bodies == 0
-                    && self.control.finally.active_normal_finally_bodies == 0
-                    && self.control.finally.active_copied_finally_bodies == 0
-                    && self.control.finally.active_finally_end_blocks == 0
-                    && self.control.finally.active_overriding_finally_returns == 0
+                    && self.control.finally.is_inactive_for_return_unwind()
                     && self
                         .control
                         .exceptions
@@ -6324,28 +6268,7 @@ impl Compiler<'_> {
                         .len()
                         == 2
                     && self.control.withs.active_with_exits.is_empty()
-                    && self
-                        .control
-                        .finally
-                        .active_return_finally_contexts
-                        .is_empty()
-                    && self.control.finally.active_loop_finally_contexts.is_empty()
-                    && self
-                        .control
-                        .finally
-                        .active_pass_finally_locations
-                        .is_empty()
-                    && self
-                        .control
-                        .finally
-                        .preserved_return_value_contexts
-                        .is_empty()
-                    && self.control.finally.copied_return_finally_preserved_values == 0
-                    && self.control.finally.active_finally_try_bodies == 0
-                    && self.control.finally.active_normal_finally_bodies == 0
-                    && self.control.finally.active_copied_finally_bodies == 0
-                    && self.control.finally.active_finally_end_blocks == 0
-                    && self.control.finally.active_overriding_finally_returns == 0
+                    && self.control.finally.is_inactive_for_return_unwind()
                     && matches!(
                         (
                             self.control.exceptions.active_exception_handlers.as_slice(),
@@ -6383,28 +6306,7 @@ impl Compiler<'_> {
                     && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                     && self.control.exceptions.active_exception_group_handlers == 0
                     && self.control.withs.active_with_exits.is_empty()
-                    && self
-                        .control
-                        .finally
-                        .active_return_finally_contexts
-                        .is_empty()
-                    && self.control.finally.active_loop_finally_contexts.is_empty()
-                    && self
-                        .control
-                        .finally
-                        .active_pass_finally_locations
-                        .is_empty()
-                    && self
-                        .control
-                        .finally
-                        .preserved_return_value_contexts
-                        .is_empty()
-                    && self.control.finally.copied_return_finally_preserved_values == 0
-                    && self.control.finally.active_finally_try_bodies == 0
-                    && self.control.finally.active_normal_finally_bodies == 0
-                    && self.control.finally.active_copied_finally_bodies == 0
-                    && self.control.finally.active_finally_end_blocks == 0
-                    && self.control.finally.active_overriding_finally_returns == 0
+                    && self.control.finally.is_inactive_for_return_unwind()
                     && !self.control.loops.contexts.is_empty()
                     && matches!(
                         self.control.exceptions.active_exception_handlers.as_slice(),
@@ -6488,28 +6390,7 @@ impl Compiler<'_> {
                     && self.control.exceptions.active_exception_group_handlers == 0
                     && self.control.withs.active_with_exits.is_empty()
                     && self.control.loops.contexts.is_empty()
-                    && self
-                        .control
-                        .finally
-                        .active_return_finally_contexts
-                        .is_empty()
-                    && self.control.finally.active_loop_finally_contexts.is_empty()
-                    && self
-                        .control
-                        .finally
-                        .active_pass_finally_locations
-                        .is_empty()
-                    && self
-                        .control
-                        .finally
-                        .preserved_return_value_contexts
-                        .is_empty()
-                    && self.control.finally.copied_return_finally_preserved_values == 0
-                    && self.control.finally.active_finally_try_bodies == 0
-                    && self.control.finally.active_normal_finally_bodies == 0
-                    && self.control.finally.active_copied_finally_bodies == 0
-                    && self.control.finally.active_finally_end_blocks == 0
-                    && self.control.finally.active_overriding_finally_returns == 0
+                    && self.control.finally.is_inactive_for_return_unwind()
                     && self
                         .control
                         .exceptions
@@ -6554,28 +6435,7 @@ impl Compiler<'_> {
                         == 3
                     && self.control.withs.active_with_exits.is_empty()
                     && self.control.loops.contexts.is_empty()
-                    && self
-                        .control
-                        .finally
-                        .active_return_finally_contexts
-                        .is_empty()
-                    && self.control.finally.active_loop_finally_contexts.is_empty()
-                    && self
-                        .control
-                        .finally
-                        .active_pass_finally_locations
-                        .is_empty()
-                    && self
-                        .control
-                        .finally
-                        .preserved_return_value_contexts
-                        .is_empty()
-                    && self.control.finally.copied_return_finally_preserved_values == 0
-                    && self.control.finally.active_finally_try_bodies == 0
-                    && self.control.finally.active_finally_end_blocks == 0
-                    && self.control.finally.active_normal_finally_bodies == 0
-                    && self.control.finally.active_copied_finally_bodies == 0
-                    && self.control.finally.active_overriding_finally_returns == 0
+                    && self.control.finally.is_inactive_for_return_unwind()
                     && matches!(
                         self.control.exceptions.active_exception_handlers.as_slice(),
                         [outer, inner]
@@ -22581,28 +22441,7 @@ impl Compiler<'_> {
                         && self.control.exceptions.active_try_marker_slots.is_empty()
                         && self.control.withs.active_with_exits.is_empty()
                         && self.control.loops.contexts.is_empty()
-                        && self
-                            .control
-                            .finally
-                            .active_return_finally_contexts
-                            .is_empty()
-                        && self.control.finally.active_loop_finally_contexts.is_empty()
-                        && self
-                            .control
-                            .finally
-                            .active_pass_finally_locations
-                            .is_empty()
-                        && self
-                            .control
-                            .finally
-                            .preserved_return_value_contexts
-                            .is_empty()
-                        && self.control.finally.copied_return_finally_preserved_values == 0
-                        && self.control.finally.active_finally_try_bodies == 0
-                        && self.control.finally.active_normal_finally_bodies == 0
-                        && self.control.finally.active_copied_finally_bodies == 0
-                        && self.control.finally.active_finally_end_blocks == 0
-                        && self.control.finally.active_overriding_finally_returns == 0
+                        && self.control.finally.is_inactive_for_return_unwind()
                         && matches!(
                             self.control.exceptions.active_exception_handlers.as_slice(),
                             [outer, middle]
@@ -24924,16 +24763,7 @@ impl Compiler<'_> {
                 .exceptions
                 .active_exception_region_exclusions
                 .is_empty()
-            && finally.active_return_finally_contexts.is_empty()
-            && finally.active_loop_finally_contexts.is_empty()
-            && finally.active_pass_finally_locations.is_empty()
-            && finally.preserved_return_value_contexts.is_empty()
-            && finally.copied_return_finally_preserved_values == 0
-            && finally.active_finally_try_bodies == 0
-            && finally.active_normal_finally_bodies == 0
-            && finally.active_copied_finally_bodies == 0
-            && finally.active_finally_end_blocks == 0
-            && finally.active_overriding_finally_returns == 0
+            && finally.is_inactive_for_return_unwind()
             && ((self.context.python_version <= crate::PythonVersion::Py313
                 && self.control.loops.contexts.is_empty()
                 && supports_nested_terminating_finally_returns(statement))
