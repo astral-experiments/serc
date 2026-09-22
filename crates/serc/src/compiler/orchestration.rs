@@ -171,7 +171,7 @@ impl<'source> Compiler<'source> {
         filename: &str,
         source: &'source str,
         tokens: &'source Tokens,
-        body: &Suite,
+        body: &'source Suite,
     ) -> Self {
         Self::module_with_python_version(
             filename,
@@ -186,7 +186,7 @@ impl<'source> Compiler<'source> {
         filename: &str,
         source: &'source str,
         tokens: &'source Tokens,
-        body: &Suite,
+        body: &'source Suite,
         python_version: crate::PythonVersion,
     ) -> Self {
         let context = Rc::new(CompilationContext::with_python_version(

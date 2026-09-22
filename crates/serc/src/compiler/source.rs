@@ -11,7 +11,7 @@ use ruff_python_ast::{
 };
 use ruff_python_codegen::{Generator, Indentation, Mode as CodegenMode};
 use ruff_source_file::{LineEnding, LineIndex};
-use ruff_text_size::{Ranged, TextLen, TextSize};
+use ruff_text_size::{Ranged, TextLen, TextRange, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::assembler::SourceLocation;
@@ -121,6 +121,7 @@ pub(super) struct CompilationContext<'source> {
     pub(super) tokens: &'source Tokens,
     line_index: LineIndex,
     pub(super) scopes: ScopeArena,
+    finally_bodies: FxHashMap<TextRange, &'source [Stmt]>,
     constant_string_origins: FxHashMap<String, Cell<StringConstantOrigin>>,
     // Class qualified-name and synthesized character identity depend on the first cache admission,
     // even when that constant or the defining class is later removed as unreachable.
@@ -154,7 +155,7 @@ impl<'source> CompilationContext<'source> {
         filename: &str,
         source: &'source str,
         tokens: &'source Tokens,
-        body: &Suite,
+        body: &'source Suite,
     ) -> Self {
         Self::with_python_version(filename, source, tokens, body, crate::PythonVersion::Py314)
     }
@@ -163,7 +164,7 @@ impl<'source> CompilationContext<'source> {
         filename: &str,
         source: &'source str,
         tokens: &'source Tokens,
-        body: &Suite,
+        body: &'source Suite,
         python_version: crate::PythonVersion,
     ) -> Self {
         let scopes = if python_version == crate::PythonVersion::Py314 {
@@ -175,12 +176,14 @@ impl<'source> CompilationContext<'source> {
         let mut requires_interning_trace = false;
         let mut static_attribute_names = FxHashSet::default();
         let mut has_percent_replacement = false;
-        let constant_string_origins = parser_interned_strings(
+        let mut finally_bodies = FxHashMap::default();
+        let constant_string_origins = analyze_source(
             body,
             &mut generated_mangled_strings,
             &mut requires_interning_trace,
             &mut static_attribute_names,
             &mut has_percent_replacement,
+            &mut finally_bodies,
         );
         let legacy = python_version <= crate::PythonVersion::Py313;
         let has_relevant_class = if legacy {
@@ -205,6 +208,7 @@ impl<'source> CompilationContext<'source> {
             tokens,
             line_index: LineIndex::from_source_text(source),
             scopes,
+            finally_bodies,
             constant_string_origins,
             constant_origins,
             interned_metadata_tuples,
@@ -218,6 +222,11 @@ impl<'source> CompilationContext<'source> {
             empty_bytes_origin: Cell::default(),
             interning_events: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Recover the original AST suite even when lowering revisits a copied exit.
+    pub(super) fn finally_body(&self, statement: &ruff_python_ast::StmtTry) -> &'source [Stmt] {
+        self.finally_bodies[&statement.range]
     }
 
     pub(super) const fn module_plan(&self) -> &ModulePlan {
@@ -578,15 +587,17 @@ fn has_double_underscore(name: &str) -> bool {
     name.as_bytes().windows(2).any(|pair| pair == b"__")
 }
 
-fn parser_interned_strings(
-    body: &Suite,
+fn analyze_source<'ast>(
+    body: &'ast Suite,
     generated_mangled_strings: &mut FxHashSet<String>,
     requires_interning_trace: &mut bool,
     static_attribute_names: &mut FxHashSet<String>,
     has_percent_replacement: &mut bool,
+    finally_bodies: &mut FxHashMap<TextRange, &'ast [Stmt]>,
 ) -> FxHashMap<String, Cell<StringConstantOrigin>> {
     #[derive(Default)]
-    struct ConstantIdentifiers {
+    struct SourceAnalysis<'ast> {
+        finally_bodies: FxHashMap<TextRange, &'ast [Stmt]>,
         origins: FxHashMap<String, Cell<StringConstantOrigin>>,
         private_name: Option<String>,
         mangled_names: Option<FxHashSet<String>>,
@@ -597,7 +608,7 @@ fn parser_interned_strings(
         has_percent_replacement: bool,
     }
 
-    impl ConstantIdentifiers {
+    impl SourceAnalysis<'_> {
         fn mangled_name<'a>(&self, name: &'a str) -> std::borrow::Cow<'a, str> {
             if self
                 .mangled_names
@@ -635,8 +646,14 @@ fn parser_interned_strings(
         }
     }
 
-    impl<'a> Visitor<'a> for ConstantIdentifiers {
+    impl<'a> Visitor<'a> for SourceAnalysis<'a> {
         fn visit_stmt(&mut self, statement: &'a Stmt) {
+            if let Stmt::Try(statement) = statement
+                && !statement.finalbody.is_empty()
+            {
+                self.finally_bodies
+                    .insert(statement.range, &statement.finalbody);
+            }
             match statement {
                 Stmt::AnnAssign(assignment) => {
                     if let Expr::Name(target) = assignment.target.as_ref() {
@@ -806,7 +823,7 @@ fn parser_interned_strings(
         }
     }
 
-    let mut visitor = ConstantIdentifiers::default();
+    let mut visitor = SourceAnalysis::default();
     for statement in body {
         visitor.visit_stmt(statement);
     }
@@ -818,6 +835,7 @@ fn parser_interned_strings(
     *generated_mangled_strings = visitor.generated_mangled_strings;
     *static_attribute_names = visitor.static_attribute_names;
     *has_percent_replacement = visitor.has_percent_replacement;
+    *finally_bodies = visitor.finally_bodies;
     visitor.origins
 }
 
@@ -2236,12 +2254,13 @@ mod tests {
         .unwrap();
         let mut generated = FxHashSet::default();
         let mut requires_trace = false;
-        let origins = parser_interned_strings(
+        let origins = analyze_source(
             parsed.suite(),
             &mut generated,
             &mut requires_trace,
             &mut FxHashSet::default(),
             &mut false,
+            &mut FxHashMap::default(),
         );
         for raw in [
             "Café",
@@ -2261,7 +2280,8 @@ mod tests {
     #[test]
     fn finishing_module_string_provenance_moves_exclusive_keys() {
         let tokens = Tokens::new(Vec::new());
-        let mut context = CompilationContext::new("example.py", "", &tokens, &Suite::new());
+        let body = Suite::new();
+        let mut context = CompilationContext::new("example.py", "", &tokens, &body);
         context.constant_string_origins = [
             ("unused", StringConstantOrigin::Unrecorded),
             ("not_interned", StringConstantOrigin::Uninterned),
