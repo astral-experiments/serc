@@ -27167,10 +27167,12 @@ impl Compiler<'_> {
                             && !expression_suspends_current_scope(&tail.test)
                             && !suite_contains_abrupt_control_flow(&tail.body)
                             && tail.body.split_last().is_some_and(|(cleanup, leading)| {
-                                // A completed conditional value joins before its assignment.
-                                // It cannot leave a cleanup POP in this later empty array.
-                                let completed_value_prefix = leading.iter().all(|statement| {
+                                // Completed values and ordinary recovery finish before the
+                                // last cleanup, leaving no POP in this later empty array.
+                                let completed_prefix = leading.iter().all(|statement| {
                                     suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                                        || matches!(statement, Stmt::Try(recovery)
+                                            if completed_recovery_has_runtime_fallthrough(recovery))
                                         || matches!(statement, Stmt::Assign(assignment)
                                             if assignment.targets.iter().all(|target| matches!(target, Expr::Name(_)))
                                                 && matches!(assignment.value.as_ref(), Expr::If(value)
@@ -27183,7 +27185,7 @@ impl Compiler<'_> {
                                 });
                                 (leading.is_empty()
                                     || suite_has_linear_borrow_fallthrough(leading)
-                                    || completed_value_prefix)
+                                    || completed_prefix)
                                     && match cleanup {
                                         Stmt::Try(recovery) => {
                                             !recovery.is_star
@@ -32070,6 +32072,37 @@ fn supports_nested_terminating_finally_returns(statement: &ruff_python_ast::Stmt
         return false;
     };
     supported_finally(statement) && supported_finally(inner) && supported_return(return_statement)
+}
+
+/// Certifies ordinary recovery whose runtime paths finish before a later cleanup.
+///
+/// Empty handlers and a runtime loop's false edge have already left their own
+/// protected region. No finalizer, named cleanup, or abrupt exit spans the suffix.
+fn completed_recovery_has_runtime_fallthrough(statement: &ruff_python_ast::StmtTry) -> bool {
+    !statement.is_star
+        && statement.orelse.is_empty()
+        && statement.finalbody.is_empty()
+        && !statement.handlers.is_empty()
+        && statement.body.iter().all(|statement| {
+            suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                || matches!(statement, Stmt::While(loop_statement)
+                    if loop_statement.orelse.is_empty()
+                        && condition_has_only_runtime_tests(&loop_statement.test)
+                        && condition_has_linear_runtime_leaves(&loop_statement.test)
+                        && condition_jump_target_count(&loop_statement.test, false) == 1
+                        && !expression_suspends_current_scope(&loop_statement.test)
+                        && matches!(loop_statement.body.as_slice(), [Stmt::Pass(_)]))
+        })
+        && statement.handlers.iter().all(|handler| {
+            handler.as_except_handler().is_some_and(|handler| {
+                handler.name.is_none()
+                    && handler.type_.as_deref().is_some_and(|test| {
+                        !expression_contains_inline_branch(test)
+                            && !expression_suspends_current_scope(test)
+                    })
+                    && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+            })
+        })
 }
 
 // Certify an emitted-work path with no internal branch or cleanup entry. A suite

@@ -726,3 +726,23 @@ fn completed_value_join_preserves_later_manager_finally_owners() {
         }
     }
 }
+
+#[test]
+fn completed_recovery_preserves_later_manager_finally_owners() {
+    for (definition, body) in [
+        ("def", "work()"),
+        ("def", "yield work()"),
+        ("async def", "await work()"),
+    ] {
+        for recovery in ["poll()", "while poll():\n    pass"] {
+            let source = format!(
+                "{definition} f(manager, value):\n    with manager:\n        try:\n            {body}\n        finally:\n            if value:\n                try:\n{}                except Error:\n                    pass\n                try:\n                    work()\n                except Error:\n                    pass\n",
+                indent(&indent(&indent(&indent(&indent(&format!("{recovery}\n")))))),
+            );
+            common::assert_matches_cpython_marshal(
+                &source,
+                "completed_recovery_manager_finally.py",
+            );
+        }
+    }
+}
