@@ -5430,3 +5430,25 @@ fn nested_raise_handler_suffix_keeps_borrow_boundary() {
         }
     }
 }
+
+#[test]
+fn preserves_finally_borrow_barrier_after_nonfinal_recovery_arms() {
+    for name in ["", " as error"] {
+        for alternative in ["", "elif other:\n    pass\n", "else:\n    pass\n"] {
+            for arm_tail in ["", "recover(owner)\n"] {
+                let recovery = format!(
+                    "if flag:\n{}{}finish(owner)\n",
+                    indent_finally_borrow_case(&format!(
+                        "try:\n    work(owner)\nexcept OtherError:\n    pass\n{arm_tail}",
+                    )),
+                    alternative,
+                );
+                let source = format!(
+                    "def function(owner, flag, other):\n    try:\n        work(owner)\n    except Error{name}:\n{}    finally:\n        owner.close()\n",
+                    indent_finally_borrow_case(&indent_finally_borrow_case(&recovery)),
+                );
+                common::assert_matches_cpython_marshal(&source, "conditional_recovery_finally.py");
+            }
+        }
+    }
+}

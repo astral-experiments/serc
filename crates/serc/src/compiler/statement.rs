@@ -24836,6 +24836,8 @@ impl Compiler<'_> {
                                             if !expression_contains_inline_branch(&awaited.value))))));
         // Unconditional cleanup predecessors can empty their original handler or else
         // exit block. That block survives cold relocation and stops borrowed-load traversal.
+        // A terminal recovery in a nonfinal handler arm also leaves its own empty
+        // jump array; later handler work cannot repopulate that original entry.
         let has_empty_handler_or_else_exit = statement.handlers.iter().any(|handler| {
             handler.as_except_handler().is_some_and(|handler| {
                 matches!(handler.body.last(), Some(Stmt::With(_) | Stmt::Try(_)))
@@ -24843,7 +24845,27 @@ impl Compiler<'_> {
         }) || matches!(
             statement.orelse.last(),
             Some(Stmt::With(_) | Stmt::Try(_) | Stmt::If(_))
-        );
+        ) || (!statement.is_star
+            && statement.orelse.is_empty()
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && statement.handlers.iter().any(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    suite_contains_conditional_nested_recovery(&handler.body)
+                })
+            }));
         // A terminal raising guard gives the else-exit jump one runtime predecessor.
         // CPython lends that condition's location to the jump before moving handlers;
         // its retained NOP keeps the normal cleanup entry reachable for borrowed loads.
