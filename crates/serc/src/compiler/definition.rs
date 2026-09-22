@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
 
 use ruff_python_ast::token::TokenKind;
@@ -31,7 +31,6 @@ use super::scope::{
     expression_requirements_outside_comprehensions, function_annotation_expressions,
     inlined_comprehension_cell_names_in_expression,
     inlined_comprehension_local_names_in_expression, nested_expression_required_names,
-    type_parameter_required_names,
 };
 use super::source::unparse_annotation;
 use super::statement::{legacy_suite_contains_yield, suite_contains_yield};
@@ -57,6 +56,40 @@ impl CompiledFunctionDefaults {
 }
 
 impl Compiler<'_> {
+    /// Class globals apply to direct annotation loads, while nested functions retain closures.
+    fn class_visible_annotation_requirements(&self, expression: &Expr) -> BTreeSet<String> {
+        let mut required = expression_required_names(expression);
+        if required
+            .iter()
+            .any(|name| self.class_scope_declares_global(self.required_name_id(name)))
+        {
+            let nested = nested_expression_required_names(expression);
+            required.retain(|name| {
+                !self.class_scope_declares_global(self.required_name_id(name))
+                    || nested.contains(name)
+            });
+        }
+        required
+    }
+
+    fn type_parameter_scope_requirements(
+        &self,
+        type_params: &ruff_python_ast::TypeParams,
+    ) -> BTreeSet<String> {
+        let mut required = BTreeSet::new();
+        for parameter in type_params {
+            if let TypeParam::TypeVar(parameter) = parameter
+                && let Some(bound) = parameter.bound.as_deref()
+            {
+                required.extend(self.class_visible_annotation_requirements(bound));
+            }
+            if let Some(default) = parameter.default() {
+                required.extend(self.class_visible_annotation_requirements(default));
+            }
+        }
+        required
+    }
+
     pub(super) fn compile_type_alias(
         &mut self,
         statement: &ruff_python_ast::StmtTypeAlias,
@@ -109,8 +142,8 @@ impl Compiler<'_> {
             .iter()
             .map(|parameter| self.required_name_id(parameter.name().as_str()))
             .collect();
-        let mut requirements = type_parameter_required_names(type_params);
-        requirements.extend(expression_required_names(value));
+        let mut requirements = self.type_parameter_scope_requirements(type_params);
+        requirements.extend(self.class_visible_annotation_requirements(value));
         let requirements = self.name_ids(&requirements);
         let cellvars = requirements
             .iter()
@@ -245,7 +278,8 @@ impl Compiler<'_> {
                 .iter()
                 .map(|parameter| self.required_name_id(parameter.name().as_str())),
         );
-        let type_parameter_requirements = self.name_ids(type_parameter_required_names(type_params));
+        let type_parameter_requirements =
+            self.name_ids(self.type_parameter_scope_requirements(type_params));
         let wrapper_local_names: FxHashSet<_> = locals.iter().copied().collect();
         let mut wrapper_plan = LoweringFunctionPlan {
             locals,
@@ -740,7 +774,7 @@ impl Compiler<'_> {
         locals.push(self.required_name_id(".type_params"));
         let (_, class_plan) = self.class_plan(definition)?;
         let required_names = &class_plan.required;
-        let type_parameter_requirements = type_parameter_required_names(type_params);
+        let type_parameter_requirements = self.type_parameter_scope_requirements(type_params);
         let mut type_parameter_cell_requirements = type_parameter_requirements.clone();
         let mut wrapper_requirements = type_parameter_requirements;
         if let Some(arguments) = definition.arguments.as_deref() {
@@ -1367,7 +1401,7 @@ impl Compiler<'_> {
         let mut seen = FxHashSet::default();
         local_names.retain(|name| seen.insert(name.clone()));
         let locals = self.name_ids(&local_names);
-        let required_names = self.name_ids(expression_required_names(expression));
+        let required_names = self.name_ids(self.class_visible_annotation_requirements(expression));
         let outside_requirements =
             self.name_id_set(expression_requirements_outside_comprehensions(expression));
         let mut freevars: Vec<_> = required_names
@@ -1386,7 +1420,7 @@ impl Compiler<'_> {
             .references
             .iter()
             .map(|name| self.required_name_id(name))
-            .filter(|name| !freevar_set.contains(name))
+            .filter(|name| !freevar_set.contains(name) || self.class_scope_declares_global(*name))
             .collect();
         let cellvars = self.name_id_set(inlined_cellvars);
         let plan = LoweringFunctionPlan {
