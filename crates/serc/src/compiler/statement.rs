@@ -20290,12 +20290,37 @@ impl Compiler<'_> {
                         clause.test.is_none()
                             && suite_terminates_before_constant_folding(&clause.body)
                     }));
+            // An enclosing try need not forward its later source successor to this else.
+            // The actual original false-edge join still cannot inherit a returning arm's
+            // line: multiple conditional entries and no physical fallthrough authenticate it.
+            let original_shared_else_exit = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && !statement.is_star
+                && statement.finalbody.is_empty()
+                && !statement.orelse.is_empty()
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && matches!(statement.orelse.last(), Some(Stmt::If(branch))
+                    if branch.elif_else_clauses.is_empty()
+                        && matches!(branch.test.as_ref(), Expr::BoolOp(_))
+                        && condition_has_only_runtime_tests(&branch.test)
+                        && !expression_contains_chained_comparison(&branch.test)
+                        && condition_jump_target_count(&branch.test, false) > 1
+                        && suite_terminates_before_constant_folding(&branch.body))
+                && self.assembler.at_original_jump_only_conditional_join();
             let shared_conditional_exit = shared_assertion_exit
                 || folded_false_try_exit
                 || terminal_else_orphan_exit
                 || forwarded_conditional_exit.is_none()
                     && guarded_finally_exit_location.is_none()
-                    && (statement.orelse.is_empty()
+                    && (original_shared_else_exit
+                        || statement.orelse.is_empty()
                         || self.control.loops.contexts.is_empty()
                         || (loop_tail.is_none()
                             // An extracted loop-tail statement is still a source successor.
