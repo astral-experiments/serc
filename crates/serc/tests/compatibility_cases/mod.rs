@@ -154,6 +154,7 @@ mod handler_tail_boolean_backedges;
 mod high_local_exception_boundaries;
 mod high_local_folded_blocks;
 mod high_local_source_block_joins;
+mod infinite_float_power_folding;
 mod initial_intern_state;
 mod inner_try_handler_return_owner;
 mod integer_true_division;
@@ -765,5 +766,3 @@ mod normal_try_discard_copies;
 mod non_final_loop_exit_barriers;
 
 mod match_tuple_tail_wrappers;
-
-mod infinite_float_power_folding;
