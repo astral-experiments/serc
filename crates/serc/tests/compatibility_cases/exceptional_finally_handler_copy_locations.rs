@@ -117,3 +117,16 @@ fn matches_cpython_handler_finally_return_cleanup_locations() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn preserves_original_jump_slot_before_attribute_store_reraise() {
+    for value in ["0", "False", "None"] {
+        let source = format!(
+            "def f(self, flag, other):\n    try:\n        work()\n    finally:\n        if flag:\n            if other:\n                try:\n                    recover()\n                except Error:\n                    pass\n            self.value = {value}\n        else:\n            cleanup()\n"
+        );
+        common::assert_matches_cpython_marshal(
+            &source,
+            "attribute_store_reraise_original_jump_slot.py",
+        );
+    }
+}
