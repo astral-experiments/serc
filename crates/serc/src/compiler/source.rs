@@ -871,102 +871,6 @@ fn suite_folds_empty_bytes(body: &Suite, python_version: crate::PythonVersion) -
 }
 
 impl Compiler<'_> {
-    /// Apply 3.15's lazy-import scope checks before lowering can discard dead suites.
-    pub(crate) fn validate_lazy_imports(
-        body: &Suite,
-        python_version: crate::PythonVersion,
-    ) -> Result<(), crate::CompileError> {
-        #[derive(Default)]
-        struct Validator {
-            scope: Option<&'static str>,
-            in_try: bool,
-            error: Option<crate::CompileError>,
-        }
-
-        impl Validator {
-            fn validate(&mut self, statement: &Stmt, import_type: &str) {
-                let context = if self.in_try {
-                    Some("try/except blocks")
-                } else {
-                    self.scope
-                };
-                if let Some(context) = context {
-                    self.error = Some(crate::CompileError::invalid_syntax(
-                        format!("lazy {import_type} not allowed inside {context}"),
-                        statement.range(),
-                    ));
-                }
-            }
-        }
-
-        impl<'a> Visitor<'a> for Validator {
-            fn visit_expr(&mut self, _expression: &'a Expr) {
-                // Import statements cannot occur inside expressions.
-            }
-
-            fn visit_stmt(&mut self, statement: &'a Stmt) {
-                if self.error.is_some() {
-                    return;
-                }
-                match statement {
-                    Stmt::Import(import) if import.is_lazy => self.validate(statement, "import"),
-                    Stmt::ImportFrom(import) if import.is_lazy => {
-                        if import.level == 0
-                            && import
-                                .module
-                                .as_ref()
-                                .is_some_and(|module| module.as_str() == "__future__")
-                        {
-                            self.error = Some(crate::CompileError::invalid_syntax(
-                                "lazy from __future__ import is not allowed",
-                                statement.range(),
-                            ));
-                            return;
-                        }
-                        self.validate(statement, "from ... import");
-                        if self.error.is_none()
-                            && import.names.iter().any(|alias| alias.name.as_str() == "*")
-                        {
-                            self.error = Some(crate::CompileError::invalid_syntax(
-                                "lazy from ... import * is not allowed",
-                                statement.range(),
-                            ));
-                        }
-                    }
-                    Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {
-                        let previous_scope = self.scope;
-                        let previous_try = self.in_try;
-                        self.scope = Some(if matches!(statement, Stmt::FunctionDef(_)) {
-                            "functions"
-                        } else {
-                            "classes"
-                        });
-                        self.in_try = false;
-                        walk_stmt(self, statement);
-                        self.scope = previous_scope;
-                        self.in_try = previous_try;
-                    }
-                    Stmt::Try(_) => {
-                        let previous = self.in_try;
-                        self.in_try = true;
-                        walk_stmt(self, statement);
-                        self.in_try = previous;
-                    }
-                    _ => walk_stmt(self, statement),
-                }
-            }
-        }
-
-        if python_version != crate::PythonVersion::Py315 {
-            return Ok(());
-        }
-        let mut validator = Validator::default();
-        for statement in body {
-            validator.visit_stmt(statement);
-        }
-        validator.error.map_or(Ok(()), Err)
-    }
-
     pub(super) fn line_number(&self, offset: u32) -> u32 {
         self.source_line(self.source_offset(offset)).number
     }
@@ -2163,11 +2067,6 @@ mod tests {
             assert!(
                 matches!(error, crate::CompileError::InvalidSyntax { message: actual, .. } if actual == message),
                 "{source}"
-            );
-            let parsed = ruff_python_parser::parse_module(source).unwrap();
-            assert!(
-                Compiler::validate_lazy_imports(parsed.suite(), crate::PythonVersion::Py314)
-                    .is_ok()
             );
         }
     }
