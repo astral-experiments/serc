@@ -25950,6 +25950,63 @@ impl Compiler<'_> {
                     && original_condition_has_unique_jump_target(&cleanup.test, false)
                     && cleanup.elif_else_clauses.is_empty()
                     && suite_has_linear_borrow_fallthrough(&cleanup.body));
+        // A conditional continue copies cleanup only into its taken handler arm.
+        // The linear normal body still enters the populated finally array, even
+        // inside a synchronous manager or after a populated handler guard prefix.
+        let iterator_continue_recovery_reaches_finally = synchronous_recovery
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && !statement.is_star
+            && statement.orelse.is_empty()
+            && matches!(self.control.loops.contexts.as_slice(), [context]
+                if context.iterator_cleanup == IteratorCleanup::Sync
+                    && !context.has_orelse
+                    && context.with_depth == 0
+                    && context.finally_end_depth == 0
+                    && context.exception_region_depth == 0)
+            && self.control.withs.active_with_exits.len() <= 1
+            && self
+                .control
+                .withs
+                .active_with_exits
+                .iter()
+                .all(|manager| !manager.is_async)
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && suite_has_linear_borrow_fallthrough(&statement.body)
+            && suite_has_linear_borrow_fallthrough(&statement.finalbody)
+            && matches!(statement.handlers.as_slice(), [handler]
+            if handler.as_except_handler().is_some_and(|handler| {
+                handler.type_.as_ref().is_some_and(|type_| {
+                    !expression_contains_inline_branch(type_)
+                        && !expression_suspends_current_scope(type_)
+                }) && handler.name.is_none()
+                    && handler.body.iter().enumerate().any(|(index, candidate)| {
+                        matches!(candidate, Stmt::If(guard)
+                            if condition_has_only_runtime_tests(&guard.test)
+                                && !expression_contains_inline_branch(&guard.test)
+                                && !expression_suspends_current_scope(&guard.test)
+                                && guard.elif_else_clauses.is_empty()
+                                && matches!(guard.body.as_slice(), [Stmt::Continue(_)]))
+                            && handler.body[..index].iter().all(|prefix| {
+                                suite_has_linear_borrow_fallthrough(std::slice::from_ref(prefix))
+                                    || matches!(prefix, Stmt::If(guard)
+                                        if condition_has_only_runtime_tests(&guard.test)
+                                            && !expression_contains_inline_branch(&guard.test)
+                                            && !expression_suspends_current_scope(&guard.test)
+                                            && guard.elif_else_clauses.is_empty()
+                                            && suite_has_linear_borrow_fallthrough(&guard.body))
+                            })
+                            && suite_has_linear_borrow_fallthrough(&handler.body[index + 1..])
+                    })
+            }));
         let normal_finally_is_borrow_reachable = (simple_fallthrough_handlers_reach_finally
             || compound_fallthrough_handlers_reach_finally
             || runtime_while_handlers_reach_finally)
@@ -25964,6 +26021,7 @@ impl Compiler<'_> {
             || inner_try_break_loop_range.is_some()
             || conditional_handler_reaches_finally
             || named_iterator_break_reaches_finally
+            || iterator_continue_recovery_reaches_finally
             || terminal_if_false_edge_reaches_finally
             || awaited_terminal_if_reaches_finally
             || terminal_raise_if_reaches_finally
