@@ -23993,6 +23993,7 @@ impl Compiler<'_> {
         let mut last_test: &Expr = statement.test.as_ref();
 
         for (branch_index, (test, body)) in branches.into_iter().enumerate() {
+            let branch_suspension_epoch = self.control.generators.coroutine_suspension_epoch;
             let next = if let Some(test) = test {
                 last_test = test;
                 let next = self.assembler.label();
@@ -24058,8 +24059,40 @@ impl Compiler<'_> {
                 && self.assembler.at_original_unconditional_join();
             // A complete nested conditional has an authored jump and fallthrough into
             // the same cleanup. Keep that original array unlocated for early copying.
+            // The coroutine wrapper does not prevent native copying of an unlocated
+            // cleanup. Admit only a non-suspending branch with no interleaved owner;
+            // generator resumptions and enclosing cleanup keep their existing path.
+            let plain_coroutine_cleanup = self.unit.flags
+                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                == CO_COROUTINE
+                && handler_depth == 1
+                && self.control.generators.coroutine_suspension_epoch == branch_suspension_epoch
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self.control.exceptions.active_try_marker_slots.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.loops.contexts.is_empty()
+                && self
+                    .control
+                    .finally
+                    .active_return_finally_contexts
+                    .is_empty()
+                && self.control.finally.active_loop_finally_contexts.is_empty()
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && body.split_last().is_some_and(|(_, prefix)| {
+                    prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix)
+                });
             let complete_conditional_cleanup =
-                self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    || plain_coroutine_cleanup)
                     && matches!(body.last(), Some(Stmt::If(tail))
                     if handler_cleanup_has_complete_runtime_join(tail))
                     && if self.context.python_version == crate::PythonVersion::Py313 {
