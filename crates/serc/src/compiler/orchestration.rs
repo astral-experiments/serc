@@ -1113,7 +1113,10 @@ impl<'source> Compiler<'source> {
                 // The annotation argument has a separate internal identity so user names
                 // and comprehension targets spelled `format` do not bind to its slot.
                 if self.unit.annotation_thunk && spelling == ".format" {
-                    return ("format".to_string(), self.required_name_id("format").0);
+                    return (
+                        "format".to_string(),
+                        MetadataId::from(self.required_name_id("format")),
+                    );
                 }
                 let name = self.mangled_name(spelling);
                 let id = if name == spelling {
