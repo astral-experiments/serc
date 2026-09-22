@@ -35372,6 +35372,39 @@ fn conditional_for_else_cleanup_exit(statement: &ruff_python_ast::StmtIf) -> boo
         && suite_has_linear_borrow_fallthrough(&cleanup.finalbody)
 }
 
+// Only these current-scope statements participate in the all-raising cleanup
+// proof. Awaited operands add suspension entries even when every arm raises.
+fn suite_has_nonsuspending_raise_work(body: &[Stmt]) -> bool {
+    body.iter().all(|statement| match statement {
+        Stmt::Raise(raised) => raised
+            .exc
+            .iter()
+            .chain(&raised.cause)
+            .all(|value| !expression_suspends_current_scope(value)),
+        Stmt::If(branch) => {
+            !expression_suspends_current_scope(&branch.test)
+                && suite_has_nonsuspending_raise_work(&branch.body)
+                && branch.elif_else_clauses.iter().all(|clause| {
+                    clause
+                        .test
+                        .as_ref()
+                        .is_none_or(|test| !expression_suspends_current_scope(test))
+                        && suite_has_nonsuspending_raise_work(&clause.body)
+                })
+        }
+        Stmt::Expr(expression) => !expression_suspends_current_scope(&expression.value),
+        Stmt::Assign(assignment) => {
+            !expression_suspends_current_scope(&assignment.value)
+                && assignment
+                    .targets
+                    .iter()
+                    .all(|target| !expression_suspends_current_scope(target))
+        }
+        Stmt::Pass(_) => true,
+        _ => false,
+    })
+}
+
 // An ordinary cleanup exits through unconditional jumps. Nested final else arms
 // preserve that property: earlier arms copy the shared exit before line resolution.
 // A following authored statement supplies fallthrough instead and stops this walk.
@@ -35401,18 +35434,7 @@ fn suite_has_unconditional_cleanup_exit(body: &[Stmt]) -> bool {
                 && statement.orelse.is_empty()
                 && suite_terminates_before_constant_folding(&statement.body)
                 && !suite_contains_yield_with_headers(&statement.body, true, true)
-                && !suite_any_statement(&statement.body, |statement| {
-                    matches!(
-                        statement,
-                        Stmt::Return(_)
-                            | Stmt::Break(_)
-                            | Stmt::Continue(_)
-                            | Stmt::For(_)
-                            | Stmt::While(_)
-                            | Stmt::Try(_)
-                            | Stmt::With(_)
-                    )
-                });
+                && suite_has_nonsuspending_raise_work(&statement.body);
             statement.finalbody.is_empty()
                 // A terminal condition in the protected body can leave an empty
                 // original join before cleanup. Linear finalizer work alone does
@@ -37821,11 +37843,48 @@ fn try_has_conditional_shared_loop_exit(statement: &Stmt) -> bool {
 mod tests {
     use super::{
         first_coroutine_try_else_condition, first_iterator_assignment_condition,
-        suite_contains_multiple_loop_breaks, suite_terminates,
-        supports_nested_terminating_finally_returns, terminal_assert_splits_success_return,
+        suite_contains_multiple_loop_breaks, suite_has_unconditional_cleanup_exit,
+        suite_terminates, supports_nested_terminating_finally_returns,
+        terminal_assert_splits_success_return,
     };
     use ruff_python_ast::Stmt;
     use ruff_python_parser::parse_module;
+
+    #[test]
+    fn raising_cleanup_exit_rejects_current_scope_suspension() {
+        for (body, expected) in [
+            ("if flag:\n    raise Error()\nraise Other()", true),
+            ("value = prepare()\nraise Error(value)", true),
+            ("if await test():\n    raise Error()\nraise Other()", false),
+            (
+                "if flag:\n    raise Error()\nelif await test():\n    raise Other()\nraise Final()",
+                false,
+            ),
+            ("raise await error()", false),
+            ("raise Error() from await cause()", false),
+            ("await work()\nraise Error()", false),
+            ("value = await work()\nraise Error(value)", false),
+            ("values[await key()] = value\nraise Error()", false),
+            (
+                "value = [item async for item in stream]\nraise Error(value)",
+                false,
+            ),
+        ] {
+            let protected = body.replace('\n', "\n        ");
+            let parsed = parse_module(&format!(
+                "async def f():\n    try:\n        {protected}\n    finally:\n        value = None\n"
+            ))
+            .unwrap();
+            let Stmt::FunctionDef(function) = &parsed.suite()[0] else {
+                panic!()
+            };
+            assert_eq!(
+                suite_has_unconditional_cleanup_exit(&function.body),
+                expected,
+                "{body}"
+            );
+        }
+    }
 
     #[test]
     fn recursive_finally_return_certificate_requires_two_complete_frames() {
