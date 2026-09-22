@@ -85,13 +85,13 @@ Then run the frozen CPython 3.14.5 outcome comparison:
 ```
 
 The check first rejects missing files, content-identity drift, tracked
-modifications, and untracked files. The September 21, 2026 outcome baseline requires 73,162
-byte-identical files, 215 accepted-input byte mismatches, and 160 files rejected by CPython. That
-is 99.71% of the 73,377 CPython-accepted inputs. There are no compiler failures on accepted
+modifications, and untracked files. The September 22, 2026 outcome baseline requires 73,225
+byte-identical files, 152 accepted-input byte mismatches, and 160 files rejected by CPython. That
+is 99.79% of the 73,377 CPython-accepted inputs. There are no compiler failures on accepted
 inputs. Among the 160 CPython-rejected inputs, Serc matches 123 rejections, accepts 29, and
 reports 8 compiler failures.
 There are no unsupported inputs, parse/decode mismatches, non-UTF-8 inputs, or oracle failures.
-See the [measurement summary](results/compatibility-2026-09-21-public-fixes.json) for the compiler and corpus
+See the [measurement summary](results/compatibility-2026-09-22-public-fixes.json) for the compiler and corpus
 revisions and all outcome counts.
 
 A full run exits unsuccessfully when any outcome category or the independent CPython rejection

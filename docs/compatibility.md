@@ -45,17 +45,17 @@ network, storage, and CPU resources:
 ./scripts/check-mypy-primer-compatibility /path/to/python3.14.5
 ```
 
-The September 21, 2026 measurements below use CPython 3.14.5 and Serc
-[`f5e8d92`](https://github.com/astral-sh/serc/commit/f5e8d921dedc5a7c3b0ad87986d0fbd832d911d0).
+The September 22, 2026 measurements below use CPython 3.14.5 and Serc
+[`81fead6`](https://github.com/astral-sh/serc/commit/81fead6e51dd0cf68175cfcd0fa1fe3fcd2188b9).
 The corpus revisions and membership are unchanged. Counts and measurement details are recorded
-in the [results summary](../corpora/results/compatibility-2026-09-21-public-fixes.json).
+in the [results summary](../corpora/results/compatibility-2026-09-22-public-fixes.json).
 
 | Corpus | Files | CPython-rejected | Byte-identical accepted | Byte mismatches | Accepted-input compiler failures | Accepted-input match rate |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Ruff fixtures | 2,451 | 221 | 2,230 | 0 | 0 | 100% |
 | NumPy `v2.4.6` | 505 | 0 | 505 | 0 | 0 | 100% |
-| mypy-primer snapshot | 73,537 | 160 | 73,162 | 215 | 0 | 99.71% |
-| **Combined** | **76,493** | **381** | **75,897** | **215** | **0** | **99.72%** |
+| mypy-primer snapshot | 73,537 | 160 | 73,225 | 152 | 0 | 99.79% |
+| **Combined** | **76,493** | **381** | **75,960** | **152** | **0** | **99.80%** |
 
 Of the 160 CPython-rejected mypy-primer files, Serc matches 123 rejections, accepts 29, and
 reports a compiler failure for 8. These outcomes are frozen independently of the marshal-byte
@@ -74,7 +74,7 @@ details.
 
 To measure compatibility beyond the pinned corpora, Serc was tested against
 four large OSS projects that are absent from the mypy-primer snapshot. The
-September 21, 2026 rerun uses the same compiler and CPython target as the public measurements
+September 22, 2026 rerun uses the same compiler and CPython target as the public measurements
 above, comparing marshal output byte for byte. The published source revisions and membership
 are unchanged: tracked regular `.py` files, excluding symlinks and stubs. This preserves the
 published `.py`-only file counts and corrects the earlier description that mentioned stubs.
@@ -82,10 +82,10 @@ published `.py`-only file counts and corrects the earlier description that menti
 | Holdout project | Files | CPython-rejected | Byte-identical accepted | Byte mismatches | Accepted-input match rate |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | [Django `bf5e73c`](https://github.com/django/django/tree/bf5e73c576c8c7d8b3ef1c03a22cf724dbb2f306) | 2,927 | 1 | 2,926 | 0 | 100% |
-| [Airflow `cad6220`](https://github.com/apache/airflow/tree/cad6220034e87c586eb87e14b5a75f4b82984fd0) | 7,621 | 0 | 7,614 | 7 | 99.91% |
-| [Transformers `ab1771c`](https://github.com/huggingface/transformers/tree/ab1771c9e42891d893189978a8009426d70b4688) | 4,643 | 0 | 4,639 | 4 | 99.91% |
-| [Ansible `3217c35`](https://github.com/ansible/ansible/tree/3217c352bb7b77392317aac0cf8b859d7d43b5b5) | 1,810 | 0 | 1,801 | 9 | 99.50% |
-| **Combined holdout** | **17,001** | **1** | **16,980** | **20** | **99.88%** |
+| [Airflow `cad6220`](https://github.com/apache/airflow/tree/cad6220034e87c586eb87e14b5a75f4b82984fd0) | 7,621 | 0 | 7,619 | 2 | 99.97% |
+| [Transformers `ab1771c`](https://github.com/huggingface/transformers/tree/ab1771c9e42891d893189978a8009426d70b4688) | 4,643 | 0 | 4,643 | 0 | 100% |
+| [Ansible `3217c35`](https://github.com/ansible/ansible/tree/3217c352bb7b77392317aac0cf8b859d7d43b5b5) | 1,810 | 0 | 1,806 | 4 | 99.78% |
+| **Combined holdout** | **17,001** | **1** | **16,994** | **6** | **99.96%** |
 
 The holdout had no unsupported inputs, parse/decode mismatches, compiler
 failures, or oracle failures. It is an independent diagnostic measurement, not
