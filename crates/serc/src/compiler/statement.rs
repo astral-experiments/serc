@@ -14595,6 +14595,7 @@ impl Compiler<'_> {
         test: &Expr,
         restart: Label,
         allow_shared_false_exit: bool,
+        allow_while_loop: bool,
     ) -> bool {
         let exception_depth = self
             .control
@@ -14610,7 +14611,8 @@ impl Compiler<'_> {
             && self.control.withs.active_with_exits.is_empty()
             && self.control.finally.active_loop_finally_contexts.is_empty()
             && self.control.loops.contexts.last().is_some_and(|context| {
-                context.iterator_cleanup == IteratorCleanup::Sync
+                (context.iterator_cleanup == IteratorCleanup::Sync
+                    || (allow_while_loop && context.iterator_cleanup == IteratorCleanup::None))
                     && !context.has_orelse
                     && context.continue_label == restart
                     && context.exception_region_depth < exception_depth
@@ -14633,9 +14635,12 @@ impl Compiler<'_> {
         non_final_branch: bool,
     ) -> Result<(), CompileError> {
         let base_depth = self.control.stack.depth;
-        let original_try_exit =
-            self.preserves_original_try_loop_tail_exit(&statement.test, restart, true)
-                && !suite_contains_loop_break(&statement.body);
+        let original_try_exit = self.preserves_original_try_loop_tail_exit(
+            &statement.test,
+            restart,
+            true,
+            non_final_branch,
+        ) && !suite_contains_loop_break(&statement.body);
         if original_try_exit
             || (non_final_branch
                 && (!self.has_active_control_flow_region()
@@ -14909,7 +14914,7 @@ impl Compiler<'_> {
             && (success_conditional
                 || (success_disjunction && condition_has_linear_runtime_leaves(&statement.test)));
         let original_try_exit = statement.msg.is_none()
-            && self.preserves_original_try_loop_tail_exit(&statement.test, restart, false);
+            && self.preserves_original_try_loop_tail_exit(&statement.test, restart, false, false);
         if (non_final_branch || original_try_exit)
             && (copy_success_backedge || condition_jump_target_count(&statement.test, true) == 1)
         {
@@ -15434,7 +15439,11 @@ impl Compiler<'_> {
                         // A direct runtime chain has two false paths into this original
                         // exit: its comparison edge and the intermediate-value cleanup.
                         // Keep both forward until the existing exit-copy pass runs.
-                        || (!self.has_active_control_flow_region()
+                        // The same protected exit begins with the replaced arm-jump
+                        // NOP, which still blocks threading before NOP cleanup.
+                        || ((!self.has_active_control_flow_region()
+                            || (!expression_suspends_current_scope(test)
+                                && !expression_yields_in_current_scope(test)))
                             && matches!(test, Expr::Compare(comparison) if comparison.ops.len() > 1)
                             && condition_has_only_runtime_tests(test)));
                 if copied_loop_branch_exit
@@ -35794,6 +35803,42 @@ fn copied_finally_tail_can_inline_continue(body: &[Stmt]) -> bool {
         })
 }
 
+/// Finds yields evaluated now, including lambda defaults and a generator's first iterable.
+fn expression_yields_in_current_scope(expression: &Expr) -> bool {
+    #[derive(Default)]
+    struct Detector {
+        found: bool,
+    }
+
+    impl<'ast> Visitor<'ast> for Detector {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if self.found {
+                return;
+            }
+            match expression {
+                Expr::Lambda(lambda) => {
+                    if let Some(parameters) = lambda.parameters.as_deref() {
+                        for default in parameter_default_expressions(parameters) {
+                            self.visit_expr(default);
+                        }
+                    }
+                }
+                Expr::Generator(generator) => {
+                    if let Some(first) = generator.generators.first() {
+                        self.visit_expr(&first.iter);
+                    }
+                }
+                Expr::Yield(_) | Expr::YieldFrom(_) => self.found = true,
+                _ => walk_expr(self, expression),
+            }
+        }
+    }
+
+    let mut detector = Detector::default();
+    detector.visit_expr(expression);
+    detector.found
+}
+
 fn condition_has_only_runtime_tests(expression: &Expr) -> bool {
     if early_condition_truthiness(expression).is_some() || fold_constant(expression).is_some() {
         return false;
@@ -38363,10 +38408,10 @@ fn try_has_conditional_shared_loop_exit(statement: &Stmt) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        first_coroutine_try_else_condition, first_iterator_assignment_condition,
-        suite_contains_multiple_loop_breaks, suite_has_unconditional_cleanup_exit,
-        suite_terminates, supports_nested_terminating_finally_returns,
-        terminal_assert_splits_success_return,
+        expression_yields_in_current_scope, first_coroutine_try_else_condition,
+        first_iterator_assignment_condition, suite_contains_multiple_loop_breaks,
+        suite_has_unconditional_cleanup_exit, suite_terminates,
+        supports_nested_terminating_finally_returns, terminal_assert_splits_success_return,
     };
     use ruff_python_ast::Stmt;
     use ruff_python_parser::parse_module;
@@ -38769,5 +38814,46 @@ mod tests {
             "entries[prepared] = None",
             true,
         ));
+    }
+    #[test]
+    fn loop_exit_yield_guard_visits_only_eager_scope_parts() {
+        for (expression, expected) in [
+            ("left < (yield item) < right", true),
+            ("left < (yield from items) < right", true),
+            ("left < (lambda value=(yield item): value) < right", true),
+            ("left < (lambda *, value=(yield item): value) < right", true),
+            (
+                "left < (lambda callback=(lambda value=(yield item): value): callback) < right",
+                true,
+            ),
+            ("left < (value for value in (yield items)) < right", true),
+            (
+                "left < (value for value in (lambda seq=(yield items): seq)()) < right",
+                true,
+            ),
+            ("left < (lambda: (yield item)) < right", false),
+            (
+                "left < (lambda callback=(lambda: (yield item)): callback) < right",
+                false,
+            ),
+            (
+                "left < ((lambda: (yield value)) for value in items) < right",
+                false,
+            ),
+            ("left < len(items) - 1 < right", false),
+        ] {
+            let parsed = parse_module(&format!("def f():\n    value = {expression}\n")).unwrap();
+            let Stmt::FunctionDef(function) = &parsed.suite()[0] else {
+                panic!("expected function");
+            };
+            let Stmt::Assign(assignment) = &function.body[0] else {
+                panic!("expected assignment");
+            };
+            assert_eq!(
+                expression_yields_in_current_scope(&assignment.value),
+                expected,
+                "{expression}"
+            );
+        }
     }
 }
