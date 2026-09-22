@@ -97,6 +97,7 @@ mod direct_try_while_return_condition_compatibility;
 mod discarded_child_constants;
 mod discarded_fstring_fragments;
 mod discarded_literal_slice_admission;
+mod discarded_metadata_tuple_origins;
 mod discarded_suspension_constants;
 mod dynamic_while_call_attribute_condition_owner_compatibility;
 mod dynamic_while_condition_owner_compatibility;

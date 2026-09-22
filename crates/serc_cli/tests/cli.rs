@@ -278,6 +278,10 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
             "value = item[r\"\\ud800\" \"\\udfff\":]",
             "item[\"\\ud800\":] = value",
             "del item[\"\\ud800\":]",
+            // Discarded metadata can intern an equal tuple while leaving scalar literals plain.
+            "if False:\n    def discarded():\n        return café\nvalue = ('café',)\n",
+            "if False:\n    def discarded(café):\n        pass\nscalar = 'café'\nvalue = ('café',)\n",
+            "if False:\n    def discarded(value: [café for café in ()]): pass\nvalue = ('format', 'café')\n",
             // Copied negation creates a fresh object at each assembler admission.
             "def first(flag, value):\n    return -((1e999 - 1e999) if flag else value)\ndef second(flag, value):\n    return -((1e999 - 1e999) if flag else value)\n",
             "def first(flag, value):\n    return -((1e999j - 1e999j) if flag else value)\ndef second(flag, value):\n    return -((1e999j - 1e999j) if flag else value)\n",

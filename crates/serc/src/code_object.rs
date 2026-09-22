@@ -104,6 +104,8 @@ impl CodeInterningSummary {
 pub(crate) struct MarshalProvenance {
     pub(crate) assembly_order: Option<usize>,
     pub(crate) interning_events: Vec<CompilationInterningEvent>,
+    /// Non-ASCII metadata tuples interned during assembly, including discarded code.
+    pub(crate) interned_metadata_tuples: Vec<Vec<String>>,
     pub(crate) locals_identity: LocalsIdentity,
     pub(crate) explicitly_interned_strings: FxHashSet<String>,
     /// Parser-interned names used as constants, including names absent from emitted tables.
