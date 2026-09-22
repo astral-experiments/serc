@@ -93,6 +93,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) copied_manager_return_compactions: Vec<CopiedManagerReturnCompaction>,
     pub(super) uncompacted_conditional_arrays: Vec<UncompactedConditionalArray>,
     pub(super) original_primitive_condition_boundaries: Vec<Instruction>,
+    // Exact comparison failure/fallthrough/cleanup records; no synthetic head label.
+    pub(super) original_comparison_fallthroughs: Vec<(Label, Label, [Instruction; 6])>,
     // Source-authored match ends establish original arrays independently of case exits.
     pub(super) original_match_join_boundaries: FxHashSet<Label>,
     // Exact post-threading head and original fallthrough donor of a shared case return.
@@ -653,6 +655,11 @@ impl ExceptionOwnerProvenance {
         }
         for instruction in &mut self.original_primitive_condition_boundaries {
             visit(instruction);
+        }
+        for (_, _, records) in &mut self.original_comparison_fallthroughs {
+            for instruction in records {
+                visit(instruction);
+            }
         }
         for record in self.shared_match_return_donors.values_mut() {
             visit(&mut record.0);

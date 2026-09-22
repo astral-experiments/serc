@@ -8312,6 +8312,8 @@ impl Compiler<'_> {
             // those labels in one block so small return copies see its body.
             self.assembler.preserve_block_boundary_if_new(end);
             self.assembler.mark(end);
+            // Native codegen_jump_if marks this existing short-circuit join.
+            self.assembler.record_exception_owner_block_boundary(end);
             return Ok(());
         }
         if let Expr::If(conditional) = expression {
@@ -8412,6 +8414,12 @@ impl Compiler<'_> {
             }
 
             self.assembler.mark(end);
+            // Native marks this existing join after emitting the comparison cleanup.
+            self.assembler.record_exception_owner_block_boundary(end);
+            if self.context.python_version >= PythonVersion::Py314 && !jump_on {
+                self.assembler
+                    .record_original_comparison_fallthrough(cleanup, end);
+            }
             self.set_depth(base_depth);
             return Ok(());
         }

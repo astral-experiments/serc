@@ -13819,6 +13819,75 @@ impl Assembler {
             .push(condition);
     }
 
+    /// Captures the unlabeled, one-jump fallthrough of an intact chained comparison.
+    pub(crate) fn record_original_comparison_fallthrough(&mut self, cleanup: Label, end: Label) {
+        let items = self.linear_items();
+        let Some((Item::Label(last), prefix)) = items.split_last() else {
+            return;
+        };
+        if *last != end {
+            return;
+        }
+        let Some(cleanup_index) = prefix
+            .iter()
+            .rposition(|item| *item == Item::Label(cleanup))
+        else {
+            return;
+        };
+        let [Item::Instruction(pop), Item::Instruction(cleanup_jump)] =
+            &prefix[cleanup_index + 1..]
+        else {
+            return;
+        };
+        let Some(start) = cleanup_index.checked_sub(3) else {
+            return;
+        };
+        let [
+            Item::Instruction(condition),
+            Item::Instruction(marker),
+            Item::Instruction(bridge),
+        ] = &prefix[start..cleanup_index]
+        else {
+            return;
+        };
+        if condition.opcode != POP_JUMP_IF_FALSE
+            || marker.opcode != NOT_TAKEN
+            || bridge.opcode != JUMP_FORWARD
+            || bridge.operand() != Operand::Forward(end)
+            || !matches!(
+                (
+                    bridge.jump_policy.inline_small_exit(),
+                    bridge.jump_policy.retained_nop()
+                ),
+                (false, ir::RetainedJumpNop::None) | (true, ir::RetainedJumpNop::Always)
+            )
+            || pop.opcode != POP_TOP
+            || cleanup_jump.opcode != JUMP_FORWARD
+            || cleanup_jump.operand() != condition.operand()
+        {
+            return;
+        }
+        let mut failures = prefix[..start].iter().filter_map(|item| match item {
+            Item::Instruction(instruction)
+                if instruction.opcode == POP_JUMP_IF_FALSE
+                    && instruction.operand() == Operand::Forward(cleanup) =>
+            {
+                Some(*instruction)
+            }
+            _ => None,
+        });
+        let Some(failure) = failures.next() else {
+            return;
+        };
+        if failures.next().is_some() {
+            return;
+        }
+        let records = [failure, *condition, *marker, *bridge, *pop, *cleanup_jump];
+        self.exception_owner_provenance
+            .original_comparison_fallthroughs
+            .push((cleanup, end, records));
+    }
+
     /// Records the original jump into a comprehension's normal restore array.
     pub(crate) fn record_original_comprehension_normal_exit(
         &mut self,
