@@ -106,6 +106,56 @@ fn compile_rejects_unsupported_python_version() {
 }
 
 #[test]
+fn compile_preserves_template_not_equal_expression_text() {
+    let source = r#"a, b, c = 1, 2, 3
+cases = (
+    (t"{(a != b):}", "(a != b)"),
+    (t"{(a != b) != c:}", "(a != b)"),
+    (t"{'!=' != 'other':}", "'!='"),
+    (t"{f'{a != b}' != c:}", "f'{a != b}'"),
+    (t"{[a != b] != c:}", "[a != b]"),
+    (t"{a != b:}", "a"),
+    (t"{a == b != c:}", "a == b"),
+    (t"{a != (b != c):}", "a"),
+    (t"{(a != b)!r:}", "(a != b)"),
+    (t"{(a != b)}", "(a != b)"),
+)
+for template, expected in cases:
+    assert template.interpolations[0].expression == expected
+"#;
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("templates.py");
+    fs_err::write(&source_path, source).unwrap();
+
+    for (version, mut oracle) in [
+        (serc::PythonVersion::Py314, common::python_3145_command()),
+        (serc::PythonVersion::Py315, common::python_315_command()),
+    ] {
+        let native = oracle
+            .args([
+                "-B",
+                "-c",
+                "import marshal, pathlib, sys; path = pathlib.Path(sys.argv[1]); code = compile(path.read_bytes(), str(path), 'exec', dont_inherit=True, optimize=0); encoded = marshal.dumps(code); exec(code); sys.stdout.buffer.write(encoded)",
+            ])
+            .arg(&source_path)
+            .output()
+            .unwrap();
+        assert!(native.status.success(), "{version}: {native:?}");
+
+        let compiled = serc::compile_with_options(
+            source,
+            &source_path.to_string_lossy(),
+            &serc::CompileOptions {
+                python_version: version,
+                ..serc::CompileOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(compiled.marshal(), native.stdout, "Python {version}");
+    }
+}
+
+#[test]
 fn compile_matches_cpython_for_version_specific_marshal_identity() {
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("module.py");
