@@ -23,8 +23,7 @@
       "revision": "8e34077345317427aa4664d6b1ec556c3c6812e7",
       "logical_projects": [
         "porcupine"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--AlexWaygood--typeshed-stats",
@@ -32,8 +31,7 @@
       "revision": "0ece8877995d6431db81f6ed1a5120b3de84ee32",
       "logical_projects": [
         "typeshed-stats"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--Avasam--speedrun.com_global_scoreboard_webapp",
@@ -41,8 +39,7 @@
       "revision": "713ab00cd567d6d9fd526faa76e10de09ef978ac",
       "logical_projects": [
         "speedrun.com_global_scoreboard_webapp"
-      ],
-      "default_ref": "refs/heads/develop"
+      ]
     },
     {
       "id": "github.com--DataDog--dd-trace-py",
@@ -50,8 +47,7 @@
       "revision": "00ec28e76be284af91f7cc6c7db467711c534535",
       "logical_projects": [
         "dd-trace-py"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--FasterSpeeding--Tanjun",
@@ -59,8 +55,7 @@
       "revision": "88d43a267a5bcd995d4929f62b14fbe5c18e59de",
       "logical_projects": [
         "Tanjun"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--Finistere--antidote",
@@ -68,8 +63,7 @@
       "revision": "7d64ff76b7e283e5d9593ca09ea7a52b9b054957",
       "logical_projects": [
         "antidote"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--Gobot1234--steam.py",
@@ -77,8 +71,7 @@
       "revision": "07a3fba21c677cd68ccb122b9287980eac470a29",
       "logical_projects": [
         "steam.py"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--JohannesBuchner--imagehash",
@@ -86,8 +79,7 @@
       "revision": "4e289ebe056b961aa19fb1b50f5bdc66c87e0d55",
       "logical_projects": [
         "imagehash"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--Kalmat--PyWinCtl",
@@ -95,8 +87,7 @@
       "revision": "e6c8de5b658cf9700ba2b67ffcc16589c9125a84",
       "logical_projects": [
         "PyWinCtl"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--Legrandin--pycryptodome",
@@ -104,8 +95,7 @@
       "revision": "d12264940c40417915fb85acb8c787ad9da58969",
       "logical_projects": [
         "pycryptodome"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--MaterializeInc--materialize",
@@ -113,8 +103,7 @@
       "revision": "f7236a6fe1ad59eb42c7f4cf4b770b0f58d90997",
       "logical_projects": [
         "materialize"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--PrefectHQ--prefect",
@@ -122,8 +111,7 @@
       "revision": "3f47d765fea655c92f2d700fedee8635ea2d4d2f",
       "logical_projects": [
         "prefect"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--PyCQA--flake8-pyi",
@@ -131,8 +119,7 @@
       "revision": "52faec995c635fa91288a4abbb196b0b1661ec36",
       "logical_projects": [
         "flake8-pyi"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--PyGithub--PyGithub",
@@ -140,8 +127,7 @@
       "revision": "e36ffcbb02ed5584e0dc46307e9a98c3214d98a6",
       "logical_projects": [
         "PyGithub"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--Rapptz--discord.py",
@@ -149,8 +135,7 @@
       "revision": "2fbed9362422dad4f7850eb6c5d9b1f8bff7c71a",
       "logical_projects": [
         "discord.py"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--Textualize--rich",
@@ -158,8 +143,7 @@
       "revision": "9d8f9a372cc5916fd4781fec207ced7ddac2f08f",
       "logical_projects": [
         "rich"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--Toufool--AutoSplit",
@@ -167,8 +151,7 @@
       "revision": "27a9995f309a50dd7f6ffc686f1dafdb4523da5f",
       "logical_projects": [
         "AutoSplit"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--WoLpH--numpy-stl",
@@ -176,8 +159,7 @@
       "revision": "f8e1c57c37a705cd11cbf1d0ee18ba34775c6380",
       "logical_projects": [
         "numpy-stl"
-      ],
-      "default_ref": "refs/heads/develop"
+      ]
     },
     {
       "id": "github.com--aaugustin--websockets",
@@ -185,8 +167,7 @@
       "revision": "f729dc4fafcbb83f4924df6bfaf5ccbc9673e5d4",
       "logical_projects": [
         "websockets"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--agronholm--anyio",
@@ -194,8 +175,7 @@
       "revision": "85b8b6eb2e213c0fc7cbc1c29f71e3d487393bab",
       "logical_projects": [
         "anyio"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--aio-libs--aiohttp",
@@ -203,8 +183,7 @@
       "revision": "8040e0ea638ec345b21e6f553b24000e5af64fd0",
       "logical_projects": [
         "aiohttp"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--aio-libs--aiohttp-devtools",
@@ -212,8 +191,7 @@
       "revision": "b76aab071d245ae35c237be21013f744fedb536d",
       "logical_projects": [
         "aiohttp-devtools"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--aio-libs--aioredis",
@@ -221,8 +199,7 @@
       "revision": "19be499015a8cf32580e937cbfd711fd48489eca",
       "logical_projects": [
         "aioredis"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--aio-libs--janus",
@@ -230,8 +207,7 @@
       "revision": "d1f1198f0a70129e5d7233908b5448f3eaaf86ba",
       "logical_projects": [
         "janus"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--aio-libs--yarl",
@@ -239,8 +215,7 @@
       "revision": "26ccd6ed2ed1ea9943b4391677c71348a0664220",
       "logical_projects": [
         "yarl"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--aiortc--aiortc",
@@ -248,8 +223,7 @@
       "revision": "4b0b4028903c8c1f2c44251762e9f1ec7cbd083b",
       "logical_projects": [
         "aiortc"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--alerta--alerta",
@@ -257,8 +231,7 @@
       "revision": "4ac0106300cd428b26ad4b373cf4a78f55f6b542",
       "logical_projects": [
         "alerta"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--apache--spark",
@@ -266,8 +239,7 @@
       "revision": "93210604bdf8280c0e4b0b86dc47557eca6cb4a2",
       "logical_projects": [
         "spark"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--archlinux--archinstall",
@@ -275,8 +247,7 @@
       "revision": "338e3cf4b8494da2aeca4ffca9218cd3a18ca989",
       "logical_projects": [
         "archinstall"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--artigraph--artigraph",
@@ -284,8 +255,7 @@
       "revision": "a158a7eae0406c35905d8bb3b2f27a733c2c18bc",
       "logical_projects": [
         "artigraph"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--arviz-devs--arviz",
@@ -293,8 +263,7 @@
       "revision": "3d7ef50cd2901e9dfc1e2e0f46c3d5cdead1435b",
       "logical_projects": [
         "arviz"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--astral-sh--docstring-adder",
@@ -302,8 +271,7 @@
       "revision": "dce9cc72681b28b525295643dd28962593d35399",
       "logical_projects": [
         "docstring-adder"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--astral-sh--ecosystem-analyzer",
@@ -311,8 +279,7 @@
       "revision": "c87597330fd25bbde0eb28a60b026af55b4e5d81",
       "logical_projects": [
         "ecosystem-analyzer"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--astroserc--xarray-dataclasses",
@@ -320,8 +287,7 @@
       "revision": "605e15f3d081fdc7ff2a51abdd09596db946a96d",
       "logical_projects": [
         "xarray-dataclasses"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--awslabs--sockeye",
@@ -329,8 +295,7 @@
       "revision": "871d9863d6a657d87de1c90f44977c5b70c99c7e",
       "logical_projects": [
         "sockeye"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--beartype--beartype",
@@ -338,8 +303,7 @@
       "revision": "f11123962925882b0b8f20af7bf85de900d586b2",
       "logical_projects": [
         "beartype"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--bokeh--bokeh",
@@ -347,8 +311,7 @@
       "revision": "784d225625feb5b826929e357848de97f73fad6d",
       "logical_projects": [
         "bokeh"
-      ],
-      "default_ref": "refs/heads/branch-3.10"
+      ]
     },
     {
       "id": "github.com--canonical--cloud-init",
@@ -356,8 +319,7 @@
       "revision": "399cc0422eb3f3407549fb0f366c8b78d6afc8cf",
       "logical_projects": [
         "cloud-init"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--canonical--operator",
@@ -365,8 +327,7 @@
       "revision": "0a09e2d814701ccd1fce8586db24a36d34de611d",
       "logical_projects": [
         "operator"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--caronc--apprise",
@@ -374,8 +335,7 @@
       "revision": "c067047a3d18a81af88c7ec90d38cb1aa0fb7564",
       "logical_projects": [
         "apprise"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--cognitedata--Expression",
@@ -383,8 +343,7 @@
       "revision": "3981fd3a3ad60a13d00a4a3c170bdac76c1943fe",
       "logical_projects": [
         "Expression"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--colour-science--colour",
@@ -392,8 +351,7 @@
       "revision": "c167aa6f56e8fbad99cd12abf4d43bf36ea2b20b",
       "logical_projects": [
         "colour"
-      ],
-      "default_ref": "refs/heads/develop"
+      ]
     },
     {
       "id": "github.com--common-workflow-language--cwltool",
@@ -401,8 +359,7 @@
       "revision": "1bf74499ca1c4a5f98e7cffb0ad4aa89aa98cb9e",
       "logical_projects": [
         "cwltool"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--common-workflow-language--schema_salad",
@@ -410,8 +367,7 @@
       "revision": "ee603d4ee923f6c3b66696f714e63ddf0ed55dff",
       "logical_projects": [
         "schema_salad"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--cpitclaudel--alectryon",
@@ -419,8 +375,7 @@
       "revision": "a6f19454a4a8756c51c6c4413544ad09d188e006",
       "logical_projects": [
         "alectryon"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--davidhalter--parso",
@@ -428,8 +383,7 @@
       "revision": "bfe30584415cde2e5a686512c2b109e1d06da3b6",
       "logical_projects": [
         "parso"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--dedupeio--dedupe",
@@ -437,8 +391,7 @@
       "revision": "3f61e79102910bd355e920a2df7e44c14c9cb247",
       "logical_projects": [
         "dedupe"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--detachhead--pytest-robotframework",
@@ -446,8 +399,7 @@
       "revision": "43b2f94ddd7b4d60818fae7d349da2e03282485f",
       "logical_projects": [
         "pytest-robotframework"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--dragonchain--dragonchain",
@@ -455,8 +407,7 @@
       "revision": "1a25eda598471fd735a2b515312bfc3bbe53770b",
       "logical_projects": [
         "dragonchain"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--dropbox--mypy-protobuf",
@@ -464,8 +415,7 @@
       "revision": "e92875b9ae3a123bfd7b1e249935a33ed7b16a34",
       "logical_projects": [
         "mypy-protobuf"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--dropbox--stone",
@@ -473,8 +423,7 @@
       "revision": "7a087d2d592bcc4500511b15109eeffa6ba29259",
       "logical_projects": [
         "stone"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--dulwich--dulwich",
@@ -482,8 +431,7 @@
       "revision": "9c454399ce5b75bb4260a2e49b77fcbc2adc32b4",
       "logical_projects": [
         "dulwich"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--egraphs-good--egglog-python",
@@ -491,8 +439,7 @@
       "revision": "6b2016e5c5ae8c2d6e75ba094774322e767bff30",
       "logical_projects": [
         "egglog-python"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--encode--starlette",
@@ -500,8 +447,7 @@
       "revision": "5174d4c8358a6f06aa8056bafd14c2272dab8dd1",
       "logical_projects": [
         "starlette"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--enthought--comtypes",
@@ -509,8 +455,7 @@
       "revision": "339ea278d85defda3d3c0dba118969021018e5fb",
       "logical_projects": [
         "comtypes"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--freqtrade--freqtrade",
@@ -518,8 +463,7 @@
       "revision": "0a5bbf68d06af9916f53532f53aea5a2b510ac86",
       "logical_projects": [
         "freqtrade"
-      ],
-      "default_ref": "refs/heads/develop"
+      ]
     },
     {
       "id": "github.com--glyph--DateType",
@@ -527,8 +471,7 @@
       "revision": "a6ebb954cd18302a031a29b2f65e077b8e7776d4",
       "logical_projects": [
         "DateType"
-      ],
-      "default_ref": "refs/heads/trunk"
+      ]
     },
     {
       "id": "github.com--google--jax",
@@ -536,8 +479,7 @@
       "revision": "7b6de017d4ca3f405d630eb59ec6c111cf7ded4c",
       "logical_projects": [
         "jax"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--graphql-python--graphql-core",
@@ -545,8 +487,7 @@
       "revision": "665225b47ca0c8172aa6553ee6236aabc5331cbb",
       "logical_projects": [
         "graphql-core"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--hauntsaninja--boostedblob",
@@ -554,8 +495,7 @@
       "revision": "cab5376deb857c3bb54001dbac64f59fcd7c7737",
       "logical_projects": [
         "boostedblob"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--hauntsaninja--mypy_primer",
@@ -563,8 +503,7 @@
       "revision": "ff3d9531335dad605d43fcc208c9c159bb09fa81",
       "logical_projects": [
         "mypy_primer"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--hauntsaninja--pyp",
@@ -572,8 +511,7 @@
       "revision": "790c3cd7b8d59781f3245beea5b4e8100b871da9",
       "logical_projects": [
         "pyp"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--home-assistant--core",
@@ -581,8 +519,7 @@
       "revision": "3e06799f51205a16d2a3118c5e24d3509b273b17",
       "logical_projects": [
         "core"
-      ],
-      "default_ref": "refs/heads/dev"
+      ]
     },
     {
       "id": "github.com--hydpy-dev--hydpy",
@@ -590,8 +527,7 @@
       "revision": "113bdbfda518f257ca428459b4b6016fe4dc78dd",
       "logical_projects": [
         "hydpy"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--hynek--svcs",
@@ -599,8 +535,7 @@
       "revision": "ff266f1b2e318b6dc03921538e9bc3499b8cc370",
       "logical_projects": [
         "svcs"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--ibis-project--ibis",
@@ -608,8 +543,7 @@
       "revision": "4556dad2c2a9f04468b12237ade271c2e708db4a",
       "logical_projects": [
         "ibis"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--ilevkivskyi--com2ann",
@@ -617,8 +551,7 @@
       "revision": "24a47720d48fc597e1e008856fb625d9607e1a52",
       "logical_projects": [
         "com2ann"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--internetarchive--openlibrary",
@@ -626,8 +559,7 @@
       "revision": "f1b8fbad022cec0a9c0a78136a4990f87fc8148c",
       "logical_projects": [
         "openlibrary"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--jab--bidict",
@@ -635,8 +567,7 @@
       "revision": "2a22e631e97c3b05420ffd2736c824c08d1f2404",
       "logical_projects": [
         "bidict"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--jaraco--zipp",
@@ -644,8 +575,7 @@
       "revision": "29a7a55c6bac1a6f705b54135dbea82d03e997c3",
       "logical_projects": [
         "zipp"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--joerick--pyinstrument",
@@ -653,8 +583,7 @@
       "revision": "e473fdea89d9165a365e8b5424b531cc3c472326",
       "logical_projects": [
         "pyinstrument"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--johtso--httpx-caching",
@@ -662,8 +591,7 @@
       "revision": "7b1f2664480b519ea8307d696a3e1238a03ae350",
       "logical_projects": [
         "httpx-caching"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--jpadilla--pyjwt",
@@ -671,8 +599,7 @@
       "revision": "7144e4534c34810f4525dc4578a32addd8212cff",
       "logical_projects": [
         "pyjwt"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--keithasaurus--koda-validate",
@@ -680,8 +607,7 @@
       "revision": "66cbe9eab6bd8816db497aa99c86698728954539",
       "logical_projects": [
         "koda-validate"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--konradhalas--dacite",
@@ -689,8 +615,7 @@
       "revision": "9898ccbb783e7e6a35ae165e7deb9fa84edfe21c",
       "logical_projects": [
         "dacite"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--kornia--kornia",
@@ -698,8 +623,7 @@
       "revision": "0fdfdc5e8354fbd116d67602f79cfa4e2a2a277e",
       "logical_projects": [
         "kornia"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--laowantong--paroxython",
@@ -707,8 +631,7 @@
       "revision": "44e14b17965c6b02871db4c9ed6acc8716c2740d",
       "logical_projects": [
         "paroxython"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--mesonbuild--meson",
@@ -716,8 +639,7 @@
       "revision": "b0c04131c77acbe0966751742ac7e4448f6c2295",
       "logical_projects": [
         "meson"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--mhammond--pywin32",
@@ -725,8 +647,7 @@
       "revision": "1e89f41c6a98bba7ed23075322b9fa6a9bfc0200",
       "logical_projects": [
         "pywin32"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--mikeshardmind--async-utils",
@@ -734,8 +655,7 @@
       "revision": "9014101d66f73028ef189a98dd72c10d19f5a370",
       "logical_projects": [
         "async-utils"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--mit-ll-responsible-ai--hydra-zen",
@@ -743,8 +663,7 @@
       "revision": "11ade066390adee051357141b30c1bead89b643f",
       "logical_projects": [
         "hydra-zen"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--mitmproxy--mitmproxy",
@@ -752,8 +671,7 @@
       "revision": "a67fc64596c472cb468be6b3ac188511e8e9ff94",
       "logical_projects": [
         "mitmproxy"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--mkdocs--mkdocs",
@@ -761,8 +679,7 @@
       "revision": "2862536793b3c67d9d83c33e0dd6d50a791928f8",
       "logical_projects": [
         "mkdocs"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--mongodb--mongo-python-driver",
@@ -770,8 +687,7 @@
       "revision": "a167a86c5b851751429f9f8a72fc63f7a3ba8807",
       "logical_projects": [
         "mongo-python-driver"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--more-itertools--more-itertools",
@@ -779,8 +695,7 @@
       "revision": "d82024d025ec48f1197f92d5b66560a537a78184",
       "logical_projects": [
         "more-itertools"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--mystor--git-revise",
@@ -788,8 +703,7 @@
       "revision": "a5bdbe420521a7784dd16c8f22b374b2f1d2d167",
       "logical_projects": [
         "git-revise"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--niklasf--python-chess",
@@ -797,8 +711,7 @@
       "revision": "8330cfd5dbb9401f0e85be92cf408d6482505642",
       "logical_projects": [
         "python-chess"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--nion-software--nionutils",
@@ -806,8 +719,7 @@
       "revision": "9816de16aa60050ab900a727ac8310bcb2f1c047",
       "logical_projects": [
         "nionutils"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--nolar--kopf",
@@ -815,8 +727,7 @@
       "revision": "60d02aefb11c98cda6afab483f7953f6bb2ab9d6",
       "logical_projects": [
         "kopf"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--optuna--optuna",
@@ -824,8 +735,7 @@
       "revision": "be2ca8a82bfcca83433048c3101faff52b15ba5e",
       "logical_projects": [
         "optuna"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--pallets--itsdangerous",
@@ -833,8 +743,7 @@
       "revision": "672971d66a2ef9f85151e53283113f33d642dabd",
       "logical_projects": [
         "itsdangerous"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--pallets--jinja",
@@ -842,8 +751,7 @@
       "revision": "5ef70112a1ff19c05324ff889dd30405b1002044",
       "logical_projects": [
         "jinja"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--pallets--werkzeug",
@@ -851,8 +759,7 @@
       "revision": "1b00618e787f40dfb21eba29caf8f8be7c8e1d93",
       "logical_projects": [
         "werkzeug"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--pandas-dev--pandas",
@@ -860,8 +767,7 @@
       "revision": "a7bd1ae0bdfe9cc2b42963c3dee8c5fcaa3a88e7",
       "logical_projects": [
         "pandas"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--pandas-dev--pandas-stubs",
@@ -869,8 +775,7 @@
       "revision": "a173d872ae5d4c881ae1e7aa779b4076e5ad9fc7",
       "logical_projects": [
         "pandas-stubs"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--pandera-dev--pandera",
@@ -878,8 +783,7 @@
       "revision": "1cfda4b424c10017ac13152df61a9d520d8b4b00",
       "logical_projects": [
         "pandera"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--ppb--ppb-vector",
@@ -887,8 +791,7 @@
       "revision": "15097fe8ba2b1103739b71eb2e806290d993ea6d",
       "logical_projects": [
         "ppb-vector"
-      ],
-      "default_ref": "refs/heads/canon"
+      ]
     },
     {
       "id": "github.com--psf--black",
@@ -896,8 +799,7 @@
       "revision": "d7587ce9f52f36eb41bc505e529540fd8cbdcd3e",
       "logical_projects": [
         "black"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--psycopg--psycopg",
@@ -905,8 +807,7 @@
       "revision": "6a52e77dc38827214b294759823a072841b4819f",
       "logical_projects": [
         "psycopg"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--pwndbg--pwndbg",
@@ -914,8 +815,7 @@
       "revision": "0beb714caee0276d5d31fff10027d921d309710a",
       "logical_projects": [
         "pwndbg"
-      ],
-      "default_ref": "refs/heads/dev"
+      ]
     },
     {
       "id": "github.com--pybind--pybind11",
@@ -923,8 +823,7 @@
       "revision": "b57b4393ff92dfcea0da1b64eb359c8f900cbcec",
       "logical_projects": [
         "pybind11"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--pyca--cryptography",
@@ -932,8 +831,7 @@
       "revision": "d64949219e72f7b43bf28590152a93fa9e98fc7f",
       "logical_projects": [
         "cryptography"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--pycqa--flake8",
@@ -941,8 +839,7 @@
       "revision": "bb943328eff3518ee193adbddffdfe15e239c3f7",
       "logical_projects": [
         "flake8"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--pycqa--isort",
@@ -950,8 +847,7 @@
       "revision": "fd8bd075176d074af69aa6acae7ed89a6a89bb05",
       "logical_projects": [
         "isort"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--pycqa--pylint",
@@ -959,8 +855,7 @@
       "revision": "8ac171bcc903962d8843743de778494a9d518c34",
       "logical_projects": [
         "pylint"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--pydantic--pydantic",
@@ -968,8 +863,7 @@
       "revision": "652a61ce4f9d7d76eaada31535807a485ece0e21",
       "logical_projects": [
         "pydantic"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--pydata--xarray",
@@ -977,8 +871,7 @@
       "revision": "02cd48103d24bfb97403fb0aab79202a4821e8c4",
       "logical_projects": [
         "xarray"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--pyodide--pyodide",
@@ -986,8 +879,7 @@
       "revision": "2f943f2fee1202113026e9f91e274e7c75e95797",
       "logical_projects": [
         "pyodide"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--pypa--bandersnatch",
@@ -995,8 +887,7 @@
       "revision": "2c62c1e99cbfd11939d04afb3cc1607b39b241f7",
       "logical_projects": [
         "bandersnatch"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--pypa--build",
@@ -1004,8 +895,7 @@
       "revision": "6c03264d186ce7a6c9f1e1990408a3a215dc7610",
       "logical_projects": [
         "build"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--pypa--cibuildwheel",
@@ -1013,8 +903,7 @@
       "revision": "3f8bd1c9ba352bad278d1a2cf8139ee0f6a25947",
       "logical_projects": [
         "cibuildwheel"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--pypa--packaging",
@@ -1022,8 +911,7 @@
       "revision": "9a11fba3d53215dc2ff08d8e9d0d5780c08fbe8f",
       "logical_projects": [
         "packaging"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--pypa--pip",
@@ -1031,8 +919,7 @@
       "revision": "131e63d4ca5f94a571e48faa03c74e7dfb03ee8a",
       "logical_projects": [
         "pip"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--pypa--pyproject-metadata",
@@ -1040,8 +927,7 @@
       "revision": "737644a1482a750ce8a38927b69bbbe07d4e8b65",
       "logical_projects": [
         "pyproject-metadata"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--pypa--setuptools",
@@ -1049,8 +935,7 @@
       "revision": "14cc4452199818e60cf01cd9cea96e90761abce7",
       "logical_projects": [
         "setuptools"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--pypa--twine",
@@ -1058,8 +943,7 @@
       "revision": "4f20c0dc374bbd54fe7cddc341e3c5ba7479917b",
       "logical_projects": [
         "twine"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--pyppeteer--pyppeteer",
@@ -1067,8 +951,7 @@
       "revision": "7dc91ee5173d3836f77800a3774beeaf2b448c0e",
       "logical_projects": [
         "pyppeteer"
-      ],
-      "default_ref": "refs/heads/dev"
+      ]
     },
     {
       "id": "github.com--pytest-dev--pytest",
@@ -1076,8 +959,7 @@
       "revision": "efc013416e45d9162dc00dca9e4a83e1ef1c4089",
       "logical_projects": [
         "pytest"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--python--cpython",
@@ -1087,8 +969,7 @@
         "CPython (Argument Clinic)",
         "CPython (cases_generator)",
         "CPython (peg_generator)"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--python--mypy",
@@ -1096,8 +977,7 @@
       "revision": "cfc07346408d92ac91c18e3698c74b9c0d3a4a65",
       "logical_projects": [
         "mypy"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--python-attrs--attrs",
@@ -1105,8 +985,7 @@
       "revision": "45de9beb093d2142517ab7d1ebda6522e3d3c4ac",
       "logical_projects": [
         "attrs"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--python-jsonschema--check-jsonschema",
@@ -1114,8 +993,7 @@
       "revision": "74853ef885b5eff266e1593d9d22e3217950afda",
       "logical_projects": [
         "check-jsonschema"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--python-poetry--poetry",
@@ -1123,8 +1001,7 @@
       "revision": "f46702336862f30050d5c641d5ed6f7568ded793",
       "logical_projects": [
         "poetry"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--python-trio--trio",
@@ -1132,8 +1009,7 @@
       "revision": "0524dc174ba9a215098daab33f3cce56198791dc",
       "logical_projects": [
         "trio"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--pytorch--ignite",
@@ -1141,8 +1017,7 @@
       "revision": "563adbe0cefca596a18867dc7b1a05f73c0120ca",
       "logical_projects": [
         "ignite"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--pytorch--vision",
@@ -1150,8 +1025,7 @@
       "revision": "da446275eccae6cd00923080d9cc91f1f3a73744",
       "logical_projects": [
         "vision"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--quora--asynq",
@@ -1159,8 +1033,7 @@
       "revision": "2983cde1b48903757122d21ad1cfd7b82e89cd32",
       "logical_projects": [
         "asynq"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--rotki--rotki",
@@ -1168,8 +1041,7 @@
       "revision": "a3b0685c9e3fb9f26d0020a0e72b073f8589a9ad",
       "logical_projects": [
         "rotki"
-      ],
-      "default_ref": "refs/heads/develop"
+      ]
     },
     {
       "id": "github.com--rpdelaney--downforeveryone",
@@ -1177,8 +1049,7 @@
       "revision": "717e93fa9e8317046e59ef4569d28ecbdd5fb9e2",
       "logical_projects": [
         "downforeveryone"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--schemathesis--schemathesis",
@@ -1186,8 +1057,7 @@
       "revision": "a66b2b8efadf323e8867114f4d1915dd10823f51",
       "logical_projects": [
         "schemathesis"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--scikit-build--scikit-build-core",
@@ -1195,8 +1065,7 @@
       "revision": "eb74b11259f88357d7e552309695bb8ae6b94a50",
       "logical_projects": [
         "scikit-build-core"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--scikit-learn--scikit-learn",
@@ -1204,8 +1073,7 @@
       "revision": "5cd6db9fd572b1064bcb868651183221c14f96f4",
       "logical_projects": [
         "scikit-learn"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--scipy--scipy",
@@ -1213,8 +1081,7 @@
       "revision": "c696737585c3a9e21b804924ea792b0a941ebd7c",
       "logical_projects": [
         "scipy"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--scipy--scipy-stubs",
@@ -1222,8 +1089,7 @@
       "revision": "e6a1fa8369261def5035c04dee3792db3e258858",
       "logical_projects": [
         "scipy-stubs"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--sco1--pylox",
@@ -1231,8 +1097,7 @@
       "revision": "84da95eaa7f0ef8bfd1a18f980427979c1c1a2b6",
       "logical_projects": [
         "pylox"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--scrapy--scrapy",
@@ -1240,8 +1105,7 @@
       "revision": "bdf3067935fd262927ffddfe6bc2ebc9d15d034e",
       "logical_projects": [
         "scrapy"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--spack--spack",
@@ -1249,8 +1113,7 @@
       "revision": "6f2e9a5f08a0006b89e383ae917e40a44a458777",
       "logical_projects": [
         "spack"
-      ],
-      "default_ref": "refs/heads/develop"
+      ]
     },
     {
       "id": "github.com--sphinx-doc--sphinx",
@@ -1258,8 +1121,7 @@
       "revision": "c1b618c559e6de70e5198ed6876f5b9fab88face",
       "logical_projects": [
         "sphinx"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--srittau--python-htmlgen",
@@ -1267,8 +1129,7 @@
       "revision": "01e3b911ac282d067850bb324b913e3594bc0e23",
       "logical_projects": [
         "python-htmlgen"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--static-frame--static-frame",
@@ -1276,8 +1137,7 @@
       "revision": "559b4bd2ebe972662a5b8044753f1b81536b8b77",
       "logical_projects": [
         "static-frame"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--strawberry-graphql--strawberry",
@@ -1285,8 +1145,7 @@
       "revision": "53856226ae77640a2b5bae11f805a046d2e6286c",
       "logical_projects": [
         "strawberry"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--streamlit--streamlit",
@@ -1294,8 +1153,7 @@
       "revision": "71c5c9adb57c6e6065aedead612ba5fef395b9fc",
       "logical_projects": [
         "streamlit"
-      ],
-      "default_ref": "refs/heads/develop"
+      ]
     },
     {
       "id": "github.com--sympy--sympy",
@@ -1303,8 +1161,7 @@
       "revision": "8960d6e8b13162158cd625dd6186bae0826ab5a2",
       "logical_projects": [
         "sympy"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--systemd--mkosi",
@@ -1312,8 +1169,7 @@
       "revision": "d4f44d212c7698f93489f220fc24b705c4665e98",
       "logical_projects": [
         "mkosi"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--tornadoweb--tornado",
@@ -1321,8 +1177,7 @@
       "revision": "b689e0e20adb4345f5b207893820e40de7b3bf70",
       "logical_projects": [
         "tornado"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--trailofbits--manticore",
@@ -1330,8 +1185,7 @@
       "revision": "cdf6c4b49603cc1d70a09cabe74e0f786df1e13f",
       "logical_projects": [
         "manticore"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--typeddjango--django-stubs",
@@ -1339,8 +1193,7 @@
       "revision": "c58e33de22dd378300944fab33b0e02be807bd7b",
       "logical_projects": [
         "django-stubs"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--urllib3--urllib3",
@@ -1348,8 +1201,7 @@
       "revision": "4e5ce638723118dc41f218cd6715f91a9f321908",
       "logical_projects": [
         "urllib3"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--vega--altair",
@@ -1357,8 +1209,7 @@
       "revision": "48b388f140c79d29056d6ea56e519b27e2ed8838",
       "logical_projects": [
         "altair"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--we-like-parsers--pegen",
@@ -1366,8 +1217,7 @@
       "revision": "3b9f936a30d6c929d2538437cdc0465fa521b8f3",
       "logical_projects": [
         "pegen"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--wemake-services--django-modern-rest",
@@ -1375,8 +1225,7 @@
       "revision": "f6c96da44763be9ae616738706dd79bb7f213a8c",
       "logical_projects": [
         "django-modern-rest"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--wemake-services--django-test-migrations",
@@ -1384,8 +1233,7 @@
       "revision": "41edc400f6aed6c2b3729e24f9028cdb13243657",
       "logical_projects": [
         "django-test-migrations"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--wntrblm--nox",
@@ -1393,8 +1241,7 @@
       "revision": "f1d521079f2c8d9d22494ce30d0f31e8a9cd7b86",
       "logical_projects": [
         "nox"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--yelp--paasta",
@@ -1402,8 +1249,7 @@
       "revision": "2c55307319826defc68d145abe3c6a45ed31f133",
       "logical_projects": [
         "paasta"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--yurijmikhalevich--rclip",
@@ -1411,8 +1257,7 @@
       "revision": "007024c9f7d134be69d1d811ad8ab6c9e6ed85c4",
       "logical_projects": [
         "rclip"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "github.com--zopefoundation--zope.interface",
@@ -1420,8 +1265,7 @@
       "revision": "b0ddabdd83ed84f005de0d3e1eba8ec83a0a3d9b",
       "logical_projects": [
         "zope.interface"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "github.com--zulip--zulip",
@@ -1429,8 +1273,7 @@
       "revision": "4ba0fbb73e0db4354dee046bd985511d5205fc06",
       "logical_projects": [
         "zulip"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "gitlab.com--TTsangSC--pytest-autoprofile",
@@ -1438,8 +1281,7 @@
       "revision": "dd8c05ce62e714b2aa87d0c81e8c3085b0ae756b",
       "logical_projects": [
         "pytest-autoprofile"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     },
     {
       "id": "gitlab.com--cki-project--cki-lib",
@@ -1447,8 +1289,7 @@
       "revision": "2f5cc062633c0d9cb723790cc865c47a4b6116e7",
       "logical_projects": [
         "cki-lib"
-      ],
-      "default_ref": "refs/heads/main"
+      ]
     },
     {
       "id": "gitlab.com--dkg--python-sop",
@@ -1456,8 +1297,7 @@
       "revision": "e20a5cd802a899f69f958d64e06bd26d6a3e69d7",
       "logical_projects": [
         "python-sop"
-      ],
-      "default_ref": "refs/heads/master"
+      ]
     }
   ]
 }

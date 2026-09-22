@@ -56,11 +56,9 @@ files. Its opt-in CPython 3.14.5 comparison supplements the required Ruff gate:
 ./scripts/check-mypy-primer-compatibility /path/to/python3.14.5
 ```
 
-The September 22, 2026 measurements use CPython 3.14.5 and Serc
-`af3806c`.
-Corpus revisions and membership are unchanged. The
-[results summary](../corpora/results/compatibility-2026-09-22-public-af3806c.json) records
-compiler and corpus identities, every outcome category, and evidence hashes.
+The [latest measurement](../corpora/results/current.json), from September 22, 2026, uses
+CPython 3.14.5 and Serc `af3806c`. It records compiler and corpus identities, every outcome
+category, and a link to the original evidence summary.
 
 | Corpus | Files | CPython-rejected | Byte-identical accepted | Byte mismatches | Accepted-input compiler failures | Accepted-input match rate |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -80,9 +78,9 @@ and update instructions live in the [corpus guide](../corpora/README.md).
 
 ## Holdout compatibility
 
-The same September 22 compiler and CPython target were tested against four OSS projects absent
-from the mypy-primer snapshot. Revisions and membership are unchanged: tracked regular `.py`
-files, excluding symlinks and stubs. Every CPython-accepted file matched byte for byte.
+The same compiler and CPython target were tested against four OSS projects absent from the
+mypy-primer snapshot. The comparison covers tracked regular `.py` files, excluding symlinks and
+stubs. Every CPython-accepted file matched byte for byte.
 
 | Holdout project | Files | CPython-rejected | Byte-identical accepted | Byte mismatches | Accepted-input match rate |
 | --- | ---: | ---: | ---: | ---: | ---: |
