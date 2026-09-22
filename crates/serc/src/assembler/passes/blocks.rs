@@ -4993,6 +4993,7 @@ impl OptimizationPipeline {
                         (RETURN_VALUE, Operand::Value(0)),
                     ]);
             if exit_without_unique_predecessor[target.index()]
+                && !self.exception_regions.is_empty()
                 && !split_iterator_return
                 && target_pre_fusion_size > 4
                 && !target_blocks.iter().any(|block| {
@@ -5014,8 +5015,9 @@ impl OptimizationPipeline {
                 // CPython's second exit-duplication pass runs after cold blocks move. For a
                 // large class footer shared by warm and cold jumps, that makes the cold, later
                 // predecessor receive the copy while the warm predecessor keeps the original.
-                // Exception cleanup exits are copied before that relocation and retain the
-                // original predecessor order, even when clearing a name makes the exit large.
+                // Without exception regions there are no cold blocks to reorder, so ordinary
+                // class predecessors retain native copying order. Exception cleanup exits are
+                // also copied before relocation, even when clearing a name makes them large.
                 continue;
             }
             // An omitted authored NOP entry is distinct from a later aliased jump head.
