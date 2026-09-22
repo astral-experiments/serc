@@ -30,6 +30,7 @@ mod comprehension_iterable_captures;
 mod comprehension_local_reservation_order;
 mod comprehension_none_condition_owner_compatibility;
 mod comprehension_scope_cells;
+mod comprehension_temporary_names;
 mod comprehension_tuple_guard_owner_compatibility;
 mod conditional_attribute_name_return_fusion_compatibility;
 mod conditional_cleanup_source_ranges;

@@ -1918,16 +1918,17 @@ impl Compiler<'_> {
         }
         for (name, force_name) in names {
             let name_id = self.required_name_id(&name);
-            let is_local_or_free = matches!(
-                &self.unit.scope,
-                Scope::Function {
-                    indices,
-                    free_indices,
-                    globals,
-                    ..
-                } if indices.contains_key(&name_id) && !globals.contains(name_id)
-                    || free_indices.contains_key(&name_id)
-            );
+            let is_local_or_free = self.symbols.active_temporaries.contains(name_id)
+                || matches!(
+                    &self.unit.scope,
+                    Scope::Function {
+                        indices,
+                        free_indices,
+                        globals,
+                        ..
+                    } if indices.contains_key(&name_id) && !globals.contains(name_id)
+                        || free_indices.contains_key(&name_id)
+                );
             if force_name || !is_local_or_free {
                 self.name_index(&name)?;
             }
@@ -1986,16 +1987,17 @@ impl Compiler<'_> {
         collector.visit_expr(expression);
         for (name, force_name) in collector.names {
             let name_id = self.required_name_id(&name);
-            let is_local_or_free = matches!(
-                &self.unit.scope,
-                Scope::Function {
-                    indices,
-                    free_indices,
-                    globals,
-                    ..
-                } if indices.contains_key(&name_id) && !globals.contains(name_id)
-                    || free_indices.contains_key(&name_id)
-            );
+            let is_local_or_free = self.symbols.active_temporaries.contains(name_id)
+                || matches!(
+                    &self.unit.scope,
+                    Scope::Function {
+                        indices,
+                        free_indices,
+                        globals,
+                        ..
+                    } if indices.contains_key(&name_id) && !globals.contains(name_id)
+                        || free_indices.contains_key(&name_id)
+                );
             if force_name || !is_local_or_free {
                 self.name_index(&name)?;
             }
