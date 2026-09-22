@@ -1469,25 +1469,37 @@ fn code_objects_equal(left: &CodeObject, right: &CodeObject) -> bool {
             .marshal_provenance
             .equal_for_constant_pool(&right.marshal_provenance)
 }
+
+/// Preserves numeric literal representation for both folding and direct emission.
+/// Integers use `Int` when they fit in `u64`, otherwise unsigned `BigInt` digits;
+/// float and complex components are copied without changing their bits.
+///
+/// ```python
+/// values = (42, 18446744073709551616, 1.5, 2j)
+/// ```
+pub(super) fn number_constant(number: &Number) -> Constant {
+    match number {
+        Number::Int(value) => value.as_u64().map_or_else(
+            || Constant::BigInt {
+                negative: false,
+                digits: big_integer_digits(&value.to_string()),
+            },
+            Constant::Int,
+        ),
+        Number::Float(value) => Constant::Float(*value),
+        Number::Complex { real, imag } => Constant::Complex {
+            real: *real,
+            imag: *imag,
+        },
+    }
+}
+
 pub(super) fn literal_constant(expression: &Expr) -> Option<Constant> {
     match expression {
         Expr::NoneLiteral(_) => Some(Constant::None),
         Expr::BooleanLiteral(boolean) => Some(Constant::Bool(boolean.value)),
         Expr::EllipsisLiteral(_) => Some(Constant::Ellipsis),
-        Expr::NumberLiteral(number) => Some(match &number.value {
-            Number::Int(value) => value.as_u64().map_or_else(
-                || Constant::BigInt {
-                    negative: false,
-                    digits: big_integer_digits(&value.to_string()),
-                },
-                Constant::Int,
-            ),
-            Number::Float(value) => Constant::Float(*value),
-            Number::Complex { real, imag } => Constant::Complex {
-                real: *real,
-                imag: *imag,
-            },
-        }),
+        Expr::NumberLiteral(number) => Some(number_constant(&number.value)),
         Expr::StringLiteral(string) => Some(Constant::String(string.value.to_str().to_string())),
         Expr::BytesLiteral(bytes) => Some(Constant::Bytes(bytes.value.bytes().collect())),
         _ => None,
@@ -3559,7 +3571,7 @@ pub(super) fn is_literal_constant(expression: &Expr) -> bool {
             | Expr::BytesLiteral(_)
     )
 }
-pub(super) fn big_integer_digits(token: &str) -> Vec<u16> {
+fn big_integer_digits(token: &str) -> Vec<u16> {
     let token: String = token
         .chars()
         .filter(|character| *character != '_')
