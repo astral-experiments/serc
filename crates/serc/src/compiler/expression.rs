@@ -39,8 +39,9 @@ use crate::{CompileError, PythonVersion};
 
 use super::constant::{
     PercentFormatPart, big_integer_digits, explicit_surrogate_string, first_literal_constant,
-    fold_constant, folded_bool_operand, folded_constant_owner_slots, optimized_percent_format,
-    python_constant_values_equal, two_element_slice_optimization,
+    fold_constant, folded_bool_operand, folded_constant_owner_slots,
+    is_small_literal_tuple_element, optimized_percent_format, python_constant_values_equal,
+    two_element_slice_optimization,
 };
 use super::scope::{
     LoweringFunctionPlan, NameId, NameSet, analyze_lambda_scope,
@@ -6180,28 +6181,14 @@ impl Compiler<'_> {
                 }
                 self.assembler.set_location(collection_location);
                 self.emit_collection_constant(Constant::Tuple(constants))?;
+                let hidden_owner_slots = folded_elements_owner_slots(elements, elements.len());
                 self.assembler
-                    .add_last_constant_fold_slots(folded_elements_owner_slots(
-                        elements,
-                        elements.len(),
-                    ));
-                // Each literal and BUILD_TUPLE belongs to this same original array.
+                    .add_last_constant_fold_slots(hidden_owner_slots);
+                // Nested literal tuples remove their own loads and builds from this array.
                 // Larger tuples use LIST_APPEND and have different slot accounting.
-                if elements.len() <= 30
-                    && elements.iter().all(|element| {
-                        matches!(
-                            element,
-                            Expr::NoneLiteral(_)
-                                | Expr::BooleanLiteral(_)
-                                | Expr::NumberLiteral(_)
-                                | Expr::StringLiteral(_)
-                                | Expr::BytesLiteral(_)
-                                | Expr::EllipsisLiteral(_)
-                        )
-                    })
-                {
+                if elements.len() <= 30 && elements.iter().all(is_small_literal_tuple_element) {
                     self.assembler
-                        .record_last_uniform_fold_owner_slots(elements.len());
+                        .record_last_uniform_fold_owner_slots(hidden_owner_slots);
                 }
                 return Ok(());
             }

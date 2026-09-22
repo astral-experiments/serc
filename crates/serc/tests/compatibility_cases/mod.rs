@@ -666,6 +666,7 @@ mod match_success_normal_try_copies;
 
 mod terminal_cold_join_probes;
 
+mod nested_literal_tuple_owner_slots;
 mod nested_manager_none_slot;
 
 mod named_handler_jump_locations;
