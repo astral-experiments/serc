@@ -750,6 +750,7 @@ mod signed_integer_folding;
 mod terminal_try_else_donor_locations;
 mod try_finally_return_exit_locations;
 mod tuple_store_join_locations;
+mod type_parameter_globals;
 mod type_parameter_scope_boundaries;
 mod with_pass_finally_owner;
 
