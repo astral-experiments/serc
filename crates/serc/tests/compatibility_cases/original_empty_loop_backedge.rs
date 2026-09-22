@@ -579,3 +579,34 @@ fn matches_cpython_folded_loop_backedge_owner_prefixes() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn guarded_match_common_tail_keeps_condition_backedge_owner() {
+    let source = r"def f(items, method_name, other_type):
+    for entry in items:
+        bindings = {}
+        if callable := entry.methods.get(method_name):
+            match callable.signature:
+                case Signature((left, right)) if right.matches(bindings, other_type):
+                    yield left.convert(bindings)
+";
+    common::assert_matches_cpython_marshal(source, "guarded_match_common_tail.py");
+}
+
+#[test]
+fn nested_for_else_shared_tail_keeps_each_predecessor_location() {
+    let source = r"def f(entries, patterns, classes):
+    for name, obj in entries:
+        if isfunction(obj):
+            consume(name)
+        elif isclass(obj):
+            for pattern in patterns:
+                if pattern.matches(name):
+                    break
+            else:
+                attrs = attributes(obj)
+                if attrs:
+                    classes[name] = attrs
+";
+    common::assert_matches_cpython_marshal(source, "nested_for_else_shared_tail.py");
+}

@@ -15003,6 +15003,23 @@ impl Compiler<'_> {
         Ok(backedge)
     }
 
+    /// Recognizes an empty original join before the loop's artificial backedge.
+    fn has_original_unlocated_loop_tail_join(&self) -> bool {
+        // Match cleanup can precede aliases without an explicit block boundary.
+        // The live match token certifies the empty array without scanning through cleanup.
+        (self.assembler.at_original_match_join()
+            && self.assembler.at_original_unconditional_join()
+            && !self
+                .assembler
+                .current_join_has_located_compacted_predecessor())
+            || (self.assembler.at_original_shared_handler_join()
+                && self.assembler.current_original_block_location().is_none()
+                && self
+                    .assembler
+                    .current_original_block_pre_fusion_instruction_count()
+                    == 0)
+    }
+
     fn compile_loop_tail_if(
         &mut self,
         statement: &ruff_python_ast::StmtIf,
@@ -15253,11 +15270,23 @@ impl Compiler<'_> {
                     |compiler| compiler.compile_loop_tail_suite(body, restart, split_short_circuit),
                 )?;
                 if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
-                    self.set_branch_end_location(body, body_start);
+                    let original_shared_tail =
+                        !non_final_branch && self.has_original_unlocated_loop_tail_join();
+                    if original_shared_tail {
+                        self.assembler.set_location(SourceLocation::NONE);
+                    } else {
+                        self.set_branch_end_location(body, body_start);
+                    }
                     // The Boolean value join falls through to the enclosing if's backedge.
                     // Its shared discard keeps the original unlocated block during assembly.
                     self.prepare_loop_tail_boolean_discard(body);
                     let backedge = self.emit_jump_backward_instruction(JUMP_BACKWARD, restart)?;
+                    if original_shared_tail {
+                        self.assembler
+                            .prepare_no_location_block_for_inlining(backedge);
+                        self.assembler.mark_as_artificial_eval_break(backedge);
+                        self.assembler.record_last_original_loop_backedge();
+                    }
                     if body
                         .last()
                         .is_some_and(try_has_conditional_shared_loop_exit)
@@ -15339,7 +15368,12 @@ impl Compiler<'_> {
                     && !self.has_active_control_flow_region()
                     && matches!(test, Expr::BoolOp(_))
                     && condition_has_only_runtime_tests(test)
-                    && final_chained_comparison_jump(test).is_some();
+                    && (final_chained_comparison_jump(test).is_some()
+                        || (!expression_suspends_current_scope(test)
+                            && matches!(test, Expr::BoolOp(boolean)
+                            if boolean.values.iter().any(|operand| {
+                                final_chained_comparison_jump(operand).is_some()
+                            }))));
                 let (comparison_test, negated) = if let Expr::UnaryOp(unary) = test
                     && unary.op == UnaryOp::Not
                 {
@@ -15420,9 +15454,22 @@ impl Compiler<'_> {
                     },
                 )?;
                 if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
-                    self.set_branch_end_location(body, body_start);
-                    self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
-                    if !non_final_branch && matches!(body.last(), Some(Stmt::Match(_))) {
+                    let original_shared_tail =
+                        !non_final_branch && self.has_original_unlocated_loop_tail_join();
+                    if original_shared_tail {
+                        self.assembler.set_location(SourceLocation::NONE);
+                    } else {
+                        self.set_branch_end_location(body, body_start);
+                    }
+                    let backedge = self.emit_jump_backward_instruction(JUMP_BACKWARD, restart)?;
+                    if original_shared_tail {
+                        // Native duplicates this unlocated eval-check array before threading.
+                        // Each incoming condition receives its own location and fresh backedge.
+                        self.assembler
+                            .prepare_no_location_block_for_inlining(backedge);
+                        self.assembler.mark_as_artificial_eval_break(backedge);
+                        self.assembler.record_last_original_loop_backedge();
+                    } else if !non_final_branch && matches!(body.last(), Some(Stmt::Match(_))) {
                         // The final arm's match join still starts the original common exit.
                         // Earlier arms use copied exits and cannot certify this backward head.
                         self.assembler.record_last_original_loop_backedge();
