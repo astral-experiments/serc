@@ -1019,7 +1019,7 @@ impl Compiler<'_> {
         if runtime.found {
             return None;
         }
-        fold_constant_with_literals(expression, &|expression| match expression {
+        let literal = |expression: &Expr| match expression {
             Expr::UnaryOp(unary)
                 if !self.has_deferred_annotations()
                     && unary.op == ruff_python_ast::UnaryOp::Invert =>
@@ -1048,7 +1048,8 @@ impl Compiler<'_> {
                 }
             }
             _ => literal_constant(expression),
-        })
+        };
+        fold_constant_with_literals(expression, self.context.python_version, &literal)
     }
 
     pub(super) fn source_aware_constant_slice(

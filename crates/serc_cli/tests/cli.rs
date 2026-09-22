@@ -210,6 +210,29 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
             "value = item[r\"\\ud800\" \"\\udfff\":]",
             "item[\"\\ud800\":] = value",
             "del item[\"\\ud800\":]",
+            // Copied negation creates a fresh object at each assembler admission.
+            "def first(flag, value):\n    return -((1e999 - 1e999) if flag else value)\ndef second(flag, value):\n    return -((1e999 - 1e999) if flag else value)\n",
+            "def first(flag, value):\n    return -((1e999j - 1e999j) if flag else value)\ndef second(flag, value):\n    return -((1e999j - 1e999j) if flag else value)\n",
+            "def first(flag, value):\n    return -(-((1e999 - 1e999) if flag else value))\ndef second(flag, value):\n    return -(-((1e999 - 1e999) if flag else value))\n",
+            // Preserve NaN creation identity through distinct folds and copied constants.
+            "a = 1e999 - 1e999\nb = 1e999 - 1e999\n",
+            "a = {1e999 - 1e999, 1e999 - 1e999}\n",
+            "a = ((1e999 - 1e999,), (1e999 - 1e999,))\n",
+            "a = ((1e999 - 1e999,) * 2,) * 2\n",
+            "a = (+(1e999 - 1e999), -(1e999 - 1e999))\n",
+            "a = (1e999 - 1e999,)[0]\nb = 1e999 - 1e999\n",
+            "a = 1e999j - 1e999j\nb = 1e999j - 1e999j\n",
+            "a = {0.0 * 1e999j, 0.0 * 1e999j}\n",
+            // Legacy mixed arithmetic first coerces scalars to complex values.
+            "a = {1e999j * 0.0, 1e999j * 0.0}\n",
+            "a = (0.0 * -0j, -0j * 0.0, (-0j) + 0.0, 0.0 + (-0j), 0.0 - 0j, 0j - 0.0)\n",
+            "a = ((0.0 * 1e999j,),)[0]\nb = (1e999j * 0.0,) * 2\n",
+            "a = (0 * 1e999j, False * 1e999j, 1e999j * 0, 1e999j * False)\n",
+            // Exercise the legacy fused-product order with finite cancellation and input NaNs.
+            "a = (1.0000000074505806 + 1j) * (0.9999999925494194 + 1j)\n",
+            "a = (1 + 1.0000000074505806j) * (1 + 0.9999999925494194j)\n",
+            "a = ((1e999 - 1e999) * 1j, 1j * (1e999 - 1e999), -(1e999 - 1e999) * 1j, 1j * -(1e999 - 1e999))\n",
+            "def first():\n    return (1e999 - 1e999) + 1j\ndef second():\n    return (1e999 - 1e999) + 1j\n",
         ] {
             fs_err::write(&source_path, source).unwrap();
             let mut oracle = match version {
