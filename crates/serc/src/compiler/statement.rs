@@ -6754,15 +6754,16 @@ impl Compiler<'_> {
                         ([handler], [finally])
                             if ((handler.name.is_none() && self.control.loops.contexts.is_empty())
                                 // Clearing a handler's name does not exit its enclosing
-                                // ordinary try. Synchronous bare returns without loops have
-                                // the same owner boundary as the existing coroutine path.
+                                // ordinary try. A synchronous bare return or direct constant
+                                // tail has the same owner boundary without loops.
                                 || (handler.name.is_some()
                                     && (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                                             == CO_COROUTINE
                                         || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                                                 == 0
-                                            && statement.value.is_none()
                                             && !preserve_tos
+                                            && (statement.value.is_none()
+                                                || handler.trailing_statement == Some(statement.range))
                                             && self.control.loops.contexts.is_empty()))
                                     && handler.finally_end_depth == 0
                                     && handler.with_depth == 0

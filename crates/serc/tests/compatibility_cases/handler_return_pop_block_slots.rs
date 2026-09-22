@@ -150,6 +150,21 @@ fn matches_cpython_outer_try_owner_on_copied_handler_return_finally() {
 }
 
 #[test]
+fn matches_cpython_outer_try_owner_on_named_handler_constant_finally() {
+    for returned in [
+        "", "False", "True", "None", "3", "'value'", "b'value'", "1.25",
+    ] {
+        for cleanup in ["finish()", "if path.exists():\n    path.remove()"] {
+            let source = format!(
+                "def f(path):\n    try:\n        try:\n            work()\n        except ValueError as error:\n            report(error)\n            return {returned}\n        finally:\n{}        finished()\n    except RuntimeError:\n        recover()\n",
+                crate::common::indent(&crate::common::indent(&crate::common::indent(cleanup)))
+            );
+            assert_matches_cpython_marshal(&source, "named_handler_constant_finally_owner.py");
+        }
+    }
+}
+
+#[test]
 fn matches_cpython_outer_try_owner_on_handler_raise_finally_control() {
     let source = r"def run():
     try:
