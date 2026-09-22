@@ -24891,42 +24891,6 @@ impl Compiler<'_> {
         }
     }
 
-    /// Certifies a generator return whose sole cleanup raises outside its protected body.
-    fn can_copy_generator_raising_finally_return(
-        &self,
-        statement: &ruff_python_ast::StmtTry,
-    ) -> bool {
-        let finally = &self.control.finally;
-        self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_GENERATOR
-            && self.control.loops.contexts.is_empty()
-            && self.control.withs.active_with_exits.is_empty()
-            && self.control.withs.active_with_region_exclusions.is_empty()
-            && self.control.exceptions.active_exception_handlers.is_empty()
-            && self.control.exceptions.active_exception_group_handlers == 0
-            && self.control.exceptions.active_try_marker_slots.is_empty()
-            && self
-                .control
-                .exceptions
-                .active_exception_region_exclusions
-                .is_empty()
-            && self
-                .control
-                .comprehensions
-                .active_comprehension_region_exclusions
-                .is_empty()
-            && finally.active_return_finally_contexts.is_empty()
-            && finally.active_loop_finally_contexts.is_empty()
-            && finally.active_pass_finally_locations.is_empty()
-            && finally.preserved_return_value_contexts.is_empty()
-            && finally.copied_return_finally_preserved_values == 0
-            && finally.active_finally_try_bodies == 0
-            && finally.active_normal_finally_bodies == 0
-            && finally.active_copied_finally_bodies == 0
-            && finally.active_finally_end_blocks == 0
-            && finally.active_overriding_finally_returns == 0
-            && supports_generator_raising_finally_return(statement)
-    }
-
     fn compile_try_finally(
         &mut self,
         statement: &ruff_python_ast::StmtTry,
@@ -24978,8 +24942,6 @@ impl Compiler<'_> {
     ) -> Result<(), CompileError> {
         use super::legacy_native_labels::{FinallyCopy, NativeRole};
 
-        let copy_generator_raising_finally =
-            self.can_copy_generator_raising_finally_return(statement);
         let preserve_exit_nop =
             std::mem::take(&mut self.control.finally.preserve_next_finally_exit_nop);
         let capture_manager_pop =
@@ -27283,12 +27245,11 @@ impl Compiler<'_> {
                 statement.finalbody.as_slice(),
                 [Stmt::Delete(delete)] if matches!(delete.targets.as_slice(), [Expr::Name(_)])
             );
-        // Native FINALLY_TRY visits the cleanup before any overriding Return
-        // discards the pending value. The certified forms use the existing
-        // copied-return contexts for terminating and falling-through cleanup.
-        let copy_finally_on_exit = self.control.finally.copies_terminating_finally_returns
-            || copy_generator_raising_finally
-            || !suite_terminates(&statement.finalbody);
+        // Every pending return must run this cleanup, including a finalizer that
+        // raises. Direct overriding returns retain their existing shared-body path
+        // unless their return-value cleanup requires an explicit copy.
+        let copy_finally_on_exit =
+            self.control.finally.copies_terminating_finally_returns || !overriding_return;
         let noop_finally_body = statement.finalbody.iter().all(|statement| {
             matches!(statement, Stmt::Pass(_))
                 || matches!(statement, Stmt::Expr(expression) if fold_constant_for_version(&expression.value, self.context.python_version).is_some())
@@ -33445,35 +33406,6 @@ fn finalizer_tail_has_matching_linear_copies(body: &[Stmt]) -> bool {
         })
 }
 
-/// Keeps the return value live while a non-suspending, branch-free finalizer raises.
-fn supports_generator_raising_finally_return(statement: &ruff_python_ast::StmtTry) -> bool {
-    let Some((Stmt::Return(returned), leading)) = statement.body.split_last() else {
-        return false;
-    };
-    let [Stmt::Raise(raised)] = statement.finalbody.as_slice() else {
-        return false;
-    };
-    let Some(exception) = raised.exc.as_deref() else {
-        return false;
-    };
-    let linear_value = |value: &Expr| {
-        !expression_contains_inline_branch(value)
-            && !expression_suspends_current_scope(value)
-            && !expression_yields_in_current_scope(value)
-    };
-    !statement.is_star
-        && statement.handlers.is_empty()
-        && statement.orelse.is_empty()
-        && returned.value.as_deref().is_none_or(linear_value)
-        && linear_value(exception)
-        && raised.cause.as_deref().is_none_or(linear_value)
-        && leading.iter().all(|statement| {
-            matches!(statement, Stmt::Expr(expression)
-                if matches!(expression.value.as_ref(), Expr::Yield(yielded)
-                    if yielded.value.as_deref().is_none_or(linear_value)))
-        })
-}
-
 /// A direct finalizer return unwinds the pending value before enclosing iterators.
 /// Both expressions stay in one block, with no newly entered cleanup scope.
 fn supports_direct_terminating_finally_returns(statement: &ruff_python_ast::StmtTry) -> bool {
@@ -39217,51 +39149,6 @@ mod tests {
             true,
         ));
     }
-    #[test]
-    fn raising_generator_finalizer_rejects_eager_branches_and_suspensions() {
-        for (returned, cleanup, expected) in [
-            ("payload", "raise error", true),
-            ("produce()", "raise create_error() from cause", true),
-            ("(lambda: (yield payload))()", "raise error", true),
-            (
-                "(lambda value=(yield payload): value)()",
-                "raise error",
-                false,
-            ),
-            (
-                "(lambda value=(first if flag else second): value)()",
-                "raise error",
-                false,
-            ),
-            ("(yield from items)", "raise error", false),
-            (
-                "payload",
-                "raise (lambda value=(yield error): value)()",
-                false,
-            ),
-            ("payload", "raise error from (yield cause)", false),
-            ("payload", "raise (error if flag else other)", false),
-            ("payload", "raise", false),
-            ("payload", "yield error\n        raise error", false),
-        ] {
-            let source = format!(
-                "def f():\n    try:\n        yield item\n        return {returned}\n    finally:\n        {cleanup}\n"
-            );
-            let parsed = parse_module(&source).unwrap();
-            let Stmt::FunctionDef(function) = &parsed.suite()[0] else {
-                panic!("expected function");
-            };
-            let Stmt::Try(statement) = &function.body[0] else {
-                panic!("expected try/finally");
-            };
-            assert_eq!(
-                super::supports_generator_raising_finally_return(statement),
-                expected,
-                "{source}"
-            );
-        }
-    }
-
     #[test]
     fn loop_exit_yield_guard_visits_only_eager_scope_parts() {
         for (expression, expected) in [
