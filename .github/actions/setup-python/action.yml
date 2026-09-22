@@ -52,10 +52,13 @@ runs:
           printf '#!/bin/bash\nexport LD_LIBRARY_PATH=%q\nexec %q "$@"\n' \
             "$prefix/lib" "$prefix/bin/python$short_version" > "$prefix/python"
           chmod +x "$prefix/python"
-          echo "SERC_TEST_PYTHON_${short_version//./}=$prefix/python" >> "$GITHUB_ENV"
         }
         install_reference 3.12.14 31661455385 5a03168292516f6dd6dcf630f4bf5369b108abd7c699a7e1db37f1e622257fff
         install_reference 3.13.15 31064747964 4e544242f8a4ef647a6f511b67f9b00eefc9ef366644e3c40a27a6eff709ae2b
+        {
+          echo "SERC_TEST_PYTHON_312=$RUNNER_TEMP/serc-cpython-3.12.14/python"
+          echo "SERC_TEST_PYTHON_313=$RUNNER_TEMP/serc-cpython-3.13.15/python"
+        } >> "$GITHUB_ENV"
     - name: Verify CPython 3.12.14 oracle
       shell: bash
       run: |
