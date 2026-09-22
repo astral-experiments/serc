@@ -3207,3 +3207,81 @@ fn mapping_pattern_lengths_use_the_full_integer_value() {
         }
     }
 }
+
+#[test]
+fn generator_nested_comprehension_captures_keep_scope_roles_for_all_targets() {
+    use crate::target::local_kinds::{CO_FAST_CELL, CO_FAST_FREE, CO_FAST_LOCAL};
+
+    let source = concat!(
+        include_str!("../../tests/fixtures/generator_nested_comprehension_captures.py"),
+        "\n",
+        include_str!("../../tests/fixtures/generator_nested_comprehension_cell_controls.py"),
+    );
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        let module = crate::compile_with_options(
+            source,
+            "generator_nested_comprehension_captures.py",
+            &crate::CompileOptions {
+                python_version,
+                ..crate::CompileOptions::default()
+            },
+        )
+        .unwrap();
+        for constant in &module.code.constants {
+            let Constant::Code(function) = constant else {
+                continue;
+            };
+            let generator = function
+                .constants
+                .iter()
+                .find_map(|constant| match constant {
+                    Constant::Code(code) if code.name == "<genexpr>" => Some(code),
+                    _ => None,
+                })
+                .unwrap();
+            let has_kind = |code: &CodeObject, kind| {
+                code.locals
+                    .iter()
+                    .zip(&code.local_kinds)
+                    .any(|(name, kinds)| name == "x" && kinds & kind != 0)
+            };
+            let captures_outer = !matches!(
+                function.name.as_str(),
+                "cell_control" | "local_control" | "outer_iterable_control" | "outside_lambda"
+            );
+            assert_eq!(
+                has_kind(function, CO_FAST_CELL),
+                captures_outer,
+                "{python_version:?}: {} outer cell",
+                function.name,
+            );
+            assert_eq!(
+                has_kind(generator, CO_FAST_FREE),
+                captures_outer,
+                "{python_version:?}: {} generator capture",
+                function.name,
+            );
+            assert_eq!(
+                has_kind(generator, CO_FAST_CELL),
+                matches!(
+                    function.name.as_str(),
+                    "cell_control" | "inlined_cell" | "outside_lambda"
+                ),
+                "{python_version:?}: {} generator cell",
+                function.name,
+            );
+            if captures_outer && function.name != "renamed_control" {
+                assert!(
+                    has_kind(generator, CO_FAST_LOCAL),
+                    "{python_version:?}: {} comprehension local",
+                    function.name
+                );
+            }
+        }
+    }
+}
