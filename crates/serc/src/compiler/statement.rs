@@ -25067,6 +25067,42 @@ impl Compiler<'_> {
                             && suite_has_linear_reraise_guards(&handler.body)
                     })
                 }));
+        // Linear else work remains in the protected body's original normal array.
+        // A returning handler's false edge retains its populated recovery suffix,
+        // including when other handlers have independent plain cleanup exits.
+        let linear_else_returning_recovery = synchronous_recovery
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && !statement.is_star
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && suite_has_linear_borrow_fallthrough(&statement.body)
+            && suite_has_linear_borrow_fallthrough(&statement.orelse)
+            && suite_has_linear_borrow_fallthrough(&statement.finalbody)
+            && statement.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.as_ref().is_some_and(|type_| {
+                        !expression_contains_inline_branch(type_)
+                            && !expression_suspends_current_scope(type_)
+                    }) && (suite_has_linear_borrow_fallthrough(&handler.body)
+                        || suite_has_linear_bare_return_recovery(&handler.body))
+                })
+            })
+            && statement.handlers.iter().any(|handler| {
+                handler
+                    .as_except_handler()
+                    .is_some_and(|handler| suite_has_linear_bare_return_recovery(&handler.body))
+            });
         // A guarded recovery retains a live POP_EXCEPT route into normal cleanup.
         // A plain companion containing work or only pass statements does not remove
         // that route. Named companions retain their own normal name-clearing cleanup.
@@ -25233,6 +25269,7 @@ impl Compiler<'_> {
                     && !expression_suspends_current_scope(&cleanup.value));
         let conditional_handler_reaches_finally = !statement.is_star
             && (statement.orelse.is_empty()
+                || linear_else_returning_recovery
                 || (suite_has_linear_borrow_fallthrough(&statement.orelse)
                     && statement.handlers.iter().all(|handler| {
                         handler.as_except_handler().is_some_and(|handler| {
@@ -25432,7 +25469,7 @@ impl Compiler<'_> {
                                 && (trailing.is_empty()
                                     || suite_has_linear_borrow_fallthrough(trailing))
                         }) || suite_has_linear_reraise_guards(&handler.body)
-                            || (plain_handler_shares_guarded_cleanup
+                            || ((plain_handler_shares_guarded_cleanup || linear_else_returning_recovery)
                                 && (suite_has_linear_borrow_fallthrough(&handler.body)
                                     || (!handler.body.is_empty()
                                         && handler.body.iter().all(|statement| {
@@ -33491,6 +33528,25 @@ fn async_recovery_has_populated_handler_suffix(body: &[Stmt]) -> bool {
                 && handler.name.is_some()
                 && suite_has_linear_borrow_fallthrough(&handler.body)
         }))
+}
+
+// A bare-return guard leaves a populated false recovery suffix. The return's
+// separately copied cleanup does not consume that original normal exit.
+fn suite_has_linear_bare_return_recovery(body: &[Stmt]) -> bool {
+    let linear = |body: &[Stmt]| body.is_empty() || suite_has_linear_borrow_fallthrough(body);
+    body.iter().enumerate().any(|(index, part)| {
+        linear(&body[..index])
+            && suite_has_linear_borrow_fallthrough(&body[index + 1..])
+            && matches!(part, Stmt::If(guard)
+            if guard.elif_else_clauses.is_empty()
+                && condition_has_only_runtime_tests(&guard.test)
+                && !expression_contains_inline_branch(&guard.test)
+                && !expression_suspends_current_scope(&guard.test)
+                && guard.body.split_last().is_some_and(|(last, prefix)| {
+                    linear(prefix)
+                        && matches!(last, Stmt::Return(return_) if return_.value.is_none())
+                }))
+    })
 }
 
 // An authored iterator break copies the two unlocated ordinary-try exits.

@@ -5387,3 +5387,26 @@ fn borrows_normal_cleanup_after_branched_bare_return_handler_prefix() {
         }
     }
 }
+
+#[test]
+fn borrows_linear_else_cleanup_with_returning_and_plain_handlers() {
+    for binding in ["", " as error"] {
+        for leading in ["", "        action(owner)\n"] {
+            for plain_first in [false, true] {
+                let plain = "    except PlainError as error:\n        action(error)\n";
+                let recovery = format!(
+                    "    except RecoverableError{binding}:\n{leading}        if check(value):\n            owner.value = value\n            return\n        action(owner, value)\n",
+                );
+                let handlers = if plain_first {
+                    format!("{plain}{recovery}")
+                } else {
+                    format!("{recovery}{plain}")
+                };
+                let source = format!(
+                    "def function(owner, value, action, check):\n    try:\n        result = action(value)\n{handlers}    else:\n        action(result)\n    finally:\n        owner.updated = value\n",
+                );
+                common::assert_matches_cpython_marshal(&source, "linear_else_return_recovery.py");
+            }
+        }
+    }
+}
