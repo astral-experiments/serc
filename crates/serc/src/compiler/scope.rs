@@ -85,7 +85,10 @@ impl Compiler<'_> {
             let captures_name = match &self.unit.scope {
                 // Method annotation thunks are created by the class body and can capture the
                 // class body's free variables, but not arbitrary class-local bindings.
-                Scope::Class { free_indices, .. } => free_indices.contains_key(&name),
+                Scope::Class { free_indices, .. } => {
+                    free_indices.contains_key(&name)
+                        || arena.names.get("__class__") == Some(name) && self.is_cell_id(name)
+                }
                 Scope::Module | Scope::Function { .. } => self.can_provide_closure_id(name),
             };
             if captures_name {
@@ -546,7 +549,7 @@ impl FunctionPlan {
             });
         }
 
-        let mut annotation_collector = ReferenceCollector::default();
+        let mut annotation_references = FxHashSet::default();
         if !future_annotations {
             for parameter in definition
                 .parameters
@@ -555,26 +558,26 @@ impl FunctionPlan {
                 .chain(&definition.parameters.args)
             {
                 if let Some(annotation) = parameter.parameter.annotation.as_deref() {
-                    annotation_collector.visit_expr(annotation);
+                    annotation_references.extend(expression_required_names(annotation));
                 }
             }
             if let Some(parameter) = &definition.parameters.vararg
                 && let Some(annotation) = parameter.annotation.as_deref()
             {
-                annotation_collector.visit_expr(annotation);
+                annotation_references.extend(expression_required_names(annotation));
             }
             for parameter in &definition.parameters.kwonlyargs {
                 if let Some(annotation) = parameter.parameter.annotation.as_deref() {
-                    annotation_collector.visit_expr(annotation);
+                    annotation_references.extend(expression_required_names(annotation));
                 }
             }
             if let Some(parameter) = &definition.parameters.kwarg
                 && let Some(annotation) = parameter.annotation.as_deref()
             {
-                annotation_collector.visit_expr(annotation);
+                annotation_references.extend(expression_required_names(annotation));
             }
             if let Some(annotation) = definition.returns.as_deref() {
-                annotation_collector.visit_expr(annotation);
+                annotation_references.extend(expression_required_names(annotation));
             }
         }
 
@@ -696,7 +699,7 @@ impl FunctionPlan {
                 })
                 .collect(),
             globals: names.intern_set(locals.globals),
-            annotation_references: names.intern_set(annotation_collector.references),
+            annotation_references: names.intern_set(annotation_references),
             cellvars: names.intern_set(cellvars),
             inlined_comprehension_cellvars: names.intern_set(inlined_comprehension_cellvars),
             freevars: Vec::new(),
@@ -3004,6 +3007,21 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
     }
 
     fn collect_function_header(&mut self, definition: &'ast StmtFunctionDef) {
+        if !self.skip_annotations && !self.eager_function_annotations {
+            for annotation in function_annotation_expressions(definition) {
+                self.facts.nested_lambda_requirements.extend(
+                    annotation_nested_required_names(annotation)
+                        .into_iter()
+                        .filter(|name| {
+                            !definition.type_params.as_deref().is_some_and(|parameters| {
+                                parameters
+                                    .iter()
+                                    .any(|parameter| parameter.name().as_str() == name)
+                            })
+                        }),
+                );
+            }
+        }
         self.facts.has_function_definition = true;
         // Symbol analysis visits defaults before decorators, which can establish the
         // first inlined-comprehension binding of a name in the enclosing scope.
@@ -3663,6 +3681,16 @@ pub(super) fn inlined_comprehension_local_names_in_expression(expression: &Expr)
                 .contains(name)
         })
         .map(String::from)
+        .collect()
+}
+
+/// Enclosing bindings passed through an annotation to its nested lambdas and generators.
+pub(super) fn annotation_nested_required_names(expression: &Expr) -> BTreeSet<String> {
+    let required =
+        analyze_expression_scope(&ruff_python_ast::Parameters::default(), expression).required;
+    nested_expression_required_names(expression)
+        .intersection(&required)
+        .cloned()
         .collect()
 }
 
