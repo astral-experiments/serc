@@ -976,6 +976,18 @@ pub(super) struct ExceptionOwnerDecision {
     pub(super) override_existing: bool,
 }
 
+impl ExceptionOwnerDecision {
+    /// Replaces the inferred owner with an exact source region or an unowned slot.
+    fn override_with_region(source_region: Option<usize>) -> Self {
+        Self {
+            has_owner: source_region.is_some(),
+            source_region,
+            definitive: true,
+            override_existing: true,
+        }
+    }
+}
+
 /// A complete original array through one value Boolean, captured before CFG rewrites.
 #[derive(Debug)]
 pub(super) struct RetainedSetupValueArray {
@@ -1079,6 +1091,22 @@ impl UniqueLabelPositions {
 }
 
 impl ExceptionOwnerProvenance {
+    /// Checks labels belonging to a captured normal-try copy, including its endpoints.
+    fn is_normal_try_copy_label(&self, label: Label) -> bool {
+        self.normal_try_copy_blocks.contains(&label)
+            || self.normal_try_copy_jump_nop_successors.contains(&label)
+            || self.normal_try_copy_inline_labels.contains(&label)
+            || self.normal_try_copy_internal_labels.contains(&label)
+            || self
+                .normal_try_copy_steps
+                .iter()
+                .any(|(start, end, _)| *start == label || *end == label)
+            || self
+                .normal_try_copy_pop_ranges
+                .iter()
+                .any(|(start, end)| *start == label || *end == label)
+    }
+
     /// Retires an async entry before erased labels can migrate to another live array.
     pub(super) fn retire_async_with_setup(&mut self, label: Label) {
         self.ordinary_await_ends.retain(|origin| {
@@ -1135,18 +1163,7 @@ impl ExceptionOwnerProvenance {
             .filter_map(|(entry, prefix)| {
                 if !self.value_jump_continuation_boundaries.contains(entry)
                     || self.retired_normal_try_copy_labels.contains(entry)
-                    || self.normal_try_copy_blocks.contains(entry)
-                    || self.normal_try_copy_inline_labels.contains(entry)
-                    || self.normal_try_copy_internal_labels.contains(entry)
-                    || self.normal_try_copy_jump_nop_successors.contains(entry)
-                    || self
-                        .normal_try_copy_steps
-                        .iter()
-                        .any(|(a, b, _)| a == entry || b == entry)
-                    || self
-                        .normal_try_copy_pop_ranges
-                        .iter()
-                        .any(|(a, b)| a == entry || b == entry)
+                    || self.is_normal_try_copy_label(*entry)
                     || self
                         .original_value_jump_prefixes
                         .iter()
@@ -2361,22 +2378,6 @@ impl LayoutAssembler {
         label_positions: &FxHashMap<Label, usize>,
     ) -> (FxHashMap<usize, usize>, FxHashSet<Label>) {
         let provenance = &self.exception_owner_provenance;
-        let copied = |label: &Label| {
-            provenance.normal_try_copy_blocks.contains(label)
-                || provenance
-                    .normal_try_copy_jump_nop_successors
-                    .contains(label)
-                || provenance.normal_try_copy_inline_labels.contains(label)
-                || provenance.normal_try_copy_internal_labels.contains(label)
-                || provenance
-                    .normal_try_copy_steps
-                    .iter()
-                    .any(|(a, b, _)| a == label || b == label)
-                || provenance
-                    .normal_try_copy_pop_ranges
-                    .iter()
-                    .any(|(a, b)| a == label || b == label)
-        };
         let mut slots = FxHashMap::default();
         let mut aliases = FxHashSet::default();
         for (origin, pop_count, requires_handler_pair, returned_value) in provenance
@@ -2409,7 +2410,7 @@ impl LayoutAssembler {
             {
                 continue;
             }
-            if copied(&origin.entry)
+            if provenance.is_normal_try_copy_label(origin.entry)
                 || !provenance.block_boundaries.contains(&origin.entry)
                 || self
                     .items
@@ -2430,7 +2431,7 @@ impl LayoutAssembler {
                 .collect::<Vec<_>>();
             if labels.is_empty()
                 || labels.iter().any(|label| {
-                    copied(label)
+                    provenance.is_normal_try_copy_label(*label)
                         || jump_targets.contains(label)
                         || provenance.block_boundaries.contains(label)
                         || provenance.source_boundaries.contains(label)
@@ -3339,22 +3340,6 @@ impl LayoutAssembler {
         if retained_setup_nops.is_empty() {
             return result;
         }
-        let copied = |label: &Label| {
-            provenance.normal_try_copy_blocks.contains(label)
-                || provenance
-                    .normal_try_copy_jump_nop_successors
-                    .contains(label)
-                || provenance.normal_try_copy_inline_labels.contains(label)
-                || provenance.normal_try_copy_internal_labels.contains(label)
-                || provenance
-                    .normal_try_copy_steps
-                    .iter()
-                    .any(|(a, b, _)| a == label || b == label)
-                || provenance
-                    .normal_try_copy_pop_ranges
-                    .iter()
-                    .any(|(a, b)| a == label || b == label)
-        };
         let boundary = |label: &Label| {
             provenance.block_boundaries.contains(label)
                 || provenance.source_boundaries.contains(label)
@@ -3365,12 +3350,12 @@ impl LayoutAssembler {
                     .iter()
                     .any(|region| region.target == *label)
                 || provenance.removed_pop_block_boundaries.contains(label)
-                || copied(label)
+                || provenance.is_normal_try_copy_label(*label)
         };
         for origin in &provenance.source_none_conditions {
             if !provenance.source_boundaries.contains(&origin.entry)
                 || !provenance.block_boundaries.contains(&origin.entry)
-                || copied(&origin.entry)
+                || provenance.is_normal_try_copy_label(origin.entry)
                 || provenance
                     .setups
                     .iter()
@@ -3431,7 +3416,14 @@ impl LayoutAssembler {
                 continue;
             };
             let (entry_aliases, entry_pop) = self
-                .source_none_entry_prefix(origin, *begin, *end, label_positions, &boundary, &copied)
+                .source_none_entry_prefix(
+                    origin,
+                    *begin,
+                    *end,
+                    label_positions,
+                    &boundary,
+                    &|label| provenance.is_normal_try_copy_label(*label),
+                )
                 .unwrap_or_default();
             let mut removed = Vec::new();
             let mut null_setup_cells = FxHashSet::default();
@@ -3654,20 +3646,7 @@ impl LayoutAssembler {
                         .count()
                         != 1
                         || provenance.retired_normal_try_copy_labels.contains(label)
-                        || provenance.normal_try_copy_blocks.contains(label)
-                        || provenance.normal_try_copy_inline_labels.contains(label)
-                        || provenance.normal_try_copy_internal_labels.contains(label)
-                        || provenance
-                            .normal_try_copy_jump_nop_successors
-                            .contains(label)
-                        || provenance
-                            .normal_try_copy_steps
-                            .iter()
-                            .any(|(a, b, _)| a == label || b == label)
-                        || provenance
-                            .normal_try_copy_pop_ranges
-                            .iter()
-                            .any(|(a, b)| a == label || b == label)
+                        || provenance.is_normal_try_copy_label(*label)
                         || provenance.removed_pop_block_boundaries.contains(label)
                         || provenance.omitted_nop_counts.contains_key(label)
                         || provenance.omitted_nop_locations.contains_key(label)
@@ -4187,12 +4166,9 @@ impl LayoutAssembler {
         {
             return None;
         }
-        Some(ExceptionOwnerDecision {
-            has_owner: source.is_some(),
-            source_region: source.map(|_| region),
-            definitive: true,
-            override_existing: true,
-        })
+        Some(ExceptionOwnerDecision::override_with_region(
+            source.map(|_| region),
+        ))
     }
 
     /// Recovers an owned handler cell across its fully captured finalizer SETUP.
@@ -4607,12 +4583,7 @@ impl LayoutAssembler {
             }
             result.insert(
                 marker,
-                ExceptionOwnerDecision {
-                    has_owner: true,
-                    source_region: Some(region),
-                    definitive: true,
-                    override_existing: true,
-                },
+                ExceptionOwnerDecision::override_with_region(Some(region)),
             );
         }
         result
@@ -5405,22 +5376,11 @@ impl LayoutAssembler {
                                 &provenance.source_boundaries,
                                 &provenance.fusion_boundaries,
                                 &provenance.removed_pop_block_boundaries,
-                                &provenance.normal_try_copy_blocks,
-                                &provenance.normal_try_copy_jump_nop_successors,
-                                &provenance.normal_try_copy_inline_labels,
                                 &provenance.retired_normal_try_copy_labels,
                             ]
                             .iter()
                             .any(|labels| labels.contains(label))
-                            && !provenance.normal_try_copy_internal_labels.contains(label)
-                            && !provenance
-                                .normal_try_copy_steps
-                                .iter()
-                                .any(|(start, end, _)| start == label || end == label)
-                            && !provenance
-                                .normal_try_copy_pop_ranges
-                                .iter()
-                                .any(|(start, end)| start == label || end == label)
+                            && !provenance.is_normal_try_copy_label(*label)
                             && unique_labels
                                 .get_or_init(|| UniqueLabelPositions::new(&self.items))
                                 .get(*label)
@@ -6043,27 +6003,10 @@ impl LayoutAssembler {
                                     .filter(|candidate| ***candidate == expected)
                                     .count()
                                     == 1
-                                && !provenance.normal_try_copy_blocks.contains(&origin.entry)
-                                && !provenance
-                                    .normal_try_copy_jump_nop_successors
-                                    .contains(&origin.entry)
-                                && !provenance
-                                    .normal_try_copy_inline_labels
-                                    .contains(&origin.entry)
-                                && !provenance
-                                    .normal_try_copy_internal_labels
-                                    .contains(&origin.entry)
+                                && !provenance.is_normal_try_copy_label(origin.entry)
                                 && !provenance
                                     .retired_normal_try_copy_labels
                                     .contains(&origin.entry)
-                                && !provenance
-                                    .normal_try_copy_steps
-                                    .iter()
-                                    .any(|(a, b, _)| *a == origin.entry || *b == origin.entry)
-                                && !provenance
-                                    .normal_try_copy_pop_ranges
-                                    .iter()
-                                    .any(|(a, b)| *a == origin.entry || *b == origin.entry)
                             {
                                 captured_null_slots.push((instruction_index, tail.early_removals));
                                 captured_null_slots
@@ -6516,12 +6459,7 @@ impl LayoutAssembler {
                         {
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: true,
-                                    source_region: Some(region),
-                                    definitive: true,
-                                    override_existing: true,
-                                },
+                                ExceptionOwnerDecision::override_with_region(Some(region)),
                             );
                         }
                         // A retained SETUP can follow removals owned by an outer handler. Only
@@ -6616,12 +6554,7 @@ impl LayoutAssembler {
                             {
                                 owners.insert(
                                     instruction_index,
-                                    ExceptionOwnerDecision {
-                                        has_owner: true,
-                                        source_region: Some(region),
-                                        definitive: true,
-                                        override_existing: true,
-                                    },
+                                    ExceptionOwnerDecision::override_with_region(Some(region)),
                                 );
                             }
                         }
@@ -6700,12 +6633,7 @@ impl LayoutAssembler {
                         {
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: true,
-                                    source_region: Some(region),
-                                    definitive: true,
-                                    override_existing: true,
-                                },
+                                ExceptionOwnerDecision::override_with_region(Some(region)),
                             );
                         }
                         if source_block && tail.early_removals == 0 && tail.late_removals == 0 {
@@ -6739,12 +6667,7 @@ impl LayoutAssembler {
                         {
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: true,
-                                    source_region: Some(region),
-                                    definitive: true,
-                                    override_existing: true,
-                                },
+                                ExceptionOwnerDecision::override_with_region(Some(region)),
                             );
                         }
                         // Late SETUP compaction can leave an ordinary-try record behind
@@ -6769,12 +6692,7 @@ impl LayoutAssembler {
                         {
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: true,
-                                    source_region: Some(region),
-                                    definitive: true,
-                                    override_existing: true,
-                                },
+                                ExceptionOwnerDecision::override_with_region(Some(region)),
                             );
                         }
                         // This source certificate identifies the retained authored return
@@ -6798,12 +6716,7 @@ impl LayoutAssembler {
                         {
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: false,
-                                    source_region: None,
-                                    definitive: true,
-                                    override_existing: true,
-                                },
+                                ExceptionOwnerDecision::override_with_region(None),
                             );
                         }
                         // The original manager POP precedes its cleanup. A later local-load
@@ -6907,12 +6820,7 @@ impl LayoutAssembler {
                         {
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: true,
-                                    source_region: Some(region),
-                                    definitive: true,
-                                    override_existing: true,
-                                },
+                                ExceptionOwnerDecision::override_with_region(Some(region)),
                             );
                         }
                         // A retained return POP can hide two earlier NULL POP records.
@@ -7134,12 +7042,7 @@ impl LayoutAssembler {
                             if marker_index == instruction_index {
                                 owners.insert(
                                     instruction_index,
-                                    ExceptionOwnerDecision {
-                                        has_owner: true,
-                                        source_region: Some(region),
-                                        definitive: true,
-                                        override_existing: true,
-                                    },
+                                    ExceptionOwnerDecision::override_with_region(Some(region)),
                                 );
                             } else {
                                 pending_compacted_append = Some((marker_index, region));
@@ -7174,12 +7077,7 @@ impl LayoutAssembler {
                         if removed > suffix_width && removed <= suffix_width + prefix_width {
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: true,
-                                    source_region: Some(region),
-                                    definitive: true,
-                                    override_existing: true,
-                                },
+                                ExceptionOwnerDecision::override_with_region(Some(region)),
                             );
                         }
                     }
@@ -7238,12 +7136,7 @@ impl LayoutAssembler {
                     {
                         owners.insert(
                             instruction_index + 1,
-                            ExceptionOwnerDecision {
-                                has_owner: false,
-                                source_region: None,
-                                definitive: true,
-                                override_existing: true,
-                            },
+                            ExceptionOwnerDecision::override_with_region(None),
                         );
                     }
                     // Certify the fresh append slot at the original terminator, before
@@ -7363,12 +7256,7 @@ impl LayoutAssembler {
                     {
                         owners.insert(
                             instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: true,
-                                source_region: Some(*region),
-                                definitive: true,
-                                override_existing: true,
-                            },
+                            ExceptionOwnerDecision::override_with_region(Some(*region)),
                         );
                     }
                     // This separate origin proof starts with one retained normal POP_BLOCK.
@@ -7402,12 +7290,7 @@ impl LayoutAssembler {
                     {
                         owners.insert(
                             instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: false,
-                                source_region: None,
-                                definitive: true,
-                                override_existing: true,
-                            },
+                            ExceptionOwnerDecision::override_with_region(None),
                         );
                     }
                     // Reinsert certified late SETUP records into this original array.
@@ -7459,12 +7342,7 @@ impl LayoutAssembler {
                         {
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: source_region.is_some(),
-                                    source_region,
-                                    definitive: true,
-                                    override_existing: true,
-                                },
+                                ExceptionOwnerDecision::override_with_region(source_region),
                             );
                         }
                     }
@@ -7490,12 +7368,7 @@ impl LayoutAssembler {
                     {
                         owners.insert(
                             instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: true,
-                                source_region: Some(region),
-                                definitive: true,
-                                override_existing: true,
-                            },
+                            ExceptionOwnerDecision::override_with_region(Some(region)),
                         );
                     }
                     // The unnamed-handler return has two separate NULL POP cells. If
@@ -7994,12 +7867,7 @@ impl LayoutAssembler {
                     {
                         owners.insert(
                             instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: true,
-                                source_region: Some(region),
-                                definitive: true,
-                                override_existing: true,
-                            },
+                            ExceptionOwnerDecision::override_with_region(Some(region)),
                         );
                     }
                     // The threading pass appends a fresh NULL-owned conditional after
@@ -8033,12 +7901,7 @@ impl LayoutAssembler {
                     if threaded_null_append == Some(instruction_index) {
                         owners.insert(
                             instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: false,
-                                source_region: None,
-                                definitive: true,
-                                override_existing: true,
-                            },
+                            ExceptionOwnerDecision::override_with_region(None),
                         );
                     }
                     // This independent source certificate proves every erased cell in
@@ -8065,34 +7928,19 @@ impl LayoutAssembler {
                     if original_normal_finally_null_markers.contains(&instruction_index) {
                         owners.insert(
                             instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: false,
-                                source_region: None,
-                                definitive: true,
-                                override_existing: true,
-                            },
+                            ExceptionOwnerDecision::override_with_region(None),
                         );
                     }
                     if retained_setup_null_markers.contains(&instruction_index) {
                         owners.insert(
                             instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: false,
-                                source_region: None,
-                                definitive: true,
-                                override_existing: true,
-                            },
+                            ExceptionOwnerDecision::override_with_region(None),
                         );
                     }
                     if retained_setup_value_null_markers.contains(&instruction_index) {
                         owners.insert(
                             instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: false,
-                                source_region: None,
-                                definitive: true,
-                                override_existing: true,
-                            },
+                            ExceptionOwnerDecision::override_with_region(None),
                         );
                     }
                     if instruction.opcode == NOT_TAKEN {
@@ -8106,12 +7954,7 @@ impl LayoutAssembler {
                         {
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: region.is_some(),
-                                    source_region: region,
-                                    definitive: true,
-                                    override_existing: true,
-                                },
+                                ExceptionOwnerDecision::override_with_region(region),
                             );
                         }
                         if instruction_index > 0
@@ -8133,12 +7976,9 @@ impl LayoutAssembler {
                                 {
                                     owners.insert(
                                         instruction_index,
-                                        ExceptionOwnerDecision {
-                                            has_owner: true,
-                                            source_region: Some(source_region),
-                                            definitive: true,
-                                            override_existing: true,
-                                        },
+                                        ExceptionOwnerDecision::override_with_region(Some(
+                                            source_region,
+                                        )),
                                     );
                                 }
                             }
@@ -8169,12 +8009,7 @@ impl LayoutAssembler {
                         {
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: true,
-                                    source_region: Some(region),
-                                    definitive: true,
-                                    override_existing: true,
-                                },
+                                ExceptionOwnerDecision::override_with_region(Some(region)),
                             );
                         }
                         // A captured named-handler prefix crosses only its own retained
@@ -8196,12 +8031,7 @@ impl LayoutAssembler {
                         {
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: true,
-                                    source_region: Some(region),
-                                    definitive: true,
-                                    override_existing: true,
-                                },
+                                ExceptionOwnerDecision::override_with_region(Some(region)),
                             );
                         }
                         if instruction.exception_policy() == super::ExceptionPolicy::NonePresent
@@ -8222,12 +8052,7 @@ impl LayoutAssembler {
                         {
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: false,
-                                    source_region: None,
-                                    definitive: true,
-                                    override_existing: true,
-                                },
+                                ExceptionOwnerDecision::override_with_region(None),
                             );
                         }
                         // This saved-value cleanup certifies two omitted handler POPs and
@@ -8249,12 +8074,7 @@ impl LayoutAssembler {
                         {
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: false,
-                                    source_region: None,
-                                    definitive: true,
-                                    override_existing: true,
-                                },
+                                ExceptionOwnerDecision::override_with_region(None),
                             );
                         }
                         // A complete captured unwind supplies its own original array proof;
@@ -8495,12 +8315,7 @@ impl LayoutAssembler {
                             {
                                 owners.insert(
                                     instruction_index,
-                                    ExceptionOwnerDecision {
-                                        has_owner: false,
-                                        source_region: None,
-                                        definitive: true,
-                                        override_existing: true,
-                                    },
+                                    ExceptionOwnerDecision::override_with_region(None),
                                 );
                             }
                             // Equality selects the original NULL finally POP immediately after
@@ -8562,12 +8377,7 @@ impl LayoutAssembler {
                             {
                                 owners.insert(
                                     instruction_index,
-                                    ExceptionOwnerDecision {
-                                        has_owner: false,
-                                        source_region: None,
-                                        definitive: true,
-                                        override_existing: true,
-                                    },
+                                    ExceptionOwnerDecision::override_with_region(None),
                                 );
                             }
                             if removed > suffix && removed - suffix <= end - start {
@@ -8580,12 +8390,7 @@ impl LayoutAssembler {
                                 {
                                     owners.insert(
                                         instruction_index,
-                                        ExceptionOwnerDecision {
-                                            has_owner: true,
-                                            source_region: Some(region),
-                                            definitive: true,
-                                            override_existing: true,
-                                        },
+                                        ExceptionOwnerDecision::override_with_region(Some(region)),
                                     );
                                 }
                             }
@@ -8625,12 +8430,7 @@ impl LayoutAssembler {
                         {
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: true,
-                                    source_region: Some(region),
-                                    definitive: true,
-                                    override_existing: true,
-                                },
+                                ExceptionOwnerDecision::override_with_region(Some(region)),
                             );
                         }
                         // A returned async iterator leaves its owned POP_TOP cell in
@@ -8691,12 +8491,7 @@ impl LayoutAssembler {
                         {
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: true,
-                                    source_region: Some(region),
-                                    definitive: true,
-                                    override_existing: true,
-                                },
+                                ExceptionOwnerDecision::override_with_region(Some(region)),
                             );
                         }
                         // An attribute None test follows the same captured iterator disposal.
@@ -8769,12 +8564,7 @@ impl LayoutAssembler {
                             let source_region = (instruction_index == slot).then_some(region);
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: source_region.is_some(),
-                                    source_region,
-                                    definitive: true,
-                                    override_existing: true,
-                                },
+                                ExceptionOwnerDecision::override_with_region(source_region),
                             );
                         }
                         // The explicit TO_BOOL places a truthiness marker one cell later
@@ -8957,12 +8747,7 @@ impl LayoutAssembler {
                             let source_region = (instruction_index == slot).then_some(region);
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: source_region.is_some(),
-                                    source_region,
-                                    definitive: true,
-                                    override_existing: true,
-                                },
+                                ExceptionOwnerDecision::override_with_region(source_region),
                             );
                         }
                         // The last SETUP compaction copies live records left and leaves
@@ -8990,12 +8775,7 @@ impl LayoutAssembler {
                         {
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: false,
-                                    source_region: None,
-                                    definitive: true,
-                                    override_existing: true,
-                                },
+                                ExceptionOwnerDecision::override_with_region(None),
                             );
                         }
                         // This original excluded NOP supplies its own exact donor cell;
@@ -9013,12 +8793,7 @@ impl LayoutAssembler {
                         {
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: false,
-                                    source_region: None,
-                                    definitive: true,
-                                    override_existing: true,
-                                },
+                                ExceptionOwnerDecision::override_with_region(None),
                             );
                         }
                         if instruction.exception_policy()
@@ -9041,12 +8816,7 @@ impl LayoutAssembler {
                         {
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: false,
-                                    source_region: None,
-                                    definitive: true,
-                                    override_existing: true,
-                                },
+                                ExceptionOwnerDecision::override_with_region(None),
                             );
                         }
                         if owner_history_exact
@@ -9066,12 +8836,7 @@ impl LayoutAssembler {
                         {
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: true,
-                                    source_region: Some(region),
-                                    definitive: true,
-                                    override_existing: true,
-                                },
+                                ExceptionOwnerDecision::override_with_region(Some(region)),
                             );
                         }
                     }
@@ -9128,15 +8893,7 @@ impl LayoutAssembler {
                 if !certified.contains(&marker) {
                     continue;
                 }
-                owners.insert(
-                    marker,
-                    ExceptionOwnerDecision {
-                        has_owner: false,
-                        source_region: None,
-                        definitive: true,
-                        override_existing: true,
-                    },
-                );
+                owners.insert(marker, ExceptionOwnerDecision::override_with_region(None));
             }
         }
         owners.extend(self.normal_try_break_pop_owners(&label_positions, &jump_targets));
@@ -9677,12 +9434,7 @@ impl LayoutAssembler {
             // no captured prefix and still appends into fresh NULL storage.
             result.insert(
                 marker,
-                ExceptionOwnerDecision {
-                    has_owner: true,
-                    source_region: Some(region),
-                    definitive: true,
-                    override_existing: true,
-                },
+                ExceptionOwnerDecision::override_with_region(Some(region)),
             );
         }
         result
@@ -10438,12 +10190,7 @@ impl LayoutAssembler {
             current.is_none_or(|current| self.exception_regions[current].is_scope_fallback)
         };
         (!owner.is_scope_fallback && !owner.preserve_lasti && current_owner_matches).then_some(
-            ExceptionOwnerDecision {
-                has_owner: owns_cleanup_record,
-                source_region: owns_cleanup_record.then_some(region),
-                definitive: true,
-                override_existing: true,
-            },
+            ExceptionOwnerDecision::override_with_region(owns_cleanup_record.then_some(region)),
         )
     }
 
@@ -10921,12 +10668,7 @@ impl LayoutAssembler {
         if marker > return_slot {
             return (return_slot.checked_add(1) == Some(marker)
                 || return_slot.checked_add(2) == Some(marker))
-            .then_some(ExceptionOwnerDecision {
-                has_owner: false,
-                source_region: None,
-                definitive: true,
-                override_existing: true,
-            });
+            .then_some(ExceptionOwnerDecision::override_with_region(None));
         }
         if return_slot - marker > pop - array
             || instructions[array..pop].iter().any(|record| {
@@ -10945,12 +10687,7 @@ impl LayoutAssembler {
         let region = self.uniform_exception_owner(array, pop, positions)?;
         (!self.exception_regions[region].is_scope_fallback
             && !self.exception_regions[region].preserve_lasti)
-            .then_some(ExceptionOwnerDecision {
-                has_owner: true,
-                source_region: Some(region),
-                definitive: true,
-                override_existing: true,
-            })
+            .then_some(ExceptionOwnerDecision::override_with_region(Some(region)))
     }
 
     /// Replays a source-certified membership return without assuming generic fold history.
@@ -10976,20 +10713,7 @@ impl LayoutAssembler {
         let provenance = &self.exception_owner_provenance;
         let copied = |label: &Label| {
             provenance.retired_normal_try_copy_labels.contains(label)
-                || provenance.normal_try_copy_blocks.contains(label)
-                || provenance.normal_try_copy_inline_labels.contains(label)
-                || provenance.normal_try_copy_internal_labels.contains(label)
-                || provenance
-                    .normal_try_copy_jump_nop_successors
-                    .contains(label)
-                || provenance
-                    .normal_try_copy_steps
-                    .iter()
-                    .any(|(a, b, _)| a == label || b == label)
-                || provenance
-                    .normal_try_copy_pop_ranges
-                    .iter()
-                    .any(|(a, b)| a == label || b == label)
+                || provenance.is_normal_try_copy_label(*label)
         };
         let mut matches = provenance
             .copied_return_membership_prefixes
@@ -11081,12 +10805,7 @@ impl LayoutAssembler {
         }
         let first_pop = load.checked_add(globals)?;
         if marker == first_pop || first_pop.checked_add(1) == Some(marker) {
-            return Some(ExceptionOwnerDecision {
-                has_owner: false,
-                source_region: None,
-                definitive: true,
-                override_existing: true,
-            });
+            return Some(ExceptionOwnerDecision::override_with_region(None));
         }
         if marker >= first_pop || first_pop - marker > prefix.len() {
             return None;
@@ -11094,12 +10813,7 @@ impl LayoutAssembler {
         let region = self.uniform_exception_owner(array, load, positions)?;
         (!self.exception_regions[region].is_scope_fallback
             && !self.exception_regions[region].preserve_lasti)
-            .then_some(ExceptionOwnerDecision {
-                has_owner: true,
-                source_region: Some(region),
-                definitive: true,
-                override_existing: true,
-            })
+            .then_some(ExceptionOwnerDecision::override_with_region(Some(region)))
     }
 
     /// Finds unchanged, unambiguous terminal pairs from the actual threading pass.
