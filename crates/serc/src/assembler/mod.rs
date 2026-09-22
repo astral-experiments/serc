@@ -7,6 +7,8 @@ mod legacy_native_labels;
 mod passes;
 
 #[cfg(test)]
+mod snapshots;
+#[cfg(test)]
 mod tests;
 
 use rustc_hash::{FxHashMap, FxHashSet};

@@ -1,0 +1,55 @@
+---
+source: crates/serc/src/marshal/graph/snapshots.rs
+expression: snapshot
+---
+object 0: shared=false cached=false interned=false
+object 1: shared=false cached=false interned=false
+object 2: shared=false cached=false interned=false
+object 3: shared=true cached=true interned=true
+object 4: shared=false cached=false interned=false
+object 5: shared=false cached=false interned=false
+object 6: shared=false cached=false interned=false
+object 7: shared=true cached=false interned=false
+object 8: shared=true cached=true interned=false
+object 9: shared=false cached=false interned=false
+object 10: shared=false cached=true interned=true
+object 11: shared=false cached=false interned=false
+object 12: shared=true cached=true interned=true
+object 13: shared=true cached=true interned=true
+object 14: shared=false cached=false interned=false
+object 15: shared=true cached=true interned=false
+object 16: shared=false cached=false interned=false
+object 17: shared=false cached=true interned=true
+object 18: shared=true cached=true interned=true
+object 19: shared=false cached=false interned=false
+visit 0: Code -> object 0
+visit 1: CodeBytes -> object 1
+visit 2: Constants -> object 2
+visit 3: Constant -> object 3
+visit 4: Code -> object 4
+visit 5: CodeBytes -> object 5
+visit 6: Constants -> object 6
+visit 7: Constant -> object 3
+visit 8: Constants -> object 7
+visit 9: Constant -> object 3
+visit 10: Constant -> object 3
+visit 11: Strings -> object 8
+visit 12: Locals -> object 9
+visit 13: MetadataString -> object 10
+visit 14: LocalKinds -> object 11
+visit 15: MetadataString -> object 12
+visit 16: MetadataString -> object 13
+visit 17: MetadataString -> object 13
+visit 18: Bytes -> object 14
+visit 19: Bytes -> object 15
+visit 20: Constants -> object 7
+visit 21: Strings -> object 16
+visit 22: MetadataString -> object 17
+visit 23: MetadataString -> object 13
+visit 24: Locals -> object 8
+visit 25: LocalKinds -> object 15
+visit 26: MetadataString -> object 12
+visit 27: MetadataString -> object 18
+visit 28: MetadataString -> object 18
+visit 29: Bytes -> object 19
+visit 30: Bytes -> object 15

@@ -41,6 +41,29 @@ pub(crate) struct Opcode {
 }
 
 impl Opcode {
+    /// Read mnemonics from the same generated metadata that defines the IR opcodes.
+    #[cfg(test)]
+    pub(crate) fn name(self) -> &'static str {
+        let code = self.code();
+        for source in [
+            include_str!("cpython_3_14_5.rs"),
+            include_str!("legacy_opcodes.rs"),
+        ] {
+            for line in source.lines() {
+                if let Some(declaration) = line.trim().strip_prefix("pub(crate) const ")
+                    && let Some((name, value)) = declaration.split_once(": Opcode = Opcode::new(")
+                    && value
+                        .strip_suffix(");")
+                        .and_then(|value| value.parse::<u8>().ok())
+                        == Some(code)
+                {
+                    return name;
+                }
+            }
+        }
+        panic!("missing generated mnemonic for opcode {code}");
+    }
+
     /// This constructor is private so that generated target metadata is the sole numeric authority.
     const fn new(code: u8) -> Self {
         Self { code }

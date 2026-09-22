@@ -5295,3 +5295,6 @@ mod tests {
         assert!(inputs.name_positions.is_none());
     }
 }
+
+#[cfg(test)]
+mod snapshots;

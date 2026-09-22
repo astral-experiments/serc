@@ -144,6 +144,8 @@ impl Assembler {
             BlockGraph::from_items(items.to_vec(), &self.preserved_block_boundaries)
                 .item_reachability(&self.exception_regions)
         });
+        #[cfg(test)]
+        super::snapshots::record(stage, items, &self.exception_regions);
         validate_structure(items, &self.exception_regions, reachable.as_deref(), stage)
     }
 }
@@ -158,6 +160,8 @@ impl OptimizationPipeline {
         let reachable = stage
             .requires_full_reachability()
             .then(|| self.reachable_items());
+        #[cfg(test)]
+        super::snapshots::record(stage, &items, &self.exception_regions);
         validate_structure(&items, &self.exception_regions, reachable.as_deref(), stage)
     }
 }
@@ -165,6 +169,8 @@ impl OptimizationPipeline {
 #[cfg(any(test, debug_assertions))]
 impl LayoutAssembler {
     fn validate_structure(&self, stage: AssemblerStage) -> Result<(), CompileError> {
+        #[cfg(test)]
+        super::snapshots::record(stage, &self.items, &self.exception_regions);
         validate_structure(&self.items, &self.exception_regions, None, stage)
     }
 }
