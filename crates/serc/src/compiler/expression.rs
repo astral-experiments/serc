@@ -8265,6 +8265,15 @@ impl Compiler<'_> {
                 self.assembler.preserve_inlined_jump_nop(exit);
                 self.assembler
                     .mark_folded_jump_borrow_fallthrough(exit, empty_folded_block);
+                if matches!(
+                    self.context.python_version,
+                    PythonVersion::Py314 | PythonVersion::Py315
+                ) && self.control.conditions.uncopied_assertion_success == Some(label)
+                {
+                    // This edge becomes unconditional only after CPython's early
+                    // copy pass; a located assertion continuation stays shared.
+                    self.assembler.prevent_jump_inlining(exit);
+                }
             } else {
                 // Native line resolution still sees this edge before constant folding.
                 self.assembler.record_folded_condition_predecessor(label);

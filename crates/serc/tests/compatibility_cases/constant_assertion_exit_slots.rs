@@ -204,3 +204,18 @@ fn matches_cpython_folded_assertion_success_inside_synchronous_manager() {
         }
     }
 }
+
+#[test]
+fn preserves_folded_assertion_success_borrowing_and_return_order() {
+    for condition in [
+        "value and True",
+        "value in items and 'ready'",
+        "not (value or False)",
+    ] {
+        for tail in ["return value", "return None", "return consume(value)"] {
+            let source =
+                format!("def validate(value, items):\n    assert {condition}\n    {tail}\n");
+            common::assert_matches_cpython_marshal(&source, "folded_assertion_success_return.py");
+        }
+    }
+}
