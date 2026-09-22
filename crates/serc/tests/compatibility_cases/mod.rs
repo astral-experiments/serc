@@ -50,6 +50,7 @@ mod constant_condition_admission;
 mod constant_false_comprehension_filters;
 mod constant_negation_ifexp_borrow;
 mod constant_pop_return_owners;
+mod constant_return_pop;
 mod context_manager_return_handler_nesting;
 mod continued_cleanup_locations;
 mod copied_comprehension_store_swaps;

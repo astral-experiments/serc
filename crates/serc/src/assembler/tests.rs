@@ -4034,6 +4034,87 @@ fn empty_exception_regions_follow_their_original_entry() {
 }
 
 #[test]
+fn constant_return_pop_requires_authored_default_records() {
+    for version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        for mutation in [
+            "intact",
+            "custom owner",
+            "hidden slot",
+            "synthetic marker",
+            "converted pop",
+            "different span",
+            "double marker",
+            "wrong depth",
+            "non-source entry",
+        ] {
+            let mut assembler = Assembler {
+                python_version: version,
+                ..Assembler::default()
+            };
+            let entry = assembler.label();
+            let donor = SourceLocation::new(2, 2, 8, 13);
+            let location = SourceLocation::new(5, 5, 15, 19);
+            let mut pop = Instruction::value_with_depth(NOP, 0, SourceLocation::NONE, 0);
+            pop.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+            pop.fusion_policy.mark_converted_pop_block();
+            let mut tail = vec![
+                Item::Instruction(Instruction::value_with_depth(NOP, 0, location, 0)),
+                Item::Instruction(Instruction::value_with_depth(LOAD_CONST, 0, location, 1)),
+                Item::Instruction(Instruction::value_with_depth(RETURN_VALUE, 0, location, 0)),
+            ];
+            let Item::Instruction(nop) = &mut tail[0] else {
+                unreachable!();
+            };
+            match mutation {
+                "custom owner" => nop.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS),
+                "hidden slot" => nop.local_policy.add_hidden_exception_owner_slots(1),
+                "synthetic marker" => {
+                    *nop = Instruction::synthetic(NOP, Operand::Value(0), location, Some(0));
+                }
+                "converted pop" => nop.fusion_policy.mark_converted_pop_block(),
+                "different span" => nop.location = SourceLocation::new(5, 5, 8, 19),
+                "wrong depth" => *nop = Instruction::value_with_depth(NOP, 0, location, 1),
+                _ => {}
+            }
+            if mutation == "double marker" {
+                tail.insert(1, tail[0]);
+            }
+            assembler.push_linear_item(Item::Instruction(Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(entry),
+                donor,
+                Some(0),
+            )));
+            assembler.push_linear_item(Item::Instruction(Instruction::value_with_depth(
+                STORE_FAST, 0, donor, 0,
+            )));
+            assembler.mark(entry);
+            if mutation != "non-source entry" {
+                assembler.record_exception_owner_block_boundary(entry);
+            }
+            assembler.push_linear_item(Item::Instruction(pop));
+            for item in tail {
+                assembler.push_linear_item(item);
+            }
+            assembler.record_copied_return_fallthrough_pop(2);
+            assert_eq!(
+                assembler
+                    .exception_owner_provenance
+                    .original_fallthrough_pop_blocks
+                    .contains_key(&entry),
+                mutation == "intact" && version >= crate::PythonVersion::Py314,
+                "{version:?}, {mutation}",
+            );
+        }
+    }
+}
+
+#[test]
 fn copied_return_pop_origins_retire_only_with_erased_unreachable_arrays() {
     for reachable in [false, true] {
         let mut assembler = Assembler::default();

@@ -1999,6 +1999,43 @@ impl Assembler {
         {
             return;
         }
+        // Constant returns author a value-location NOP before LOAD_CONST and
+        // RETURN_VALUE. Together with POP_BLOCK this is exactly four original
+        // records, so it participates in the same pre-line copy pass.
+        let constant_return_prefix =
+            items
+                .get(marker_item + 1..marker_item + 4)
+                .is_some_and(|tail| {
+                    let [
+                        Item::Instruction(nop),
+                        Item::Instruction(load),
+                        Item::Instruction(ret),
+                    ] = tail
+                    else {
+                        return false;
+                    };
+                    let Operand::Value(constant) = load.operand() else {
+                        return false;
+                    };
+                    let Some(depth) = marker.depth_after() else {
+                        return false;
+                    };
+                    let Some(value_depth) = depth.checked_add(1) else {
+                        return false;
+                    };
+                    // Exact default instructions exclude converted POPs, synthetic
+                    // markers, custom owners, and every hidden or folded slot.
+                    *nop == Instruction::value_with_depth(NOP, 0, nop.location, depth)
+                        && *load
+                            == Instruction::value_with_depth(
+                                LOAD_CONST,
+                                constant,
+                                nop.location,
+                                value_depth,
+                            )
+                        && *ret
+                            == Instruction::value_with_depth(RETURN_VALUE, 0, nop.location, depth)
+                });
         let mut returned = false;
         let mut original_size = 1;
         for item in items.iter().skip(marker_item + 1).take(3) {
@@ -2009,7 +2046,8 @@ impl Assembler {
                 || instruction.local_policy.hidden_exception_owner_slots() != 0
                 || instruction.location.line < 0
                 || instruction.no_location_policy.preserves_location()
-                || matches!(instruction.opcode, NOP | NOT_TAKEN)
+                || instruction.opcode == NOT_TAKEN
+                || (instruction.opcode == NOP && !(constant_return_prefix && original_size == 1))
                 || !matches!(instruction.operand(), Operand::Value(_))
             {
                 return;
