@@ -377,14 +377,25 @@ fn borrowed_string_tuple_keys_compare_across_sources() {
         Constant::String("beta".to_string()),
     ];
     let strings = vec!["alpha".to_string(), "beta".to_string()];
-    let constant_key = constants_tuple_key(&constants);
-    let string_key = strings_tuple_key(&strings);
-
-    assert_eq!(constant_key, string_key);
-
-    let mut graph = ObjectGraph::default();
-    assert!(graph.record(constant_key));
-    assert!(!graph.record(string_key));
+    let keys = [0..1, 0..2, 1..2].map(|range| {
+        [
+            constants_tuple_key(&constants[range.clone()]),
+            strings_tuple_key(&strings[range]),
+        ]
+    });
+    for (left_index, left_keys) in keys.iter().enumerate() {
+        for (right_index, right_keys) in keys.iter().enumerate() {
+            for left in left_keys {
+                for right in right_keys {
+                    assert_eq!(left == right, left_index == right_index);
+                    assert_eq!(left.cmp(right), left_index.cmp(&right_index));
+                }
+            }
+        }
+        let mut graph = ObjectGraph::default();
+        assert!(graph.record(left_keys[0].clone()));
+        assert!(!graph.record(left_keys[1].clone()));
+    }
 }
 
 #[test]

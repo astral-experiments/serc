@@ -157,28 +157,22 @@ impl<'a> StringTupleKey<'a> {
     fn strings(values: &'a [String]) -> Self {
         Self(StringTupleKind::Strings(values))
     }
+
+    fn iter(&self) -> impl Iterator<Item = &'a str> {
+        let (constants, strings): (&[Constant], &[String]) = match self.0 {
+            StringTupleKind::Constants(values) => (values, &[]),
+            StringTupleKind::Strings(values) => (&[], values),
+        };
+        constants
+            .iter()
+            .map(constant_string)
+            .chain(strings.iter().map(String::as_str))
+    }
 }
 
 impl PartialEq for StringTupleKey<'_> {
     fn eq(&self, other: &Self) -> bool {
-        match (self.0, other.0) {
-            (StringTupleKind::Constants(left), StringTupleKind::Constants(right)) => {
-                left.len() == right.len()
-                    && left
-                        .iter()
-                        .zip(right)
-                        .all(|(left, right)| constant_string(left) == constant_string(right))
-            }
-            (StringTupleKind::Constants(left), StringTupleKind::Strings(right))
-            | (StringTupleKind::Strings(right), StringTupleKind::Constants(left)) => {
-                left.len() == right.len()
-                    && left
-                        .iter()
-                        .zip(right)
-                        .all(|(left, right)| constant_string(left) == right)
-            }
-            (StringTupleKind::Strings(left), StringTupleKind::Strings(right)) => left == right,
-        }
+        self.iter().eq(other.iter())
     }
 }
 
@@ -186,14 +180,13 @@ impl Eq for StringTupleKey<'_> {}
 
 impl Hash for StringTupleKey<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        match self.0 {
-            StringTupleKind::Constants(values) => {
-                values.len().hash(state);
-                for value in values {
-                    constant_string(value).hash(state);
-                }
-            }
-            StringTupleKind::Strings(values) => values.hash(state),
+        let length = match self.0 {
+            StringTupleKind::Constants(values) => values.len(),
+            StringTupleKind::Strings(values) => values.len(),
+        };
+        length.hash(state);
+        for value in self.iter() {
+            value.hash(state);
         }
     }
 }
@@ -206,21 +199,7 @@ impl PartialOrd for StringTupleKey<'_> {
 
 impl Ord for StringTupleKey<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
-        match (self.0, other.0) {
-            (StringTupleKind::Constants(left), StringTupleKind::Constants(right)) => left
-                .iter()
-                .map(constant_string)
-                .cmp(right.iter().map(constant_string)),
-            (StringTupleKind::Constants(left), StringTupleKind::Strings(right)) => left
-                .iter()
-                .map(constant_string)
-                .cmp(right.iter().map(String::as_str)),
-            (StringTupleKind::Strings(left), StringTupleKind::Constants(right)) => left
-                .iter()
-                .map(String::as_str)
-                .cmp(right.iter().map(constant_string)),
-            (StringTupleKind::Strings(left), StringTupleKind::Strings(right)) => left.cmp(right),
-        }
+        self.iter().cmp(other.iter())
     }
 }
 
