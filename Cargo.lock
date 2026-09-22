@@ -937,6 +937,7 @@ dependencies = [
  "cpu-time",
  "encoding_rs",
  "fs-err",
+ "hashbrown",
  "insta",
  "serc_fixtures",
  "rayon",
