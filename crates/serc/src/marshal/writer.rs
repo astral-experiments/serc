@@ -1,4 +1,4 @@
-use ruff_index::newtype_index;
+use ruff_index::{IndexVec, newtype_index};
 
 use crate::code_object::{CodeObject, Constant, MetadataId};
 use crate::{InitialInternState, PythonVersion};
@@ -123,7 +123,7 @@ fn encode_code_into_with_mode(
     let mut writer = Writer {
         graph: &graph,
         output,
-        references: vec![None; graph.object_count()],
+        references: IndexVec::from_raw(vec![None; graph.object_count()]),
         reference_count: 0,
         occurrences: graph.occurrence_cursor(),
     };
@@ -134,7 +134,7 @@ fn encode_code_into_with_mode(
 struct Writer<'output, 'graph, 'code> {
     graph: &'graph ObjectGraph<'code>,
     output: &'output mut Vec<u8>,
-    references: Vec<Option<ReferenceId>>,
+    references: IndexVec<ObjectId, Option<ReferenceId>>,
     reference_count: usize,
     occurrences: OccurrenceCursor<'graph>,
 }
@@ -191,13 +191,13 @@ impl Writer<'_, '_, '_> {
         if reference_mode == ReferenceMode::IfShared && !self.graph.is_shared_object(object) {
             return Some(0);
         }
-        if let Some(index) = self.references[object.index()] {
+        if let Some(index) = self.references[object] {
             self.byte_and_long(TYPE_REF, index.as_u32());
             return None;
         }
         let index = ReferenceId::from_usize(self.reference_count);
         self.reference_count += 1;
-        self.references[object.index()] = Some(index);
+        self.references[object] = Some(index);
         Some(FLAG_REF)
     }
 

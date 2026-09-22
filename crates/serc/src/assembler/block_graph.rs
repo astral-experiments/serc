@@ -1,6 +1,6 @@
 use std::ops::Index;
 
-use ruff_index::newtype_index;
+use ruff_index::{IndexVec, newtype_index};
 use rustc_hash::FxHashSet;
 
 use crate::target::opcodes::{
@@ -159,7 +159,7 @@ impl PipelineFeatures {
 /// without invalidating identities captured by data-flow state.
 #[derive(Clone, Debug)]
 pub(super) struct BlockGraph {
-    blocks: Vec<BasicBlock>,
+    blocks: IndexVec<BasicBlockId, BasicBlock>,
     order: Vec<BasicBlockId>,
     label_blocks: Vec<Option<BasicBlockId>>,
     features: PipelineFeatures,
@@ -301,8 +301,11 @@ impl BlockGraph {
         preserved_block_boundaries: &FxHashSet<Label>,
     ) -> Self {
         let (blocks, features) = Self::partition_items(items, preserved_block_boundaries);
-        let blocks = blocks.into_iter().map(BasicBlock::new).collect::<Vec<_>>();
-        let order = (0..blocks.len()).map(BasicBlockId::from_usize).collect();
+        let blocks = blocks
+            .into_iter()
+            .map(BasicBlock::new)
+            .collect::<IndexVec<BasicBlockId, _>>();
+        let order = blocks.indices().collect();
         let mut graph = Self {
             blocks,
             order,
@@ -446,7 +449,7 @@ impl BlockGraph {
     }
 
     pub(super) fn allocate_block(&mut self, items: Vec<Item>) -> BasicBlockId {
-        let block = BasicBlockId::from_usize(self.blocks.len());
+        let block = self.blocks.next_index();
         self.blocks.push(BasicBlock::new(items));
         self.bind_block_labels(block, 0);
         block
@@ -484,14 +487,14 @@ impl BlockGraph {
         let items = original_order
             .iter()
             .copied()
-            .flat_map(|block| std::mem::take(&mut self.blocks[block.index()].items));
+            .flat_map(|block| std::mem::take(&mut self.blocks[block].items));
         let segments = collect_segments(items, segment_lengths);
 
         let mut reusable = original_order.into_iter();
         let mut order = Vec::with_capacity(segments.len());
         for items in segments {
             if let Some(block) = reusable.next() {
-                self.blocks[block.index()].items = items;
+                self.blocks[block].items = items;
                 order.push(block);
             } else {
                 order.push(self.allocate_block(items));
@@ -558,8 +561,8 @@ impl BlockGraph {
         for (block, continuation) in old_order.into_iter().zip(join) {
             if continuation {
                 let head: BasicBlockId = *order.last().expect("validated continuation prefix");
-                let items = std::mem::take(&mut self.blocks[block.index()].items);
-                self.blocks[head.index()].items.extend(items);
+                let items = std::mem::take(&mut self.blocks[block].items);
+                self.blocks[head].items.extend(items);
             } else {
                 order.push(block);
             }
@@ -610,13 +613,13 @@ impl BlockGraph {
     ) {
         debug_assert!(self.order.contains(&block));
         let start = self[block].items.len();
-        self.blocks[block.index()].items.extend(items);
+        self.blocks[block].items.extend(items);
         self.bind_block_labels(block, start);
     }
 
     pub(super) fn insert_label(&mut self, block: BasicBlockId, position: usize, label: Label) {
         debug_assert!(self.order.contains(&block));
-        self.blocks[block.index()]
+        self.blocks[block]
             .items
             .insert(position, Item::Label(label));
         self.bind_label(label, block);
@@ -624,7 +627,7 @@ impl BlockGraph {
 
     /// Removes one item while keeping label lookup synchronized.
     pub(super) fn remove_item_at(&mut self, block: BasicBlockId, position: usize) -> Item {
-        let item = self.blocks[block.index()].items.remove(position);
+        let item = self.blocks[block].items.remove(position);
         if let Item::Label(label) = item
             && self.label_block(label) == Some(block)
         {
@@ -676,7 +679,7 @@ impl BlockGraph {
         block: BasicBlockId,
         mut keep: impl FnMut(&Item) -> bool,
     ) {
-        let items = &mut self.blocks[block.index()].items;
+        let items = &mut self.blocks[block].items;
         let label_blocks = &mut self.label_blocks;
         items.retain(|item| {
             let retain = keep(item);
@@ -713,13 +716,10 @@ impl BlockGraph {
         &mut self,
         block: BasicBlockId,
     ) -> impl Iterator<Item = ItemMut<'_>> {
-        self.blocks[block.index()]
-            .items
-            .iter_mut()
-            .map(|item| match item {
-                Item::Label(_) => ItemMut::Label,
-                Item::Instruction(instruction) => ItemMut::Instruction(instruction),
-            })
+        self.blocks[block].items.iter_mut().map(|item| match item {
+            Item::Label(_) => ItemMut::Label,
+            Item::Instruction(instruction) => ItemMut::Instruction(instruction),
+        })
     }
 
     /// Fuses non-overlapping adjacent instruction pairs without exposing labels.
@@ -728,7 +728,7 @@ impl BlockGraph {
         block: BasicBlockId,
         fuse: impl FnMut(&Instruction, &Instruction) -> Option<Instruction>,
     ) {
-        fuse_adjacent_instructions(&mut self.blocks[block.index()].items, fuse);
+        fuse_adjacent_instructions(&mut self.blocks[block].items, fuse);
     }
 
     fn validate_order(&self, order: &[BasicBlockId]) -> Result<(), String> {
@@ -763,7 +763,8 @@ impl BlockGraph {
         let original = std::mem::take(&mut self.blocks);
         let reachable_len = reachable.as_ref().map(|reachable| reachable.len());
         debug_assert!(reachable_len.is_none_or(|len| len == original.len()));
-        let mut blocks: Vec<BasicBlock> = Vec::with_capacity(original.len());
+        let mut blocks: IndexVec<BasicBlockId, BasicBlock> =
+            IndexVec::with_capacity(original.len());
         for (index, mut block) in original.into_iter().enumerate() {
             if blocks.last().is_some_and(|previous| {
                 previous
@@ -817,7 +818,7 @@ impl BlockGraph {
     pub(super) fn for_each_instruction_mut(&mut self, mut visit: impl FnMut(&mut Instruction)) {
         let blocks = &mut self.blocks;
         for block in self.order.iter().copied() {
-            for item in &mut blocks[block.index()].items {
+            for item in &mut blocks[block].items {
                 if let Item::Instruction(instruction) = item {
                     visit(instruction);
                 }
@@ -829,7 +830,7 @@ impl BlockGraph {
         &mut self,
         block: BasicBlockId,
     ) -> impl DoubleEndedIterator<Item = &mut Instruction> {
-        self.blocks[block.index()]
+        self.blocks[block]
             .items
             .iter_mut()
             .filter_map(|item| match item {
@@ -844,7 +845,7 @@ impl BlockGraph {
     ) {
         let blocks = &mut self.blocks;
         for block in self.order.iter().copied() {
-            let items = &mut blocks[block.index()].items;
+            let items = &mut blocks[block].items;
             for index in 0..items.len().saturating_sub(1) {
                 let (before, after) = items.split_at_mut(index + 1);
                 if let (Item::Instruction(first), Item::Instruction(second)) =
@@ -906,7 +907,7 @@ impl BlockGraph {
     }
 
     pub(super) fn instruction_mut(&mut self, position: ItemPosition) -> Option<&mut Instruction> {
-        match &mut self.blocks[position.block.index()].items[position.offset] {
+        match &mut self.blocks[position.block].items[position.offset] {
             Item::Instruction(instruction) => Some(instruction),
             Item::Label(_) => None,
         }
@@ -927,7 +928,7 @@ impl BlockGraph {
         if let Item::Label(label) = item {
             self.bind_label(label, position.block);
         }
-        self.blocks[position.block.index()]
+        self.blocks[position.block]
             .items
             .insert(position.offset, item);
     }
@@ -1055,15 +1056,19 @@ impl BlockGraph {
     pub(super) fn into_items(mut self) -> Vec<Item> {
         match self.order.as_slice() {
             [] => return Vec::new(),
-            [block] => return std::mem::take(&mut self.blocks[block.index()].items),
+            [block] => return std::mem::take(&mut self.blocks[*block].items),
             _ => {}
         }
-        let mut blocks = self.blocks.into_iter().map(Some).collect::<Vec<_>>();
+        let mut blocks = self
+            .blocks
+            .into_iter()
+            .map(Some)
+            .collect::<IndexVec<BasicBlockId, _>>();
         let item_count = self
             .order
             .iter()
             .map(|block| {
-                blocks[block.index()]
+                blocks[*block]
                     .as_ref()
                     .expect("block appears more than once in emission order")
                     .items
@@ -1073,7 +1078,7 @@ impl BlockGraph {
         let mut items = Vec::with_capacity(item_count);
         for block in self.order {
             items.append(
-                &mut blocks[block.index()]
+                &mut blocks[block]
                     .take()
                     .expect("block appears more than once in emission order")
                     .items,
@@ -1087,7 +1092,7 @@ impl BlockGraph {
         self.validate_order(&self.order)?;
         let mut labels = Vec::new();
         for block in self.order.iter().copied() {
-            let contents = &self.blocks[block.index()];
+            let contents = &self.blocks[block];
             if contents.items.is_empty() {
                 return Err(format!("block {} is empty", block.index()));
             }
@@ -1121,7 +1126,7 @@ impl Index<BasicBlockId> for BlockGraph {
     type Output = BasicBlock;
 
     fn index(&self, index: BasicBlockId) -> &Self::Output {
-        &self.blocks[index.index()]
+        &self.blocks[index]
     }
 }
 
@@ -1524,7 +1529,7 @@ mod tests {
         let first_label = Label::from_u32(0);
         let second_label = Label::from_u32(1);
         let mut graph = BlockGraph {
-            blocks: Vec::new(),
+            blocks: IndexVec::new(),
             order: Vec::new(),
             label_blocks: Vec::new(),
             features: PipelineFeatures::default(),
@@ -1577,7 +1582,7 @@ mod tests {
                 normalized_segment_lengths(&items, items.len(), &boundaries);
             for split_mask in 0..(1 << (items.len() - 1)) {
                 let mut graph = BlockGraph {
-                    blocks: Vec::new(),
+                    blocks: IndexVec::new(),
                     order: Vec::new(),
                     label_blocks: Vec::new(),
                     features: PipelineFeatures::default(),
