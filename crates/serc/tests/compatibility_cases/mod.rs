@@ -749,3 +749,5 @@ mod match_failure_loop_backedge;
 mod match_store_fusion;
 
 mod copied_match_guard_subject;
+
+mod shared_handler_cleanup_copies;

@@ -22704,7 +22704,31 @@ impl Compiler<'_> {
             let handler_has_named_while_break_join = handler.name.is_some()
                 && matches!(handler.body.last(), Some(Stmt::While(tail)) if tail.orelse.is_empty())
                 && self.assembler.defer_original_while_break_cleanup_edges();
+            // The false operands alone enter this original cleanup. Its normal
+            // finalizer suffix reaches the loop eval check; the exceptional copy
+            // reaches RERAISE. Keep the omitted POP_BLOCK and later copied jumps
+            // on the existing unlocated-array path until each edge gets its donor.
+            let handler_has_finalizer_false_join = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && handler.name.is_none()
+                && !terminal
+                && loop_tail.is_none()
+                && self.control.in_loop()
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    == CO_COROUTINE
+                && self.control.finally.active_copied_finally_bodies == 0
+                && (self.control.finally.active_normal_finally_bodies > 0
+                    || self.control.finally.active_finally_end_blocks > 0)
+                && matches!(handler.body.as_slice(), [Stmt::If(tail)]
+                    if tail.elif_else_clauses.is_empty()
+                        && condition_has_linear_runtime_leaves(&tail.test)
+                        && !expression_suspends_current_scope(&tail.test)
+                        && condition_jump_target_count(&tail.test, false) > 1
+                        && matches!(tail.body.as_slice(), [Stmt::Raise(raised)]
+                            if raised.exc.is_none() && raised.cause.is_none()))
+                && self.assembler.at_original_jump_only_conditional_join();
             let handler_ends_with_inlineable_cleanup = handler_ends_with_preordered_cleanup
+                || handler_has_finalizer_false_join
                 || handler_has_guarded_finally_cleanup
                 || coroutine_guarded_finally_cleanup
                 || handler_has_named_while_break_join
@@ -24490,13 +24514,23 @@ impl Compiler<'_> {
                         && condition_has_linear_runtime_leaves(&tail.test)
                         && if_normal_exit_count(tail) > 1
             );
-            if inline_join_cleanup || shared_conditional_cleanup {
+            // A nested manager or comprehension can finish before the final
+            // body donor. The actual empty conditional join, not that earlier
+            // work, determines whether this named cleanup needs private copies.
+            let shared_original_cleanup = self.context.python_version
+                >= crate::PythonVersion::Py313
+                && matches!(body.last(), Some(Stmt::If(tail))
+                    if tail.elif_else_clauses.is_empty()
+                        && condition_has_linear_runtime_leaves(&tail.test)
+                        && !expression_suspends_current_scope(&tail.test))
+                && self.assembler.at_original_shared_conditional_join();
+            if inline_join_cleanup || shared_conditional_cleanup || shared_original_cleanup {
                 self.assembler.record_unlocated_cleanup_targets();
             }
             exclusions.push(self.emit_terminal_exception_handler_action(
                 name,
                 handler_depth,
-                if inline_join_cleanup || shared_conditional_cleanup {
+                if inline_join_cleanup || shared_conditional_cleanup || shared_original_cleanup {
                     SourceLocation::NONE
                 } else {
                     action_location
