@@ -5221,6 +5221,8 @@ fn preserves_copied_pass_recovery_borrow_fallthrough_and_independent_jumps() {
 
 #[test]
 fn borrows_through_named_plain_companions_of_guarded_handlers() {
+    use std::fmt::Write as _;
+
     for (name_plain, name_guard) in [(false, false), (true, true), (false, true), (true, false)] {
         for guard_index in 0..3 {
             for cleanup in [
@@ -5237,15 +5239,15 @@ fn borrows_through_named_plain_companions_of_guarded_handlers() {
                     } else {
                         "consume(value)\n"
                     };
-                    recovery.push_str(&format!(
+                    write!(
+                        recovery,
                         "except Error{index}{name}:\n{}",
                         indent_finally_borrow_case(body),
-                    ));
+                    )
+                    .unwrap();
                 }
-                recovery.push_str(&format!(
-                    "finally:\n{}",
-                    indent_finally_borrow_case(cleanup)
-                ));
+                recovery.push_str("finally:\n");
+                recovery.push_str(&indent_finally_borrow_case(cleanup));
                 let source = format!(
                     "def function(owner, flag, value, marker):\n{}    return value\n",
                     indent_finally_borrow_case(&recovery),
