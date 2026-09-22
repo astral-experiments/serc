@@ -454,8 +454,7 @@ impl Compiler<'_> {
         terminal: bool,
     ) -> Result<(), CompileError> {
         let base_depth = self.control.stack.depth;
-        let match_has_following =
-            !terminal && self.control.statements.current_statement_has_following;
+        let match_has_following = !terminal && self.control.statements.context.has_following;
         if self.context.python_version >= PythonVersion::Py314
             && matches!(statement.subject.as_ref(), Expr::Tuple(_))
             && let Some(constant) =
@@ -923,6 +922,7 @@ impl Compiler<'_> {
                                 && !(self
                                     .control
                                     .statements
+                                    .context
                                     .match_successor_fills_small_exit_copy_budget
                                     && match_case_has_nested_jump_predecessor(
                                         tail,
@@ -6903,10 +6903,7 @@ impl Compiler<'_> {
                 .control
                 .current_try_handler_starts_with_optimized_boolean_generator()
                 && matches!(expression.test.as_ref(), Expr::Name(_)))
-            || (self
-                .control
-                .statements
-                .current_statement_preceded_by_terminating_if
+            || (self.control.statements.context.preceded_by_terminating_if
                 && self.control.stack.depth == 2
                 && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                 && self.control.withs.active_with_region_exclusions.len() == 1
@@ -7487,11 +7484,8 @@ impl Compiler<'_> {
                 && operand_index == 0
                 && !nested_leading_group
                 && self.control.in_synchronous_with()
-                && (self.control.statements.current_statement_preceded_by_try
-                    || (self
-                        .control
-                        .statements
-                        .current_statement_preceded_by_terminating_if
+                && (self.control.statements.context.preceded_by_try
+                    || (self.control.statements.context.preceded_by_terminating_if
                         && self
                             .control
                             .exceptions
@@ -7513,19 +7507,22 @@ impl Compiler<'_> {
                 && self
                     .control
                     .statements
-                    .current_statement_follows_sync_with_nonterminal_join;
+                    .context
+                    .follows_sync_with_nonterminal_join;
             let follows_sync_with_return_join = operand_index == 0
                 && (!self
                     .control
                     .statements
-                    .current_statement_follows_sync_with_return_join_after_gap
+                    .context
+                    .follows_sync_with_return_join_after_gap
                     || expression.values.len() == 2)
                 && !nested_leading_group
                 && self.control.in_synchronous_with()
                 && self
                     .control
                     .statements
-                    .current_statement_follows_sync_with_return_join
+                    .context
+                    .follows_sync_with_return_join
                 && (self
                     .control
                     .exceptions
@@ -7534,7 +7531,8 @@ impl Compiler<'_> {
                     || (!self
                         .control
                         .statements
-                        .current_statement_follows_sync_with_return_join_after_gap
+                        .context
+                        .follows_sync_with_return_join_after_gap
                         && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR)
                             == 0
                         && !self.control.in_synchronous_with_nested_exception_region()))
@@ -7557,16 +7555,18 @@ impl Compiler<'_> {
                     .active_comprehension_region_exclusions
                     .is_empty()
                 && !self.control.in_loop()
-                && !self.control.statements.current_statement_has_following
-                && !self.control.statements.inherited_statement_has_following
+                && !self.control.statements.context.has_following
+                && !self.control.statements.context.inherited_has_following
                 && !self
                     .control
                     .statements
-                    .current_statement_follows_sync_with_return_join
+                    .context
+                    .follows_sync_with_return_join
                 && !self
                     .control
                     .statements
-                    .current_statement_follows_sync_with_nonterminal_join
+                    .context
+                    .follows_sync_with_nonterminal_join
                 && self
                     .control
                     .statements
@@ -7697,7 +7697,7 @@ impl Compiler<'_> {
                 && self.control.has_with_suspension_epoch(suspension_epoch);
             let named_exception_handler = self.control.current_exception_handler_binds_name();
             let exclude_nested_handler_boolean = self.control.in_exception_handler()
-                && self.control.statements.inherited_statement_has_following
+                && self.control.statements.context.inherited_has_following
                 && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
                 && self
                     .control
