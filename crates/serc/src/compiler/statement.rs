@@ -519,8 +519,8 @@ pub(super) struct ConditionState {
     // Source-proven conditions can reuse slots removed while lowering the condition itself.
     pub(super) allow_compacted_condition_owner: bool,
     pub(super) include_assert_none_condition_owner: bool,
-    // Folded success edges are conditional during native small-exit copying.
-    pub(super) uncopied_assertion_success: Option<Label>,
+    // Folded assertion-condition exits are conditional during native small-exit copying.
+    pub(super) uncopied_assertion_condition_target: Option<Label>,
     // Protected multi-branch chains and None-condition tuple branches relocate their source
     // jump; the final else assertion cannot reuse the stale owner slot.
     suppress_else_assert_none_condition_owner: bool,
@@ -18221,7 +18221,7 @@ impl Compiler<'_> {
             );
             self.assembler.mark_assertion_side_exit_candidate();
             self.with_control_override(
-                |control| &mut control.conditions.uncopied_assertion_success,
+                |control| &mut control.conditions.uncopied_assertion_condition_target,
                 Some(end),
                 |compiler| compiler.compile_linear_assert_condition(&statement.test, end),
             )?;

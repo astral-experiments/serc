@@ -8330,10 +8330,10 @@ impl Compiler<'_> {
                 if matches!(
                     self.context.python_version,
                     PythonVersion::Py314 | PythonVersion::Py315
-                ) && self.control.conditions.uncopied_assertion_success == Some(label)
+                ) && self.control.conditions.uncopied_assertion_condition_target == Some(label)
                 {
                     // This edge becomes unconditional only after CPython's early
-                    // copy pass; a located assertion continuation stays shared.
+                    // copy pass; a located assertion-condition target stays shared.
                     self.assembler.prevent_jump_inlining(exit);
                 }
             } else {
@@ -8413,24 +8413,40 @@ impl Compiler<'_> {
                 super::legacy_native_labels::NativeRole::ConditionBoolEnd(boolean.range),
                 end,
             );
-            for (operand_index, value) in leading.iter().enumerate() {
-                if defer_terminal_with_exclusion {
-                    self.with_control_override(
-                        |control| &mut control.conditions.exclude_terminal_if_not_taken,
-                        false,
-                        |compiler| compiler.compile_jump_if(value, !jump_on, end),
-                    )?;
-                } else {
-                    self.compile_jump_if(value, !jump_on, end)?;
-                }
-                if jump_constant_truthiness(value) == Some(matches!(boolean.op, BoolOp::Or)) {
-                    self.assembler.record_folded_condition_borrow_entry(end);
-                }
-                if preserve_leading_protected_loop_owner && operand_index == 0 {
-                    self.assembler.preserve_last_not_taken_exception_owner();
-                }
-                self.assembler.record_short_circuit_owner_continuation();
-            }
+            // Native sends these leading operands to a new Boolean join. Their
+            // folded exits remain conditional during early copying, just like
+            // exits to the outer assertion target. Preserve unrelated targets.
+            let leading_assertion_target =
+                match self.control.conditions.uncopied_assertion_condition_target {
+                    Some(target) if target == label => Some(end),
+                    target => target,
+                };
+            self.with_control_override(
+                |control| &mut control.conditions.uncopied_assertion_condition_target,
+                leading_assertion_target,
+                |compiler| {
+                    for (operand_index, value) in leading.iter().enumerate() {
+                        if defer_terminal_with_exclusion {
+                            compiler.with_control_override(
+                                |control| &mut control.conditions.exclude_terminal_if_not_taken,
+                                false,
+                                |compiler| compiler.compile_jump_if(value, !jump_on, end),
+                            )?;
+                        } else {
+                            compiler.compile_jump_if(value, !jump_on, end)?;
+                        }
+                        if jump_constant_truthiness(value) == Some(matches!(boolean.op, BoolOp::Or))
+                        {
+                            compiler.assembler.record_folded_condition_borrow_entry(end);
+                        }
+                        if preserve_leading_protected_loop_owner && operand_index == 0 {
+                            compiler.assembler.preserve_last_not_taken_exception_owner();
+                        }
+                        compiler.assembler.record_short_circuit_owner_continuation();
+                    }
+                    Ok(())
+                },
+            )?;
             self.compile_jump_if(last, jump_on, label)?;
             // The final operand may already end at a pending join label. Keep
             // those labels in one block so small return copies see its body.
