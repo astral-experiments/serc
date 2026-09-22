@@ -38,9 +38,9 @@ use crate::target::{Opcode, is_scope_exit};
 use crate::{CompileError, PythonVersion};
 
 use super::constant::{
-    PercentFormatPart, big_integer_digits, constant_slice, explicit_surrogate_string,
-    first_literal_constant, fold_constant, folded_bool_operand, folded_constant_owner_slots,
-    optimized_percent_format, python_constant_values_equal, two_element_slice_optimization,
+    PercentFormatPart, big_integer_digits, explicit_surrogate_string, first_literal_constant,
+    fold_constant, folded_bool_operand, folded_constant_owner_slots, optimized_percent_format,
+    python_constant_values_equal, two_element_slice_optimization,
 };
 use super::scope::{
     LoweringFunctionPlan, NameId, NameSet, analyze_lambda_scope,
@@ -2159,7 +2159,7 @@ impl Compiler<'_> {
                     let slice_location = self.source_location(slice.range);
                     let subscript_location = self.source_location(subscript.range);
                     if self.context.python_version >= PythonVersion::Py314
-                        && let Some(constant) = constant_slice(slice)
+                        && let Some(constant) = self.source_aware_constant_slice(slice)
                     {
                         let index = self.add_constant(constant)?;
                         self.assembler.set_location(slice_location);
@@ -6531,7 +6531,7 @@ impl Compiler<'_> {
     fn compile_slice(&mut self, slice: &ruff_python_ast::ExprSlice) -> Result<(), CompileError> {
         let slice_location = self.source_location(slice.range);
         if self.context.python_version >= PythonVersion::Py314
-            && let Some(constant) = constant_slice(slice)
+            && let Some(constant) = self.source_aware_constant_slice(slice)
         {
             let index = self.add_constant(constant)?;
             self.assembler.set_location(slice_location);

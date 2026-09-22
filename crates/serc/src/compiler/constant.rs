@@ -675,7 +675,7 @@ impl Compiler<'_> {
                 if self.context.python_version <= PythonVersion::Py313 {
                     self.record_folded_value(&subscript.slice)?;
                 } else if let Expr::Slice(slice) = subscript.slice.as_ref() {
-                    if let Some(constant) = constant_slice(slice) {
+                    if let Some(constant) = self.source_aware_constant_slice(slice) {
                         self.add_constant(constant)?;
                     } else {
                         for bound in [slice.lower.as_deref(), slice.upper.as_deref()]
@@ -701,17 +701,20 @@ impl Compiler<'_> {
         let operands: Vec<_> = match expression {
             Expr::BinOp(binary) => [&*binary.left, &*binary.right]
                 .into_iter()
-                .filter_map(fold_constant)
+                .filter_map(|value| self.source_aware_fold_constant(value))
                 .collect(),
-            Expr::UnaryOp(unary) => fold_constant(&unary.operand).into_iter().collect(),
+            Expr::UnaryOp(unary) => self
+                .source_aware_fold_constant(&unary.operand)
+                .into_iter()
+                .collect(),
             Expr::Subscript(subscript) => [&*subscript.value, &*subscript.slice]
                 .into_iter()
-                .filter_map(fold_constant)
+                .filter_map(|value| self.source_aware_fold_constant(value))
                 .collect(),
             _ => Vec::new(),
         };
         if !operands.is_empty()
-            && let Some(result) = fold_constant(expression)
+            && let Some(result) = self.source_aware_fold_constant(expression)
         {
             self.record_folded_constant_dependencies(&result, operands);
         }
@@ -852,7 +855,7 @@ impl Compiler<'_> {
         }
         if self.context.python_version >= PythonVersion::Py314
             && matches!(expression, Expr::Slice(_))
-            && let Some(constant) = fold_constant(expression)
+            && let Some(constant) = self.source_aware_fold_constant(expression)
         {
             self.add_constant(constant)?;
             return Ok(());
@@ -862,7 +865,7 @@ impl Compiler<'_> {
             return Ok(());
         }
         if let Expr::FString(fstring) = expression
-            && fold_constant(expression).is_some()
+            && self.source_aware_fold_constant(expression).is_some()
         {
             let constant = match super::expression::fstring_components(fstring, self.context.source)
                 .into_iter()
@@ -902,7 +905,7 @@ impl Compiler<'_> {
         }
 
         self.record_folded_operands(expression)?;
-        if let Some(constant) = fold_constant(expression)
+        if let Some(constant) = self.source_aware_fold_constant(expression)
             && !matches!(constant, Constant::Int(value) if u8::try_from(value).is_ok())
         {
             self.output.deferred_constants.push((None, constant));
@@ -1655,12 +1658,20 @@ fn parse_percent_format(
     Some((conversion, (!format_spec.is_empty()).then_some(format_spec)))
 }
 
+pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
+    fold_constant_with_literals(expression, &literal_constant)
+}
+
+/// Folds the same expression shapes using source-aware literal values when supplied.
 #[expect(
     clippy::cast_precision_loss,
     reason = "CPython mixed integer/float folding rounds integer operands to binary64"
 )]
-pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
-    if let Some(constant) = literal_constant(expression) {
+pub(super) fn fold_constant_with_literals(
+    expression: &Expr,
+    literal: &impl Fn(&Expr) -> Option<Constant>,
+) -> Option<Constant> {
+    if let Some(constant) = literal(expression) {
         return Some(constant);
     }
     let result = match expression {
@@ -1687,15 +1698,15 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
         Expr::Tuple(tuple) if tuple.ctx == ExprContext::Load => tuple
             .elts
             .iter()
-            .map(fold_constant)
+            .map(|value| fold_constant_with_literals(value, literal))
             .collect::<Option<Vec<_>>>()
             .map(Constant::Tuple),
         Expr::Subscript(subscript) if subscript.ctx == ExprContext::Load => {
-            fold_literal_subscript(&subscript.value, &subscript.slice)
+            fold_literal_subscript(&subscript.value, &subscript.slice, literal)
         }
-        Expr::Slice(slice) => constant_slice(slice),
+        Expr::Slice(slice) => constant_slice_with_literals(slice, literal),
         Expr::UnaryOp(unary) => match unary.op {
-            UnaryOp::UAdd => match fold_constant(&unary.operand)? {
+            UnaryOp::UAdd => match fold_constant_with_literals(&unary.operand, literal)? {
                 Constant::Bool(value) => Some(Constant::Int(u64::from(value))),
                 constant @ (Constant::Int(_)
                 | Constant::SignedInt(_)
@@ -1707,15 +1718,15 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
             },
             UnaryOp::Not => {
                 if matches!(unary.operand.as_ref(), Expr::Tuple(_)) {
-                    fold_constant(&unary.operand)?;
+                    fold_constant_with_literals(&unary.operand, literal)?;
                 }
                 literal_truthiness(&unary.operand).map(|value| Constant::Bool(!value))
             }
-            UnaryOp::USub => fold_constant(&unary.operand)?
+            UnaryOp::USub => fold_constant_with_literals(&unary.operand, literal)?
                 .into_numeric_value()
                 .negated(),
             UnaryOp::Invert => {
-                let operand = fold_constant(&unary.operand)?;
+                let operand = fold_constant_with_literals(&unary.operand, literal)?;
                 // CPython leaves boolean inversion at runtime for its deprecation warning.
                 if matches!(operand, Constant::Bool(_)) {
                     return None;
@@ -1731,8 +1742,8 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
             }
         },
         Expr::BinOp(binary) => {
-            let left = fold_constant(&binary.left)?.into_numeric_value();
-            let right = fold_constant(&binary.right)?.into_numeric_value();
+            let left = fold_constant_with_literals(&binary.left, literal)?.into_numeric_value();
+            let right = fold_constant_with_literals(&binary.right, literal)?.into_numeric_value();
             match (left, binary.op, right) {
                 (left, operator @ (Operator::Add | Operator::Sub | Operator::Mult), right)
                     if is_integer_constant(&left) && is_integer_constant(&right) =>
@@ -1865,6 +1876,23 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                     left.push_str(&right);
                     Some(Constant::String(left))
                 }
+                (Constant::SurrogateString(mut left), Operator::Add, Constant::String(right)) => {
+                    left.extend_from_slice(right.as_bytes());
+                    Some(Constant::SurrogateString(left))
+                }
+                (Constant::String(left), Operator::Add, Constant::SurrogateString(right)) => {
+                    let mut bytes = left.into_bytes();
+                    bytes.extend(right);
+                    Some(Constant::SurrogateString(bytes))
+                }
+                (
+                    Constant::SurrogateString(mut left),
+                    Operator::Add,
+                    Constant::SurrogateString(right),
+                ) => {
+                    left.extend(right);
+                    Some(Constant::SurrogateString(left))
+                }
                 (Constant::Bytes(mut left), Operator::Add, Constant::Bytes(right)) => {
                     left.extend(right);
                     Some(Constant::Bytes(left))
@@ -1881,6 +1909,15 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                     };
                     let times = usize::try_from(times).ok()?;
                     (times <= max_times).then(|| Constant::String(value.repeat(times)))
+                }
+                (Constant::SurrogateString(value), Operator::Mult, Constant::Int(times))
+                | (Constant::Int(times), Operator::Mult, Constant::SurrogateString(value)) => {
+                    let length = value.iter().filter(|byte| **byte & 0xc0 != 0x80).count();
+                    let Some(max_times) = 4096_usize.checked_div(length) else {
+                        return Some(Constant::String(String::new()));
+                    };
+                    let times = usize::try_from(times).ok()?;
+                    (times <= max_times).then(|| surrogate_string_constant(value.repeat(times)))
                 }
                 (Constant::Bytes(value), Operator::Mult, Constant::Int(times))
                 | (Constant::Int(times), Operator::Mult, Constant::Bytes(value)) => {
@@ -2485,7 +2522,11 @@ fn integer_constant(negative: bool, digits: Vec<u16>) -> Constant {
     Constant::BigInt { negative, digits }
 }
 
-fn fold_literal_subscript(value: &Expr, index: &Expr) -> Option<Constant> {
+fn fold_literal_subscript(
+    value: &Expr,
+    index: &Expr,
+    literal: &impl Fn(&Expr) -> Option<Constant>,
+) -> Option<Constant> {
     fn integer(expression: &Expr) -> Option<usize> {
         match fold_constant(expression)? {
             Constant::Bool(value) => Some(usize::from(value)),
@@ -2517,7 +2558,7 @@ fn fold_literal_subscript(value: &Expr, index: &Expr) -> Option<Constant> {
         Some((lower.min(upper)..upper).step_by(step).collect())
     }
 
-    let value = fold_constant(value)?;
+    let value = fold_constant_with_literals(value, literal)?;
     if !matches!(index, Expr::Slice(_)) {
         let index = match fold_constant(index)? {
             Constant::Bool(value) => i128::from(u8::from(value)),
@@ -2527,6 +2568,9 @@ fn fold_literal_subscript(value: &Expr, index: &Expr) -> Option<Constant> {
         };
         let length = match &value {
             Constant::String(value) => value.chars().count(),
+            Constant::SurrogateString(value) => {
+                value.iter().filter(|byte| **byte & 0xc0 != 0x80).count()
+            }
             Constant::Bytes(value) => value.len(),
             Constant::Tuple(value) => value.len(),
             _ => return None,
@@ -2544,6 +2588,9 @@ fn fold_literal_subscript(value: &Expr, index: &Expr) -> Option<Constant> {
                 .chars()
                 .nth(index)
                 .map(|character| Constant::String(character.to_string())),
+            Constant::SurrogateString(value) => Some(surrogate_string_constant(
+                surrogate_characters(&value)[index].to_vec(),
+            )),
             Constant::Bytes(value) => Some(Constant::Int(u64::from(value[index]))),
             Constant::Tuple(value) => Some(value[index].clone()),
             _ => None,
@@ -2567,6 +2614,15 @@ fn fold_literal_subscript(value: &Expr, index: &Expr) -> Option<Constant> {
                     .collect(),
             ))
         }
+        Constant::SurrogateString(value) => {
+            let characters = surrogate_characters(&value);
+            Some(surrogate_string_constant(
+                indices(slice, characters.len())?
+                    .into_iter()
+                    .flat_map(|index| characters[index].iter().copied())
+                    .collect(),
+            ))
+        }
         Constant::Bytes(value) => Some(Constant::Bytes(
             indices(slice, value.len())?
                 .into_iter()
@@ -2580,6 +2636,28 @@ fn fold_literal_subscript(value: &Expr, index: &Expr) -> Option<Constant> {
                 .collect(),
         )),
         _ => None,
+    }
+}
+
+/// Splits surrogate-pass UTF-8 at code-point boundaries, including lone surrogates.
+fn surrogate_characters(value: &[u8]) -> Vec<&[u8]> {
+    let mut starts: Vec<_> = value
+        .iter()
+        .enumerate()
+        .filter_map(|(index, byte)| (*byte & 0xc0 != 0x80).then_some(index))
+        .collect();
+    starts.push(value.len());
+    starts
+        .windows(2)
+        .map(|pair| &value[pair[0]..pair[1]])
+        .collect()
+}
+
+/// Recovers ordinary string identity when a fold removes every surrogate code point.
+fn surrogate_string_constant(value: Vec<u8>) -> Constant {
+    match String::from_utf8(value) {
+        Ok(value) => Constant::String(value),
+        Err(error) => Constant::SurrogateString(error.into_bytes()),
     }
 }
 
@@ -2796,9 +2874,20 @@ pub(super) fn constant_truthiness(constant: &Constant) -> bool {
 }
 
 pub(super) fn constant_slice(slice: &ruff_python_ast::ExprSlice) -> Option<Constant> {
-    fn bound(expression: Option<&Expr>) -> Option<Constant> {
-        expression.map_or(Some(Constant::None), literal_constant)
-    }
+    constant_slice_with_literals(slice, &literal_constant)
+}
+
+pub(super) fn constant_slice_with_literals(
+    slice: &ruff_python_ast::ExprSlice,
+    literal: &impl Fn(&Expr) -> Option<Constant>,
+) -> Option<Constant> {
+    let bound = |expression: Option<&Expr>| {
+        expression.map_or(Some(Constant::None), |expression| {
+            // CPython admits only literal bounds to this early slice optimization.
+            literal_constant(expression)?;
+            literal(expression)
+        })
+    };
 
     Some(Constant::Slice {
         lower: Box::new(bound(slice.lower.as_deref())?),
@@ -3425,7 +3514,7 @@ fn first_constant(
             }
             if let Expr::Slice(slice) = expression {
                 if self.compiler.context.python_version >= PythonVersion::Py314
-                    && let Some(constant) = constant_slice(slice)
+                    && let Some(constant) = self.compiler.source_aware_constant_slice(slice)
                 {
                     self.constant = Some(constant);
                 } else {

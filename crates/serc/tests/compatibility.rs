@@ -12608,6 +12608,50 @@ def nested():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_source_aware_surrogate_folds() {
+        for source in [
+            r#"value = "\ud800"[0]"#,
+            r#"value = "\ud800x"[-1]"#,
+            r#"value = "a\ud800b\udfff"[1:4:2]"#,
+            r#"value = "a\ud800b"[:1]"#,
+            r#"value = "\ud800"[:0]"#,
+            r#"value = ("\ud800",)[0]"#,
+            r#"value = ("\ud800", "x")[:1]"#,
+            r#"value = ("\ud800",) + ("x",)"#,
+            r#"value = ("\ud800",) * 2"#,
+            r#"value = 2 * (("\ud800",),)"#,
+            r#"value = (f"\ud800",)"#,
+            r#"value = f"\ud800" + "x""#,
+            r#"value = (f"\ud800" f"\udfff")[1]"#,
+            r#"value = (rf"\ud800" f"\udfff")[-1]"#,
+            r#"value = item["\ud800":]"#,
+            r#"value = item[:"\ud800":]"#,
+            r#"value = item[::"\ud800"]"#,
+            r#"value = item[r"\ud800" "\udfff":]"#,
+            r#"item["\ud800":] = value"#,
+            r#"del item["\ud800":]"#,
+        ] {
+            assert_matches_cpython_marshal(source, "surrogate_folds.py");
+        }
+    }
+
+    #[test]
+    fn executes_source_aware_surrogate_folds() {
+        assert_executes(
+            r#"class Echo:
+    def __getitem__(self, key):
+        return key
+
+print(ord("\ud800"[0]))
+print(ord((("\ud800",) * 2)[1]))
+print(ord((f"\ud800" + "x")[0]))
+print(ord(Echo()["\ud800":].start))
+"#,
+            "55296\n55296\n55296\n55296\n",
+        );
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_surrogate_fstring_literal_segments() {
         let source = r#"def regular(first, second):
     return f"\ud83d{first}\udc0d{second}\udfff"

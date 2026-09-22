@@ -17,7 +17,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::assembler::SourceLocation;
 use crate::code_object::{CodeInterningSummary, CodeObject, CompilationInterningEvent, Constant};
 
-use super::constant::{explicit_surrogate_string, fold_constant, is_literal_constant};
+use super::constant::{
+    constant_slice_with_literals, explicit_surrogate_string, fold_constant,
+    fold_constant_with_literals, is_literal_constant, literal_constant,
+};
 use super::scope::{ModulePlan, ScopeArena};
 use super::symbol::mangle_name;
 use super::{CachedSourceLine, Compiler};
@@ -981,92 +984,81 @@ impl Compiler<'_> {
 
     /// Folds constants while preserving surrogate escapes that Ruff represents as U+FFFD.
     pub(super) fn source_aware_fold_constant(&self, expression: &Expr) -> Option<Constant> {
-        #[derive(Default)]
-        struct RequiresRuntimeConstruction(bool);
+        struct RequiresRuntimeConstruction {
+            python_version: crate::PythonVersion,
+            found: bool,
+        }
 
         impl<'a> Visitor<'a> for RequiresRuntimeConstruction {
             fn visit_expr(&mut self, expression: &'a Expr) {
-                if matches!(expression, Expr::Slice(_) | Expr::FString(_)) {
-                    self.0 = true;
-                } else if !self.0 {
+                let requires_runtime = if self.python_version <= crate::PythonVersion::Py313 {
+                    // The AST optimizer leaves slices and joined strings at runtime.
+                    matches!(expression, Expr::Slice(_) | Expr::FString(_))
+                } else {
+                    // BUILD_TUPLE folds after TO_BOOL, so UNARY_NOT still consumes
+                    // a runtime Boolean, including inside a larger constant expression.
+                    matches!(expression, Expr::UnaryOp(unary)
+                        if unary.op == ruff_python_ast::UnaryOp::Not
+                            && matches!(unary.operand.as_ref(), Expr::Tuple(_)))
+                };
+                if requires_runtime {
+                    self.found = true;
+                } else if !self.found {
                     walk_expr(self, expression);
                 }
             }
         }
 
-        if !self.has_deferred_annotations() {
-            // The legacy AST optimizer keeps slices and joined strings as runtime
-            // expressions, including when nested inside an otherwise constant value.
-            let mut runtime = RequiresRuntimeConstruction::default();
-            runtime.visit_expr(expression);
-            if runtime.0 {
-                return None;
-            }
-            if let Expr::UnaryOp(unary) = expression
-                && unary.op == ruff_python_ast::UnaryOp::Invert
-                && let Some(Constant::Bool(value)) = fold_constant(&unary.operand)
-            {
-                return Some(Constant::SignedInt(-i64::from(value) - 1));
-            }
+        // A literal callback returning None permits generic folding. Reject runtime
+        // expressions before recursive folding so nested occurrences cannot fall back.
+        let mut runtime = RequiresRuntimeConstruction {
+            python_version: self.context.python_version,
+            found: false,
+        };
+        runtime.visit_expr(expression);
+        if runtime.found {
+            return None;
         }
-        match expression {
-            // BUILD_TUPLE becomes LOAD_CONST after the pass that folds TO_BOOL.
-            // The following UNARY_NOT therefore still consumes a runtime Boolean.
+        fold_constant_with_literals(expression, &|expression| match expression {
             Expr::UnaryOp(unary)
-                if self.context.python_version >= crate::PythonVersion::Py314
-                    && unary.op == ruff_python_ast::UnaryOp::Not
-                    && matches!(unary.operand.as_ref(), Expr::Tuple(_)) =>
+                if !self.has_deferred_annotations()
+                    && unary.op == ruff_python_ast::UnaryOp::Invert =>
             {
+                if let Some(Constant::Bool(value)) = fold_constant(&unary.operand) {
+                    return Some(Constant::SignedInt(-i64::from(value) - 1));
+                }
                 None
             }
+
             Expr::StringLiteral(string) => Some(self.string_literal_constant(string)),
-            Expr::Tuple(tuple) if tuple.ctx == ExprContext::Load => tuple
-                .elts
-                .iter()
-                .map(|element| self.source_aware_fold_constant(element))
-                .collect::<Option<Vec<_>>>()
-                .map(Constant::Tuple),
-            Expr::BinOp(binary) if matches!(binary.op, Operator::Add | Operator::Mult) => {
-                let folded = fold_constant(expression)?;
-                if !matches!(&folded, Constant::String(value) if value.contains('\u{fffd}')) {
-                    return Some(folded);
-                }
-                let left = self.source_aware_fold_constant(&binary.left)?;
-                let right = self.source_aware_fold_constant(&binary.right)?;
-                match (left, binary.op, right) {
-                    (
-                        Constant::SurrogateString(mut left),
-                        Operator::Add,
-                        Constant::String(right),
-                    ) => {
-                        left.extend_from_slice(right.as_bytes());
-                        Some(Constant::SurrogateString(left))
+            Expr::FString(fstring) => {
+                // Preserve the existing literal-only f-string folding gate.
+                fold_constant(expression)?;
+                match super::expression::fstring_components(fstring, self.context.source)
+                    .into_iter()
+                    .next()
+                {
+                    Some(super::expression::InterpolatedStringComponent::Literal(literal)) => {
+                        Some(literal.into_constant())
                     }
-                    (Constant::String(left), Operator::Add, Constant::SurrogateString(right)) => {
-                        let mut bytes = left.into_bytes();
-                        bytes.extend(right);
-                        Some(Constant::SurrogateString(bytes))
+                    None => Some(Constant::String(String::new())),
+                    Some(super::expression::InterpolatedStringComponent::Interpolation(_, _)) => {
+                        unreachable!("a folded f-string has no interpolated expressions")
                     }
-                    (
-                        Constant::SurrogateString(mut left),
-                        Operator::Add,
-                        Constant::SurrogateString(right),
-                    ) => {
-                        left.extend(right);
-                        Some(Constant::SurrogateString(left))
-                    }
-                    (Constant::SurrogateString(value), Operator::Mult, Constant::Int(times))
-                    | (Constant::Int(times), Operator::Mult, Constant::SurrogateString(value)) => {
-                        let length = value.iter().filter(|byte| **byte & 0xc0 != 0x80).count();
-                        let max_times = 4096_usize.checked_div(length).unwrap_or(usize::MAX);
-                        let times = usize::try_from(times).ok()?;
-                        (times <= max_times).then(|| Constant::SurrogateString(value.repeat(times)))
-                    }
-                    _ => Some(folded),
                 }
             }
-            _ => fold_constant(expression),
-        }
+            _ => literal_constant(expression),
+        })
+    }
+
+    pub(super) fn source_aware_constant_slice(
+        &self,
+        slice: &ruff_python_ast::ExprSlice,
+    ) -> Option<Constant> {
+        constant_slice_with_literals(slice, &|expression| match expression {
+            Expr::StringLiteral(string) => Some(self.string_literal_constant(string)),
+            _ => literal_constant(expression),
+        })
     }
 
     pub(super) fn generator_expression_range(

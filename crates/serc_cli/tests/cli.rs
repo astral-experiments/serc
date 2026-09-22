@@ -130,6 +130,43 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
             "from __future__ import annotations\nsequence: [lambda: item for item in (1,)]\ndef function(argument: [lambda: item for item in (2,)]):\n    pass\n",
             "def f[T](x: [lambda: item for item in (1,)]): pass\n",
             "def outer(values):\n def f[T](x: [lambda: item for item in values]): pass\n return f\n",
+            // Preserve legacy boolean inversion during recursive literal-aware folding.
+            "value = ((~True,),)",
+            r#"value = ((~False,), "\ud800")"#,
+            // Recursive source-aware folding keeps target-specific tuple truth steps.
+            r#"value = not ()"#,
+            r#"value = not ("\ud800",)"#,
+            r#"value = ((not ("\ud800",)), "\udfff")"#,
+            r#"value = (not (),) * 2"#,
+            r#"value = (not (), "\ud800")[0]"#,
+            r#"value = (17, 23)[not ()]"#,
+            r#"value = (not ("\ud800",)) + 1"#,
+            r#"value = (not (),) + ("\ud800",)"#,
+            r#"value = not (runtime(), "\ud800")"#,
+            // Preserve numeric allocation origins through the same recursive path.
+            r#"value = (((1e309 - 1e309), "\ud800"),) * 2"#,
+            r#"value = (-(1e309 - 1e309), +(1e309 - 1e309))"#,
+            // Preserve surrogate code points through composite constant folding.
+            "value = \"\\ud800\"[0]",
+            "value = \"\\ud800x\"[-1]",
+            "value = \"a\\ud800b\\udfff\"[1:4:2]",
+            "value = \"a\\ud800b\"[:1]",
+            "value = \"\\ud800\"[:0]",
+            "value = (\"\\ud800\",)[0]",
+            "value = (\"\\ud800\", \"x\")[:1]",
+            "value = (\"\\ud800\",) + (\"x\",)",
+            "value = (\"\\ud800\",) * 2",
+            "value = 2 * ((\"\\ud800\",),)",
+            "value = (f\"\\ud800\",)",
+            "value = f\"\\ud800\" + \"x\"",
+            "value = (f\"\\ud800\" f\"\\udfff\")[1]",
+            "value = (rf\"\\ud800\" f\"\\udfff\")[-1]",
+            "value = item[\"\\ud800\":]",
+            "value = item[:\"\\ud800\":]",
+            "value = item[::\"\\ud800\"]",
+            "value = item[r\"\\ud800\" \"\\udfff\":]",
+            "item[\"\\ud800\":] = value",
+            "del item[\"\\ud800\":]",
         ] {
             fs_err::write(&source_path, source).unwrap();
             let mut oracle = match version {
