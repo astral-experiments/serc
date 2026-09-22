@@ -728,6 +728,7 @@ mod tuple_store_join_locations;
 mod type_parameter_scope_boundaries;
 mod with_pass_finally_owner;
 
+mod empty_bytes_identity;
 mod nan_allocation_identity;
 mod nan_identity;
 

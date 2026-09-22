@@ -418,6 +418,7 @@ impl Compiler<'_> {
             && matches!(statement.subject.as_ref(), Expr::Tuple(_))
             && let Some(constant) = fold_constant(&statement.subject)
         {
+            self.record_folded_operands(&statement.subject)?;
             if self.output.constants.is_empty()
                 && let Some(seed) = first_literal_constant(&statement.subject)
             {

@@ -182,7 +182,9 @@ fn traverse_slice_member<'a, V>(value: &'a Constant, visitor: &mut V)
 where
     V: MarshalVisitor<'a>,
 {
-    if slice_member_uses_identity_for(value, visitor.python_version()) {
+    if slice_member_uses_identity_for(value, visitor.python_version())
+        || matches!(value, Constant::Bytes(value) if value.is_empty())
+    {
         visitor.slice_member(value);
     } else if matches!(value, Constant::String(_)) {
         visitor.cached_slice_string(value);

@@ -160,7 +160,7 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
         let pyc_path = directory
             .path()
             .join(format!("__pycache__/module.cpython-3{minor}.pyc"));
-        for source in [
+        let mut sources = vec![
             scalar_source.as_str(),
             "def answer():\n    return 42\n",
             "café = 'café'\n",
@@ -233,7 +233,29 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
             "a = (1 + 1.0000000074505806j) * (1 + 0.9999999925494194j)\n",
             "a = ((1e999 - 1e999) * 1j, 1j * (1e999 - 1e999), -(1e999 - 1e999) * 1j, 1j * -(1e999 - 1e999))\n",
             "def first():\n    return (1e999 - 1e999) + 1j\ndef second():\n    return (1e999 - 1e999) + 1j\n",
-        ] {
+        ];
+        if version >= serc::PythonVersion::Py314 {
+            sources.extend([
+                // Preserve empty-bytes identity across constant-cache admission orders.
+                "value = b'x' * 0\n",
+                "value = 0 * b'x'\n",
+                "value = b'' * 3\n",
+                "value = b'x'[:0]\n",
+                "value = (b'x' * 0) * 2\n",
+                "a = b''; value = b'x' * 0\n",
+                "value = b'x' * 0; a = b''\n",
+                "def f(): return b'x' * 0\nvalue = b''\n",
+                "def f(): pass\nvalue = b'x' * 0\n",
+                "value = b'x' * 0\ndef f(): pass\n",
+                "value = (b'', b'x' * 0)\n",
+                "value = (b'x' * 0, b'')\n",
+                "value = b'x' * 0; other = data[b'':]\n",
+                "other = data[:b'']; value = b'x' * 0\n",
+                "if False:\n    def f(): return b'x' * 0\nvalue = b''\n",
+                "def f():\n    return b'x' * 0\n    value = b''\n",
+            ]);
+        }
+        for source in sources {
             fs_err::write(&source_path, source).unwrap();
             let mut oracle = match version {
                 serc::PythonVersion::Py312 => common::python_312_command(),

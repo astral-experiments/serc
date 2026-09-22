@@ -52,6 +52,8 @@ pub(super) enum ObjectKey<'a> {
     Code(usize),
     CodeBytes(usize),
     LocalKinds(usize),
+    // A zero repetition can seed the constant cache with an empty object distinct from b"".
+    FreshEmptyBytes,
 }
 
 #[derive(Clone, Debug)]
