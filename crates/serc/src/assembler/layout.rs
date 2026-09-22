@@ -78,12 +78,10 @@ impl LayoutAssembler {
         let mut setup_labels = vec![false; labels.len()];
         let mut first_region_starts = vec![None; labels.len()];
         for (region, &(start, _, _, _, _, _)) in self.exception_regions.iter().zip(&regions) {
-            if let Some(block_label) =
-                block_labels.get_mut(usize::try_from(region.target.0).unwrap())
-            {
+            if let Some(block_label) = block_labels.get_mut(region.target.index()) {
                 *block_label = true;
             }
-            let target = usize::try_from(region.target.0).unwrap();
+            let target = region.target.index();
             if first_region_starts[target].is_none_or(|(position, _)| start < position) {
                 first_region_starts[target] = Some((start, region.start));
             }
@@ -92,14 +90,12 @@ impl LayoutAssembler {
         // ranges. Only its initial setup can vacate an instruction slot; resuming a
         // protected range does not emit another SETUP instruction in CPython.
         for (_, label) in first_region_starts.into_iter().flatten() {
-            setup_labels[usize::try_from(label.0).unwrap()] = true;
+            setup_labels[label.index()] = true;
         }
         for item in &self.items {
             match item {
                 Item::Label(label) if self.preserved_block_boundaries.contains(label) => {
-                    if let Some(block_label) =
-                        block_labels.get_mut(usize::try_from(label.0).unwrap())
-                    {
+                    if let Some(block_label) = block_labels.get_mut(label.index()) {
                         *block_label = true;
                     }
                 }
@@ -109,9 +105,7 @@ impl LayoutAssembler {
                     else {
                         continue;
                     };
-                    if let Some(block_label) =
-                        block_labels.get_mut(usize::try_from(label.0).unwrap())
-                    {
+                    if let Some(block_label) = block_labels.get_mut(label.index()) {
                         *block_label = true;
                     }
                 }
@@ -131,7 +125,7 @@ impl LayoutAssembler {
         for item in &self.items {
             match item {
                 Item::Label(label) => {
-                    let label = usize::try_from(label.0).unwrap();
+                    let label = label.index();
                     if block_has_instruction && block_labels.get(label).copied().unwrap_or(false) {
                         block_has_instruction = false;
                         block_has_stale_exception_owner = false;
@@ -170,7 +164,7 @@ impl LayoutAssembler {
                     let dynamic_owner = (!instruction.jump_policy.is_authored_branch_marker())
                         .then(|| dynamic_exception_owners.get(&instruction_index))
                         .flatten();
-                    if let Some(region) = dynamic_owner.and_then(|owner| owner.source_region) {
+                    if let Some(region) = dynamic_owner.and_then(|owner| owner.source_region()) {
                         late_source_exception_owners.push((position, end, region));
                     } else {
                         if instruction
@@ -180,13 +174,13 @@ impl LayoutAssembler {
                         {
                             late_exception_exclusions.push((position, end));
                         }
-                        if let Some(has_owner) = dynamic_owner {
-                            if has_owner.has_owner {
-                                if has_owner.override_existing {
+                        if let Some(decision) = dynamic_owner {
+                            if decision.has_owner() {
+                                if decision.overrides_existing() {
                                     late_exception_overrides.push((position, end));
                                 }
                                 late_exception_inclusions.push((position, end));
-                            } else if has_owner.definitive {
+                            } else if decision.is_definitive() {
                                 late_exception_exclusions.push((position, end));
                             }
                         }
@@ -196,7 +190,7 @@ impl LayoutAssembler {
                             == NormalizedExceptionOwner::Absent
                             || (instruction.exception_policy().owner()
                                 == NormalizedExceptionOwner::DynamicCondition
-                                && !dynamic_owner.is_some_and(|owner| owner.has_owner))
+                                && !dynamic_owner.is_some_and(|owner| owner.has_owner()))
                         {
                             if block_has_applied_comprehension_swap {
                                 late_exception_inclusions.push((position, end));
@@ -490,7 +484,7 @@ impl LayoutAssembler {
                 Operand::Deferred(id) => {
                     return Err(CompileError::Internal(format!(
                         "unresolved operand patch {} reached final layout",
-                        id.0
+                        id.as_u32()
                     )));
                 }
                 Operand::Forward(label) => {
@@ -560,7 +554,7 @@ impl LayoutAssembler {
                     instruction_index += 1;
                 }
                 Item::Label(label) => {
-                    labels[usize::try_from(label.0).unwrap()] = Some(position);
+                    labels[label.index()] = Some(position);
                 }
             }
         }
@@ -587,10 +581,7 @@ pub(super) fn backward_argument(
 }
 
 pub(super) fn label_position(labels: &[Option<u32>], label: Label) -> Option<u32> {
-    labels
-        .get(usize::try_from(label.0).unwrap())
-        .copied()
-        .flatten()
+    labels.get(label.index()).copied().flatten()
 }
 
 /// Writes a source span as location entries covering at most eight code units each.
@@ -764,12 +755,12 @@ mod tests {
         ExceptionRegion {
             is_scope_fallback: false,
             priority: super::super::ExceptionRegionPriority::OriginalRange(
-                Label(start),
-                Label(end),
+                Label::from_u32(start),
+                Label::from_u32(end),
             ),
-            start: Label(start),
-            end: Label(end),
-            target: Label(target),
+            start: Label::from_u32(start),
+            end: Label::from_u32(end),
+            target: Label::from_u32(target),
             depth,
             preserve_lasti,
         }
@@ -846,21 +837,21 @@ mod tests {
 
         let mut assembler = layout(
             vec![
-                Item::Label(Label(0)),
+                Item::Label(Label::from_u32(0)),
                 Item::Instruction(Instruction::new(
                     RESUME,
                     Operand::Value(0),
                     SourceLocation::NONE,
                     None,
                 )),
-                Item::Label(Label(1)),
+                Item::Label(Label::from_u32(1)),
                 Item::Instruction(Instruction::new(
                     GET_ITER,
                     Operand::Value(0),
                     SourceLocation::NONE,
                     None,
                 )),
-                Item::Label(Label(2)),
+                Item::Label(Label::from_u32(2)),
             ],
             vec![region(0, 2, 2, 0, false)],
         );

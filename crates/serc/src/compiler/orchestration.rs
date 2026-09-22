@@ -15,7 +15,7 @@ use super::{
 };
 use crate::assembler::{AssembledCode, Assembler, ConstantTable, SourceLocation};
 use crate::code_object::{
-    CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance,
+    CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance, MetadataId,
 };
 use crate::target::code_flags::{
     CO_ASYNC_GENERATOR, CO_COROUTINE, CO_FUTURE_ANNOTATIONS, CO_GENERATOR, CO_HAS_DOCSTRING,
@@ -1110,11 +1110,19 @@ impl<'source> Compiler<'source> {
             .iter()
             .map(|name_id| {
                 let spelling = self.resolve_name(*name_id);
+                // The annotation argument has a separate internal identity so user names
+                // and comprehension targets spelled `format` do not bind to its slot.
+                if self.unit.annotation_thunk && spelling == ".format" {
+                    return (
+                        "format".to_string(),
+                        MetadataId::from(self.required_name_id("format")),
+                    );
+                }
                 let name = self.mangled_name(spelling);
                 let id = if name == spelling {
-                    name_id.0
+                    MetadataId::from(*name_id)
                 } else {
-                    self.required_name_id(&name).0
+                    MetadataId::from(self.required_name_id(&name))
                 };
                 (name, id)
             })
@@ -1127,9 +1135,11 @@ impl<'source> Compiler<'source> {
                 .ok_or_else(|| CompileError::Internal("too many marshal metadata names".into()))?,
             names: std::mem::take(&mut self.output.name_ids),
             locals: local_ids,
-            filename: filename_id,
-            name: interner.get(&self.unit.name).map(|id| id.0),
-            qualified_name: interner.get(&self.unit.qualified_name).map(|id| id.0),
+            filename: MetadataId::from_u32(filename_id),
+            name: interner.get(&self.unit.name).map(MetadataId::from),
+            qualified_name: interner
+                .get(&self.unit.qualified_name)
+                .map(MetadataId::from),
         };
         let parameter_count = usize::try_from(
             self.unit.arg_count

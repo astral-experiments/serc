@@ -1202,7 +1202,7 @@ fn borrow_block_ranges(
     let label_count = items
         .iter()
         .filter_map(|item| match item {
-            Item::Label(label) => usize::try_from(label.0).ok(),
+            Item::Label(label) => Some(label.index()),
             Item::Instruction(_) => None,
         })
         .max()
@@ -1247,7 +1247,7 @@ fn borrow_block_ranges_with_label_count(
                 has_block_label = false;
                 is_unreachable = false;
             }
-            label_blocks[usize::try_from(label.0).unwrap()] = ranges.len();
+            label_blocks[label.index()] = ranges.len();
             is_unreachable |= borrow_unreachable_labels.contains(label);
             has_block_label |= is_boundary;
         }
@@ -2615,7 +2615,7 @@ impl OptimizationPipeline {
         let mut label_positions = vec![None; usize::try_from(self.next_label).unwrap()];
         for (index, item) in graph.iter_items().enumerate() {
             if let Item::Label(label) = item {
-                label_positions[usize::try_from(label.0).unwrap()] = Some(index);
+                label_positions[label.index()] = Some(index);
             }
         }
 
@@ -2625,13 +2625,10 @@ impl OptimizationPipeline {
             .enumerate()
             .filter_map(|(index, region)| {
                 let start = label_positions
-                    .get(usize::try_from(region.start.0).unwrap())
+                    .get(region.start.index())
                     .copied()
                     .flatten()?;
-                let end = label_positions
-                    .get(usize::try_from(region.end.0).unwrap())
-                    .copied()
-                    .flatten()?;
+                let end = label_positions.get(region.end.index()).copied().flatten()?;
                 if end <= start {
                     return None;
                 }
@@ -2643,14 +2640,8 @@ impl OptimizationPipeline {
                 })?;
                 let (priority_start, priority_end) = match region.priority {
                     ExceptionRegionPriority::OriginalRange(start, end) => (
-                        label_positions
-                            .get(usize::try_from(start.0).unwrap())
-                            .copied()
-                            .flatten()?,
-                        label_positions
-                            .get(usize::try_from(end.0).unwrap())
-                            .copied()
-                            .flatten()?,
+                        label_positions.get(start.index()).copied().flatten()?,
+                        label_positions.get(end.index()).copied().flatten()?,
                     ),
                     ExceptionRegionPriority::Resolved { start, end } => (start, end),
                 };
@@ -3071,8 +3062,7 @@ impl OptimizationPipeline {
                             &self.borrow_unreachable_blocks,
                             &preserved,
                         );
-                        let range =
-                            blocks.get(*label_blocks.get(usize::try_from(label.0).unwrap())?)?;
+                        let range = blocks.get(*label_blocks.get(label.index())?)?;
                         let instructions = items[range.clone()]
                             .iter()
                             .filter_map(|item| match item {
@@ -3433,7 +3423,7 @@ impl OptimizationPipeline {
                 }
                 if let Some(last) = last
                     && let Operand::Forward(label) | Operand::Backward(label) = last.operand()
-                    && let Some(target) = label_blocks.get(label.0 as usize).copied()
+                    && let Some(target) = label_blocks.get(label.index()).copied()
                     && target < blocks.len()
                 {
                     pending.push(target);
@@ -3452,8 +3442,7 @@ impl OptimizationPipeline {
             for item in items.iter() {
                 match item {
                     Item::Label(label) => {
-                        highest_bound_label =
-                            highest_bound_label.max(usize::try_from(label.0).ok());
+                        highest_bound_label = highest_bound_label.max(Some(label.index()));
                     }
                     Item::Instruction(instruction) => match instruction.operand() {
                         Operand::Forward(label) => {
@@ -3692,10 +3681,7 @@ impl OptimizationPipeline {
                         })
                         .and_then(|source| retained_finally_entries.get(source))
                         .is_some_and(|target| {
-                            label_blocks
-                                .get(usize::try_from(target.0).unwrap())
-                                .copied()
-                                == Some(block + 1)
+                            label_blocks.get(target.index()).copied() == Some(block + 1)
                                 && items[blocks[block + 1].clone()].iter().all(|item| {
                                     !matches!(item, Item::Label(label)
                                             if borrow_unreachable_labels.contains(label)
@@ -3770,7 +3756,7 @@ impl OptimizationPipeline {
                 // a zero-distance surrogate still represents the removed empty block.
                 if let Operand::Forward(label) | Operand::Backward(label) = last.operand()
                     && let Some(target) = label_blocks
-                        .get(usize::try_from(label.0).unwrap())
+                        .get(label.index())
                         .copied()
                         .filter(|target| *target != usize::MAX)
                     && (!last.jump_policy.borrow_empty_block()
@@ -3792,9 +3778,7 @@ impl OptimizationPipeline {
                                 Item::Instruction(_) => None,
                             })
                             .and_then(|source| retained_finally_entries.get(source))
-                        && let Some(finally_block) = label_blocks
-                            .get(usize::try_from(finally.0).unwrap())
-                            .copied()
+                        && let Some(finally_block) = label_blocks.get(finally.index()).copied()
                         && finally_block == target + 1
                         && finally_block < blocks.len()
                         && {
@@ -4350,8 +4334,8 @@ mod tests {
 
     #[test]
     fn removed_borrow_markers_preserve_entry_counts_for_following_markers() {
-        let target = Label(0);
-        let alias = Label(1);
+        let target = Label::from_u32(0);
+        let alias = Label::from_u32(1);
         for (mut items, retained) in [
             (
                 vec![
@@ -4399,8 +4383,8 @@ mod tests {
 
     #[test]
     fn pre_copy_jump_certificates_stop_at_analysis_block_boundaries() {
-        let source = Label(0);
-        let cleanup = Label(1);
+        let source = Label::from_u32(0);
+        let cleanup = Label::from_u32(1);
         for marker in [
             instruction(super::NOT_TAKEN, Operand::Value(0)),
             instruction(NOP, Operand::Forward(cleanup)),
@@ -4433,12 +4417,12 @@ mod tests {
 
     #[test]
     fn pre_copy_jump_certificates_reject_copied_prefixes_and_empty_joins() {
-        let cleanup = Label(0);
-        let unrelated_barrier = Label(1);
-        let original_join = Label(2);
-        let original_entry = Label(3);
-        let copied_entry = Label(4);
-        let old_target = Label(5);
+        let cleanup = Label::from_u32(0);
+        let unrelated_barrier = Label::from_u32(1);
+        let original_join = Label::from_u32(2);
+        let original_entry = Label::from_u32(3);
+        let copied_entry = Label::from_u32(4);
+        let old_target = Label::from_u32(5);
         for edge in [JUMP_FORWARD, NOP] {
             for has_live_prefix in [false, true] {
                 for follows_original_join in [false, true] {
@@ -4547,9 +4531,9 @@ mod tests {
     #[test]
     fn initial_borrow_jump_origins_survive_implicit_entries_and_normalization() {
         use crate::assembler::block_graph::{BlockGraph, ItemPosition};
-        let leading = Label(0);
-        let source = Label(1);
-        let cleanup = Label(2);
+        let leading = Label::from_u32(0);
+        let source = Label::from_u32(1);
+        let cleanup = Label::from_u32(2);
         for implicit in [false, true] {
             let mut items = Vec::new();
             if !implicit {
@@ -4596,7 +4580,7 @@ mod tests {
             if !implicit {
                 assert_ne!(old_source, new_source);
             }
-            let assigned = Label(3);
+            let assigned = Label::from_u32(3);
             graph.insert_label(new_source, graph[new_source].items().len() - 3, assigned);
             let entries = super::OptimizationPipeline::take_pre_copy_borrow_jump_entries(
                 &mut graph,
@@ -4622,9 +4606,9 @@ mod tests {
     #[test]
     fn initial_borrow_jump_origins_reject_empty_targets_retargeting_and_synthesis() {
         use crate::assembler::block_graph::BlockGraph;
-        let source = Label(0);
-        let empty = Label(1);
-        let cleanup = Label(2);
+        let source = Label::from_u32(0);
+        let empty = Label::from_u32(1);
+        let cleanup = Label::from_u32(2);
         for direct in [false, true] {
             for mutation in 0..3 {
                 let items = vec![
@@ -4689,9 +4673,9 @@ mod tests {
 
     #[test]
     fn original_borrow_jump_entry_targets_keep_empty_arrays_separate() {
-        let target = Label(0);
-        let alias = Label(1);
-        let header = Label(2);
+        let target = Label::from_u32(0);
+        let alias = Label::from_u32(1);
+        let header = Label::from_u32(2);
         let candidates = FxHashSet::from_iter([target, alias]);
         let boundaries = FxHashSet::from_iter([target, alias, header]);
         for prefix in 0..5 {
@@ -4742,7 +4726,7 @@ mod tests {
 
     #[test]
     fn protected_async_loop_exit_retains_borrowing_only_for_small_continuations() {
-        let exit = Label(0);
+        let exit = Label::from_u32(0);
         for preserve_small_exit in [false, true] {
             for padding in 0..3 {
                 let mut items = vec![
@@ -4799,12 +4783,12 @@ mod tests {
 
     #[test]
     fn borrowed_ranges_keep_protected_boundaries_and_split_handlers() {
-        let protected_start = Label(0);
-        let protected_end = Label(1);
-        let handler = Label(2);
-        let target = Label(3);
-        let preserved = Label(4);
-        let unreachable = Label(5);
+        let protected_start = Label::from_u32(0);
+        let protected_end = Label::from_u32(1);
+        let handler = Label::from_u32(2);
+        let target = Label::from_u32(3);
+        let preserved = Label::from_u32(4);
+        let unreachable = Label::from_u32(5);
         let items = vec![
             Item::Label(protected_start),
             instruction(LOAD_FAST, Operand::Value(0)),
@@ -4838,10 +4822,10 @@ mod tests {
 
     #[test]
     fn borrowed_ranges_use_bound_labels_only_and_preserve_sparse_indices() {
-        let first = Label(2);
-        let target = Label(7);
-        let unbound_forward = Label(90);
-        let unbound_backward = Label(91);
+        let first = Label::from_u32(2);
+        let target = Label::from_u32(7);
+        let unbound_forward = Label::from_u32(90);
+        let unbound_backward = Label::from_u32(91);
         let items = vec![
             Item::Label(first),
             instruction(LOAD_FAST, Operand::Value(0)),
@@ -4927,9 +4911,9 @@ mod tests {
 
     #[test]
     fn borrowed_ranges_preserve_empty_original_blocks_without_splitting_range_aliases() {
-        let empty = Label(0);
-        let alias = Label(1);
-        let accepted = Label(2);
+        let empty = Label::from_u32(0);
+        let alias = Label::from_u32(1);
+        let accepted = Label::from_u32(2);
         let items = vec![
             instruction(LOAD_FAST, Operand::Value(0)),
             instruction(POP_JUMP_IF_TRUE, Operand::Forward(empty)),
@@ -4960,8 +4944,8 @@ mod tests {
 
     #[test]
     fn assertion_borrowed_ranges_preserve_all_reference_stack_boundaries() {
-        let first = Label(0);
-        let second = Label(1);
+        let first = Label::from_u32(0);
+        let second = Label::from_u32(1);
         let items = vec![
             instruction(LOAD_FAST, Operand::Value(0)),
             instruction(POP_JUMP_IF_TRUE, Operand::Forward(first)),
@@ -4990,10 +4974,10 @@ mod tests {
         assert_eq!(expected, [0..2, 2..3, 3..5, 5..8, 8..9, 9..11, 11..14]);
     }
     fn threaded_entry_fixture(extra_hop: bool) -> crate::assembler::OptimizationPipeline {
-        let source = Label(0);
-        let join = Label(1);
-        let cleanup = Label(2);
-        let second = Label(3);
+        let source = Label::from_u32(0);
+        let join = Label::from_u32(1);
+        let cleanup = Label::from_u32(2);
+        let second = Label::from_u32(3);
         let mut items = vec![
             Item::Label(source),
             instruction(LOAD_FAST, Operand::Value(1)),
@@ -5040,11 +5024,11 @@ mod tests {
             &mut items,
             &[],
             super::BorrowEntryLabels {
-                unreachable: &FxHashSet::from_iter([Label(2)]),
+                unreachable: &FxHashSet::from_iter([Label::from_u32(2)]),
                 loop_exits: &FxHashMap::default(),
                 finally_entries: &FxHashMap::default(),
                 finally_jump_sources: &FxHashMap::default(),
-                jump_entries: &FxHashSet::from_iter([Label(2)]),
+                jump_entries: &FxHashSet::from_iter([Label::from_u32(2)]),
                 original_boundaries: boundaries,
                 pre_copy_jump_entries: entries,
                 authored_finally_break_entries: &FxHashMap::default(),
@@ -5071,8 +5055,10 @@ mod tests {
     fn original_threaded_entry_reaches_nonempty_cleanup() {
         let mut pipeline = threaded_entry_fixture(false);
         assert_eq!(
-            pipeline.borrow_threaded_jump_targets.get(&Label(1)),
-            Some(&Label(2))
+            pipeline
+                .borrow_threaded_jump_targets
+                .get(&Label::from_u32(1)),
+            Some(&Label::from_u32(2))
         );
         assert!(pipeline.thread_forward_jumps());
         let boundaries = pipeline.exception_owner_provenance.block_boundaries.clone();
@@ -5081,7 +5067,7 @@ mod tests {
             &boundaries,
             &mut pipeline.borrow_threaded_jump_entries,
         );
-        assert_eq!(entries.get(&Label(0)), Some(&Label(2)));
+        assert_eq!(entries.get(&Label::from_u32(0)), Some(&Label::from_u32(2)));
         assert_eq!(
             borrowed_cleanup_after_entries(pipeline.graph.into_items(), &entries, &boundaries),
             LOAD_FAST_BORROW
@@ -5092,12 +5078,16 @@ mod tests {
     fn original_threaded_entry_can_follow_multiple_original_jumps() {
         let mut pipeline = threaded_entry_fixture(true);
         assert_eq!(
-            pipeline.borrow_threaded_jump_targets.get(&Label(1)),
-            Some(&Label(2))
+            pipeline
+                .borrow_threaded_jump_targets
+                .get(&Label::from_u32(1)),
+            Some(&Label::from_u32(2))
         );
         assert_eq!(
-            pipeline.borrow_threaded_jump_targets.get(&Label(3)),
-            Some(&Label(2))
+            pipeline
+                .borrow_threaded_jump_targets
+                .get(&Label::from_u32(3)),
+            Some(&Label::from_u32(2))
         );
         assert!(pipeline.thread_forward_jumps());
         let entries = super::OptimizationPipeline::capture_pre_copy_borrow_entries_with_threaded(
@@ -5105,7 +5095,7 @@ mod tests {
             &pipeline.exception_owner_provenance.block_boundaries,
             &pipeline.borrow_threaded_jump_entries,
         );
-        assert_eq!(entries.get(&Label(0)), Some(&Label(2)));
+        assert_eq!(entries.get(&Label::from_u32(0)), Some(&Label::from_u32(2)));
     }
 
     #[test]
@@ -5114,7 +5104,7 @@ mod tests {
         let mut items = pipeline.graph.into_items();
         let join = items
             .iter()
-            .position(|item| matches!(item, Item::Label(Label(1))))
+            .position(|item| matches!(item, Item::Label(label) if matches!(label.as_u32(), 1)))
             .unwrap();
         items[join + 1] = instruction(NOP, Operand::Value(0));
         pipeline.graph =
@@ -5124,7 +5114,7 @@ mod tests {
             &mut pipeline.graph,
             &pipeline.exception_owner_provenance.block_boundaries,
         );
-        assert!(!routes.contains_key(&Label(1)));
+        assert!(!routes.contains_key(&Label::from_u32(1)));
         assert!(
             super::OptimizationPipeline::capture_pre_copy_borrow_jump_entries(
                 &pipeline.graph,
@@ -5140,9 +5130,9 @@ mod tests {
         let mut items = pipeline.graph.into_items();
         let second = items
             .iter()
-            .position(|item| matches!(item, Item::Label(Label(3))))
+            .position(|item| matches!(item, Item::Label(label) if matches!(label.as_u32(), 3)))
             .unwrap();
-        items[second + 1] = instruction(JUMP_FORWARD, Operand::Forward(Label(1)));
+        items[second + 1] = instruction(JUMP_FORWARD, Operand::Forward(Label::from_u32(1)));
         pipeline.graph =
             crate::assembler::block_graph::BlockGraph::from_items(items, &FxHashSet::default());
         super::OptimizationPipeline::clear_initial_borrow_jump_entries(&mut pipeline.graph);
@@ -5150,7 +5140,9 @@ mod tests {
             &mut pipeline.graph,
             &pipeline.exception_owner_provenance.block_boundaries,
         );
-        assert!(!routes.contains_key(&Label(1)) && !routes.contains_key(&Label(3)));
+        assert!(
+            !routes.contains_key(&Label::from_u32(1)) && !routes.contains_key(&Label::from_u32(3))
+        );
     }
 
     #[test]
@@ -5159,7 +5151,7 @@ mod tests {
         let mut items = pipeline.graph.into_items();
         let join = items
             .iter()
-            .position(|item| matches!(item, Item::Label(Label(1))))
+            .position(|item| matches!(item, Item::Label(label) if matches!(label.as_u32(), 1)))
             .unwrap();
         let Item::Instruction(jump) = &mut items[join + 1] else {
             unreachable!()
@@ -5172,15 +5164,15 @@ mod tests {
             &mut pipeline.graph,
             &pipeline.exception_owner_provenance.block_boundaries,
         );
-        assert!(!routes.contains_key(&Label(1)));
+        assert!(!routes.contains_key(&Label::from_u32(1)));
     }
 
     #[test]
     fn unrelated_retarget_cannot_renew_an_original_route() {
         let mut pipeline = threaded_entry_fixture(false);
         pipeline.graph.for_each_instruction_mut(|instruction| {
-            if instruction.initial_borrow_jump_target() == Some(Label(1)) {
-                instruction.retarget(Operand::Forward(Label(2)));
+            if instruction.initial_borrow_jump_target() == Some(Label::from_u32(1)) {
+                instruction.retarget(Operand::Forward(Label::from_u32(2)));
             }
         });
         pipeline.thread_forward_jumps();
@@ -5204,11 +5196,11 @@ mod tests {
                 &boundaries,
                 &mut pipeline.borrow_threaded_jump_entries,
             );
-            assert_eq!(entries.get(&Label(0)), Some(&Label(2)));
+            assert_eq!(entries.get(&Label::from_u32(0)), Some(&Label::from_u32(2)));
             let mut items = pipeline.graph.into_items();
             let cleanup = items
                 .iter()
-                .position(|item| matches!(item, Item::Label(Label(2))))
+                .position(|item| matches!(item, Item::Label(label) if matches!(label.as_u32(), 2)))
                 .unwrap();
             // Model the reordered warm arrays after intervening cold arrays move away.
             items.drain(4..cleanup);
@@ -5238,7 +5230,7 @@ mod tests {
         assert!(pipeline.graph.iter_items().all(|item| !matches!(item,
             Item::Instruction(instruction) if instruction.initial_borrow_jump_target().is_some())));
         let mut items = pipeline.graph.into_items();
-        items.insert(1, Item::Label(Label(4)));
+        items.insert(1, Item::Label(Label::from_u32(4)));
         assert_eq!(
             borrowed_cleanup_after_entries(items, &entries, &boundaries),
             LOAD_FAST
@@ -5253,10 +5245,10 @@ mod tests {
             assert!(!pipeline.borrow_threaded_jump_entries.is_empty());
             pipeline.graph.for_each_instruction_mut(|instruction| {
                 if instruction.opcode == JUMP_FORWARD
-                    && instruction.operand() == Operand::Forward(Label(2))
+                    && instruction.operand() == Operand::Forward(Label::from_u32(2))
                 {
                     match change {
-                        0 => instruction.retarget(Operand::Forward(Label(3))),
+                        0 => instruction.retarget(Operand::Forward(Label::from_u32(3))),
                         1 => instruction.add_pre_fold_extra_instructions(1),
                         _ => {
                             instruction.location = SourceLocation {
@@ -5283,12 +5275,14 @@ mod tests {
     fn threaded_origin_snapshot_checks_new_original_boundaries_and_consumes_proof() {
         let mut pipeline = threaded_entry_fixture(false);
         pipeline.thread_forward_jumps();
-        let source_block = pipeline.graph.label_block(Label(0)).unwrap();
-        pipeline.graph.insert_label(source_block, 3, Label(4));
+        let source_block = pipeline.graph.label_block(Label::from_u32(0)).unwrap();
+        pipeline
+            .graph
+            .insert_label(source_block, 3, Label::from_u32(4));
         pipeline
             .exception_owner_provenance
             .block_boundaries
-            .insert(Label(4));
+            .insert(Label::from_u32(4));
         let entries = super::OptimizationPipeline::take_pre_copy_borrow_entries_with_threaded(
             &mut pipeline.graph,
             &pipeline.exception_owner_provenance.block_boundaries,
@@ -5304,8 +5298,8 @@ mod tests {
         pipeline.thread_forward_jumps();
         let mut items = pipeline.graph.into_items();
         for item in &mut items {
-            if matches!(item, Item::Label(Label(0))) {
-                *item = Item::Label(Label(4));
+            if matches!(item, Item::Label(label) if matches!(label.as_u32(), 0)) {
+                *item = Item::Label(Label::from_u32(4));
             }
         }
         pipeline.graph =
@@ -5313,11 +5307,11 @@ mod tests {
         pipeline
             .exception_owner_provenance
             .block_boundaries
-            .remove(&Label(0));
+            .remove(&Label::from_u32(0));
         pipeline
             .exception_owner_provenance
             .block_boundaries
-            .insert(Label(4));
+            .insert(Label::from_u32(4));
         let entries = super::OptimizationPipeline::take_pre_copy_borrow_entries_with_threaded(
             &mut pipeline.graph,
             &pipeline.exception_owner_provenance.block_boundaries,
@@ -5334,12 +5328,12 @@ mod tests {
             .push(crate::assembler::ExceptionRegion {
                 is_scope_fallback: false,
                 priority: crate::assembler::ir::ExceptionRegionPriority::OriginalRange(
-                    Label(0),
-                    Label(1),
+                    Label::from_u32(0),
+                    Label::from_u32(1),
                 ),
-                start: Label(0),
-                end: Label(1),
-                target: Label(2),
+                start: Label::from_u32(0),
+                end: Label::from_u32(1),
+                target: Label::from_u32(2),
                 depth: 0,
                 preserve_lasti: false,
             });
@@ -5353,15 +5347,15 @@ mod tests {
         let mut pipeline = threaded_owner_split_fixture();
         let before = pipeline.graph.iter_items().copied().collect::<Vec<_>>();
         assert_eq!(
-            pipeline.graph.label_block(Label(0)),
-            pipeline.graph.label_block(Label(4))
+            pipeline.graph.label_block(Label::from_u32(0)),
+            pipeline.graph.label_block(Label::from_u32(4))
         );
         pipeline
             .graph
             .normalize_blocks(&pipeline.preserved_block_boundaries);
         assert_ne!(
-            pipeline.graph.label_block(Label(0)),
-            pipeline.graph.label_block(Label(4))
+            pipeline.graph.label_block(Label::from_u32(0)),
+            pipeline.graph.label_block(Label::from_u32(4))
         );
         assert_eq!(
             pipeline.graph.iter_items().copied().collect::<Vec<_>>(),
@@ -5372,7 +5366,7 @@ mod tests {
             &pipeline.exception_owner_provenance.block_boundaries,
             &mut pipeline.borrow_threaded_jump_entries,
         );
-        assert_eq!(entries.get(&Label(4)), Some(&Label(2)));
+        assert_eq!(entries.get(&Label::from_u32(4)), Some(&Label::from_u32(2)));
         assert!(pipeline.borrow_threaded_jump_entries.is_empty());
     }
 
@@ -5382,7 +5376,7 @@ mod tests {
         let mut items = pipeline.graph.into_items();
         let owner = items
             .iter()
-            .position(|item| *item == Item::Label(Label(4)))
+            .position(|item| *item == Item::Label(Label::from_u32(4)))
             .unwrap();
         let label = items.remove(owner);
         items.insert(owner - 1, label);
@@ -5399,8 +5393,8 @@ mod tests {
     #[test]
     fn threaded_origin_rejects_an_uncaptured_internal_label() {
         let mut pipeline = threaded_owner_split_fixture();
-        let source = pipeline.graph.label_block(Label(0)).unwrap();
-        pipeline.graph.insert_label(source, 2, Label(6));
+        let source = pipeline.graph.label_block(Label::from_u32(0)).unwrap();
+        pipeline.graph.insert_label(source, 2, Label::from_u32(6));
         pipeline
             .graph
             .normalize_blocks(&pipeline.preserved_block_boundaries);
@@ -5417,7 +5411,7 @@ mod tests {
 
         let mut jump = Instruction::new(
             JUMP_FORWARD,
-            Operand::Forward(Label(2)),
+            Operand::Forward(Label::from_u32(2)),
             SourceLocation {
                 line: 1,
                 end_line: 1,
@@ -5432,22 +5426,26 @@ mod tests {
         pop_block.fusion_policy.mark_converted_pop_block();
         let call = Instruction::new(CALL, Operand::Value(0), jump.location, None);
         let items = vec![
-            Item::Label(Label(0)),
+            Item::Label(Label::from_u32(0)),
             instruction(LOAD_CONST, Operand::Value(0)),
             instruction(
                 POP_JUMP_IF_TRUE,
-                Operand::Forward(if reachable { Label(1) } else { Label(5) }),
+                Operand::Forward(if reachable {
+                    Label::from_u32(1)
+                } else {
+                    Label::from_u32(5)
+                }),
             ),
             instruction(LOAD_CONST, Operand::Value(0)),
             instruction(RETURN_VALUE, Operand::Value(0)),
-            Item::Label(Label(1)),
+            Item::Label(Label::from_u32(1)),
             Item::Instruction(jump),
-            Item::Label(Label(4)),
+            Item::Label(Label::from_u32(4)),
             instruction(LOAD_CONST, Operand::Value(0)),
             instruction(RETURN_VALUE, Operand::Value(0)),
-            Item::Label(Label(2)),
-            instruction(JUMP_FORWARD, Operand::Forward(Label(3))),
-            Item::Label(Label(3)),
+            Item::Label(Label::from_u32(2)),
+            instruction(JUMP_FORWARD, Operand::Forward(Label::from_u32(3))),
+            Item::Label(Label::from_u32(3)),
             Item::Instruction(pop_block),
             instruction(LOAD_CONST, Operand::Value(0)),
             instruction(PUSH_NULL, Operand::Value(0)),
@@ -5455,18 +5453,23 @@ mod tests {
             instruction(POP_TOP, Operand::Value(0)),
             instruction(LOAD_FAST, Operand::Value(0)),
             instruction(POP_TOP, Operand::Value(0)),
-            instruction(JUMP_FORWARD, Operand::Forward(Label(5))),
-            Item::Label(Label(5)),
+            instruction(JUMP_FORWARD, Operand::Forward(Label::from_u32(5))),
+            Item::Label(Label::from_u32(5)),
             instruction(LOAD_CONST, Operand::Value(0)),
             instruction(RETURN_VALUE, Operand::Value(0)),
         ];
         let mut assembler = crate::assembler::Assembler::from_linear_items(items);
         assembler.next_label = 6;
-        assembler.exception_owner_provenance.block_boundaries = (0..6).map(Label).collect();
+        assembler.exception_owner_provenance.block_boundaries =
+            (0..6).map(Label::from_u32).collect();
         let mut pipeline = assembler.into_optimization_pipeline();
-        pipeline.borrow_finally_entries.insert(Label(3), None);
-        pipeline.borrow_unreachable_blocks.insert(Label(3));
-        pipeline.borrow_jump_entry_labels.insert(Label(3));
+        pipeline
+            .borrow_finally_entries
+            .insert(Label::from_u32(3), None);
+        pipeline
+            .borrow_unreachable_blocks
+            .insert(Label::from_u32(3));
+        pipeline.borrow_jump_entry_labels.insert(Label::from_u32(3));
         pipeline.record_borrow_cleanup_calls();
         pipeline
     }
@@ -5486,7 +5489,7 @@ mod tests {
                 loop_exits: &FxHashMap::default(),
                 finally_entries: calls,
                 finally_jump_sources: &FxHashMap::default(),
-                jump_entries: &FxHashSet::from_iter([Label(3)]),
+                jump_entries: &FxHashSet::from_iter([Label::from_u32(3)]),
                 original_boundaries: boundaries,
                 pre_copy_jump_entries: &FxHashMap::default(),
                 authored_finally_break_entries: entries,
@@ -5517,7 +5520,7 @@ mod tests {
             let original = pipeline.graph.iter_items().copied().collect::<Vec<_>>();
             let head = original
                 .iter()
-                .position(|item| *item == Item::Label(Label(3)))
+                .position(|item| *item == Item::Label(Label::from_u32(3)))
                 .unwrap();
             let pop = original[head + 1];
             let call = original
@@ -5541,42 +5544,44 @@ mod tests {
             );
             let mut items = original[..head].to_vec();
             items.extend([
-                Item::Label(Label(3)),
-                Item::Label(Label(6)),
+                Item::Label(Label::from_u32(3)),
+                Item::Label(Label::from_u32(6)),
                 pop,
-                Item::Label(Label(7)),
+                Item::Label(Label::from_u32(7)),
                 Item::Instruction(nop),
-                Item::Label(Label(8)),
-                Item::Label(Label(9)),
+                Item::Label(Label::from_u32(8)),
+                Item::Label(Label::from_u32(9)),
                 instruction(LOAD_FAST, Operand::Value(0)),
                 instruction(PUSH_NULL, Operand::Value(0)),
                 Item::Instruction(call),
                 instruction(POP_TOP, Operand::Value(0)),
-                Item::Label(Label(10)),
+                Item::Label(Label::from_u32(10)),
                 instruction(LOAD_CONST, Operand::Value(0)),
                 instruction(RETURN_VALUE, Operand::Value(0)),
-                Item::Label(Label(5)),
+                Item::Label(Label::from_u32(5)),
                 instruction(LOAD_CONST, Operand::Value(0)),
                 instruction(RETURN_VALUE, Operand::Value(0)),
             ]);
             pipeline.graph =
                 crate::assembler::block_graph::BlockGraph::from_items(items, &FxHashSet::default());
             pipeline.next_label = 12;
-            pipeline.borrow_finally_entries = [(Label(6), None)].into_iter().collect();
-            pipeline.borrow_unreachable_blocks = [Label(6)].into_iter().collect();
-            pipeline.borrow_jump_entry_labels = [Label(6)].into_iter().collect();
-            pipeline.preserved_block_boundaries.insert(Label(6));
+            pipeline.borrow_finally_entries = [(Label::from_u32(6), None)].into_iter().collect();
+            pipeline.borrow_unreachable_blocks = [Label::from_u32(6)].into_iter().collect();
+            pipeline.borrow_jump_entry_labels = [Label::from_u32(6)].into_iter().collect();
+            pipeline
+                .preserved_block_boundaries
+                .insert(Label::from_u32(6));
             pipeline
                 .exception_owner_provenance
                 .setup_nop_ranges
-                .push((Label(7), Label(8)));
+                .push((Label::from_u32(7), Label::from_u32(8)));
             pipeline
                 .exception_owner_provenance
                 .setups
-                .push((Label(9), Some(nop.location)));
+                .push((Label::from_u32(9), Some(nop.location)));
             if change == 2 {
                 pipeline.borrow_loop_exit_blocks.insert(
-                    Label(6),
+                    Label::from_u32(6),
                     crate::assembler::BorrowLoopExitPolicy {
                         allow_surviving_break: false,
                         preserve_small_exit: false,
@@ -5589,7 +5594,7 @@ mod tests {
                 assert!(origins.is_empty());
                 assert!(pipeline.borrow_block_aliases.is_empty());
                 assert_eq!(
-                    pipeline.borrow_loop_exit_blocks[&Label(6)].cleanup_call,
+                    pipeline.borrow_loop_exit_blocks[&Label::from_u32(6)].cleanup_call,
                     None
                 );
                 continue;
@@ -5601,7 +5606,7 @@ mod tests {
                 &pipeline.exception_owner_provenance.block_boundaries,
                 &mut pipeline.borrow_authored_finally_break_origins,
             );
-            assert_eq!(entries[&Label(1)].target, Label(3));
+            assert_eq!(entries[&Label::from_u32(1)].target, Label::from_u32(3));
             let mut items = pipeline.graph.into_items();
             items.retain(|item| {
                 !matches!(item, Item::Instruction(instruction)
@@ -5612,9 +5617,9 @@ mod tests {
             if change == 1 {
                 let label = items
                     .iter_mut()
-                    .find(|item| **item == Item::Label(Label(9)))
+                    .find(|item| **item == Item::Label(Label::from_u32(9)))
                     .unwrap();
-                *label = Item::Label(Label(11));
+                *label = Item::Label(Label::from_u32(11));
             }
             super::OptimizationPipeline::retain_setup_finally_origins(
                 &items,
@@ -5623,13 +5628,13 @@ mod tests {
                 &mut pipeline.borrow_block_aliases,
             );
             assert_eq!(
-                pipeline.borrow_block_aliases.contains(&Label(6)),
+                pipeline.borrow_block_aliases.contains(&Label::from_u32(6)),
                 change == 0
             );
             if change == 1 {
                 assert_eq!(
                     pipeline.borrow_finally_entries,
-                    [(Label(6), None)].into_iter().collect()
+                    [(Label::from_u32(6), None)].into_iter().collect()
                 );
             }
             super::OptimizationPipeline::optimize_load_fast(
@@ -5679,14 +5684,14 @@ mod tests {
                 pipeline
                     .borrow_authored_finally_break_origins
                     .snapshots
-                    .contains_key(&Label(1)),
+                    .contains_key(&Label::from_u32(1)),
                 reachable,
             );
             // The real pipeline records the intermediate jump-only array as
             // empty after the original authored route has been captured.
             assert!(pipeline.record_borrow_empty_jump_heads());
             assert!(!pipeline.record_borrow_empty_jump_heads());
-            let intermediate = pipeline.graph.label_block(Label(2)).unwrap();
+            let intermediate = pipeline.graph.label_block(Label::from_u32(2)).unwrap();
             assert!(
                 pipeline.graph[intermediate]
                     .last_instruction()
@@ -5700,7 +5705,7 @@ mod tests {
                 &pipeline.exception_owner_provenance.block_boundaries,
                 &mut pipeline.borrow_authored_finally_break_origins,
             );
-            assert_eq!(entries.contains_key(&Label(1)), reachable);
+            assert_eq!(entries.contains_key(&Label::from_u32(1)), reachable);
             assert!(
                 pipeline
                     .borrow_authored_finally_break_origins
@@ -5714,7 +5719,7 @@ mod tests {
                     .is_empty()
             );
             if reachable {
-                assert_eq!(entries[&Label(1)].target, Label(3),);
+                assert_eq!(entries[&Label::from_u32(1)].target, Label::from_u32(3),);
                 assert_eq!(
                     authored_finally_load_opcode(
                         pipeline.graph.into_items(),
@@ -5738,12 +5743,12 @@ mod tests {
                 .push(crate::assembler::ExceptionRegion {
                     is_scope_fallback: false,
                     priority: crate::assembler::ir::ExceptionRegionPriority::OriginalRange(
-                        Label(1),
-                        Label(2),
+                        Label::from_u32(1),
+                        Label::from_u32(2),
                     ),
-                    start: Label(1),
-                    end: Label(2),
-                    target: Label(5),
+                    start: Label::from_u32(1),
+                    end: Label::from_u32(2),
+                    target: Label::from_u32(5),
                     depth: 0,
                     preserve_lasti: false,
                 });
@@ -5761,7 +5766,7 @@ mod tests {
                 pipeline
                     .exception_owner_provenance
                     .block_boundaries
-                    .insert(Label(6));
+                    .insert(Label::from_u32(6));
             }
             let entries = super::OptimizationPipeline::take_pre_copy_authored_finally_break_entries(
                 &pipeline.graph,
@@ -5771,7 +5776,10 @@ mod tests {
             if new_original_boundary {
                 assert!(entries.is_empty());
             } else {
-                assert_eq!(entries[&Label(6)].original_source, Label(1));
+                assert_eq!(
+                    entries[&Label::from_u32(6)].original_source,
+                    Label::from_u32(1)
+                );
                 assert_eq!(
                     authored_finally_load_opcode(
                         pipeline.graph.into_items(),
@@ -5797,7 +5805,7 @@ mod tests {
                 pipeline.graph.for_each_instruction_mut(|instruction| {
                     if instruction.fusion_policy.is_authored_break() {
                         match change {
-                            0 => instruction.retarget(Operand::Forward(Label(5))),
+                            0 => instruction.retarget(Operand::Forward(Label::from_u32(5))),
                             1 => instruction.location.column += 1,
                             _ => instruction.add_pre_fold_extra_instructions(1),
                         }
@@ -5831,7 +5839,7 @@ mod tests {
                 if (missing_call && instruction.opcode == crate::target::opcodes::CALL)
                     || (!missing_call
                         && instruction.opcode == JUMP_FORWARD
-                        && instruction.operand() == Operand::Forward(Label(3)))
+                        && instruction.operand() == Operand::Forward(Label::from_u32(3)))
                 {
                     instruction.opcode = NOP;
                     instruction.set_operand(Operand::Value(0));
@@ -5867,18 +5875,18 @@ mod tests {
                     &pipeline.exception_owner_provenance.block_boundaries,
                     &mut pipeline.borrow_authored_finally_break_origins,
                 );
-            assert!(entries.contains_key(&Label(1)));
+            assert!(entries.contains_key(&Label::from_u32(1)));
             let mut items = pipeline.graph.into_items();
             let jump = items.iter().position(|item| matches!(item,
                 Item::Instruction(instruction) if instruction.fusion_policy.is_authored_break()
             )).unwrap();
             let cleanup = items
                 .iter()
-                .position(|item| *item == Item::Label(Label(3)))
+                .position(|item| *item == Item::Label(Label::from_u32(3)))
                 .unwrap();
             match rejection {
                 0 => entries.clear(),
-                1 => items.insert(jump, Item::Label(Label(6))),
+                1 => items.insert(jump, Item::Label(Label::from_u32(6))),
                 2 => {
                     items.drain(jump + 1..cleanup);
                 }
@@ -5892,8 +5900,10 @@ mod tests {
                     }
                 }
                 4 => {
-                    items.insert(cleanup, Item::Label(Label(6)));
-                    pipeline.borrow_unreachable_blocks.insert(Label(6));
+                    items.insert(cleanup, Item::Label(Label::from_u32(6)));
+                    pipeline
+                        .borrow_unreachable_blocks
+                        .insert(Label::from_u32(6));
                 }
                 5 => {
                     for item in &mut items {
@@ -5906,9 +5916,13 @@ mod tests {
                     }
                 }
                 _ => {
-                    items.insert(cleanup, Item::Label(Label(6)));
-                    pipeline.borrow_unreachable_blocks.insert(Label(6));
-                    pipeline.borrow_finally_entries.insert(Label(6), None);
+                    items.insert(cleanup, Item::Label(Label::from_u32(6)));
+                    pipeline
+                        .borrow_unreachable_blocks
+                        .insert(Label::from_u32(6));
+                    pipeline
+                        .borrow_finally_entries
+                        .insert(Label::from_u32(6), None);
                 }
             }
             assert_eq!(
@@ -5928,8 +5942,8 @@ mod tests {
         use crate::assembler::{Instruction, Item, Label, Operand, SourceLocation};
         use crate::target::opcodes::{END_FOR, FOR_ITER, JUMP_FORWARD, LOAD_CONST, POP_ITER};
 
-        let empty = Label(0);
-        let target = Label(1);
+        let empty = Label::from_u32(0);
+        let target = Label::from_u32(1);
         let instruction =
             |opcode, operand| Instruction::new(opcode, operand, SourceLocation::NONE, None);
         for change in [
@@ -5960,8 +5974,8 @@ mod tests {
                     unreachable.insert(target);
                 }
                 "later empty alias" => {
-                    items.insert(2, Item::Label(Label(2)));
-                    unreachable.insert(Label(2));
+                    items.insert(2, Item::Label(Label::from_u32(2)));
+                    unreachable.insert(Label::from_u32(2));
                 }
                 "non-for edge" => {
                     edge = instruction(JUMP_FORWARD, Operand::Forward(target));
@@ -6038,11 +6052,11 @@ mod retained_finally_origin_tests {
             "late boundary",
             "changed prefix",
         ] {
-            let source = Label(0);
-            let alias = Label(1);
-            let cold = Label(2);
-            let target = Label(3);
-            let finally = Label(4);
+            let source = Label::from_u32(0);
+            let alias = Label::from_u32(1);
+            let cold = Label::from_u32(2);
+            let target = Label::from_u32(3);
+            let finally = Label::from_u32(4);
             let mut prefix = vec![
                 instruction(LOAD_FAST, Operand::Value(0)),
                 instruction(PUSH_NULL, Operand::Value(0)),
@@ -6066,7 +6080,7 @@ mod retained_finally_origin_tests {
                 instruction(LOAD_CONST, Operand::Value(0)),
                 instruction(RETURN_VALUE, Operand::Value(0)),
             ];
-            let source_alias = Label(5);
+            let source_alias = Label::from_u32(5);
             let mut original = vec![Item::Label(source_alias), Item::Label(source)];
             original.extend(prefix.iter().copied());
             original.extend([
@@ -6162,7 +6176,7 @@ mod retained_finally_origin_tests {
         ] {
             let mut jump = Instruction::new(
                 JUMP_FORWARD,
-                Operand::Forward(Label(2)),
+                Operand::Forward(Label::from_u32(2)),
                 SourceLocation::new(10, 10, 0, 8),
                 None,
             );
@@ -6171,23 +6185,23 @@ mod retained_finally_origin_tests {
                 Instruction::new(NOP, Operand::Value(0), SourceLocation::NONE, None);
             pop_block.fusion_policy.mark_converted_pop_block();
             let mut original = vec![
-                Item::Label(Label(0)),
+                Item::Label(Label::from_u32(0)),
                 Item::Instruction(jump),
-                Item::Label(Label(1)),
+                Item::Label(Label::from_u32(1)),
                 Item::Instruction(Instruction::new(
                     JUMP_FORWARD,
-                    Operand::Forward(Label(2)),
+                    Operand::Forward(Label::from_u32(2)),
                     SourceLocation::NONE,
                     None,
                 )),
-                Item::Label(Label(2)),
-                Item::Label(Label(3)),
+                Item::Label(Label::from_u32(2)),
+                Item::Label(Label::from_u32(3)),
                 Item::Instruction(pop_block),
             ];
             // This separates the disappearing POP_BLOCK from the live cleanup.
             // Physical label merging must not turn that empty array into an entry.
             if matches!(change, Change::EmptyOriginalTarget) {
-                original.push(Item::Label(Label(4)));
+                original.push(Item::Label(Label::from_u32(4)));
             }
             original.extend([
                 instruction(LOAD_FAST, Operand::Value(0)),
@@ -6198,17 +6212,23 @@ mod retained_finally_origin_tests {
             let mut assembler = Assembler::from_linear_items(original);
             assembler.next_label = 5;
             assembler.exception_owner_provenance.block_boundaries =
-                [Label(0), Label(1), Label(2)].into_iter().collect();
+                [Label::from_u32(0), Label::from_u32(1), Label::from_u32(2)]
+                    .into_iter()
+                    .collect();
             if matches!(change, Change::EmptyOriginalTarget) {
                 assembler
                     .exception_owner_provenance
                     .block_boundaries
-                    .insert(Label(4));
+                    .insert(Label::from_u32(4));
             }
             let mut pipeline = assembler.into_optimization_pipeline();
-            pipeline.borrow_finally_entries.insert(Label(3), None);
-            pipeline.borrow_unreachable_blocks.insert(Label(3));
-            pipeline.borrow_jump_entry_labels.insert(Label(3));
+            pipeline
+                .borrow_finally_entries
+                .insert(Label::from_u32(3), None);
+            pipeline
+                .borrow_unreachable_blocks
+                .insert(Label::from_u32(3));
+            pipeline.borrow_jump_entry_labels.insert(Label::from_u32(3));
             pipeline.record_borrow_finally_jump_sources();
             let origins = pipeline.capture_retained_finally_origins();
 
@@ -6216,24 +6236,30 @@ mod retained_finally_origin_tests {
             // return, POP_BLOCK disappeared, and the original jump kept its line.
             jump.opcode = NOP;
             jump.set_operand(Operand::Value(0));
-            let mut items = vec![Item::Label(Label(0))];
+            let mut items = vec![Item::Label(Label::from_u32(0))];
             if matches!(change, Change::MergedSourceAlias) {
-                items.insert(0, Item::Label(Label(4)));
+                items.insert(0, Item::Label(Label::from_u32(4)));
             }
             if !matches!(change, Change::ErasedJumpNop) {
                 items.push(Item::Instruction(jump));
             }
-            items.extend([Item::Label(Label(2)), Item::Label(Label(3))]);
+            items.extend([
+                Item::Label(Label::from_u32(2)),
+                Item::Label(Label::from_u32(3)),
+            ]);
             if matches!(change, Change::EmptyOriginalTarget) {
-                items.push(Item::Label(Label(4)));
+                items.push(Item::Label(Label::from_u32(4)));
             }
             items.extend([
                 instruction(LOAD_FAST, Operand::Value(0)),
                 instruction(POP_TOP, Operand::Value(0)),
                 instruction(LOAD_CONST, Operand::Value(0)),
                 instruction(RETURN_VALUE, Operand::Value(0)),
-                Item::Label(Label(1)),
-                instruction(JUMP_BACKWARD_NO_INTERRUPT, Operand::Backward(Label(2))),
+                Item::Label(Label::from_u32(1)),
+                instruction(
+                    JUMP_BACKWARD_NO_INTERRUPT,
+                    Operand::Backward(Label::from_u32(2)),
+                ),
             ]);
             pipeline.graph = BlockGraph::from_items(items, &FxHashSet::default());
             let retained = pipeline.retained_finally_entries(&origins);
@@ -6243,11 +6269,13 @@ mod retained_finally_origin_tests {
                     .iter()
                     .position(|item| matches!(item, Item::Instruction(value) if value.opcode == LOAD_FAST))
                     .unwrap();
-                items.insert(load, Item::Label(Label(4)));
-                pipeline.borrow_unreachable_blocks.insert(Label(4));
+                items.insert(load, Item::Label(Label::from_u32(4)));
+                pipeline
+                    .borrow_unreachable_blocks
+                    .insert(Label::from_u32(4));
                 // Certify a generic jump entry, but not this finally array. The
                 // newly collapsed marker must still veto the retained NOP edge.
-                pipeline.borrow_jump_entry_labels.insert(Label(4));
+                pipeline.borrow_jump_entry_labels.insert(Label::from_u32(4));
             }
             OptimizationPipeline::optimize_load_fast_with_retained_entries(
                 pipeline.python_version,
@@ -6297,9 +6325,9 @@ mod retained_finally_origin_tests {
         use crate::target::opcodes::{POP_JUMP_IF_TRUE, RAISE_VARARGS};
 
         for direct_successor in [false, true] {
-            let entry = Label(0);
-            let empty = Label(1);
-            let successor = Label(2);
+            let entry = Label::from_u32(0);
+            let empty = Label::from_u32(1);
+            let successor = Label::from_u32(2);
             let mut jump = Instruction::new(
                 JUMP_FORWARD,
                 Operand::Forward(successor),

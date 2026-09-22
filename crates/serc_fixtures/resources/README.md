@@ -1,8 +1,8 @@
-# Benchmark fixture provenance
+# Shared test and benchmark fixtures
 
-The `micro` and `marshal` fixtures are project-owned focused workloads. The composite fixtures
-materialize source that was already covered by Serc's compatibility tests, except for
-`context_managers.py`, which is shared with the execution fixtures.
+These fixtures are shared by Serc's compatibility tests and benchmarks. The `micro` and
+`marshal` fixtures are project-owned focused workloads. The composite fixtures materialize source
+that was already covered by Serc's compatibility and execution tests.
 
 `large/dataset.py` is copied byte-for-byte from
 `crates/ruff_benchmark/resources/large/dataset.py` at the Serc workspace's pinned Ruff commit

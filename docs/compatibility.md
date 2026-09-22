@@ -1,8 +1,12 @@
 # CPython compatibility
 
 Serc targets exact CPython releases, not arbitrary versions or inputs. Python 3.14 is the
-default; the 3.12, 3.13, and 3.15 targets are experimental. See the
+default. See the
 [target pins](../crates/serc/README.md#updating-the-cpython-target) for commits and magic numbers.
+
+Exact releases can still differ by native build: two CPython 3.14.5 Linux builds fold
+complex NaNs to different marshal bytes. The [build-profile diagnostic](cpython-build-profiles.md)
+records the reproducer and identities; the policy for selecting these profiles is unresolved.
 
 ## Required Ruff gate
 
@@ -24,7 +28,7 @@ resources. Ruff's dependencies, lockfile, and clean submodule must all match rev
 | --- | ---: | ---: | ---: | ---: | ---: |
 | 3.12.14 | 2,174 | 277 | 210 | 61 | 6 |
 | 3.13.15 | 2,193 | 258 | 196 | 55 | 7 |
-| 3.14.5 | 2,230 | 221 | 151 | 56 | 14 |
+| 3.14.5 | 2,230 | 221 | 152 | 55 | 14 |
 | 3.15.0rc2 | 2,249 | 202 | 133 | 55 | 14 |
 
 The last three columns partition CPython-rejected inputs and expose existing rejection
@@ -56,11 +60,9 @@ files. Its opt-in CPython 3.14.5 comparison supplements the required Ruff gate:
 ./scripts/check-mypy-primer-compatibility /path/to/python3.14.5
 ```
 
-The September 22, 2026 measurements use CPython 3.14.5 and Serc
-`af3806c`.
-Corpus revisions and membership are unchanged. The
-[results summary](../corpora/results/compatibility-2026-09-22-public-af3806c.json) records
-compiler and corpus identities, every outcome category, and evidence hashes.
+The [latest measurement](../corpora/results/current.json), from September 22, 2026, uses
+CPython 3.14.5 and Serc `af3806c`. It records compiler and corpus identities, every outcome
+category, and a link to the original evidence summary.
 
 | Corpus | Files | CPython-rejected | Byte-identical accepted | Byte mismatches | Accepted-input compiler failures | Accepted-input match rate |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -80,9 +82,9 @@ and update instructions live in the [corpus guide](../corpora/README.md).
 
 ## Holdout compatibility
 
-The same September 22 compiler and CPython target were tested against four OSS projects absent
-from the mypy-primer snapshot. Revisions and membership are unchanged: tracked regular `.py`
-files, excluding symlinks and stubs. Every CPython-accepted file matched byte for byte.
+The same compiler and CPython target were tested against four OSS projects absent from the
+mypy-primer snapshot. The comparison covers tracked regular `.py` files, excluding symlinks and
+stubs. Every CPython-accepted file matched byte for byte.
 
 | Holdout project | Files | CPython-rejected | Byte-identical accepted | Byte mismatches | Accepted-input match rate |
 | --- | ---: | ---: | ---: | ---: | ---: |

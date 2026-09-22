@@ -61,7 +61,7 @@ serc compile --check path/to/package
 
 ### Python version
 
-Select a target with `--python-version`:
+Python 3.14 is the default. Select a target with `--python-version`:
 
 ```console
 serc compile --python-version 3.12 path/to/package
@@ -70,12 +70,12 @@ serc compile --python-version 3.14 path/to/package
 serc compile --python-version 3.15 path/to/package
 ```
 
-| Target | Pinned CPython release | Status |
-| --- | --- | --- |
-| `3.12` | 3.12.14 | Experimental |
-| `3.13` | 3.13.15 | Experimental |
-| `3.14` | 3.14.5 | Default |
-| `3.15` | 3.15.0rc2 | Experimental |
+| Target | Pinned CPython release |
+| --- | --- |
+| `3.12` | 3.12.14 |
+| `3.13` | 3.13.15 |
+| `3.14` | 3.14.5 |
+| `3.15` | 3.15.0rc2 |
 
 Each target writes its own cache tag and bytecode magic number, so the four versions can coexist
 under `__pycache__`. Bytecode and marshal formats vary across Python releases; see the

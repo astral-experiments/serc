@@ -15,7 +15,7 @@ mod tests {
         CPYTHON_TARGET, CompileError, compile, compile_bytes, compile_bytes_to_pyc, compile_to_pyc,
         decode_source,
     };
-    use serc_workloads as benchmark_workloads;
+    use serc_fixtures as fixtures;
 
     #[test]
     fn exposes_the_pinned_cpython_source_identity() {
@@ -64,6 +64,48 @@ mod tests {
             "# coding: latin-1\nvalue = '\u{e9}'\n"
         );
         assert!(compile("# coding: latin-1\nvalue = 'already decoded'\n", "value.py").is_ok());
+    }
+
+    #[test]
+    fn rejects_null_characters_in_text_source() {
+        use serc::{
+            CompileOptions, InitialInternState, PythonVersion, SourceDecodeError,
+            compile_with_intern_state, compile_with_options,
+        };
+
+        let expected = CompileError::Decode(SourceDecodeError::NullByte);
+        for source in [
+            "\0value = 1\n",
+            "# generated comment\0\nvalue = 1\n",
+            "value = 'before\0after'\n",
+            "value = 1\n\0",
+            "\u{feff}# generated comment\0\r\nvalue = 1\r\n",
+        ] {
+            assert_eq!(compile(source, "null.py").unwrap_err(), expected);
+            assert_eq!(compile_to_pyc(source, "null.py", 0).unwrap_err(), expected);
+            assert_eq!(
+                compile_with_intern_state(source, "null.py", &InitialInternState::default())
+                    .unwrap_err(),
+                expected
+            );
+            for python_version in [
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ] {
+                let options = CompileOptions {
+                    python_version,
+                    ..CompileOptions::default()
+                };
+                assert_eq!(
+                    compile_with_options(source, "null.py", &options).unwrap_err(),
+                    expected
+                );
+            }
+        }
+
+        assert_matches_cpython_marshal("value = '\\0'\n", "escaped_null.py");
     }
 
     #[test]
@@ -310,11 +352,11 @@ async def coroutine():
 
     #[test]
     fn benchmark_workloads_match_cpython_marshal() {
-        for workload in benchmark_workloads::COMPILE_MICRO_WORKLOADS
+        for workload in fixtures::COMPILE_MICRO_WORKLOADS
             .iter()
-            .chain(benchmark_workloads::COMPOSITE_WORKLOADS)
-            .chain(benchmark_workloads::LARGE_WORKLOADS)
-            .chain(benchmark_workloads::MARSHAL_MICRO_WORKLOADS)
+            .chain(fixtures::COMPOSITE_WORKLOADS)
+            .chain(fixtures::LARGE_WORKLOADS)
+            .chain(fixtures::MARSHAL_MICRO_WORKLOADS)
         {
             assert_matches_cpython_marshal(workload.source, workload.filename);
         }
@@ -334,7 +376,7 @@ async def coroutine():
 
     #[test]
     fn matches_cpython_marshal_when_a_match_case_ends_in_a_constant_expression() {
-        let source = include_str!("fixtures/benchmark/match_control_flow.py");
+        let source = fixtures::MATCH_CONTROL_FLOW;
         assert_matches_cpython_marshal(source, "match.py");
     }
 
@@ -422,6 +464,38 @@ def paired_classes(value):
             return None
 ";
         assert_matches_cpython_marshal(source, "unpacked_match_capture_swaps.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_reordered_or_pattern_captures() {
+        for pattern in [
+            "[left, right] | [right, left]",
+            "[left, right] | [\n            right,\n            left\n        ]",
+            "[left, middle, right] | [right, left, middle] | [middle, right, left]",
+            "{'left': left, 'right': right} | {'left': right, 'right': left}",
+            "Point(left, right) | Point(right, left)",
+            "[left, right] | (left, right)",
+        ] {
+            let source = format!(
+                "def capture(subject):\n    match subject:\n        case {pattern}:\n            return left, right\n"
+            );
+            assert_matches_cpython_marshal(&source, "or_pattern_captures.py");
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_or_pattern_failure_cleanup_boundaries() {
+        for (pattern, guard) in [
+            ("([capture] | [_, capture]) as whole", ""),
+            ("([capture] | [_, capture]) as whole", " if subject"),
+            ("(([capture] | [_, capture]) as middle) as whole", ""),
+            ("(0 | 1) as whole", ""),
+        ] {
+            let source = format!(
+                "def capture(subject):\n    match subject:\n        case {pattern}{guard}:\n            pass\n        case _:\n            return subject\n"
+            );
+            assert_matches_cpython_marshal(&source, "or_pattern_failure_cleanup.py");
+        }
     }
 
     #[test]
@@ -1087,8 +1161,47 @@ def parent():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_class_annotation_comprehensions() {
+        for source in [
+            "class C:\n    def f(x: [i for i in (1,)]): pass\n",
+            "class C:\n global __class__\n def f(a: [i for i in __class__]): pass\n",
+            "class C:\n global __class__\n a: [i for i in __class__]\n",
+            "class C:\n global __class__\n type A = [i for i in __class__]\n",
+            "def outer(x):\n class C:\n  global x\n  def f(a: [x for i in (1,)]): pass\n return C\n",
+            "def outer(x):\n class C:\n  global x\n  a: [x for i in (1,)]\n return C\n",
+            "def outer(x):\n class C:\n  global x\n  def f(a: (x, [x for i in (1,)])): pass\n return C\n",
+            "def outer(x):\n class C:\n  global x\n  a: (x, [x for i in (1,)])\n return C\n",
+            "class C:\n global __class__\n def f(a: [__class__ for i in (1,)]): pass\n",
+            "class C:\n global __class__\n a: [__class__ for i in (1,)]\n",
+            "class C:\n global T\n def f[T](a: [T for i in (1,)]): pass\n",
+            "class C:\n global T\n def f[T](a: (T, [T for i in (1,)])): pass\n",
+            "class C:\n    x: {i for i in (1, 2) if i}\n",
+            "class C:\n    def f(x: {i: i + 1 for i in (1, 2) if i}): pass\n",
+            "class C:\n    type A = [(i, j) for i in (1, 2) for j in (i,) if j]\n",
+            "def outer(value):\n    class C:\n        type A = [value + i for i in (1, 2)]\n    return C\n",
+            "class C:\n    type A = [lambda: i for i in (1, 2)]\n",
+            "class C:\n    type A = [[lambda: j for j in (i,)] for i in (1, 2)]\n",
+            "class C:\n    values = (1, 2)\n    item = int\n    type A = [item for i in values]\n",
+            "class C:\n    def f[T: [i for i in (1, 2)]](): pass\n",
+            "class C:\n    type A[T = {i for i in (1, 2)}] = T\n",
+            "class C:\n    type A = [i for i in [j for j in (1, 2)]]\n",
+            "def outer(value):\n    class C:\n        value = 10\n        type A = [value + i for i in (1,)]\n    return C\n",
+            "def outer(value):\n    class C:\n        value = 10\n        def f(x: [value + i for i in (1,)]): pass\n    return C\n",
+            "def outer(value):\n    class C:\n        value = 10\n        x: [value + i for i in (1,)]\n    return C\n",
+            "class C:\n    type A = [__class__ for i in (1,)]\n",
+            "class C:\n    def f(x: [__class__ for i in (1,)]): pass\n",
+            "class C:\n    x: [__class__ for i in (1,)]\n",
+            "def outer(__class__):\n    class C:\n        type A = [i for i in __class__]\n    return C\n",
+            "def outer(T):\n    class C:\n        def f[T](x: [T for i in (1,)]): pass\n    return C\n",
+            "def outer(a):\n    class C:\n        a = type\n        class D[T](*[a for i in (1,)]): pass\n    return C\n",
+        ] {
+            assert_matches_cpython_marshal(source, "class_annotation_comprehensions.py");
+        }
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_annotation_scope_closures() {
-        let source = include_str!("fixtures/benchmark/annotation_scopes.py");
+        let source = fixtures::ANNOTATION_SCOPES;
         assert_matches_cpython_marshal(source, "annotation_scopes.py");
     }
 
@@ -5584,6 +5697,31 @@ async def conditional(values, source, enabled):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_constant_false_match_guard_cleanup() {
+        for (pattern, guard) in [
+            ("([captured] | [_, captured]) as whole", "False"),
+            ("[captured]", "False"),
+            ("[head, [tail]]", "False"),
+            ("{\"key\": captured}", "False"),
+            ("Record(captured)", "False"),
+            ("[captured]", "0"),
+            ("[captured]", "None"),
+            ("0", "False"),
+        ] {
+            let source = format!(
+                "def capture(subject):\n    match subject:\n        case {pattern} if {guard}:\n            pass\n        case _:\n            return subject\n"
+            );
+            assert_matches_cpython_marshal(&source, "constant_false_match_guard.py");
+        }
+        for source in [
+            "def capture(subject):\n    match subject:\n        case [captured] if False:\n            pass\n        case [captured]:\n            return captured\n        case _:\n            return subject\n",
+            "def capture(subject, manager):\n    with manager:\n        match subject:\n            case [captured] if False:\n                pass\n            case _:\n                return subject\n",
+        ] {
+            assert_matches_cpython_marshal(source, "constant_false_match_guard_context.py");
+        }
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_multiline_constant_match_guards() {
         let source = "match 1:\n    case _ if (True):\n        pass\n\nmatch 1:\n    case _ if (\n        True\n    ):\n        pass\n";
         assert_matches_cpython_marshal(source, "match_guard.py");
@@ -7254,7 +7392,7 @@ print(" ".join(
 
     #[test]
     fn matches_cpython_marshal_for_loop_and_async_iteration_edges() {
-        let source = include_str!("fixtures/benchmark/loop_async_edges.py");
+        let source = fixtures::LOOP_ASYNC_EDGES;
         assert_matches_cpython_marshal(source, "loop_tail.py");
     }
 
@@ -13911,7 +14049,7 @@ print(parse(False), parse(True))
 
     #[test]
     fn executes_context_managers_and_exception_suppression() {
-        let source = include_str!("fixtures/execution/context_managers.py");
+        let source = fixtures::CONTEXT_MANAGERS;
         assert_executes(
             source,
             "['enter', 42, 'exit', 'enter', 'exit', 'enter', 'enter', 'exit', 'exit', 'enter', 0, 'exit', 'enter', 1, 'exit', 'handled-0', 'handled-1']\n",

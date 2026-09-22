@@ -12,7 +12,7 @@ use crate::target::opcodes::{
 };
 
 use super::definition::clean_doc;
-use super::scope::{FunctionPlan, NameId, NameInterner, ScopeBodyFacts};
+use super::scope::{FunctionPlan, NameId, NameInterner, ScopeBodyFacts, ScopeId};
 use super::source::{
     debug_text_range, interpolated_string_content_range, strip_expression_comments,
     unparse_annotation,
@@ -25,6 +25,12 @@ use super::symbol::{
     CompilerStackEffect, ReraiseStackState, compiler_stack_effect, validate_compiler_stack_effect,
 };
 use super::{Compiler, SHADOWED_SUPER_SENTINEL};
+
+#[test]
+fn optional_compiler_ids_remain_four_bytes() {
+    assert_eq!(std::mem::size_of::<Option<NameId>>(), 4);
+    assert_eq!(std::mem::size_of::<Option<ScopeId>>(), 4);
+}
 
 #[test]
 fn generator_nested_comprehension_captures_keep_scope_roles_for_all_targets() {
@@ -463,14 +469,17 @@ fn interns_adversarial_identifier_families_densely() {
 
     for (index, name) in names.iter().enumerate() {
         let id = interner.intern(name);
-        assert_eq!(id, NameId(u32::try_from(index).unwrap()));
+        assert_eq!(id, NameId::from_u32(u32::try_from(index).unwrap()));
         assert_eq!(interner.resolve(id), name);
     }
     for (index, name) in names.iter().enumerate().rev() {
-        assert_eq!(interner.intern(name), NameId(u32::try_from(index).unwrap()));
+        assert_eq!(
+            interner.intern(name),
+            NameId::from_u32(u32::try_from(index).unwrap())
+        );
         assert_eq!(
             interner.get(name),
-            Some(NameId(u32::try_from(index).unwrap()))
+            Some(NameId::from_u32(u32::try_from(index).unwrap()))
         );
     }
     assert_eq!(
@@ -496,8 +505,8 @@ fn name_ids_do_not_define_observable_name_order() {
             .collect::<Vec<_>>(),
         ["_hidden", "alpha", "beta", "zeta", "éclair"]
     );
-    assert_eq!(source_order[0], NameId(0));
-    assert_eq!(source_order[1], NameId(1));
+    assert_eq!(source_order[0], NameId::from_u32(0));
+    assert_eq!(source_order[1], NameId::from_u32(1));
 
     let plan = FunctionPlan {
         locals: source_order.to_vec(),
@@ -593,13 +602,13 @@ class Container:
         let metadata = &code.marshal_provenance.metadata_ids;
         assert_eq!(metadata.names.len(), code.names.len());
         assert_eq!(metadata.locals.len(), code.locals.len());
-        assert!(metadata.filename < metadata.domain_len);
+        assert!(metadata.filename.as_u32() < metadata.domain_len);
         assert!(
             metadata
                 .names
                 .iter()
                 .chain(&metadata.locals)
-                .all(|id| *id < metadata.domain_len)
+                .all(|id| id.as_u32() < metadata.domain_len)
         );
     }
 }

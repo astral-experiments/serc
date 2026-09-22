@@ -1010,24 +1010,53 @@ pub(super) struct OriginalNormalFinallyArray {
     pub(super) borrow_join: Option<(Label, Instruction)>,
 }
 
+/// Whether a slot is protected, with its exact source region when known.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct ExceptionOwnerDecision {
-    pub(super) has_owner: bool,
+pub(super) enum ExceptionOwner {
+    Absent,
+    /// An owner exists, but layout must infer its source region.
+    Present,
     // An earlier original-array record can have a different owner from the condition.
-    pub(super) source_region: Option<usize>,
-    pub(super) definitive: bool,
-    pub(super) override_existing: bool,
+    SourceRegion(usize),
+}
+
+/// The strength of an ownership result reconstructed from original-array provenance.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ExceptionOwnerDecision {
+    Tentative(ExceptionOwner),
+    Definitive(ExceptionOwner),
+    Override(ExceptionOwner),
 }
 
 impl ExceptionOwnerDecision {
     /// Replaces the inferred owner with an exact source region or an unowned slot.
     fn override_with_region(source_region: Option<usize>) -> Self {
-        Self {
-            has_owner: source_region.is_some(),
-            source_region,
-            definitive: true,
-            override_existing: true,
+        Self::Override(source_region.map_or(ExceptionOwner::Absent, ExceptionOwner::SourceRegion))
+    }
+
+    fn owner(self) -> ExceptionOwner {
+        match self {
+            Self::Tentative(owner) | Self::Definitive(owner) | Self::Override(owner) => owner,
         }
+    }
+
+    pub(super) fn has_owner(self) -> bool {
+        !matches!(self.owner(), ExceptionOwner::Absent)
+    }
+
+    pub(super) fn source_region(self) -> Option<usize> {
+        match self.owner() {
+            ExceptionOwner::SourceRegion(region) => Some(region),
+            ExceptionOwner::Absent | ExceptionOwner::Present => None,
+        }
+    }
+
+    pub(super) fn is_definitive(self) -> bool {
+        !matches!(self, Self::Tentative(_))
+    }
+
+    pub(super) fn overrides_existing(self) -> bool {
+        matches!(self, Self::Override(_))
     }
 }
 
@@ -6418,7 +6447,7 @@ impl LayoutAssembler {
                             && !has_owner
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive);
+                                .is_none_or(|owner| !owner.is_definitive());
                         // Presence is already proved for a value-preserving Boolean
                         // marker. Retained array provenance supplies its exact source owner.
                         let source_region = (has_owner
@@ -6426,7 +6455,7 @@ impl LayoutAssembler {
                                 == NormalizedExceptionOwner::Dynamic
                             && instruction_index > 0
                             && owners.get(&instruction_index).is_none_or(
-                                |owner: &ExceptionOwnerDecision| owner.source_region.is_none(),
+                                |owner: &ExceptionOwnerDecision| owner.source_region().is_none(),
                             ))
                         .then(|| {
                             self.exception_owner_provenance
@@ -6447,18 +6476,23 @@ impl LayoutAssembler {
                                 })
                         })
                         .flatten();
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner,
-                                source_region,
-                                override_existing: false,
-                                definitive: proven_unprotected_slot
-                                    || prologue_consumed_all_slots
-                                    || instruction.exception_policy().owner()
-                                        != NormalizedExceptionOwner::DynamicCondition,
-                            },
-                        );
+                        let owner = if let Some(region) = source_region {
+                            ExceptionOwner::SourceRegion(region)
+                        } else if has_owner {
+                            ExceptionOwner::Present
+                        } else {
+                            ExceptionOwner::Absent
+                        };
+                        let decision = if proven_unprotected_slot
+                            || prologue_consumed_all_slots
+                            || instruction.exception_policy().owner()
+                                != NormalizedExceptionOwner::DynamicCondition
+                        {
+                            ExceptionOwnerDecision::Definitive(owner)
+                        } else {
+                            ExceptionOwnerDecision::Tentative(owner)
+                        };
+                        owners.insert(instruction_index, decision);
                     }
                     // These replay rules only resolve inserted markers.
                     if instruction.opcode == NOT_TAKEN {
@@ -6477,16 +6511,11 @@ impl LayoutAssembler {
                             && tail.post_compaction_fusions == 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                         {
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: false,
-                                    source_region: None,
-                                    definitive: true,
-                                    override_existing: false,
-                                },
+                                ExceptionOwnerDecision::Definitive(ExceptionOwner::Absent),
                             );
                         }
                         // Local fusion leaves a newer stale suffix inside the original array.
@@ -6572,12 +6601,7 @@ impl LayoutAssembler {
                             {
                                 owners.insert(
                                     instruction_index,
-                                    ExceptionOwnerDecision {
-                                        has_owner: false,
-                                        source_region: None,
-                                        definitive: true,
-                                        override_existing: false,
-                                    },
+                                    ExceptionOwnerDecision::Definitive(ExceptionOwner::Absent),
                                 );
                             }
                         }
@@ -6646,12 +6670,7 @@ impl LayoutAssembler {
                             {
                                 owners.insert(
                                     instruction_index,
-                                    ExceptionOwnerDecision {
-                                        has_owner: true,
-                                        source_region: None,
-                                        definitive: true,
-                                        override_existing: true,
-                                    },
+                                    ExceptionOwnerDecision::Override(ExceptionOwner::Present),
                                 );
                             }
                         }
@@ -6724,12 +6743,7 @@ impl LayoutAssembler {
                         }) {
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: true,
-                                    source_region: None,
-                                    definitive: true,
-                                    override_existing: true,
-                                },
+                                ExceptionOwnerDecision::Override(ExceptionOwner::Present),
                             );
                         }
                         let reusable_suffix_slots = if tail.late_removals > 0 {
@@ -6790,12 +6804,7 @@ impl LayoutAssembler {
                             // no removed records. Appending its marker allocates a NULL owner.
                             owners.insert(
                                 instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: false,
-                                    source_region: None,
-                                    definitive: true,
-                                    override_existing: false,
-                                },
+                                ExceptionOwnerDecision::Definitive(ExceptionOwner::Absent),
                             );
                         }
                         // Fusion leaves stale records in a uniformly owned original source
@@ -6829,7 +6838,7 @@ impl LayoutAssembler {
                             && tail.post_compaction_fusions == 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive)
+                                .is_none_or(|owner| !owner.is_definitive())
                             && let Some(region) = self.entry_manager_return_setup_owner(
                                 instruction_index,
                                 tail.insertions,
@@ -6853,7 +6862,7 @@ impl LayoutAssembler {
                             && tail.post_compaction_fusions == 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive)
+                                .is_none_or(|owner| !owner.is_definitive())
                             && self.retained_manager_return_none_owner(
                                 instruction_index,
                                 original_array_start,
@@ -6880,7 +6889,7 @@ impl LayoutAssembler {
                             && tail.late_removals == 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive)
+                                .is_none_or(|owner| !owner.is_definitive())
                             && let Some(decision) = self.copied_manager_return_compaction_owner(
                                 instruction_index,
                                 original_array_start,
@@ -6911,7 +6920,7 @@ impl LayoutAssembler {
                             && tail.post_compaction_fusions == 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive)
+                                .is_none_or(|owner| !owner.is_definitive())
                             && let Some(decision) = self.copied_manager_return_compaction_owner(
                                 instruction_index,
                                 original_array_start,
@@ -6933,7 +6942,7 @@ impl LayoutAssembler {
                             && tail.post_compaction_fusions == 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive)
+                                .is_none_or(|owner| !owner.is_definitive())
                             && let Some(decision) = self.copied_manager_return_compaction_owner(
                                 instruction_index,
                                 original_array_start,
@@ -6957,7 +6966,7 @@ impl LayoutAssembler {
                             && tail.post_compaction_fusions == 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive)
+                                .is_none_or(|owner| !owner.is_definitive())
                             && let Some(region) = self.copied_return_call_parent_owner(
                                 instruction_index,
                                 original_array_start,
@@ -6984,7 +6993,7 @@ impl LayoutAssembler {
                             && tail.post_compaction_fusions == 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive)
+                                .is_none_or(|owner| !owner.is_definitive())
                             && let Some(decision) = self.copied_return_attribute_truth_owner(
                                 instruction_index,
                                 original_array_start,
@@ -7281,7 +7290,7 @@ impl LayoutAssembler {
                             != super::BorrowFallthrough::Barrier
                         && owners
                             .get(&(instruction_index + 1))
-                            .is_none_or(|owner| !owner.definitive)
+                            .is_none_or(|owner| !owner.is_definitive())
                     {
                         owners.insert(
                             instruction_index + 1,
@@ -7509,11 +7518,11 @@ impl LayoutAssembler {
                                 !self.exception_regions[region].is_scope_fallback
                             }) && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive))
+                                .is_none_or(|owner| !owner.is_definitive()))
                             || (reuses_null_setup
                                 && owners
                                     .get(&instruction_index)
-                                    .is_none_or(|owner| !owner.definitive))
+                                    .is_none_or(|owner| !owner.is_definitive()))
                         {
                             owners.insert(
                                 instruction_index,
@@ -7532,7 +7541,7 @@ impl LayoutAssembler {
                         && tail.post_compaction_fusions == 0
                         && owners
                             .get(&instruction_index)
-                            .is_none_or(|owner| !owner.definitive)
+                            .is_none_or(|owner| !owner.is_definitive())
                         && let Some(region) = self.copied_bare_handler_none_owner(
                             instruction_index,
                             original_array_start,
@@ -8038,7 +8047,7 @@ impl LayoutAssembler {
                         && index == instruction_index
                         && owners
                             .get(&instruction_index)
-                            .is_none_or(|owner| !owner.definitive || owner.has_owner)
+                            .is_none_or(|owner| !owner.is_definitive() || owner.has_owner())
                     {
                         owners.insert(
                             instruction_index,
@@ -8086,7 +8095,7 @@ impl LayoutAssembler {
                         && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
                         && owners
                             .get(&instruction_index)
-                            .is_none_or(|owner| !owner.definitive)
+                            .is_none_or(|owner| !owner.is_definitive())
                         && let Some(owner) = self.copied_return_membership_owner(
                             instruction_index,
                             original_array_start,
@@ -8125,7 +8134,7 @@ impl LayoutAssembler {
                             && index == instruction_index
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive)
+                                .is_none_or(|owner| !owner.is_definitive())
                         {
                             owners.insert(
                                 instruction_index,
@@ -8135,7 +8144,7 @@ impl LayoutAssembler {
                         if instruction_index > 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive)
+                                .is_none_or(|owner| !owner.is_definitive())
                         {
                             for (condition, marker, region) in
                                 &self.exception_owner_provenance.fused_manager_owners
@@ -8168,10 +8177,10 @@ impl LayoutAssembler {
                                 .values()
                                 .any(|position| *position == instruction_index)
                             && owners.get(&instruction_index).is_none_or(|decision| {
-                                !decision.definitive
-                                    || (decision.has_owner
-                                        && decision.source_region.is_none()
-                                        && !decision.override_existing)
+                                !decision.is_definitive()
+                                    || (decision.has_owner()
+                                        && decision.source_region().is_none()
+                                        && !decision.overrides_existing())
                             })
                             && let Some(region) = self.copied_handler_value_owner(
                                 instruction_index,
@@ -8194,7 +8203,7 @@ impl LayoutAssembler {
                             && owner_history_exact
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                             && let Some(region) = self.named_handler_try_owner(
                                 instruction_index,
                                 original_array_start,
@@ -8213,7 +8222,7 @@ impl LayoutAssembler {
                             && owner_history_exact
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                             && self
                                 .continued_handler_try_is_null(
                                     instruction_index,
@@ -8237,7 +8246,7 @@ impl LayoutAssembler {
                             && pop_slot_epoch_known
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                             && self.saved_named_handler_none_is_null(
                                 instruction_index,
                                 original_array_start,
@@ -8258,7 +8267,7 @@ impl LayoutAssembler {
                             && owner_history_exact
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                             && let Some(decision) = self.copied_cleanup_return_none_owner(
                                 instruction_index,
                                 original_array_start,
@@ -8287,7 +8296,7 @@ impl LayoutAssembler {
                             )
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                             && let Some((
                                 array,
                                 start,
@@ -8585,7 +8594,7 @@ impl LayoutAssembler {
                             )
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                             && let Some((array, pop, slot, region)) = early_return_nop_slot
                             && original_array_start == array
                             && pop < instruction_index
@@ -8626,7 +8635,7 @@ impl LayoutAssembler {
                             && instruction.pre_fold_extra_instructions() == 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                             && let Some((array, iterator, slot, region)) =
                                 early_return_iterator_slot
                             && original_array_start == array
@@ -8678,7 +8687,7 @@ impl LayoutAssembler {
                             && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|owner| !owner.definitive)
+                                .is_none_or(|owner| !owner.is_definitive())
                             && let Some((array, iterator, slot, region)) =
                                 early_return_iterator_slot
                             && original_array_start == array
@@ -8761,7 +8770,7 @@ impl LayoutAssembler {
                             && instruction.pre_fold_extra_instructions() == 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                             && let Some((array, pop, slot)) = early_return_truth_slot
                             && original_array_start == array
                             && instruction_index - pop == 4
@@ -8799,12 +8808,7 @@ impl LayoutAssembler {
                             if !protected || source_region.is_some() {
                                 owners.insert(
                                     instruction_index,
-                                    ExceptionOwnerDecision {
-                                        has_owner: protected,
-                                        source_region,
-                                        definitive: true,
-                                        override_existing: true,
-                                    },
+                                    ExceptionOwnerDecision::override_with_region(source_region),
                                 );
                             }
                         }
@@ -8884,11 +8888,11 @@ impl LayoutAssembler {
                                     | NormalizedExceptionOwner::DynamicCondition
                             ) || threaded_paired_pop_marker)
                             && owners.get(&instruction_index).is_none_or(|decision| {
-                                !decision.definitive
+                                !decision.is_definitive()
                                     || (threaded_paired_pop_marker
-                                        && decision.has_owner
-                                        && decision.source_region.is_none()
-                                        && !decision.override_existing)
+                                        && decision.has_owner()
+                                        && decision.source_region().is_none()
+                                        && !decision.overrides_existing())
                             })
                             && let Some((array, pop, slot, region)) = early_return_nop_slot
                             && original_array_start == array
@@ -8939,7 +8943,7 @@ impl LayoutAssembler {
                                 == NormalizedExceptionOwner::Present
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                             && self.entry_retained_setup_null_marker(
                                 instruction_index,
                                 &indexed_instructions,
@@ -8980,7 +8984,7 @@ impl LayoutAssembler {
                             && tail.post_compaction_fusions == 0
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                             && self.copied_named_break_truth_is_null(
                                 instruction_index,
                                 original_array_start,
@@ -8999,7 +9003,7 @@ impl LayoutAssembler {
                                 == super::ExceptionPolicy::NoneDynamicCondition
                             && owners
                                 .get(&instruction_index)
-                                .is_none_or(|decision| !decision.definitive)
+                                .is_none_or(|decision| !decision.is_definitive())
                             && let Some(region) = self.copied_shared_break_truth_owner(
                                 instruction_index,
                                 original_array_start,
@@ -9226,12 +9230,7 @@ impl LayoutAssembler {
             // the old condition cell at index four for the appended NOT_TAKEN.
             owners.insert(
                 marker,
-                ExceptionOwnerDecision {
-                    has_owner: true,
-                    source_region: Some(region),
-                    definitive: true,
-                    override_existing: true,
-                },
+                ExceptionOwnerDecision::override_with_region(Some(region)),
             );
         }
         owners
@@ -11298,7 +11297,7 @@ mod tests {
             "retired entry",
             "copied entry",
         ] {
-            let body = Label(2);
+            let body = Label::from_u32(2);
             let location = SourceLocation::new(4, 4, 8, 12);
             let original = Instruction::new(STORE_FAST, Operand::Value(4), location, None);
             let mut surviving = original;
@@ -11318,14 +11317,14 @@ mod tests {
 
             // The body starts at instruction 2, although its store is item 5.
             let mut items = vec![
-                Item::Label(Label(0)),
+                Item::Label(Label::from_u32(0)),
                 Item::Instruction(Instruction::new(
                     LOAD_CONST,
                     Operand::Value(0),
                     location,
                     None,
                 )),
-                Item::Label(Label(1)),
+                Item::Label(Label::from_u32(1)),
                 Item::Instruction(Instruction::new(POP_TOP, Operand::Value(0), location, None)),
                 Item::Label(body),
                 Item::Instruction(surviving),
@@ -11337,7 +11336,7 @@ mod tests {
                 ..ExceptionOwnerProvenance::default()
             };
             match case {
-                "intervening label" => items.insert(5, Item::Label(Label(3))),
+                "intervening label" => items.insert(5, Item::Label(Label::from_u32(3))),
                 "duplicate body" => items.push(Item::Label(body)),
                 "duplicate origin" => provenance.for_target_owner_prefixes.push((body, original)),
                 "missing source boundary" => provenance.source_boundaries.clear(),
@@ -11409,11 +11408,11 @@ mod tests {
             LOAD_CONST, LOAD_FAST, NOP, NOT_TAKEN, POP_JUMP_IF_FALSE, RETURN_VALUE,
         };
 
-        let setup = Label(0);
-        let end = Label(1);
-        let exit = Label(2);
-        let bookkeeping = Label(3);
-        let handler = Label(4);
+        let setup = Label::from_u32(0);
+        let end = Label::from_u32(1);
+        let exit = Label::from_u32(2);
+        let bookkeeping = Label::from_u32(3);
+        let handler = Label::from_u32(4);
         let location = SourceLocation::new(2, 2, 0, 4);
         let plain =
             |opcode, operand| Item::Instruction(Instruction::new(opcode, operand, location, None));
@@ -11468,7 +11467,7 @@ mod tests {
             if outer_region {
                 // An earlier outer handler invalidates the first unprotected array
                 // origin even though all compaction and insertion counts are zero.
-                let outer_start = Label(5);
+                let outer_start = Label::from_u32(5);
                 assembler.items.insert(0, Item::Label(outer_start));
                 assembler.exception_regions.push(ExceptionRegion {
                     is_scope_fallback: false,
@@ -11483,9 +11482,9 @@ mod tests {
             }
             let decisions = assembler.dynamic_exception_owners();
             let decision = decisions.get(&3).expect("dynamic marker decision");
-            assert!(!decision.has_owner);
-            assert_eq!(decision.definitive, !barrier && !outer_region);
-            assert_eq!(decision.override_existing, !barrier && !outer_region);
+            assert!(!decision.has_owner());
+            assert_eq!(decision.is_definitive(), !barrier && !outer_region);
+            assert_eq!(decision.overrides_existing(), !barrier && !outer_region);
 
             if !barrier && !outer_region {
                 let Item::Instruction(instruction) = &mut assembler.items[5] else {
@@ -11494,7 +11493,7 @@ mod tests {
                 instruction.opcode = LOAD_FAST;
                 let decisions = assembler.dynamic_exception_owners();
                 let decision = decisions.get(&3).expect("ordinary dynamic owner decision");
-                assert!(!decision.override_existing);
+                assert!(!decision.overrides_existing());
             }
         }
     }
@@ -11530,23 +11529,23 @@ mod tests {
                 Item::Instruction(Instruction::new(opcode, operand, location, None))
             };
             let mut items = vec![
-                Item::Label(Label(0)),
+                Item::Label(Label::from_u32(0)),
                 plain(NOP, Operand::Value(0)),
                 plain(NOP, Operand::Value(0)),
                 plain(STORE_FAST, Operand::Value(4)),
                 plain(STORE_FAST, Operand::Value(5)),
                 plain(LOAD_FAST, Operand::Value(0)),
-                plain(POP_JUMP_IF_FALSE, Operand::Forward(Label(2))),
+                plain(POP_JUMP_IF_FALSE, Operand::Forward(Label::from_u32(2))),
                 plain(NOT_TAKEN, Operand::Value(0)),
-                Item::Label(Label(1)),
+                Item::Label(Label::from_u32(1)),
                 plain(LOAD_CONST, Operand::Value(0)),
                 plain(RETURN_VALUE, Operand::Value(0)),
-                Item::Label(Label(2)),
-                plain(JUMP_FORWARD, Operand::Forward(Label(3))),
-                Item::Label(Label(3)),
+                Item::Label(Label::from_u32(2)),
+                plain(JUMP_FORWARD, Operand::Forward(Label::from_u32(3))),
+                Item::Label(Label::from_u32(3)),
                 plain(LOAD_CONST, Operand::Value(0)),
                 plain(RETURN_VALUE, Operand::Value(0)),
-                Item::Label(Label(4)),
+                Item::Label(Label::from_u32(4)),
                 plain(LOAD_CONST, Operand::Value(0)),
                 plain(RETURN_VALUE, Operand::Value(0)),
             ];
@@ -11558,13 +11557,16 @@ mod tests {
             let mut pipeline = Assembler {
                 code: UnoptimizedCode::Linear(items),
                 exception_regions: vec![ExceptionRegion {
-                    start: Label(0),
-                    end: Label(1),
-                    target: Label(4),
+                    start: Label::from_u32(0),
+                    end: Label::from_u32(1),
+                    target: Label::from_u32(4),
                     depth: 2,
                     preserve_lasti: true,
                     is_scope_fallback: false,
-                    priority: ExceptionRegionPriority::OriginalRange(Label(0), Label(1)),
+                    priority: ExceptionRegionPriority::OriginalRange(
+                        Label::from_u32(0),
+                        Label::from_u32(1),
+                    ),
                 }],
                 next_label: 6,
                 ..Assembler::default()
@@ -11572,7 +11574,7 @@ mod tests {
             .into_optimization_pipeline();
             pipeline
                 .conditional_threading_targets
-                .insert(Label(2), location);
+                .insert(Label::from_u32(2), location);
             assert!(pipeline.thread_original_conditional_jump_targets());
             assert_eq!(
                 pipeline
@@ -11617,11 +11619,11 @@ mod tests {
                     .threaded_condition_origins
                     .clear(),
                 "late setup" => {
-                    assembler.items.insert(1, Item::Label(Label(5)));
+                    assembler.items.insert(1, Item::Label(Label::from_u32(5)));
                     assembler
                         .exception_owner_provenance
                         .setups
-                        .push((Label(5), None));
+                        .push((Label::from_u32(5), None));
                 }
                 "opaque count" => {
                     let store = assembler
@@ -11640,7 +11642,7 @@ mod tests {
                     let Item::Instruction(condition) = &mut assembler.items[marker_item - 1] else {
                         unreachable!();
                     };
-                    condition.retarget(Operand::Forward(Label(1)));
+                    condition.retarget(Operand::Forward(Label::from_u32(1)));
                 }
                 "duplicate origin" => assembler
                     .exception_owner_provenance
@@ -11650,11 +11652,17 @@ mod tests {
                     .items
                     .extend([Item::Instruction(origin.0), Item::Instruction(origin.1)]),
                 "new join" => {
-                    assembler.items.insert(marker_item, Item::Label(Label(5)));
-                    assembler.preserved_block_boundaries.insert(Label(5));
+                    assembler
+                        .items
+                        .insert(marker_item, Item::Label(Label::from_u32(5)));
+                    assembler
+                        .preserved_block_boundaries
+                        .insert(Label::from_u32(5));
                 }
                 "bookkeeping" => {
-                    assembler.items.insert(marker_item, Item::Label(Label(5)));
+                    assembler
+                        .items
+                        .insert(marker_item, Item::Label(Label::from_u32(5)));
                 }
                 "intervening barrier" => {
                     let mut barrier = Instruction::new(NOP, Operand::Value(0), location, None);
@@ -11668,7 +11676,7 @@ mod tests {
                 "unknown source join" => {
                     assembler
                         .items
-                        .insert(marker_item - 1, Item::Label(Label(5)));
+                        .insert(marker_item - 1, Item::Label(Label::from_u32(5)));
                 }
                 _ => {}
             }
@@ -11684,7 +11692,7 @@ mod tests {
             let owners = assembler.dynamic_exception_owners();
             let decision = owners.get(&marker_index).expect("dynamic marker decision");
             assert_eq!(
-                !decision.has_owner && decision.definitive && decision.override_existing,
+                !decision.has_owner() && decision.is_definitive() && decision.overrides_existing(),
                 matches!(change, "unchanged" | "bookkeeping"),
                 "{change}"
             );
@@ -11728,7 +11736,7 @@ mod tests {
             };
             let mut condition = Instruction::new(
                 POP_JUMP_IF_NOT_NONE,
-                Operand::Forward(Label(9)),
+                Operand::Forward(Label::from_u32(9)),
                 location,
                 None,
             );
@@ -11739,44 +11747,48 @@ mod tests {
                 python_version: crate::PythonVersion::Py314,
                 legacy_uniform_jump_seed: false,
                 items: vec![
-                    Item::Label(Label(0)),
+                    Item::Label(Label::from_u32(0)),
                     plain(LOAD_CONST, Operand::Value(0)),
-                    Item::Label(Label(1)),
+                    Item::Label(Label::from_u32(1)),
                     plain(LOAD_CONST, Operand::Value(0)),
-                    Item::Label(Label(2)),
-                    Item::Label(Label(3)),
+                    Item::Label(Label::from_u32(2)),
+                    Item::Label(Label::from_u32(3)),
                     plain(NOP, Operand::Value(0)),
-                    Item::Label(Label(4)),
-                    Item::Label(Label(5)),
-                    Item::Label(Label(6)),
+                    Item::Label(Label::from_u32(4)),
+                    Item::Label(Label::from_u32(5)),
+                    Item::Label(Label::from_u32(6)),
                     plain(LOAD_FAST, Operand::Value(0)),
                     Item::Instruction(condition),
                     Item::Instruction(marker),
-                    Item::Label(Label(8)),
+                    Item::Label(Label::from_u32(8)),
                     plain(LOAD_CONST, Operand::Value(0)),
                     plain(RETURN_VALUE, Operand::Value(0)),
-                    Item::Label(Label(9)),
+                    Item::Label(Label::from_u32(9)),
                     plain(LOAD_CONST, Operand::Value(0)),
                     plain(RETURN_VALUE, Operand::Value(0)),
                 ],
                 exception_regions: Vec::new(),
                 exception_owner_provenance: ExceptionOwnerProvenance {
                     setups: vec![
-                        (Label(1), None),
-                        (Label(2), None),
-                        (Label(5), Some(location)),
-                        (Label(6), None),
+                        (Label::from_u32(1), None),
+                        (Label::from_u32(2), None),
+                        (Label::from_u32(5), Some(location)),
+                        (Label::from_u32(6), None),
                     ],
-                    block_boundaries: [Label(0)].into_iter().collect(),
-                    source_boundaries: [Label(0)].into_iter().collect(),
-                    setup_nop_boundaries: [Label(3), Label(4)].into_iter().collect(),
-                    setup_nop_ranges: vec![(Label(3), Label(4))],
-                    synchronous_with_setups: [Label(1), Label(2)].into_iter().collect(),
+                    block_boundaries: [Label::from_u32(0)].into_iter().collect(),
+                    source_boundaries: [Label::from_u32(0)].into_iter().collect(),
+                    setup_nop_boundaries: [Label::from_u32(3), Label::from_u32(4)]
+                        .into_iter()
+                        .collect(),
+                    setup_nop_ranges: vec![(Label::from_u32(3), Label::from_u32(4))],
+                    synchronous_with_setups: [Label::from_u32(1), Label::from_u32(2)]
+                        .into_iter()
+                        .collect(),
                     source_none_conditions: vec![SourceNoneCondition {
-                        entry: Label(0),
-                        labels: (0..=6).map(Label).collect(),
+                        entry: Label::from_u32(0),
+                        labels: (0..=6).map(Label::from_u32).collect(),
                         instruction: condition,
-                        entry_prefix: Some(vec![Item::Label(Label(0))]),
+                        entry_prefix: Some(vec![Item::Label(Label::from_u32(0))]),
                     }],
                     ..ExceptionOwnerProvenance::default()
                 },
@@ -11786,15 +11798,19 @@ mod tests {
                 has_next_location: false,
             };
             match change {
-                "bookkeeping" => assembler.items.insert(12, Item::Label(Label(7))),
+                "bookkeeping" => assembler.items.insert(12, Item::Label(Label::from_u32(7))),
                 "one setup owned load" => {
                     assembler.items.remove(4);
                     let provenance = &mut assembler.exception_owner_provenance;
-                    provenance.setups.retain(|(label, _)| *label != Label(2));
+                    provenance
+                        .setups
+                        .retain(|(label, _)| *label != Label::from_u32(2));
                     provenance.source_none_conditions[0]
                         .labels
-                        .retain(|label| *label != Label(2));
-                    provenance.synchronous_with_setups.remove(&Label(2));
+                        .retain(|label| *label != Label::from_u32(2));
+                    provenance
+                        .synchronous_with_setups
+                        .remove(&Label::from_u32(2));
                 }
                 "no origin" => assembler
                     .exception_owner_provenance
@@ -11802,22 +11818,24 @@ mod tests {
                     .clear(),
                 "retarget" => {
                     let mut changed = condition;
-                    changed.set_operand(Operand::Forward(Label(8)));
+                    changed.set_operand(Operand::Forward(Label::from_u32(8)));
                     assembler.items[11] = Item::Instruction(changed);
                 }
                 "duplicate condition" => assembler.items.push(Item::Instruction(condition)),
-                "new join" => assembler.items.insert(10, Item::Label(Label(10))),
+                "new join" => assembler.items.insert(10, Item::Label(Label::from_u32(10))),
                 "old target" => {
-                    assembler.preserved_block_boundaries.insert(Label(3));
+                    assembler
+                        .preserved_block_boundaries
+                        .insert(Label::from_u32(3));
                 }
                 "incoming jump" => assembler
                     .items
-                    .push(plain(JUMP_FORWARD, Operand::Forward(Label(3)))),
+                    .push(plain(JUMP_FORWARD, Operand::Forward(Label::from_u32(3)))),
                 "copied entry" => {
                     assembler
                         .exception_owner_provenance
                         .normal_try_copy_blocks
-                        .insert(Label(0));
+                        .insert(Label::from_u32(0));
                 }
                 "retained nop changed" => assembler.items[6] = plain(LOAD_CONST, Operand::Value(0)),
                 "prefix hidden" => {
@@ -11848,7 +11866,7 @@ mod tests {
                 "multiline count" => {
                     let mut changed = Instruction::new(
                         POP_JUMP_IF_NOT_NONE,
-                        Operand::Forward(Label(9)),
+                        Operand::Forward(Label::from_u32(9)),
                         location,
                         None,
                     );
@@ -11857,7 +11875,7 @@ mod tests {
                     assembler.exception_owner_provenance.source_none_conditions[0].instruction =
                         changed;
                 }
-                "duplicate label" => assembler.items.push(Item::Label(Label(0))),
+                "duplicate label" => assembler.items.push(Item::Label(Label::from_u32(0))),
                 _ => {}
             }
             let mut positions = rustc_hash::FxHashMap::default();
@@ -11951,7 +11969,7 @@ mod tests {
             if returned {
                 current_pop.local_policy.add_hidden_exception_owner_slots(1);
             }
-            let mut source_prefix = vec![Item::Label(Label(0))];
+            let mut source_prefix = vec![Item::Label(Label::from_u32(0))];
             if returned {
                 source_prefix.push(Item::Instruction(plain(
                     NOP,
@@ -11959,7 +11977,7 @@ mod tests {
                     prefix_location,
                 )));
             }
-            source_prefix.push(Item::Label(Label(10)));
+            source_prefix.push(Item::Label(Label::from_u32(10)));
             if !handler {
                 source_prefix.push(Item::Instruction(source_pop));
             }
@@ -11968,7 +11986,11 @@ mod tests {
             } else {
                 current_pop
             };
-            let mut condition = plain(POP_JUMP_IF_NOT_NONE, Operand::Forward(Label(9)), location);
+            let mut condition = plain(
+                POP_JUMP_IF_NOT_NONE,
+                Operand::Forward(Label::from_u32(9)),
+                location,
+            );
             condition.local_policy.add_hidden_exception_owner_slots(3);
             let mut marker = plain(NOT_TAKEN, Operand::Value(0), location);
             marker.set_exception_owner(NormalizedExceptionOwner::Present);
@@ -11978,54 +12000,56 @@ mod tests {
                 items: vec![
                     Item::Instruction(plain(
                         JUMP_FORWARD,
-                        Operand::Forward(Label(0)),
+                        Operand::Forward(Label::from_u32(0)),
                         prefix_location,
                     )),
-                    Item::Label(Label(0)),
-                    Item::Label(Label(10)),
+                    Item::Label(Label::from_u32(0)),
+                    Item::Label(Label::from_u32(10)),
                     Item::Instruction(prefix_instruction),
                     Item::Instruction(plain(LOAD_CONST, Operand::Value(0), location)),
-                    Item::Label(Label(1)),
+                    Item::Label(Label::from_u32(1)),
                     Item::Instruction(plain(LOAD_CONST, Operand::Value(0), location)),
-                    Item::Label(Label(2)),
-                    Item::Label(Label(3)),
+                    Item::Label(Label::from_u32(2)),
+                    Item::Label(Label::from_u32(3)),
                     Item::Instruction(plain(NOP, Operand::Value(0), setup_location)),
-                    Item::Label(Label(4)),
-                    Item::Label(Label(5)),
-                    Item::Label(Label(6)),
+                    Item::Label(Label::from_u32(4)),
+                    Item::Label(Label::from_u32(5)),
+                    Item::Label(Label::from_u32(6)),
                     Item::Instruction(plain(LOAD_FAST, Operand::Value(0), location)),
                     Item::Instruction(condition),
                     Item::Instruction(marker),
-                    Item::Label(Label(8)),
+                    Item::Label(Label::from_u32(8)),
                     Item::Instruction(plain(LOAD_CONST, Operand::Value(0), location)),
                     Item::Instruction(plain(RETURN_VALUE, Operand::Value(0), location)),
-                    Item::Label(Label(9)),
+                    Item::Label(Label::from_u32(9)),
                     Item::Instruction(plain(LOAD_CONST, Operand::Value(0), location)),
                     Item::Instruction(plain(RETURN_VALUE, Operand::Value(0), location)),
                 ],
                 exception_regions: Vec::new(),
                 exception_owner_provenance: ExceptionOwnerProvenance {
                     setups: vec![
-                        (Label(1), None),
-                        (Label(2), None),
-                        (Label(5), Some(setup_location)),
-                        (Label(6), None),
+                        (Label::from_u32(1), None),
+                        (Label::from_u32(2), None),
+                        (Label::from_u32(5), Some(setup_location)),
+                        (Label::from_u32(6), None),
                     ],
-                    block_boundaries: [Label(0)].into_iter().collect(),
-                    source_boundaries: [Label(0)].into_iter().collect(),
-                    setup_nop_boundaries: [Label(3), Label(4)].into_iter().collect(),
-                    setup_nop_ranges: vec![(Label(3), Label(4))],
+                    block_boundaries: [Label::from_u32(0)].into_iter().collect(),
+                    source_boundaries: [Label::from_u32(0)].into_iter().collect(),
+                    setup_nop_boundaries: [Label::from_u32(3), Label::from_u32(4)]
+                        .into_iter()
+                        .collect(),
+                    setup_nop_ranges: vec![(Label::from_u32(3), Label::from_u32(4))],
                     source_none_conditions: vec![SourceNoneCondition {
-                        entry: Label(0),
+                        entry: Label::from_u32(0),
                         labels: vec![
-                            Label(0),
-                            Label(10),
-                            Label(1),
-                            Label(2),
-                            Label(3),
-                            Label(4),
-                            Label(5),
-                            Label(6),
+                            Label::from_u32(0),
+                            Label::from_u32(10),
+                            Label::from_u32(1),
+                            Label::from_u32(2),
+                            Label::from_u32(3),
+                            Label::from_u32(4),
+                            Label::from_u32(5),
+                            Label::from_u32(6),
                         ],
                         instruction: condition,
                         entry_prefix: Some(source_prefix),
@@ -12041,14 +12065,16 @@ mod tests {
                 assembler
                     .exception_owner_provenance
                     .setups
-                    .insert(0, (Label(10), None));
-                assembler.preserved_block_boundaries.insert(Label(10));
+                    .insert(0, (Label::from_u32(10), None));
+                assembler
+                    .preserved_block_boundaries
+                    .insert(Label::from_u32(10));
             }
             match change {
                 "setup on source entry" => assembler
                     .exception_owner_provenance
                     .setups
-                    .insert(0, (Label(0), None)),
+                    .insert(0, (Label::from_u32(0), None)),
                 "missing prefix" => {
                     assembler.exception_owner_provenance.source_none_conditions[0].entry_prefix =
                         None;
@@ -12058,7 +12084,7 @@ mod tests {
                         .entry_prefix
                         .as_mut()
                         .unwrap()
-                        .retain(|item| *item != Item::Label(Label(10)));
+                        .retain(|item| *item != Item::Label(Label::from_u32(10)));
                 }
                 "different nop lines" => {
                     let prefix = assembler.exception_owner_provenance.source_none_conditions[0]
@@ -12071,24 +12097,26 @@ mod tests {
                     instruction.location = location;
                 }
                 "interior return target" => {
-                    assembler.preserved_block_boundaries.insert(Label(10));
+                    assembler
+                        .preserved_block_boundaries
+                        .insert(Label::from_u32(10));
                 }
                 "two predecessors" => assembler.items.push(Item::Instruction(plain(
                     JUMP_FORWARD,
-                    Operand::Forward(Label(0)),
+                    Operand::Forward(Label::from_u32(0)),
                     prefix_location,
                 ))),
                 "unknown interior label" => {
-                    assembler.items.insert(5, Item::Label(Label(11)));
+                    assembler.items.insert(5, Item::Label(Label::from_u32(11)));
                     assembler.exception_owner_provenance.source_none_conditions[0]
                         .labels
-                        .insert(2, Label(11));
+                        .insert(2, Label::from_u32(11));
                 }
                 "copied alias" => {
                     assembler
                         .exception_owner_provenance
                         .normal_try_copy_blocks
-                        .insert(Label(10));
+                        .insert(Label::from_u32(10));
                 }
                 "wrong early count" => {
                     let Item::Instruction(instruction) = &mut assembler.items[3] else {
@@ -12103,7 +12131,7 @@ mod tests {
                 "missing setup cell" => assembler
                     .exception_owner_provenance
                     .setups
-                    .retain(|(label, _)| *label != Label(6)),
+                    .retain(|(label, _)| *label != Label::from_u32(6)),
                 "prefix barrier" => {
                     let Item::Instruction(instruction) = &mut assembler.items[3] else {
                         unreachable!()
@@ -12165,7 +12193,7 @@ mod tests {
         let fixture = || {
             let mut condition = Instruction::new(
                 POP_JUMP_IF_NOT_NONE,
-                Operand::Forward(Label(9)),
+                Operand::Forward(Label::from_u32(9)),
                 location,
                 None,
             );
@@ -12176,53 +12204,60 @@ mod tests {
                 python_version: crate::PythonVersion::Py314,
                 legacy_uniform_jump_seed: false,
                 items: vec![
-                    Item::Label(Label(0)),
+                    Item::Label(Label::from_u32(0)),
                     plain(LOAD_CONST, Operand::Value(0)),
-                    Item::Label(Label(1)),
+                    Item::Label(Label::from_u32(1)),
                     plain(LOAD_CONST, Operand::Value(0)),
-                    Item::Label(Label(2)),
-                    Item::Label(Label(3)),
+                    Item::Label(Label::from_u32(2)),
+                    Item::Label(Label::from_u32(3)),
                     plain(NOP, Operand::Value(0)),
-                    Item::Label(Label(4)),
-                    Item::Label(Label(5)),
-                    Item::Label(Label(6)),
+                    Item::Label(Label::from_u32(4)),
+                    Item::Label(Label::from_u32(5)),
+                    Item::Label(Label::from_u32(6)),
                     plain(LOAD_FAST, Operand::Value(0)),
                     Item::Instruction(condition),
-                    Item::Label(Label(7)),
+                    Item::Label(Label::from_u32(7)),
                     Item::Instruction(marker),
-                    Item::Label(Label(8)),
+                    Item::Label(Label::from_u32(8)),
                     plain(LOAD_CONST, Operand::Value(0)),
                     plain(RETURN_VALUE, Operand::Value(0)),
-                    Item::Label(Label(9)),
+                    Item::Label(Label::from_u32(9)),
                     plain(LOAD_CONST, Operand::Value(0)),
                     plain(RETURN_VALUE, Operand::Value(0)),
                 ],
                 exception_regions: vec![ExceptionRegion {
                     is_scope_fallback: false,
-                    priority: ExceptionRegionPriority::OriginalRange(Label(0), Label(8)),
-                    start: Label(0),
-                    end: Label(7),
-                    target: Label(9),
+                    priority: ExceptionRegionPriority::OriginalRange(
+                        Label::from_u32(0),
+                        Label::from_u32(8),
+                    ),
+                    start: Label::from_u32(0),
+                    end: Label::from_u32(7),
+                    target: Label::from_u32(9),
                     depth: 0,
                     preserve_lasti: false,
                 }],
                 exception_owner_provenance: ExceptionOwnerProvenance {
                     setups: vec![
-                        (Label(1), None),
-                        (Label(2), None),
-                        (Label(5), Some(location)),
-                        (Label(6), None),
+                        (Label::from_u32(1), None),
+                        (Label::from_u32(2), None),
+                        (Label::from_u32(5), Some(location)),
+                        (Label::from_u32(6), None),
                     ],
-                    block_boundaries: [Label(0)].into_iter().collect(),
-                    source_boundaries: [Label(0)].into_iter().collect(),
-                    setup_nop_boundaries: [Label(3), Label(4)].into_iter().collect(),
-                    setup_nop_ranges: vec![(Label(3), Label(4))],
-                    synchronous_with_setups: [Label(1), Label(2)].into_iter().collect(),
+                    block_boundaries: [Label::from_u32(0)].into_iter().collect(),
+                    source_boundaries: [Label::from_u32(0)].into_iter().collect(),
+                    setup_nop_boundaries: [Label::from_u32(3), Label::from_u32(4)]
+                        .into_iter()
+                        .collect(),
+                    setup_nop_ranges: vec![(Label::from_u32(3), Label::from_u32(4))],
+                    synchronous_with_setups: [Label::from_u32(1), Label::from_u32(2)]
+                        .into_iter()
+                        .collect(),
                     source_none_conditions: vec![SourceNoneCondition {
-                        entry: Label(0),
-                        labels: (0..=6).map(Label).collect(),
+                        entry: Label::from_u32(0),
+                        labels: (0..=6).map(Label::from_u32).collect(),
                         instruction: condition,
-                        entry_prefix: Some(vec![Item::Label(Label(0))]),
+                        entry_prefix: Some(vec![Item::Label(Label::from_u32(0))]),
                     }],
                     ..ExceptionOwnerProvenance::default()
                 },
@@ -12251,28 +12286,32 @@ mod tests {
                 "jump target" => {
                     assembler
                         .items
-                        .push(plain(JUMP_FORWARD, Operand::Forward(Label(7))));
+                        .push(plain(JUMP_FORWARD, Operand::Forward(Label::from_u32(7))));
                 }
                 "source boundary" => {
-                    provenance.source_boundaries.insert(Label(7));
+                    provenance.source_boundaries.insert(Label::from_u32(7));
                 }
                 "block boundary" => {
-                    provenance.block_boundaries.insert(Label(7));
+                    provenance.block_boundaries.insert(Label::from_u32(7));
                 }
                 "setup boundary" => {
-                    provenance.setups.push((Label(7), None));
+                    provenance.setups.push((Label::from_u32(7), None));
                 }
                 "pop boundary" => {
-                    provenance.removed_pop_block_boundaries.insert(Label(7));
+                    provenance
+                        .removed_pop_block_boundaries
+                        .insert(Label::from_u32(7));
                 }
                 "copied boundary" => {
-                    provenance.normal_try_copy_blocks.insert(Label(7));
+                    provenance.normal_try_copy_blocks.insert(Label::from_u32(7));
                 }
                 "preserved boundary" => {
-                    assembler.preserved_block_boundaries.insert(Label(7));
+                    assembler
+                        .preserved_block_boundaries
+                        .insert(Label::from_u32(7));
                 }
                 "handler target" => {
-                    assembler.exception_regions[0].target = Label(7);
+                    assembler.exception_regions[0].target = Label::from_u32(7);
                 }
                 _ => unreachable!(),
             }
@@ -12518,10 +12557,10 @@ mod tests {
             "continuation only",
             "copied jump successor",
         ] {
-            let entry = Label(0);
-            let range_end = Label(1);
-            let marker_alias = Label(2);
-            let exit = Label(3);
+            let entry = Label::from_u32(0);
+            let range_end = Label::from_u32(1);
+            let marker_alias = Label::from_u32(2);
+            let exit = Label::from_u32(3);
             let location = SourceLocation::new(9, 9, 15, 19);
             let plain = |opcode, operand| Instruction::new(opcode, operand, location, None);
             let mut pop = plain(NOP, Operand::Value(0));
@@ -12658,7 +12697,9 @@ mod tests {
                         .source_boundaries
                         .insert(marker_alias);
                 }
-                "foreign inserted label" => assembler.items.insert(4, Item::Label(Label(4))),
+                "foreign inserted label" => {
+                    assembler.items.insert(4, Item::Label(Label::from_u32(4)));
+                }
                 "missing pop" => {
                     assembler.items.remove(1);
                 }
@@ -12681,8 +12722,10 @@ mod tests {
                         .prefix[1] = nonconverted;
                 }
                 "changed branch" => {
-                    assembler.items[5] =
-                        Item::Instruction(plain(POP_JUMP_IF_FALSE, Operand::Forward(Label(4))));
+                    assembler.items[5] = Item::Instruction(plain(
+                        POP_JUMP_IF_FALSE,
+                        Operand::Forward(Label::from_u32(4)),
+                    ));
                 }
                 "duplicate entry" => assembler.items.push(Item::Label(entry)),
                 "already owned marker" => {
@@ -12726,9 +12769,9 @@ mod tests {
         for (opcode, case) in [CALL, LOAD_ATTR, LOAD_FAST].into_iter().flat_map(|opcode| {
             ["original", "unsealed", "cloned", "retired"].map(|case| (opcode, case))
         }) {
-            let entry = Label(0);
-            let exit = Label(1);
-            let clone = Label(2);
+            let entry = Label::from_u32(0);
+            let exit = Label::from_u32(1);
+            let clone = Label::from_u32(2);
             let plain = |opcode, operand| {
                 Instruction::new(opcode, operand, SourceLocation::new(3, 3, 0, 4), None)
             };
@@ -12834,40 +12877,48 @@ mod tests {
             let location = |line| SourceLocation::new(line, line, 0, 4);
             let plain =
                 |opcode, operand, line| Instruction::new(opcode, operand, location(line), None);
-            let incoming = plain(POP_JUMP_IF_FALSE, Operand::Forward(Label(1)), 1);
+            let incoming = plain(POP_JUMP_IF_FALSE, Operand::Forward(Label::from_u32(1)), 1);
             let mut items = vec![
                 Item::Instruction(incoming),
                 Item::Instruction(plain(NOT_TAKEN, Operand::Value(0), 1)),
-                Item::Instruction(plain(JUMP_BACKWARD, Operand::Backward(Label(9)), 1)),
-                Item::Label(Label(1)),
-                Item::Label(Label(2)),
+                Item::Instruction(plain(
+                    JUMP_BACKWARD,
+                    Operand::Backward(Label::from_u32(9)),
+                    1,
+                )),
+                Item::Label(Label::from_u32(1)),
+                Item::Label(Label::from_u32(2)),
                 // Generator SETUP markers may have the default exception policy.
                 Item::Instruction(plain(NOP, Operand::Value(0), 2)),
-                Item::Label(Label(3)),
-                Item::Label(Label(4)),
+                Item::Label(Label::from_u32(3)),
+                Item::Label(Label::from_u32(4)),
                 Item::Instruction(plain(LOAD_FAST, Operand::Value(0), 3)),
                 Item::Instruction(plain(LOAD_ATTR, Operand::Value(0), 3)),
                 Item::Instruction(plain(TO_BOOL, Operand::Value(0), 3)),
-                Item::Instruction(plain(POP_JUMP_IF_FALSE, Operand::Forward(Label(5)), 3)),
+                Item::Instruction(plain(
+                    POP_JUMP_IF_FALSE,
+                    Operand::Forward(Label::from_u32(5)),
+                    3,
+                )),
                 Item::Instruction(plain(NOT_TAKEN, Operand::Value(0), 3)),
-                Item::Label(Label(5)),
+                Item::Label(Label::from_u32(5)),
                 Item::Instruction(plain(RETURN_VALUE, Operand::Value(0), 4)),
             ];
             let mut provenance = ExceptionOwnerProvenance {
                 original_primitive_condition_boundaries: vec![incoming],
-                setups: vec![(Label(4), Some(location(2)))],
-                setup_nop_ranges: vec![(Label(2), Label(3))],
+                setups: vec![(Label::from_u32(4), Some(location(2)))],
+                setup_nop_ranges: vec![(Label::from_u32(2), Label::from_u32(3))],
                 ..ExceptionOwnerProvenance::default()
             };
             match case {
                 "authored break" => {
-                    let mut jump = plain(JUMP_FORWARD, Operand::Forward(Label(1)), 1);
+                    let mut jump = plain(JUMP_FORWARD, Operand::Forward(Label::from_u32(1)), 1);
                     jump.fusion_policy.mark_authored_break();
                     items[0] = Item::Instruction(jump);
                     provenance.original_primitive_condition_boundaries.clear();
                 }
                 "missing leading labels" => {
-                    items.retain(|item| !matches!(item, Item::Label(Label(1 | 2))));
+                    items.retain(|item| !matches!(item, Item::Label(label) if matches!(label.as_u32(), 1 | 2)));
                     // A still-literal incoming condition cannot authenticate an unlabeled array.
                     assert!(!provenance.uncompacted_prefix(
                         &items[3..=10],
@@ -12879,8 +12930,11 @@ mod tests {
                 }
                 "unknown origin" => provenance.original_primitive_condition_boundaries.clear(),
                 "changed origin" => {
-                    items[0] =
-                        Item::Instruction(plain(POP_JUMP_IF_FALSE, Operand::Forward(Label(6)), 1));
+                    items[0] = Item::Instruction(plain(
+                        POP_JUMP_IF_FALSE,
+                        Operand::Forward(Label::from_u32(6)),
+                        1,
+                    ));
                 }
                 "duplicate origin" => items.push(Item::Instruction(incoming)),
                 "unlocated setup" => {
@@ -12916,11 +12970,11 @@ mod tests {
                 }
                 "copy record" => items[9] = Item::Instruction(plain(COPY, Operand::Value(1), 3)),
                 "omitted record" => {
-                    provenance.omitted_nop_counts.insert(Label(4), 1);
+                    provenance.omitted_nop_counts.insert(Label::from_u32(4), 1);
                 }
                 "interior entry" => items.push(Item::Instruction(plain(
                     JUMP_FORWARD,
-                    Operand::Forward(Label(4)),
+                    Operand::Forward(Label::from_u32(4)),
                     4,
                 ))),
                 _ => {}
@@ -12944,14 +12998,14 @@ mod tests {
                     };
                     instruction.opcode = LOAD_FAST_BORROW;
                 }
-                "range alias" => assembler.items.insert(12, Item::Label(Label(10))),
+                "range alias" => assembler.items.insert(12, Item::Label(Label::from_u32(10))),
                 "changed policy" => {
                     let Item::Instruction(instruction) = &mut assembler.items[8] else {
                         unreachable!()
                     };
                     instruction.jump_policy.prevent_threading_target();
                 }
-                "duplicate final entry" => assembler.items.push(Item::Label(Label(1))),
+                "duplicate final entry" => assembler.items.push(Item::Label(Label::from_u32(1))),
                 _ => {}
             }
             let targets = assembler
@@ -13011,15 +13065,15 @@ mod tests {
             let plain = |opcode, operand, line| {
                 Item::Instruction(Instruction::new(opcode, operand, location(line), None))
             };
-            let entry = Label(0);
+            let entry = Label::from_u32(0);
             let mut items = vec![
                 // The folded while test belongs to an earlier original array.
                 plain(NOP, Operand::Value(0), 1),
                 Item::Label(entry),
-                Item::Label(Label(1)),
+                Item::Label(Label::from_u32(1)),
                 plain(NOP, Operand::Value(0), 2),
-                Item::Label(Label(2)),
-                Item::Label(Label(3)),
+                Item::Label(Label::from_u32(2)),
+                Item::Label(Label::from_u32(3)),
                 plain(LOAD_FAST, Operand::Value(0), 3),
                 plain(LOAD_ATTR, Operand::Value(1), 3),
                 plain(CALL, Operand::Value(0), 3),
@@ -13027,27 +13081,27 @@ mod tests {
                 plain(LOAD_FAST, Operand::Value(0), 4),
                 plain(LOAD_ATTR, Operand::Value(0), 4),
                 plain(TO_BOOL, Operand::Value(0), 4),
-                plain(POP_JUMP_IF_FALSE, Operand::Forward(Label(4)), 4),
+                plain(POP_JUMP_IF_FALSE, Operand::Forward(Label::from_u32(4)), 4),
                 plain(NOT_TAKEN, Operand::Value(0), 4),
             ];
             let mut provenance = ExceptionOwnerProvenance {
                 block_boundaries: [entry].into_iter().collect(),
                 source_boundaries: [entry].into_iter().collect(),
-                setups: vec![(Label(3), Some(location(2)))],
-                setup_nop_ranges: vec![(Label(1), Label(2))],
+                setups: vec![(Label::from_u32(3), Some(location(2)))],
+                setup_nop_ranges: vec![(Label::from_u32(1), Label::from_u32(2))],
                 ..ExceptionOwnerProvenance::default()
             };
             match case {
                 "block only" => provenance.source_boundaries.clear(),
                 "source only" => provenance.block_boundaries.clear(),
                 "adjacent boundary" => {
-                    provenance.block_boundaries.insert(Label(5));
-                    provenance.source_boundaries.insert(Label(5));
-                    items.insert(1, Item::Label(Label(5)));
+                    provenance.block_boundaries.insert(Label::from_u32(5));
+                    provenance.source_boundaries.insert(Label::from_u32(5));
+                    items.insert(1, Item::Label(Label::from_u32(5)));
                 }
                 "interior boundary" => {
-                    provenance.block_boundaries.insert(Label(3));
-                    provenance.source_boundaries.insert(Label(3));
+                    provenance.block_boundaries.insert(Label::from_u32(3));
+                    provenance.source_boundaries.insert(Label::from_u32(3));
                 }
                 "constant discard" => items[8] = plain(LOAD_CONST, Operand::Value(0), 3),
                 "hidden record" => {
@@ -13060,7 +13114,7 @@ mod tests {
             }
             provenance.capture_uncompacted_conditional_arrays(&items);
             match case {
-                "copied entry" => items[1] = Item::Label(Label(6)),
+                "copied entry" => items[1] = Item::Label(Label::from_u32(6)),
                 "retired source" => provenance.source_boundaries.clear(),
                 "retired block" => provenance.block_boundaries.clear(),
                 _ => {}
@@ -13082,7 +13136,9 @@ mod tests {
                 rustc_hash::FxHashSet::default()
             };
             assert_eq!(
-                assembler.uncompacted_conditional_null_markers(&[Label(4)].into_iter().collect()),
+                assembler.uncompacted_conditional_null_markers(
+                    &[Label::from_u32(4)].into_iter().collect()
+                ),
                 expected,
                 "{case}"
             );
@@ -13118,13 +13174,13 @@ mod tests {
             "protected gap",
             "excluded marker",
         ] {
-            let entry = Label(0);
-            let body = Label(1);
-            let exit = Label(2);
-            let marker_start = Label(3);
-            let marker_end = Label(4);
-            let handler = Label(5);
-            let fallback = Label(6);
+            let entry = Label::from_u32(0);
+            let body = Label::from_u32(1);
+            let exit = Label::from_u32(2);
+            let marker_start = Label::from_u32(3);
+            let marker_end = Label::from_u32(4);
+            let handler = Label::from_u32(5);
+            let fallback = Label::from_u32(6);
             let location = SourceLocation::new(3, 3, 4, 20);
             let plain = |opcode, operand| Instruction::new(opcode, operand, location, None);
             let mut pop = plain(NOP, Operand::Value(0));
@@ -13194,7 +13250,7 @@ mod tests {
                 Item::Instruction(plain(RERAISE, Operand::Value(0))),
             ];
             if matches!(case, "foreign label" | "protected gap") {
-                items.insert(4, Item::Label(Label(7)));
+                items.insert(4, Item::Label(Label::from_u32(7)));
             }
             let mut provenance = ExceptionOwnerProvenance {
                 source_boundaries: [entry].into_iter().collect(),
@@ -13214,7 +13270,7 @@ mod tests {
                 provenance.source_boundaries.clear();
             }
             let protected_start = if case == "protected gap" {
-                Label(7)
+                Label::from_u32(7)
             } else {
                 body
             };
@@ -13286,14 +13342,18 @@ mod tests {
                 "none" | "not none" | "present" | "global fold" | "boolean compare"
             ) {
                 let decision = decisions.get(&4).expect("marker after region-end label");
-                assert_eq!(decision.source_region, Some(0), "{case}");
+                assert_eq!(decision.source_region(), Some(0), "{case}");
                 assert!(
-                    decision.has_owner && decision.definitive && decision.override_existing,
+                    decision.has_owner()
+                        && decision.is_definitive()
+                        && decision.overrides_existing(),
                     "{case}"
                 );
             } else if case == "excluded marker" {
                 assert!(
-                    !decisions.get(&4).is_some_and(|decision| decision.has_owner),
+                    !decisions
+                        .get(&4)
+                        .is_some_and(|decision| decision.has_owner()),
                     "{case}"
                 );
             }
@@ -13312,7 +13372,7 @@ mod tests {
         for (opcode, operand) in [
             (LIST_EXTEND, Operand::Value(1)),
             (SET_UPDATE, Operand::Value(1)),
-            (LOAD_CONST, Operand::Deferred(OperandPatchId(0))),
+            (LOAD_CONST, Operand::Deferred(OperandPatchId::from_u32(0))),
         ] {
             for count in [4, 9, 28, 30] {
                 let location = SourceLocation::new(1, 1, 0, 12);
@@ -13580,7 +13640,7 @@ mod tests {
             let mut inner = Instruction::new(NOP, Operand::Value(0), inner_location, None);
             let mut condition = Instruction::new(
                 POP_JUMP_IF_NONE,
-                Operand::Forward(Label(12)),
+                Operand::Forward(Label::from_u32(12)),
                 guard_location,
                 None,
             );
@@ -13589,24 +13649,24 @@ mod tests {
             marker.set_exception_owner(NormalizedExceptionOwner::Present);
 
             let mut items = vec![
-                Item::Label(Label(0)),
+                Item::Label(Label::from_u32(0)),
                 Item::Instruction(plain(RETURN_GENERATOR)), // 0: inserted generator prologue.
                 Item::Instruction(plain(POP_TOP)),
-                Item::Label(Label(1)), // Removed scope SETUP: compact position 2, old position 2.
+                Item::Label(Label::from_u32(1)), // Removed scope SETUP: compact position 2, old position 2.
                 Item::Instruction(plain(RESUME)),
                 Item::Instruction(plain(LOAD_CONST)),
-                Item::Label(Label(2)), // First manager SETUP: compact position 4, old position 5.
+                Item::Label(Label::from_u32(2)), // First manager SETUP: compact position 4, old position 5.
                 Item::Instruction(plain(LOAD_CONST)),
-                Item::Label(Label(3)), // Second manager SETUP: compact position 5, old position 7.
-                Item::Label(Label(4)),
+                Item::Label(Label::from_u32(3)), // Second manager SETUP: compact position 5, old position 7.
+                Item::Label(Label::from_u32(4)),
                 Item::Instruction(outer), // 5: retained outer SETUP.
-                Item::Label(Label(5)),
-                Item::Label(Label(6)),
+                Item::Label(Label::from_u32(5)),
+                Item::Label(Label::from_u32(6)),
                 Item::Instruction(plain(LOAD_CONST)),
                 Item::Instruction(plain(YIELD_VALUE)),
                 Item::Instruction(plain(RESUME)),
                 Item::Instruction(plain(POP_TOP)),
-                Item::Label(Label(7)), // Erased outer normal POP_BLOCK, compact position 10.
+                Item::Label(Label::from_u32(7)), // Erased outer normal POP_BLOCK, compact position 10.
             ];
             if intervening_call {
                 // The earlier POP vacancy moves to the call, leaving the inner SETUP unchanged.
@@ -13621,19 +13681,19 @@ mod tests {
                 inner.local_policy.add_hidden_exception_owner_slots(1);
             }
             items.extend([
-                Item::Label(Label(8)),
+                Item::Label(Label::from_u32(8)),
                 Item::Instruction(inner), // Target source 10; control source 13.
-                Item::Label(Label(9)),
-                Item::Label(Label(10)),
+                Item::Label(Label::from_u32(9)),
+                Item::Label(Label::from_u32(10)),
                 Item::Instruction(plain(LOAD_FAST)),
                 Item::Instruction(condition),
-                Item::Label(Label(11)), // A bookkeeping marker alias is not a new original array.
-                Item::Instruction(marker), // Target m=13; control m=16; both select m-3.
-                Item::Label(Label(12)),
+                Item::Label(Label::from_u32(11)), // A bookkeeping marker alias is not a new original array.
+                Item::Instruction(marker),        // Target m=13; control m=16; both select m-3.
+                Item::Label(Label::from_u32(12)),
                 Item::Instruction(plain(LOAD_CONST)),
                 Item::Instruction(plain(RETURN_VALUE)),
-                Item::Label(Label(13)),
-                Item::Label(Label(14)),
+                Item::Label(Label::from_u32(13)),
+                Item::Label(Label::from_u32(14)),
                 Item::Instruction(plain(LOAD_CONST)),
                 Item::Instruction(plain(RETURN_VALUE)),
             ]);
@@ -13643,30 +13703,43 @@ mod tests {
                 items,
                 exception_regions: vec![ExceptionRegion {
                     is_scope_fallback: true,
-                    priority: ExceptionRegionPriority::OriginalRange(Label(1), Label(13)),
-                    start: Label(1),
-                    end: Label(13),
-                    target: Label(14),
+                    priority: ExceptionRegionPriority::OriginalRange(
+                        Label::from_u32(1),
+                        Label::from_u32(13),
+                    ),
+                    start: Label::from_u32(1),
+                    end: Label::from_u32(13),
+                    target: Label::from_u32(14),
                     depth: 0,
                     preserve_lasti: false,
                 }],
                 exception_owner_provenance: ExceptionOwnerProvenance {
                     setups: vec![
-                        (Label(1), None),
-                        (Label(2), None),
-                        (Label(3), None),
-                        (Label(6), Some(outer_location)),
-                        (Label(10), Some(inner_location)),
+                        (Label::from_u32(1), None),
+                        (Label::from_u32(2), None),
+                        (Label::from_u32(3), None),
+                        (Label::from_u32(6), Some(outer_location)),
+                        (Label::from_u32(10), Some(inner_location)),
                     ],
-                    block_boundaries: [Label(0)].into_iter().collect(),
-                    source_boundaries: [Label(0)].into_iter().collect(),
-                    synchronous_with_setups: [Label(2), Label(3)].into_iter().collect(),
-                    setup_nop_boundaries: [Label(4), Label(5), Label(8), Label(9)]
+                    block_boundaries: [Label::from_u32(0)].into_iter().collect(),
+                    source_boundaries: [Label::from_u32(0)].into_iter().collect(),
+                    synchronous_with_setups: [Label::from_u32(2), Label::from_u32(3)]
                         .into_iter()
                         .collect(),
-                    setup_nop_ranges: vec![(Label(4), Label(5)), (Label(8), Label(9))],
-                    removed_pop_block_boundaries: [Label(7)].into_iter().collect(),
-                    removed_pop_block_widths: [(Label(7), 1)].into_iter().collect(),
+                    setup_nop_boundaries: [
+                        Label::from_u32(4),
+                        Label::from_u32(5),
+                        Label::from_u32(8),
+                        Label::from_u32(9),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    setup_nop_ranges: vec![
+                        (Label::from_u32(4), Label::from_u32(5)),
+                        (Label::from_u32(8), Label::from_u32(9)),
+                    ],
+                    removed_pop_block_boundaries: [Label::from_u32(7)].into_iter().collect(),
+                    removed_pop_block_widths: [(Label::from_u32(7), 1)].into_iter().collect(),
                     ..ExceptionOwnerProvenance::default()
                 },
                 preserved_block_boundaries: rustc_hash::FxHashSet::default(),
@@ -13688,10 +13761,10 @@ mod tests {
                 }
             }
             assembler.entry_retained_setup_null_marker(
-                positions[&Label(11)],
+                positions[&Label::from_u32(11)],
                 &instructions,
                 &positions,
-                &[Label(12)].into_iter().collect(),
+                &[Label::from_u32(12)].into_iter().collect(),
                 &[2, 5, 7],
             )
         }
@@ -13750,7 +13823,7 @@ mod tests {
                 assert!(!recognizes(&assembler), "{name}");
             };
             rejects("changed retained range", |assembler| {
-                assembler.exception_owner_provenance.setup_nop_ranges[1].1 = Label(11);
+                assembler.exception_owner_provenance.setup_nop_ranges[1].1 = Label::from_u32(11);
             });
             rejects("uncertified hidden POP", |assembler| {
                 assembler
@@ -13762,13 +13835,13 @@ mod tests {
                 assembler
                     .exception_owner_provenance
                     .block_boundaries
-                    .insert(Label(7));
+                    .insert(Label::from_u32(7));
             });
             rejects("unknown removed SETUP", |assembler| {
                 assembler
                     .exception_owner_provenance
                     .synchronous_with_setups
-                    .remove(&Label(3));
+                    .remove(&Label::from_u32(3));
             });
             rejects("earlier condition marker", |assembler| {
                 let instruction = assembler
@@ -13786,7 +13859,7 @@ mod tests {
                 assembler
                     .exception_owner_provenance
                     .normal_try_copy_blocks
-                    .insert(Label(7));
+                    .insert(Label::from_u32(7));
             });
             rejects("borrow barrier", |assembler| {
                 let instruction = assembler

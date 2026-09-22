@@ -20,35 +20,37 @@ use crate::target::is_preinterned_string_for;
 /// a fixed bootstrap, not a long-lived interpreter session in which mortal interned
 /// strings may disappear. Compiling an import statement does not execute the import
 /// or change this state. Clones share the immutable entries.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct InitialInternState {
     strings: Option<Arc<FxHashSet<Box<str>>>>,
     additional_strings: Option<Arc<FxHashSet<Box<str>>>>,
-    absence_predicate: Option<Arc<AbsencePredicate>>,
-    absence_exceptions: Option<Arc<FxHashSet<Box<str>>>>,
     mode: InitialInternMode,
 }
 
 type AbsencePredicate = dyn Fn(PythonVersion, &str) -> bool + Send + Sync;
 
-impl fmt::Debug for InitialInternState {
+#[derive(Clone)]
+struct AbsenceProof {
+    predicate: Arc<AbsencePredicate>,
+    exceptions: Option<Arc<FxHashSet<Box<str>>>>,
+}
+
+impl fmt::Debug for AbsenceProof {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("InitialInternState")
-            .field("strings", &self.strings)
-            .field("additional_strings", &self.additional_strings)
-            .field("has_absence_predicate", &self.absence_predicate.is_some())
-            .field("absence_exceptions", &self.absence_exceptions)
-            .field("mode", &self.mode)
-            .finish()
+        f.debug_struct("AbsenceProof")
+            .field("exceptions", &self.exceptions)
+            .finish_non_exhaustive()
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default)]
 enum InitialInternMode {
     #[default]
     Supplemental,
     Complete,
-    Partial,
+    Partial {
+        absence: Option<AbsenceProof>,
+    },
 }
 
 impl InitialInternState {
@@ -83,7 +85,7 @@ impl InitialInternState {
     /// canonical owner retained throughout compilation, independent of its literals.
     pub fn from_partial(strings: impl IntoIterator<Item = impl Into<Box<str>>>) -> Self {
         Self {
-            mode: InitialInternMode::Partial,
+            mode: InitialInternMode::Partial { absence: None },
             ..Self::new(strings)
         }
     }
@@ -103,8 +105,13 @@ impl InitialInternState {
         predicate: impl Fn(PythonVersion, &str) -> bool + Send + Sync + 'static,
     ) -> Self {
         Self {
-            absence_predicate: Some(Arc::new(predicate)),
-            ..Self::from_partial(strings)
+            mode: InitialInternMode::Partial {
+                absence: Some(AbsenceProof {
+                    predicate: Arc::new(predicate),
+                    exceptions: None,
+                }),
+            },
+            ..Self::new(strings)
         }
     }
 
@@ -118,19 +125,27 @@ impl InitialInternState {
         &self,
         strings: impl IntoIterator<Item = impl Into<Box<str>>>,
     ) -> Self {
-        if self.absence_predicate.is_none() {
+        let InitialInternMode::Partial {
+            absence: Some(proof),
+        } = &self.mode
+        else {
             return self.clone();
-        }
+        };
         let mut absence_exceptions: FxHashSet<_> =
             strings.into_iter().map(Into::<Box<str>>::into).collect();
         if absence_exceptions.is_empty() {
             return self.clone();
         }
-        if let Some(existing) = &self.absence_exceptions {
+        if let Some(existing) = &proof.exceptions {
             absence_exceptions.extend(existing.iter().cloned());
         }
         Self {
-            absence_exceptions: Some(Arc::new(absence_exceptions)),
+            mode: InitialInternMode::Partial {
+                absence: Some(AbsenceProof {
+                    predicate: Arc::clone(&proof.predicate),
+                    exceptions: Some(Arc::new(absence_exceptions)),
+                }),
+            },
             ..self.clone()
         }
     }
@@ -159,11 +174,11 @@ impl InitialInternState {
     }
 
     pub(crate) fn uses_startup_state(&self) -> bool {
-        self.mode == InitialInternMode::Supplemental
+        matches!(self.mode, InitialInternMode::Supplemental)
     }
 
     pub(crate) fn has_unknown_entries(&self) -> bool {
-        self.mode == InitialInternMode::Partial
+        matches!(self.mode, InitialInternMode::Partial { .. })
     }
 
     /// Return known presence or absence, or `None` for an unresolved entry.
@@ -183,21 +198,20 @@ impl InitialInternState {
                 .is_some_and(|strings| strings.contains(value))
         {
             Some(true)
-        } else if self.has_unknown_entries() {
-            if self
-                .absence_exceptions
-                .as_ref()
-                .is_some_and(|strings| strings.contains(value))
-            {
-                None
-            } else {
-                self.absence_predicate
-                    .as_ref()
-                    .is_some_and(|predicate| predicate(python_version, value))
-                    .then_some(false)
-            }
         } else {
-            Some(false)
+            match &self.mode {
+                InitialInternMode::Partial { absence } => absence
+                    .as_ref()
+                    .is_some_and(|proof| {
+                        !proof
+                            .exceptions
+                            .as_ref()
+                            .is_some_and(|strings| strings.contains(value))
+                            && (proof.predicate)(python_version, value)
+                    })
+                    .then_some(false),
+                InitialInternMode::Supplemental | InitialInternMode::Complete => Some(false),
+            }
         }
     }
 
@@ -211,7 +225,7 @@ impl InitialInternState {
 mod tests {
     use std::sync::Arc;
 
-    use super::InitialInternState;
+    use super::{AbsenceProof, InitialInternMode, InitialInternState};
     use crate::PythonVersion;
 
     #[test]
@@ -365,6 +379,15 @@ mod tests {
 
     #[test]
     fn absence_exceptions_share_proofs_and_preserve_retained_owners() {
+        fn absence_proof(state: &InitialInternState) -> &AbsenceProof {
+            match &state.mode {
+                InitialInternMode::Partial {
+                    absence: Some(proof),
+                } => proof,
+                _ => panic!("expected a partial state with an absence proof"),
+            }
+        }
+
         let base = InitialInternState::from_partial_with_absence(["proof_retained"], |_, value| {
             value.starts_with("proof_")
         });
@@ -379,8 +402,8 @@ mod tests {
                 state.strings.as_ref().unwrap()
             ));
             assert!(Arc::ptr_eq(
-                base.absence_predicate.as_ref().unwrap(),
-                state.absence_predicate.as_ref().unwrap()
+                &absence_proof(&base).predicate,
+                &absence_proof(state).predicate
             ));
             assert_eq!(
                 state.membership_for(PythonVersion::Py313, "proof_retained"),
@@ -388,8 +411,8 @@ mod tests {
             );
         }
         assert!(Arc::ptr_eq(
-            extended.absence_exceptions.as_ref().unwrap(),
-            unchanged.absence_exceptions.as_ref().unwrap()
+            absence_proof(&extended).exceptions.as_ref().unwrap(),
+            absence_proof(&unchanged).exceptions.as_ref().unwrap()
         ));
         assert_eq!(
             base.membership_for(PythonVersion::Py313, "proof_first"),
@@ -411,7 +434,10 @@ mod tests {
             sibling.membership_for(PythonVersion::Py313, "proof_second"),
             None
         );
-        assert_eq!(repeated.absence_exceptions.as_ref().unwrap().len(), 3);
+        assert_eq!(
+            absence_proof(&repeated).exceptions.as_ref().unwrap().len(),
+            3
+        );
         assert_eq!(
             unchanged.membership_for(PythonVersion::Py313, "proof_first"),
             Some(true)
@@ -438,7 +464,8 @@ mod tests {
             InitialInternState::from_partial(std::iter::empty::<&str>()),
         ] {
             let extended = state.with_absence_exceptions(["proof_absent"]);
-            assert_eq!(extended.mode, state.mode);
+            assert_eq!(extended.uses_startup_state(), state.uses_startup_state());
+            assert_eq!(extended.has_unknown_entries(), state.has_unknown_entries());
             assert_eq!(
                 extended.membership_for(PythonVersion::Py313, "proof_absent"),
                 state.membership_for(PythonVersion::Py313, "proof_absent")
@@ -448,7 +475,7 @@ mod tests {
             InitialInternState::from_partial_with_absence(std::iter::empty::<&str>(), |_, _| {
                 panic!("Debug must not evaluate an absence predicate")
             });
-        assert!(format!("{state:?}").contains("has_absence_predicate: true"));
+        assert!(format!("{state:?}").contains("AbsenceProof"));
     }
 
     #[test]

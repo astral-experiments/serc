@@ -81,7 +81,7 @@ struct ComprehensionLoop {
 #[derive(Debug)]
 struct MatchContext {
     stores: Vec<NameId>,
-    fail_pop: Vec<Label>,
+    fail_pop: Vec<Option<Label>>,
     // Case or OR-alternative source identity; fail-pop indices belong to this context.
     native_fail_owner: ruff_text_size::TextRange,
     direct_loop_failure: Option<Label>,
@@ -577,6 +577,9 @@ impl Compiler<'_> {
                         }
                     }
                     if !truthiness || !context.fail_pop.is_empty() {
+                        // Constant folding removes the guard's jump after CPython
+                        // has already established its failure-block boundary.
+                        self.ensure_match_fail_pop(&mut context, 0);
                         let range = if is_wildcard_pattern(&case.pattern) {
                             case.pattern.range()
                         } else {
@@ -599,11 +602,19 @@ impl Compiler<'_> {
                         }
                     }
                     if !truthiness {
-                        self.ensure_match_fail_pop(&mut context, 0);
+                        if context.fail_pop.len() > 1 {
+                            let failure = self.ensure_match_fail_pop(&mut context, 0);
+                            // Captures have already been stored, so guard failure skips
+                            // the cleanup slots reserved for an unmatched pattern.
+                            let failure =
+                                self.emit_jump_forward_instruction(JUMP_FORWARD, failure)?;
+                            // CPython's edge is still conditional during small-exit copying.
+                            self.assembler.prevent_jump_inlining(failure);
+                        }
                         guard_always_false = true;
                     }
                 } else {
-                    self.ensure_match_fail_pop(&mut context, 0);
+                    let failure = self.ensure_match_fail_pop(&mut context, 0);
                     if copied_subject
                         && is_wildcard_pattern(&case.pattern)
                         && self.source_location(case.pattern.range()).line
@@ -629,9 +640,9 @@ impl Compiler<'_> {
                     {
                         // The assembler transports the original bridge donor only onto an
                         // intact private copy of the four-record subject-pop return.
-                        self.compile_match_guard(guard, &case.body, context.fail_pop[0])?;
+                        self.compile_match_guard(guard, &case.body, failure)?;
                     } else {
-                        self.compile_jump_if(guard, false, context.fail_pop[0])?;
+                        self.compile_jump_if(guard, false, failure)?;
                     }
                 }
             }
@@ -767,7 +778,8 @@ impl Compiler<'_> {
                             } else if has_default
                                 && index + 1 == matched_cases
                                 && case.guard.is_none()
-                                && cleanup.is_some_and(|label| context.fail_pop.contains(&label))
+                                && cleanup
+                                    .is_some_and(|label| context.fail_pop.contains(&Some(label)))
                                 && self
                                     .assembler
                                     .is_small_linear_scope_exit_since(success_start)
@@ -1363,18 +1375,27 @@ impl Compiler<'_> {
         }
     }
 
-    fn ensure_match_fail_pop(&mut self, context: &mut MatchContext, pops: usize) {
+    fn ensure_match_fail_pop(&mut self, context: &mut MatchContext, pops: usize) -> Label {
         while context.fail_pop.len() <= pops {
+            let depth = context.fail_pop.len();
+            context.fail_pop.push(None);
+            self.match_fail_pop_label(context, depth);
+        }
+        self.match_fail_pop_label(context, pops)
+    }
+
+    fn match_fail_pop_label(&mut self, context: &mut MatchContext, pops: usize) -> Label {
+        *context.fail_pop[pops].get_or_insert_with(|| {
             let label = self.assembler.label();
             self.bind_native_source_label(
                 super::legacy_native_labels::NativeRole::MatchFailPop(
                     context.native_fail_owner,
-                    context.fail_pop.len(),
+                    pops,
                 ),
                 label,
             );
-            context.fail_pop.push(label);
-        }
+            label
+        })
     }
 
     fn jump_to_match_fail(
@@ -1423,8 +1444,8 @@ impl Compiler<'_> {
             return Ok(());
         }
         let pops = context.on_top + context.stores.len();
-        self.ensure_match_fail_pop(context, pops);
-        self.emit_jump_forward(opcode, context.fail_pop[pops], effect)?;
+        let failure = self.ensure_match_fail_pop(context, pops);
+        self.emit_jump_forward(opcode, failure, effect)?;
         if matches!(
             opcode,
             POP_JUMP_IF_FALSE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE | POP_JUMP_IF_TRUE
@@ -1443,18 +1464,21 @@ impl Compiler<'_> {
         failure_depth: i32,
     ) -> Result<(), CompileError> {
         for pops in (1..context.fail_pop.len()).rev() {
-            self.assembler.mark(context.fail_pop[pops]);
+            if let Some(label) = context.fail_pop[pops] {
+                self.assembler.mark(label);
+            }
             self.set_depth(failure_depth + i32::try_from(pops).unwrap());
             self.assembler.set_location(location);
             self.emit(POP_TOP, 0, -1)?;
         }
-        // Native 3.12 cleanup falls through to a separate zero-pop block.
-        // Keep that original boundary even when no pattern jumps to it directly.
-        if self.context.python_version == crate::PythonVersion::Py312 {
-            self.assembler
-                .record_exception_owner_block_boundary(context.fail_pop[0]);
+        if let Some(label) = context.fail_pop[0] {
+            // Native 3.12 cleanup falls through to a separate zero-pop block.
+            // Keep that original boundary even when no pattern jumps to it directly.
+            if self.context.python_version == crate::PythonVersion::Py312 {
+                self.assembler.record_exception_owner_block_boundary(label);
+            }
+            self.assembler.mark(label);
         }
-        self.assembler.mark(context.fail_pop[0]);
         self.set_depth(failure_depth);
         Ok(())
     }
@@ -1627,6 +1651,10 @@ impl Compiler<'_> {
                 .empty_success_blocks
                 .append(&mut alternative_context.empty_success_blocks);
 
+            // Capture reordering belongs to the whole alternative, rather than
+            // the last nested pattern compiled above.
+            self.assembler
+                .set_location(self.source_location(alternative.range()));
             if index != 0 {
                 let control = control.as_ref().unwrap();
                 if alternative_context.stores.len() != control.len() {
@@ -1662,8 +1690,6 @@ impl Compiler<'_> {
                 }
             }
 
-            self.assembler
-                .set_location(self.source_location(alternative.range()));
             let success_starts_block = self
                 .assembler
                 .instruction_opcode_at(self.assembler.instruction_count() - 1)
@@ -1713,15 +1739,27 @@ impl Compiler<'_> {
             .set_location(self.source_location(pattern.range));
         self.emit(POP_TOP, 0, -1)?;
         let pops = context.on_top + context.stores.len();
-        self.ensure_match_fail_pop(context, pops);
-        self.emit_jump_forward_instruction(JUMP_FORWARD, context.fail_pop[pops])?;
+        let failure = if self.context.python_version == PythonVersion::Py312 {
+            // Native 3.12 retains each cleanup boundary, including the zero-pop
+            // block that prevents copying cleanup into a protected failure edge.
+            self.ensure_match_fail_pop(context, pops)
+        } else {
+            // An OR failure jumps directly to this depth. Unused intermediate
+            // labels must not split its fallthrough cleanup before exit copying.
+            // Conditional failures keep their existing owner-boundary provenance.
+            if context.fail_pop.len() <= pops {
+                context.fail_pop.resize(pops + 1, None);
+            }
+            self.match_fail_pop_label(context, pops)
+        };
+        self.emit_jump_forward_instruction(JUMP_FORWARD, failure)?;
         // Outer failure pops also allow the success array to copy away, but
         // their failure target must remain too large to copy into this jump.
         let success_start = self.assembler.instruction_count();
         context.empty_failure_jumps.push((
             success_start - 1,
             success_start,
-            (pops != 0).then_some(context.fail_pop[pops]),
+            (pops != 0).then_some(failure),
         ));
         if empty_success {
             context
@@ -2730,7 +2768,9 @@ impl Compiler<'_> {
             // percent formatting, so it no longer has the required Tuple AST node.
             return Ok(SpecializedLowering::NotApplicable);
         }
-        let Some(parts) = optimized_percent_format(expression) else {
+        let Some(parts) =
+            optimized_percent_format(expression, |literal| self.string_literal_constant(literal))
+        else {
             return Ok(SpecializedLowering::NotApplicable);
         };
 
@@ -2739,13 +2779,14 @@ impl Compiler<'_> {
         for part in parts {
             match part {
                 PercentFormatPart::Literal(value) => {
-                    if value == "%" {
+                    if matches!(&value, Constant::String(value) if value == "%") {
                         self.context.record_percent_replacement();
                     }
                     // The preprocessing pass synthesizes these constants without
                     // source locations.
                     self.assembler.set_location(SourceLocation::NONE);
-                    self.load_string_constant(&value)?;
+                    let constant = self.add_constant(value)?;
+                    self.emit(LOAD_CONST, constant, 1)?;
                     self.assembler
                         .inherit_percent_target_location_for_last_instruction();
                 }
@@ -3578,7 +3619,7 @@ impl Compiler<'_> {
         }
         let name_id = self.required_name_id(name.id.as_str());
         if self.unit.annotation_classdict_index.is_some()
-            && (self.is_type_parameter_id(name_id) || !self.class_scope_declares_global(name_id))
+            && !self.class_scope_declares_global(name_id)
         {
             return Ok(SpecializedLowering::NotApplicable);
         }
@@ -3837,6 +3878,18 @@ impl Compiler<'_> {
             return Err(CompileError::Internal(
                 "comprehension has no generators".to_string(),
             ));
+        }
+        if self.unit.annotation_classdict_index.is_some()
+            && self.context.python_version >= PythonVersion::Py313
+        {
+            return self.compile_annotation_comprehension(
+                generators,
+                key,
+                value,
+                build_opcode,
+                add_opcode,
+                discard_result,
+            );
         }
         let comprehension_cell_names = comprehension_cell_names(generators, key, value);
         let base_depth = self.control.stack.depth;
@@ -4391,6 +4444,98 @@ impl Compiler<'_> {
                     i32::from(!discard_result)
                 },
         );
+        Ok(())
+    }
+
+    /// Class-visible annotation scopes keep comprehensions in a separate function.
+    fn compile_annotation_comprehension(
+        &mut self,
+        generators: &[ruff_python_ast::Comprehension],
+        key: Option<&Expr>,
+        value: &Expr,
+        build_opcode: Opcode,
+        add_opcode: Opcode,
+        discard_result: bool,
+    ) -> Result<(), CompileError> {
+        let location = self.assembler.location();
+        let name = match build_opcode {
+            BUILD_LIST => "<listcomp>",
+            BUILD_SET => "<setcomp>",
+            BUILD_MAP => "<dictcomp>",
+            _ => unreachable!("comprehension collection opcode"),
+        };
+        let mut locals = vec![".0".to_string()];
+        locals.extend(comprehension_temporary_names(generators, key, value));
+        let mut globals = FxHashSet::default();
+        let mut freevars = Vec::new();
+        for (name, bound) in comprehension_name_bindings(generators, key, value) {
+            if !bound {
+                if self.can_provide_closure(&name) {
+                    freevars.push(name);
+                } else {
+                    globals.insert(name);
+                }
+            }
+        }
+        let mut inlined_cellvars = inlined_comprehension_cell_names_in_expression(value);
+        if let Some(key) = key {
+            inlined_cellvars.extend(inlined_comprehension_cell_names_in_expression(key));
+        }
+        for (index, generator) in generators.iter().enumerate() {
+            if index > 0 {
+                inlined_cellvars.extend(inlined_comprehension_cell_names_in_expression(
+                    &generator.iter,
+                ));
+            }
+            for condition in &generator.ifs {
+                inlined_cellvars.extend(inlined_comprehension_cell_names_in_expression(condition));
+            }
+        }
+        let plan = LoweringFunctionPlan {
+            locals: self.name_ids(locals),
+            globals: self.name_id_set(globals),
+            cellvars: self.name_id_set(comprehension_cell_names(generators, key, value)),
+            inlined_comprehension_cellvars: self.name_id_set(inlined_cellvars),
+            freevars: self.name_ids(freevars),
+            ..LoweringFunctionPlan::default()
+        };
+        let mut child = Self::function(
+            Rc::clone(&self.context),
+            name,
+            self.child_qualified_name(name),
+            location.line.cast_unsigned(),
+            &plan,
+            self.unit.scope_id,
+            1,
+            0,
+            0,
+            CO_NESTED | (self.unit.flags & SUPPORTED_FUTURE_FLAGS),
+        )?;
+        child.inherit_lexical_context(self);
+        child.unit.child_qualified_name_parent = Some(child.unit.qualified_name.clone());
+        child.emit_function_prologue()?;
+        child.assembler.set_location(location);
+        child.emit(build_opcode, 0, 1)?;
+        child.emit_owned_fast(0, 1)?;
+        child.compile_comprehension_generator(generators, 0, key, value, add_opcode, 0)?;
+        child.assembler.set_location(location);
+        child.emit(RETURN_VALUE, 0, -1)?;
+        let child = child.finish_inner(false)?;
+
+        self.emit_function_with_closure(child, &plan.freevars)?;
+        if self.context.python_version == PythonVersion::Py315 {
+            self.compile_expression(&generators[0].iter)?;
+        } else {
+            self.compile_iterable_expression(&generators[0].iter)?;
+            self.assembler
+                .set_location(self.source_location(generators[0].iter.range()));
+            self.emit_comprehension_iterator(false)?;
+        }
+        self.assembler.set_location(location);
+        self.emit(CALL, 0, -1)?;
+        if discard_result {
+            self.emit(POP_TOP, 0, -1)?;
+        }
         Ok(())
     }
 

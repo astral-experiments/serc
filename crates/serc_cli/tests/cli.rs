@@ -2,7 +2,7 @@ mod common;
 
 use std::fmt::Write as _;
 use std::process::Command;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 fn serc() -> Command {
     Command::new(env!("CARGO_BIN_EXE_serc"))
@@ -24,6 +24,16 @@ fn compile_writes_a_timestamp_pyc() {
     let source_path = directory.path().join("module.py");
     let source = "answer = 42\n";
     fs_err::write(&source_path, source).unwrap();
+    let source_mtime = 1_700_000_000;
+    std::fs::File::options()
+        .write(true)
+        .open(&source_path)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(u64::from(source_mtime))),
+        )
+        .unwrap();
 
     let output = serc()
         .args(["compile", "--quiet"])
@@ -36,18 +46,84 @@ fn compile_writes_a_timestamp_pyc() {
     assert!(output.stderr.is_empty());
 
     let pyc_path = directory.path().join("__pycache__/module.cpython-314.pyc");
-    let metadata = fs_err::metadata(&source_path).unwrap();
-    let seconds = metadata
-        .modified()
-        .unwrap()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let source_mtime = u32::try_from(seconds).unwrap();
     let expected =
         serc::compile_to_pyc(source, &source_path.to_string_lossy(), source_mtime).unwrap();
 
     assert_eq!(fs_err::read(pyc_path).unwrap(), expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn compile_matches_cpython_for_rounded_timestamps() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("module.py");
+    let pyc_path = directory.path().join("__pycache__/module.cpython-314.pyc");
+    fs_err::write(&source_path, "answer = 42\n").unwrap();
+
+    for (before_epoch, seconds, nanos) in [
+        (false, 1_700_000_000, 999_999_999),
+        (false, 1_700_000_000, 1),
+        (true, 1_700_000_000, 999_999_999),
+        (true, 1_700_000_000, 1),
+        (true, 1, 500_000_000),
+        (true, 0, 500_000_000),
+        (false, u64::from(u32::MAX), 999_999_999),
+    ] {
+        let duration = Duration::new(seconds, nanos);
+        let modified = if before_epoch {
+            UNIX_EPOCH - duration
+        } else {
+            UNIX_EPOCH + duration
+        };
+        std::fs::File::options()
+            .write(true)
+            .open(&source_path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(
+            fs_err::metadata(&source_path).unwrap().modified().unwrap(),
+            modified
+        );
+
+        let output = serc()
+            .args(["compile", "--quiet"])
+            .arg(&source_path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{modified:?}: {output:?}");
+
+        let native = common::python_3145_command()
+            .args([
+                "-B",
+                "-c",
+                r"
+import importlib._bootstrap_external as external
+import pathlib
+import py_compile
+import sys
+
+source = pathlib.Path(sys.argv[1])
+cache = pathlib.Path(sys.argv[2])
+actual = cache.read_bytes()
+stat = source.stat()
+external._validate_timestamp_pyc(actual, int(stat.st_mtime), stat.st_size, 'module', {})
+oracle = py_compile.compile(str(source), cfile=str(cache) + '.oracle', doraise=True,
+                            optimize=0, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+sys.stdout.buffer.write(pathlib.Path(oracle).read_bytes())
+",
+            ])
+            .arg(&source_path)
+            .arg(&pyc_path)
+            .output()
+            .unwrap();
+        assert!(native.status.success(), "{modified:?}: {native:?}");
+        assert_eq!(
+            fs_err::read(&pyc_path).unwrap(),
+            native.stdout,
+            "{modified:?}"
+        );
+    }
 }
 
 #[test]
@@ -259,6 +335,7 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
             .join(format!("__pycache__/module.cpython-3{minor}.pyc"));
         let mut sources = vec![
             scalar_source.as_str(),
+            include_str!("../../serc/tests/fixtures/complex_division_signed_zeros.py"),
             "def answer():\n    return 42\n",
             "café = 'café'\n",
             "# coding: utf--8-sig\nvalue = 'é'\n",
@@ -276,6 +353,8 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
             "from __future__ import annotations\nsequence: [lambda: item for item in (1,)]\ndef function(argument: [lambda: item for item in (2,)]):\n    pass\n",
             "def f[T](x: [lambda: item for item in (1,)]): pass\n",
             "def outer(values):\n def f[T](x: [lambda: item for item in values]): pass\n return f\n",
+            // Eager annotations keep ordinary comprehensions in the defining scope.
+            "class C:\n def f(a: [i for i in (1,)]): pass\n",
             // Deferred module and class annotations inherit the active future flags.
             "from __future__ import barry_as_FLUFL\nvalue: int\n",
             "from __future__ import barry_as_FLUFL\nclass C:\n value: int\n def method(self, arg: int): pass\n",
@@ -353,8 +432,24 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
             "a = ((1e999 - 1e999) * 1j, 1j * (1e999 - 1e999), -(1e999 - 1e999) * 1j, 1j * -(1e999 - 1e999))\n",
             "def first():\n    return (1e999 - 1e999) + 1j\ndef second():\n    return (1e999 - 1e999) + 1j\n",
         ];
+        if version >= serc::PythonVersion::Py313 {
+            // Python 3.12 rejects comprehensions in class-visible annotation scopes.
+            sources.extend([
+                "class C:\n type A[T = {i for i in (1, 2)}] = T\n",
+                "class C:\n type A = [[lambda: j for j in (i,)] for i in (1, 2)]\n",
+                "class C:\n global __class__\n type A = [__class__ for i in (1,)]\n",
+                "class C:\n global __class__\n type A = [i for i in __class__]\n",
+                "def outer(a):\n class C:\n  a = type\n  class D[T](*[a for i in (1,)]): pass\n return C\n",
+            ]);
+        }
         if version >= serc::PythonVersion::Py314 {
             sources.extend([
+                // Deferred signatures keep captures separate from direct class-global lookup.
+                "class C:\n def f[T: [i for i in (1,)]](a: [T for i in (1,)]): pass\n",
+                "def outer(x):\n class C:\n  x = None\n  def f(a: [x for i in (1,)]): pass\n return C\n",
+                "def outer(x):\n class C:\n  x = None\n  def f[T](a: [x for i in (1,)]): pass\n return C\n",
+                "def outer(x):\n class C:\n  global x\n  def f(a: (x, [x for i in (1,)])): pass\n return C\n",
+                "class C:\n global T\n def f[T](a: (T, [T for i in (1,)])): pass\n",
                 // Preserve empty-bytes identity across constant-cache admission orders.
                 "value = b'x' * 0\n",
                 "value = 0 * b'x'\n",

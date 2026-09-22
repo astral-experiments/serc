@@ -26,8 +26,8 @@ use crate::{CompileError, PythonVersion};
 
 use super::constant::{fold_constant_for_version, folded_constant_owner_slots};
 use super::scope::{
-    LoweringFunctionPlan, NameId, ReferenceCollector, collect_conditional_simple_annotations,
-    collect_simple_annotations, expression_required_names,
+    LoweringFunctionPlan, NameId, ReferenceCollector, annotation_nested_required_names,
+    collect_conditional_simple_annotations, collect_simple_annotations, expression_required_names,
     expression_requirements_outside_comprehensions, function_annotation_expressions,
     inlined_comprehension_cell_names_in_expression,
     inlined_comprehension_local_names_in_expression, nested_expression_required_names,
@@ -56,14 +56,14 @@ impl CompiledFunctionDefaults {
 }
 
 impl Compiler<'_> {
-    /// Class globals apply to direct annotation loads, while nested functions retain closures.
+    /// Class globals apply to direct annotation loads; nested functions and comprehensions retain captures.
     fn class_visible_annotation_requirements(&self, expression: &Expr) -> BTreeSet<String> {
         let mut required = expression_required_names(expression);
         if required
             .iter()
             .any(|name| self.class_scope_declares_global(self.required_name_id(name)))
         {
-            let nested = nested_expression_required_names(expression);
+            let nested = annotation_nested_required_names(expression);
             required.retain(|name| {
                 !self.class_scope_declares_global(self.required_name_id(name))
                     || nested.contains(name)
@@ -295,6 +295,9 @@ impl Compiler<'_> {
                 .collect(),
             ..LoweringFunctionPlan::default()
         };
+        let nested_annotation_requirements = self.name_id_set(
+            function_annotation_expressions(definition).flat_map(annotation_nested_required_names),
+        );
         wrapper_plan.absorb_child_requirements(
             child_plan.required.iter().copied(),
             child_plan
@@ -302,7 +305,9 @@ impl Compiler<'_> {
                 .iter()
                 .copied()
                 .filter(|name| {
-                    self.has_deferred_annotations() && !self.class_scope_declares_global(*name)
+                    self.has_deferred_annotations()
+                        && (!self.class_scope_declares_global(*name)
+                            || nested_annotation_requirements.contains(name))
                 }),
         );
         if !self.has_deferred_annotations() && self.unit.flags & CO_FUTURE_ANNOTATIONS == 0 {
@@ -1401,7 +1406,8 @@ impl Compiler<'_> {
         let mut seen = FxHashSet::default();
         local_names.retain(|name| seen.insert(name.clone()));
         let locals = self.name_ids(&local_names);
-        let required_names = self.name_ids(self.class_visible_annotation_requirements(expression));
+        let required_names = self.name_ids(expression_required_names(expression));
+        let nested_requirements = self.name_id_set(annotation_nested_required_names(expression));
         let outside_requirements =
             self.name_id_set(expression_requirements_outside_comprehensions(expression));
         let mut freevars: Vec<_> = required_names
@@ -1409,6 +1415,9 @@ impl Compiler<'_> {
             .filter(|name| !locals.contains(name) || outside_requirements.contains(name))
             .filter(|name| !self.unit.pending_private_type_parameters.contains(*name))
             .filter(|name| self.is_type_parameter_id(**name) || self.can_provide_closure_id(**name))
+            .filter(|name| {
+                !self.class_scope_declares_global(**name) || nested_requirements.contains(*name)
+            })
             .copied()
             .collect();
         if can_see_class_scope {
@@ -1589,14 +1598,23 @@ impl Compiler<'_> {
             return Ok(None);
         }
 
+        let nested_requirements = self.name_id_set(
+            annotations
+                .iter()
+                .flat_map(|(_, annotation)| annotation_nested_required_names(annotation)),
+        );
         let mut freevars = function_plan.annotation_freevars.clone();
-        freevars.retain(|name| !self.class_scope_declares_global(*name));
+        freevars.retain(|name| {
+            !self.class_scope_declares_global(*name) || nested_requirements.contains(name)
+        });
         if self.unit.flags & CO_FUTURE_ANNOTATIONS == 0 {
             for name in function_plan
                 .annotation_references
                 .iter()
                 .filter(|name| {
-                    self.is_type_parameter_id(**name) && !self.class_scope_declares_global(**name)
+                    self.is_type_parameter_id(**name)
+                        && (!self.class_scope_declares_global(**name)
+                            || nested_requirements.contains(*name))
                 })
                 .copied()
             {
@@ -1613,7 +1631,7 @@ impl Compiler<'_> {
             let classdict = self.required_name_id("__classdict__");
             self.insert_lexical_name(&mut freevars, classdict);
         }
-        let mut local_names = vec!["format".to_string()];
+        let mut local_names = vec![".format".to_string()];
         let mut references = ReferenceCollector::default();
         let mut inlined_cellvars = FxHashSet::default();
         if self.unit.flags & CO_FUTURE_ANNOTATIONS == 0 && !can_see_class_scope {
@@ -1719,7 +1737,7 @@ impl Compiler<'_> {
         );
         child.assembler.set_location(location);
 
-        child.emit_annotation_format_guard("format")?;
+        child.emit_annotation_format_guard(".format")?;
         // The format guard reads its synthetic parameter; annotation expressions use their own globals.
         if let Scope::Function { globals, .. } = &mut child.unit.scope {
             globals.extend(annotation_globals);
@@ -1753,13 +1771,20 @@ impl Compiler<'_> {
         for annotation in &annotations {
             references.extend(expression_required_names(&annotation.annotation));
         }
+        let nested_requirements = self.name_id_set(
+            annotations
+                .iter()
+                .flat_map(|annotation| annotation_nested_required_names(&annotation.annotation)),
+        );
         let available_freevars: FxHashSet<_> = self.symbols.free_names.iter().copied().collect();
         let reference_ids = self.name_id_set(&references);
         let mut freevars = Vec::new();
         for name in reference_ids
             .iter()
             .filter(|name| {
-                available_freevars.contains(*name) && !self.class_scope_declares_global(**name)
+                available_freevars.contains(*name)
+                    && (!self.class_scope_declares_global(**name)
+                        || nested_requirements.contains(*name))
             })
             .copied()
         {
@@ -1768,7 +1793,8 @@ impl Compiler<'_> {
         let dunder_class = self.required_name_id("__class__");
         if reference_ids.contains(&dunder_class)
             && self.is_cell_id(dunder_class)
-            && !self.class_scope_declares_global(dunder_class)
+            && (!self.class_scope_declares_global(dunder_class)
+                || nested_requirements.contains(&dunder_class))
         {
             self.insert_lexical_name(&mut freevars, dunder_class);
         }
@@ -1781,11 +1807,11 @@ impl Compiler<'_> {
         let freevar_set: FxHashSet<_> = freevars.iter().copied().collect();
         let globals = reference_ids
             .into_iter()
-            .filter(|name| !freevar_set.contains(name))
+            .filter(|name| !freevar_set.contains(name) || self.class_scope_declares_global(*name))
             .collect();
         let closure_names = freevars.clone();
         let plan = LoweringFunctionPlan {
-            locals: vec![self.required_name_id("format")],
+            locals: vec![self.required_name_id(".format")],
             globals,
             freevars,
             ..LoweringFunctionPlan::default()
@@ -1815,7 +1841,7 @@ impl Compiler<'_> {
         let line = i32::try_from(self.unit.first_line_number).unwrap_or(i32::MAX);
         let setup_location = SourceLocation::new(line, line, 0, 0);
         child.assembler.set_location(setup_location);
-        child.emit_annotation_format_guard("format")?;
+        child.emit_annotation_format_guard(".format")?;
         child.emit(BUILD_MAP, 0, 1)?;
 
         let mut conditional_index = 0_u32;
@@ -1879,7 +1905,7 @@ impl Compiler<'_> {
         let first = annotations.first().ok_or_else(|| {
             CompileError::Internal("module annotation thunk has no annotations".to_string())
         })?;
-        let mut local_names = vec!["format".to_string()];
+        let mut local_names = vec![".format".to_string()];
         let mut inlined_cellvars = FxHashSet::default();
         for annotation in &annotations {
             local_names.extend(inlined_comprehension_local_names_in_expression(
@@ -1917,7 +1943,7 @@ impl Compiler<'_> {
         child.emit_function_prologue()?;
         let setup_location = self.source_location(body.first().map_or(first.range, Ranged::range));
         child.assembler.set_location(setup_location);
-        child.emit_annotation_format_guard("format")?;
+        child.emit_annotation_format_guard(".format")?;
         child.emit(BUILD_MAP, 0, 1)?;
 
         for (index, annotation) in annotations.iter().enumerate() {

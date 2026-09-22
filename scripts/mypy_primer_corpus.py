@@ -319,21 +319,16 @@ def repository_id(url: str) -> str:
     return identifier
 
 
-def resolve_remote(url: str) -> tuple[str, str | None]:
-    output = git(["ls-remote", "--symref", url, "HEAD"]).stdout.splitlines()
+def resolve_remote(url: str) -> str:
+    output = git(["ls-remote", url, "HEAD"]).stdout.splitlines()
     revision: str | None = None
-    default_ref: str | None = None
     for line in output:
         fields = line.split("\t")
-        if len(fields) != 2 or fields[1] != "HEAD":
-            continue
-        if fields[0].startswith("ref: "):
-            default_ref = fields[0].removeprefix("ref: ")
-        elif is_revision(fields[0]):
+        if len(fields) == 2 and fields[1] == "HEAD" and is_revision(fields[0]):
             revision = fields[0]
     if revision is None:
         raise CorpusError(f"could not resolve remote HEAD for {url}")
-    return revision, default_ref
+    return revision
 
 
 def update_lock(args: argparse.Namespace) -> None:
@@ -341,7 +336,7 @@ def update_lock(args: argparse.Namespace) -> None:
     revision, entries = read_catalog(checkout)
     by_url = group_catalog(entries)
 
-    resolved: dict[str, tuple[str, str | None]] = {}
+    resolved: dict[str, str] = {}
     failures: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
         futures = {executor.submit(resolve_remote, url): url for url in by_url}
@@ -358,15 +353,12 @@ def update_lock(args: argparse.Namespace) -> None:
 
     repositories = []
     for url, names in by_url.items():
-        project_revision, default_ref = resolved[url]
         repository: dict[str, Any] = {
             "id": repository_id(url),
             "url": url,
-            "revision": project_revision,
+            "revision": resolved[url],
             "logical_projects": names,
         }
-        if default_ref is not None:
-            repository["default_ref"] = default_ref
         repositories.append(repository)
     repositories.sort(key=lambda repository: repository["id"])
 
@@ -574,7 +566,7 @@ def verify(args: argparse.Namespace) -> None:
 
 def lock_content(args: argparse.Namespace) -> None:
     lock = read_lock(args.lock)
-    verify_checkouts(args.corpus_root, {**lock, "content": None}, verify_content=False)
+    verify_checkouts(args.corpus_root, lock, verify_content=False)
     content = inspect_content(args.corpus_root, lock["repositories"])
     lock["content"] = content
     write_lock(args.lock, lock)

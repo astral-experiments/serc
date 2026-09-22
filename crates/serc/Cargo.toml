@@ -19,6 +19,7 @@ workspace = true
 
 [dependencies]
 encoding_rs = { workspace = true }
+ruff_index = { workspace = true }
 ruff_python_ast = { workspace = true }
 ruff_python_codegen = { workspace = true }
 ruff_python_literal = { workspace = true }
@@ -32,7 +33,7 @@ smallvec = { workspace = true }
 clap = { workspace = true }
 cpu-time = { workspace = true }
 fs-err = { workspace = true }
-serc_workloads = { workspace = true }
+serc_fixtures = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

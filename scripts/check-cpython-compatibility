@@ -27,8 +27,8 @@ case "$python_version" in
     3.14)
         expected_exact=2230
         expected_rejected=221
-        expected_matched_rejection=151
-        expected_rejection_mismatch=56
+        expected_matched_rejection=152
+        expected_rejection_mismatch=55
         expected_compiler_failure=14
         ;;
     3.15)

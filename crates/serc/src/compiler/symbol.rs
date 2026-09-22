@@ -225,10 +225,10 @@ impl Compiler<'_> {
                 1,
             );
         }
-        // A generic wrapper binds its own parameters before inheriting class globals.
-        let annotation_classdict_index = self.unit.annotation_classdict_index.filter(|_| {
-            self.is_type_parameter_id(name_id) || !self.class_scope_declares_global(name_id)
-        });
+        let annotation_classdict_index = self
+            .unit
+            .annotation_classdict_index
+            .filter(|_| !self.unit.annotation_thunk || !self.class_scope_declares_global(name_id));
         match &self.unit.scope {
             Scope::Module => {
                 let index = self.name_index_with_id(name, name_id)?;
@@ -284,6 +284,7 @@ impl Compiler<'_> {
                 if globals.contains(name_id) {
                     if let Some(classdict) = annotation_classdict_index
                         && name != "__classdict__"
+                        && !self.class_scope_declares_global(name_id)
                     {
                         self.emit(LOAD_DEREF, classdict, 1)?;
                         let name = self.annotation_mangled_name(name);
