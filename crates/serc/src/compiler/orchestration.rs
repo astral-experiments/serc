@@ -983,7 +983,18 @@ impl<'source> Compiler<'source> {
         }
 
         self.output.first_flowgraph_constant = self.output.constants.len();
-        for (target, constant) in std::mem::take(&mut self.output.deferred_constants) {
+        for (deferred_index, (target, constant)) in
+            std::mem::take(&mut self.output.deferred_constants)
+                .into_iter()
+                .enumerate()
+        {
+            if self
+                .output
+                .fresh_empty_bytes_deferred
+                .contains(&deferred_index)
+            {
+                self.context.record_empty_bytes_origin(true);
+            }
             let index = self.add_constant(constant)?;
             match target {
                 Some(DeferredConstantTarget::Instruction(instruction)) => {
@@ -1106,6 +1117,9 @@ impl<'source> Compiler<'source> {
             parameter_count,
             Some(&mut constants),
         )?;
+        if exception_table.is_empty() || line_table.is_empty() {
+            self.context.record_empty_bytes_origin(false);
+        }
         let max_depth = if self.context.python_version <= crate::PythonVersion::Py313
             || (removed_max_depth == Some(self.control.stack.max_depth)
                 && assembled_max_depth < self.control.stack.max_depth)
@@ -1168,6 +1182,7 @@ impl<'source> Compiler<'source> {
                 uncached_percent_constant: self.context.has_uncached_percent_constant(),
                 metadata_ids,
                 subtree_has_frozenset_constants: self.output.has_frozenset_constants,
+                fresh_empty_bytes_constant: self.context.fresh_empty_bytes_constant(),
             },
         };
         code.validate()?;

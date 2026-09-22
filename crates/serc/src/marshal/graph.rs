@@ -176,6 +176,7 @@ pub(super) struct ObjectGraph<'a> {
     cached_scalar_ids: Option<Box<[u32]>>,
     cache_scalars: bool,
     uncached_percent_constant: bool,
+    fresh_empty_bytes_constant: bool,
     needs_reference_sorting: bool,
     legacy_qualified_name_aliases: FxHashSet<usize>,
     objects_by_id: Vec<Object>,
@@ -249,6 +250,7 @@ impl<'a> ObjectGraph<'a> {
             metadata_aliased_constants: collect_metadata_aliased_constants(code, &metadata_tuples),
             cache_scalars: code.constants.len() >= MIN_CACHED_SCALAR_CONSTANTS,
             uncached_percent_constant: code.marshal_provenance.uncached_percent_constant,
+            fresh_empty_bytes_constant: code.marshal_provenance.fresh_empty_bytes_constant,
             metadata_slots,
             ..Self::default()
         };
@@ -290,7 +292,13 @@ impl<'a> ObjectGraph<'a> {
                 should_intern(value) || self.interned_strings.contains_key(value.as_str()),
             );
         }
-        let key = constant_key(value);
+        let key = if self.fresh_empty_bytes_constant
+            && matches!(value, Constant::Bytes(value) if value.is_empty())
+        {
+            ObjectKey::FreshEmptyBytes
+        } else {
+            constant_key(value)
+        };
         let shared = Self::is_cached(&key, self.python_version)
             || self
                 .objects
@@ -394,11 +402,14 @@ impl<'a> ObjectGraph<'a> {
         first
     }
 
-    /// Records byte values using the empty-byte cache and, when enabled, the single-byte cache.
+    /// Records bytes using the compilation's empty-byte identity and optional single-byte cache.
     /// The occurrence kind distinguishes structural bytes from constant visits without splitting
     /// their shared object identity.
     fn record_bytes(&mut self, kind: OccurrenceKind, value: &'a [u8]) -> bool {
         match value {
+            [] if self.fresh_empty_bytes_constant => {
+                self.record_keyed(kind, ObjectKey::FreshEmptyBytes)
+            }
             [] => self.record_cached_value(kind, CachedObject::EmptyBytes),
             [value] if self.cache_scalars => {
                 self.record_cached_value(kind, CachedObject::Byte(*value))
@@ -2342,6 +2353,13 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
 
     #[inline]
     fn slice_member(&mut self, value: &'code Constant) {
+        if self.graph.python_version >= PythonVersion::Py314
+            && matches!(value, Constant::Bytes(value) if value.is_empty())
+        {
+            self.graph
+                .record_cached_value(OccurrenceKind::SliceMember, CachedObject::EmptyBytes);
+            return;
+        }
         let address = std::ptr::from_ref(value).addr();
         self.graph
             .record_unique_value(OccurrenceKind::SliceMember, ObjectKey::SliceMember(address));

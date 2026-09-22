@@ -1825,8 +1825,10 @@ impl Compiler<'_> {
             reorder_try_suites: !unwind_exits.0,
             register_literals,
             register_folds,
-            build_discarded: self.context.requires_discarded_builders(),
-            record_string_origins: self.context.has_tracked_string_origins(),
+            build_discarded: self.context.requires_discarded_builders()
+                || self.context.requires_empty_bytes_cache_trace,
+            record_string_origins: self.context.has_tracked_string_origins()
+                || self.context.requires_empty_bytes_cache_trace,
             private_name: self.unit.private_name.clone(),
             future_annotations: self.unit.flags & CO_FUTURE_ANNOTATIONS != 0,
             legacy_compiler: (!self.has_deferred_annotations()).then_some(&*self),
@@ -1873,6 +1875,7 @@ impl Compiler<'_> {
                 }
                 SkippedAction::Origins(origins) => {
                     for (constant, interned) in origins {
+                        self.context.record_constant_empty_bytes_origin(&constant);
                         self.context
                             .record_constant_string_origins(&constant, interned);
                     }

@@ -242,6 +242,7 @@ pub(super) struct OutputState {
     pub(super) has_deferred_break_none: bool,
     pub(super) deferred_constants_before_return: Vec<(OperandPatchId, Constant)>,
     pub(super) deferred_constants: Vec<(Option<DeferredConstantTarget>, Constant)>,
+    pub(super) fresh_empty_bytes_deferred: FxHashSet<usize>,
     pub(super) folded_constant_dependencies: Vec<(Constant, Vec<Constant>)>,
     pub(super) has_untracked_discarded_collection: bool,
     pub(super) deferred_names: Vec<(OperandPatchId, String)>,
@@ -613,6 +614,7 @@ impl Compiler<'_> {
         {
             self.emit(LOAD_SMALL_INT, u32::from(value), 1)?;
         } else {
+            self.record_fresh_empty_bytes_fold(expression, &constant);
             self.emit_deferred_constant(constant)?;
         }
         if self.assembler.early_boolean_admissions_certified() {
@@ -652,7 +654,7 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    fn record_folded_operands(&mut self, expression: &Expr) -> Result<(), CompileError> {
+    pub(super) fn record_folded_operands(&mut self, expression: &Expr) -> Result<(), CompileError> {
         match expression {
             Expr::BinOp(binary) => {
                 self.record_folded_value(&binary.left)?;
@@ -901,6 +903,7 @@ impl Compiler<'_> {
         if let Some(constant) = self.source_aware_fold_constant(expression)
             && !matches!(constant, Constant::Int(value) if u8::try_from(value).is_ok())
         {
+            self.record_fresh_empty_bytes_fold(expression, &constant);
             self.output.deferred_constants.push((None, constant));
         }
         Ok(())
@@ -983,6 +986,7 @@ impl Compiler<'_> {
         } else {
             constant
         };
+        self.context.record_constant_empty_bytes_origin(&constant);
         self.context
             .record_constant_string_origins(&constant, false);
         self.output.has_frozenset_constants |= matches!(constant, Constant::FrozenSet(_));
@@ -1063,6 +1067,16 @@ impl Compiler<'_> {
                 let index = usize::try_from(index).expect("constant index always fits in usize");
                 index_map[index]
             });
+    }
+
+    fn record_fresh_empty_bytes_fold(&mut self, expression: &Expr, constant: &Constant) {
+        if matches!(constant, Constant::Bytes(value) if value.is_empty())
+            && matches!(expression, Expr::BinOp(binary) if binary.op == Operator::Mult)
+        {
+            self.output
+                .fresh_empty_bytes_deferred
+                .insert(self.output.deferred_constants.len());
+        }
     }
 
     pub(super) fn emit_deferred_constant(

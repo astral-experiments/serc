@@ -549,7 +549,7 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
 
     #[inline]
     fn slice_member(&mut self, value: &'code Constant) {
-        // The graph gives these occurrences fresh, uninterned object IDs.
+        // The graph selects scalar identity, including the cached empty-bytes singleton.
         match value {
             Constant::Int(_)
             | Constant::SignedInt(_)
@@ -566,7 +566,7 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
                     OccurrenceKind::SliceMember,
                 );
             }
-            _ => unreachable!("only non-cached scalar slice members use identity keys"),
+            _ => unreachable!("only scalar slice members use dedicated traversal"),
         }
     }
 }

@@ -227,6 +227,8 @@ pub(crate) struct MarshalProvenance {
     pub(crate) metadata_ids: MarshalMetadataIds,
     /// Whether this code tree can contain a frozenset constant.
     pub(crate) subtree_has_frozenset_constants: bool,
+    /// Whether the constant cache first admitted a fresh empty bytes object.
+    pub(crate) fresh_empty_bytes_constant: bool,
 }
 
 impl MarshalProvenance {
