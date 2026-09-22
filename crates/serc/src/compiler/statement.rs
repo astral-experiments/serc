@@ -35171,10 +35171,10 @@ fn conditional_for_else_cleanup_exit(statement: &ruff_python_ast::StmtIf) -> boo
     {
         return false;
     }
-    // Exhaustion continues the enclosing loop. Ordinary inner-loop breaks copy
-    // the following conditional exit, leaving its original false edge as donor.
+    // Exhaustion exits the suite or continues the enclosing loop. Ordinary breaks
+    // copy the following conditional exit, leaving its original false edge as donor.
     // Nested exception cleanup needs its own original exit-boundary certificate.
-    if matches!(loop_statement.orelse.as_slice(), [Stmt::Continue(_)])
+    if suite_terminates(&loop_statement.orelse)
         && suite_contains_loop_break(&loop_statement.body)
         && !suite_contains_nested_exception_cleanup(&loop_statement.body)
     {
