@@ -5195,6 +5195,12 @@ impl OptimizationPipeline {
                     instruction.opcode == JUMP_BACKWARD
                         || instruction.jump_policy.is_interruptible()
                         || instruction.fusion_policy.is_authored_break()
+                        // Retained Pass NOPs share their tag with interruptible
+                        // jumps. The original match-success certificate still
+                        // proves this authored edge was JUMP before copying.
+                        || (instruction.opcode == JUMP_FORWARD
+                            && instruction.jump_policy.is_original_match_success()
+                            && instruction.exception_policy() == ExceptionPolicy::default())
                 })
                 && let Some(instruction) = copied.iter_mut().rev().find_map(|item| match item {
                     Item::Instruction(instruction) => Some(instruction),
