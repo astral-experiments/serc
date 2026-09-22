@@ -224,3 +224,21 @@ fn matches_cpython_copied_return_attribute_truth_parent_owners() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_manager_return_attribute_guard_pop_slots() {
+    for calls in 0..=6 {
+        let arguments = if calls == 0 {
+            "value".to_owned()
+        } else {
+            (0..calls)
+                .map(|index| format!("work{index}()"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let source = format!(
+            "def f(self, flag, value):\n    with self.lock:\n        try:\n            if flag:\n                chosen = 1\n            else:\n                chosen = 2\n            prepare({arguments})\n            return Result.make(value)\n        except Exception:\n            self.reset()\n            raise\n        finally:\n            if not self.reuse:\n                self.reset()\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "manager_attribute_guard_pop_slots.py");
+    }
+}

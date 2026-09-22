@@ -8652,6 +8652,10 @@ impl Compiler<'_> {
                                         if matches!(comparison.left.as_ref(), Expr::Name(_))
                                             && matches!(comparison.ops.as_ref(), [CmpOp::Is | CmpOp::IsNot])
                                             && matches!(comparison.comparators.as_ref(), [Expr::NoneLiteral(_)])),
+                                // Direct attribute truth guards consume the same original POP pair.
+                                Expr::Attribute(attribute) => matches!(attribute.value.as_ref(), Expr::Name(_)),
+                                Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => matches!(unary.operand.as_ref(),
+                                    Expr::Attribute(attribute) if matches!(attribute.value.as_ref(), Expr::Name(_))),
                                 _ => false,
                             });
                     // This manager was entered inside every ordinary try still active
