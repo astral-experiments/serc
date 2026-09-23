@@ -168,7 +168,8 @@ const SCOPE_SEED_NAMES: [&str; 26] = [
 
 #[derive(Debug, Default)]
 pub(super) struct NameInterner {
-    names: IndexVec<NameId, Cow<'static, str>>,
+    seed_names: &'static [&'static str],
+    names: Vec<String>,
     reverse: HashTable<NameId>,
 }
 
@@ -237,44 +238,82 @@ impl FromIterator<NameId> for NameSet {
 }
 
 impl NameInterner {
-    fn seeded(seeds: &[&'static str]) -> Self {
-        let mut interner = Self {
-            names: IndexVec::with_capacity(seeds.len()),
-            reverse: HashTable::with_capacity(seeds.len()),
-        };
-        for &name in seeds {
-            interner.insert(Cow::Borrowed(name));
+    fn seeded() -> Self {
+        Self {
+            seed_names: &SCOPE_SEED_NAMES,
+            ..Self::default()
         }
-        interner
+    }
+
+    fn seed_id(name: &str) -> Option<NameId> {
+        let index = match name {
+            SHADOWED_SUPER_SENTINEL => 0,
+            "" => 1,
+            ".0" => 2,
+            ".defaults" => 3,
+            ".format" => 4,
+            ".generic_base" => 5,
+            ".kwdefaults" => 6,
+            ".type_params" => 7,
+            "__class__" => 8,
+            "__classdict__" => 9,
+            "__classcell__" => 10,
+            "__classdictcell__" => 11,
+            "__conditional_annotations__" => 12,
+            "__annotate__" => 13,
+            "__annotate_func__" => 14,
+            "__annotations__" => 15,
+            "__doc__" => 16,
+            "__firstlineno__" => 17,
+            "__module__" => 18,
+            "__name__" => 19,
+            "__qualname__" => 20,
+            "__static_attributes__" => 21,
+            "__type_params__" => 22,
+            "format" => 23,
+            "join" => 24,
+            "super" => 25,
+            _ => return None,
+        };
+        Some(NameId::from_usize(index))
     }
 
     pub(super) fn intern(&mut self, name: &str) -> NameId {
         if let Some(id) = self.get(name) {
             return id;
         }
-        self.insert(Cow::Owned(name.to_owned()))
+        self.insert(name.to_owned())
     }
 
     fn intern_owned(&mut self, name: String) -> NameId {
         if let Some(id) = self.get(&name) {
             return id;
         }
-        self.insert(Cow::Owned(name))
+        self.insert(name)
     }
 
-    /// Stores each spelling once; reverse lookup retains only its stable name ID.
-    fn insert(&mut self, name: Cow<'static, str>) -> NameId {
-        let id = self.names.next_index();
-        self.reverse
-            .insert_unique(Self::hash(&name), id, |id| Self::hash(&self.names[*id]));
+    /// Stores dynamic spellings once; seed IDs resolve from the static table.
+    fn insert(&mut self, name: String) -> NameId {
+        let seed_count = self.seed_names.len();
+        let id = NameId::from_usize(seed_count + self.names.len());
+        self.reverse.insert_unique(Self::hash(&name), id, |id| {
+            Self::hash(&self.names[id.index() - seed_count])
+        });
         self.names.push(name);
         id
     }
 
     pub(super) fn get(&self, name: &str) -> Option<NameId> {
-        self.reverse
-            .find(Self::hash(name), |id| self.names[*id].as_ref() == name)
-            .copied()
+        if !self.reverse.is_empty()
+            && let Some(id) = self.reverse.find(Self::hash(name), |id| {
+                self.names[id.index() - self.seed_names.len()] == name
+            })
+        {
+            return Some(*id);
+        }
+        (!self.seed_names.is_empty())
+            .then(|| Self::seed_id(name))
+            .flatten()
     }
 
     fn hash(name: &str) -> u64 {
@@ -291,11 +330,16 @@ impl NameInterner {
     }
 
     pub(super) fn resolve(&self, id: NameId) -> &str {
-        self.names[id].as_ref()
+        let index = id.index();
+        if let Some(name) = self.seed_names.get(index) {
+            name
+        } else {
+            &self.names[index - self.seed_names.len()]
+        }
     }
 
     pub(super) fn len(&self) -> usize {
-        self.names.len()
+        self.seed_names.len() + self.names.len()
     }
 
     pub(super) fn insert_lexical(&self, names: &mut Vec<NameId>, id: NameId) {
@@ -1219,7 +1263,7 @@ impl ScopeArena {
             !matches!(python_version, PythonVersion::Py312 | PythonVersion::Py313);
         let eager_annotations = !deferred_annotations && !future_annotations;
         let mut arena = Self {
-            names: NameInterner::seeded(&SCOPE_SEED_NAMES),
+            names: NameInterner::seeded(),
             deferred_annotations,
             python_version,
             ..Self::default()
@@ -4884,7 +4928,6 @@ pub(super) fn collect_simple_annotations<'a>(
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
 
     use ruff_python_parser::parse_module;
     use rustc_hash::{FxHashMap, FxHashSet};
@@ -5198,24 +5241,26 @@ mod tests {
     }
 
     #[test]
-    fn seeded_name_interner_preserves_ids_order_and_borrowed_storage() {
-        let mut names = NameInterner::seeded(&SCOPE_SEED_NAMES);
+    fn seeded_name_interner_preserves_ids_order_and_static_storage() {
+        let mut names = NameInterner::seeded();
 
         for (index, name) in SCOPE_SEED_NAMES.into_iter().enumerate() {
             let id = NameId::from_usize(index);
             assert_eq!(names.get(name), Some(id));
             assert_eq!(names.resolve(id), name);
-            assert!(matches!(names.names[id], Cow::Borrowed(_)));
+            assert_eq!(names.seed_names[index], name);
         }
+        assert!(names.names.is_empty());
 
         assert_eq!(names.intern("__user_name__"), NameId::from_u32(26));
-        assert!(matches!(names.names[NameId::from_u32(26)], Cow::Owned(_)));
+        assert_eq!(names.names[0], "__user_name__");
         assert_eq!(names.intern("super"), NameId::from_u32(25));
+        assert_eq!(names.intern_owned("super".to_owned()), NameId::from_u32(25));
     }
 
     #[test]
     fn name_interner_preserves_ids_through_growth_and_repeated_lookup() {
-        let mut names = NameInterner::seeded(&SCOPE_SEED_NAMES);
+        let mut names = NameInterner::seeded();
         for index in 0..2048 {
             let spelling = format!("name_{index}_名");
             let expected = NameId::from_usize(SCOPE_SEED_NAMES.len() + index);
@@ -5230,10 +5275,7 @@ mod tests {
         }
         for (index, seed) in SCOPE_SEED_NAMES.iter().enumerate() {
             assert_eq!(names.intern(seed), NameId::from_usize(index));
-            assert!(matches!(
-                names.names[NameId::from_usize(index)],
-                Cow::Borrowed(_)
-            ));
+            assert_eq!(names.seed_names[index], *seed);
         }
         assert_eq!(names.len(), SCOPE_SEED_NAMES.len() + 2048);
         assert_eq!(names.get("missing"), None);
@@ -5243,15 +5285,16 @@ mod tests {
     fn default_name_interner_starts_with_zero_id() {
         let mut names = NameInterner::default();
 
+        assert_eq!(names.get("super"), None);
         assert_eq!(names.intern("dynamic"), NameId::from_u32(0));
-        assert!(matches!(names.names[NameId::from_u32(0)], Cow::Owned(_)));
+        assert_eq!(names.names[0], "dynamic");
     }
 
     #[test]
     fn module_name_walk_records_scope_definitions_in_preorder() {
         let source = "if condition:\n    def outer(value):\n        class Inner:\n            def method(self):\n                return value\nelse:\n    class Sibling:\n        def other(self):\n            return 1\n";
         let parsed = parse_module(source).unwrap();
-        let mut names = NameInterner::seeded(&SCOPE_SEED_NAMES);
+        let mut names = NameInterner::seeded();
 
         let (_, definitions, requires_module_bindings) =
             ModuleNameCollector::collect(&mut names, parsed.suite(), false);
@@ -5302,7 +5345,7 @@ mod tests {
 
         for (source, expected) in cases {
             let parsed = parse_module(source).unwrap();
-            let mut names = NameInterner::seeded(&SCOPE_SEED_NAMES);
+            let mut names = NameInterner::seeded();
             let (_, _, requires_module_bindings) =
                 ModuleNameCollector::collect(&mut names, parsed.suite(), false);
             assert_eq!(requires_module_bindings, expected, "source:\n{source}");
