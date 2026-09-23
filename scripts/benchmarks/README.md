@@ -34,3 +34,19 @@ Results default to `target/benchmarks/results/numpy.{json,md,metadata.txt}`. The
 source and output hashes, source count and size, revisions and working-tree state, toolchain and
 binary identities, build profile, worker counts, and machine details. See
 [published results](../../BENCHMARKS.md).
+
+## Profile-guided build
+
+After running [`scripts/build-pgo-release`](../../docs/development.md#profile-guided-release-build),
+pass its merged profile to the runner. Use the same source and Rust toolchain that generated it:
+
+```console
+PYTHON=/path/to/python3.14.5 \
+SERC_PGO_PROFILE="$PWD/target/pgo-release/run-EXAMPLE/training.profdata" \
+  ./scripts/benchmarks/run.sh
+```
+
+The runner builds the CLI with this profile and records `release-pgo`, the profile path, and
+its SHA-256 in the result metadata. It retains the complete bytecode preflight, one-worker
+workload, and untimed cache cleanup. Omitting `SERC_PGO_PROFILE` keeps the ordinary release
+build. Unset `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS` for the PGO mode.

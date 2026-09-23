@@ -1,0 +1,75 @@
+name: PGO
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/pgo.yml
+      - .github/actions/setup-python/**
+      - scripts/build-pgo-release
+      - scripts/check-cpython-compatibility
+      - scripts/check-ruff-pin
+      - scripts/pgo_corpus.py
+      - scripts/test_pgo_corpus.py
+      - scripts/benchmarks/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - vendor/ruff
+  pull_request:
+    paths:
+      - .github/workflows/pgo.yml
+      - .github/actions/setup-python/**
+      - scripts/build-pgo-release
+      - scripts/check-cpython-compatibility
+      - scripts/check-ruff-pin
+      - scripts/pgo_corpus.py
+      - scripts/test_pgo_corpus.py
+      - scripts/benchmarks/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - vendor/ruff
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  pgo-smoke:
+    name: "PGO pipeline smoke"
+    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_RETRY: 10
+      CARGO_TERM_COLOR: always
+      RUSTUP_MAX_RETRIES: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          submodules: true
+      - uses: ./.github/actions/setup-python
+      - name: "Install LLVM profile tools"
+        run: rustup component add llvm-tools-preview
+      # Exercise three CLI builds and the strict comparator on the full corpus.
+      # Debug mode avoids release optimization costs while checking the pipeline.
+      - name: "Exercise PGO pipeline"
+        run: ./scripts/build-pgo-release --debug "$SERC_TEST_PYTHON"
+      - name: "Upload PGO diagnostics"
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pgo-diagnostics
+          path: |
+            target/pgo-release/run-*/manifest.json
+            target/pgo-release/run-*/*.stdout
+            target/pgo-release/run-*/*.stderr
+          if-no-files-found: ignore
+          retention-days: 7

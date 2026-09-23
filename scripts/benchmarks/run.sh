@@ -10,6 +10,7 @@ Environment:
   PYTHON                 CPython executable (default: python3.14)
   HYPERFINE_WARMUP       Warmup runs (default: 3)
   HYPERFINE_MIN_RUNS     Minimum measured runs (default: 10)
+  SERC_PGO_PROFILE    Optional merged profile from scripts/build-pgo-release
 EOF
 }
 
@@ -24,6 +25,11 @@ numpy_checkout="$repo_root/target/benchmarks/numpy"
 numpy_revision="b832a09cf2a169c833dd2371e7c07aa00b293242"
 default_corpus="$numpy_checkout/numpy"
 serc_profile="release"
+serc_build_mode="release"
+pgo_profile="${SERC_PGO_PROFILE:-}"
+pgo_profile_sha256=""
+pgo_target=""
+build_target_args=()
 
 python="${PYTHON:-python3.14}"
 corpus="${1:-$default_corpus}"
@@ -133,11 +139,30 @@ if actual != expected:
     raise SystemExit(f"expected {expected}, got {actual}")
 '
 
-echo "Building Serc with the $serc_profile profile"
+if [[ -n "$pgo_profile" ]]; then
+    if [[ -n "${RUSTFLAGS:-}" || -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]]; then
+        echo "error: unset RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS when using SERC_PGO_PROFILE" >&2
+        exit 1
+    fi
+    if [[ ! -f "$pgo_profile" ]]; then
+        echo "error: PGO profile not found: $pgo_profile" >&2
+        exit 1
+    fi
+    pgo_profile="$(cd "$(dirname "$pgo_profile")" && pwd -P)/$(basename "$pgo_profile")"
+    pgo_profile_sha256="$(sha256_file "$pgo_profile")"
+    export CARGO_ENCODED_RUSTFLAGS="-Cprofile-use=$pgo_profile"
+    export CARGO_PROFILE_RELEASE_PANIC=unwind
+    pgo_target="$(rustc --version --verbose | sed -n 's/^host: //p')"
+    build_target_args=(--target "$pgo_target")
+    serc_build_mode="release-pgo"
+fi
+
+echo "Building Serc with the $serc_build_mode profile"
 serc="$(
     CARGO_INCREMENTAL=0 cargo build \
         --manifest-path "$repo_root/Cargo.toml" \
         --profile "$serc_profile" \
+        "${build_target_args[@]}" \
         --locked \
         --package serc-cli \
         --bin serc \
@@ -233,6 +258,10 @@ serc_binary_sha256="$(sha256_file "$serc")"
     echo "serc_binary=$serc"
     echo "serc_binary_sha256=$serc_binary_sha256"
     echo "serc_profile=$serc_profile"
+    echo "serc_build_mode=$serc_build_mode"
+    echo "pgo_profile=$pgo_profile"
+    echo "pgo_profile_sha256=$pgo_profile_sha256"
+    echo "pgo_target=$pgo_target"
     echo "serc_jobs=1"
     echo "cpython_jobs=1"
     echo "preflight_pyc_sha256=$serc_pyc_sha256"
