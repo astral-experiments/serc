@@ -33858,15 +33858,33 @@ pub(super) fn function_body_contains_yield(body: &[Stmt], eager_annotations: boo
     suite_contains_yield_with_headers(body, true, eager_annotations)
 }
 
+/// Include eager definition headers, excluding generic class annotation scopes.
+pub(super) fn suite_contains_yield_in_function_scope(
+    body: &[Stmt],
+    eager_annotations: bool,
+) -> bool {
+    suite_contains_yield_with_scope_options(body, true, eager_annotations, true)
+}
+
 fn suite_contains_yield_with_headers(
     body: &[Stmt],
     visit_function_headers: bool,
     eager_annotations: bool,
 ) -> bool {
+    suite_contains_yield_with_scope_options(body, visit_function_headers, eager_annotations, false)
+}
+
+fn suite_contains_yield_with_scope_options(
+    body: &[Stmt],
+    visit_function_headers: bool,
+    eager_annotations: bool,
+    skip_generic_bases: bool,
+) -> bool {
     struct YieldCollector {
         found: bool,
         visit_function_headers: bool,
         eager_annotations: bool,
+        skip_generic_bases: bool,
     }
 
     impl<'ast> Visitor<'ast> for YieldCollector {
@@ -33892,7 +33910,9 @@ fn suite_contains_yield_with_headers(
                     for decorator in &definition.decorator_list {
                         self.visit_expr(&decorator.expression);
                     }
-                    if let Some(arguments) = definition.arguments.as_deref() {
+                    if (!self.skip_generic_bases || definition.type_params.is_none())
+                        && let Some(arguments) = definition.arguments.as_deref()
+                    {
                         for argument in &arguments.args {
                             self.visit_expr(argument);
                         }
@@ -33930,6 +33950,7 @@ fn suite_contains_yield_with_headers(
         found: false,
         visit_function_headers,
         eager_annotations,
+        skip_generic_bases,
     };
     for statement in body {
         collector.visit_stmt(statement);

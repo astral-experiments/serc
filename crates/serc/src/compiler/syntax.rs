@@ -12,6 +12,8 @@ use ruff_text_size::{Ranged, TextRange};
 
 use crate::{CompileError, PythonVersion};
 
+use super::statement::suite_contains_yield_in_function_scope;
+
 /// Validate AST-based syntax restrictions using Ruff's shared checker.
 pub(crate) fn validate(
     source: &str,
@@ -46,6 +48,7 @@ enum ScopeKind<'ast> {
     Class,
     Function {
         is_async: bool,
+        is_async_generator: bool,
         parameters: Option<&'ast ast::Parameters>,
     },
     Comprehension {
@@ -183,6 +186,24 @@ impl<'ast> Visitor<'ast> for Validator<'_, 'ast> {
         if self.error.borrow().is_some() {
             return;
         }
+        // This precedes return-value checks and except* transfer checks, as in CPython.
+        if let Stmt::Return(statement) = statement
+            && statement.value.is_some()
+            && matches!(
+                self.scope().kind,
+                ScopeKind::Function {
+                    is_async_generator: true,
+                    ..
+                }
+            )
+        {
+            self.report_semantic_error(SemanticSyntaxError {
+                kind: SemanticSyntaxErrorKind::ReturnInGenerator,
+                range: statement.range,
+                python_version: self.python_version,
+            });
+            return;
+        }
         // Relative imports of a module named __future__ are ordinary imports. The shared
         // checker identifies directives by their module spelling, so hide that spelling here.
         if let Stmt::ImportFrom(import) = statement
@@ -212,6 +233,13 @@ impl<'ast> Visitor<'ast> for Validator<'_, 'ast> {
                 self.with_scope(
                     ScopeKind::Function {
                         is_async: function.is_async,
+                        // Ruff's return checker skips eager nested headers and defaults.
+                        is_async_generator: function.is_async
+                            && suite_contains_yield_in_function_scope(
+                                &function.body,
+                                !self.future_annotations
+                                    && self.python_version < ast::PythonVersion::PY314,
+                            ),
                         parameters: Some(&function.parameters),
                     },
                     |visitor| visitor.visit_body(&function.body),
@@ -266,6 +294,7 @@ impl<'ast> Visitor<'ast> for Validator<'_, 'ast> {
                 self.with_scope(
                     ScopeKind::Function {
                         is_async: false,
+                        is_async_generator: false,
                         parameters: lambda.parameters.as_deref(),
                     },
                     |visitor| visitor.visit_expr(&lambda.body),

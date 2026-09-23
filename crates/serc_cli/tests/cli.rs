@@ -1,3 +1,4 @@
+mod async_generator_returns;
 mod common;
 
 use std::fmt::Write as _;
