@@ -1,5 +1,6 @@
 mod async_generator_returns;
 mod common;
+mod except_star_transfers;
 
 use std::fmt::Write as _;
 use std::process::Command;
