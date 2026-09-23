@@ -288,7 +288,10 @@ fn private_nonlocal_aliases_match_native_bindings_and_pyc() {
         );
         for artifact in [&native_path, &cache_path] {
             let output = oracle().arg("-B").arg(artifact).output().unwrap();
-            assert!(output.status.success(), "{version}: {artifact:?}: {output:?}");
+            assert!(
+                output.status.success(),
+                "{version}: {artifact:?}: {output:?}"
+            );
         }
     }
 }
