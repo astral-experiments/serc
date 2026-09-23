@@ -3063,17 +3063,16 @@ impl OptimizationPipeline {
                             &preserved,
                         );
                         let range = blocks.get(*label_blocks.get(label.index())?)?;
-                        let instructions = items[range.clone()]
-                            .iter()
-                            .filter_map(|item| match item {
-                                Item::Instruction(instruction) => Some(instruction),
-                                Item::Label(_) => None,
-                            })
-                            .collect::<Vec<_>>();
-                        let first = instructions.first()?;
+                        let records = items[range.clone()].iter().filter_map(|item| match item {
+                            Item::Instruction(instruction) => Some(instruction),
+                            Item::Label(_) => None,
+                        });
+                        let first = records.clone().next()?;
                         if first.opcode != NOP || !first.fusion_policy.is_converted_pop_block() {
                             return None;
                         }
+                        let mut instructions: Vec<&Instruction> = Vec::with_capacity(range.len());
+                        instructions.extend(records);
                         let live = instructions
                             .iter()
                             .copied()

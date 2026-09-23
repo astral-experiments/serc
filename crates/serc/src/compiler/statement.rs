@@ -33895,7 +33895,19 @@ fn suite_contains_yield_with_scope_options(
     }
 
     impl<'ast> Visitor<'ast> for YieldCollector {
+        fn visit_body(&mut self, body: &'ast [Stmt]) {
+            for statement in body {
+                if self.found {
+                    return;
+                }
+                self.visit_stmt(statement);
+            }
+        }
+
         fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if self.found {
+                return;
+            }
             match statement {
                 Stmt::FunctionDef(definition) => {
                     if self.visit_function_headers {
@@ -33935,6 +33947,9 @@ fn suite_contains_yield_with_scope_options(
         }
 
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if self.found {
+                return;
+            }
             if let Expr::Lambda(lambda) = expression {
                 if self.visit_function_headers
                     && let Some(parameters) = lambda.parameters.as_deref()
@@ -33959,9 +33974,7 @@ fn suite_contains_yield_with_scope_options(
         eager_annotations,
         skip_generic_bases,
     };
-    for statement in body {
-        collector.visit_stmt(statement);
-    }
+    collector.visit_body(body);
     collector.found
 }
 

@@ -438,8 +438,11 @@ impl FusionPolicy {
     }
 
     const fn operand(self, payload: u32) -> Operand {
-        match self.0 & Self::OPERAND_KIND_MASK {
-            Self::VALUE_OPERAND => Operand::Value(payload),
+        let kind = self.0 & Self::OPERAND_KIND_MASK;
+        if kind == Self::VALUE_OPERAND {
+            return Operand::Value(payload);
+        }
+        match kind {
             Self::DEFERRED_OPERAND => Operand::Deferred(OperandPatchId::from_u32(payload)),
             Self::FORWARD_OPERAND => Operand::Forward(Label::from_u32(payload)),
             Self::BACKWARD_OPERAND => Operand::Backward(Label::from_u32(payload)),
@@ -1053,8 +1056,11 @@ impl ExceptionPolicy {
 struct InstructionMetadata(NonZeroU16);
 
 impl InstructionMetadata {
-    const POLICY_COUNT: u16 = 23;
-    const NORMAL_STATES: u16 = Self::POLICY_COUNT * 5 * 2;
+    const POLICY_MASK: u16 = 0b1_1111;
+    const EXTRA_INSTRUCTIONS_SHIFT: u16 = 5;
+    const EXTRA_INSTRUCTIONS_MASK: u16 = 0b111 << Self::EXTRA_INSTRUCTIONS_SHIFT;
+    const UNCONDITIONAL_INLINING_ONLY: u16 = 1 << 8;
+    const INITIAL_BORROW_ENTRY: u16 = 1 << 12;
     const RETIRED_CONTAINS: u16 = 1 << 15;
     const LATE_FOLD_LOCATION: u16 = 1 << 14;
     const LEGACY_JUMP_SEED_PRESENT: u16 = 1 << 9;
@@ -1075,29 +1081,27 @@ impl InstructionMetadata {
         Self(NonZeroU16::new(self.state() | flags).expect("instruction metadata reserves zero"))
     }
 
-    // Values 231..=276 retain all 23 exception policies and both copy modes for
-    // a direct original jump with no earlier copied slots. Adding slots discards
-    // this conservative proof; existing slot counts keep their full range.
+    // Only a direct original jump without earlier copied slots retains this proof.
+    // Adding slots discards it without changing the other metadata fields.
     const fn has_initial_borrow_entry(self) -> bool {
-        self.state() > Self::NORMAL_STATES
+        self.0.get() & Self::INITIAL_BORROW_ENTRY != 0
     }
 
     const fn normal_bits(self) -> u16 {
-        if self.has_initial_borrow_entry() {
-            self.state() - Self::NORMAL_STATES - 1
-        } else {
-            self.state() - 1
-        }
+        self.0.get()
+            & (Self::POLICY_MASK
+                | Self::EXTRA_INSTRUCTIONS_MASK
+                | Self::UNCONDITIONAL_INLINING_ONLY)
     }
 
     fn with_initial_borrow_entry(self, retain: bool) -> Self {
-        let bits = self.normal_bits() + 1;
+        let bits = self.0.get() & !Self::INITIAL_BORROW_ENTRY;
         let bits = if retain && self.pre_fold_extra_instructions() == 0 {
-            bits + Self::NORMAL_STATES
+            bits | Self::INITIAL_BORROW_ENTRY
         } else {
             bits
         };
-        Self(NonZeroU16::new(bits | self.flags()).expect("instruction metadata reserves zero"))
+        Self(NonZeroU16::new(bits).expect("instruction metadata reserves zero"))
     }
 
     fn new(
@@ -1107,17 +1111,37 @@ impl InstructionMetadata {
     ) -> Self {
         // The early exit pass copies at most four instructions, so four extra instructions
         // on any one surviving instruction are sufficient to rule it out.
-        // 23 policies, five slot counts, and two copy modes occupy 230 nonzero values.
-        let bits = ((u16::from(pre_fold_extra_instructions.min(4)) * Self::POLICY_COUNT)
-            + exception_policy as u16)
-            * 2
-            + u16::from(unconditional_inlining_only)
-            + 1;
+        // Store policy + 1 to reserve zero, leaving each field independently readable.
+        let bits = (exception_policy as u16 + 1)
+            | (u16::from(pre_fold_extra_instructions.min(4)) << Self::EXTRA_INSTRUCTIONS_SHIFT)
+            | (u16::from(unconditional_inlining_only) * Self::UNCONDITIONAL_INLINING_ONLY);
         Self(NonZeroU16::new(bits).expect("exception policy reserves the zero discriminant"))
     }
 
+    fn with_exception_policy(self, policy: ExceptionPolicy) -> Self {
+        let bits = (self.0.get() & !Self::POLICY_MASK) | (policy as u16 + 1);
+        Self(NonZeroU16::new(bits).expect("exception policy reserves the zero discriminant"))
+    }
+
+    fn with_added_pre_fold_extra_instructions(self, count: u8) -> Self {
+        if count == 0 {
+            return self;
+        }
+        let slots = self
+            .pre_fold_extra_instructions()
+            .saturating_add(count)
+            .min(4);
+        let bits = (self.0.get() & !(Self::EXTRA_INSTRUCTIONS_MASK | Self::INITIAL_BORROW_ENTRY))
+            | (u16::from(slots) << Self::EXTRA_INSTRUCTIONS_SHIFT);
+        Self(NonZeroU16::new(bits).expect("instruction metadata reserves zero"))
+    }
+
+    fn with_unconditional_inlining(self) -> Self {
+        Self(self.0 | Self::UNCONDITIONAL_INLINING_ONLY)
+    }
+
     const fn exception_policy(self) -> ExceptionPolicy {
-        match (self.normal_bits() / 2) % Self::POLICY_COUNT {
+        match (self.0.get() & Self::POLICY_MASK) - 1 {
             0 => ExceptionPolicy::NoneUnchanged,
             1 => ExceptionPolicy::NonePresent,
             2 => ExceptionPolicy::NoneOverridePresent,
@@ -1147,7 +1171,7 @@ impl InstructionMetadata {
 
     const fn pre_fold_extra_instructions(self) -> u8 {
         // Valid metadata reserves five slot counts; reject invalid encodings.
-        match self.normal_bits() / (Self::POLICY_COUNT * 2) {
+        match (self.0.get() & Self::EXTRA_INSTRUCTIONS_MASK) >> Self::EXTRA_INSTRUCTIONS_SHIFT {
             0 => 0,
             1 => 1,
             2 => 2,
@@ -1158,7 +1182,7 @@ impl InstructionMetadata {
     }
 
     const fn only_allows_unconditional_inlining(self) -> bool {
-        self.normal_bits() & 1 != 0
+        self.0.get() & Self::UNCONDITIONAL_INLINING_ONLY != 0
     }
 }
 
@@ -1350,16 +1374,11 @@ impl Instruction {
     }
 
     pub(super) fn set_exception_policy(&mut self, policy: ExceptionPolicy) {
-        if policy != self.exception_policy() {
+        let metadata = self.metadata.with_exception_policy(policy);
+        if metadata != self.metadata {
             self.jump_policy.retire_original_uniform_fold();
         }
-        self.metadata = InstructionMetadata::new(
-            policy,
-            self.pre_fold_extra_instructions(),
-            self.only_allows_unconditional_inlining(),
-        )
-        .with_initial_borrow_entry(self.metadata.has_initial_borrow_entry())
-        .with_flags(self.metadata.flags());
+        self.metadata = metadata;
     }
 
     pub(super) fn set_exception_owner(&mut self, owner: NormalizedExceptionOwner) {
@@ -1384,24 +1403,12 @@ impl Instruction {
             // cannot change. It invalidates the original literal-only transaction.
             self.jump_policy.retire_original_uniform_fold();
         }
-        self.metadata = InstructionMetadata::new(
-            self.exception_policy(),
-            self.pre_fold_extra_instructions().saturating_add(count),
-            self.only_allows_unconditional_inlining(),
-        )
-        .with_initial_borrow_entry(self.metadata.has_initial_borrow_entry())
-        .with_flags(self.metadata.flags());
+        self.metadata = self.metadata.with_added_pre_fold_extra_instructions(count);
     }
 
     pub(super) fn allow_unconditional_block_inlining(&mut self) {
         self.no_location_policy.allow_block_inlining();
-        self.metadata = InstructionMetadata::new(
-            self.exception_policy(),
-            self.pre_fold_extra_instructions(),
-            true,
-        )
-        .with_initial_borrow_entry(self.metadata.has_initial_borrow_entry())
-        .with_flags(self.metadata.flags());
+        self.metadata = self.metadata.with_unconditional_inlining();
     }
 
     pub(super) const fn only_allows_unconditional_inlining(&self) -> bool {
@@ -1942,6 +1949,22 @@ mod initial_borrow_metadata_tests {
         ExceptionPolicy::AlwaysAbsentPostTryCondition,
     ];
 
+    fn metadata_encodings() -> Vec<u16> {
+        let mut encodings = Vec::with_capacity(276);
+        for policy in 1..=23 {
+            for slots in 0..=4 {
+                for copy in [false, true] {
+                    let raw = policy | (slots << 5) | (u16::from(copy) << 8);
+                    encodings.push(raw);
+                    if slots == 0 {
+                        encodings.push(raw | (1 << 12));
+                    }
+                }
+            }
+        }
+        encodings
+    }
+
     #[test]
     fn fusion_owner_fields_preserve_every_normal_metadata_combination() {
         let original = Instruction::new(
@@ -1951,10 +1974,11 @@ mod initial_borrow_metadata_tests {
             None,
         );
         let mut same_count = 0;
-        for first in 1..=276 {
+        let encodings = metadata_encodings();
+        for &first in &encodings {
             let mut a = original;
             a.metadata = InstructionMetadata(NonZeroU16::new(first).unwrap());
-            for second in 1..=276 {
+            for &second in &encodings {
                 let mut b = original;
                 b.metadata = InstructionMetadata(NonZeroU16::new(second).unwrap());
                 let expected = a.exception_policy() == b.exception_policy()
@@ -2023,7 +2047,7 @@ mod initial_borrow_metadata_tests {
 
     #[test]
     fn constant_fold_provenance_survives_metadata_updates() {
-        for raw in 1..=276 {
+        for raw in metadata_encodings() {
             let original = InstructionMetadata(NonZeroU16::new(raw).unwrap());
             let mut instruction =
                 Instruction::new(LOAD_FAST, Operand::Value(0), SourceLocation::NONE, None);
@@ -2056,7 +2080,7 @@ mod initial_borrow_metadata_tests {
     #[test]
     fn native_jump_seed_survives_pointer_retargeting_and_policy_changes() {
         for argument in [0, 255, 256, 65_535, 65_536, 16_777_215, 16_777_216] {
-            for raw in 1..=276 {
+            for raw in metadata_encodings() {
                 let mut original = Instruction::synthetic(
                     JUMP_FORWARD,
                     Operand::Forward(Label::from_u32(1)),
@@ -2087,19 +2111,30 @@ mod initial_borrow_metadata_tests {
     }
 
     #[test]
-    fn wide_initial_borrow_metadata_preserves_all_276_encodings() {
-        let mut above_byte_capacity = 0;
-        for raw in 1..=276 {
+    fn bit_field_metadata_preserves_all_276_states() {
+        assert_eq!(size_of::<InstructionMetadata>(), 2);
+        assert_eq!(size_of::<Option<InstructionMetadata>>(), 2);
+        let mut encodings = metadata_encodings();
+        encodings.sort_unstable();
+        encodings.dedup();
+        assert_eq!(encodings.len(), 276);
+        assert!(!encodings.contains(&0));
+        for raw in encodings {
             let value = InstructionMetadata(NonZeroU16::new(raw).unwrap());
-            let origin = raw > 230;
-            let payload = if origin { raw - 231 } else { raw - 1 };
+            let origin = raw & (1 << 12) != 0;
             assert_eq!(value.has_initial_borrow_entry(), origin);
             assert_eq!(
                 value.exception_policy(),
-                POLICIES[usize::from(payload / 2 % 23)]
+                POLICIES[usize::from((raw & 31) - 1)]
             );
-            assert_eq!(u16::from(value.pre_fold_extra_instructions()), payload / 46);
-            assert_eq!(value.only_allows_unconditional_inlining(), payload % 2 != 0);
+            assert_eq!(
+                u16::from(value.pre_fold_extra_instructions()),
+                (raw >> 5) & 7
+            );
+            assert_eq!(
+                value.only_allows_unconditional_inlining(),
+                raw & (1 << 8) != 0
+            );
             if origin {
                 assert_eq!(value.pre_fold_extra_instructions(), 0);
             }
@@ -2110,8 +2145,14 @@ mod initial_borrow_metadata_tests {
             )
             .with_initial_borrow_entry(origin);
             assert_eq!(rebuilt.0.get(), raw);
+            let marked = value.with_initial_borrow_entry(true);
+            assert_eq!(
+                marked.has_initial_borrow_entry(),
+                value.pre_fold_extra_instructions() == 0
+            );
+            assert_eq!(marked.normal_bits(), value.normal_bits());
             let cleared = value.with_initial_borrow_entry(false);
-            assert!((1..=230).contains(&cleared.0.get()));
+            assert_eq!(cleared.0.get(), raw & !(1 << 12));
             assert_eq!(cleared.exception_policy(), value.exception_policy());
             assert_eq!(
                 cleared.pre_fold_extra_instructions(),
@@ -2121,23 +2162,12 @@ mod initial_borrow_metadata_tests {
                 cleared.only_allows_unconditional_inlining(),
                 value.only_allows_unconditional_inlining()
             );
-            if raw > u16::from(u8::MAX) {
-                above_byte_capacity += 1;
-                assert!(u8::try_from(rebuilt.0.get()).is_err());
-            }
-        }
-        assert_eq!(above_byte_capacity, 21);
-        for copy in [false, true] {
-            let tagged =
-                InstructionMetadata::new(ExceptionPolicy::NoneUnchangedBooleanSingleton, 0, copy)
-                    .with_initial_borrow_entry(true);
-            assert_eq!(tagged.0.get(), 273 + u16::from(copy));
         }
     }
 
     #[test]
     fn wide_metadata_preserves_policy_updates_and_invalidates_changed_origins() {
-        for raw in 1..=276 {
+        for raw in metadata_encodings() {
             let metadata = InstructionMetadata(NonZeroU16::new(raw).unwrap());
             let mut original = Instruction::synthetic(
                 JUMP_FORWARD,

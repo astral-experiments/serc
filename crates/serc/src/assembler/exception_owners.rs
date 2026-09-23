@@ -1089,7 +1089,7 @@ impl ExceptionOwnerTail {
             > 0
     }
 
-    fn instruction(&mut self, instruction: Instruction, previous: Option<Instruction>) {
+    fn instruction(&mut self, instruction: &Instruction, previous: Option<&Instruction>) {
         self.early_removals += usize::from(instruction.local_policy.hidden_exception_owner_slots());
         if matches!(
             instruction.opcode,
@@ -1134,6 +1134,37 @@ pub(super) struct UncompactedConditionalArray {
 struct UncompactedPrefixIndexes {
     positions: FxHashMap<Label, usize>,
     targets: FxHashSet<Label>,
+    authored_break_targets: FxHashSet<Label>,
+}
+
+impl UncompactedPrefixIndexes {
+    fn new(all: &[Item]) -> Self {
+        let mut positions = FxHashMap::default();
+        let mut targets = FxHashSet::default();
+        let mut authored_break_targets = FxHashSet::default();
+        for (index, item) in all.iter().enumerate() {
+            match item {
+                Item::Label(label) => {
+                    positions.insert(*label, index);
+                }
+                Item::Instruction(instruction) => {
+                    if let Operand::Forward(label) | Operand::Backward(label) =
+                        instruction.operand()
+                    {
+                        targets.insert(label);
+                        if instruction.fusion_policy.is_authored_break() {
+                            authored_break_targets.insert(label);
+                        }
+                    }
+                }
+            }
+        }
+        Self {
+            positions,
+            targets,
+            authored_break_targets,
+        }
+    }
 }
 
 /// Item and instruction positions for labels that occur exactly once.
@@ -1639,6 +1670,7 @@ impl ExceptionOwnerProvenance {
                 }
             })
             .collect::<FxHashSet<_>>();
+        let indexes = || indexes.get_or_init(|| UncompactedPrefixIndexes::new(all));
         // A raw emitted return or copied backedge is not necessarily a CP
         // record. The compiler's original branch target establishes the left
         // edge independently; the preceding terminator only bounds this scan.
@@ -1653,12 +1685,9 @@ impl ExceptionOwnerProvenance {
                             .count()
                             == 1
                 })
-                || all.iter().any(|item| {
-                    matches!(item, Item::Instruction(instruction)
-                        if instruction.fusion_policy.is_authored_break()
-                        && matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
-                            if leading_labels.contains(&label)))
-                })
+                || leading_labels
+                    .iter()
+                    .any(|label| indexes().authored_break_targets.contains(label))
                 || self.original_match_join_boundaries.iter().any(|entry| {
                     leading_labels.contains(entry)
                         && all
@@ -1715,33 +1744,9 @@ impl ExceptionOwnerProvenance {
         {
             return false;
         }
-        let UncompactedPrefixIndexes { positions, targets } = indexes.get_or_init(|| {
-            let positions = all
-                .iter()
-                .enumerate()
-                .filter_map(|(index, item)| {
-                    if let Item::Label(label) = item {
-                        Some((*label, index))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let targets = all
-                .iter()
-                .filter_map(|item| {
-                    if let Item::Instruction(instruction) = item
-                        && let Operand::Forward(label) | Operand::Backward(label) =
-                            instruction.operand()
-                    {
-                        Some(label)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            UncompactedPrefixIndexes { positions, targets }
-        });
+        let UncompactedPrefixIndexes {
+            positions, targets, ..
+        } = indexes();
         let mut instructions = Vec::new();
         let mut labels = FxHashSet::default();
         let mut from_import_members = FxHashSet::default();
@@ -2757,7 +2762,7 @@ impl LayoutAssembler {
                 .filter(|item| matches!(item, Item::Instruction(_)))
                 .count();
             let mut tail = ExceptionOwnerTail::default();
-            let mut previous = Some(*marker);
+            let mut previous = Some(marker);
             let mut unchanged_prefix = true;
             for (offset, item) in self.items[cursor..].iter().enumerate() {
                 // Even an apparently empty foreign label can stand for a different
@@ -2781,7 +2786,7 @@ impl LayoutAssembler {
                 }
                 unchanged_prefix &=
                     instruction.exception_policy() == super::ExceptionPolicy::default();
-                tail.instruction(*instruction, previous);
+                tail.instruction(instruction, previous);
                 // Global-call and boolean-comparison folding also remove protected
                 // records. Their complete prefix must retain its original owner policy.
                 if (tail.early_removals != usize::from(none_tail) * 3 && !unchanged_prefix)
@@ -2818,7 +2823,7 @@ impl LayoutAssembler {
                 if !matches!(instruction.operand(), Operand::Value(_)) {
                     break;
                 }
-                previous = Some(*instruction);
+                previous = Some(instruction);
             }
         }
         result
@@ -3189,7 +3194,7 @@ impl LayoutAssembler {
                 continue;
             }
             let mut tail = ExceptionOwnerTail::default();
-            let mut previous = Some(marker);
+            let mut previous = Some(&marker);
             let mut valid = true;
             for item in &current[marker_at + 1..current.len() - 1] {
                 let Item::Instruction(instruction) = item else {
@@ -3206,8 +3211,8 @@ impl LayoutAssembler {
                     valid = false;
                     break;
                 }
-                tail.instruction(*instruction, previous);
-                previous = Some(*instruction);
+                tail.instruction(instruction, previous);
+                previous = Some(instruction);
             }
             if !valid
                 || tail.early_removals != 0
@@ -3538,7 +3543,7 @@ impl LayoutAssembler {
                                 if !logical
                                     .checked_sub(1)
                                     .is_some_and(|index| retained_setup_nops.contains(&index))
-                                    || !previous.is_some_and(|instruction: Instruction| {
+                                    || !previous.is_some_and(|instruction: &Instruction| {
                                         instruction.opcode == NOP
                                             && instruction.location == *location
                                     })
@@ -3606,12 +3611,12 @@ impl LayoutAssembler {
                             valid = false;
                             break;
                         }
-                        tail.instruction(*instruction, previous);
+                        tail.instruction(instruction, previous);
                         if tail.insertions != 0 || tail.post_compaction_fusions != 0 {
                             valid = false;
                             break;
                         }
-                        previous = Some(*instruction);
+                        previous = Some(instruction);
                         logical += 1;
                     }
                 }
@@ -3788,7 +3793,7 @@ impl LayoutAssembler {
                                     || !logical
                                         .checked_sub(1)
                                         .is_some_and(|index| retained_setup_nops.contains(&index))
-                                    || !previous.is_some_and(|instruction: Instruction| {
+                                    || !previous.is_some_and(|instruction: &Instruction| {
                                         instruction.opcode == NOP
                                             && instruction.location == *location
                                     })
@@ -3862,12 +3867,12 @@ impl LayoutAssembler {
                             valid = false;
                             break;
                         }
-                        tail.instruction(*instruction, previous);
+                        tail.instruction(instruction, previous);
                         if tail.insertions != 0 || tail.post_compaction_fusions != 0 {
                             valid = false;
                             break;
                         }
-                        previous = Some(*instruction);
+                        previous = Some(instruction);
                         logical += 1;
                     }
                 }
@@ -3984,7 +3989,7 @@ impl LayoutAssembler {
             {
                 return None;
             }
-            prefix_tail.instruction(**record, None);
+            prefix_tail.instruction(record, None);
         }
         // The authored return NOP and two handler POPs precede the four exact
         // cleanup records; the finalizer POP follows them and transfers to LOAD_FAST.
@@ -4224,7 +4229,7 @@ impl LayoutAssembler {
             {
                 return None;
             }
-            prefix.instruction(**record, None);
+            prefix.instruction(record, None);
         }
         if prefix.insertions != 0
             || prefix.post_compaction_fusions != 0
@@ -4405,7 +4410,7 @@ impl LayoutAssembler {
             {
                 return None;
             }
-            prefix.instruction(**record, None);
+            prefix.instruction(record, None);
         }
         if prefix.insertions != 0
             || prefix.post_compaction_fusions != 0
@@ -4687,6 +4692,23 @@ impl LayoutAssembler {
     /// Resolves inserted markers after fusion and complete SETUP provenance is available.
     pub(super) fn dynamic_exception_owners(&self) -> FxHashMap<usize, ExceptionOwnerDecision> {
         if self.exception_regions.is_empty() {
+            return FxHashMap::default();
+        }
+        // Only markers, dynamic policies, or captured arrays can change owners.
+        let provenance = &self.exception_owner_provenance;
+        if provenance.normal_try_break_pop_owners.is_empty()
+            && provenance.named_handler_truth_prefixes.is_empty()
+            && provenance.copied_conjunction_break_prefixes.is_empty()
+            && provenance.uncompacted_conditional_arrays.is_empty()
+            && !self.items.iter().any(|item| {
+                matches!(item, Item::Instruction(instruction)
+                    if instruction.opcode == NOT_TAKEN
+                        || matches!(instruction.exception_policy().owner(),
+                            NormalizedExceptionOwner::Dynamic
+                                | NormalizedExceptionOwner::DynamicCondition
+                                | NormalizedExceptionOwner::DynamicConditionStrict))
+            })
+        {
             return FxHashMap::default();
         }
         let has_retained_setup = self
@@ -5190,19 +5212,19 @@ impl LayoutAssembler {
                                 .exception_owner_provenance
                                 .omitted_nop_locations
                                 .contains_key(label)
-                            && previous.is_some_and(|condition: Instruction| {
+                            && previous.is_some_and(|condition: &Instruction| {
                                 is_conditional_jump(condition.opcode)
                                     && matches!(condition.operand(), Operand::Forward(_))
                                     && self
                                         .exception_owner_provenance
                                         .original_primitive_condition_boundaries
                                         .iter()
-                                        .filter(|origin| **origin == condition)
+                                        .filter(|origin| *origin == condition)
                                         .count()
                                         == 1
                                     && indexed_instructions
                                         .iter()
-                                        .filter(|record| ***record == condition)
+                                        .filter(|record| **record == condition)
                                         .count()
                                         == 1
                                     && indexed_instructions.get(instruction_index).is_some_and(
@@ -5308,7 +5330,7 @@ impl LayoutAssembler {
                                     .copied()
                                     .unwrap_or(1),
                             ));
-                        } else if !previous.is_some_and(|instruction: Instruction| {
+                        } else if !previous.is_some_and(|instruction: &Instruction| {
                             is_conditional_jump(instruction.opcode)
                         }) {
                             ended_owned_suffix = None;
@@ -5328,13 +5350,13 @@ impl LayoutAssembler {
                             && matches!(indexed_instructions.get(instruction_index), Some(marker)
                             if marker.opcode == NOT_TAKEN
                                 && marker.exception_policy() == super::ExceptionPolicy::NoneDynamicCondition
-                                && previous.is_some_and(|condition: Instruction| {
+                                && previous.is_some_and(|condition: &Instruction| {
                                     condition.location == marker.location
                                         && matches!(condition.opcode,
                                             crate::target::opcodes::POP_JUMP_IF_FALSE | crate::target::opcodes::POP_JUMP_IF_TRUE)
                                         && matches!(condition.operand(), Operand::Forward(_))
                                         && self.exception_owner_provenance.original_primitive_condition_boundaries
-                                            .iter().filter(|original| **original == condition).count() == 1
+                                            .iter().filter(|original| *original == condition).count() == 1
                                 }))
                             && matches!(&indexed_instructions[original_array_start..instruction_index],
                             [load, to_bool, condition]
@@ -5430,7 +5452,7 @@ impl LayoutAssembler {
                             retained_epoch_known = false;
                         }
                         if jump_targets.contains(label)
-                            || !previous.is_some_and(|instruction: Instruction| {
+                            || !previous.is_some_and(|instruction: &Instruction| {
                                 is_conditional_jump(instruction.opcode)
                             })
                         {
@@ -5538,7 +5560,7 @@ impl LayoutAssembler {
                         if (ended_owned_prefix
                             .is_none_or(|(_, end, _, _)| end != instruction_index)
                             || jump_targets.contains(label))
-                            && !previous.is_some_and(|instruction: Instruction| {
+                            && !previous.is_some_and(|instruction: &Instruction| {
                                 is_conditional_jump(instruction.opcode)
                             })
                             && (jump_targets.contains(label)
@@ -5556,7 +5578,7 @@ impl LayoutAssembler {
                                     .exception_owner_provenance
                                     .setup_nop_boundaries
                                     .contains(label)
-                                && !previous.is_some_and(|instruction: Instruction| {
+                                && !previous.is_some_and(|instruction: &Instruction| {
                                     is_conditional_jump(instruction.opcode)
                                 })))
                     {
@@ -5581,7 +5603,7 @@ impl LayoutAssembler {
                             .protected_prefix_boundaries
                             .contains(label)
                         && ended_owned_suffix != Some(instruction_index)
-                        && !previous.is_some_and(|instruction: Instruction| {
+                        && !previous.is_some_and(|instruction: &Instruction| {
                             is_conditional_jump(instruction.opcode)
                         })
                     {
@@ -5605,7 +5627,7 @@ impl LayoutAssembler {
                         ended_owned_suffix = None;
                         source_owned_prefix = None;
                         let retained = nop_location.is_some_and(|location| {
-                            previous.is_some_and(|previous: Instruction| {
+                            previous.is_some_and(|previous: &Instruction| {
                                 previous.opcode == NOP && previous.location == location
                             })
                         });
@@ -6129,7 +6151,7 @@ impl LayoutAssembler {
                         }
                     }
                     let previous_fusions = tail.post_compaction_fusions;
-                    tail.instruction(*instruction, previous);
+                    tail.instruction(instruction, previous);
                     // The exact named-handler POP span also certifies its surviving
                     // SWAP and POP_EXCEPT cells. After counting the preceding erased
                     // POP, this is the survivor's old slot, with its own structural owner.
@@ -6760,7 +6782,7 @@ impl LayoutAssembler {
                         let folded_none_suffix_slots = if tail.late_removals == 0
                             && tail.insertions == 0
                             && tail.post_compaction_fusions == 0
-                            && previous.is_some_and(|previous: Instruction| {
+                            && previous.is_some_and(|previous: &Instruction| {
                                 matches!(previous.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
                                     && previous.local_policy.hidden_exception_owner_slots() >= 3
                             }) {
@@ -6907,7 +6929,7 @@ impl LayoutAssembler {
                         // the generic POP epoch stays unknown for every other retained NOP.
                         if instruction.exception_policy()
                             == super::ExceptionPolicy::NoneDynamicCondition
-                            && previous.is_some_and(|condition: Instruction| {
+                            && previous.is_some_and(|condition: &Instruction| {
                                 matches!(
                                     condition.opcode,
                                     crate::target::opcodes::POP_JUMP_IF_FALSE
@@ -8340,7 +8362,7 @@ impl LayoutAssembler {
                                             **actual == expected
                                         })
                             } else {
-                                previous.is_some_and(|previous: Instruction| {
+                                previous.is_some_and(|previous: &Instruction| {
                                     let none_test =
                                         matches!(
                                             previous.opcode,
@@ -8466,7 +8488,7 @@ impl LayoutAssembler {
                                             .exception_owner_provenance
                                             .original_primitive_condition_boundaries
                                             .iter()
-                                            .filter(|condition| **condition == previous)
+                                            .filter(|condition| *condition == previous)
                                             .count()
                                             == 1
                                         && !jump_targets
@@ -8533,14 +8555,14 @@ impl LayoutAssembler {
                                     self.exception_owner_provenance
                                         .source_none_conditions
                                         .iter()
-                                        .filter(|origin| Some(origin.instruction) == previous)
+                                        .filter(|origin| Some(&origin.instruction) == previous)
                                         .count()
                                         == 1
                                 } else {
                                     self.exception_owner_provenance
                                         .original_primitive_condition_boundaries
                                         .iter()
-                                        .filter(|condition| Some(**condition) == previous)
+                                        .filter(|condition| Some(*condition) == previous)
                                         .count()
                                         == 1
                                 })
@@ -8827,7 +8849,7 @@ impl LayoutAssembler {
                             && previous.is_some_and(|condition| {
                                 self.exception_owner_provenance
                                     .threaded_condition_origins
-                                    .contains(&(condition, *instruction))
+                                    .contains(&(*condition, *instruction))
                                     // Another copied condition can leave an identical
                                     // historical origin after later normalization.
                                     // The captured POP prefix must identify the sole
@@ -8835,7 +8857,7 @@ impl LayoutAssembler {
                                     && indexed_instructions
                                         .windows(2)
                                         .filter(|pair| {
-                                            *pair[0] == condition && *pair[1] == *instruction
+                                            pair[0] == condition && *pair[1] == *instruction
                                         })
                                         .count()
                                         == 1
@@ -8915,7 +8937,7 @@ impl LayoutAssembler {
                                     .local_policy
                                     .hidden_exception_owner_slots()
                                     == 0
-                                && previous.is_some_and(|previous: Instruction| {
+                                && previous.is_some_and(|previous: &Instruction| {
                                     matches!(
                                         previous.opcode,
                                         POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
@@ -9062,7 +9084,7 @@ impl LayoutAssembler {
                         owner_history_exact = true;
                         pop_slot_epoch_known = true;
                     } else {
-                        previous = Some(*instruction);
+                        previous = Some(instruction);
                     }
                 }
             }
@@ -10185,7 +10207,7 @@ impl LayoutAssembler {
                     {
                         return false;
                     }
-                    prefix_tail.instruction(**actual, None);
+                    prefix_tail.instruction(actual, None);
                 }
                 if prefix_tail.insertions != 0
                     || prefix_tail.post_compaction_fusions != 0
@@ -10452,7 +10474,7 @@ impl LayoutAssembler {
             {
                 return None;
             }
-            prefix_tail.instruction(**instruction, None);
+            prefix_tail.instruction(instruction, None);
         }
         if prefix_tail.insertions != 0
             || prefix_tail
@@ -11271,6 +11293,66 @@ impl LayoutAssembler {
 #[cfg(test)]
 mod tests {
     use super::ExceptionOwnerTail;
+
+    #[test]
+    fn dynamic_replay_preserves_non_marker_dynamic_policies() {
+        use super::ExceptionOwnerProvenance;
+        use crate::assembler::{
+            ExceptionRegion, ExceptionRegionPriority, Instruction, Item, Label, LayoutAssembler,
+            NormalizedExceptionOwner, Operand, SourceLocation,
+        };
+        use crate::target::opcodes::LOAD_CONST;
+
+        let start = Label::from_u32(0);
+        let end = Label::from_u32(1);
+        for owner in [
+            NormalizedExceptionOwner::Unchanged,
+            NormalizedExceptionOwner::Dynamic,
+            NormalizedExceptionOwner::DynamicCondition,
+            NormalizedExceptionOwner::DynamicConditionStrict,
+        ] {
+            let mut instruction = Instruction::new(
+                LOAD_CONST,
+                Operand::Value(0),
+                SourceLocation::new(1, 1, 0, 1),
+                None,
+            );
+            instruction.set_exception_owner(owner);
+            let assembler = LayoutAssembler {
+                python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
+                items: vec![
+                    Item::Label(start),
+                    Item::Instruction(instruction),
+                    Item::Label(end),
+                ],
+                exception_regions: vec![ExceptionRegion {
+                    is_scope_fallback: false,
+                    priority: ExceptionRegionPriority::OriginalRange(start, end),
+                    start,
+                    end,
+                    target: end,
+                    depth: 0,
+                    preserve_lasti: false,
+                }],
+                exception_owner_provenance: Box::new(ExceptionOwnerProvenance {
+                    source_boundaries: [start].into_iter().collect(),
+                    block_boundaries: [start].into_iter().collect(),
+                    ..ExceptionOwnerProvenance::default()
+                }),
+                preserved_block_boundaries: rustc_hash::FxHashSet::default(),
+                removed_max_depth: None,
+                next_label: 2,
+                has_next_location: false,
+            };
+            let owners = assembler.dynamic_exception_owners();
+            assert_eq!(
+                owners.contains_key(&0),
+                owner != NormalizedExceptionOwner::Unchanged,
+                "{owner:?}",
+            );
+        }
+    }
 
     #[test]
     fn for_target_owner_prefix_requires_the_exact_surviving_entry() {

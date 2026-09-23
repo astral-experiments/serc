@@ -724,13 +724,15 @@ impl Assembler {
     }
 
     /// Recognizes one ordinary block whose local, fusion, and location passes have linear forms.
-    pub(in crate::assembler) fn has_only_linear_instructions(&self) -> bool {
+    pub(in crate::assembler) fn has_only_linear_instructions(&self, local_count: usize) -> bool {
         use crate::target::opcodes::{
             BINARY_OP, BINARY_SLICE, BUILD_LIST, BUILD_MAP, BUILD_SET, BUILD_SLICE, BUILD_STRING,
-            BUILD_TUPLE, CALL, CALL_FUNCTION_EX, CALL_INTRINSIC_1, CALL_KW, DELETE_ATTR,
-            DELETE_GLOBAL, DELETE_NAME, DELETE_SUBSCR, IMPORT_NAME, LOAD_BUILD_CLASS, LOAD_NAME,
-            MAKE_FUNCTION, PUSH_NULL, STORE_ATTR, STORE_NAME, STORE_SLICE, STORE_SUBSCR,
-            UNARY_INVERT, UNARY_NEGATIVE,
+            BUILD_TUPLE, CALL, CALL_FUNCTION_EX, CALL_INTRINSIC_1, CALL_KW, CONVERT_VALUE,
+            COPY_FREE_VARS, DELETE_ATTR, DELETE_GLOBAL, DELETE_NAME, DELETE_SUBSCR, FORMAT_SIMPLE,
+            FORMAT_WITH_SPEC, GET_ITER, IMPORT_NAME, LOAD_BUILD_CLASS, LOAD_DEREF, LOAD_LOCALS,
+            LOAD_NAME, LOAD_SUPER_ATTR, MAKE_CELL, MAKE_FUNCTION, MAP_ADD, PUSH_NULL,
+            SETUP_ANNOTATIONS, STORE_ATTR, STORE_DEREF, STORE_NAME, STORE_SLICE, STORE_SUBSCR,
+            UNARY_INVERT, UNARY_NEGATIVE, UNPACK_EX,
         };
 
         if !self.has_no_linear_control_flow_metadata() {
@@ -739,11 +741,29 @@ impl Assembler {
         let UnoptimizedCode::Linear(items) = &self.code else {
             return false;
         };
+        let mut items = items.as_slice();
+        while let [Item::Instruction(prefix), rest @ ..] = items {
+            if !matches!(prefix.opcode, COPY_FREE_VARS | MAKE_CELL) {
+                break;
+            }
+            if !matches!(prefix.operand(), Operand::Value(_))
+                || *prefix
+                    != Instruction::new(
+                        prefix.opcode,
+                        prefix.operand(),
+                        SourceLocation::NONE,
+                        Some(0),
+                    )
+            {
+                return false;
+            }
+            items = rest;
+        }
         let [
             Item::Instruction(resume),
             middle @ ..,
             Item::Instruction(ret),
-        ] = items.as_slice()
+        ] = items
         else {
             return false;
         };
@@ -767,11 +787,18 @@ impl Assembler {
             return false;
         }
 
-        middle.iter().all(|item| {
+        let mut has_unpack = false;
+        let mut may_have_nops = false;
+        let ordinary = middle.iter().all(|item| {
             let Item::Instruction(instruction) = item else {
                 return false;
             };
+            has_unpack |= instruction.opcode == UNPACK_SEQUENCE;
+            may_have_nops |= matches!(instruction.opcode, NOP | TO_BOOL | UNARY_NOT);
             if !matches!(instruction.operand(), Operand::Value(_))
+                // Cell stores can remove checked loads in the graph's later local pass.
+                // Zero-local scopes never create checked loads in either pipeline.
+                || (instruction.opcode == STORE_DEREF && local_count != 0)
                 || !matches!(
                     instruction.opcode,
                     BINARY_OP
@@ -788,6 +815,7 @@ impl Assembler {
                         | CALL_KW
                         | COMPARE_OP
                         | CONTAINS_OP
+                        | CONVERT_VALUE
                         | COPY
                         | DELETE_ATTR
                         | DELETE_FAST
@@ -796,6 +824,9 @@ impl Assembler {
                         | DELETE_SUBSCR
                         | DICT_MERGE
                         | DICT_UPDATE
+                        | FORMAT_SIMPLE
+                        | FORMAT_WITH_SPEC
+                        | GET_ITER
                         | IMPORT_FROM
                         | IMPORT_NAME
                         | IS_OP
@@ -804,18 +835,24 @@ impl Assembler {
                         | LOAD_ATTR
                         | LOAD_BUILD_CLASS
                         | LOAD_CONST
+                        | LOAD_DEREF
                         | LOAD_FAST
                         | LOAD_GLOBAL
+                        | LOAD_LOCALS
                         | LOAD_NAME
                         | LOAD_SMALL_INT
+                        | LOAD_SUPER_ATTR
                         | MAKE_FUNCTION
+                        | MAP_ADD
                         | NOP
                         | POP_TOP
                         | PUSH_NULL
                         | SET_ADD
                         | SET_FUNCTION_ATTRIBUTE
                         | SET_UPDATE
+                        | SETUP_ANNOTATIONS
                         | STORE_ATTR
+                        | STORE_DEREF
                         | STORE_FAST
                         | STORE_GLOBAL
                         | STORE_NAME
@@ -825,6 +862,8 @@ impl Assembler {
                         | UNARY_INVERT
                         | UNARY_NEGATIVE
                         | UNARY_NOT
+                        | UNPACK_EX
+                        | UNPACK_SEQUENCE
                 )
                 || (instruction.opcode == NOP && instruction.location.line < 0)
             {
@@ -844,25 +883,37 @@ impl Assembler {
                 if instruction.local_policy.force_borrowed_load() {
                     ordinary.local_policy.mark_force_borrowed_load();
                 }
+                if instruction.local_policy.is_post_analysis_closure_load() {
+                    // A later ordinary load of a fast-local cell can lose its check in
+                    // the graph's second local pass. Keep those cells on the graph path.
+                    if matches!(instruction.operand(), Operand::Value(argument)
+                        if usize::try_from(argument).is_ok_and(|index| index < local_count))
+                    {
+                        return false;
+                    }
+                    ordinary.local_policy.mark_post_analysis_closure_load();
+                    ordinary.fusion_policy.prevent_with_previous();
+                }
             }
-            let hidden = instruction.local_policy.hidden_exception_owner_slots();
-            if matches!(instruction.opcode, LOAD_CONST | LOAD_SMALL_INT)
-                && (1..4).contains(&hidden)
-                && u16::from(instruction.pre_fold_extra_instructions()) == hidden
-                && self
-                    .exception_owner_provenance
-                    .uniform_fold_owner_slots
-                    .contains(&(instruction.location, instruction.opcode, hidden))
-            {
-                // Only block-copy sizing and exception ownership consume these paired counts;
-                // a single block without an exception region needs neither.
-                ordinary
-                    .local_policy
-                    .add_hidden_exception_owner_slots(hidden);
+            if matches!(
+                instruction.opcode,
+                LOAD_CONST | LOAD_SMALL_INT | LIST_EXTEND | SET_UPDATE | LOAD_SUPER_ATTR
+            ) {
+                // Fold history only affects block copying and exception ownership;
+                // neither applies to this block without labels or exception regions.
+                ordinary.local_policy.add_hidden_exception_owner_slots(
+                    instruction.local_policy.hidden_exception_owner_slots(),
+                );
                 ordinary.add_pre_fold_extra_instructions(instruction.pre_fold_extra_instructions());
+                if instruction.jump_policy.has_original_uniform_fold() {
+                    ordinary.jump_policy.mark_original_uniform_fold();
+                }
             }
             *instruction == ordinary
-        })
+        });
+        // The graph preserves distinct unpack/capture NOP line events. Boolean rewrites
+        // can create NOPs, and later compaction can expose them beside an unpack.
+        ordinary && !(has_unpack && may_have_nops)
     }
 
     fn has_no_linear_control_flow_metadata(&self) -> bool {
@@ -880,7 +931,6 @@ impl Assembler {
             && provenance.omitted_nop_tail.is_none()
             && provenance.noop_finally_locations.is_empty()
             && provenance.with_context_locations.is_empty()
-            && provenance.original_uniform_folds.is_empty()
             && provenance.copied_finally_iterator_returns.is_empty()
     }
 

@@ -152,16 +152,14 @@ impl OptimizationPipeline {
         if !graph.features().has_swap() {
             return false;
         }
-        let instructions = graph
-            .item_positions()
-            .into_iter()
-            .filter_map(|position| {
-                let Item::Instruction(instruction) = *graph.item(position) else {
-                    return None;
-                };
-                Some((position, instruction))
-            })
-            .collect::<Vec<_>>();
+        let positions = graph.item_positions();
+        let mut instructions = Vec::with_capacity(positions.len());
+        instructions.extend(positions.into_iter().filter_map(|position| {
+            let Item::Instruction(instruction) = *graph.item(position) else {
+                return None;
+            };
+            Some((position, instruction))
+        }));
         let mut previous = None;
         let mut redundant = Vec::new();
         let mut pop_location_swaps = Vec::new();
@@ -241,8 +239,15 @@ impl OptimizationPipeline {
             // swaptimize still cannot move stores across that block's entry.
             block_labels.extend(&self.exception_owner_provenance.block_boundaries);
         }
-        let blocks = graph.partition_positions(&block_labels, |instruction| {
+        let mut blocks = graph.partition_positions(&block_labels, |instruction| {
             !matches!(instruction.operand(), Operand::Value(_)) || ends_scope(instruction.opcode)
+        });
+        // Both swap phases operate within partitions containing a swap.
+        blocks.retain(|block| {
+            block.iter().any(|&position| {
+                matches!(graph.item(position), Item::Instruction(instruction)
+                    if instruction.opcode == SWAP)
+            })
         });
         // Admit cleanups from their complete original partition before any swap run is
         // rewritten. A newly simplified suffix cannot certify an emitted owner slot.

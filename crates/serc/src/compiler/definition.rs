@@ -2105,29 +2105,34 @@ fn function_annotations(
 }
 
 pub(super) fn clean_doc(docstring: &str) -> String {
-    let mut expanded = String::with_capacity(docstring.len());
-    let mut column = 0_usize;
-    for character in docstring.chars() {
-        match character {
-            '\t' => {
-                let spaces = 8 - column % 8;
-                expanded.extend(std::iter::repeat_n(' ', spaces));
-                column += spaces;
-            }
-            '\n' | '\r' => {
-                expanded.push(character);
-                column = 0;
-            }
-            _ => {
-                expanded.push(character);
-                column += 1;
+    let expanded = if docstring.contains('\t') {
+        let mut expanded = String::with_capacity(docstring.len());
+        let mut column = 0_usize;
+        for character in docstring.chars() {
+            match character {
+                '\t' => {
+                    let spaces = 8 - column % 8;
+                    expanded.extend(std::iter::repeat_n(' ', spaces));
+                    column += spaces;
+                }
+                '\n' | '\r' => {
+                    expanded.push(character);
+                    column = 0;
+                }
+                _ => {
+                    expanded.push(character);
+                    column += 1;
+                }
             }
         }
-    }
+        std::borrow::Cow::Owned(expanded)
+    } else {
+        std::borrow::Cow::Borrowed(docstring)
+    };
 
-    let lines: Vec<_> = expanded.split_inclusive('\n').collect();
+    let mut lines = expanded.split_inclusive('\n');
     let margin = lines
-        .iter()
+        .clone()
         .skip(1)
         .filter_map(|line| {
             let indentation = line.bytes().take_while(|byte| *byte == b' ').count();
@@ -2139,12 +2144,12 @@ pub(super) fn clean_doc(docstring: &str) -> String {
         .min()
         .unwrap_or(0);
 
-    let Some((first, remaining)) = lines.split_first() else {
-        return expanded;
+    let Some(first) = lines.next() else {
+        return expanded.into_owned();
     };
     let mut cleaned = String::with_capacity(expanded.len());
     cleaned.push_str(first.trim_start_matches(' '));
-    for line in remaining {
+    for line in lines {
         let indentation = line.bytes().take_while(|byte| *byte == b' ').count();
         cleaned.push_str(&line[indentation.min(margin)..]);
     }

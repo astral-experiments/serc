@@ -1318,7 +1318,10 @@ impl<'source> Compiler<'source> {
         };
         let (parser_interned_strings, canonical_constant_strings) =
             if matches!(self.unit.scope, Scope::Module) {
-                CompilationContext::finish_constant_string_provenance(&mut self.context)
+                CompilationContext::finish_constant_string_provenance(
+                    &mut self.context,
+                    self.output.has_frozenset_constants,
+                )
             } else {
                 (FxHashSet::default(), FxHashSet::default())
             };

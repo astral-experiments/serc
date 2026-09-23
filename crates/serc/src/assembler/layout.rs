@@ -428,11 +428,10 @@ impl LayoutAssembler {
             }
             bytecode[byte_offset] = instruction.opcode.code_for(self.python_version);
             bytecode[byte_offset + 1] = (argument & 0xff) as u8;
-            byte_offset += 2 + usize::from(instruction.opcode.caches_for(self.python_version)) * 2;
+            let caches = instruction.opcode.caches_for(self.python_version);
+            byte_offset += 2 + usize::from(caches) * 2;
 
-            let size = u32::from(extended_arg_count)
-                + 1
-                + u32::from(instruction.opcode.caches_for(self.python_version));
+            let size = u32::from(extended_arg_count) + 1 + u32::from(caches);
             if let Some((location, length)) = &mut run
                 && *location == instruction.location
             {
@@ -477,8 +476,8 @@ impl LayoutAssembler {
             let Item::Instruction(instruction) = *item else {
                 continue;
             };
-            let jump_base =
-                position + 1 + u32::from(instruction.opcode.caches_for(self.python_version));
+            let size = 1 + u32::from(instruction.opcode.caches_for(self.python_version));
+            let jump_base = position + size;
             let argument = match self.encoded_operand(&instruction)? {
                 Operand::Value(argument) => argument,
                 Operand::Deferred(id) => {
@@ -508,7 +507,6 @@ impl LayoutAssembler {
 
             bytecode[byte_offset] = instruction.opcode.code_for(self.python_version);
             bytecode[byte_offset + 1] = argument;
-            let size = 1 + u32::from(instruction.opcode.caches_for(self.python_version));
             byte_offset += usize::try_from(size).unwrap() * 2;
             position = jump_base;
 
@@ -707,6 +705,52 @@ mod tests {
 
     use super::*;
     use crate::assembler::{ExceptionPolicy, ExceptionRegion, NOP};
+
+    #[test]
+    fn wire_operand_lowering_preserves_target_specific_encodings() {
+        use crate::PythonVersion::{Py312, Py313, Py314, Py315};
+        use crate::target::GENEXPR_RESUME_ARGUMENT;
+        use crate::target::opcodes::{GET_YIELD_FROM_ITER, JUMP_FORWARD, RESUME};
+        use crate::target::operands::ResumeLocation;
+
+        let depth = ResumeLocation::AFTER_YIELD.at_depth(true);
+        let label = Label::from_u32(0);
+        for (version, expected_depth, expected_genexpr, expected_iter) in [
+            (Py312, 1, 0, 0),
+            (Py313, depth, 0, 0),
+            (Py314, depth, GENEXPR_RESUME_ARGUMENT, 0),
+            (Py315, 9, 4, 3),
+        ] {
+            let mut assembler = layout(Vec::new(), Vec::new());
+            assembler.python_version = version;
+            for (opcode, operand, expected) in [
+                (
+                    RESUME,
+                    Operand::Value(depth),
+                    Operand::Value(expected_depth),
+                ),
+                (
+                    RESUME,
+                    Operand::Value(GENEXPR_RESUME_ARGUMENT),
+                    Operand::Value(expected_genexpr),
+                ),
+                (
+                    GET_YIELD_FROM_ITER,
+                    Operand::Value(0),
+                    Operand::Value(expected_iter),
+                ),
+                (NOP, Operand::Value(1234), Operand::Value(1234)),
+                (
+                    JUMP_FORWARD,
+                    Operand::Forward(label),
+                    Operand::Forward(label),
+                ),
+            ] {
+                let instruction = Instruction::new(opcode, operand, SourceLocation::NONE, None);
+                assert_eq!(assembler.encoded_operand(&instruction).unwrap(), expected);
+            }
+        }
+    }
 
     #[test]
     fn legacy_annotation_tuple_nops_do_not_contribute_stack_peaks() {
