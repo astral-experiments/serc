@@ -519,6 +519,7 @@ impl Assembler {
             folded_predecessor_sources: self.folded_predecessor_sources,
             folded_loop_exit_anchors: self.folded_loop_exit_anchors,
             discarded_fold_admissions: self.discarded_fold_admissions,
+            folded_constant_admissions: self.folded_constant_admissions,
             early_boolean_admissions_certified: self.early_boolean_admissions_certified,
             has_early_boolean_admissions: self.has_early_boolean_admissions,
             initial_reachable,
@@ -896,6 +897,7 @@ impl OptimizationPipeline {
             if sequence_depth.is_some()
                 || !copied_entry_labels.is_empty()
                 || early_booleans.is_some()
+                || !self.folded_constant_admissions.is_empty()
             {
                 self.fold_copied_constants(
                     constants,

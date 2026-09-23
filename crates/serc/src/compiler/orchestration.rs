@@ -1162,6 +1162,9 @@ impl<'source> Compiler<'source> {
                 Some(DeferredConstantTarget::DiscardedExpression(label)) => {
                     self.assembler.record_discarded_fold_admission(label, index);
                 }
+                Some(DeferredConstantTarget::FoldedOperand(id)) => {
+                    self.assembler.record_fold_admission(id, index);
+                }
                 None => {}
             }
         }

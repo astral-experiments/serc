@@ -521,6 +521,11 @@ impl OptimizationPipeline {
                 order.extend(admissions);
             }
             if let Item::Instruction(instruction) = item
+                && let Some(id) = instruction.folded_constant_admissions
+            {
+                order.extend(&self.folded_constant_admissions[id.index()]);
+            }
+            if let Item::Instruction(instruction) = item
                 && instruction.opcode == LOAD_CONST
                 && let Operand::Value(index) = instruction.operand()
             {
@@ -531,6 +536,7 @@ impl OptimizationPipeline {
         order.retain(|index| used[*index as usize]);
         let indices = constants.retain_used(&used, &order, early_booleans);
         self.graph.for_each_instruction_mut(|instruction| {
+            instruction.folded_constant_admissions = None;
             if instruction.opcode == LOAD_CONST
                 && let Operand::Value(index) = instruction.operand()
             {

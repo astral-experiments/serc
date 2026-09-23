@@ -632,6 +632,84 @@ fn private_class_captures_match_native_marshal_and_execution() {
 }
 
 #[test]
+fn compile_matches_cpython_for_negative_empty_sequence_repetition() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory
+        .path()
+        .join("negative_empty_sequence_repetition.py");
+    let mut sources = vec![
+        include_str!("../../serc/tests/fixtures/negative_empty_sequence_repetition.py").to_string(),
+        "prior = ('', 1)\nempty = '' * -1\nlater = (2, 3)\nreused = 'x' * -1\n".to_string(),
+        "def f(flag):\n    if flag:\n        print('value')\n    return (1e1000 - 1e1000, '' * -1)\n".to_string(),
+    ];
+    // Synthetic constant containers and defaults have separate emission paths.
+    for expression in [
+        "x = ['' * -1, 2, 3]\n",
+        "x = {'' * -1, 2, 3}\n",
+        "x = ['' * -1, 2, 3, *values]\n",
+        "for x in ['' * -1, 2, 3]: pass\n",
+        "x = value in {'' * -1, 2, 3}\n",
+        "def f(value='' * -1): pass\n",
+        "f = lambda value='' * -1: value\n",
+        "if '' * -1: print('unreachable')\nx = (2, 3)\n",
+        "'' * -1\nx = (2, 3)\n",
+        "x = '' * -1 or (2, 3)\n",
+        "x: str = '' * -1\ny = (2, 3)\n",
+    ] {
+        sources.push(format!(
+            "for repeat in ():\n    try:\n        repeat()\n    except Exception:\n        pass\n{expression}reused = 'text' * -1\n"
+        ));
+    }
+    for source in sources {
+        fs_err::write(&source_path, &source).unwrap();
+        for version in [
+            serc::PythonVersion::Py312,
+            serc::PythonVersion::Py313,
+            serc::PythonVersion::Py314,
+            serc::PythonVersion::Py315,
+        ] {
+            let mut oracle = match version {
+                serc::PythonVersion::Py312 => common::python_312_command(),
+                serc::PythonVersion::Py313 => common::python_313_command(),
+                serc::PythonVersion::Py314 => common::python_3145_command(),
+                serc::PythonVersion::Py315 => common::python_315_command(),
+            };
+            let native = oracle
+            .args([
+                "-B",
+                "-c",
+                "import py_compile, sys; py_compile.compile(sys.argv[1], doraise=True, optimize=0, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)",
+            ])
+            .arg(&source_path)
+            .output()
+            .unwrap();
+            assert!(native.status.success(), "Python {version}: {native:?}");
+            let (_, minor, _) = version.target().version;
+            let pyc_path = directory.path().join(format!(
+                "__pycache__/negative_empty_sequence_repetition.cpython-3{minor}.pyc"
+            ));
+            let expected = fs_err::read(&pyc_path).unwrap();
+            let compiled = serc()
+                .args([
+                    "compile",
+                    "--quiet",
+                    "--python-version",
+                    &version.to_string(),
+                ])
+                .arg(&source_path)
+                .output()
+                .unwrap();
+            assert!(compiled.status.success(), "Python {version}: {compiled:?}");
+            assert_eq!(
+                fs_err::read(&pyc_path).unwrap(),
+                expected,
+                "Python {version}: {source}"
+            );
+        }
+    }
+}
+
+#[test]
 fn compile_matches_cpython_for_version_specific_marshal_identity() {
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("module.py");
