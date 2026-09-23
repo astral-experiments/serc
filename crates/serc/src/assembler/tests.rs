@@ -724,6 +724,26 @@ fn instruction_offsets_follow_label_insertions_and_trailing_removal() {
     assert_eq!(assembler.instruction_location_at(0), Some(first));
     assert_eq!(assembler.instruction_location_at(1), Some(second));
     assert_eq!(assembler.instruction_location_at(2), None);
+    assert_eq!(assembler.instruction_item_index(0), Some(0));
+    assert_eq!(assembler.instruction_item_index(1), Some(2));
+    assert_eq!(assembler.instruction_item_index(2), None);
+    assembler.exclude_normalized_exception_owner_at(1);
+    assert_eq!(
+        assembler
+            .instruction_at(1)
+            .unwrap()
+            .exception_policy()
+            .owner(),
+        NormalizedExceptionOwner::Absent
+    );
+    assert_eq!(
+        assembler
+            .instruction_at(0)
+            .unwrap()
+            .exception_policy()
+            .owner(),
+        NormalizedExceptionOwner::Unchanged
+    );
     assert!(assembler.contains_opcode_since(NOP, 1));
     assert!(!assembler.contains_opcode_since(LOAD_CONST, 1));
     assert!(!assembler.contains_opcode_since(NOP, 2));
@@ -743,6 +763,9 @@ fn instruction_offsets_follow_label_insertions_and_trailing_removal() {
     assert!(assembler.contains_opcode_since(RETURN_VALUE, 1));
     assert!(!assembler.contains_opcode_since(NOP, 0));
     assert_eq!(assembler.pre_fusion_instruction_count_since(0), 2);
+    assert!(assembler.is_small_linear_scope_exit_since(1));
+    assert!(!assembler.is_small_linear_scope_exit_since(0));
+    assert!(!assembler.is_small_linear_scope_exit_since(2));
 }
 
 #[test]

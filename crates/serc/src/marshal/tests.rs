@@ -262,6 +262,40 @@ fn frozenset_free_provenance_walk_preserves_nested_interns_and_qualified_names()
 }
 
 #[test]
+fn qualified_name_scalar_interning_and_recorded_origins_match_fallback() {
+    fn class(name: &str, origin: Option<bool>) -> Constant {
+        let mut code = code_object(vec![Constant::String(name.to_string())]);
+        code.name = name.rsplit('.').next().unwrap().to_string();
+        code.qualified_name = name.to_string();
+        code.marshal_provenance.qualified_name_constant_index = Some(0);
+        code.marshal_provenance.qualified_name_is_canonical = origin;
+        Constant::Code(Box::new(code))
+    }
+
+    fn module(simple: Option<bool>, shared: Option<bool>, separate: Option<bool>) -> CodeObject {
+        code_object(vec![
+            Constant::String("SercOuter.Separate".to_string()),
+            class("SercSimple", simple),
+            class("SercOuter.Shared", shared),
+            class("SercOuter.Separate", separate),
+        ])
+    }
+
+    let fallback = encode_code(&module(None, None, None));
+    assert_eq!(fallback, encode_code(&module(Some(false), None, None)));
+    assert_eq!(
+        fallback,
+        encode_code(&module(Some(false), Some(true), Some(false)))
+    );
+    assert_eq!(
+        fallback,
+        encode_code(&module(Some(false), None, Some(false)))
+    );
+    assert_ne!(fallback, encode_code(&module(None, Some(false), None)));
+    assert_ne!(fallback, encode_code(&module(None, None, Some(true))));
+}
+
+#[test]
 fn dense_metadata_ids_preserve_nested_and_constant_string_identity() {
     let mut nested = code_object(vec![Constant::String("shared_before".to_string())]);
     nested.names = vec!["shared_after".to_string(), "nested_only".to_string()];
