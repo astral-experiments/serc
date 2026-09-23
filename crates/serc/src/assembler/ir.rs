@@ -1597,7 +1597,8 @@ pub(crate) struct Assembler {
     pub(super) original_match_join: Option<Label>,
     /// Synchronous for-else end labels and their producer stack depth.
     pub(super) original_sync_for_else_ends: FxHashMap<Label, u32>,
-    pub(super) exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance,
+    /// Keeps this large state in place as the assembler changes optimization phases.
+    pub(super) exception_owner_provenance: Box<super::exception_owners::ExceptionOwnerProvenance>,
     pub(super) preserved_block_boundaries: FxHashSet<Label>,
     pub(super) borrow_unreachable_blocks: FxHashSet<Label>,
     /// Cleanup targets whose original for-loop backedge array was omitted during lowering.
@@ -1715,7 +1716,7 @@ pub(super) struct OptimizationPipeline {
     pub(super) next_label: u32,
     pub(super) legacy_native_labels: Option<Box<super::legacy_native_labels::LegacyNativeLabels>>,
     pub(super) exception_regions: Vec<ExceptionRegion>,
-    pub(super) exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance,
+    pub(super) exception_owner_provenance: Box<super::exception_owners::ExceptionOwnerProvenance>,
     pub(super) preserved_block_boundaries: FxHashSet<Label>,
     pub(super) borrow_unreachable_blocks: FxHashSet<Label>,
     /// Cleanup targets whose original for-loop backedge array was omitted during lowering.
@@ -1777,7 +1778,7 @@ pub(super) struct LayoutAssembler {
     pub(super) legacy_uniform_jump_seed: bool,
     pub(super) items: Vec<Item>,
     pub(super) exception_regions: Vec<ExceptionRegion>,
-    pub(super) exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance,
+    pub(super) exception_owner_provenance: Box<super::exception_owners::ExceptionOwnerProvenance>,
     pub(super) preserved_block_boundaries: FxHashSet<Label>,
     pub(super) removed_max_depth: Option<u32>,
     pub(super) next_label: u32,
@@ -1855,8 +1856,7 @@ impl Default for Assembler {
             original_fallthrough_location: None,
             original_match_join: None,
             original_sync_for_else_ends: FxHashMap::default(),
-            exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance::default(
-            ),
+            exception_owner_provenance: Box::default(),
             preserved_block_boundaries: FxHashSet::default(),
             borrow_unreachable_blocks: FxHashSet::default(),
             borrow_omitted_for_backedges: FxHashSet::default(),

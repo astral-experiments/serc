@@ -1666,7 +1666,7 @@ fn fused_final_artifacts_preserve_cache_extended_argument_location_and_depth_sem
             )),
         ],
         exception_regions: Vec::new(),
-        exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance::default(),
+        exception_owner_provenance: Box::default(),
         preserved_block_boundaries: rustc_hash::FxHashSet::default(),
         removed_max_depth: None,
         next_label: 1,
@@ -1751,7 +1751,7 @@ fn unextended_final_artifacts_preserve_jump_cache_location_and_depth_semantics()
             )),
         ],
         exception_regions: Vec::new(),
-        exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance::default(),
+        exception_owner_provenance: Box::default(),
         preserved_block_boundaries: rustc_hash::FxHashSet::default(),
         removed_max_depth: None,
         next_label: 1,
@@ -4628,6 +4628,267 @@ fn linear_constant_return_rejects_nontrivial_instructions_and_metadata() {
 }
 
 #[test]
+fn ordinary_linear_instructions_match_the_block_graph_pipeline() {
+    let instruction = |opcode, argument, line, depth| {
+        Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Value(argument),
+            SourceLocation::new(line, line, 0, 0),
+            Some(depth),
+        ))
+    };
+    let unlocated = |opcode, argument, depth| {
+        Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Value(argument),
+            SourceLocation::NONE,
+            Some(depth),
+        ))
+    };
+    let resume = instruction(RESUME, ResumeLocation::AT_FUNC_START.argument(), 1, 0);
+    let ret = instruction(RETURN_VALUE, 0, 8, 0);
+    let scenarios = [
+        (
+            0,
+            0,
+            vec![
+                instruction(LOAD_SMALL_INT, 0, 2, 1),
+                instruction(LOAD_CONST, 0, 2, 2),
+                instruction(IMPORT_NAME, 0, 2, 1),
+                instruction(IMPORT_FROM, 1, 2, 2),
+                instruction(STORE_NAME, 1, 2, 1),
+                instruction(POP_TOP, 0, 2, 0),
+                instruction(LOAD_CONST, 1, 4, 1),
+                unlocated(MAKE_FUNCTION, 0, 1),
+                instruction(STORE_NAME, 2, 4, 0),
+                instruction(LOAD_CONST, 0, 8, 1),
+            ],
+        ),
+        (
+            4,
+            2,
+            vec![
+                instruction(NOP, 0, 2, 0),
+                instruction(LOAD_FAST, 0, 3, 1),
+                instruction(PUSH_NULL, 0, 3, 2),
+                instruction(LOAD_FAST, 1, 3, 3),
+                instruction(CALL, 1, 3, 1),
+                unlocated(STORE_FAST, 2, 0),
+                instruction(LOAD_FAST, 2, 4, 1),
+                instruction(COPY, 1, 4, 2),
+                instruction(POP_TOP, 0, 4, 1),
+                instruction(STORE_FAST, 3, 4, 0),
+                instruction(DELETE_FAST, 2, 5, 0),
+                instruction(LOAD_FAST, 2, 5, 1),
+                instruction(POP_TOP, 0, 5, 0),
+                instruction(LOAD_FAST, 2, 6, 1),
+                instruction(LOAD_FAST, 3, 6, 2),
+                instruction(BUILD_TUPLE, 2, 6, 1),
+            ],
+        ),
+        (
+            2,
+            2,
+            vec![
+                instruction(LOAD_FAST, 0, 2, 1),
+                instruction(LOAD_FAST, 1, 2, 2),
+                instruction(IS_OP, 0, 2, 1),
+                instruction(TO_BOOL, 0, 2, 1),
+                instruction(UNARY_NOT, 0, 2, 1),
+            ],
+        ),
+        (
+            2,
+            2,
+            vec![
+                instruction(LOAD_FAST, 1, 2, 1),
+                instruction(LOAD_FAST, 0, 2, 2),
+                instruction(STORE_ATTR, 0, 2, 0),
+                instruction(LOAD_FAST, 0, 3, 1),
+                instruction(LOAD_SMALL_INT, 2, 3, 2),
+                instruction(BUILD_LIST, 2, 3, 1),
+                instruction(LOAD_FAST, 1, 4, 2),
+                instruction(LIST_EXTEND, 1, 4, 1),
+            ],
+        ),
+    ];
+    for (local_count, parameter_count, body) in scenarios {
+        for (owned, borrowed) in [(false, false), (true, false), (false, true)] {
+            let mut items = vec![resume];
+            items.extend(body.iter().copied());
+            items.push(ret);
+            if owned || borrowed {
+                for item in &mut items {
+                    if let Item::Instruction(instruction) = item
+                        && instruction.opcode == LOAD_FAST
+                    {
+                        instruction.local_policy = LocalPolicy::for_load(owned, owned);
+                        if borrowed {
+                            instruction.local_policy.mark_force_borrowed_load();
+                        }
+                    }
+                }
+            }
+            let linear = Assembler::from_linear_items(items.clone());
+            assert!(linear.has_only_linear_instructions());
+            assert!(!linear.has_only_linear_constant_return());
+            let graph = super::block_graph::BlockGraph::from_items(
+                items,
+                &rustc_hash::FxHashSet::default(),
+            );
+            let reachable = graph.reachable_blocks(&[]);
+            let generic = Assembler {
+                code: UnoptimizedCode::Prepared { graph, reachable },
+                ..Assembler::default()
+            };
+            assert!(!generic.has_only_linear_instructions());
+
+            let actual = linear.finish_code(1, local_count, parameter_count).unwrap();
+            let expected = generic
+                .finish_code(1, local_count, parameter_count)
+                .unwrap();
+            assert_eq!(actual.bytecode, expected.bytecode);
+            assert_eq!(actual.line_table, expected.line_table);
+            assert_eq!(actual.exception_table, expected.exception_table);
+            assert_eq!(actual.max_depth, expected.max_depth);
+            assert_eq!(actual.removed_max_depth, expected.removed_max_depth);
+        }
+    }
+}
+
+#[test]
+fn ordinary_linear_unprotected_folds_and_class_footer_match_the_block_graph_pipeline() {
+    let instruction = |opcode, argument, line, depth| {
+        Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Value(argument),
+            if line < 0 {
+                SourceLocation::NONE
+            } else {
+                SourceLocation::new(line, line, 0, 0)
+            },
+            Some(depth),
+        ))
+    };
+    for opcode in [LOAD_CONST, LOAD_SMALL_INT] {
+        for count in 1..4 {
+            for class_footer in [false, true] {
+                let build = |recorded| {
+                    let mut assembler = Assembler::from_linear_items(vec![
+                        instruction(RESUME, ResumeLocation::AT_FUNC_START.argument(), 1, 0),
+                        instruction(opcode, 1, 2, 1),
+                    ]);
+                    assembler.add_last_constant_fold_slots(count);
+                    if recorded {
+                        assembler.record_last_uniform_fold_owner_slots(count);
+                    }
+                    for item in [
+                        instruction(STORE_NAME, 0, 2, 0),
+                        instruction(LOAD_CONST, 0, -1, 1),
+                        instruction(RETURN_VALUE, 0, -1, 0),
+                    ] {
+                        assembler.push_linear_item(item);
+                    }
+                    if class_footer {
+                        assembler.allow_last_no_location_block_inlining();
+                    }
+                    assembler
+                };
+                assert!(!build(false).has_only_linear_instructions());
+                let linear = build(true);
+                assert!(linear.has_only_linear_instructions());
+                let mut generic = build(true);
+                let graph = super::block_graph::BlockGraph::from_items(
+                    generic.linear_items().to_vec(),
+                    &rustc_hash::FxHashSet::default(),
+                );
+                let reachable = graph.reachable_blocks(&[]);
+                generic.code = UnoptimizedCode::Prepared { graph, reachable };
+
+                let actual = linear.finish_code(1, 0, 0).unwrap();
+                let expected = generic.finish_code(1, 0, 0).unwrap();
+                assert_eq!(actual.bytecode, expected.bytecode);
+                assert_eq!(actual.line_table, expected.line_table);
+                assert_eq!(actual.exception_table, expected.exception_table);
+                assert_eq!(actual.max_depth, expected.max_depth);
+                assert_eq!(actual.removed_max_depth, expected.removed_max_depth);
+            }
+        }
+    }
+}
+
+#[test]
+fn ordinary_linear_instructions_reject_control_flow_and_unhandled_policies() {
+    let instruction = |opcode, argument, depth| {
+        Instruction::new(
+            opcode,
+            Operand::Value(argument),
+            SourceLocation::new(1, 1, 0, 0),
+            Some(depth),
+        )
+    };
+    let original = || {
+        vec![
+            Item::Instruction(instruction(
+                RESUME,
+                ResumeLocation::AT_FUNC_START.argument(),
+                0,
+            )),
+            Item::Instruction(instruction(LOAD_FAST, 0, 1)),
+            Item::Instruction(instruction(RETURN_VALUE, 0, 0)),
+        ]
+    };
+    assert!(Assembler::from_linear_items(original()).has_only_linear_instructions());
+
+    let mut hidden_slots = instruction(LOAD_FAST, 0, 1);
+    hidden_slots
+        .local_policy
+        .add_hidden_exception_owner_slots(1);
+    let mut closure_load = instruction(LOAD_FAST, 0, 1);
+    closure_load.local_policy.mark_post_analysis_closure_load();
+    let mut no_location = instruction(NOP, 0, 0);
+    no_location.location = SourceLocation::NONE;
+    let mut retained_nop = instruction(NOP, 0, 0);
+    retained_nop.jump_policy.preserve_explicit_nop();
+    let mut exceptional = instruction(LOAD_FAST, 0, 1);
+    exceptional.set_exception_policy(ExceptionPolicy::NonePresent);
+    let target = super::Label::from_u32(0);
+    for replacement in [
+        Item::Instruction(instruction(SWAP, 2, 1)),
+        Item::Instruction(instruction(UNPACK_SEQUENCE, 2, 1)),
+        Item::Instruction(instruction(RETURN_VALUE, 0, 0)),
+        Item::Instruction(instruction(RETURN_GENERATOR, 0, 0)),
+        Item::Instruction(hidden_slots),
+        Item::Instruction(closure_load),
+        Item::Instruction(no_location),
+        Item::Instruction(retained_nop),
+        Item::Instruction(exceptional),
+        Item::Instruction(Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(target),
+            SourceLocation::NONE,
+            Some(0),
+        )),
+        Item::Label(target),
+    ] {
+        let mut items = original();
+        items[1] = replacement;
+        assert!(!Assembler::from_linear_items(items).has_only_linear_instructions());
+    }
+
+    let mut allocated = Assembler::from_linear_items(original());
+    allocated.label();
+    assert!(!allocated.has_only_linear_instructions());
+    let mut provenance = Assembler::from_linear_items(original());
+    provenance.exception_owner_provenance.omitted_nop_tail =
+        Some((1, SourceLocation::new(2, 2, 0, 0), 1));
+    assert!(!provenance.has_only_linear_instructions());
+    let mut next_location = Assembler::from_linear_items(original());
+    next_location.has_next_location = true;
+    assert!(!next_location.has_only_linear_instructions());
+}
+
+#[test]
 fn maybe_null_comprehension_restore_checks_only_the_first_later_load() {
     let mut restore = Instruction::new(STORE_FAST, Operand::Value(0), SourceLocation::NONE, None);
     restore.local_policy.mark_maybe_null_comprehension_restore();
@@ -5588,12 +5849,14 @@ fn retained_setup_nop_identity_survives_consecutive_labels_without_aliasing_remo
             legacy_uniform_jump_seed: false,
             items,
             exception_regions: Vec::new(),
-            exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance {
-                setups: vec![(setup, Some(location))],
-                setup_nop_ranges: vec![(start, end)],
-                setup_nop_boundaries: [start, end].into_iter().collect(),
-                ..Default::default()
-            },
+            exception_owner_provenance: Box::new(
+                super::exception_owners::ExceptionOwnerProvenance {
+                    setups: vec![(setup, Some(location))],
+                    setup_nop_ranges: vec![(start, end)],
+                    setup_nop_boundaries: [start, end].into_iter().collect(),
+                    ..Default::default()
+                },
+            ),
             preserved_block_boundaries: rustc_hash::FxHashSet::default(),
             removed_max_depth: None,
             next_label: 4,
