@@ -1,18 +1,21 @@
 //! Source validation runs before lowering can discard unreachable statements.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 
-use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
+use ruff_python_ast::visitor::{Visitor, walk_expr, walk_parameters, walk_stmt};
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_python_parser::semantic_errors::{
     AwaitOutsideAsyncFunctionKind, InvalidExpressionKind, LazyImportContext, SemanticSyntaxChecker,
     SemanticSyntaxContext, SemanticSyntaxError, SemanticSyntaxErrorKind,
 };
 use ruff_text_size::{Ranged, TextRange};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{CompileError, PythonVersion};
 
 use super::statement::suite_contains_yield_in_function_scope;
+use super::symbol::mangle_name;
 
 /// Validate AST-based syntax restrictions using Ruff's shared checker.
 pub(crate) fn validate(
@@ -36,6 +39,8 @@ pub(crate) fn validate(
                 if import.level == 0 && import.module.as_deref() == Some("__future__")
                     && import.names.iter().any(|alias| alias.name.as_str() == "annotations"))
         }),
+        private_name: None,
+        mangled_names: None,
         scopes: vec![Scope::new(ScopeKind::Module)],
     };
     validator.visit_body(body);
@@ -82,6 +87,8 @@ struct Validator<'source, 'ast> {
     body: &'ast [Stmt],
     python_version: ast::PythonVersion,
     future_annotations: bool,
+    private_name: Option<&'ast str>,
+    mangled_names: Option<FxHashSet<&'ast str>>,
     scopes: Vec<Scope<'ast>>,
 }
 
@@ -155,6 +162,58 @@ impl<'ast> Validator<'_, 'ast> {
         self.scopes.push(Scope::new(kind));
         visit(self);
         self.scopes.pop();
+    }
+
+    fn with_private_context(
+        &mut self,
+        private_name: &'ast str,
+        mangled_names: Option<FxHashSet<&'ast str>>,
+        visit: impl FnOnce(&mut Self),
+    ) {
+        let previous_private = self.private_name.replace(private_name);
+        let previous_mangled = std::mem::replace(&mut self.mangled_names, mangled_names);
+        visit(self);
+        self.private_name = previous_private;
+        self.mangled_names = previous_mangled;
+    }
+
+    fn validate_private_parameters(&self, parameters: &'ast ast::Parameters) {
+        if self.private_name.is_none() || self.error.borrow().is_some() {
+            return;
+        }
+        let mut seen = FxHashMap::default();
+        // Symbol analysis visits keyword-only parameters before either variadic parameter.
+        for parameter in parameters
+            .iter_non_variadic_params()
+            .map(|parameter| &parameter.parameter)
+            .chain(parameters.vararg.as_deref())
+            .chain(parameters.kwarg.as_deref())
+        {
+            let spelling = parameter.name.as_str();
+            let canonical = if self
+                .mangled_names
+                .as_ref()
+                .is_some_and(|names| !names.contains(spelling))
+            {
+                Cow::Borrowed(spelling)
+            } else {
+                mangle_name(spelling, self.private_name)
+            };
+            if let Some(previous) = seen.insert(canonical, spelling)
+                && previous != spelling
+            {
+                let kind = if self.python_version >= ast::PythonVersion::PY315 {
+                    "parameter"
+                } else {
+                    "argument"
+                };
+                *self.error.borrow_mut() = Some(CompileError::invalid_syntax(
+                    format!("duplicate {kind} '{spelling}' in function definition"),
+                    parameter.name.range(),
+                ));
+                return;
+            }
+        }
     }
 
     fn with_checker(&mut self, visit: impl FnOnce(&mut SemanticSyntaxChecker, &Self)) {
@@ -270,12 +329,39 @@ impl<'ast> Visitor<'ast> for Validator<'_, 'ast> {
                     self.visit_decorator(decorator);
                 }
                 if let Some(params) = &class.type_params {
-                    self.visit_type_params(params);
+                    self.with_private_context(
+                        class.name.as_str(),
+                        Some(FxHashSet::default()),
+                        |visitor| {
+                            for parameter in params.iter() {
+                                // Generic class headers only mangle type parameters already
+                                // declared when this bound or default is visited.
+                                visitor
+                                    .mangled_names
+                                    .as_mut()
+                                    .expect("generic headers have restricted name mangling")
+                                    .insert(parameter.name().as_str());
+                                visitor.visit_type_param(parameter);
+                            }
+                            if let Some(arguments) = &class.arguments {
+                                visitor.visit_arguments(arguments);
+                            }
+                            visitor.mangled_names = None;
+                            visitor.with_scope(ScopeKind::Class, |visitor| {
+                                visitor.visit_body(&class.body);
+                            });
+                        },
+                    );
+                } else {
+                    if let Some(arguments) = &class.arguments {
+                        self.visit_arguments(arguments);
+                    }
+                    self.with_private_context(class.name.as_str(), None, |visitor| {
+                        visitor.with_scope(ScopeKind::Class, |visitor| {
+                            visitor.visit_body(&class.body);
+                        });
+                    });
                 }
-                if let Some(arguments) = &class.arguments {
-                    self.visit_arguments(arguments);
-                }
-                self.with_scope(ScopeKind::Class, |visitor| visitor.visit_body(&class.body));
             }
             Stmt::For(statement) => {
                 self.visit_expr(&statement.iter);
@@ -370,6 +456,11 @@ impl<'ast> Visitor<'ast> for Validator<'_, 'ast> {
             }
             _ => walk_expr(self, expression),
         }
+    }
+
+    fn visit_parameters(&mut self, parameters: &'ast ast::Parameters) {
+        self.validate_private_parameters(parameters);
+        walk_parameters(self, parameters);
     }
 }
 
@@ -529,5 +620,100 @@ impl SemanticSyntaxContext for Validator<'_, '_> {
                 CompileError::invalid_syntax(message, error.range)
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ruff_python_parser::parse_module;
+
+    use super::validate;
+    use crate::{CompileError, PythonVersion};
+
+    const TARGETS: [PythonVersion; 4] = [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
+    ];
+
+    #[test]
+    fn private_parameter_aliases_are_rejected_in_their_lexical_class() {
+        for (source, duplicate) in [
+            ("class C:\n def f(__x, _C__x): pass", "_C__x"),
+            ("class C:\n def f(_C__x, __x): pass", "__x"),
+            ("class C:\n def f(__x, /, _C__x): pass", "_C__x"),
+            ("class C:\n def f(__x, *, _C__x): pass", "_C__x"),
+            ("class C:\n def f(*__x, _C__x): pass", "__x"),
+            ("class C:\n def f(*__x, **_C__x): pass", "_C__x"),
+            ("class C:\n f = lambda __x, _C__x: None", "_C__x"),
+            ("class C:\n def f():\n  def g(__x, _C__x): pass", "_C__x"),
+            ("class C:\n def f[T](__x, _C__x): pass", "_C__x"),
+            ("class __C:\n def f(__x, _C__x): pass", "_C__x"),
+            ("class C:\n class D:\n  def f(__x, _D__x): pass", "_D__x"),
+            (
+                "class C:\n class D: pass\n def f(__x, _C__x): pass",
+                "_C__x",
+            ),
+            (
+                "class C:\n class D((lambda __x, _C__x: object)(0, 0)): pass",
+                "_C__x",
+            ),
+            (
+                "class C:\n @(lambda __x, _C__x: object)\n class D[T]: pass",
+                "_C__x",
+            ),
+            (
+                "class C[__x]((lambda __x, _C__x: object)(0, 0)): pass",
+                "_C__x",
+            ),
+            (
+                "class C[__x, T: (lambda __x, _C__x: object)]: pass",
+                "_C__x",
+            ),
+        ] {
+            let parsed = parse_module(source).unwrap();
+            for python_version in TARGETS {
+                let error = validate(source, &parsed.syntax().body, python_version).unwrap_err();
+                let CompileError::InvalidSyntax { message, range } = error else {
+                    panic!("unexpected error for {source}: {error}");
+                };
+                let kind = if python_version == PythonVersion::Py315 {
+                    "parameter"
+                } else {
+                    "argument"
+                };
+                assert_eq!(
+                    message,
+                    format!("duplicate {kind} '{duplicate}' in function definition"),
+                    "{python_version:?}: {source}",
+                );
+                assert_eq!(
+                    &source[usize::from(range.start())..usize::from(range.end())],
+                    duplicate,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parameter_mangling_respects_class_headers_and_context_restoration() {
+        for source in [
+            "def f(__x, _C__x): pass",
+            "class C: pass\ndef f(__x, _C__x): pass",
+            "class ___:\n def f(__x, ____x): pass",
+            "class C:\n class D:\n  def f(__x, _C__x): pass",
+            "@(lambda __x, _C__x: object)\nclass C[T]: pass",
+            "class C((lambda __x, _C__x: object)(0, 0)): pass",
+            "class C[T]((lambda __x, _C__x: object)(0, 0)): pass",
+            "class C[T: (lambda __x, _C__x: object), __x]: pass",
+            "class C[__x: (lambda __y, _C__y: object)]: pass",
+        ] {
+            let parsed = parse_module(source).unwrap();
+            for python_version in TARGETS {
+                validate(source, &parsed.syntax().body, python_version)
+                    .unwrap_or_else(|error| panic!("{python_version:?}: {source}: {error}"));
+            }
+        }
     }
 }

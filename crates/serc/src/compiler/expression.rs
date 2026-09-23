@@ -45,11 +45,11 @@ use super::constant::{
     python_constant_values_equal, two_element_slice_optimization,
 };
 use super::scope::{
-    LoweringFunctionPlan, NameId, NameSet, analyze_lambda_scope,
+    LoweringFunctionPlan, NameId, NameSet, analyze_lambda_scope, analyze_lambda_scope_with_mangler,
     collect_nested_comprehension_target_names, collect_self_iterated_nested_comprehension_targets,
-    collect_target_names, comprehension_cell_names, comprehension_name_bindings,
-    comprehension_scope_facts, comprehension_temporary_names, generator_cellvars,
-    generator_required_names, global_comprehension_temporary_names,
+    collect_target_names, comprehension_cell_names, comprehension_cell_names_in_private_context,
+    comprehension_name_bindings, comprehension_scope_facts, comprehension_temporary_names,
+    generator_cellvars, generator_required_names, global_comprehension_temporary_names,
     inlined_comprehension_cell_names_in_expression, legacy_class_comprehension_names,
     parameter_default_expressions,
 };
@@ -3749,7 +3749,17 @@ impl Compiler<'_> {
             self.emit(BUILD_MAP, count, 1 - i32::try_from(count).unwrap() * 2)?;
         }
 
-        let analysis = analyze_lambda_scope(lambda);
+        // Generic class headers need their declaration-time mangling restriction,
+        // which differs from the completed whitelist retained for code generation.
+        // Keep their existing analysis until that separate context is available.
+        let (analysis, local_aliases) =
+            if self.unit.private_name.is_some() && self.unit.mangled_names.is_none() {
+                let contextual =
+                    analyze_lambda_scope_with_mangler(lambda, &|name| self.mangled_name(name));
+                (contextual.analysis, contextual.local_aliases)
+            } else {
+                (analyze_lambda_scope(lambda), Vec::new())
+            };
         let freevar_names = analysis
             .required
             .iter()
@@ -3757,15 +3767,36 @@ impl Compiler<'_> {
             .cloned()
             .collect::<BTreeSet<_>>();
         let globals = self.name_id_set(analysis.required.difference(&freevar_names));
-        let freevars = self.name_ids(&freevar_names);
+        let mut freevars = self.name_ids(&freevar_names);
+        let free_aliases = self.coalesce_private_freevars(&mut freevars);
         let closure_names = freevars.clone();
+        let cell_sort_names = if local_aliases.is_empty() {
+            FxHashMap::default()
+        } else {
+            analysis
+                .locals
+                .iter()
+                .map(|name| (self.required_name_id(name), self.mangled_name(name)))
+                .collect()
+        };
         let plan = LoweringFunctionPlan {
             locals: self.name_ids(analysis.locals),
+            local_aliases: local_aliases
+                .into_iter()
+                .map(|(alias, original)| {
+                    (
+                        self.required_name_id(&alias),
+                        self.required_name_id(&original),
+                    )
+                })
+                .collect(),
+            cell_sort_names,
             globals,
             cellvars: self.name_id_set(analysis.cellvars),
             inlined_comprehension_cellvars: self
                 .name_id_set(analysis.inlined_comprehension_cellvars),
             freevars,
+            free_aliases,
             ..LoweringFunctionPlan::default()
         };
 
@@ -3891,7 +3922,20 @@ impl Compiler<'_> {
                 discard_result,
             );
         }
-        let comprehension_cell_names = comprehension_cell_names(generators, key, value);
+        let comprehension_cell_names = comprehension_cell_names_in_private_context(
+            generators,
+            key,
+            value,
+            self.unit
+                .private_name
+                .as_deref()
+                .filter(|_| self.unit.mangled_names.is_none()),
+        );
+        let comprehension_cell_ids = self
+            .name_id_set(&comprehension_cell_names)
+            .into_iter()
+            .collect::<NameSet>()
+            .with_aliases_from(&self.symbols.cell_names);
         let base_depth = self.control.stack.depth;
         let comprehension_location = self.assembler.location();
         // Legacy AST folding applies to every comprehension iterable, including
@@ -4009,7 +4053,7 @@ impl Compiler<'_> {
             .filter(|name| {
                 let name_id = self.required_name_id(name);
                 !direct_temporary_names.contains(*name)
-                    && (!comprehension_cell_names.contains(*name) || self.is_cell(name))
+                    && (!comprehension_cell_ids.contains(name_id) || self.is_cell(name))
                     && matches!(&self.unit.scope, Scope::Function { free_indices, .. }
                         if free_indices.contains_key(&name_id))
                     && (!self.symbols.active_temporaries.contains(name_id)
@@ -4029,9 +4073,7 @@ impl Compiler<'_> {
 
         let mut seen_temporaries = FxHashSet::default();
         temporary_names.retain(|name| {
-            let key = if matches!(&self.unit.scope, Scope::Function { globals, .. }
-                if globals.contains(self.required_name_id(name)))
-            {
+            let key = if matches!(&self.unit.scope, Scope::Function { .. }) {
                 self.mangled_name(name)
             } else {
                 name.clone()
@@ -4044,7 +4086,7 @@ impl Compiler<'_> {
         if let Scope::Function { free_indices, .. } = &self.unit.scope {
             for name in &temporary_names {
                 let name_id = self.required_name_id(name);
-                if comprehension_cell_names.contains(name)
+                if comprehension_cell_ids.contains(name_id)
                     && self.is_cell(name)
                     && let Some(index) = free_indices.get(&name_id).copied()
                     && (!self.symbols.active_temporaries.contains(name_id)
@@ -4059,7 +4101,7 @@ impl Compiler<'_> {
             let index = self.ensure_temporary(name)?;
             temporary_indices.push(index);
             self.emit(LOAD_FAST_AND_CLEAR, index, 1)?;
-            if comprehension_cell_names.contains(name) && self.is_cell(name) {
+            if comprehension_cell_ids.contains(self.required_name_id(name)) && self.is_cell(name) {
                 let cell_index = comprehension_free_cell_indices
                     .get(&self.required_name_id(name))
                     .copied()
@@ -4096,7 +4138,6 @@ impl Compiler<'_> {
             .copied()
             .filter(|name| self.symbols.active_temporaries.contains(*name))
             .collect();
-        let comprehension_cell_ids = self.name_id_set(&comprehension_cell_names);
         let previous_fast_temporary_ids: NameSet = direct_temporary_ids
             .iter()
             .copied()
@@ -4121,7 +4162,7 @@ impl Compiler<'_> {
                 .get(name)
                 .and_then(|index| usize::try_from(*index).ok())
                 .is_some_and(|index| index < self.symbols.fast_local_count);
-            if comprehension_cell_ids.contains(name) || !is_fast_local {
+            if comprehension_cell_ids.contains(*name) || !is_fast_local {
                 self.symbols.active_temporary_fast_cells.remove(*name);
             } else {
                 self.symbols.active_temporary_fast_cells.insert(*name);

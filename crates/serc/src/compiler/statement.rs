@@ -2398,7 +2398,8 @@ impl<'source> Compiler<'source> {
                     for target in &assignment.targets {
                         collect_target_names(target, &mut target_names);
                     }
-                    self.name_id_set(target_names).into_iter().collect()
+                    self.name_id_set(target_names).into_iter().collect::<NameSet>()
+                        .with_aliases_from(&self.symbols.initialized_locals)
                 } else {
                     NameSet::default()
                 };
