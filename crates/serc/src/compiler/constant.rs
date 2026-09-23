@@ -2035,7 +2035,8 @@ pub(super) fn fold_constant_with_literals(
 fn sequence_repeat_count(value: &Constant, boolean_sequence_repetition: bool) -> Option<u64> {
     match value {
         Constant::Bool(value) if boolean_sequence_repetition => Some(u64::from(*value)),
-        Constant::Int(value) => Some(*value),
+        // The pinned targets convert counts to 64-bit Py_ssize_t even for empty sequences.
+        Constant::Int(value) if i64::try_from(*value).is_ok() => Some(*value),
         _ => None,
     }
 }
