@@ -28,6 +28,17 @@ impl Compiler<'_> {
             .is_some_and(|plan| plan.globals.contains(&name))
     }
 
+    /// Class namespace bindings exclude the temporary targets of inlined comprehensions.
+    pub(super) fn class_scope_binds_name(&self, name: &str) -> bool {
+        let arena = self.scope_arena();
+        let name = mangle_name(name, self.unit.private_name.as_deref());
+        arena.names.get(name.as_ref()).is_some_and(|name| {
+            arena
+                .class(self.unit.scope_id)
+                .is_some_and(|plan| plan.namespace_bindings.contains(&name))
+        })
+    }
+
     /// Direct annotation references honor class bindings before enclosing closure cells.
     pub(super) fn class_scope_shadows_annotation_name(&self, name: NameId) -> bool {
         if self
@@ -1037,6 +1048,7 @@ struct ClassPlan {
     nonlocals: FxHashSet<NameId>,
     bound_names: FxHashSet<NameId>,
     canonical_annotation_shadows: FxHashSet<NameId>,
+    namespace_bindings: FxHashSet<NameId>,
     comprehension_targets: Vec<(NameId, bool)>,
     comprehension_cells: FxHashSet<NameId>,
     required: FxHashSet<NameId>,
@@ -1274,6 +1286,15 @@ impl ClassPlan {
             .collect();
         Self {
             canonical_annotation_shadows,
+            namespace_bindings: locals
+                .non_comprehension_bindings
+                .iter()
+                .filter(|name| locals.seen.contains(name.as_str()))
+                .map(|name| {
+                    names
+                        .intern(mangle_name(name.as_str(), Some(definition.name.as_str())).as_ref())
+                })
+                .collect(),
             globals: names.intern_set(locals.globals),
             nonlocals: names.intern_set(locals.nonlocals),
             bound_names: locals
