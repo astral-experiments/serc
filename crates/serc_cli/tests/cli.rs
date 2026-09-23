@@ -1783,3 +1783,74 @@ fn compile_matches_cpython_for_class_comprehension_closure_slots() {
         }
     }
 }
+
+#[test]
+fn compile_matches_cpython_for_legacy_class_comprehension_cells() {
+    for before in [false, true] {
+        let comprehension = "items = [lambda: x for x in ()]";
+        let outside = "other = lambda: x";
+        let (first, second) = if before {
+            (outside, comprehension)
+        } else {
+            (comprehension, outside)
+        };
+        let source = format!(
+            "def outer():\n    x = 'outside'\n    class C:\n        {first}\n        {second}\n    return C\n"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("module.py");
+        let native_path = directory.path().join("native.pyc");
+        fs_err::write(&source_path, source).unwrap();
+
+        for version in [
+            serc::PythonVersion::Py312,
+            serc::PythonVersion::Py313,
+            serc::PythonVersion::Py314,
+            serc::PythonVersion::Py315,
+        ] {
+            let mut oracle = match version {
+                serc::PythonVersion::Py312 => common::python_312_command(),
+                serc::PythonVersion::Py313 => common::python_313_command(),
+                serc::PythonVersion::Py314 => common::python_3145_command(),
+                serc::PythonVersion::Py315 => common::python_315_command(),
+            };
+            let native = oracle
+                .args([
+                    "-c",
+                    "import py_compile, sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True, optimize=0, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)",
+                ])
+                .arg(&source_path)
+                .arg(&native_path)
+                .output()
+                .unwrap();
+            assert!(
+                native.status.success(),
+                "{version}, before={before}: {native:?}"
+            );
+
+            let output = serc()
+                .args([
+                    "compile",
+                    "--quiet",
+                    "--python-version",
+                    &version.to_string(),
+                ])
+                .arg(&source_path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{version}, before={before}: {output:?}"
+            );
+            let (_, minor, _) = version.target().version;
+            let pyc_path = directory
+                .path()
+                .join(format!("__pycache__/module.cpython-3{minor}.pyc"));
+            assert_eq!(
+                fs_err::read(&pyc_path).unwrap(),
+                fs_err::read(&native_path).unwrap(),
+                "Python {version}, before={before}"
+            );
+        }
+    }
+}
