@@ -1341,20 +1341,16 @@ impl Assembler {
     /// Whether the next instruction starts a block with an emitted incoming jump.
     pub(crate) fn at_jump_target(&self) -> bool {
         let items = self.linear_items();
-        let labels = items
+        let trailing = items
             .iter()
-            .rev()
-            .take_while(|item| matches!(item, Item::Label(_)))
-            .filter_map(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+            .rposition(|item| matches!(item, Item::Instruction(_)))
+            .map_or(0, |index| index + 1);
+        let (previous, labels) = items.split_at(trailing);
         !labels.is_empty()
-            && items.iter().any(|item| {
+            && previous.iter().rev().any(|item| {
                 matches!(item, Item::Instruction(instruction)
                     if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
-                        if labels.contains(&label)))
+                        if labels.iter().any(|item| matches!(item, Item::Label(candidate) if *candidate == label))))
             })
     }
 
@@ -3301,16 +3297,15 @@ impl Assembler {
 
     /// Whether the latest scope exit has no explicit incoming edge at the current position.
     pub(crate) fn has_terminated_fallthrough(&self) -> bool {
-        !self.at_jump_target()
-            && self
-                .linear_items()
-                .iter()
-                .rev()
-                .find_map(|item| match item {
-                    Item::Instruction(instruction) => Some(ends_scope(instruction.opcode)),
-                    Item::Label(_) => None,
-                })
-                .unwrap_or(false)
+        self.linear_items()
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                Item::Instruction(instruction) => Some(ends_scope(instruction.opcode)),
+                Item::Label(_) => None,
+            })
+            .unwrap_or(false)
+            && !self.at_jump_target()
     }
 
     /// Whether an emitted forward break reaches this loop's exit label.
@@ -3498,27 +3493,34 @@ impl Assembler {
         self.linear_items().len()
     }
 
+    fn instruction_at(&self, instruction_offset: usize) -> Option<&Instruction> {
+        let items = self.linear_items();
+        if instruction_offset >= self.instruction_count {
+            return None;
+        }
+        let from_back = self.instruction_count - instruction_offset - 1;
+        let mut instructions = items.iter().filter_map(|item| match item {
+            Item::Instruction(instruction) => Some(instruction),
+            Item::Label(_) => None,
+        });
+        if instruction_offset <= from_back {
+            instructions.nth(instruction_offset)
+        } else {
+            instructions.nth_back(from_back)
+        }
+    }
+
     pub(crate) fn instruction_opcode_at(&self, instruction_offset: usize) -> Option<Opcode> {
-        self.linear_items()
-            .iter()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction.opcode),
-                Item::Label(_) => None,
-            })
-            .nth(instruction_offset)
+        self.instruction_at(instruction_offset)
+            .map(|instruction| instruction.opcode)
     }
 
     pub(crate) fn instruction_location_at(
         &self,
         instruction_offset: usize,
     ) -> Option<SourceLocation> {
-        self.linear_items()
-            .iter()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction.location),
-                Item::Label(_) => None,
-            })
-            .nth(instruction_offset)
+        self.instruction_at(instruction_offset)
+            .map(|instruction| instruction.location)
     }
 
     /// Counts the current original array before constant folding and global-call fusion.
@@ -3688,11 +3690,12 @@ impl Assembler {
     pub(crate) fn pre_fusion_instruction_count_since(&self, instruction_offset: usize) -> usize {
         self.linear_items()
             .iter()
+            .rev()
             .filter_map(|item| match item {
                 Item::Instruction(instruction) => Some(instruction),
                 Item::Label(_) => None,
             })
-            .skip(instruction_offset)
+            .take(self.instruction_count.saturating_sub(instruction_offset))
             .map(|instruction| {
                 1 + usize::from(instruction.pre_fold_extra_instructions())
                     + usize::from(instruction.opcode == LOAD_GLOBAL
@@ -3862,11 +3865,12 @@ impl Assembler {
     pub(crate) fn contains_opcode_since(&self, opcode: Opcode, instruction_offset: usize) -> bool {
         self.linear_items()
             .iter()
+            .rev()
             .filter_map(|item| match item {
                 Item::Instruction(instruction) => Some(instruction),
                 Item::Label(_) => None,
             })
-            .skip(instruction_offset)
+            .take(self.instruction_count.saturating_sub(instruction_offset))
             .any(|instruction| instruction.opcode == opcode)
     }
 

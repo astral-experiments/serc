@@ -701,7 +701,12 @@ fn iterator_tail_barrier_scan_ignores_prefix_and_labels() {
 #[test]
 fn instruction_offsets_follow_label_insertions_and_trailing_removal() {
     let mut assembler = Assembler::default();
+    let first = SourceLocation::new(1, 1, 0, 1);
+    let second = SourceLocation::new(2, 2, 0, 1);
+    let third = SourceLocation::new(3, 3, 0, 1);
+    assembler.set_location(first);
     assembler.emit(LOAD_CONST, 0);
+    assembler.set_location(second);
     assembler.emit(NOP, 0);
 
     let trailing = assembler.label();
@@ -715,15 +720,50 @@ fn instruction_offsets_follow_label_insertions_and_trailing_removal() {
     assert_eq!(assembler.instruction_opcode_at(0), Some(LOAD_CONST));
     assert_eq!(assembler.instruction_opcode_at(1), Some(NOP));
     assert_eq!(assembler.instruction_opcode_at(2), None);
+    assert_eq!(assembler.instruction_opcode_at(usize::MAX), None);
+    assert_eq!(assembler.instruction_location_at(0), Some(first));
+    assert_eq!(assembler.instruction_location_at(1), Some(second));
+    assert_eq!(assembler.instruction_location_at(2), None);
+    assert!(assembler.contains_opcode_since(NOP, 1));
+    assert!(!assembler.contains_opcode_since(LOAD_CONST, 1));
+    assert!(!assembler.contains_opcode_since(NOP, 2));
+    assert_eq!(assembler.pre_fusion_instruction_count_since(1), 1);
+    assert_eq!(assembler.pre_fusion_instruction_count_since(usize::MAX), 0);
 
     assert!(assembler.take_trailing_nop_location().is_some());
     assert_eq!(assembler.instruction_count(), 1);
     assert_eq!(assembler.instruction_opcode_at(0), Some(LOAD_CONST));
     assert_eq!(assembler.instruction_opcode_at(1), None);
 
+    assembler.set_location(third);
     assembler.emit(RETURN_VALUE, 0);
     assert_eq!(assembler.instruction_count(), 2);
     assert_eq!(assembler.instruction_opcode_at(1), Some(RETURN_VALUE));
+    assert_eq!(assembler.instruction_location_at(1), Some(third));
+    assert!(assembler.contains_opcode_since(RETURN_VALUE, 1));
+    assert!(!assembler.contains_opcode_since(NOP, 0));
+    assert_eq!(assembler.pre_fusion_instruction_count_since(0), 2);
+}
+
+#[test]
+fn fallthrough_termination_accounts_for_jumps_to_any_trailing_label() {
+    let mut assembler = Assembler::default();
+    let success = assembler.label();
+    let unused = assembler.label();
+    assembler.emit_forward_with_depth(JUMP_FORWARD, success, 0, ExceptionPolicy::default());
+    assembler.emit(RETURN_VALUE, 0);
+    assert!(assembler.has_terminated_fallthrough());
+
+    assembler.mark(unused);
+    assert!(assembler.has_terminated_fallthrough());
+    assembler.mark(success);
+    assert!(assembler.at_jump_target());
+    assert!(!assembler.has_terminated_fallthrough());
+
+    assembler.emit(NOP, 0);
+    let nonterminal = assembler.label();
+    assembler.mark(nonterminal);
+    assert!(!assembler.has_terminated_fallthrough());
 }
 
 #[test]

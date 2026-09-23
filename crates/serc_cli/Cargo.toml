@@ -19,6 +19,8 @@ clap = { workspace = true }
 fs-err = { workspace = true }
 mimalloc = { workspace = true }
 serc = { path = "../serc" }
+rayon = { workspace = true }
+same-file = { workspace = true }
 tempfile = { workspace = true }
 walkdir = { workspace = true }
 

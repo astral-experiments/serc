@@ -600,15 +600,240 @@ fn check_compiles_a_directory_without_writing() {
     fs_err::write(directory.path().join("module.py"), "value = 1\n").unwrap();
     fs_err::write(nested.join("__init__.py"), "from module import value\n").unwrap();
 
-    let output = serc()
-        .args(["compile", "--check", "--quiet"])
+    for jobs in ["1", "4"] {
+        let output = serc()
+            .args(["compile", "--check", "--quiet", "--jobs", jobs])
+            .arg(directory.path())
+            .output()
+            .unwrap();
+
+        assert!(output.status.success(), "{output:?}");
+        assert!(!directory.path().join("__pycache__").exists());
+        assert!(!nested.join("__pycache__").exists());
+    }
+}
+
+#[test]
+fn parallel_compile_writes_identical_caches_including_colliding_names() {
+    let directory = tempfile::tempdir().unwrap();
+    let nested = directory.path().join("package");
+    fs_err::create_dir_all(&nested).unwrap();
+    for (path, source) in [
+        (".py", "value = 'first cache owner'\n"),
+        ("py.py", "value = 'last cache owner'\n"),
+        ("module.py", "def value(x):\n    return x * 2\n"),
+        ("package/__init__.py", "from .nested import value\n"),
+        ("package/nested.py", "value = tuple(range(5))\n"),
+        ("package/other.py", "value = {1, 2, 3}\n"),
+    ] {
+        fs_err::write(directory.path().join(path), source).unwrap();
+    }
+    let deeply_nested = format!("value = {}1{}\n", "call(".repeat(180), ")".repeat(180));
+    fs_err::write(directory.path().join("deep.py"), deeply_nested).unwrap();
+    let caches = [
+        directory.path().join("__pycache__/py.cpython-314.pyc"),
+        directory.path().join("__pycache__/module.cpython-314.pyc"),
+        directory.path().join("__pycache__/deep.cpython-314.pyc"),
+        nested.join("__pycache__/__init__.cpython-314.pyc"),
+        nested.join("__pycache__/nested.cpython-314.pyc"),
+        nested.join("__pycache__/other.cpython-314.pyc"),
+    ];
+    let serial = serc()
+        .args(["compile", "--jobs", "1"])
         .arg(directory.path())
         .output()
         .unwrap();
+    assert!(serial.status.success(), "{serial:?}");
+    assert_eq!(serial.stdout, b"Compiled 7 files\n");
+    assert!(serial.stderr.is_empty());
+    let expected = caches.each_ref().map(|path| fs_err::read(path).unwrap());
 
-    assert!(output.status.success(), "{output:?}");
-    assert!(!directory.path().join("__pycache__").exists());
-    assert!(!nested.join("__pycache__").exists());
+    for jobs in [Some("4"), None, Some("4")] {
+        fs_err::remove_dir_all(directory.path().join("__pycache__")).unwrap();
+        fs_err::remove_dir_all(nested.join("__pycache__")).unwrap();
+        let mut command = serc();
+        command.arg("compile").env("RAYON_NUM_THREADS", "2");
+        if let Some(jobs) = jobs {
+            command.args(["-j", jobs]);
+        }
+        let parallel = command.arg(directory.path()).output().unwrap();
+        assert!(parallel.status.success(), "{parallel:?}");
+        assert_eq!(parallel.stdout, serial.stdout);
+        assert_eq!(parallel.stderr, serial.stderr);
+        assert_eq!(
+            caches.each_ref().map(|path| fs_err::read(path).unwrap()),
+            expected
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn parallel_compile_orders_outputs_in_aliased_cache_directories() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("a");
+    let last = directory.path().join("z");
+    let alias = directory.path().join("b");
+    let cache = directory.path().join("shared");
+    for path in [&first, &last, &cache] {
+        fs_err::create_dir(path).unwrap();
+    }
+    symlink(&first, &alias).unwrap();
+    fs_err::write(first.join("module.py"), "value = 'first'\n").unwrap();
+    fs_err::write(last.join("module.py"), "value = 'last'\n").unwrap();
+    symlink(&cache, first.join("__pycache__")).unwrap();
+    symlink(&cache, last.join("__pycache__")).unwrap();
+    let output = cache.join("module.cpython-314.pyc");
+
+    for sources in [
+        [last.join("module.py"), first.join("module.py")],
+        [alias.join("module.py"), first.join("module.py")],
+    ] {
+        let serial = serc()
+            .args(["compile", "--jobs", "1"])
+            .args(&sources)
+            .output()
+            .unwrap();
+        assert!(serial.status.success(), "{serial:?}");
+        let expected = fs_err::read(&output).unwrap();
+        fs_err::remove_file(&output).unwrap();
+        let parallel = serc()
+            .args(["compile", "--jobs", "2"])
+            .args(sources)
+            .output()
+            .unwrap();
+        assert!(parallel.status.success(), "{parallel:?}");
+        assert_eq!(parallel.stdout, serial.stdout);
+        assert_eq!(parallel.stderr, serial.stderr);
+        assert_eq!(fs_err::read(&output).unwrap(), expected);
+    }
+
+    fs_err::remove_file(first.join("__pycache__")).unwrap();
+    let output = first.join("__pycache__/module.cpython-314.pyc");
+    let sources = [alias.join("module.py"), first.join("module.py")];
+    let serial = serc()
+        .args(["compile", "--jobs", "1"])
+        .args(&sources)
+        .output()
+        .unwrap();
+    assert!(serial.status.success(), "{serial:?}");
+    let expected = fs_err::read(&output).unwrap();
+    fs_err::remove_dir_all(first.join("__pycache__")).unwrap();
+    let parallel = serc()
+        .args(["compile", "--jobs", "2"])
+        .args(sources)
+        .output()
+        .unwrap();
+    assert!(parallel.status.success(), "{parallel:?}");
+    assert_eq!(fs_err::read(output).unwrap(), expected);
+}
+
+#[test]
+fn parallel_compile_matches_serial_for_filesystem_case_and_unicode_aliases() {
+    for (original, alias) in [
+        ("A.py", "a.py"),
+        ("K.py", "\u{212a}.py"),
+        ("caf\u{e9}.py", "cafe\u{301}.py"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join(original);
+        let second = directory.path().join(alias);
+        let other = directory.path().join("other.py");
+        fs_err::write(&first, "value = 1\n").unwrap();
+        fs_err::write(&other, "value = 2\n").unwrap();
+        if !second.is_file() {
+            // Grouping itself is also checked on filesystems that distinguish these names.
+            continue;
+        }
+
+        let inputs = [&second, &first, &other];
+        let serial = serc()
+            .args(["compile", "--jobs", "1"])
+            .args(inputs)
+            .output()
+            .unwrap();
+        assert!(serial.status.success(), "{serial:?}");
+        let cache_directory = directory.path().join("__pycache__");
+        let name = original.strip_suffix(".py").unwrap();
+        let output = cache_directory.join(format!("{name}.cpython-314.pyc"));
+        let expected = fs_err::read(&output).unwrap();
+        for _ in 0..3 {
+            fs_err::remove_dir_all(&cache_directory).unwrap();
+            let parallel = serc()
+                .args(["compile", "--jobs", "4"])
+                .args(inputs)
+                .output()
+                .unwrap();
+            assert!(parallel.status.success(), "{parallel:?}");
+            assert_eq!(parallel.stdout, serial.stdout);
+            assert_eq!(parallel.stderr, serial.stderr);
+            assert_eq!(fs_err::read(&output).unwrap(), expected);
+        }
+    }
+}
+
+#[test]
+fn parallel_compile_reports_errors_in_serial_order() {
+    let directory = tempfile::tempdir().unwrap();
+    for (name, source) in [
+        ("z.py", "def broken(:\n"),
+        ("m.py", "value = 42\n"),
+        ("a.py", "if broken\n"),
+    ] {
+        fs_err::write(directory.path().join(name), source).unwrap();
+    }
+    let serial = serc()
+        .args(["compile", "--check", "--jobs", "1"])
+        .arg(directory.path())
+        .output()
+        .unwrap();
+    assert_eq!(serial.status.code(), Some(1));
+    assert!(serial.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&serial.stderr);
+    let lines: Vec<_> = stderr.lines().collect();
+    assert_eq!(lines.len(), 3, "{stderr}");
+    assert!(lines[0].contains("a.py"), "{stderr}");
+    assert!(lines[1].contains("z.py"), "{stderr}");
+    assert!(
+        lines[2].contains("failed to compile 2 of 3 files"),
+        "{stderr}"
+    );
+
+    for options in [
+        ["--check", "-j", "4"].as_slice(),
+        ["--check"].as_slice(),
+        ["--jobs", "4"].as_slice(),
+        [].as_slice(),
+    ] {
+        let parallel = serc()
+            .arg("compile")
+            .args(options)
+            .env("RAYON_NUM_THREADS", "2")
+            .arg(directory.path())
+            .output()
+            .unwrap();
+        assert_eq!(parallel.status.code(), serial.status.code());
+        assert_eq!(parallel.stdout, serial.stdout);
+        assert_eq!(parallel.stderr, serial.stderr);
+        assert_eq!(
+            directory
+                .path()
+                .join("__pycache__/m.cpython-314.pyc")
+                .exists(),
+            !options.contains(&"--check")
+        );
+    }
+}
+
+#[test]
+fn compile_rejects_zero_jobs() {
+    let output = serc().args(["compile", "-j", "0"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid value '0'"), "{stderr}");
+    assert!(stderr.contains("--jobs"), "{stderr}");
 }
 
 #[test]

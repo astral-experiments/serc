@@ -1,8 +1,9 @@
 # End-to-end compiler benchmarks
 
 The harness measures process startup, source discovery and reads, compilation at optimization
-level 0, marshaling, and timestamp-invalidated `.pyc` writes. Both compilers run sequentially;
-cache-file cleanup is untimed. For isolated phases, use the
+level 0, marshaling, and timestamp-invalidated `.pyc` writes. Both compilers run sequentially:
+the preflight and timing use Serc `--jobs 1` and CPython `-j 1`. Cache-file cleanup is untimed.
+For isolated phases, use the
 [Criterion and corpus benchmarks](../../crates/serc_benchmark/README.md).
 
 From the workspace root, with Git, the pinned Rust toolchain, and CPython 3.14.5 (magic
@@ -31,4 +32,5 @@ PYTHON=/path/to/python3.14.5 ./scripts/benchmarks/run.sh /path/to/project target
 The runner deletes all `__pycache__` directories in the corpus, including before each timed command.
 Results default to `target/benchmarks/results/numpy.{json,md,metadata.txt}`. The metadata records
 source and output hashes, source count and size, revisions and working-tree state, toolchain and
-binary identities, build profile, and machine details. See [published results](../../BENCHMARKS.md).
+binary identities, build profile, worker counts, and machine details. See
+[published results](../../BENCHMARKS.md).

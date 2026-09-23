@@ -177,8 +177,9 @@ impl<'source> CompilationContext<'source> {
         let mut static_attribute_names = FxHashSet::default();
         let mut has_percent_replacement = false;
         let mut finally_bodies = FxHashMap::default();
-        let constant_string_origins = analyze_source(
+        let (constant_string_origins, requires_empty_bytes_cache_trace) = analyze_source(
             body,
+            python_version,
             &mut generated_mangled_strings,
             &mut requires_interning_trace,
             &mut static_attribute_names,
@@ -217,8 +218,7 @@ impl<'source> CompilationContext<'source> {
             cached_static_attribute_tuples: RefCell::new(FxHashSet::default()),
             generated_mangled_strings,
             requires_interning_trace,
-            requires_empty_bytes_cache_trace: python_version >= crate::PythonVersion::Py314
-                && suite_folds_empty_bytes(body, python_version),
+            requires_empty_bytes_cache_trace,
             empty_bytes_origin: Cell::default(),
             interning_events: RefCell::new(Vec::new()),
         }
@@ -589,14 +589,16 @@ fn has_double_underscore(name: &str) -> bool {
 
 fn analyze_source<'ast>(
     body: &'ast Suite,
+    python_version: crate::PythonVersion,
     generated_mangled_strings: &mut FxHashSet<String>,
     requires_interning_trace: &mut bool,
     static_attribute_names: &mut FxHashSet<String>,
     has_percent_replacement: &mut bool,
     finally_bodies: &mut FxHashMap<TextRange, &'ast [Stmt]>,
-) -> FxHashMap<String, Cell<StringConstantOrigin>> {
+) -> (FxHashMap<String, Cell<StringConstantOrigin>>, bool) {
     #[derive(Default)]
     struct SourceAnalysis<'ast> {
+        python_version: crate::PythonVersion,
         finally_bodies: FxHashMap<TextRange, &'ast [Stmt]>,
         origins: FxHashMap<String, Cell<StringConstantOrigin>>,
         private_name: Option<String>,
@@ -606,6 +608,7 @@ fn analyze_source<'ast>(
         restricted_private_identifier: bool,
         static_attribute_names: FxHashSet<String>,
         has_percent_replacement: bool,
+        requires_empty_bytes_cache_trace: bool,
     }
 
     impl SourceAnalysis<'_> {
@@ -750,6 +753,16 @@ fn analyze_source<'ast>(
                         self.has_percent_replacement |= format.value.to_str().contains("%%");
                     }
                 }
+                Expr::BinOp(binary)
+                    if binary.op == Operator::Mult
+                        && !self.requires_empty_bytes_cache_trace
+                        && self.python_version >= crate::PythonVersion::Py314 =>
+                {
+                    self.requires_empty_bytes_cache_trace = matches!(
+                        fold_constant_for_version(expression, self.python_version),
+                        Some(Constant::Bytes(value)) if value.is_empty()
+                    );
+                }
                 Expr::Name(name) => self.record_raw_name(name.id.as_str()),
                 Expr::Attribute(attribute) => {
                     self.record_raw_name(attribute.attr.as_str());
@@ -823,7 +836,10 @@ fn analyze_source<'ast>(
         }
     }
 
-    let mut visitor = SourceAnalysis::default();
+    let mut visitor = SourceAnalysis {
+        python_version,
+        ..SourceAnalysis::default()
+    };
     for statement in body {
         visitor.visit_stmt(statement);
     }
@@ -836,38 +852,7 @@ fn analyze_source<'ast>(
     *static_attribute_names = visitor.static_attribute_names;
     *has_percent_replacement = visitor.has_percent_replacement;
     *finally_bodies = visitor.finally_bodies;
-    visitor.origins
-}
-
-fn suite_folds_empty_bytes(body: &Suite, python_version: crate::PythonVersion) -> bool {
-    struct EmptyBytesFold {
-        found: bool,
-        python_version: crate::PythonVersion,
-    }
-
-    impl<'a> Visitor<'a> for EmptyBytesFold {
-        fn visit_expr(&mut self, expression: &'a Expr) {
-            if self.found {
-                return;
-            }
-            if matches!(expression, Expr::BinOp(binary) if binary.op == Operator::Mult)
-                && matches!(fold_constant_for_version(expression, self.python_version), Some(Constant::Bytes(value)) if value.is_empty())
-            {
-                self.found = true;
-            } else {
-                walk_expr(self, expression);
-            }
-        }
-    }
-
-    let mut visitor = EmptyBytesFold {
-        found: false,
-        python_version,
-    };
-    for statement in body {
-        visitor.visit_stmt(statement);
-    }
-    visitor.found
+    (visitor.origins, visitor.requires_empty_bytes_cache_trace)
 }
 
 impl Compiler<'_> {
@@ -1047,16 +1032,6 @@ impl Compiler<'_> {
             }
         }
 
-        // A literal callback returning None permits generic folding. Reject runtime
-        // expressions before recursive folding so nested occurrences cannot fall back.
-        let mut runtime = RequiresRuntimeConstruction {
-            python_version: self.context.python_version,
-            found: false,
-        };
-        runtime.visit_expr(expression);
-        if runtime.found {
-            return None;
-        }
         let literal = |expression: &Expr| match expression {
             Expr::UnaryOp(unary)
                 if !self.has_deferred_annotations()
@@ -1087,12 +1062,23 @@ impl Compiler<'_> {
             }
             _ => literal_constant(expression),
         };
-        fold_constant_with_literals(
+        let constant = fold_constant_with_literals(
             expression,
             self.context.python_version,
             &literal,
             self.context.python_version >= crate::PythonVersion::Py314,
-        )
+        )?;
+
+        // A literal callback returning None permits generic folding. Check successful
+        // folds for runtime-only descendants so nested occurrences cannot fall back.
+        // Most runtime expressions stop folding at their first nonconstant operand and
+        // never need a second walk through their remaining descendants.
+        let mut runtime = RequiresRuntimeConstruction {
+            python_version: self.context.python_version,
+            found: false,
+        };
+        runtime.visit_expr(expression);
+        (!runtime.found).then_some(constant)
     }
 
     pub(super) fn source_aware_constant_slice(
@@ -2016,6 +2002,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn source_aware_folding_keeps_target_runtime_expressions() {
+        use crate::PythonVersion::{Py312, Py313, Py314, Py315};
+
+        for (source, legacy, modern) in [
+            ("'abc'[1]", true, true),
+            ("('abc',)[0]", true, true),
+            ("'abc'[1:]", false, true),
+            ("('abc'[1:],)", false, true),
+            ("f'abc'", false, true),
+            ("(f'abc',)", false, true),
+            ("f'{value}'", false, false),
+            ("not ()", true, false),
+            ("((not ()),)", true, false),
+            ("~True", true, false),
+            ("'\\ud800' + 'x'", true, true),
+            ("helper(not (), f'abc', 'abc'[1:])", false, false),
+        ] {
+            let parsed = ruff_python_parser::parse_module(source).unwrap();
+            let [Stmt::Expr(statement)] = parsed.suite().as_slice() else {
+                unreachable!("test cases are expressions");
+            };
+            for (version, expected) in [
+                (Py312, legacy),
+                (Py313, legacy),
+                (Py314, modern),
+                (Py315, modern),
+            ] {
+                let compiler = Compiler::module_with_python_version(
+                    "fold.py",
+                    source,
+                    parsed.tokens(),
+                    parsed.suite(),
+                    version,
+                );
+                let actual = compiler.source_aware_fold_constant(&statement.value);
+                assert_eq!(
+                    actual.is_some(),
+                    expected,
+                    "{version:?} {source}: {actual:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn python315_lazy_import_checks_precede_dead_code_elimination() {
         let options = crate::CompileOptions {
             python_version: crate::PythonVersion::Py315,
@@ -2153,8 +2184,9 @@ mod tests {
         .unwrap();
         let mut generated = FxHashSet::default();
         let mut requires_trace = false;
-        let origins = analyze_source(
+        let (origins, _) = analyze_source(
             parsed.suite(),
+            crate::PythonVersion::Py314,
             &mut generated,
             &mut requires_trace,
             &mut FxHashSet::default(),
