@@ -60,6 +60,7 @@ enum ScopeKind<'ast> {
 struct Scope<'ast> {
     kind: ScopeKind<'ast>,
     loop_depth: usize,
+    except_star_loop_depth: Option<usize>,
     in_try: bool,
 }
 
@@ -68,6 +69,7 @@ impl<'ast> Scope<'ast> {
         Self {
             kind,
             loop_depth: 0,
+            except_star_loop_depth: None,
             in_try: false,
         }
     }
@@ -94,6 +96,16 @@ impl<'ast> Validator<'_, 'ast> {
         self.scopes
             .last_mut()
             .expect("validation always has a module scope")
+    }
+
+    fn reject_except_star_transfer(&self, statement: &Stmt) {
+        let mut error = self.error.borrow_mut();
+        if error.is_none() {
+            *error = Some(CompileError::invalid_syntax(
+                "'break', 'continue' and 'return' cannot appear in an except* block",
+                statement.range(),
+            ));
+        }
     }
 
     /// Ruff's annotation walk also visits independent lambda and lazy generator bodies.
@@ -204,6 +216,14 @@ impl<'ast> Visitor<'ast> for Validator<'_, 'ast> {
             });
             return;
         }
+        // A loop contained within the handler can be exited without leaving except*.
+        // Independent function and class scopes start without the enclosing boundary.
+        if matches!(statement, Stmt::Break(_) | Stmt::Continue(_))
+            && self.scope().except_star_loop_depth == Some(self.scope().loop_depth)
+        {
+            self.reject_except_star_transfer(statement);
+            return;
+        }
         // Relative imports of a module named __future__ are ordinary imports. The shared
         // checker identifies directives by their module spelling, so hide that spelling here.
         if let Stmt::ImportFrom(import) = statement
@@ -272,9 +292,31 @@ impl<'ast> Visitor<'ast> for Validator<'_, 'ast> {
                 self.scope_mut().loop_depth -= 1;
                 self.visit_body(&statement.orelse);
             }
-            Stmt::Try(_) => {
-                let previous = std::mem::replace(&mut self.scope_mut().in_try, true);
+            Stmt::Return(_) => {
+                // CPython validates the returned expression before unwinding the handler.
                 walk_stmt(self, statement);
+                if self.scope().except_star_loop_depth.is_some() {
+                    self.reject_except_star_transfer(statement);
+                }
+            }
+            Stmt::Try(try_statement) => {
+                let previous = std::mem::replace(&mut self.scope_mut().in_try, true);
+                if try_statement.is_star {
+                    self.visit_body(&try_statement.body);
+                    for ast::ExceptHandler::ExceptHandler(handler) in &try_statement.handlers {
+                        if let Some(type_) = &handler.type_ {
+                            self.visit_expr(type_);
+                        }
+                        let scope = self.scope_mut();
+                        let previous = scope.except_star_loop_depth.replace(scope.loop_depth);
+                        self.visit_body(&handler.body);
+                        self.scope_mut().except_star_loop_depth = previous;
+                    }
+                    self.visit_body(&try_statement.orelse);
+                    self.visit_body(&try_statement.finalbody);
+                } else {
+                    walk_stmt(self, statement);
+                }
                 self.scope_mut().in_try = previous;
             }
             _ => walk_stmt(self, statement),
