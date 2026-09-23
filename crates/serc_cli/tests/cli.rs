@@ -305,6 +305,66 @@ fn class_bindings_preserve_type_parameter_wrapper_cells() {
 }
 
 #[test]
+fn compile_preserves_empty_sequence_repetition_boundaries() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("empty_sequence_repetition.py");
+    fs_err::write(
+        &source_path,
+        include_str!("../../serc/tests/fixtures/empty_sequence_repetition.py"),
+    )
+    .unwrap();
+
+    for (version, mut oracle) in [
+        (serc::PythonVersion::Py312, common::python_312_command()),
+        (serc::PythonVersion::Py313, common::python_313_command()),
+        (serc::PythonVersion::Py314, common::python_3145_command()),
+        (serc::PythonVersion::Py315, common::python_315_command()),
+    ] {
+        let (_, minor, _) = version.target().version;
+        let pyc_path = directory.path().join(format!(
+            "__pycache__/empty_sequence_repetition.cpython-3{minor}.pyc"
+        ));
+        let native = oracle
+            .args([
+                "-B",
+                "-c",
+                "import py_compile, sys; py_compile.compile(sys.argv[1], doraise=True, optimize=0, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)",
+            ])
+            .arg(&source_path)
+            .output()
+            .unwrap();
+        assert!(native.status.success(), "{version}: {native:?}");
+        let expected = fs_err::read(&pyc_path).unwrap();
+
+        let output = serc()
+            .args([
+                "compile",
+                "--quiet",
+                "--python-version",
+                &version.to_string(),
+            ])
+            .arg(&source_path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{version}: {output:?}");
+        assert_eq!(
+            fs_err::read(&pyc_path).unwrap(),
+            expected,
+            "Python {version}"
+        );
+
+        let mut runtime = match version {
+            serc::PythonVersion::Py312 => common::python_312_command(),
+            serc::PythonVersion::Py313 => common::python_313_command(),
+            serc::PythonVersion::Py314 => common::python_3145_command(),
+            serc::PythonVersion::Py315 => common::python_315_command(),
+        };
+        let output = runtime.arg(&pyc_path).output().unwrap();
+        assert!(output.status.success(), "{version}: {output:?}");
+    }
+}
+
+#[test]
 fn compile_matches_cpython_for_version_specific_marshal_identity() {
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("module.py");
