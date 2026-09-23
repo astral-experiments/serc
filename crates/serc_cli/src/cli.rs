@@ -5,6 +5,7 @@ use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::builder::Styles;
@@ -113,28 +114,30 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
             .build()
             .map_err(|error| format!("failed to start compilation workers: {error}"))?;
         let mut errors: Vec<(usize, String)> = pool.install(|| {
-            if let Some(output_groups) = output_groups {
-                output_groups
-                    .into_par_iter()
-                    .flat_map_iter(|group| {
-                        group.into_iter().filter_map(|(index, path)| {
-                            compile_path(path, false, &options)
+            let groups = output_groups.unwrap_or_else(|| {
+                paths
+                    .iter()
+                    .enumerate()
+                    .map(|(index, path)| vec![(index, path.as_path())])
+                    .collect()
+            });
+            let groups = prioritize_compilation_groups(groups, jobs);
+            let next_group = AtomicUsize::new(0);
+            (0..jobs.min(groups.len()))
+                .into_par_iter()
+                .with_max_len(1)
+                .flat_map_iter(|_| {
+                    // Each worker takes the largest remaining group. Splitting the sorted slice
+                    // into Rayon chunks would strand some large inputs behind a worker's backlog.
+                    std::iter::from_fn(|| groups.get(next_group.fetch_add(1, Ordering::Relaxed)))
+                        .flatten()
+                        .filter_map(|&(index, path)| {
+                            compile_path(path, command.check, &options)
                                 .err()
                                 .map(|message| (index, message))
                         })
-                    })
-                    .collect()
-            } else {
-                paths
-                    .par_iter()
-                    .enumerate()
-                    .filter_map(|(index, path)| {
-                        compile_path(path, true, &options)
-                            .err()
-                            .map(|message| (index, message))
-                    })
-                    .collect()
-            }
+                })
+                .collect()
         });
         errors.sort_unstable_by_key(|(index, _)| *index);
         failures = errors.len();
@@ -208,6 +211,22 @@ fn prepare_compilation(
     }
     let groups = compilation_groups(paths, python_version);
     (jobs.min(groups.len()), Some(groups))
+}
+
+/// Start the most expensive independent groups first, retaining order within aliased outputs.
+fn prioritize_compilation_groups(
+    mut groups: Vec<CompilationGroup<'_>>,
+    jobs: usize,
+) -> Vec<CompilationGroup<'_>> {
+    if groups.len() > jobs {
+        groups.sort_by_cached_key(|group| {
+            let size = group.iter().fold(0_u64, |total, (_, path)| {
+                total.saturating_add(fs_err::metadata(path).map_or(0, |metadata| metadata.len()))
+            });
+            (std::cmp::Reverse(size), group[0].0)
+        });
+    }
+    groups
 }
 
 /// Keep inputs that share an output in discovery order so the same cache wins as in serial mode.
@@ -527,7 +546,7 @@ fn write_error(message: &str) {
 mod tests {
     use super::{
         cache_path, cache_tag, compilation_groups, compile_path_with_metadata, discover,
-        encode_mtime, has_python_suffix, prepare_compilation,
+        encode_mtime, has_python_suffix, prepare_compilation, prioritize_compilation_groups,
     };
     use super::{default_jobs, jobs_for_inputs};
     use serc::{CompileOptions, PythonVersion};
@@ -664,6 +683,42 @@ mod tests {
         };
         assert_eq!(indices(&paths[..3]), [vec![0, 1], vec![2]]);
         assert_eq!(indices(&paths), [vec![0, 1, 2, 3]]);
+    }
+
+    #[test]
+    fn parallel_compilation_prioritizes_total_source_size_without_reordering_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..6)
+            .map(|index| directory.path().join(format!("{index}.py")))
+            .collect();
+        for (path, size) in paths.iter().zip([1, 4, 12, 9, 6]) {
+            fs_err::write(path, vec![b' '; size]).unwrap();
+        }
+        let groups = vec![
+            vec![(0, paths[0].as_path()), (3, paths[3].as_path())],
+            vec![(1, paths[1].as_path()), (4, paths[4].as_path())],
+            vec![(2, paths[2].as_path())],
+            vec![(5, paths[5].as_path())],
+        ];
+        let indices = |groups: Vec<Vec<(usize, &Path)>>| {
+            groups
+                .into_iter()
+                .map(|group| {
+                    group
+                        .into_iter()
+                        .map(|(index, _)| index)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            indices(prioritize_compilation_groups(groups.clone(), 4)),
+            [vec![0, 3], vec![1, 4], vec![2], vec![5]]
+        );
+        assert_eq!(
+            indices(prioritize_compilation_groups(groups, 2)),
+            [vec![2], vec![0, 3], vec![1, 4], vec![5]]
+        );
     }
 
     #[test]
