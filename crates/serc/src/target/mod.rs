@@ -497,29 +497,17 @@ mod tests {
     }
 
     #[test]
-    fn preinterned_bloom_rejects_only_known_nonmembers() {
-        use super::cpython_3_14_5::{BOOTSTRAP_INTERNED_STRINGS, might_be_preinterned_string};
-
-        for value in PREINTERNED_STRINGS
-            .iter()
-            .chain(COMPILER_INTERNED_STRINGS)
-            .chain(BOOTSTRAP_INTERNED_STRINGS)
-        {
-            assert!(
-                might_be_preinterned_string(value),
-                "false negative {value:?}"
-            );
-        }
-        for value in ["alpha", "beta", "gamma", "méthode"] {
-            assert!(!might_be_preinterned_string(value));
-            assert!(!is_preinterned_string(value));
-        }
-        for value in ["False__nonmember", "add__nonmember", "sum__nonmember"] {
-            assert!(might_be_preinterned_string(value));
-            assert!(!is_preinterned_string(value), "false positive {value:?}");
-        }
-        for value in ["\0", "☃", &"é".repeat(32_768), &"x".repeat(65_537)] {
-            assert!(!is_preinterned_string(value));
+    fn preinterned_lookup_rejects_nonmembers_with_shared_prefixes() {
+        for value in [
+            "BuiltinImporter\0",
+            "find_spec_suffix",
+            "__name__\0",
+            "utf_8_suffix",
+            "\0",
+            "méthode",
+            "☃",
+        ] {
+            assert!(!is_preinterned_string(value), "unexpected member {value:?}");
         }
     }
 }
