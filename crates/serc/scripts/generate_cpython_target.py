@@ -410,10 +410,25 @@ def rust_string_literal(value: str) -> str:
     return f'"{"".join(escaped)}"'
 
 
+def render_compact_rust_strings(values: list[str]) -> list[str]:
+    lines = []
+    row = "    "
+    for value in values:
+        literal = rust_string_literal(value) + ","
+        if row.strip() and len(row) + len(literal) > 100:
+            lines.append(row.rstrip())
+            row = "    "
+        row += literal + " "
+    if row.strip():
+        lines.append(row.rstrip())
+    return lines
+
+
 def render_preinterned_lookup(
     preinterned_strings: list[str],
     startup_strings: tuple[str, ...],
     compiler_strings: tuple[str, ...] = (),
+    table_name: str = "PREINTERNED_STRINGS",
 ) -> list[str]:
     def prefix(value: str) -> int:
         encoded = value.encode()
@@ -476,84 +491,7 @@ def render_preinterned_lookup(
         [
             "        _ => return false,",
             "    };",
-            "    PREINTERNED_STRINGS[start..end].binary_search(&value).is_ok()",
-            "}",
-        ]
-    )
-    return lines
-
-
-def preinterned_bloom_location(value: str) -> tuple[int, int]:
-    """Match the generated Rust's sampled UTF-8 hash and two bits in one word."""
-    encoded = value.encode()
-    if not encoded:
-        return 0, 0
-    sample = int.from_bytes(
-        bytes(
-            (
-                encoded[0],
-                encoded[1] if len(encoded) > 1 else 0,
-                encoded[len(encoded) // 2],
-                encoded[-1],
-            )
-        ),
-        "little",
-    )
-    hash_ = sample ^ (((len(encoded) & 0xFFFF) * 0x9E3779B9) & 0xFFFFFFFF)
-    hash_ ^= hash_ >> 16
-    hash_ = (hash_ * 0x85EBCA6B) & 0xFFFFFFFF
-    hash_ ^= hash_ >> 13
-    return hash_ & 0xFF, (1 << ((hash_ >> 8) & 63)) | (1 << ((hash_ >> 14) & 63))
-
-
-def preinterned_bloom_words(values: list[str]) -> list[int]:
-    words = [0] * 256
-    for value in values:
-        index, bits = preinterned_bloom_location(value)
-        words[index] |= bits
-    return words
-
-
-def render_preinterned_bloom_filter(values: list[str]) -> list[str]:
-    lines = [
-        "// This 2 KiB filter covers the union of every platform's exact intern tables.",
-        "// Hash the byte length and four sampled UTF-8 bytes to reject most nonmembers cheaply.",
-        "// Positive results still require the existing platform-specific exact lookups.",
-        "#[rustfmt::skip]",
-        "static PREINTERNED_BLOOM: [u64; 256] = [",
-    ]
-    words = preinterned_bloom_words(values)
-    for index in range(0, len(words), 4):
-        literals = []
-        for word in words[index : index + 4]:
-            digits = f"{word:016x}"
-            literals.append(
-                "0x"
-                + "_".join(digits[offset : offset + 4] for offset in range(0, 16, 4))
-            )
-        chunk = ", ".join(literals)
-        lines.append(f"    {chunk},")
-    lines.extend(
-        [
-            "];",
-            "",
-            "pub(super) fn might_be_preinterned_string(value: &str) -> bool {",
-            "    let bytes = value.as_bytes();",
-            "    let Some((&first, rest)) = bytes.split_first() else { return true };",
-            "    let sample = u32::from_le_bytes([",
-            "        first,",
-            "        rest.first().copied().unwrap_or(0),",
-            "        bytes[bytes.len() / 2],",
-            "        bytes[bytes.len() - 1],",
-            "    ]);",
-            '    let length = u32::try_from(bytes.len() & 0xffff).expect("masked length fits in u32");',
-            "    let mut hash = sample ^ length.wrapping_mul(0x9e37_79b9);",
-            "    hash ^= hash >> 16;",
-            "    hash = hash.wrapping_mul(0x85eb_ca6b);",
-            "    hash ^= hash >> 13;",
-            '    let index = usize::try_from(hash & 0xff).expect("masked index fits in usize");',
-            "    let bits = (1_u64 << ((hash >> 8) & 63)) | (1_u64 << ((hash >> 14) & 63));",
-            "    PREINTERNED_BLOOM[index] & bits == bits",
+            f"    {table_name}[start..end].binary_search(&value).is_ok()",
             "}",
         ]
     )
@@ -1134,6 +1072,8 @@ def render(sources: dict[str, str]) -> str:
             f"pub(crate) const SMALL_INT_MAX: i64 = {small_ints['_PY_NSMALLPOSINTS'] - 1};"
         )
         lines.append("")
+    if TARGET_MINOR == "3.14":
+        lines.append('#[cfg(any(not(target_os = "linux"), test))]')
     lines.append("pub(crate) static PREINTERNED_STRINGS: &[&str] = &[")
     lines.extend(f"    {rust_string_literal(value)}," for value in preinterned_strings)
     lines.extend(["];", ""])
@@ -1153,44 +1093,44 @@ def render(sources: dict[str, str]) -> str:
         lines.extend(
             [
                 "// Source-derived identifiers and live owners from neutral Linux bootstrap.",
+                "#[cfg(test)]",
                 "pub(crate) static BOOTSTRAP_INTERNED_STRINGS: &[&str] = &[",
             ]
         )
         lines.extend(
             f"    {rust_string_literal(value)}," for value in bootstrap_strings
         )
+        linux_preinterned_strings = sorted(
+            set(preinterned_strings) | set(bootstrap_strings)
+        )
         lines.extend(
             [
                 "];",
                 "",
-                "pub(crate) fn is_preinterned_string(value: &str) -> bool {",
-                "    might_be_preinterned_string(value)",
-                "        && (is_preinterned_static_string(value)",
-                '            || (cfg!(target_os = "linux")',
-                "                && BOOTSTRAP_INTERNED_STRINGS.binary_search(&value).is_ok()))",
-                "}",
-                "",
+                "// Include Linux bootstrap strings in the same exact prefix lookup.",
+                '#[cfg(target_os = "linux")]',
+                "#[rustfmt::skip]",
+                "static LINUX_PREINTERNED_STRINGS: &[&str] = &[",
             ]
         )
+        lines.extend(render_compact_rust_strings(linux_preinterned_strings))
+        lines.extend(["];", "", '#[cfg(target_os = "linux")]'])
         lines.extend(
-            render_preinterned_bloom_filter(
-                sorted(
-                    set(preinterned_strings)
-                    | set(STARTUP_INTERNED_STRINGS)
-                    | set(UNIX_STARTUP_INTERNED_STRINGS)
-                    | set(compiler_interned_strings)
-                    | set(bootstrap_strings)
-                )
+            render_preinterned_lookup(
+                linux_preinterned_strings,
+                STARTUP_INTERNED_STRINGS + UNIX_STARTUP_INTERNED_STRINGS,
+                tuple(compiler_interned_strings),
+                "LINUX_PREINTERNED_STRINGS",
             )
         )
-        lines.append("")
-        lookup = render_preinterned_lookup(
-            preinterned_strings,
-            STARTUP_INTERNED_STRINGS + UNIX_STARTUP_INTERNED_STRINGS,
-            tuple(compiler_interned_strings),
+        lines.extend(["", '#[cfg(not(target_os = "linux"))]'])
+        lines.extend(
+            render_preinterned_lookup(
+                preinterned_strings,
+                STARTUP_INTERNED_STRINGS + UNIX_STARTUP_INTERNED_STRINGS,
+                tuple(compiler_interned_strings),
+            )
         )
-        lookup[0] = "fn is_preinterned_static_string(value: &str) -> bool {"
-        lines.extend(lookup)
     else:
         lines.extend(
             [

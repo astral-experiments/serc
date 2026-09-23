@@ -96,26 +96,33 @@ class ReadInputsTest(unittest.TestCase):
 
 
 class RenderPreinternedLookupTest(unittest.TestCase):
-    def test_bloom_has_no_false_negatives_for_sampled_and_unicode_strings(self) -> None:
-        values = ["", "x", "xy", "a\0b", "méthode", "\u2603", "a" * 70_000]
-        values.extend(f"target_{index:04x}_value" for index in range(5_000))
-        words = generator.preinterned_bloom_words(values)
-        self.assertEqual(
-            words, generator.preinterned_bloom_words(list(reversed(values)))
-        )
-        self.assertEqual(len(words), 256)
-        for value in values:
-            index, bits = generator.preinterned_bloom_location(value)
-            self.assertEqual(words[index] & bits, bits, value)
-
-        self.assertEqual(generator.preinterned_bloom_location(""), (0, 0))
-        rendered = generator.render_preinterned_bloom_filter(values)
-        self.assertIn("    PREINTERNED_BLOOM[index] & bits == bits", rendered)
-
     def test_escapes_rust_string_literals(self) -> None:
         self.assertEqual(
             generator.rust_string_literal('quote" slash\\ \n\r\t\0 ☃\x01\x7f'),
             '"quote\\" slash\\\\ \\n\\r\\t\\0 ☃\\x01\\x7f"',
+        )
+
+    def test_compact_rust_strings_wrap_only_between_literals(self) -> None:
+        long = "x" * 85
+        self.assertEqual(
+            generator.render_compact_rust_strings([long, 'quote"', "two words"]),
+            [f'    "{long}",', '    "quote\\"", "two words",'],
+        )
+
+    def test_renders_combined_strings_against_the_named_table(self) -> None:
+        static = ["", "alpha", "beta"]
+        bootstrap = ["alpine", "beta", "méthode"]
+        rendered = generator.render_preinterned_lookup(
+            sorted(set(static) | set(bootstrap)),
+            ("albatross",),
+            table_name="LINUX_PREINTERNED_STRINGS",
+        )
+        self.assertIn("            (1, 3)", rendered)
+        self.assertIn("        0x6265 => (3, 4),", rendered)
+        self.assertIn("        0x6dc3 => (4, 5),", rendered)
+        self.assertIn(
+            "    LINUX_PREINTERNED_STRINGS[start..end].binary_search(&value).is_ok()",
+            rendered,
         )
 
     def test_gates_unix_startup_candidates(self) -> None:
