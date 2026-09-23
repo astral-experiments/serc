@@ -163,22 +163,6 @@ L3:
   handler L12..L19 -> L3 depth=1 lasti=true fallback=false priority=Resolved { start: 23, end: 39 }
   handler L20..L21 -> L3 depth=1 lasti=true fallback=false priority=Resolved { start: 43, end: 45 }
 
-== remove_unreachable_instructions (initial) ==
-  RESUME Value(0) @ 0:0-1:0 depth=Some(0) exception=NoneUnchanged
-  LOAD_CONST Value(0) @ 1:0-7:17 depth=Some(1) exception=NoneUnchanged
-  MAKE_FUNCTION Value(0) @ 1:0-7:17 depth=Some(1) exception=NoneUnchanged
-  STORE_NAME Value(0) @ 1:0-7:17 depth=Some(0) exception=NoneUnchanged
-  LOAD_CONST Value(1) @ -1:-1--1:-1 depth=Some(1) exception=NoneUnchanged
-  RETURN_VALUE Value(0) @ -1:-1--1:-1 depth=Some(0) exception=NoneUnchanged
-
-== duplicate_exit_blocks ==
-  RESUME Value(0) @ 0:0-1:0 depth=Some(0) exception=NoneUnchanged
-  LOAD_CONST Value(0) @ 1:0-7:17 depth=Some(1) exception=NoneUnchanged
-  MAKE_FUNCTION Value(0) @ 1:0-7:17 depth=Some(1) exception=NoneUnchanged
-  STORE_NAME Value(0) @ 1:0-7:17 depth=Some(0) exception=NoneUnchanged
-  LOAD_CONST Value(1) @ -1:-1--1:-1 depth=Some(1) exception=NoneUnchanged
-  RETURN_VALUE Value(0) @ -1:-1--1:-1 depth=Some(0) exception=NoneUnchanged
-
 == final jump layout ==
   RESUME Value(0) @ 0:0-1:0 depth=Some(0) exception=NoneUnchanged
   LOAD_CONST Value(0) @ 1:0-7:17 depth=Some(1) exception=NoneUnchanged

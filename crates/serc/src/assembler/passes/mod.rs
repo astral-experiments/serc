@@ -202,10 +202,13 @@ impl Assembler {
         self.resolve_operand_patches()?;
         self.prepare_legacy_yield_arguments();
         self.resolve_folded_condition_borrow_entries();
+        // Keep ordinary blocks with more locals on the graph path, which also preserves
+        // initialization for locals above CPython's 64-bit dataflow mask.
         if self.python_version == crate::PythonVersion::Py314
             && !(self.early_boolean_admissions_certified && self.has_early_boolean_admissions)
             && (self.has_only_linear_assertion_side_exits()
-                || self.has_only_linear_constant_return())
+                || self.has_only_linear_constant_return()
+                || (local_count <= 64 && self.has_only_linear_instructions()))
         {
             return self
                 .optimize_linear_assertion_side_exits(
@@ -1537,8 +1540,7 @@ mod uniform_jump_seed_tests {
             legacy_uniform_jump_seed: uniform,
             items,
             exception_regions: Vec::new(),
-            exception_owner_provenance:
-                crate::assembler::exception_owners::ExceptionOwnerProvenance::default(),
+            exception_owner_provenance: Box::default(),
             preserved_block_boundaries: rustc_hash::FxHashSet::default(),
             removed_max_depth: None,
             next_label: 1,

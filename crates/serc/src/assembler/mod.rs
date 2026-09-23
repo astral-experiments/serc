@@ -716,6 +716,156 @@ impl Assembler {
             return false;
         }
 
+        self.has_no_linear_control_flow_metadata()
+            && self
+                .exception_owner_provenance
+                .uniform_fold_owner_slots
+                .is_empty()
+    }
+
+    /// Recognizes one ordinary block whose local, fusion, and location passes have linear forms.
+    pub(in crate::assembler) fn has_only_linear_instructions(&self) -> bool {
+        use crate::target::opcodes::{
+            BINARY_OP, BINARY_SLICE, BUILD_LIST, BUILD_MAP, BUILD_SET, BUILD_SLICE, BUILD_STRING,
+            BUILD_TUPLE, CALL, CALL_FUNCTION_EX, CALL_INTRINSIC_1, CALL_KW, DELETE_ATTR,
+            DELETE_GLOBAL, DELETE_NAME, DELETE_SUBSCR, IMPORT_NAME, LOAD_BUILD_CLASS, LOAD_NAME,
+            MAKE_FUNCTION, PUSH_NULL, STORE_ATTR, STORE_NAME, STORE_SLICE, STORE_SUBSCR,
+            UNARY_INVERT, UNARY_NEGATIVE,
+        };
+
+        if !self.has_no_linear_control_flow_metadata() {
+            return false;
+        }
+        let UnoptimizedCode::Linear(items) = &self.code else {
+            return false;
+        };
+        let [
+            Item::Instruction(resume),
+            middle @ ..,
+            Item::Instruction(ret),
+        ] = items.as_slice()
+        else {
+            return false;
+        };
+        let mut ordinary_return =
+            Instruction::new(ret.opcode, ret.operand(), ret.location, Some(0));
+        if ret.location == SourceLocation::NONE && ret.no_location_policy.allows_block_inlining() {
+            // A class footer permits copying onto predecessor edges, which do not exist here.
+            ordinary_return.no_location_policy.allow_block_inlining();
+        }
+        if middle.is_empty()
+            || resume.opcode != RESUME
+            || resume.operand() != Operand::Value(ResumeLocation::AT_FUNC_START.argument())
+            || resume.depth_after() != Some(0)
+            || *resume
+                != Instruction::new(resume.opcode, resume.operand(), resume.location, Some(0))
+            || ret.opcode != RETURN_VALUE
+            || ret.operand() != Operand::Value(0)
+            || ret.depth_after() != Some(0)
+            || *ret != ordinary_return
+        {
+            return false;
+        }
+
+        middle.iter().all(|item| {
+            let Item::Instruction(instruction) = item else {
+                return false;
+            };
+            if !matches!(instruction.operand(), Operand::Value(_))
+                || !matches!(
+                    instruction.opcode,
+                    BINARY_OP
+                        | BINARY_SLICE
+                        | BUILD_LIST
+                        | BUILD_MAP
+                        | BUILD_SET
+                        | BUILD_SLICE
+                        | BUILD_STRING
+                        | BUILD_TUPLE
+                        | CALL
+                        | CALL_FUNCTION_EX
+                        | CALL_INTRINSIC_1
+                        | CALL_KW
+                        | COMPARE_OP
+                        | CONTAINS_OP
+                        | COPY
+                        | DELETE_ATTR
+                        | DELETE_FAST
+                        | DELETE_GLOBAL
+                        | DELETE_NAME
+                        | DELETE_SUBSCR
+                        | DICT_MERGE
+                        | DICT_UPDATE
+                        | IMPORT_FROM
+                        | IMPORT_NAME
+                        | IS_OP
+                        | LIST_APPEND
+                        | LIST_EXTEND
+                        | LOAD_ATTR
+                        | LOAD_BUILD_CLASS
+                        | LOAD_CONST
+                        | LOAD_FAST
+                        | LOAD_GLOBAL
+                        | LOAD_NAME
+                        | LOAD_SMALL_INT
+                        | MAKE_FUNCTION
+                        | NOP
+                        | POP_TOP
+                        | PUSH_NULL
+                        | SET_ADD
+                        | SET_FUNCTION_ATTRIBUTE
+                        | SET_UPDATE
+                        | STORE_ATTR
+                        | STORE_FAST
+                        | STORE_GLOBAL
+                        | STORE_NAME
+                        | STORE_SLICE
+                        | STORE_SUBSCR
+                        | TO_BOOL
+                        | UNARY_INVERT
+                        | UNARY_NEGATIVE
+                        | UNARY_NOT
+                )
+                || (instruction.opcode == NOP && instruction.location.line < 0)
+            {
+                return false;
+            }
+            let mut ordinary = Instruction::new(
+                instruction.opcode,
+                instruction.operand(),
+                instruction.location,
+                instruction.depth_after(),
+            );
+            if instruction.opcode == LOAD_FAST {
+                ordinary.local_policy = LocalPolicy::for_load(
+                    instruction.local_policy.force_owned_load(),
+                    instruction.local_policy.strict_owned_load(),
+                );
+                if instruction.local_policy.force_borrowed_load() {
+                    ordinary.local_policy.mark_force_borrowed_load();
+                }
+            }
+            let hidden = instruction.local_policy.hidden_exception_owner_slots();
+            if matches!(instruction.opcode, LOAD_CONST | LOAD_SMALL_INT)
+                && (1..4).contains(&hidden)
+                && u16::from(instruction.pre_fold_extra_instructions()) == hidden
+                && self
+                    .exception_owner_provenance
+                    .uniform_fold_owner_slots
+                    .contains(&(instruction.location, instruction.opcode, hidden))
+            {
+                // Only block-copy sizing and exception ownership consume these paired counts;
+                // a single block without an exception region needs neither.
+                ordinary
+                    .local_policy
+                    .add_hidden_exception_owner_slots(hidden);
+                ordinary.add_pre_fold_extra_instructions(instruction.pre_fold_extra_instructions());
+            }
+            *instruction == ordinary
+        })
+    }
+
+    fn has_no_linear_control_flow_metadata(&self) -> bool {
         // Zero allocated labels rules out emitted, removed, and metadata-only CFG entries.
         // The remaining provenance below can identify instruction locations without a label.
         let provenance = &self.exception_owner_provenance;
@@ -730,7 +880,6 @@ impl Assembler {
             && provenance.omitted_nop_tail.is_none()
             && provenance.noop_finally_locations.is_empty()
             && provenance.with_context_locations.is_empty()
-            && provenance.uniform_fold_owner_slots.is_empty()
             && provenance.original_uniform_folds.is_empty()
             && provenance.copied_finally_iterator_returns.is_empty()
     }
