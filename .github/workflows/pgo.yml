@@ -46,7 +46,6 @@ jobs:
     permissions:
       contents: read
     env:
-      CARGO_INCREMENTAL: 0
       CARGO_NET_RETRY: 10
       CARGO_TERM_COLOR: always
       RUSTUP_MAX_RETRIES: 10
@@ -58,8 +57,6 @@ jobs:
       - uses: ./.github/actions/setup-python
       - name: "Install LLVM profile tools"
         run: rustup component add llvm-tools-preview
-      # Exercise three CLI builds and the strict comparator on the full corpus.
-      # Debug mode avoids release optimization costs while checking the pipeline.
       - name: "Exercise PGO pipeline"
         run: ./scripts/build-pgo-release --debug "$SERC_TEST_PYTHON"
       - name: "Upload PGO diagnostics"

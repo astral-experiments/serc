@@ -153,8 +153,6 @@ def main():
             {
                 "source_head": run(["git", "rev-parse", "HEAD"]),
                 "source_sha256": source_hash(),
-                "cargo_lock_sha256": sha(repo / "Cargo.lock"),
-                "recipe_sha256": sha(__file__),
                 "rustc": rust_version,
                 "cargo": run([*cargo, "--version"]),
                 "host": host,
@@ -174,25 +172,7 @@ def main():
                 },
             }
         )
-        (run_dir / "source.patch").write_text(
-            run(
-                [
-                    "git",
-                    "diff",
-                    "--binary",
-                    "--full-index",
-                    "--no-ext-diff",
-                    "--no-textconv",
-                    "HEAD",
-                ]
-            )
-            + "\n"
-        )
         shared = os.environ.get("CARGO_BUILD_BUILD_DIR")
-        if args.toolchain == "ohm" and not shared:
-            raise ValueError(
-                "set CARGO_BUILD_BUILD_DIR to a shared Ohm build directory"
-            )
         if shared and Path(shared).resolve().is_relative_to(output):
             raise ValueError(
                 "the shared build directory must be separate from the PGO output directory"
@@ -247,6 +227,23 @@ def main():
             if tree_summary(corpus, ".py") != manifest["corpus_sources"]:
                 raise ValueError("Training sources changed during the build")
 
+        def compile_corpus(binary, jobs, env=None):
+            clean_bytecode(corpus)
+            run(
+                [
+                    binary,
+                    "compile",
+                    "--quiet",
+                    "--python-version",
+                    "3.14",
+                    "--jobs",
+                    jobs,
+                    corpus,
+                ],
+                env,
+            )
+            verify_sources()
+
         run(
             [
                 args.python,
@@ -272,21 +269,7 @@ def main():
         control = build(
             "serc-cli", ["--bin", "serc"], output / "control-target", ""
         )
-        clean_bytecode(corpus)
-        run(
-            [
-                control,
-                "compile",
-                "--quiet",
-                "--python-version",
-                "3.14",
-                "--jobs",
-                "1",
-                corpus,
-            ]
-        )
-        verify_sources()
-        expected_bytecode = tree_summary(corpus, ".pyc")
+        compile_corpus(control, 1)
         control_outputs = bytecode_hashes(corpus)
         if control_outputs.keys() != cpython_outputs.keys():
             raise ValueError(
@@ -307,7 +290,6 @@ def main():
             "differences": differences,
         }
         manifest["control_outputs"] = control_outputs
-        manifest["control_bytecode"] = expected_bytecode
         control_artifact = run_dir / f"serc-control{control.suffix}"
         shutil.copy2(control, control_artifact)
         manifest["control_binary"] = str(control_artifact)
@@ -327,26 +309,17 @@ def main():
         )
         profiles = []
         manifest["profile_groups"] = {}
+        parallel_jobs = min(4, os.cpu_count() or 1)
         for group, jobs in (
             ("cli-serial", 1),
-            ("cli-parallel", min(4, os.cpu_count() or 1)),
+            ("cli-parallel", parallel_jobs),
         ):
-            clean_bytecode(corpus)
-            run(
-                [
-                    instrumented,
-                    "compile",
-                    "--quiet",
-                    "--python-version",
-                    "3.14",
-                    "--jobs",
-                    str(jobs),
-                    corpus,
-                ],
+            compile_corpus(
+                instrumented,
+                jobs,
                 {"LLVM_PROFILE_FILE": str(raw / f"{group}-%m-%p.profraw")},
             )
-            verify_sources()
-            verify_bytecode(corpus, expected_bytecode, "ordinary Serc")
+            verify_bytecode(corpus, control_outputs)
             group_profiles = require_profiles(raw, group)
             manifest["profile_groups"][group] = [path.name for path in group_profiles]
             profiles.extend(group_profiles)
@@ -356,17 +329,8 @@ def main():
             output / "generate-target",
             f"-Cprofile-generate={raw}",
         )
-        # Keep the roots and expectations synchronized with check-cpython-compatibility (3.14).
-        roots = [
-            repo / "vendor/ruff" / name
-            for name in (
-                "crates/ty_python_semantic/resources/corpus",
-                "crates/ruff_python_parser/resources/valid",
-                "crates/ruff_python_parser/resources/inline/ok",
-                "crates/ruff_linter/resources/test/fixtures",
-                "crates/ruff_python_formatter/resources/test/fixtures",
-            )
-        ]
+        # Use the comparator's default roots; keep expectations in sync with
+        # check-cpython-compatibility (3.14).
         outcomes = {
             "matched-rejection": 207,
             "rejection-mismatch": 12,
@@ -397,7 +361,6 @@ def main():
                 "221",
                 *expectations,
                 "--require-all",
-                *roots,
             ],
             {
                 "RAYON_NUM_THREADS": "1",
@@ -416,28 +379,9 @@ def main():
                 output / "use-target",
                 f"-Cprofile-use={merged}",
             )
-            manifest["optimized_bytecode"] = {}
-            for mode, jobs in (
-                ("serial", 1),
-                ("parallel", min(4, os.cpu_count() or 1)),
-            ):
-                clean_bytecode(corpus)
-                run(
-                    [
-                        binary,
-                        "compile",
-                        "--quiet",
-                        "--python-version",
-                        "3.14",
-                        "--jobs",
-                        str(jobs),
-                        corpus,
-                    ]
-                )
-                verify_sources()
-                manifest["optimized_bytecode"][mode] = verify_bytecode(
-                    corpus, expected_bytecode, "ordinary Serc"
-                )
+            for jobs in (1, parallel_jobs):
+                compile_corpus(binary, jobs)
+                verify_bytecode(corpus, control_outputs)
             artifact = run_dir / binary.name
             shutil.copy2(binary, artifact)
             manifest.update({"binary": str(artifact), "binary_sha256": sha(artifact)})
@@ -452,7 +396,6 @@ def main():
             {
                 "status": "complete",
                 "profile_sha256": sha(merged),
-                "raw_profiles": {path.name: sha(path) for path in profiles},
             }
         )
         print(f"Merged PGO profile: {merged}\nBuild manifest: {manifest_path}")

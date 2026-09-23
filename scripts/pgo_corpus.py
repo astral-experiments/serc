@@ -217,10 +217,14 @@ def bytecode_hashes(corpus: Path):
     }
 
 
-def verify_bytecode(corpus: Path, expected, label="CPython"):
-    actual = tree_summary(corpus, ".pyc")
+def verify_bytecode(corpus: Path, expected):
+    actual = bytecode_hashes(corpus)
     if actual != expected:
-        raise ValueError(
-            f"Corpus .pyc contents differ from {label}: expected {expected}, got {actual}"
+        changed = sorted(
+            path
+            for path in actual.keys() | expected.keys()
+            if actual.get(path) != expected.get(path)
         )
-    return actual
+        raise ValueError(
+            f"Corpus .pyc contents differ from ordinary Serc: {changed}"
+        )

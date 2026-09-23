@@ -46,7 +46,5 @@ SERC_PGO_PROFILE="$PWD/target/pgo-release/run-EXAMPLE/training.profdata" \
   ./scripts/benchmarks/run.sh
 ```
 
-The runner builds the CLI with this profile and records `release-pgo`, the profile path, and
-its SHA-256 in the result metadata. It retains the complete bytecode preflight, one-worker
-workload, and untimed cache cleanup. Omitting `SERC_PGO_PROFILE` keeps the ordinary release
-build. Unset `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS` for the PGO mode.
+The runner records the profile path and SHA-256 alongside the usual benchmark metadata.
+Unset `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS` when using PGO.

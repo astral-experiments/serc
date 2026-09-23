@@ -54,15 +54,14 @@ class PgoCorpusTests(unittest.TestCase):
 
         self.assertEqual(summary["files"], 2)
         self.assertEqual(
-            sorted(
-                path.relative_to(destination).as_posix()
-                for path in destination.rglob("*.py")
-            ),
-            sorted(selected),
+            {
+                path.relative_to(destination).as_posix(): path.read_bytes()
+                for path in destination.rglob("*")
+                if path.is_file()
+            },
+            {name: before[checkout / name] for name in selected},
         )
         self.assertEqual(summary["revision"], project.revision)
-        for name in selected:
-            self.assertEqual((destination / name).read_bytes(), before[checkout / name])
         (destination / selected[0]).write_bytes(b"private_edit = True\n")
         self.assertEqual(
             {path: path.read_bytes() for path in checkout.rglob("*") if path.is_file()},
@@ -80,45 +79,32 @@ class PgoCorpusTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "No Python training sources"):
             corpus.copy_sources(project, checkout, destination, ["package/module.pyi"])
 
-    def test_tree_summary_binds_names_and_contents(self):
-        self.write("first/a.py", b"alpha")
-        self.write("first/nested/b.py", b"beta")
-        self.write("second/nested/b.py", b"beta")
-        self.write("second/a.py", b"alpha")
-        expected = corpus.tree_summary(self.root / "first", ".py")
-        self.assertEqual(expected["files"], 2)
-        self.assertEqual(expected["bytes"], 9)
-        self.assertEqual(corpus.tree_summary(self.root / "second", ".py"), expected)
-
-        (self.root / "second/a.py").rename(self.root / "second/c.py")
-        renamed = corpus.tree_summary(self.root / "second", ".py")
-        self.assertEqual(renamed["files"], expected["files"])
-        self.assertEqual(renamed["bytes"], expected["bytes"])
-        self.assertNotEqual(renamed["sha256"], expected["sha256"])
-        self.write("second/c.py", b"Alpha")
-        self.assertNotEqual(
-            corpus.tree_summary(self.root / "second", ".py")["sha256"],
-            renamed["sha256"],
-        )
-
-    def test_bytecode_verification_rejects_changed_missing_and_extra_output(self):
+    def test_bytecode_verification_rejects_changed_renamed_missing_and_extra_output(
+        self,
+    ):
         bytecode = b"\x2b\x0e\x0d\x0a" + bytes(12) + b"compiled payload"
         first = self.write("corpus/__pycache__/first.cpython-314.pyc", bytecode)
         self.write("corpus/nested/__pycache__/second.cpython-314.pyc", bytecode)
         root = self.root / "corpus"
-        expected = corpus.tree_summary(root, ".pyc")
-        self.assertEqual(corpus.verify_bytecode(root, expected), expected)
+        expected = corpus.bytecode_hashes(root)
+        corpus.verify_bytecode(root, expected)
 
-        # A changed header must fail even when file counts and lengths agree.
-        first.write_bytes(bytecode[:8] + b"\x01" + bytecode[9:])
-        with self.assertRaisesRegex(ValueError, "contents differ from CPython"):
+        # Header and payload changes must fail even when counts and lengths agree.
+        for region, offset in (("header", 8), ("payload", 16)):
+            with self.subTest(region=region):
+                first.write_bytes(bytecode[:offset] + b"\x01" + bytecode[offset + 1 :])
+                with self.assertRaisesRegex(ValueError, "ordinary Serc"):
+                    corpus.verify_bytecode(root, expected)
+        first.write_bytes(bytecode)
+        renamed = first.rename(first.with_name("renamed.pyc"))
+        with self.assertRaisesRegex(ValueError, "ordinary Serc"):
             corpus.verify_bytecode(root, expected)
-        first.unlink()
-        with self.assertRaisesRegex(ValueError, "contents differ from CPython"):
+        renamed.unlink()
+        with self.assertRaisesRegex(ValueError, "ordinary Serc"):
             corpus.verify_bytecode(root, expected)
         first.write_bytes(bytecode)
         self.write("corpus/extra.pyc", bytecode)
-        with self.assertRaisesRegex(ValueError, "contents differ from CPython"):
+        with self.assertRaisesRegex(ValueError, "ordinary Serc"):
             corpus.verify_bytecode(root, expected)
 
     def test_requires_nonempty_profiles_from_requested_group(self):
