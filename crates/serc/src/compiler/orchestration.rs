@@ -256,7 +256,14 @@ impl<'source> Compiler<'source> {
             })
             .map(|(_, name)| *name)
             .collect();
-        cell_only_locals.sort_by(|left, right| names.resolve(*left).cmp(names.resolve(*right)));
+        cell_only_locals.sort_by(|left, right| {
+            let spelling = |name| {
+                plan.cell_sort_names
+                    .get(&name)
+                    .map_or_else(|| names.resolve(name), String::as_str)
+            };
+            spelling(*left).cmp(spelling(*right))
+        });
         locals.extend(cell_only_locals);
         let mut indices = locals
             .iter()
@@ -271,17 +278,32 @@ impl<'source> Compiler<'source> {
             temporary_indices.insert(original, index);
         }
         let local_count = locals.len();
-        let free_indices = plan
+        let mut free_indices = plan
             .freevars
             .iter()
             .enumerate()
             .map(|(index, name)| Ok((*name, to_u32(local_count + index, "free variable count")?)))
             .collect::<Result<FxHashMap<_, _>, CompileError>>()?;
+        for &(alias, original) in &plan.free_aliases {
+            free_indices.insert(alias, free_indices[&original]);
+        }
         locals.extend(plan.freevars.iter().copied());
 
-        let cell_names: NameSet = plan.cellvars.iter().copied().collect();
+        let aliases: Option<Rc<[(NameId, NameId)]>> =
+            (!plan.local_aliases.is_empty()).then(|| plan.local_aliases.clone().into());
+        let cell_names = plan
+            .cellvars
+            .iter()
+            .copied()
+            .collect::<NameSet>()
+            .with_aliases(aliases.as_ref());
         let global_names = plan.globals.iter().copied().collect();
-        let initialized_locals = locals.iter().take(parameter_count).copied().collect();
+        let initialized_locals = locals
+            .iter()
+            .take(parameter_count)
+            .copied()
+            .collect::<NameSet>()
+            .with_aliases(aliases.as_ref());
         let free_names = plan.freevars.clone();
 
         let symbols = SymbolState {
@@ -291,6 +313,11 @@ impl<'source> Compiler<'source> {
             free_names,
             initialized_locals,
             temporary_indices,
+            hidden_names: NameSet::default().with_aliases(aliases.as_ref()),
+            active_temporaries: NameSet::default().with_aliases(aliases.as_ref()),
+            active_temporary_fast_cells: NameSet::default().with_aliases(aliases.as_ref()),
+            active_temporary_free_cells: NameSet::default().with_aliases(aliases.as_ref()),
+            owned_load_locals: NameSet::default().with_aliases(aliases.as_ref()),
             ..SymbolState::default()
         };
         let unit = CodeUnit::from_spec(CodeUnitSpec {

@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hasher;
+use std::rc::Rc;
 
 use hashbrown::HashTable;
 use ruff_index::{IndexVec, newtype_index};
@@ -126,7 +127,38 @@ impl Compiler<'_> {
                 plan.insert_annotation_freevar(&arena.names, name);
             }
         }
-        Ok((scope_id, plan.into_lowering_plan()))
+        let mut plan = plan.into_lowering_plan();
+        plan.free_aliases = self.coalesce_private_freevars(&mut plan.freevars);
+        Ok((scope_id, plan))
+    }
+
+    /// Coalesce captured spellings only after closure eligibility has been resolved.
+    pub(super) fn coalesce_private_freevars(
+        &self,
+        freevars: &mut Vec<NameId>,
+    ) -> Vec<(NameId, NameId)> {
+        if self.unit.private_name.is_none() || self.unit.mangled_names.is_some() {
+            return Vec::new();
+        }
+        freevars.sort_by_cached_key(|name| {
+            let raw = self.resolve_name(*name);
+            let emitted = self.mangled_name(raw);
+            let is_alias = raw != emitted;
+            (emitted, is_alias)
+        });
+        let mut emitted_names = FxHashMap::default();
+        let mut aliases = Vec::new();
+        freevars.retain(|name| {
+            let emitted = self.mangled_name(self.resolve_name(*name));
+            if let Some(&original) = emitted_names.get(&emitted) {
+                aliases.push((*name, original));
+                false
+            } else {
+                emitted_names.insert(emitted, *name);
+                true
+            }
+        });
+        aliases
     }
 
     pub(super) fn class_plan(
@@ -191,18 +223,42 @@ pub(super) struct NameInterner {
 #[derive(Clone, Debug, Default)]
 pub(super) struct NameSet {
     words: Vec<u64>,
+    aliases: Option<Rc<[(NameId, NameId)]>>,
 }
 
 impl NameSet {
+    /// Raw private spellings share one symbol in an optimized function scope.
+    pub(super) fn with_aliases(mut self, aliases: Option<&Rc<[(NameId, NameId)]>>) -> Self {
+        let Some(aliases) = aliases else {
+            return self;
+        };
+        let names = self.iter_unordered().collect::<Vec<_>>();
+        self.words.clear();
+        self.aliases = Some(Rc::clone(aliases));
+        self.extend(names);
+        self
+    }
+
+    pub(super) fn with_aliases_from(self, names: &Self) -> Self {
+        self.with_aliases(names.aliases.as_ref())
+    }
+
+    fn canonical(&self, name: NameId) -> NameId {
+        self.aliases
+            .as_deref()
+            .and_then(|aliases| aliases.iter().find(|(alias, _)| *alias == name))
+            .map_or(name, |(_, original)| *original)
+    }
+
     pub(super) fn contains(&self, name: NameId) -> bool {
-        let index = name.index();
+        let index = self.canonical(name).index();
         self.words
             .get(index / u64::BITS as usize)
             .is_some_and(|word| word & (1 << (index % u64::BITS as usize)) != 0)
     }
 
     pub(super) fn insert(&mut self, name: NameId) -> bool {
-        let index = name.index();
+        let index = self.canonical(name).index();
         let word_index = index / u64::BITS as usize;
         self.words.resize(self.words.len().max(word_index + 1), 0);
         let bit = 1 << (index % u64::BITS as usize);
@@ -212,7 +268,7 @@ impl NameSet {
     }
 
     pub(super) fn remove(&mut self, name: NameId) -> bool {
-        let index = name.index();
+        let index = self.canonical(name).index();
         let Some(word) = self.words.get_mut(index / u64::BITS as usize) else {
             return false;
         };
@@ -370,6 +426,7 @@ impl NameInterner {
 pub(super) struct FunctionPlan {
     pub(super) locals: Vec<NameId>,
     pub(super) local_aliases: Vec<(NameId, NameId)>,
+    pub(super) cell_sort_names: FxHashMap<NameId, String>,
     pub(super) globals: FxHashSet<NameId>,
     pub(super) annotation_references: FxHashSet<NameId>,
     pub(super) cellvars: FxHashSet<NameId>,
@@ -415,6 +472,8 @@ pub(super) struct ScopeBodyFacts {
 pub(super) struct LoweringFunctionPlan {
     pub(super) locals: Vec<NameId>,
     pub(super) local_aliases: Vec<(NameId, NameId)>,
+    pub(super) free_aliases: Vec<(NameId, NameId)>,
+    pub(super) cell_sort_names: FxHashMap<NameId, String>,
     pub(super) globals: FxHashSet<NameId>,
     pub(super) annotation_references: FxHashSet<NameId>,
     pub(super) cellvars: FxHashSet<NameId>,
@@ -430,7 +489,12 @@ impl LoweringFunctionPlan {
         required_names: impl IntoIterator<Item = NameId>,
         annotation_references: impl IntoIterator<Item = NameId>,
     ) {
-        let local_names: FxHashSet<_> = self.locals.iter().copied().collect();
+        let local_names: FxHashSet<_> = self
+            .locals
+            .iter()
+            .copied()
+            .chain(self.local_aliases.iter().map(|(alias, _)| *alias))
+            .collect();
         for name in required_names.into_iter().chain(annotation_references) {
             if local_names.contains(&name) {
                 self.cellvars.insert(name);
@@ -447,7 +511,8 @@ impl LoweringFunctionPlan {
     pub(super) fn mark_global(&mut self, name: NameId) {
         self.annotation_freevars
             .retain(|candidate| *candidate != name);
-        if self.locals.contains(&name) {
+        if self.locals.contains(&name) || self.local_aliases.iter().any(|(alias, _)| *alias == name)
+        {
             return;
         }
         self.freevars.retain(|candidate| *candidate != name);
@@ -462,7 +527,12 @@ impl FunctionPlan {
         required_names: impl IntoIterator<Item = NameId>,
         annotation_references: impl IntoIterator<Item = NameId>,
     ) {
-        let local_names: FxHashSet<_> = self.locals.iter().copied().collect();
+        let local_names: FxHashSet<_> = self
+            .locals
+            .iter()
+            .copied()
+            .chain(self.local_aliases.iter().map(|(alias, _)| *alias))
+            .collect();
         for name in required_names.into_iter().chain(annotation_references) {
             if local_names.contains(&name) && !self.comprehension_shadowed_targets.contains(&name) {
                 self.cellvars.insert(name);
@@ -544,7 +614,7 @@ impl FunctionPlan {
         for parameter in parameters_in_locals_order(&definition.parameters) {
             locals.insert(parameter.name.as_str());
         }
-        let parameter_names = locals.names.iter().cloned().collect::<FxHashSet<_>>();
+        let mut parameter_names = locals.names.iter().cloned().collect::<FxHashSet<_>>();
         #[expect(
             clippy::iter_over_hash_type,
             reason = "Runtime uses claim source-order positions; unused names are filtered and capture-only cells are sorted during lowering."
@@ -562,19 +632,35 @@ impl FunctionPlan {
         // Child references in a module-level function resolve globally before comprehensions
         // are inlined. A temporary target cannot turn those references into closure captures.
         // Enclosing function bindings have different cell promotion during CPython's inlining.
+        let mut outside_names = outside_inlined_comprehension_references
+            .iter()
+            .map(|name| mangle_name(name, private_name))
+            .collect::<FxHashSet<_>>();
+        if module_parent {
+            outside_names.extend(
+                outside_inlined_comprehension_requirements
+                    .iter()
+                    .map(|name| mangle_name(name, private_name)),
+            );
+            outside_names.extend(
+                class_requirements
+                    .iter()
+                    .chain(nested_function_requirements)
+                    .chain(nested_function_annotation_references)
+                    .map(|name| mangle_name(names.resolve(*name), private_name)),
+            );
+        }
+        let non_comprehension_names = locals
+            .non_comprehension_bindings
+            .iter()
+            .map(|name| mangle_name(name.as_str(), private_name))
+            .collect::<FxHashSet<_>>();
         let mut comprehension_shadowed_targets = locals
             .comprehension_targets
             .iter()
             .filter(|name| {
-                (outside_inlined_comprehension_references.contains(name.as_str())
-                    || module_parent
-                        && (outside_inlined_comprehension_requirements.contains(name.as_str())
-                            || names.get(name.as_str()).is_some_and(|name| {
-                                class_requirements.contains(&name)
-                                    || nested_function_requirements.contains(&name)
-                                    || nested_function_annotation_references.contains(&name)
-                            })))
-                    && !locals.non_comprehension_bindings.contains(name.as_str())
+                let canonical = mangle_name(name.as_str(), private_name);
+                outside_names.contains(&canonical) && !non_comprehension_names.contains(&canonical)
             })
             .cloned()
             .collect::<FxHashSet<_>>();
@@ -585,24 +671,49 @@ impl FunctionPlan {
                 .filter(|name| locals.globals.contains(name.as_str()))
                 .cloned(),
         );
-        let mut local_aliases = Vec::new();
-        if private_name.is_some() && !locals.globals.is_empty() {
-            let mut canonical_locals: FxHashMap<String, Name> = FxHashMap::default();
-            locals.names.retain(|name| {
-                if !locals.globals.contains(name.as_str()) {
-                    return true;
-                }
-                let canonical = mangle_name(name.as_str(), private_name).into_owned();
-                if let Some(original) = canonical_locals.get(&canonical) {
-                    local_aliases.push((name.clone(), original.clone()));
-                    false
-                } else {
-                    canonical_locals.insert(canonical, name.clone());
-                    true
-                }
-            });
+        let mut local_aliases = coalesce_private_locals(
+            &mut locals.names,
+            private_name,
+            references
+                .iter()
+                .chain(&lambda_requirements)
+                .chain(&generator_requirements)
+                .chain(&annotation_scope_requirements)
+                .map(String::as_str)
+                .chain(
+                    nested_function_requirements
+                        .iter()
+                        .map(|name| names.resolve(*name)),
+                )
+                .chain(
+                    nested_function_annotation_references
+                        .iter()
+                        .map(|name| names.resolve(*name)),
+                ),
+        );
+        for (alias, original) in &local_aliases {
+            if parameter_names.contains(alias) || parameter_names.contains(original) {
+                parameter_names.extend([alias.clone(), original.clone()]);
+            }
+            if comprehension_shadowed_targets.contains(alias)
+                || comprehension_shadowed_targets.contains(original)
+            {
+                comprehension_shadowed_targets.extend([alias.clone(), original.clone()]);
+            }
         }
 
+        let annotation_required = |expression: &Expr| {
+            private_name.map_or_else(
+                || expression_required_names(expression),
+                |private_name| {
+                    contextual_expression_requirements(
+                        expression,
+                        &|name| mangle_name(name, Some(private_name)).into_owned(),
+                        expression_required_names,
+                    )
+                },
+            )
+        };
         let mut annotation_references = FxHashSet::default();
         if !future_annotations {
             for parameter in definition
@@ -612,33 +723,38 @@ impl FunctionPlan {
                 .chain(&definition.parameters.args)
             {
                 if let Some(annotation) = parameter.parameter.annotation.as_deref() {
-                    annotation_references.extend(expression_required_names(annotation));
+                    annotation_references.extend(annotation_required(annotation));
                 }
             }
             if let Some(parameter) = &definition.parameters.vararg
                 && let Some(annotation) = parameter.annotation.as_deref()
             {
-                annotation_references.extend(expression_required_names(annotation));
+                annotation_references.extend(annotation_required(annotation));
             }
             for parameter in &definition.parameters.kwonlyargs {
                 if let Some(annotation) = parameter.parameter.annotation.as_deref() {
-                    annotation_references.extend(expression_required_names(annotation));
+                    annotation_references.extend(annotation_required(annotation));
                 }
             }
             if let Some(parameter) = &definition.parameters.kwarg
                 && let Some(annotation) = parameter.annotation.as_deref()
             {
-                annotation_references.extend(expression_required_names(annotation));
+                annotation_references.extend(annotation_required(annotation));
             }
             if let Some(annotation) = definition.returns.as_deref() {
-                annotation_references.extend(expression_required_names(annotation));
+                annotation_references.extend(annotation_required(annotation));
             }
         }
 
         if locals.annotation_only.contains("__class__") && !explicit_dunder_class_reference {
             references.remove("__class__");
         }
-        let local_names: FxHashSet<_> = locals.names.iter().cloned().collect();
+        let local_names: FxHashSet<_> = locals
+            .names
+            .iter()
+            .cloned()
+            .chain(local_aliases.iter().map(|(alias, _)| alias.clone()))
+            .collect();
         locals.names.retain(|name| {
             !locals.annotation_only.contains(name)
                 || references.contains(name.as_str())
@@ -653,6 +769,7 @@ impl FunctionPlan {
                     .get(name)
                     .is_some_and(|name| nested_function_requirements.contains(&name))
         });
+        local_aliases.retain(|(_, original)| locals.names.contains(original));
         let mut annotation_cell_locals = local_annotation_cellvars
             .iter()
             .filter(|name| !local_names.contains(name.as_str()))
@@ -716,7 +833,17 @@ impl FunctionPlan {
                 .filter(|name| comprehension_shadowed_targets.contains(name.as_str()))
                 .cloned(),
         );
-        let retained_local_names: FxHashSet<_> = locals.names.iter().map(Name::as_str).collect();
+        let retained_local_names: FxHashSet<_> = locals
+            .names
+            .iter()
+            .map(Name::as_str)
+            .chain(
+                local_aliases
+                    .iter()
+                    .filter(|(_, original)| locals.names.contains(original))
+                    .map(|(alias, _)| alias.as_str()),
+            )
+            .collect();
         let required: BTreeSet<_> = references
             .iter()
             .chain(&locals.nonlocals)
@@ -753,6 +880,7 @@ impl FunctionPlan {
                 })
                 .collect(),
             globals: names.intern_set(locals.globals),
+            cell_sort_names: FxHashMap::default(),
             annotation_references: names.intern_set(annotation_references),
             cellvars: names.intern_set(cellvars),
             inlined_comprehension_cellvars: names.intern_set(inlined_comprehension_cellvars),
@@ -765,30 +893,46 @@ impl FunctionPlan {
             required: names.intern_set(required),
             type_parameter_names: names.intern_set(type_parameter_names),
         };
-        // A captured iteration alias shares the representative's emitted local kind,
-        // while raw-name lookup still needs both IDs to address the same slot.
-        for &(alias, original) in &plan.local_aliases {
-            if plan.cellvars.contains(&alias) {
-                plan.cellvars.insert(original);
-            }
-            if plan.inlined_comprehension_cellvars.contains(&alias) {
-                plan.inlined_comprehension_cellvars.insert(original);
-            }
-        }
         plan.absorb_child_requirements(
             nested_function_requirements.iter().copied(),
             nested_function_annotation_references.iter().copied(),
         );
+        // Captures use either spelling, while emitted metadata retains one native slot.
+        for &(alias, original) in &plan.local_aliases {
+            if plan.comprehension_shadowed_targets.contains(&alias)
+                || plan.comprehension_shadowed_targets.contains(&original)
+            {
+                plan.comprehension_shadowed_targets
+                    .extend([alias, original]);
+            }
+            if plan.cellvars.contains(&alias) || plan.cellvars.contains(&original) {
+                plan.cellvars.extend([alias, original]);
+            }
+            if plan.inlined_comprehension_cellvars.contains(&alias)
+                || plan.inlined_comprehension_cellvars.contains(&original)
+            {
+                plan.inlined_comprehension_cellvars
+                    .extend([alias, original]);
+            }
+        }
+        let canonical_local = |name| {
+            plan.local_aliases
+                .iter()
+                .find(|(alias, _)| *alias == name)
+                .map_or(name, |(_, original)| *original)
+        };
         let comprehension_fast_cellvars = comprehension_fast_bindings
             .iter()
             .filter_map(|name| names.get(name))
+            .map(canonical_local)
             .filter(|name| plan.cellvars.contains(name))
             .collect::<Vec<_>>();
+        let mut seen_reordered = FxHashSet::default();
         let comprehension_reordered_fast_locals = comprehension_fast_bindings
             .iter()
             .filter(|name| !parameter_names.contains(*name))
             .filter_map(|name| {
-                let id = names.get(name)?;
+                let id = canonical_local(names.get(name)?);
                 // Explicit globals were reserved at their first comprehension save;
                 // ordinary global operations never claimed an earlier fast-local slot.
                 if plan.globals.contains(&id) {
@@ -799,26 +943,32 @@ impl FunctionPlan {
                 (plan.comprehension_shadowed_targets.contains(&id) || plan.cellvars.contains(&id))
                     .then_some(id)
             })
+            .filter(|name| seen_reordered.insert(*name))
             .collect::<Vec<_>>();
-        let comprehension_fast_predecessors = comprehension_target_predecessors
-            .into_iter()
-            .filter_map(|(name, predecessors)| {
-                let annotation_only_predecessors =
-                    comprehension_annotation_only_predecessors.get(&name);
-                Some((
-                    names.get(&name)?,
+        let mut comprehension_fast_predecessors = FxHashMap::default();
+        for name in &comprehension_fast_bindings {
+            let Some(id) = names.get(name).map(canonical_local) else {
+                continue;
+            };
+            let Some(predecessors) = comprehension_target_predecessors.get(name) else {
+                continue;
+            };
+            let annotation_only = comprehension_annotation_only_predecessors.get(name);
+            // Aliases share the reservation made by the first source-order target.
+            comprehension_fast_predecessors
+                .entry(id)
+                .or_insert_with(|| {
                     predecessors
-                        .into_iter()
+                        .iter()
                         .filter(|predecessor| {
-                            annotation_only_predecessors.is_none_or(|annotation_only| {
-                                !annotation_only.contains(predecessor)
-                            })
+                            annotation_only.is_none_or(|names| !names.contains(*predecessor))
                         })
-                        .filter_map(|predecessor| names.get(&predecessor))
-                        .collect(),
-                ))
-            })
-            .collect();
+                        .filter_map(|predecessor| names.get(predecessor))
+                        .map(canonical_local)
+                        .filter(|predecessor| *predecessor != id)
+                        .collect()
+                });
+        }
         reorder_comprehension_fast_cells(
             &mut plan.locals,
             &comprehension_reordered_fast_locals,
@@ -826,6 +976,19 @@ impl FunctionPlan {
         );
         plan.inlined_comprehension_cellvars
             .extend(comprehension_fast_cellvars);
+        if !plan.local_aliases.is_empty() {
+            plan.cell_sort_names = plan
+                .locals
+                .iter()
+                .copied()
+                .map(|name| {
+                    (
+                        name,
+                        mangle_name(names.resolve(name), private_name).into_owned(),
+                    )
+                })
+                .collect();
+        }
         plan
     }
 
@@ -840,7 +1003,10 @@ impl FunctionPlan {
     pub(super) fn mark_global(&mut self, name: NameId) {
         self.annotation_freevars
             .retain(|candidate| *candidate != name);
-        if self.locals.contains(&name) && !self.comprehension_shadowed_targets.contains(&name) {
+        if (self.locals.contains(&name)
+            || self.local_aliases.iter().any(|(alias, _)| *alias == name))
+            && !self.comprehension_shadowed_targets.contains(&name)
+        {
             return;
         }
         self.freevars.retain(|candidate| *candidate != name);
@@ -852,6 +1018,8 @@ impl FunctionPlan {
         LoweringFunctionPlan {
             locals: self.locals,
             local_aliases: self.local_aliases,
+            free_aliases: Vec::new(),
+            cell_sort_names: self.cell_sort_names,
             globals: self.globals,
             annotation_references: self.annotation_references,
             cellvars: self.cellvars,
@@ -1421,18 +1589,76 @@ impl ScopeArena {
         // Flat functions have no closure, annotation, or evaluation-order edge cases. Their
         // bindings and references were already collected during the module-wide name walk.
         if let Some(inputs) = flat {
+            if private_name.is_none()
+                || !inputs.names.iter().any(|(name, _)| {
+                    mangle_name(self.names.resolve(*name), private_name)
+                        != self.names.resolve(*name)
+                })
+            {
+                let mut locals = Vec::with_capacity(inputs.names.len());
+                let mut required = FxHashSet::default();
+                required.reserve(inputs.names.len());
+                for (name, bound) in inputs.names {
+                    if bound {
+                        locals.push(name);
+                    } else {
+                        required.insert(name);
+                    }
+                }
+                self.nodes[id].plan = ScopePlan::Function(FunctionPlan {
+                    locals,
+                    required,
+                    ..FunctionPlan::default()
+                });
+                return;
+            }
+            let mut ordered_names: Vec<_> = inputs
+                .names
+                .iter()
+                .map(|(name, _)| Name::new(self.names.resolve(*name)))
+                .collect();
+            let local_aliases =
+                coalesce_private_locals(&mut ordered_names, private_name, std::iter::empty());
+            let bound: FxHashSet<_> = inputs
+                .names
+                .iter()
+                .filter(|(_, bound)| *bound)
+                .map(|(name, _)| mangle_name(self.names.resolve(*name), private_name).into_owned())
+                .collect();
             let mut locals = Vec::with_capacity(inputs.names.len());
             let mut required = FxHashSet::default();
             required.reserve(inputs.names.len());
-            for (name, bound) in inputs.names {
-                if bound {
-                    locals.push(name);
-                } else {
-                    required.insert(name);
+            for name in ordered_names {
+                let id = self.names.get(&name).expect("collected names are interned");
+                if bound.contains(mangle_name(&name, private_name).as_ref()) {
+                    locals.push(id);
                 }
             }
+            required.extend(
+                inputs
+                    .names
+                    .iter()
+                    .filter(|(name, _)| {
+                        !bound
+                            .contains(mangle_name(self.names.resolve(*name), private_name).as_ref())
+                    })
+                    .map(|(name, _)| *name),
+            );
+            let local_aliases = local_aliases
+                .into_iter()
+                .filter_map(|(alias, original)| {
+                    let original = self
+                        .names
+                        .get(&original)
+                        .expect("alias representative is interned");
+                    locals
+                        .contains(&original)
+                        .then(|| (self.names.get(&alias).expect("alias is interned"), original))
+                })
+                .collect();
             self.nodes[id].plan = ScopePlan::Function(FunctionPlan {
                 locals,
+                local_aliases,
                 required,
                 ..FunctionPlan::default()
             });
@@ -1440,16 +1666,13 @@ impl ScopeArena {
         }
 
         let eager_annotations = !self.deferred_annotations && !future_annotations;
-        let facts = if eager_annotations {
-            ScopeBodyFactsCollector::collect(
-                &definition.body,
-                true,
-                ScopeBodyContext::Function,
-                true,
-            )
-        } else {
-            ScopeBodyFacts::for_function(&definition.body)
-        };
+        let facts = ScopeBodyFactsCollector::collect(
+            &definition.body,
+            true,
+            ScopeBodyContext::Function,
+            eager_annotations,
+            private_name,
+        );
         let (nested_function_requirements, nested_function_annotation_references) =
             self.nested_function_requirements(id);
         let (mut class_requirements, unmangled_requirements) = self.nested_class_requirements(id);
@@ -1476,11 +1699,13 @@ impl ScopeArena {
         future_annotations: bool,
         enclosing_private_name: Option<&str>,
     ) {
-        let mut facts = if !self.deferred_annotations && !future_annotations {
-            ScopeBodyFactsCollector::collect(&definition.body, false, ScopeBodyContext::Class, true)
-        } else {
-            ScopeBodyFacts::for_class(&definition.body, future_annotations)
-        };
+        let mut facts = ScopeBodyFactsCollector::collect(
+            &definition.body,
+            future_annotations,
+            ScopeBodyContext::Class,
+            !self.deferred_annotations && !future_annotations,
+            Some(definition.name.as_str()),
+        );
         if self.python_version == PythonVersion::Py312 {
             // Python 3.12 rejects comprehensions in class-visible annotation scopes.
             facts.annotation_comprehension_requirements =
@@ -2233,6 +2458,48 @@ enum LocalUnwind<'a> {
     Loop,
 }
 
+/// Preserve the first symbol position while making private spellings share its slot.
+fn coalesce_private_locals<'a>(
+    locals: &mut Vec<Name>,
+    private_name: Option<&str>,
+    references: impl IntoIterator<Item = &'a str>,
+) -> Vec<(Name, Name)> {
+    let Some(private_name) = private_name else {
+        return Vec::new();
+    };
+    let mut groups: FxHashMap<String, Vec<Name>> = FxHashMap::default();
+    locals.retain(|name| {
+        let canonical = mangle_name(name, Some(private_name)).into_owned();
+        let group = groups.entry(canonical).or_default();
+        group.push(name.clone());
+        group.len() == 1
+    });
+    for name in references {
+        let canonical = mangle_name(name, Some(private_name));
+        if let Some(group) = groups.get_mut(canonical.as_ref())
+            && !group.iter().any(|existing| existing == name)
+        {
+            group.push(Name::new(name));
+        }
+    }
+    let mut aliases = Vec::new();
+    for original in locals.iter_mut() {
+        let canonical = mangle_name(original, Some(private_name));
+        let group = &groups[canonical.as_ref()];
+        if group.len() > 1 {
+            let representative = Name::new(canonical.as_ref());
+            aliases.extend(
+                group
+                    .iter()
+                    .filter(|name| **name != representative)
+                    .map(|name| (name.clone(), representative.clone())),
+            );
+            *original = representative;
+        }
+    }
+    aliases
+}
+
 #[derive(Debug, Default)]
 struct LocalCollector {
     names: Vec<Name>,
@@ -2451,12 +2718,12 @@ impl LocalCollector {
         if self.globals.contains(name) || self.nonlocals.contains(name) {
             return;
         }
+        self.claim_annotation_only_position(name);
         if self
             .candidate_bindings
             .as_ref()
             .is_some_and(|candidate_bindings| candidate_bindings.contains_key(name))
         {
-            self.claim_annotation_only_position(name);
             return;
         }
         let Some(candidate_bindings) = &mut self.candidate_bindings else {
@@ -2469,13 +2736,30 @@ impl LocalCollector {
     fn claim_annotation_only_position(&mut self, name: &str) {
         // A no-value function annotation emits no fast-local operation in CPython. Keep its
         // symbol-table position provisional until the first runtime load or binding claims it.
-        if !self.annotation_only.remove(name) {
+        let annotation = if self.annotation_only.contains(name) {
+            Name::new(name)
+        } else if let Some(private_name) = self.private_name.as_deref() {
+            let canonical = mangle_name(name, Some(private_name));
+            let Some(annotation) = self
+                .names
+                .iter()
+                .find(|candidate| {
+                    self.annotation_only.contains(*candidate)
+                        && mangle_name(candidate, Some(private_name)) == canonical
+                })
+                .cloned()
+            else {
+                return;
+            };
+            annotation
+        } else {
             return;
-        }
+        };
+        self.annotation_only.remove(&annotation);
         let index = self
             .names
             .iter()
-            .position(|candidate| candidate == name)
+            .position(|candidate| *candidate == annotation)
             .expect("an annotation-only local should have a candidate position");
         let name = self.names.remove(index);
         self.names.push(name);
@@ -2485,7 +2769,18 @@ impl LocalCollector {
         let Some(candidate_bindings) = self.candidate_bindings.take() else {
             return;
         };
-        self.names.retain(|name| candidate_bindings[name]);
+        if let Some(private_name) = self.private_name.as_deref() {
+            let bound: FxHashSet<_> = self
+                .names
+                .iter()
+                .filter(|name| candidate_bindings[*name])
+                .map(|name| mangle_name(name, Some(private_name)).into_owned())
+                .collect();
+            self.names
+                .retain(|name| bound.contains(mangle_name(name, Some(private_name)).as_ref()));
+        } else {
+            self.names.retain(|name| candidate_bindings[name]);
+        }
     }
 
     fn insert(&mut self, name: &str) {
@@ -3055,13 +3350,20 @@ impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
     }
 }
 
+#[cfg(test)]
 impl ScopeBodyFacts {
     pub(super) fn for_function(body: &[Stmt]) -> Self {
-        ScopeBodyFactsCollector::collect(body, true, ScopeBodyContext::Function, false)
+        ScopeBodyFactsCollector::collect(body, true, ScopeBodyContext::Function, false, None)
     }
 
     pub(super) fn for_class(body: &[Stmt], future_annotations: bool) -> Self {
-        ScopeBodyFactsCollector::collect(body, future_annotations, ScopeBodyContext::Class, false)
+        ScopeBodyFactsCollector::collect(
+            body,
+            future_annotations,
+            ScopeBodyContext::Class,
+            false,
+            None,
+        )
     }
 }
 
@@ -3083,6 +3385,7 @@ struct ScopeBodyFactsCollector<'ast> {
     inlined_comprehension_depth: usize,
     seen_inlined_comprehension_targets: FxHashSet<String>,
     class_comprehension_targets: Vec<String>,
+    private_name: Option<String>,
 }
 
 #[derive(Default)]
@@ -3109,6 +3412,7 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
         skip_annotations: bool,
         context: ScopeBodyContext,
         eager_function_annotations: bool,
+        private_name: Option<&str>,
     ) -> ScopeBodyFacts {
         let collect_function_scope_facts = matches!(context, ScopeBodyContext::Function);
         let class_scope = matches!(context, ScopeBodyContext::Class);
@@ -3124,6 +3428,7 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
             inlined_comprehension_depth: 0,
             seen_inlined_comprehension_targets: FxHashSet::default(),
             class_comprehension_targets: Vec::new(),
+            private_name: private_name.map(str::to_owned),
         };
         for statement in body {
             collector.visit_stmt(statement);
@@ -3147,13 +3452,33 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
         collector.facts
     }
 
+    fn expression_requirements(
+        &self,
+        expression: &Expr,
+        collect: impl Fn(&Expr) -> BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        let Some(private_name) = self.private_name.as_deref() else {
+            return collect(expression);
+        };
+        contextual_expression_requirements(
+            expression,
+            &|name| mangle_name(name, Some(private_name)).into_owned(),
+            collect,
+        )
+    }
+
     fn collect_annotation_comprehensions(
         &mut self,
         expression: &Expr,
         type_params: Option<&ruff_python_ast::TypeParams>,
     ) {
         if !self.collect_function_scope_facts {
-            let requirements = annotation_comprehension_requirements(expression);
+            let mut requirements = annotation_comprehension_requirements(expression);
+            if self.private_name.is_some() {
+                requirements.captures = self.expression_requirements(expression, |expression| {
+                    annotation_comprehension_requirements(expression).captures
+                });
+            }
             let is_type_parameter = |name: &str| {
                 type_params.is_some_and(|parameters| {
                     parameters
@@ -3193,17 +3518,17 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
     fn collect_function_header(&mut self, definition: &'ast StmtFunctionDef) {
         if !self.skip_annotations && !self.eager_function_annotations {
             for annotation in function_annotation_expressions(definition) {
-                self.facts.nested_lambda_requirements.extend(
-                    annotation_nested_required_names(annotation)
-                        .into_iter()
-                        .filter(|name| {
-                            !definition.type_params.as_deref().is_some_and(|parameters| {
-                                parameters
-                                    .iter()
-                                    .any(|parameter| parameter.name().as_str() == name)
-                            })
-                        }),
-                );
+                let required =
+                    self.expression_requirements(annotation, annotation_nested_required_names);
+                self.facts
+                    .nested_lambda_requirements
+                    .extend(required.into_iter().filter(|name| {
+                        !definition.type_params.as_deref().is_some_and(|parameters| {
+                            parameters
+                                .iter()
+                                .any(|parameter| parameter.name().as_str() == name)
+                        })
+                    }));
             }
         }
         if !self.skip_annotations
@@ -3288,12 +3613,22 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
     fn collect_local_annotation(&mut self, annotation: &Expr) {
         // Before PEP 649, local annotations are omitted from bytecode but still participate
         // in symbol analysis. Their closures survive, while their fast-local positions do not.
-        let analysis =
-            analyze_expression_scope(&ruff_python_ast::Parameters::default(), annotation);
+        let parameters = ruff_python_ast::Parameters::default();
+        let analysis = self.private_name.as_deref().map_or_else(
+            || analyze_expression_scope(&parameters, annotation),
+            |private_name| {
+                analyze_expression_scope_with_mangler(&parameters, annotation, &|name| {
+                    mangle_name(name, Some(private_name)).into_owned()
+                })
+                .analysis
+            },
+        );
         let mut bindings = LocalAnnotationBindings::default();
         bindings.visit_expr(annotation);
+        let nested_required =
+            self.expression_requirements(annotation, nested_expression_required_names);
         self.facts.nested_lambda_requirements.extend(
-            nested_expression_required_names(annotation)
+            nested_required
                 .into_iter()
                 .filter(|name| analysis.required.contains(name) || bindings.0.contains(name)),
         );
@@ -3323,6 +3658,9 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
             }
             return;
         };
+        // Restricted generic headers retain their existing analysis. Their private
+        // binding context depends on which type parameters have been declared so far.
+        let enclosing_private_name = self.private_name.take();
         self.facts.has_generic_definition = true;
         // Keep this restricted header's captures separate until their lexical origin
         // has been recorded; an earlier body use can have the same source spelling.
@@ -3410,6 +3748,7 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
             .annotation_comprehension_requirements
             .captures
             .extend(body_comprehension_captures);
+        self.private_name = enclosing_private_name;
     }
 
     /// Annotation scopes request the current class cell, independently of class-body captures.
@@ -3591,7 +3930,16 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
         }
         if let Expr::Lambda(lambda) = expression {
             visit_lambda_defaults(self, lambda);
-            let required = analyze_lambda_scope(lambda).required;
+            let required = self.private_name.as_deref().map_or_else(
+                || analyze_lambda_scope(lambda).required,
+                |private_name| {
+                    analyze_lambda_scope_with_mangler(lambda, &|name| {
+                        mangle_name(name, Some(private_name)).into_owned()
+                    })
+                    .analysis
+                    .required
+                },
+            );
             if self.inlined_comprehension_depth == 0 {
                 self.facts
                     .outside_inlined_comprehension_requirements
@@ -3609,8 +3957,14 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
         {
             // A generator owns its iteration targets. Only its free references escape
             // into the class, and enclosing comprehension targets provide their own cells.
-            self.facts.nested_generator_requirements.extend(
+            let required = self.expression_requirements(expression, |expression| {
+                let Expr::Generator(generator) = expression else {
+                    unreachable!()
+                };
                 generator_required_names(generator)
+            });
+            self.facts.nested_generator_requirements.extend(
+                required
                     .into_iter()
                     .filter(|name| !self.class_comprehension_targets.contains(name)),
             );
@@ -3623,7 +3977,12 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
             && self.generator_depth == 0
             && let Expr::Generator(generator) = expression
         {
-            let required = generator_required_names(generator);
+            let required = self.expression_requirements(expression, |expression| {
+                let Expr::Generator(generator) = expression else {
+                    unreachable!()
+                };
+                generator_required_names(generator)
+            });
             if self.inlined_comprehension_depth == 0 {
                 self.facts
                     .outside_inlined_comprehension_requirements
@@ -3658,9 +4017,13 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
                 _ => None,
             };
             if let Some((generators, key, value)) = comprehension {
-                self.facts
-                    .inlined_comprehension_cellvars
-                    .extend(comprehension_cell_names(generators, key, value));
+                let cells = comprehension_cell_names_in_private_context(
+                    generators,
+                    key,
+                    value,
+                    self.private_name.as_deref(),
+                );
+                self.facts.inlined_comprehension_cellvars.extend(cells);
                 if self.collect_function_scope_facts {
                     if !self.facts.has_inlined_comprehension {
                         let mut references = self
@@ -3681,10 +4044,18 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
                         self.visit_expr(&first.iter);
                     }
                     if self.inlined_comprehension_depth == 0 {
-                        for (name, bound) in comprehension_name_bindings(generators, key, value) {
+                        for (name, bound) in comprehension_bindings_in_private_context(
+                            expression,
+                            self.private_name.as_deref(),
+                        ) {
+                            let canonical = mangle_name(&name, self.private_name.as_deref());
                             if bound {
-                                self.seen_inlined_comprehension_targets.insert(name);
-                            } else if !self.seen_inlined_comprehension_targets.contains(&name) {
+                                self.seen_inlined_comprehension_targets
+                                    .insert(canonical.into_owned());
+                            } else if !self
+                                .seen_inlined_comprehension_targets
+                                .contains(canonical.as_ref())
+                            {
                                 self.outside_inlined_comprehension_references
                                     .as_mut()
                                     .expect("inlined comprehension references are initialized")
@@ -3852,6 +4223,179 @@ pub(super) fn analyze_lambda_scope(lambda: &ruff_python_ast::ExprLambda) -> Lamb
     let empty_parameters = ruff_python_ast::Parameters::default();
     let parameters = lambda.parameters.as_deref().unwrap_or(&empty_parameters);
     analyze_expression_scope(parameters, &lambda.body)
+}
+
+pub(super) struct ContextualLambdaScopeAnalysis {
+    pub(super) analysis: LambdaScopeAnalysis,
+    pub(super) local_aliases: Vec<(String, String)>,
+}
+
+/// Analyze symbol identity on a private clone, then retain raw escaping names.
+///
+/// `mangle` describes symbol analysis at this lambda's lexical location. It must
+/// include a generic class header's declaration-time restriction when present.
+pub(super) fn analyze_lambda_scope_with_mangler(
+    lambda: &ruff_python_ast::ExprLambda,
+    mangle: &impl Fn(&str) -> String,
+) -> ContextualLambdaScopeAnalysis {
+    let empty_parameters = ruff_python_ast::Parameters::default();
+    analyze_expression_scope_with_mangler(
+        lambda.parameters.as_deref().unwrap_or(&empty_parameters),
+        &lambda.body,
+        mangle,
+    )
+}
+
+fn analyze_expression_scope_with_mangler(
+    parameters: &ruff_python_ast::Parameters,
+    body: &Expr,
+    mangle: &impl Fn(&str) -> String,
+) -> ContextualLambdaScopeAnalysis {
+    let raw = analyze_expression_scope(parameters, body);
+    let mut spellings = VariableSpellings::default();
+    spellings.visit_parameters(parameters);
+    spellings.visit_expr(body);
+    let aliases = colliding_private_spellings(&spellings.names, mangle);
+    if aliases.is_empty() {
+        return ContextualLambdaScopeAnalysis {
+            analysis: raw,
+            local_aliases: Vec::new(),
+        };
+    }
+    let normalize = |name: &str| {
+        aliases
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_owned())
+    };
+    let mut parameters = parameters.clone();
+    let mut body = body.clone();
+    let transformer = PrivateVariableNormalizer { mangle: &normalize };
+    ruff_python_ast::visitor::transformer::Transformer::visit_parameters(
+        &transformer,
+        &mut parameters,
+    );
+    ruff_python_ast::visitor::transformer::Transformer::visit_expr(&transformer, &mut body);
+
+    let mut analysis = analyze_expression_scope(&parameters, &body);
+    // Preserve the spellings used by the surrounding scope and original AST.
+    // The normalized result removes false escapes such as lambda __x: _C__x.
+    // Preserve the existing free-variable spelling selection.
+    analysis.required = raw
+        .required
+        .into_iter()
+        .filter(|name| analysis.required.contains(&normalize(name)))
+        .collect();
+
+    let local_names: FxHashSet<_> = analysis.locals.iter().map(String::as_str).collect();
+    let local_aliases = spellings
+        .names
+        .into_iter()
+        .filter_map(|raw| {
+            let canonical = normalize(&raw);
+            (raw != canonical && local_names.contains(canonical.as_str()))
+                .then_some((raw, canonical))
+        })
+        .collect();
+
+    ContextualLambdaScopeAnalysis {
+        analysis,
+        local_aliases,
+    }
+}
+
+/// Adapt existing pure requirement collectors without changing recursive APIs.
+///
+/// Use at parent fact-collection boundaries for generator or annotation trees
+/// whose nested lambdas must honor the current private-name context.
+fn contextual_expression_requirements(
+    expression: &Expr,
+    mangle: &impl Fn(&str) -> String,
+    collect: impl Fn(&Expr) -> BTreeSet<String>,
+) -> BTreeSet<String> {
+    let raw = collect(expression);
+    let mut spellings = VariableSpellings::default();
+    spellings.visit_expr(expression);
+    let aliases = colliding_private_spellings(&spellings.names, mangle);
+    if aliases.is_empty() {
+        return raw;
+    }
+    let normalize = |name: &str| {
+        aliases
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_owned())
+    };
+    let mut normalized = expression.clone();
+    ruff_python_ast::visitor::transformer::Transformer::visit_expr(
+        &PrivateVariableNormalizer { mangle: &normalize },
+        &mut normalized,
+    );
+    let required = collect(&normalized);
+    raw.into_iter()
+        .filter(|name| required.contains(&normalize(name)))
+        .collect()
+}
+
+/// Only normalize identities with multiple observed source spellings.
+fn colliding_private_spellings(
+    spellings: &BTreeSet<String>,
+    mangle: &impl Fn(&str) -> String,
+) -> FxHashMap<String, String> {
+    let mut counts: FxHashMap<String, usize> = FxHashMap::default();
+    for spelling in spellings {
+        *counts.entry(mangle(spelling)).or_default() += 1;
+    }
+    spellings
+        .iter()
+        .filter_map(|spelling| {
+            let canonical = mangle(spelling);
+            (counts[&canonical] > 1 && spelling != &canonical)
+                .then(|| (spelling.clone(), canonical))
+        })
+        .collect()
+}
+
+struct PrivateVariableNormalizer<'a, M> {
+    mangle: &'a M,
+}
+
+impl<M: Fn(&str) -> String> ruff_python_ast::visitor::transformer::Transformer
+    for PrivateVariableNormalizer<'_, M>
+{
+    fn visit_expr(&self, expression: &mut Expr) {
+        if let Expr::Name(name) = expression {
+            name.id = Name::new((self.mangle)(name.id.as_str()));
+        }
+        // Attribute labels and call keyword labels are deliberately unchanged.
+        // Recursing visits nested lambda parameters, walrus targets, generator
+        // targets, comprehension targets, and their variable references.
+        ruff_python_ast::visitor::transformer::walk_expr(self, expression);
+    }
+
+    fn visit_parameter(&self, parameter: &mut ruff_python_ast::Parameter) {
+        parameter.name.id = Name::new((self.mangle)(parameter.name.as_str()));
+        ruff_python_ast::visitor::transformer::walk_parameter(self, parameter);
+    }
+}
+
+#[derive(Default)]
+struct VariableSpellings {
+    names: BTreeSet<String>,
+}
+
+impl<'ast> Visitor<'ast> for VariableSpellings {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if let Expr::Name(name) = expression {
+            self.names.insert(name.id.to_string());
+        }
+        ruff_python_ast::visitor::walk_expr(self, expression);
+    }
+
+    fn visit_parameter(&mut self, parameter: &'ast ruff_python_ast::Parameter) {
+        self.names.insert(parameter.name.to_string());
+        ruff_python_ast::visitor::walk_parameter(self, parameter);
+    }
 }
 
 fn analyze_expression_scope(
@@ -4625,6 +5169,56 @@ pub(super) fn comprehension_name_bindings(
     Collector::comprehension(generators, key, value)
 }
 
+/// Compare alias identities before child admission, retaining raw escaping names.
+fn comprehension_bindings_in_private_context(
+    expression: &Expr,
+    private_name: Option<&str>,
+) -> BTreeMap<String, bool> {
+    let collect = |expression: &Expr| match expression {
+        Expr::ListComp(comprehension) => {
+            comprehension_name_bindings(&comprehension.generators, None, &comprehension.elt)
+        }
+        Expr::SetComp(comprehension) => {
+            comprehension_name_bindings(&comprehension.generators, None, &comprehension.elt)
+        }
+        Expr::DictComp(comprehension) => comprehension_name_bindings(
+            &comprehension.generators,
+            comprehension.key.as_deref(),
+            &comprehension.value,
+        ),
+        _ => unreachable!("inlined comprehension expression"),
+    };
+    let raw = collect(expression);
+    let Some(private_name) = private_name else {
+        return raw;
+    };
+    let mut spellings = VariableSpellings::default();
+    spellings.visit_expr(expression);
+    let aliases = colliding_private_spellings(&spellings.names, &|name| {
+        mangle_name(name, Some(private_name)).into_owned()
+    });
+    if aliases.is_empty() {
+        return raw;
+    }
+    let normalize = |name: &str| {
+        aliases
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_owned())
+    };
+    let mut normalized = expression.clone();
+    ruff_python_ast::visitor::transformer::Transformer::visit_expr(
+        &PrivateVariableNormalizer { mangle: &normalize },
+        &mut normalized,
+    );
+    let bindings = collect(&normalized);
+    // Reuse the existing own/first-child precedence, including its exclusion of
+    // the first iterable. Only symbol identity changes before that traversal.
+    raw.into_keys()
+        .filter_map(|name| bindings.get(&normalize(&name)).map(|bound| (name, *bound)))
+        .collect()
+}
+
 pub(super) fn collect_nested_comprehension_target_names(
     expression: &Expr,
     names: &mut Vec<String>,
@@ -4705,30 +5299,55 @@ pub(super) fn comprehension_cell_names(
     key: Option<&Expr>,
     value: &Expr,
 ) -> FxHashSet<String> {
+    comprehension_cell_names_in_private_context(generators, key, value, None)
+}
+
+/// Return source target spellings captured under the current private-name context.
+pub(super) fn comprehension_cell_names_in_private_context(
+    generators: &[ruff_python_ast::Comprehension],
+    key: Option<&Expr>,
+    value: &Expr,
+    private_name: Option<&str>,
+) -> FxHashSet<String> {
+    let nested_required = |expression: &Expr| {
+        private_name.map_or_else(
+            || nested_expression_required_names(expression),
+            |private_name| {
+                contextual_expression_requirements(
+                    expression,
+                    &|name| mangle_name(name, Some(private_name)).into_owned(),
+                    nested_expression_required_names,
+                )
+            },
+        )
+    };
     let mut targets = Vec::new();
     let mut required = BTreeSet::new();
     for (index, generator) in generators.iter().enumerate() {
         collect_target_names(&generator.target, &mut targets);
         if index > 0 {
             collect_nested_comprehension_target_names(&generator.iter, &mut targets);
-            required.extend(nested_expression_required_names(&generator.iter));
+            required.extend(nested_required(&generator.iter));
         }
         for condition in &generator.ifs {
             collect_nested_comprehension_target_names(condition, &mut targets);
-            required.extend(nested_expression_required_names(condition));
+            required.extend(nested_required(condition));
         }
     }
     if let Some(key) = key {
         collect_nested_comprehension_target_names(key, &mut targets);
-        required.extend(nested_expression_required_names(key));
+        required.extend(nested_required(key));
     }
     collect_nested_comprehension_target_names(value, &mut targets);
-    required.extend(nested_expression_required_names(value));
+    required.extend(nested_required(value));
 
-    let targets = targets.into_iter().collect::<FxHashSet<_>>();
-    required
+    let required = required
+        .iter()
+        .map(|name| mangle_name(name, private_name))
+        .collect::<FxHashSet<_>>();
+    targets
         .into_iter()
-        .filter(|name| targets.contains(name))
+        .filter(|name| required.contains(&mangle_name(name, private_name)))
         .collect()
 }
 
