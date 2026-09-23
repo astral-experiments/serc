@@ -7,7 +7,7 @@ use super::{
     Instruction, Item, NormalizedExceptionOwner, Operand, OperandPatchId, SourceLocation,
 };
 use crate::target::opcodes::*;
-use crate::target::operands::{CommonConstant, ResumeLocation};
+use crate::target::operands::{CommonConstant, Conversion, ResumeLocation};
 
 #[test]
 #[cfg(target_pointer_width = "64")]
@@ -4721,7 +4721,7 @@ fn ordinary_linear_instructions_match_the_block_graph_pipeline() {
                 instruction(LOAD_FAST, 1, 3, 1),
                 instruction(FORMAT_SIMPLE, 0, 3, 1),
                 instruction(LOAD_FAST, 2, 3, 2),
-                instruction(CONVERT_VALUE, 2, 3, 2),
+                instruction(CONVERT_VALUE, Conversion::REPR.argument(), 3, 2),
                 instruction(LOAD_CONST, 0, 3, 3),
                 instruction(FORMAT_WITH_SPEC, 0, 3, 2),
                 instruction(BUILD_STRING, 2, 3, 1),
@@ -5009,7 +5009,7 @@ fn linear_literal_fold_history_matches_the_block_graph_pipeline() {
     for opcode in [LOAD_CONST, LOAD_SMALL_INT, LIST_EXTEND, SET_UPDATE] {
         for count in [1, 4, 9, 1023] {
             for extra in [0, 4] {
-                let mut items = vec![item(RESUME, 0, 0)];
+                let mut items = vec![item(RESUME, ResumeLocation::AT_FUNC_START.argument(), 0)];
                 if matches!(opcode, LIST_EXTEND | SET_UPDATE) {
                     items.push(item(
                         if opcode == LIST_EXTEND {
