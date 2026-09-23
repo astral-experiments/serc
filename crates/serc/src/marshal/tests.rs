@@ -5,8 +5,9 @@ use crate::code_object::{
 use super::encode_code;
 use super::graph::{ObjectGraph, OccurrenceKind};
 use super::key::{
-    ObjectKey, code_bytes_key, code_key, constant_key, constant_sort_key, constants_tuple_key,
-    local_kinds_key, locals_tuple_key, slice_member_uses_identity, strings_tuple_key,
+    HashedObjectKey, ObjectKey, code_bytes_key, code_key, constant_key, constant_sort_key,
+    constants_tuple_key, local_kinds_key, locals_tuple_key, metadata_tuple_properties,
+    slice_member_uses_identity, strings_tuple_key,
 };
 use super::plan::{MarshalVisitor, ObjectId, ReferenceMode, traverse_code};
 
@@ -154,6 +155,92 @@ fn uses_cpython_reference_cache_boundaries() {
         );
     }
     assert!(graph.is_shared(&ObjectKey::Float(0), true));
+}
+
+#[test]
+fn precomputed_metadata_hashes_match_borrowed_tuples_from_either_source() {
+    let names = ["value", "méthode", ".0", "é"].map(str::to_owned);
+    let locals = ["ascii_name", "A09", "_"].map(str::to_owned);
+    let properties = metadata_tuple_properties(&names, &locals);
+    assert!(!properties.names.automatically_interned);
+    assert!(properties.locals.automatically_interned);
+
+    for (values, properties) in [
+        (names.as_slice(), properties.names),
+        (locals.as_slice(), properties.locals),
+        (&[], metadata_tuple_properties(&[], &[]).names),
+    ] {
+        let constants = values
+            .iter()
+            .cloned()
+            .map(Constant::String)
+            .collect::<Vec<_>>();
+        let hinted = HashedObjectKey::with_hash(strings_tuple_key(values), properties.hash);
+        assert_eq!(hinted, HashedObjectKey::from(strings_tuple_key(values)));
+        assert_eq!(
+            hinted,
+            HashedObjectKey::from(constants_tuple_key(&constants))
+        );
+    }
+}
+
+#[test]
+fn compiled_metadata_hashes_and_interning_flags_match_uncached_marshal() {
+    fn remove_properties(code: &mut CodeObject, observed: &mut [bool; 4]) {
+        let properties = code
+            .marshal_provenance
+            .metadata_tuple_properties
+            .take()
+            .unwrap();
+        observed[0] |= properties.names.automatically_interned;
+        observed[1] |= !properties.names.automatically_interned;
+        observed[2] |= !properties.locals.automatically_interned;
+        observed[3] |= code.marshal_provenance.locals_identity == LocalsIdentity::Fresh;
+        for constant in &mut code.constants {
+            if let Constant::Code(child) = constant {
+                remove_properties(child, observed);
+            }
+        }
+    }
+
+    let source = "\
+import xml.etree
+marker = ('méthode',)
+def lookup():
+    return méthode
+def with_unicode_local(méthode, café):
+    return méthode, café
+class Annotated:
+    field: int
+";
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        let options = crate::CompileOptions {
+            python_version,
+            ..crate::CompileOptions::default()
+        };
+        let module = crate::compile_with_options(source, "metadata_hints.py", &options).unwrap();
+        let mut fallback = module.clone();
+        let mut observed = [false; 4];
+        remove_properties(&mut fallback.code, &mut observed);
+        assert_eq!(observed[..3], [true; 3]);
+        if python_version >= crate::PythonVersion::Py314 {
+            assert!(
+                observed[3],
+                "annotation locals missing for {python_version}"
+            );
+        }
+        assert_eq!(module.marshal(), fallback.marshal(), "{python_version}");
+        assert_eq!(
+            module.to_timestamp_pyc(123, 456),
+            fallback.to_timestamp_pyc(123, 456),
+            "{python_version}"
+        );
+    }
 }
 
 #[test]
@@ -332,6 +419,130 @@ fn qualified_name_scalar_interning_and_recorded_origins_match_fallback() {
     );
     assert_ne!(fallback, encode_code(&module(None, Some(false), None)));
     assert_ne!(fallback, encode_code(&module(None, None, Some(true))));
+}
+
+#[test]
+fn class_qualified_name_origins_preserve_hints_and_surviving_order() {
+    fn class(name: &str, canonical: Option<bool>, frozenset_hint: bool) -> Constant {
+        let mut code = code_object(vec![Constant::String(name.to_string())]);
+        code.name = name.rsplit('.').next().unwrap().to_string();
+        code.qualified_name = name.to_string();
+        code.marshal_provenance.qualified_name_constant_index = Some(0);
+        code.marshal_provenance.qualified_name_is_canonical = canonical;
+        code.marshal_provenance.subtree_has_frozenset_constants = frozenset_hint;
+        Constant::Code(Box::new(code))
+    }
+
+    fn encoded(
+        name: &str,
+        ordinary_first: bool,
+        canonical: Option<bool>,
+        frozenset_hint: bool,
+    ) -> Vec<u8> {
+        let ordinary = Constant::String(name.to_string());
+        let class = class(name, canonical, frozenset_hint);
+        let mut root = code_object(if ordinary_first {
+            vec![ordinary, class]
+        } else {
+            vec![class, ordinary]
+        });
+        root.marshal_provenance.subtree_has_frozenset_constants = frozenset_hint;
+        encode_code(&root)
+    }
+
+    fn spelling_count(bytes: &[u8], name: &str) -> usize {
+        bytes
+            .windows(name.len())
+            .filter(|bytes| *bytes == name.as_bytes())
+            .count()
+    }
+
+    let dotted = "outer.<locals>.MarshalOriginClass";
+    let identifier = "MarshalIdentifierClass";
+    for frozenset_hint in [false, true] {
+        for ordinary_first in [false, true] {
+            let fallback = encoded(dotted, ordinary_first, None, frozenset_hint);
+            assert_eq!(
+                fallback,
+                encoded(
+                    dotted,
+                    ordinary_first,
+                    Some(!ordinary_first),
+                    frozenset_hint
+                ),
+            );
+            assert_eq!(
+                spelling_count(&fallback, dotted),
+                if ordinary_first { 2 } else { 1 },
+            );
+
+            // Recorded discarded-code admissions remain authoritative even when the order of
+            // the surviving constants alone would give the opposite identity.
+            let contrary = encoded(dotted, ordinary_first, Some(ordinary_first), frozenset_hint);
+            assert_eq!(
+                spelling_count(&contrary, dotted),
+                if ordinary_first { 1 } else { 2 },
+            );
+
+            let automatic = encoded(identifier, ordinary_first, None, frozenset_hint);
+            assert_eq!(spelling_count(&automatic, identifier), 1);
+            for origin in [false, true] {
+                assert_eq!(
+                    automatic,
+                    encoded(identifier, ordinary_first, Some(origin), frozenset_hint),
+                );
+            }
+        }
+
+        let hinted = "outer.<locals>.HintedOriginClass";
+        let unhinted = "outer.<locals>.UnhintedOriginClass";
+        let mut mixed = code_object(vec![
+            Constant::String(hinted.to_string()),
+            class(hinted, Some(true), frozenset_hint),
+            class(hinted, None, frozenset_hint),
+            Constant::String(unhinted.to_string()),
+            class(unhinted, None, frozenset_hint),
+        ]);
+        mixed.marshal_provenance.subtree_has_frozenset_constants = frozenset_hint;
+        let bytes = encode_code(&mixed);
+        assert_eq!(spelling_count(&bytes, hinted), 1);
+        assert_eq!(spelling_count(&bytes, unhinted), 2);
+    }
+}
+
+#[test]
+fn compiled_class_qualified_names_match_unhinted_surviving_provenance() {
+    fn remove_hints(code: &mut CodeObject, observed: &mut Vec<(String, bool)>) {
+        if let Some(origin) = code.marshal_provenance.qualified_name_is_canonical.take() {
+            observed.push((code.qualified_name.clone(), origin));
+        }
+        for constant in &mut code.constants {
+            if let Constant::Code(code) = constant {
+                remove_hints(code, observed);
+            }
+        }
+    }
+
+    let source = "\
+class IdentifierClass:
+    pass
+
+class Namespace:
+    earlier = 'Namespace.LiteralFirst'
+    class LiteralFirst:
+        pass
+    class ClassFirst:
+        pass
+    later = 'Namespace.ClassFirst'
+";
+    let module = crate::compile(source, "class_origins.py").unwrap();
+    let expected = module.marshal();
+    let mut fallback = module.code;
+    let mut observed = Vec::new();
+    remove_hints(&mut fallback, &mut observed);
+    assert!(observed.contains(&("Namespace.LiteralFirst".to_string(), false)));
+    assert!(observed.contains(&("Namespace.ClassFirst".to_string(), true)));
+    assert_eq!(encode_code(&fallback), expected);
 }
 
 #[test]
@@ -757,7 +968,7 @@ impl<'a> MarshalVisitor<'a> for RecordingVisitor<'a> {
             .is_some_and(|pruned| std::ptr::eq(pruned, values))
     }
 
-    fn strings(&mut self, _values: &'a [String]) -> bool {
+    fn names(&mut self, _code: &'a CodeObject) -> bool {
         true
     }
 

@@ -133,6 +133,8 @@ pub(crate) struct MarshalProvenance {
     /// Whether `%` first entered the compiler cache as a fresh `PyUnicode_Replace` result.
     pub(crate) uncached_percent_constant: bool,
     pub(crate) metadata_ids: MarshalMetadataIds,
+    /// Value properties computed for the emitted metadata; absent for hand-built code objects.
+    pub(crate) metadata_tuple_properties: Option<MarshalMetadataTupleProperties>,
     /// Whether this code tree can contain a frozenset constant.
     pub(crate) subtree_has_frozenset_constants: bool,
     /// Whether no surviving constant tuple can share a non-identifier string with code metadata.
@@ -141,13 +143,25 @@ pub(crate) struct MarshalProvenance {
     pub(crate) fresh_empty_bytes_constant: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MarshalMetadataTupleProperties {
+    pub(crate) names: MarshalStringTupleProperties,
+    pub(crate) locals: MarshalStringTupleProperties,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MarshalStringTupleProperties {
+    pub(crate) hash: u64,
+    pub(crate) automatically_interned: bool,
+}
+
 impl MarshalProvenance {
     /// Compares the subset of marshal provenance that participates in code-constant equality.
     pub(crate) fn equal_for_constant_pool(&self, other: &Self) -> bool {
         // CPython gives annotation-scope locals fresh identity, which distinguishes otherwise
-        // equal code constants. String origins, qualified-name origins, metadata IDs,
-        // frozenset and metadata-alias hints, and assembly events only affect graph planning and
-        // are omitted from constant-pool equality.
+        // equal code constants. String origins, qualified-name origins, metadata IDs and tuple
+        // properties, frozenset and metadata-alias hints, and assembly events only affect graph
+        // planning and are omitted from constant-pool equality.
         self.locals_identity == other.locals_identity
     }
 }
@@ -534,6 +548,7 @@ mod tests {
                 name: Some(MetadataId::from_u32(0)),
                 qualified_name: Some(MetadataId::from_u32(1)),
             },
+            metadata_tuple_properties: Some(crate::marshal::metadata_tuple_properties(&[], &[])),
             subtree_has_frozenset_constants: true,
             metadata_alias_scan_unnecessary: true,
             ..MarshalProvenance::default()
