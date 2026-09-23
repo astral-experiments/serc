@@ -969,6 +969,71 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
 }
 
 #[test]
+fn compile_matches_cpython_for_class_local_closure_shadowing() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("module.py");
+    let native_path = directory.path().join("native.pyc");
+    fs_err::write(
+        &source_path,
+        include_str!("../../serc/tests/fixtures/class_local_closure_shadow.py"),
+    )
+    .unwrap();
+
+    for version in [
+        serc::PythonVersion::Py312,
+        serc::PythonVersion::Py313,
+        serc::PythonVersion::Py314,
+        serc::PythonVersion::Py315,
+    ] {
+        let oracle = || match version {
+            serc::PythonVersion::Py312 => common::python_312_command(),
+            serc::PythonVersion::Py313 => common::python_313_command(),
+            serc::PythonVersion::Py314 => common::python_3145_command(),
+            serc::PythonVersion::Py315 => common::python_315_command(),
+        };
+        let native = oracle()
+            .args([
+                "-c",
+                "import py_compile, sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True, optimize=0, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)",
+            ])
+            .arg(&source_path)
+            .arg(&native_path)
+            .output()
+            .unwrap();
+        assert!(native.status.success(), "{version}: {native:?}");
+
+        let output = serc()
+            .args([
+                "compile",
+                "--quiet",
+                "--python-version",
+                &version.to_string(),
+            ])
+            .arg(&source_path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{version}: {output:?}");
+        let (_, minor, _) = version.target().version;
+        let pyc_path = directory
+            .path()
+            .join(format!("__pycache__/module.cpython-3{minor}.pyc"));
+        assert_eq!(
+            fs_err::read(&pyc_path).unwrap(),
+            fs_err::read(&native_path).unwrap(),
+            "Python {version}"
+        );
+        for path in [&native_path, &pyc_path] {
+            let executed = oracle().arg(path).output().unwrap();
+            assert!(
+                executed.status.success(),
+                "{version}: {}: {executed:?}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
 fn check_compiles_a_directory_without_writing() {
     let directory = tempfile::tempdir().unwrap();
     let nested = directory.path().join("package");

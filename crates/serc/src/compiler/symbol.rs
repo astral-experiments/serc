@@ -246,7 +246,15 @@ impl Compiler<'_> {
                 if globals.contains(name_id) {
                     let index = self.name_index_with_id(name, name_id)?;
                     self.emit(LOAD_GLOBAL, index << 1, 1)
-                } else if let Some(index) = free_indices.get(&name_id).copied() {
+                } else if let Some(index) = free_indices.get(&name_id).copied()
+                    // A cell carried through for a method does not change class-local lookup.
+                    && (!self.class_scope_binds_name(name)
+                        || !self
+                            .control
+                            .comprehensions
+                            .active_comprehension_local_names
+                            .is_empty())
+                {
                     if self
                         .control
                         .comprehensions
