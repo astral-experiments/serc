@@ -3293,8 +3293,8 @@ impl OptimizationPipeline {
         // a predecessor's line. Memoization bounds the traversal to the original graph size.
         let mut absence = vec![None; instructions.len()];
         let mut visited = vec![usize::MAX; instructions.len()];
+        let mut path = Vec::new();
         for start in 0..instructions.len() {
-            let mut path = Vec::new();
             let mut entry = start;
             let absent = loop {
                 if let Some(absent) = absence[entry] {
@@ -3312,7 +3312,7 @@ impl OptimizationPipeline {
                 }
             };
             absence[start] = Some(absent);
-            for entry in path {
+            for entry in path.drain(..) {
                 absence[entry] = Some(absent);
             }
         }
@@ -3872,6 +3872,12 @@ impl OptimizationPipeline {
         &self,
     ) -> ReversedStoreHandlerExits {
         let mut entries = FxHashMap::default();
+        if self.exception_owner_provenance.source_boundaries.is_empty() {
+            return ReversedStoreHandlerExits {
+                original_labels: FxHashSet::default(),
+                entries,
+            };
+        }
         for pair in self.graph.order().windows(2) {
             let source = self.graph[pair[0]].items();
             let target = self.graph[pair[1]].items();

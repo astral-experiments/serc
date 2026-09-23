@@ -727,13 +727,15 @@ fn collect_explicitly_interned<'a>(
     );
     let mut seen = FxHashSet::default();
     let mut ordinary_first = FxHashSet::default();
-    collect_qualified_name_origins(
-        code,
-        &qualified_name_constants,
-        &qualified_name_values,
-        &mut seen,
-        &mut ordinary_first,
-    );
+    if recorded_origins.len() != qualified_name_values.len() {
+        collect_qualified_name_origins(
+            code,
+            &qualified_name_constants,
+            &qualified_name_values,
+            &mut seen,
+            &mut ordinary_first,
+        );
+    }
     values.extend(qualified_name_values.into_iter().filter(|value| {
         // Interning metadata replaces its pointer when an equal canonical object
         // already exists; the class's fresh constant remains a separate plain string.
@@ -741,9 +743,20 @@ fn collect_explicitly_interned<'a>(
             .get(value)
             .copied()
             .unwrap_or_else(|| !ordinary_first.contains(value))
-            && (should_intern(value) || !initial_intern_state.contains_for(python_version, value))
+            && !initial_intern_state.contains_for(python_version, value)
     }));
     frozenset_recreation_need
+}
+
+/// Names already interned by their scalar value do not require qualified-name origin analysis.
+fn qualified_name_constant_requiring_origin(code: &CodeObject) -> Option<(&Constant, &str)> {
+    let index = code.marshal_provenance.qualified_name_constant_index?;
+    let index = usize::try_from(index).expect("constant index always fits in usize");
+    let constant = code.constants.get(index)?;
+    let Constant::String(value) = constant else {
+        return None;
+    };
+    (!should_intern(value)).then_some((constant, value))
 }
 
 fn collect_interning_provenance_without_frozensets<'a>(
@@ -758,10 +771,7 @@ fn collect_interning_provenance_without_frozensets<'a>(
             .iter()
             .map(String::as_str),
     );
-    let mut has_qualified_name_constant = code
-        .marshal_provenance
-        .qualified_name_constant_index
-        .is_some();
+    let mut has_qualified_name_constant = qualified_name_constant_requiring_origin(code).is_some();
     for constant in &code.constants {
         if let Constant::Code(code) = constant {
             has_qualified_name_constant |=
@@ -784,10 +794,7 @@ fn collect_interning_provenance<'a>(
             .iter()
             .map(String::as_str),
     );
-    let mut has_qualified_name_constant = code
-        .marshal_provenance
-        .qualified_name_constant_index
-        .is_some();
+    let mut has_qualified_name_constant = qualified_name_constant_requiring_origin(code).is_some();
     // Reuse the provenance walk to classify frozenset recreation for code trees that can contain
     // one (and for hand-built objects without a conservative compiler hint).
     let mut frozenset_recreation_need = FrozensetRecreationNeed::None;
@@ -885,15 +892,12 @@ fn collect_qualified_name_constants<'a>(
     values: &mut FxHashSet<&'a str>,
     recorded_origins: &mut FxHashMap<&'a str, bool>,
 ) {
-    if let Some(index) = code.marshal_provenance.qualified_name_constant_index {
-        let index = usize::try_from(index).expect("constant index always fits in usize");
-        if let Some(constant @ Constant::String(value)) = code.constants.get(index) {
-            constants.insert(std::ptr::from_ref(constant).addr());
-            values.insert(value.as_str());
-            if let Some(canonical) = code.marshal_provenance.qualified_name_is_canonical {
-                // Compilation provenance includes earlier admissions from discarded code.
-                recorded_origins.insert(value.as_str(), canonical);
-            }
+    if let Some((constant, value)) = qualified_name_constant_requiring_origin(code) {
+        constants.insert(std::ptr::from_ref(constant).addr());
+        values.insert(value);
+        if let Some(canonical) = code.marshal_provenance.qualified_name_is_canonical {
+            // Compilation provenance includes earlier admissions from discarded code.
+            recorded_origins.insert(value, canonical);
         }
     }
     for constant in &code.constants {

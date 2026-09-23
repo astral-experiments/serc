@@ -2255,16 +2255,11 @@ impl Assembler {
             return;
         }
         let items = self.linear_items();
-        let Some((marker_item, marker)) = items
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| match item {
-                Item::Instruction(instruction) => Some((index, *instruction)),
-                Item::Label(_) => None,
-            })
-            .nth(instruction_offset)
-        else {
+        let Some(marker_item) = self.instruction_item_index(instruction_offset) else {
             return;
+        };
+        let Item::Instruction(marker) = items[marker_item] else {
+            unreachable!("the instruction index only selects instructions");
         };
         if marker.opcode != NOP
             || !marker.fusion_policy.is_converted_pop_block()
@@ -3429,12 +3424,7 @@ impl Assembler {
             return false;
         }
         let items = self.linear_items();
-        let Some(first) = items
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| matches!(item, Item::Instruction(_)).then_some(index))
-            .nth(start.instruction_count)
-        else {
+        let Some(first) = self.instruction_item_index(start.instruction_count) else {
             // An unchanged empty region has no instruction that can stop fallthrough.
             return start.instruction_count == self.instruction_count();
         };
@@ -3493,21 +3483,42 @@ impl Assembler {
         self.linear_items().len()
     }
 
-    fn instruction_at(&self, instruction_offset: usize) -> Option<&Instruction> {
+    fn indexed_instruction_at(&self, instruction_offset: usize) -> Option<(usize, &Instruction)> {
         let items = self.linear_items();
         if instruction_offset >= self.instruction_count {
             return None;
         }
         let from_back = self.instruction_count - instruction_offset - 1;
-        let mut instructions = items.iter().filter_map(|item| match item {
-            Item::Instruction(instruction) => Some(instruction),
-            Item::Label(_) => None,
+        let mut instructions = items.iter().enumerate().filter_map(|(index, item)| {
+            if let Item::Instruction(instruction) = item {
+                Some((index, instruction))
+            } else {
+                None
+            }
         });
         if instruction_offset <= from_back {
             instructions.nth(instruction_offset)
         } else {
             instructions.nth_back(from_back)
         }
+    }
+
+    fn instruction_item_index(&self, instruction_offset: usize) -> Option<usize> {
+        self.indexed_instruction_at(instruction_offset)
+            .map(|(index, _)| index)
+    }
+
+    fn instruction_at(&self, instruction_offset: usize) -> Option<&Instruction> {
+        self.indexed_instruction_at(instruction_offset)
+            .map(|(_, instruction)| instruction)
+    }
+
+    fn instruction_at_mut(&mut self, instruction_offset: usize) -> Option<&mut Instruction> {
+        let index = self.instruction_item_index(instruction_offset)?;
+        let Item::Instruction(instruction) = &mut self.linear_items_mut()[index] else {
+            unreachable!("the instruction index only selects instructions");
+        };
+        Some(instruction)
     }
 
     pub(crate) fn instruction_opcode_at(&self, instruction_offset: usize) -> Option<Opcode> {
@@ -3707,13 +3718,7 @@ impl Assembler {
     /// Recognizes a small exit whose emitted slots occupy one original array.
     pub(crate) fn is_small_linear_scope_exit_since(&self, instruction_offset: usize) -> bool {
         let items = self.linear_items();
-        let Some(start) = items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| matches!(item, Item::Instruction(_)))
-            .nth(instruction_offset)
-            .map(|(index, _)| index)
-        else {
+        let Some(start) = self.instruction_item_index(instruction_offset) else {
             return false;
         };
         let mut count = 0;
@@ -3751,13 +3756,7 @@ impl Assembler {
     /// Proves that an emitted prefix exceeds CPython's four-slot exit-copy budget.
     pub(crate) fn has_large_linear_prefix_since(&self, instruction_offset: usize) -> bool {
         let items = self.linear_items();
-        let Some(start) = items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| matches!(item, Item::Instruction(_)))
-            .nth(instruction_offset)
-            .map(|(index, _)| index)
-        else {
+        let Some(start) = self.instruction_item_index(instruction_offset) else {
             return false;
         };
         let mut count = 0;
@@ -3798,13 +3797,7 @@ impl Assembler {
     /// Marks an emitted instruction as ownerless when normalization does not reuse a stale slot.
     pub(crate) fn exclude_normalized_exception_owner_at(&mut self, instruction_offset: usize) {
         let instruction = self
-            .linear_items_mut()
-            .iter_mut()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            })
-            .nth(instruction_offset)
+            .instruction_at_mut(instruction_offset)
             .expect("instruction offset should reference an emitted instruction");
         instruction.set_exception_owner(NormalizedExceptionOwner::Absent);
     }
@@ -5473,13 +5466,7 @@ impl Assembler {
             return;
         }
         let items = self.linear_items();
-        let Some(pop_index) = items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| matches!(item, Item::Instruction(_)))
-            .nth(pop_ordinal)
-            .map(|(index, _)| index)
-        else {
+        let Some(pop_index) = self.instruction_item_index(pop_ordinal) else {
             return;
         };
         let Some(
@@ -6125,13 +6112,7 @@ impl Assembler {
             return;
         }
         let items = self.linear_items();
-        let Some(index) = items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| matches!(item, Item::Instruction(_)))
-            .nth(ordinal)
-            .map(|(index, _)| index)
-        else {
+        let Some(index) = self.instruction_item_index(ordinal) else {
             return;
         };
         let Item::Instruction(marker) = items[index] else {
@@ -6255,13 +6236,7 @@ impl Assembler {
     /// Marks a previously emitted jump after label insertion has moved its item position.
     pub(crate) fn mark_borrow_empty_block_at(&mut self, instruction_offset: usize) {
         let instruction = self
-            .linear_items_mut()
-            .iter_mut()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            })
-            .nth(instruction_offset)
+            .instruction_at_mut(instruction_offset)
             .expect("instruction offset should reference an emitted jump");
         debug_assert!(matches!(
             instruction.operand(),
@@ -6273,13 +6248,7 @@ impl Assembler {
     /// Marks a prior empty jump after its target's copy cost is known, preserving NOP policies.
     pub(crate) fn mark_borrow_empty_block_if_unretained_at(&mut self, instruction_offset: usize) {
         let instruction = self
-            .linear_items_mut()
-            .iter_mut()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            })
-            .nth(instruction_offset)
+            .instruction_at_mut(instruction_offset)
             .expect("instruction offset should reference an emitted jump");
         debug_assert!(matches!(
             instruction.operand(),
@@ -12459,13 +12428,7 @@ impl Assembler {
     /// Captures the unchanged first array of an ordinary normal-finally entry.
     pub(crate) fn record_original_normal_finally_array(&mut self, ordinal: usize) {
         let items = self.linear_items();
-        let Some(index) = items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| matches!(item, Item::Instruction(_)))
-            .nth(ordinal)
-            .map(|(index, _)| index)
-        else {
+        let Some(index) = self.instruction_item_index(ordinal) else {
             return;
         };
         let Item::Instruction(marker) = items[index] else {

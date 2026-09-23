@@ -160,15 +160,20 @@ pub(super) fn remove_none_comparison_boolean_conversions<'a>(
 
 /// Counts the original target instructions before graph normalization splits inline labels.
 fn targets_small_scope_exit(graph: &BlockGraph, target: Label) -> bool {
-    let mut started = false;
+    let Some(target_block) = graph.label_block(target) else {
+        return false;
+    };
+    let items = graph[target_block].items();
+    let Some(target_offset) = items
+        .iter()
+        .position(|item| matches!(item, Item::Label(label) if *label == target))
+    else {
+        return false;
+    };
     let mut size = 0;
-    for item in graph.iter_items() {
-        if !started {
-            started = matches!(item, Item::Label(label) if *label == target);
-            continue;
-        }
+    let mut check = |item: &Item| {
         match item {
-            Item::Label(_) if size > 0 => return false,
+            Item::Label(_) if size > 0 => return Some(false),
             Item::Label(_) => {}
             Item::Instruction(instruction) => {
                 let fused_push_null = instruction.opcode == LOAD_GLOBAL
@@ -177,23 +182,35 @@ fn targets_small_scope_exit(graph: &BlockGraph, target: Label) -> bool {
                     + usize::from(fused_push_null)
                     + usize::from(instruction.pre_fold_extra_instructions());
                 if size > 4 {
-                    return false;
+                    return Some(false);
                 }
                 if ends_scope(instruction.opcode) {
                     // Synthetic fallthrough exits retain their existing no-location copy
                     // policy, including the boundaries around normal-finally bodies.
-                    return instruction.location.line >= 0;
+                    return Some(instruction.location.line >= 0);
                 }
                 if matches!(
                     instruction.operand(),
                     Operand::Forward(_) | Operand::Backward(_)
                 ) {
-                    return false;
+                    return Some(false);
                 }
             }
         }
+        None
+    };
+    if let Some(result) = items[target_offset + 1..].iter().find_map(&mut check) {
+        return result;
     }
-    false
+    // Alias-only blocks and blocks whose terminator was removed can continue in the next
+    // physical block. Most targets can be decided before looking up their position in order.
+    graph
+        .iter()
+        .skip_while(|(block, _)| *block != target_block)
+        .skip(1)
+        .flat_map(|(_, block)| block.items())
+        .find_map(check)
+        .unwrap_or(false)
 }
 
 /// Recognizes the three original slots of a same-line explicit constant return.
@@ -5684,6 +5701,55 @@ impl OptimizationPipeline {
 mod tests {
     use super::*;
     use crate::assembler::{Assembler, ExceptionRegion, ExceptionRegionPriority};
+
+    #[test]
+    fn small_scope_exit_follows_aliases_and_unlabeled_physical_blocks() {
+        let target = Label::from_u32(0);
+        let alias = Label::from_u32(1);
+        let boundary = Label::from_u32(2);
+        let missing = Label::from_u32(3);
+        let separator = Label::from_u32(4);
+        let prior = Label::from_u32(5);
+        let located = SourceLocation::new(7, 7, 0, 1);
+        let instruction = |opcode, operand, location| {
+            Item::Instruction(Instruction::new(opcode, operand, location, None))
+        };
+        for boundaries in [FxHashSet::default(), [alias].into_iter().collect()] {
+            let mut items = vec![Item::Label(prior)];
+            items.extend([instruction(LOAD_CONST, Operand::Value(0), located); 5]);
+            items.extend([
+                Item::Label(target),
+                Item::Label(alias),
+                instruction(LOAD_CONST, Operand::Value(0), located),
+                instruction(JUMP_FORWARD, Operand::Forward(boundary), located),
+                instruction(RETURN_VALUE, Operand::Value(0), located),
+                Item::Label(boundary),
+                instruction(RETURN_VALUE, Operand::Value(0), SourceLocation::NONE),
+            ]);
+            let mut graph = BlockGraph::from_items(items, &boundaries);
+            assert!(!targets_small_scope_exit(&graph, prior));
+            assert!(!targets_small_scope_exit(&graph, target));
+            assert!(!targets_small_scope_exit(&graph, alias));
+            assert!(!targets_small_scope_exit(&graph, boundary));
+            assert!(!targets_small_scope_exit(&graph, missing));
+
+            let alias_block = graph.label_block(alias).unwrap();
+            let alias_position = graph
+                .order()
+                .iter()
+                .position(|block| *block == alias_block)
+                .unwrap();
+            let continuation = graph.block_at(alias_position + 1);
+            graph.remove_item_at(alias_block, graph[alias_block].items().len() - 1);
+            assert!(targets_small_scope_exit(&graph, target));
+            assert!(targets_small_scope_exit(&graph, alias));
+
+            graph.insert_label(continuation, 0, separator);
+            assert!(!targets_small_scope_exit(&graph, target));
+            assert!(!targets_small_scope_exit(&graph, alias));
+            assert!(targets_small_scope_exit(&graph, separator));
+        }
+    }
 
     #[test]
     fn setup_nop_requires_its_original_predecessor_to_survive() {

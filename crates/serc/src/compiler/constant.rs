@@ -208,25 +208,19 @@ fn constant_pool_fingerprint(constant: &Constant) -> Option<u64> {
                 hash_constant(step)?.hash(&mut hasher);
             }
             Constant::Code(code) => {
+                // Source identity distinguishes nearly all code objects in a pool. Hash only
+                // inexpensive equality fields, leaving the full body comparison to collisions
+                // rather than rehashing nested code every time a parent enters its own pool.
+                code.first_line_number.hash(&mut hasher);
+                code.name.hash(&mut hasher);
+                code.qualified_name.hash(&mut hasher);
                 code.arg_count.hash(&mut hasher);
                 code.positional_only_arg_count.hash(&mut hasher);
                 code.keyword_only_arg_count.hash(&mut hasher);
                 code.stack_size.hash(&mut hasher);
                 code.flags.hash(&mut hasher);
-                code.bytecode.hash(&mut hasher);
+                code.bytecode.len().hash(&mut hasher);
                 code.constants.len().hash(&mut hasher);
-                for constant in &code.constants {
-                    hash_constant(constant)?.hash(&mut hasher);
-                }
-                code.names.hash(&mut hasher);
-                code.locals.hash(&mut hasher);
-                code.local_kinds.hash(&mut hasher);
-                code.filename.hash(&mut hasher);
-                code.first_line_number.hash(&mut hasher);
-                code.name.hash(&mut hasher);
-                code.qualified_name.hash(&mut hasher);
-                code.line_table.hash(&mut hasher);
-                code.exception_table.hash(&mut hasher);
                 std::mem::discriminant(&code.marshal_provenance.locals_identity).hash(&mut hasher);
             }
         }
@@ -4056,6 +4050,39 @@ mod tests {
     }
 
     #[test]
+    fn indexed_code_constants_compare_bodies_with_matching_source_identities() {
+        let mut pool = ConstantPool::default();
+        for value in 0..CONSTANT_INDEX_THRESHOLD {
+            pool.intern(Constant::Int(u64::try_from(value).unwrap()))
+                .unwrap();
+        }
+
+        let mut original = code_object(vec![Constant::Int(1)]);
+        original.bytecode = vec![1, 2];
+        let mut other_constants = original.clone();
+        other_constants.constants[0] = Constant::Int(2);
+        let mut other_bytecode = original.clone();
+        other_bytecode.bytecode[1] = 3;
+        let mut other_line_table = original.clone();
+        other_line_table.line_table.push(4);
+
+        let original = Constant::Code(Box::new(original));
+        let original_hash = constant_pool_fingerprint(&original);
+        let original_index = pool.intern(original.clone()).unwrap();
+        for (offset, other) in [other_constants, other_bytecode, other_line_table]
+            .into_iter()
+            .enumerate()
+        {
+            let other = Constant::Code(Box::new(other));
+            assert_eq!(constant_pool_fingerprint(&other), original_hash);
+            let index = original_index + u32::try_from(offset).unwrap() + 1;
+            assert_eq!(pool.intern(other.clone()).unwrap(), index);
+            assert_eq!(pool.intern(other).unwrap(), index);
+            assert_eq!(pool.intern(original.clone()).unwrap(), original_index);
+        }
+    }
+
+    #[test]
     fn indexed_constant_pool_preserves_duplicate_frozenset_fallback() {
         let mut pool = ConstantPool::default();
         for value in 0..CONSTANT_INDEX_THRESHOLD {
@@ -4066,8 +4093,18 @@ mod tests {
         let duplicate = Constant::FrozenSet(vec![Constant::Int(1), Constant::Int(1)]);
         let compatible = Constant::FrozenSet(vec![Constant::Int(1), Constant::Int(2)]);
         assert_eq!(constant_pool_fingerprint(&duplicate), None);
-        let duplicate_index = pool.intern(duplicate).unwrap();
-        assert_eq!(pool.intern(compatible).unwrap(), duplicate_index);
+        let duplicate_index = pool.intern(duplicate.clone()).unwrap();
+        assert_eq!(pool.intern(compatible.clone()).unwrap(), duplicate_index);
+
+        let duplicate_code = Constant::Code(Box::new(code_object(vec![duplicate])));
+        let compatible_code = Constant::Code(Box::new(code_object(vec![compatible])));
+        assert!(constant_pool_fingerprint(&duplicate_code).is_some());
+        assert_eq!(
+            constant_pool_fingerprint(&duplicate_code),
+            constant_pool_fingerprint(&compatible_code)
+        );
+        let duplicate_code_index = pool.intern(duplicate_code).unwrap();
+        assert_eq!(pool.intern(compatible_code).unwrap(), duplicate_code_index);
     }
 
     #[test]
