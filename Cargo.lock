@@ -965,6 +965,8 @@ dependencies = [
  "fs-err",
  "mimalloc",
  "serc",
+ "rayon",
+ "same-file",
  "tempfile",
  "walkdir",
 ]

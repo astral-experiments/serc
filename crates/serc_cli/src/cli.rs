@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::hint::black_box;
 use std::io::{self, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,6 +11,7 @@ use clap::builder::Styles;
 use clap::builder::styling::{AnsiColor, Effects};
 use clap::{Parser, Subcommand, ValueHint};
 use serc::{CompileError, CompileOptions, PythonVersion, compile_bytes_with_options};
+use rayon::prelude::*;
 use walkdir::WalkDir;
 
 const STYLES: Styles = Styles::styled()
@@ -46,6 +49,10 @@ struct CompileCommand {
     /// Python language and bytecode version to target (3.12, 3.13, 3.14, or 3.15).
     #[arg(long, default_value_t = PythonVersion::default())]
     python_version: PythonVersion,
+
+    /// Maximum number of files to compile in parallel [default: available CPUs].
+    #[arg(short, long)]
+    jobs: Option<NonZeroUsize>,
 
     /// Compile the sources without writing .pyc files.
     #[arg(long)]
@@ -85,9 +92,53 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
         ..CompileOptions::default()
     };
 
-    for path in &paths {
-        if let Err(message) = compile_path(path, command.check, &options) {
-            failures += 1;
+    let (jobs, output_groups) = prepare_compilation(
+        &paths,
+        options.python_version,
+        command.check,
+        jobs_for_inputs(command.jobs, paths.len()),
+    );
+    if jobs <= 1 {
+        for path in &paths {
+            if let Err(message) = compile_path(path, command.check, &options) {
+                failures += 1;
+                write_error(&message);
+            }
+        }
+    } else {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(jobs)
+            // Nested Python expressions and scopes use recursive compiler traversals.
+            .stack_size(8 * 1024 * 1024)
+            .build()
+            .map_err(|error| format!("failed to start compilation workers: {error}"))?;
+        let mut errors: Vec<(usize, String)> = pool.install(|| {
+            if let Some(output_groups) = output_groups {
+                output_groups
+                    .into_par_iter()
+                    .flat_map_iter(|group| {
+                        group.into_iter().filter_map(|(index, path)| {
+                            compile_path(path, false, &options)
+                                .err()
+                                .map(|message| (index, message))
+                        })
+                    })
+                    .collect()
+            } else {
+                paths
+                    .par_iter()
+                    .enumerate()
+                    .filter_map(|(index, path)| {
+                        compile_path(path, true, &options)
+                            .err()
+                            .map(|message| (index, message))
+                    })
+                    .collect()
+            }
+        });
+        errors.sort_unstable_by_key(|(index, _)| *index);
+        failures = errors.len();
+        for (_, message) in errors {
             write_error(&message);
         }
     }
@@ -108,6 +159,154 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// Follow Rayon's environment and CPU defaults without starting idle workers for small inputs.
+fn jobs_for_inputs(requested: Option<NonZeroUsize>, inputs: usize) -> usize {
+    if inputs <= 1 {
+        return inputs;
+    }
+    requested
+        .map_or_else(
+            || {
+                let configured = std::env::var("RAYON_NUM_THREADS").ok();
+                let legacy = std::env::var("RAYON_RS_NUM_CPUS").ok();
+                default_jobs(configured.as_deref(), legacy.as_deref(), || {
+                    std::thread::available_parallelism().map_or(1, NonZeroUsize::get)
+                })
+            },
+            NonZeroUsize::get,
+        )
+        .min(inputs)
+}
+
+fn default_jobs(
+    configured: Option<&str>,
+    legacy: Option<&str>,
+    available: impl FnOnce() -> usize,
+) -> usize {
+    match configured.and_then(|value| value.parse::<usize>().ok()) {
+        Some(0) => available(),
+        Some(jobs) => jobs,
+        None => legacy
+            .and_then(|value| value.parse::<NonZeroUsize>().ok())
+            .map_or_else(available, NonZeroUsize::get),
+    }
+}
+
+type CompilationGroup<'a> = Vec<(usize, &'a Path)>;
+
+/// Limit cache-writing workers to groups that can make progress independently.
+fn prepare_compilation(
+    paths: &[PathBuf],
+    python_version: PythonVersion,
+    check: bool,
+    jobs: usize,
+) -> (usize, Option<Vec<CompilationGroup<'_>>>) {
+    if check || jobs <= 1 {
+        return (jobs, None);
+    }
+    let groups = compilation_groups(paths, python_version);
+    (jobs.min(groups.len()), Some(groups))
+}
+
+/// Keep inputs that share an output in discovery order so the same cache wins as in serial mode.
+fn compilation_groups(
+    paths: &[PathBuf],
+    python_version: PythonVersion,
+) -> Vec<CompilationGroup<'_>> {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    let mut directories = HashMap::new();
+    let mut non_ascii_directories = HashSet::new();
+    let mut unknown_directory = false;
+    let mut identities = Vec::with_capacity(paths.len());
+    for path in paths {
+        let output = cache_path(path, python_version).ok().and_then(|output| {
+            let parent = output.parent()?;
+            let filename = output.file_name()?;
+            let directory = Arc::clone(
+                directories
+                    .entry(parent.to_owned())
+                    .or_insert_with(|| Arc::new(cache_directory_identity(parent))),
+            );
+            unknown_directory |= matches!(directory.as_ref(), CacheDirectoryIdentity::Unknown);
+            if !filename.as_encoded_bytes().is_ascii() {
+                non_ascii_directories.insert(Arc::clone(&directory));
+            }
+            Some((directory, filename.to_ascii_lowercase()))
+        });
+        identities.push(output);
+    }
+
+    let mut groups = Vec::<Vec<_>>::new();
+    let mut outputs = HashMap::new();
+    for (index, (path, output)) in paths.iter().zip(identities).enumerate() {
+        let output = output.map(|(directory, filename)| {
+            // Filesystems disagree on Unicode normalization and case folding, including aliases
+            // between Unicode and ASCII names. Serialize the directory when either may occur.
+            if unknown_directory {
+                // An unidentified directory may alias one that was identified successfully.
+                (None, non_ascii_directories.is_empty().then_some(filename))
+            } else {
+                let filename = (!non_ascii_directories.contains(&directory)).then_some(filename);
+                (Some(directory), filename)
+            }
+        });
+        let group = output.map_or(groups.len(), |output| {
+            *outputs.entry(output).or_insert(groups.len())
+        });
+        if group == groups.len() {
+            groups.push(Vec::new());
+        }
+        groups[group].push((index, path.as_path()));
+    }
+    groups
+}
+
+#[derive(Eq, Hash, PartialEq)]
+enum CacheDirectoryIdentity {
+    Existing(DirectoryHandle),
+    Parent(DirectoryHandle),
+    Unknown,
+}
+
+#[cfg(unix)]
+#[derive(Eq, Hash, PartialEq)]
+struct DirectoryHandle {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+impl DirectoryHandle {
+    fn from_path(path: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = fs_err::metadata(path)?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
+#[cfg(not(unix))]
+type DirectoryHandle = same_file::Handle;
+
+/// Identify directory aliases even when the cache is absent or spelled with different casing.
+fn cache_directory_identity(directory: &Path) -> CacheDirectoryIdentity {
+    if let Ok(handle) = DirectoryHandle::from_path(directory) {
+        return CacheDirectoryIdentity::Existing(handle);
+    }
+    let parent = directory
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    DirectoryHandle::from_path(parent)
+        .map(CacheDirectoryIdentity::Parent)
+        .unwrap_or(CacheDirectoryIdentity::Unknown)
 }
 
 fn discover(roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
@@ -327,12 +526,73 @@ fn write_error(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        cache_path, cache_tag, compile_path_with_metadata, discover, encode_mtime,
-        has_python_suffix,
+        cache_path, cache_tag, compilation_groups, compile_path_with_metadata, discover,
+        encode_mtime, has_python_suffix, prepare_compilation,
     };
+    use super::{default_jobs, jobs_for_inputs};
     use serc::{CompileOptions, PythonVersion};
+    use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn default_compilation_jobs_follow_rayon_and_available_inputs() {
+        assert_eq!(default_jobs(None, None, || 8), 8);
+        assert_eq!(default_jobs(Some("4"), None, || 8), 4);
+        assert_eq!(default_jobs(Some("1"), Some("4"), || 8), 1);
+        assert_eq!(default_jobs(Some("0"), Some("4"), || 8), 8);
+        assert_eq!(default_jobs(Some("invalid"), None, || 8), 8);
+        assert_eq!(default_jobs(Some("invalid"), Some("4"), || 8), 4);
+        assert_eq!(default_jobs(None, Some("4"), || 8), 4);
+        assert_eq!(default_jobs(None, Some("0"), || 8), 8);
+        assert_eq!(default_jobs(None, None, || 1), 1);
+        assert_eq!(jobs_for_inputs(None, 0), 0);
+        assert_eq!(jobs_for_inputs(None, 1), 1);
+        assert_eq!(jobs_for_inputs(NonZeroUsize::new(1), 4), 1);
+        assert_eq!(jobs_for_inputs(NonZeroUsize::new(8), 4), 4);
+    }
+
+    #[test]
+    fn cache_writing_limits_workers_to_independent_outputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = [
+            directory.path().join("Alpha.py"),
+            directory.path().join("alpha.py"),
+            directory.path().join("other.py"),
+            directory.path().join("caf\u{e9}.py"),
+        ];
+
+        let (jobs, groups) = prepare_compilation(&paths[..3], PythonVersion::Py314, false, 3);
+        assert_eq!(jobs, 2);
+        assert_eq!(groups.unwrap().len(), 2);
+
+        let (jobs, groups) = prepare_compilation(&paths, PythonVersion::Py314, false, 4);
+        assert_eq!(jobs, 1);
+        assert_eq!(
+            groups.unwrap()[0]
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        assert_eq!(
+            prepare_compilation(&paths, PythonVersion::Py314, true, 4),
+            (4, None)
+        );
+        assert_eq!(
+            prepare_compilation(&paths, PythonVersion::Py314, false, 1),
+            (1, None)
+        );
+        assert_eq!(
+            prepare_compilation(
+                &paths[..1],
+                PythonVersion::Py314,
+                false,
+                jobs_for_inputs(None, 1)
+            ),
+            (1, None)
+        );
+    }
 
     #[test]
     fn target_cache_tag() {
@@ -340,6 +600,70 @@ mod tests {
         assert_eq!(cache_tag(PythonVersion::Py313), "cpython-313");
         assert_eq!(cache_tag(PythonVersion::Py314), "cpython-314");
         assert_eq!(cache_tag(PythonVersion::Py315), "cpython-315");
+    }
+
+    #[test]
+    fn parallel_compilation_groups_cover_case_and_unicode_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let ascii = directory.path().join("ascii");
+        let unicode = directory.path().join("unicode");
+        let other = directory.path().join("other");
+        for parent in [&ascii, &unicode, &other] {
+            fs_err::create_dir(parent).unwrap();
+        }
+        let paths = [
+            ascii.join("A.py"),
+            ascii.join("a.py"),
+            ascii.join("different.py"),
+            unicode.join("K.py"),
+            unicode.join("\u{212a}.py"),
+            unicode.join("caf\u{e9}.py"),
+            unicode.join("cafe\u{301}.py"),
+            unicode.join("different.py"),
+            other.join("a.py"),
+        ];
+        let indices = || {
+            compilation_groups(&paths, PythonVersion::Py314)
+                .into_iter()
+                .map(|group| {
+                    group
+                        .into_iter()
+                        .map(|(index, _)| index)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected = [vec![0, 1], vec![2], vec![3, 4, 5, 6, 7], vec![8]];
+        assert_eq!(indices(), expected);
+        for parent in [&ascii, &unicode, &other] {
+            fs_err::create_dir(parent.join("__pycache__")).unwrap();
+        }
+        assert_eq!(indices(), expected);
+    }
+
+    #[test]
+    fn parallel_compilation_groups_cover_unknown_directory_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing");
+        let paths = [
+            directory.path().join("A.py"),
+            missing.join("a.py"),
+            directory.path().join("other.py"),
+            missing.join("\u{212a}.py"),
+        ];
+        let indices = |paths: &[PathBuf]| {
+            compilation_groups(paths, PythonVersion::Py314)
+                .into_iter()
+                .map(|group| {
+                    group
+                        .into_iter()
+                        .map(|(index, _)| index)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(indices(&paths[..3]), [vec![0, 1], vec![2]]);
+        assert_eq!(indices(&paths), [vec![0, 1, 2, 3]]);
     }
 
     #[test]

@@ -59,6 +59,13 @@ serc compile path/to/package
 serc compile --check path/to/package
 ```
 
+Compilation uses the available CPUs by default. Use `--jobs` (or `-j`) to set a limit, including
+`--jobs 1` for serial compilation. You can also set the default with `RAYON_NUM_THREADS`:
+
+```console
+serc compile --jobs 4 path/to/package
+```
+
 ### Python version
 
 Python 3.14 is the default. Select a target with `--python-version`:

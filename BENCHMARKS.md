@@ -19,7 +19,8 @@ equivalent to compiling a package after installation, before its first import.
 
 Each command starts a fresh process, discovers and reads the sources, compiles at optimization
 level 0, marshals the bytecode, and writes timestamp-invalidated `.pyc` files. Both compilers
-process files sequentially. Cache-file cleanup happens outside the timed command.
+process files sequentially. The reproduction harness selects one worker explicitly with Serc
+`--jobs 1` and CPython `-j 1`. Cache-file cleanup happens outside the timed command.
 
 ![Time to compile NumPy: Serc 1.194 seconds, CPython 1.739 seconds. Lower is better.](docs/assets/benchmarks/numpy-compilation.svg)
 
@@ -88,7 +89,7 @@ if needed, including when Cargo uses a custom target directory.
   taskset -c "$BENCH_CPU" hyperfine --warmup 5 --min-runs 25 \
     --prepare 'find "$BENCH_CORPUS" -type d -name __pycache__ -prune -exec rm -rf {} +' \
     --prepare 'find "$BENCH_CORPUS" -type d -name __pycache__ -prune -exec rm -rf {} +' \
-    '"$BENCH_SERC" compile --quiet "$BENCH_CORPUS"' \
+    '"$BENCH_SERC" compile --quiet --jobs 1 "$BENCH_CORPUS"' \
     '"$BENCH_PYTHON" -I -S -m compileall -q -f -j 1 -o 0 --invalidation-mode timestamp "$BENCH_CORPUS"'
 )
 ```

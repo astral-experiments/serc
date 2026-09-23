@@ -178,7 +178,7 @@ cpython_summary="$(tree_summary "$corpus" .pyc)"
 read -r cpython_count _cpython_bytes cpython_pyc_sha256 <<< "$cpython_summary"
 
 clean_caches
-"$serc" compile --quiet "$corpus"
+"$serc" compile --quiet --jobs 1 "$corpus"
 serc_summary="$(tree_summary "$corpus" .pyc)"
 read -r serc_count _serc_bytes serc_pyc_sha256 <<< "$serc_summary"
 
@@ -204,7 +204,7 @@ printf -v cpython_command \
     '%q -I -S -m compileall -q -f -j 1 -o 0 --invalidation-mode timestamp %q' \
     "$python" \
     "$corpus"
-printf -v serc_command '%q compile --quiet %q' "$serc" "$corpus"
+printf -v serc_command '%q compile --quiet --jobs 1 %q' "$serc" "$corpus"
 printf -v prepare_command \
     'find %q -type d -name __pycache__ -prune -exec rm -rf {} +' \
     "$corpus"
@@ -233,6 +233,8 @@ serc_binary_sha256="$(sha256_file "$serc")"
     echo "serc_binary=$serc"
     echo "serc_binary_sha256=$serc_binary_sha256"
     echo "serc_profile=$serc_profile"
+    echo "serc_jobs=1"
+    echo "cpython_jobs=1"
     echo "preflight_pyc_sha256=$serc_pyc_sha256"
     echo "python_executable=$python"
     echo

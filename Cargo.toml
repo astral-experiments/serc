@@ -33,6 +33,7 @@ cpu-time = "1.0.0"
 fs-err = "3.2.2"
 serc_fixtures = { path = "crates/serc_fixtures" }
 rayon = "1.10.0"
+same-file = "1.0.6"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.10.9"
