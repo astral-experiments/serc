@@ -501,6 +501,71 @@ fn generic_class_headers_respect_enclosing_class_bindings() {
 }
 
 #[test]
+fn private_class_captures_match_native_marshal_and_execution() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("private_class_captures.py");
+    fs_err::write(
+        &source_path,
+        include_str!("../../serc/tests/fixtures/private_class_captures.py"),
+    )
+    .unwrap();
+
+    for version in [
+        serc::PythonVersion::Py312,
+        serc::PythonVersion::Py313,
+        serc::PythonVersion::Py314,
+        serc::PythonVersion::Py315,
+    ] {
+        let oracle = || match version {
+            serc::PythonVersion::Py312 => common::python_312_command(),
+            serc::PythonVersion::Py313 => common::python_313_command(),
+            serc::PythonVersion::Py314 => common::python_3145_command(),
+            serc::PythonVersion::Py315 => common::python_315_command(),
+        };
+        let native = oracle()
+            .args([
+                "-B",
+                "-c",
+                "import py_compile, sys; py_compile.compile(sys.argv[1], doraise=True, optimize=0, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)",
+            ])
+            .arg(&source_path)
+            .output()
+            .unwrap();
+        assert!(native.status.success(), "{version}: {native:?}");
+
+        let (_, minor, _) = version.target().version;
+        let pyc_path = directory.path().join(format!(
+            "__pycache__/private_class_captures.cpython-3{minor}.pyc"
+        ));
+        let expected = fs_err::read(&pyc_path).unwrap();
+        let native = oracle().arg(&pyc_path).output().unwrap();
+        assert!(native.status.success(), "{version}: {native:?}");
+        assert!(native.stdout.is_empty(), "{version}: {native:?}");
+
+        let output = serc()
+            .args([
+                "compile",
+                "--quiet",
+                "--python-version",
+                &version.to_string(),
+            ])
+            .arg(&source_path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{version}: {output:?}");
+        assert_eq!(
+            fs_err::read(&pyc_path).unwrap(),
+            expected,
+            "Python {version}"
+        );
+
+        let output = oracle().arg(&pyc_path).output().unwrap();
+        assert!(output.status.success(), "{version}: {output:?}");
+        assert!(output.stdout.is_empty(), "{version}: {output:?}");
+    }
+}
+
+#[test]
 fn compile_matches_cpython_for_version_specific_marshal_identity() {
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("module.py");

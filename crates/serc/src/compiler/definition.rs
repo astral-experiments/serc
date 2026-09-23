@@ -1644,6 +1644,8 @@ impl Compiler<'_> {
             let classdict = self.required_name_id("__classdict__");
             self.insert_lexical_name(&mut freevars, classdict);
         }
+        // Private captures sort by their emitted spelling, alongside synthetic class cells.
+        freevars.sort_unstable_by_key(|name| self.mangled_name(self.resolve_name(*name)));
         let mut local_names = vec![".format".to_string()];
         let mut references = ReferenceCollector::default();
         let mut inlined_cellvars = FxHashSet::default();
@@ -1813,6 +1815,8 @@ impl Compiler<'_> {
         }
         let classdict = self.required_name_id("__classdict__");
         self.insert_lexical_name(&mut freevars, classdict);
+        // Preserve closure lookup IDs while matching the emitted private-name order.
+        freevars.sort_unstable_by_key(|name| self.mangled_name(self.resolve_name(*name)));
         if !conditional_annotations.is_empty() {
             let conditional = self.required_name_id("__conditional_annotations__");
             freevars.push(conditional);

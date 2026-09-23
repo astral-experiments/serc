@@ -1444,9 +1444,8 @@ impl ScopeArena {
             &nested_class_requirements,
             child_needs_class_closure,
         );
-        if !self.deferred_annotations
-            && enclosing_private_name.map(|name| name.trim_start_matches('_'))
-                != Some(definition.name.as_str().trim_start_matches('_'))
+        if enclosing_private_name.map(|name| name.trim_start_matches('_'))
+            != Some(definition.name.as_str().trim_start_matches('_'))
         {
             // Keep raw identifiers inside the class, but resolve its private requirements
             // in the enclosing scope using the spelling established by this class.
