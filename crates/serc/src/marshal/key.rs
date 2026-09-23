@@ -716,15 +716,94 @@ pub(super) fn locals_tuple_key(code: &CodeObject) -> ObjectKey<'_> {
 }
 
 pub(super) fn should_intern(value: &str) -> bool {
-    is_cached_character(value)
-        || value
-            .bytes()
-            .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+    if is_cached_character(value) {
+        return true;
+    }
+
+    let (chunks, remainder) = value.as_bytes().as_chunks::<8>();
+    for &chunk in chunks {
+        let word = u64::from_ne_bytes(chunk);
+        if !is_ascii_identifier_word(word) {
+            return false;
+        }
+    }
+    remainder
+        .iter()
+        .all(|byte| *byte == b'_' || byte.is_ascii_alphanumeric())
+}
+
+/// Tests the eight ASCII identifier bytes independently without branches between characters.
+#[inline]
+fn is_ascii_identifier_word(word: u64) -> bool {
+    const HIGH: u64 = u64::from_ne_bytes([0x80; 8]);
+    const LOW: u64 = !HIGH;
+    const CASE: u64 = u64::from_ne_bytes([0x20; 8]);
+    const UNDERSCORE: u64 = u64::from_ne_bytes([b'_'; 8]);
+
+    let in_range = |bytes: u64, lower: u8, upper: u8| {
+        // Setting each minuend's high bit prevents borrows from crossing byte boundaries.
+        let at_least = (bytes | HIGH).wrapping_sub(u64::from_ne_bytes([lower; 8]));
+        let at_most = (u64::from_ne_bytes([upper; 8]) | HIGH).wrapping_sub(bytes & LOW);
+        at_least & at_most
+    };
+    let letters = in_range(word | CASE, b'a', b'z');
+    let digits = in_range(word, b'0', b'9');
+    let underscores = !((word ^ UNDERSCORE) & LOW).wrapping_add(LOW);
+    (letters | digits | underscores) & !word & HIGH == HIGH
 }
 
 pub(super) fn is_cached_character(value: &str) -> bool {
-    let mut characters = value.chars();
-    characters
-        .next()
-        .is_some_and(|character| characters.next().is_none() && u32::from(character) <= 0xff)
+    matches!(value.as_bytes(), [0x00..=0x7f] | [0xc2..=0xc3, 0x80..=0xbf])
+}
+
+#[cfg(test)]
+mod intern_tests {
+    use super::{is_ascii_identifier_word, is_cached_character, should_intern};
+
+    #[test]
+    fn classifies_every_byte_at_every_word_position() {
+        for position in 0..8 {
+            for byte in u8::MIN..=u8::MAX {
+                let mut word = *b"Az_09bY7";
+                word[position] = byte;
+                assert_eq!(
+                    is_ascii_identifier_word(u64::from_ne_bytes(word)),
+                    word.iter()
+                        .all(|byte| *byte == b'_' || byte.is_ascii_alphanumeric()),
+                    "{position}: {byte}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn matches_character_cache_and_scalar_rule_across_word_boundaries() {
+        let scalar = |value: &str| {
+            let mut chars = value.chars();
+            chars
+                .next()
+                .is_some_and(|first| u32::from(first) <= 0xff && chars.next().is_none())
+                || value
+                    .bytes()
+                    .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+        };
+        for length in 0..=24 {
+            let mut value = "a".repeat(length);
+            assert_eq!(should_intern(&value), scalar(&value));
+            for position in 0..=length {
+                for ch in [
+                    '\0', '.', '_', 'Z', '9', '\u{7f}', '\u{80}', 'é', 'ÿ', 'Ā', '🦀',
+                ] {
+                    value.insert(position, ch);
+                    assert_eq!(should_intern(&value), scalar(&value), "{value:?}");
+                    value.remove(position);
+                }
+            }
+        }
+        for ch in ['\0', '.', '\u{7f}', '\u{80}', 'é', 'ÿ', 'Ā', '🦀'] {
+            assert_eq!(is_cached_character(&ch.to_string()), u32::from(ch) <= 0xff);
+        }
+        assert!(!is_cached_character(""));
+        assert!(!is_cached_character("éa"));
+    }
 }

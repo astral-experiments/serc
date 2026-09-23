@@ -95,6 +95,7 @@ fn mismatched_occurrence(index: usize, expected: OccurrenceKind, recorded: Occur
 }
 
 const CODE_OBJECT_CHILDREN: usize = 10;
+const ESTIMATED_OCCURRENCE_BYTES: usize = 8;
 const CACHED_BYTE_SLOTS: usize = 256;
 const CACHED_CHARACTER_SLOTS: usize = 256;
 fn cached_integer_slots(python_version: PythonVersion) -> (usize, usize) {
@@ -184,6 +185,7 @@ pub(super) struct ObjectGraph<'a> {
     legacy_qualified_name_aliases: FxHashSet<usize>,
     objects_by_id: IndexVec<ObjectId, Object>,
     occurrences: Vec<Occurrence>,
+    estimated_payload_bytes: usize,
     #[cfg(debug_assertions)]
     unique_objects: FxHashSet<HashedObjectKey<'a>>,
 }
@@ -219,8 +221,11 @@ impl<'a> ObjectGraph<'a> {
     ) -> Self {
         let mut explicitly_interned = FxHashSet::default();
         let mut metadata_tuples = FxHashSet::default();
-        for values in &code.marshal_provenance.interned_metadata_tuples {
-            metadata_tuples.insert(strings_tuple_key(values).into());
+        let needs_metadata_alias_scan = !code.marshal_provenance.metadata_alias_scan_unnecessary;
+        if needs_metadata_alias_scan {
+            for values in &code.marshal_provenance.interned_metadata_tuples {
+                metadata_tuples.insert(strings_tuple_key(values).into());
+            }
         }
         let frozenset_recreation_need = collect_explicitly_interned(
             code,
@@ -228,6 +233,7 @@ impl<'a> ObjectGraph<'a> {
             initial_intern_state,
             &mut explicitly_interned,
             &mut metadata_tuples,
+            needs_metadata_alias_scan,
         );
         let mut recreated_frozensets = FxHashSet::default();
         collect_recreated_frozensets(
@@ -338,6 +344,18 @@ impl<'a> ObjectGraph<'a> {
             .reserve(estimated_descendants.saturating_add(1));
         self.occurrences
             .reserve(estimated_descendants.saturating_add(1));
+        self.estimated_payload_bytes = self
+            .estimated_payload_bytes
+            .saturating_add(code.bytecode.len())
+            .saturating_add(code.local_kinds.len());
+    }
+
+    fn estimate_long_payload(&mut self, length: usize) {
+        self.estimate_payload(length.saturating_sub(ESTIMATED_OCCURRENCE_BYTES));
+    }
+
+    fn estimate_payload(&mut self, length: usize) {
+        self.estimated_payload_bytes = self.estimated_payload_bytes.saturating_add(length);
     }
 
     fn record_keyed(&mut self, kind: OccurrenceKind, key: ObjectKey<'a>) -> bool {
@@ -566,6 +584,15 @@ impl<'a> ObjectGraph<'a> {
         self.objects_by_id.len()
     }
 
+    /// Estimates space for the writer from the same traversal that records object identities.
+    /// Structural bytes and long first-seen values supplement the allowance for each occurrence.
+    pub(super) fn estimated_wire_size(&self) -> usize {
+        self.occurrences
+            .len()
+            .saturating_mul(ESTIMATED_OCCURRENCE_BYTES)
+            .saturating_add(self.estimated_payload_bytes)
+    }
+
     #[cfg(test)]
     pub(super) fn keyed_object_count(&self) -> usize {
         self.objects.len()
@@ -691,6 +718,7 @@ fn collect_explicitly_interned<'a>(
     initial_intern_state: &InitialInternState,
     values: &mut FxHashSet<&'a str>,
     metadata_tuples: &mut FxHashSet<HashedObjectKey<'a>>,
+    needs_metadata_alias_scan: bool,
 ) -> FrozensetRecreationNeed {
     // Identifier objects can enter the compilation-wide constant cache before an equal
     // ordinary string. Preserve that recorded origin when sharing constant and metadata strings.
@@ -703,11 +731,22 @@ fn collect_explicitly_interned<'a>(
     let (has_qualified_name_constant, frozenset_recreation_need) =
         if !code.marshal_provenance.subtree_has_frozenset_constants {
             (
-                collect_interning_provenance_without_frozensets(code, values, metadata_tuples),
+                collect_interning_provenance_without_frozensets(
+                    code,
+                    values,
+                    metadata_tuples,
+                    needs_metadata_alias_scan,
+                ),
                 FrozensetRecreationNeed::None,
             )
         } else {
-            collect_interning_provenance(code, python_version, values, metadata_tuples)
+            collect_interning_provenance(
+                code,
+                python_version,
+                values,
+                metadata_tuples,
+                needs_metadata_alias_scan,
+            )
         };
     if !has_qualified_name_constant || python_version == PythonVersion::Py312 {
         return frozenset_recreation_need;
@@ -750,8 +789,11 @@ fn collect_interning_provenance_without_frozensets<'a>(
     code: &'a CodeObject,
     values: &mut FxHashSet<&'a str>,
     metadata_tuples: &mut FxHashSet<HashedObjectKey<'a>>,
+    needs_metadata_alias_scan: bool,
 ) -> bool {
-    collect_metadata_tuple_keys(code, metadata_tuples);
+    if needs_metadata_alias_scan {
+        collect_metadata_tuple_keys(code, metadata_tuples);
+    }
     values.extend(
         code.marshal_provenance
             .explicitly_interned_strings
@@ -764,8 +806,12 @@ fn collect_interning_provenance_without_frozensets<'a>(
         .is_some();
     for constant in &code.constants {
         if let Constant::Code(code) = constant {
-            has_qualified_name_constant |=
-                collect_interning_provenance_without_frozensets(code, values, metadata_tuples);
+            has_qualified_name_constant |= collect_interning_provenance_without_frozensets(
+                code,
+                values,
+                metadata_tuples,
+                needs_metadata_alias_scan,
+            );
         }
     }
     has_qualified_name_constant
@@ -776,8 +822,11 @@ fn collect_interning_provenance<'a>(
     python_version: PythonVersion,
     values: &mut FxHashSet<&'a str>,
     metadata_tuples: &mut FxHashSet<HashedObjectKey<'a>>,
+    needs_metadata_alias_scan: bool,
 ) -> (bool, FrozensetRecreationNeed) {
-    collect_metadata_tuple_keys(code, metadata_tuples);
+    if needs_metadata_alias_scan {
+        collect_metadata_tuple_keys(code, metadata_tuples);
+    }
     values.extend(
         code.marshal_provenance
             .explicitly_interned_strings
@@ -793,8 +842,13 @@ fn collect_interning_provenance<'a>(
     let mut frozenset_recreation_need = FrozensetRecreationNeed::None;
     for constant in &code.constants {
         if let Constant::Code(code) = constant {
-            let (has_qualified_name, recreation_need) =
-                collect_interning_provenance(code, python_version, values, metadata_tuples);
+            let (has_qualified_name, recreation_need) = collect_interning_provenance(
+                code,
+                python_version,
+                values,
+                metadata_tuples,
+                needs_metadata_alias_scan,
+            );
             has_qualified_name_constant |= has_qualified_name;
             frozenset_recreation_need = frozenset_recreation_need.max(recreation_need);
         } else {
@@ -2169,14 +2223,17 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
 
     #[inline]
     fn metadata_string(&mut self, value: &'code str, metadata_id: Option<MetadataId>) {
-        if self.graph.cache_scalars
+        let first = if self.graph.cache_scalars
             && let Some(character) = CachedObject::character(value)
         {
             self.graph
-                .record_cached_value(OccurrenceKind::MetadataString, character);
+                .record_cached_value(OccurrenceKind::MetadataString, character)
         } else {
             self.graph
-                .record_metadata_string(OccurrenceKind::MetadataString, value, metadata_id);
+                .record_metadata_string(OccurrenceKind::MetadataString, value, metadata_id)
+        };
+        if first {
+            self.graph.estimate_long_payload(value.len());
         }
     }
 
@@ -2189,11 +2246,11 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
             || is_cached_character(&code.filename)
         {
             self.metadata_string(&code.filename, metadata_id);
-        } else {
-            self.graph.record_keyed(
-                OccurrenceKind::MetadataString,
-                ObjectKey::Filename(&code.filename),
-            );
+        } else if self.graph.record_keyed(
+            OccurrenceKind::MetadataString,
+            ObjectKey::Filename(&code.filename),
+        ) {
+            self.graph.estimate_long_payload(code.filename.len());
         }
     }
 
@@ -2201,10 +2258,12 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
         if self.graph.python_version == PythonVersion::Py312
             && code.name.starts_with("<generic parameters of ")
         {
-            self.graph.record_keyed(
+            if self.graph.record_keyed(
                 OccurrenceKind::MetadataString,
                 ObjectKey::UninternedMetadata(std::ptr::from_ref(&code.name).addr()),
-            );
+            ) {
+                self.graph.estimate_long_payload(code.name.len());
+            }
         } else {
             self.metadata_string(&code.name, metadata_id);
         }
@@ -2229,13 +2288,17 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
             } else {
                 ObjectKey::UninternedMetadata(std::ptr::from_ref(&code.qualified_name).addr())
             };
-            self.graph.record_keyed(OccurrenceKind::MetadataString, key);
+            if self.graph.record_keyed(OccurrenceKind::MetadataString, key) {
+                self.graph.estimate_long_payload(code.qualified_name.len());
+            }
         }
     }
 
     #[inline]
     fn bytes(&mut self, value: &'code [u8]) {
-        self.graph.record_bytes(OccurrenceKind::Bytes, value);
+        if self.graph.record_bytes(OccurrenceKind::Bytes, value) {
+            self.graph.estimate_payload(value.len());
+        }
     }
 
     #[inline]
@@ -2277,13 +2340,17 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
                     || self
                         .explicitly_interned
                         .is_some_and(|values| values.contains(value.as_str()));
-                if interned {
+                let first = if interned {
                     self.graph
                         .record_interned_string(OccurrenceKind::Constant, value)
                 } else {
                     self.graph
                         .record_keyed(OccurrenceKind::Constant, ObjectKey::ConstantString(value))
+                };
+                if first {
+                    self.graph.estimate_long_payload(value.len());
                 }
+                first
             }
             Constant::FrozenSet(_)
                 if self
@@ -2322,7 +2389,32 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
                     ),
                 )
             }
-            Constant::Bytes(value) => self.graph.record_bytes(OccurrenceKind::Constant, value),
+            Constant::Bytes(value) => {
+                let first = self.graph.record_bytes(OccurrenceKind::Constant, value);
+                if first {
+                    self.graph.estimate_long_payload(value.len());
+                }
+                first
+            }
+            Constant::SurrogateString(bytes) => {
+                let first = self
+                    .graph
+                    .record_keyed(OccurrenceKind::Constant, constant_key(value));
+                if first {
+                    self.graph.estimate_long_payload(bytes.len());
+                }
+                first
+            }
+            Constant::BigInt { digits, .. } => {
+                let first = self
+                    .graph
+                    .record_keyed(OccurrenceKind::Constant, constant_key(value));
+                if first {
+                    self.graph
+                        .estimate_long_payload(digits.len().saturating_mul(2));
+                }
+                first
+            }
             _ => self
                 .graph
                 .record_keyed(OccurrenceKind::Constant, constant_key(value)),
@@ -2366,6 +2458,16 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
         let address = std::ptr::from_ref(value).addr();
         self.graph
             .record_unique_value(OccurrenceKind::SliceMember, ObjectKey::SliceMember(address));
+        match value {
+            Constant::String(value) => self.graph.estimate_long_payload(value.len()),
+            Constant::SurrogateString(value) | Constant::Bytes(value) => {
+                self.graph.estimate_long_payload(value.len());
+            }
+            Constant::BigInt { digits, .. } => self
+                .graph
+                .estimate_long_payload(digits.len().saturating_mul(2)),
+            _ => {}
+        }
     }
 }
 
