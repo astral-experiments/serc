@@ -57,17 +57,25 @@ impl CompiledFunctionDefaults {
 
 impl Compiler<'_> {
     /// Class bindings apply to direct annotation loads; nested functions and comprehensions retain captures.
-    fn class_visible_annotation_requirements(&self, expression: &Expr) -> BTreeSet<String> {
+    fn class_visible_annotation_requirements(
+        &self,
+        expression: &Expr,
+        unmangled: bool,
+    ) -> BTreeSet<String> {
+        let shadows = |name| {
+            if unmangled {
+                self.class_scope_shadows_unmangled_annotation_name(name)
+            } else {
+                self.class_scope_shadows_annotation_name(name)
+            }
+        };
         let mut required = expression_required_names(expression);
         if required
             .iter()
-            .any(|name| self.class_scope_shadows_annotation_name(self.required_name_id(name)))
+            .any(|name| shadows(self.required_name_id(name)))
         {
             let nested = annotation_nested_required_names(expression);
-            required.retain(|name| {
-                !self.class_scope_shadows_annotation_name(self.required_name_id(name))
-                    || nested.contains(name)
-            });
+            required.retain(|name| !shadows(self.required_name_id(name)) || nested.contains(name));
         }
         required
     }
@@ -75,16 +83,17 @@ impl Compiler<'_> {
     fn type_parameter_scope_requirements(
         &self,
         type_params: &ruff_python_ast::TypeParams,
+        unmangled: bool,
     ) -> BTreeSet<String> {
         let mut required = BTreeSet::new();
         for parameter in type_params {
             if let TypeParam::TypeVar(parameter) = parameter
                 && let Some(bound) = parameter.bound.as_deref()
             {
-                required.extend(self.class_visible_annotation_requirements(bound));
+                required.extend(self.class_visible_annotation_requirements(bound, unmangled));
             }
             if let Some(default) = parameter.default() {
-                required.extend(self.class_visible_annotation_requirements(default));
+                required.extend(self.class_visible_annotation_requirements(default, unmangled));
             }
         }
         required
@@ -142,8 +151,8 @@ impl Compiler<'_> {
             .iter()
             .map(|parameter| self.required_name_id(parameter.name().as_str()))
             .collect();
-        let mut requirements = self.type_parameter_scope_requirements(type_params);
-        requirements.extend(self.class_visible_annotation_requirements(value));
+        let mut requirements = self.type_parameter_scope_requirements(type_params, false);
+        requirements.extend(self.class_visible_annotation_requirements(value, false));
         let requirements = self.name_ids(&requirements);
         let cellvars = requirements
             .iter()
@@ -279,7 +288,7 @@ impl Compiler<'_> {
                 .map(|parameter| self.required_name_id(parameter.name().as_str())),
         );
         let type_parameter_requirements =
-            self.name_ids(self.type_parameter_scope_requirements(type_params));
+            self.name_ids(self.type_parameter_scope_requirements(type_params, false));
         let wrapper_local_names: FxHashSet<_> = locals.iter().copied().collect();
         let mut wrapper_plan = LoweringFunctionPlan {
             locals,
@@ -628,12 +637,25 @@ impl Compiler<'_> {
         code: CodeObject,
         closure_names: &[NameId],
     ) -> Result<(), CompileError> {
-        if !closure_names.is_empty() {
-            self.emit_closure_tuple(closure_names)?;
+        let indices = closure_names
+            .iter()
+            .map(|name| self.closure_index_id(*name))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.emit_function_with_closure_indices(code, &indices)
+    }
+
+    /// Create a function with a closure resolved across explicit lexical contexts.
+    fn emit_function_with_closure_indices(
+        &mut self,
+        code: CodeObject,
+        indices: &[u32],
+    ) -> Result<(), CompileError> {
+        if !indices.is_empty() {
+            self.emit_closure_indices(indices)?;
         }
         let code = self.add_constant(Constant::Code(Box::new(code)))?;
         self.emit(LOAD_CONST, code, 1)?;
-        self.emit_make_function(if closure_names.is_empty() {
+        self.emit_make_function(if indices.is_empty() {
             0
         } else {
             FunctionAttribute::CLOSURE.argument()
@@ -775,20 +797,21 @@ impl Compiler<'_> {
         locals.push(self.required_name_id(".type_params"));
         let (_, class_plan) = self.class_plan(definition)?;
         let required_names = &class_plan.required;
-        let type_parameter_requirements = self.type_parameter_scope_requirements(type_params);
+        let type_parameter_requirements = self.type_parameter_scope_requirements(type_params, true);
         let mut type_parameter_cell_requirements = type_parameter_requirements.clone();
         let mut wrapper_requirements = type_parameter_requirements;
         let mut header_references = ReferenceCollector::default();
         if let Some(arguments) = definition.arguments.as_deref() {
             for argument in &arguments.args {
                 header_references.visit_expr(argument);
-                wrapper_requirements.extend(self.class_visible_annotation_requirements(argument));
+                wrapper_requirements
+                    .extend(self.class_visible_annotation_requirements(argument, true));
                 type_parameter_cell_requirements.extend(nested_expression_required_names(argument));
             }
             for keyword in &arguments.keywords {
                 header_references.visit_expr(&keyword.value);
                 wrapper_requirements
-                    .extend(self.class_visible_annotation_requirements(&keyword.value));
+                    .extend(self.class_visible_annotation_requirements(&keyword.value, true));
                 type_parameter_cell_requirements
                     .extend(nested_expression_required_names(&keyword.value));
             }
@@ -800,30 +823,64 @@ impl Compiler<'_> {
             .chain(type_names.intersection(&type_parameter_cell_requirements))
             .copied()
             .collect();
-        cellvars.insert(self.required_name_id(".type_params"));
-        let mut freevars = Vec::new();
-        for name in required_names
+        let emitted_type_name = |name| {
+            self.required_name_id(&super::symbol::mangle_name(
+                self.resolve_name(name),
+                Some(definition.name.as_str()),
+            ))
+        };
+        let emitted_type_names = type_names
             .iter()
-            .map(|name| {
-                class_plan
-                    .enclosing_names
-                    .get(name)
-                    .copied()
-                    .unwrap_or(*name)
-            })
-            .chain(wrapper_requirements.iter().copied())
-            .filter(|name| !type_names.contains(name))
-            .filter(|name| self.can_provide_closure_id(*name))
-        {
-            self.insert_lexical_name(&mut freevars, name);
+            .copied()
+            .map(emitted_type_name)
+            .collect::<FxHashSet<_>>();
+        cellvars.extend(type_names.iter().copied().filter(|name| {
+            class_plan
+                .unmangled_required
+                .contains(&emitted_type_name(*name))
+        }));
+        cellvars.insert(self.required_name_id(".type_params"));
+        let mut captures = Vec::new();
+        #[expect(
+            clippy::iter_over_hash_type,
+            reason = "Capture records are sorted by emitted identity before closure emission."
+        )]
+        for &name in required_names {
+            if type_names.contains(&name) {
+                continue;
+            }
+            let enclosing = class_plan
+                .enclosing_names
+                .get(&name)
+                .copied()
+                .unwrap_or(name);
+            if self.can_provide_closure_id(enclosing) {
+                let physical =
+                    self.required_name_id(&self.mangled_name(self.resolve_name(enclosing)));
+                captures.push((physical, self.closure_index_id(enclosing)?));
+            }
         }
-        // A type-parameter scope nested directly in a class can resolve names through the
-        // class namespace. CPython provides that namespace through the synthetic
-        // `__classdict__` closure, even when no type-parameter expression uses a class name.
+        for &name in wrapper_requirements
+            .iter()
+            .filter(|name| !type_names.contains(*name))
+            .chain(class_plan.unmangled_required.iter())
+        {
+            if !emitted_type_names.contains(&name)
+                && let Some(index) = self.physical_closure_index(name)?
+            {
+                captures.push((name, index));
+            }
+        }
+        // Class-visible headers always receive the class namespace cell.
         if matches!(self.unit.scope, Scope::Class { .. }) {
             let classdict = self.required_name_id("__classdict__");
-            self.insert_lexical_name(&mut freevars, classdict);
+            captures.push((classdict, self.closure_index_id(classdict)?));
         }
+        captures.sort_unstable_by(|(left, _), (right, _)| {
+            self.resolve_name(*left).cmp(self.resolve_name(*right))
+        });
+        captures.dedup_by_key(|(name, _)| *name);
+        let (freevars, wrapper_closure_indices): (Vec<_>, Vec<_>) = captures.into_iter().unzip();
         // Direct header loads honor class bindings even when a nested expression still
         // captures the same name. Type parameters keep their own fast-local or cell lookup.
         let globals = header_references
@@ -831,7 +888,7 @@ impl Compiler<'_> {
             .iter()
             .map(|name| self.required_name_id(name))
             .filter(|name| !type_names.contains(name))
-            .filter(|name| self.class_scope_shadows_annotation_name(*name))
+            .filter(|name| self.class_scope_shadows_unmangled_annotation_name(*name))
             .collect();
         let plan = LoweringFunctionPlan {
             locals,
@@ -877,6 +934,22 @@ impl Compiler<'_> {
                 .map(|parameter| parameter.name().to_string())
                 .collect(),
         );
+        wrapper.unit.free_names_are_final = true;
+        let passthrough_aliases = plan
+            .freevars
+            .iter()
+            .copied()
+            .filter(|name| {
+                wrapper.mangled_name(wrapper.resolve_name(*name)) != wrapper.resolve_name(*name)
+            })
+            .collect::<Vec<_>>();
+        if let Scope::Function { free_indices, .. } = &mut wrapper.unit.scope {
+            // A declared private type parameter keeps its own source lookup while
+            // a raw header capture with the same spelling occupies a separate tail slot.
+            for name in passthrough_aliases {
+                free_indices.remove(&name);
+            }
+        }
         wrapper
             .symbols
             .imported_scope_names
@@ -901,7 +974,6 @@ impl Compiler<'_> {
             .compile_plain_class_definition(definition, DefinitionDecorators::AlreadyCompiled)?;
         wrapper.emit(RETURN_VALUE, 0, -1)?;
         let wrapper = wrapper.finish_inner(false)?;
-        let wrapper_closure_names = plan.freevars;
 
         let definition_location = self.definition_location(
             definition.range,
@@ -913,7 +985,7 @@ impl Compiler<'_> {
         if self.context.python_version == PythonVersion::Py312 {
             self.emit(PUSH_NULL, 0, 1)?;
         }
-        self.emit_function_with_closure(wrapper, &wrapper_closure_names)?;
+        self.emit_function_with_closure_indices(wrapper, &wrapper_closure_indices)?;
         if self.context.python_version != PythonVersion::Py312 {
             self.emit(PUSH_NULL, 0, 1)?;
         }
@@ -940,57 +1012,57 @@ impl Compiler<'_> {
         let is_generic = self.unit.generic_target_qualified_name.is_some();
 
         let (scope_id, class_plan) = self.class_plan(definition)?;
-        let mut freevars = Vec::new();
-        for name in class_plan.required.iter().copied().filter(|name| {
-            let enclosing = class_plan
-                .enclosing_names
-                .get(name)
-                .copied()
-                .unwrap_or(*name);
-            match &self.unit.scope {
-                Scope::Module => false,
-                Scope::Class { free_indices, .. } => {
-                    self.symbols.cell_names.contains(enclosing)
-                        || free_indices.contains_key(&enclosing)
-                }
-                Scope::Function { .. } => self.can_provide_closure_id(enclosing),
+        let mut captures = Vec::new();
+        let mut body_free_aliases = Vec::new();
+        for name in class_plan.required.iter().copied() {
+            let physical = self.required_name_id(&super::symbol::mangle_name(
+                self.resolve_name(name),
+                Some(definition.name.as_str()),
+            ));
+            let index = if is_generic {
+                self.physical_closure_index(physical)?
+            } else {
+                let enclosing = class_plan
+                    .enclosing_names
+                    .get(&name)
+                    .copied()
+                    .unwrap_or(name);
+                let can_capture = match &self.unit.scope {
+                    Scope::Module => false,
+                    Scope::Class { free_indices, .. } => {
+                        self.symbols.cell_names.contains(enclosing)
+                            || free_indices.contains_key(&enclosing)
+                    }
+                    Scope::Function { .. } => self.can_provide_closure_id(enclosing),
+                };
+                can_capture
+                    .then(|| self.closure_index_id(enclosing))
+                    .transpose()?
+            };
+            if let Some(index) = index {
+                captures.push((physical, index));
+                body_free_aliases.extend([(name, physical), (physical, physical)]);
             }
-        }) {
-            self.insert_lexical_name(&mut freevars, name);
+        }
+        #[expect(
+            clippy::iter_over_hash_type,
+            reason = "Capture records are sorted by emitted identity before closure emission."
+        )]
+        for &name in &class_plan.unmangled_required {
+            if let Some(index) = self.physical_closure_index(name)? {
+                captures.push((name, index));
+            }
         }
         if is_generic {
             let type_params = self.required_name_id(".type_params");
-            self.insert_lexical_name(&mut freevars, type_params);
+            captures.push((type_params, self.closure_index_id(type_params)?));
+            body_free_aliases.push((type_params, type_params));
         }
-        let mut free_aliases = Vec::new();
-        if self.context.python_version <= PythonVersion::Py313 {
-            let canonical_name = |name| {
-                super::symbol::mangle_name(self.resolve_name(name), Some(definition.name.as_str()))
-            };
-            freevars.sort_unstable_by(|left, right| {
-                canonical_name(*left)
-                    .cmp(&canonical_name(*right))
-                    .then_with(|| self.resolve_name(*left).cmp(self.resolve_name(*right)))
-            });
-            freevars.dedup_by(|alias, original| {
-                if canonical_name(*alias) == canonical_name(*original) {
-                    free_aliases.push((*alias, *original));
-                    true
-                } else {
-                    false
-                }
-            });
-        }
-        let closure_names = freevars
-            .iter()
-            .map(|name| {
-                class_plan
-                    .enclosing_names
-                    .get(name)
-                    .copied()
-                    .unwrap_or(*name)
-            })
-            .collect::<Vec<_>>();
+        captures.sort_unstable_by(|(left, _), (right, _)| {
+            self.resolve_name(*left).cmp(self.resolve_name(*right))
+        });
+        captures.dedup_by_key(|(name, _)| *name);
+        let (freevars, closure_indices): (Vec<_>, Vec<_>) = captures.into_iter().unzip();
         let qualified_name = self
             .unit
             .generic_target_qualified_name
@@ -1011,8 +1083,7 @@ impl Compiler<'_> {
         let mut comprehension_targets = Vec::with_capacity(class_plan.comprehension_targets.len());
         for &(name, requires_free) in &class_plan.comprehension_targets {
             if (!requires_free
-                || ((freevars.contains(&name)
-                    || free_aliases.iter().any(|(alias, _)| *alias == name))
+                || (body_free_aliases.iter().any(|(alias, _)| *alias == name)
                     && super::scope::legacy_class_comprehension_keeps_free_name(
                         self.resolve_name(name),
                         self.context.python_version,
@@ -1031,6 +1102,7 @@ impl Compiler<'_> {
             class_plan.globals,
             class_plan.nonlocals,
             &freevars,
+            &body_free_aliases,
             &comprehension_targets,
             &class_plan.comprehension_cells,
             class_plan.bound_names,
@@ -1039,11 +1111,6 @@ impl Compiler<'_> {
             class_plan.has_conditional_annotations,
             self.unit.flags & SUPPORTED_FUTURE_FLAGS,
         );
-        if let Scope::Class { free_indices, .. } = &mut child.unit.scope {
-            for (alias, original) in free_aliases {
-                free_indices.insert(alias, free_indices[&original]);
-            }
-        }
         child.unit.class_scope_is_nested = class_scope_is_nested;
         child
             .symbols
@@ -1069,7 +1136,7 @@ impl Compiler<'_> {
         if self.context.python_version != PythonVersion::Py312 {
             self.emit(PUSH_NULL, 0, 1)?;
         }
-        self.emit_function_with_closure(child, &closure_names)?;
+        self.emit_function_with_closure_indices(child, &closure_indices)?;
         self.context
             .record_constant_string_origin(definition.name.as_str(), true);
         let name = self.add_constant(Constant::String(definition.name.as_str().to_string()))?;
@@ -1644,6 +1711,8 @@ impl Compiler<'_> {
             let classdict = self.required_name_id("__classdict__");
             self.insert_lexical_name(&mut freevars, classdict);
         }
+        // Private captures sort by their emitted spelling, alongside synthetic class cells.
+        freevars.sort_unstable_by_key(|name| self.mangled_name(self.resolve_name(*name)));
         let mut local_names = vec![".format".to_string()];
         let mut references = ReferenceCollector::default();
         let mut inlined_cellvars = FxHashSet::default();
@@ -1789,7 +1858,10 @@ impl Compiler<'_> {
                 .iter()
                 .flat_map(|annotation| annotation_nested_required_names(&annotation.annotation)),
         );
-        let available_freevars: FxHashSet<_> = self.symbols.free_names.iter().copied().collect();
+        let Scope::Class { free_indices, .. } = &self.unit.scope else {
+            unreachable!("class annotations are compiled in a class scope");
+        };
+        let available_freevars: FxHashSet<_> = free_indices.keys().copied().collect();
         let reference_ids = self.name_id_set(&references);
         let mut freevars = Vec::new();
         for name in reference_ids
@@ -1813,6 +1885,8 @@ impl Compiler<'_> {
         }
         let classdict = self.required_name_id("__classdict__");
         self.insert_lexical_name(&mut freevars, classdict);
+        // Preserve closure lookup IDs while matching the emitted private-name order.
+        freevars.sort_unstable_by_key(|name| self.mangled_name(self.resolve_name(*name)));
         if !conditional_annotations.is_empty() {
             let conditional = self.required_name_id("__conditional_annotations__");
             freevars.push(conditional);

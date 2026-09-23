@@ -58,6 +58,7 @@ pub(super) struct CodeUnit {
     pub(super) qualified_name: String,
     pub(super) private_name: Option<String>,
     pub(super) mangled_names: Option<FxHashSet<String>>,
+    pub(super) free_names_are_final: bool,
     pub(super) pending_private_type_parameters: FxHashSet<NameId>,
     pub(super) arg_count: u32,
     positional_only_arg_count: u32,
@@ -321,6 +322,7 @@ impl<'source> Compiler<'source> {
         globals: FxHashSet<NameId>,
         nonlocals: FxHashSet<NameId>,
         freevars: &[NameId],
+        body_free_aliases: &[(NameId, NameId)],
         comprehension_targets: &[NameId],
         comprehension_cells: &FxHashSet<NameId>,
         bound_names: FxHashSet<NameId>,
@@ -368,10 +370,15 @@ impl<'source> Compiler<'source> {
             cell_names.insert(name);
         }
         let free_start = locals.len();
-        let free_indices = freevars
+        let free_indices = body_free_aliases
             .iter()
-            .enumerate()
-            .map(|(index, name)| (*name, u32::try_from(free_start + index).unwrap_or(u32::MAX)))
+            .map(|(name, physical)| {
+                let index = freevars
+                    .iter()
+                    .position(|name| name == physical)
+                    .expect("class body capture has a physical slot");
+                (*name, u32::try_from(free_start + index).unwrap_or(u32::MAX))
+            })
             .collect();
         locals.extend(freevars.iter().copied());
         let free_names = freevars.to_vec();
@@ -387,7 +394,7 @@ impl<'source> Compiler<'source> {
             hidden_names,
             ..SymbolState::default()
         };
-        let unit = CodeUnit::from_spec(CodeUnitSpec {
+        let mut unit = CodeUnit::from_spec(CodeUnitSpec {
             scope: Scope::Class {
                 globals,
                 nonlocals,
@@ -404,6 +411,7 @@ impl<'source> Compiler<'source> {
             flags: future_flags,
             first_line_number,
         });
+        unit.free_names_are_final = true;
         Self::new(context, unit, symbols)
     }
 
@@ -1108,8 +1116,14 @@ impl<'source> Compiler<'source> {
             .symbols
             .locals
             .iter()
-            .map(|name_id| {
+            .enumerate()
+            .map(|(index, name_id)| {
                 let spelling = self.resolve_name(*name_id);
+                if self.unit.free_names_are_final
+                    && index >= self.symbols.locals.len() - self.symbols.free_names.len()
+                {
+                    return (spelling.to_string(), MetadataId::from(*name_id));
+                }
                 // The annotation argument has a separate internal identity so user names
                 // and comprehension targets spelled `format` do not bind to its slot.
                 if self.unit.annotation_thunk && spelling == ".format" {
@@ -1335,6 +1349,7 @@ impl CodeUnit {
             qualified_name: spec.qualified_name,
             private_name: spec.private_name,
             mangled_names: None,
+            free_names_are_final: false,
             pending_private_type_parameters: FxHashSet::default(),
             arg_count: spec.arg_count,
             positional_only_arg_count: spec.positional_only_arg_count,
