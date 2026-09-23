@@ -483,6 +483,83 @@ def render_preinterned_lookup(
     return lines
 
 
+def preinterned_bloom_location(value: str) -> tuple[int, int]:
+    """Match the generated Rust's sampled UTF-8 hash and two bits in one word."""
+    encoded = value.encode()
+    if not encoded:
+        return 0, 0
+    sample = int.from_bytes(
+        bytes(
+            (
+                encoded[0],
+                encoded[1] if len(encoded) > 1 else 0,
+                encoded[len(encoded) // 2],
+                encoded[-1],
+            )
+        ),
+        "little",
+    )
+    hash_ = sample ^ (((len(encoded) & 0xFFFF) * 0x9E3779B9) & 0xFFFFFFFF)
+    hash_ ^= hash_ >> 16
+    hash_ = (hash_ * 0x85EBCA6B) & 0xFFFFFFFF
+    hash_ ^= hash_ >> 13
+    return hash_ & 0xFF, (1 << ((hash_ >> 8) & 63)) | (1 << ((hash_ >> 14) & 63))
+
+
+def preinterned_bloom_words(values: list[str]) -> list[int]:
+    words = [0] * 256
+    for value in values:
+        index, bits = preinterned_bloom_location(value)
+        words[index] |= bits
+    return words
+
+
+def render_preinterned_bloom_filter(values: list[str]) -> list[str]:
+    lines = [
+        "// This 2 KiB filter covers the union of every platform's exact intern tables.",
+        "// Hash the byte length and four sampled UTF-8 bytes to reject most nonmembers cheaply.",
+        "// Positive results still require the existing platform-specific exact lookups.",
+        "#[rustfmt::skip]",
+        "static PREINTERNED_BLOOM: [u64; 256] = [",
+    ]
+    words = preinterned_bloom_words(values)
+    for index in range(0, len(words), 4):
+        literals = []
+        for word in words[index : index + 4]:
+            digits = f"{word:016x}"
+            literals.append(
+                "0x"
+                + "_".join(digits[offset : offset + 4] for offset in range(0, 16, 4))
+            )
+        chunk = ", ".join(literals)
+        lines.append(f"    {chunk},")
+    lines.extend(
+        [
+            "];",
+            "",
+            "pub(super) fn might_be_preinterned_string(value: &str) -> bool {",
+            "    let bytes = value.as_bytes();",
+            "    let Some((&first, rest)) = bytes.split_first() else { return true };",
+            "    let sample = u32::from_le_bytes([",
+            "        first,",
+            "        rest.first().copied().unwrap_or(0),",
+            "        bytes[bytes.len() / 2],",
+            "        bytes[bytes.len() - 1],",
+            "    ]);",
+            '    let length = u32::try_from(bytes.len() & 0xffff).expect("masked length fits in u32");',
+            "    let mut hash = sample ^ length.wrapping_mul(0x9e37_79b9);",
+            "    hash ^= hash >> 16;",
+            "    hash = hash.wrapping_mul(0x85eb_ca6b);",
+            "    hash ^= hash >> 13;",
+            '    let index = usize::try_from(hash & 0xff).expect("masked index fits in usize");',
+            "    let bits = (1_u64 << ((hash >> 8) & 63)) | (1_u64 << ((hash >> 14) & 63));",
+            "    PREINTERNED_BLOOM[index] & bits == bits",
+            "}",
+        ]
+    )
+    return lines
+
+
 def parse_opcodes(source: str) -> list[tuple[str, int]]:
     section = source.split("/* Instruction opcodes for compiled code */", 1)[1]
     section = section.split("#define HAVE_ARGUMENT", 1)[0]
@@ -1072,6 +1149,7 @@ def render(sources: dict[str, str]) -> str:
     )
     lines.extend(["];", ""])
     if TARGET_MINOR == "3.14":
+        bootstrap_strings = read_bootstrap_strings(sources)
         lines.extend(
             [
                 "// Source-derived identifiers and live owners from neutral Linux bootstrap.",
@@ -1079,21 +1157,33 @@ def render(sources: dict[str, str]) -> str:
             ]
         )
         lines.extend(
-            f"    {rust_string_literal(value)},"
-            for value in read_bootstrap_strings(sources)
+            f"    {rust_string_literal(value)}," for value in bootstrap_strings
         )
         lines.extend(
             [
                 "];",
                 "",
                 "pub(crate) fn is_preinterned_string(value: &str) -> bool {",
-                "    is_preinterned_static_string(value)",
-                '        || (cfg!(target_os = "linux")',
-                "            && BOOTSTRAP_INTERNED_STRINGS.binary_search(&value).is_ok())",
+                "    might_be_preinterned_string(value)",
+                "        && (is_preinterned_static_string(value)",
+                '            || (cfg!(target_os = "linux")',
+                "                && BOOTSTRAP_INTERNED_STRINGS.binary_search(&value).is_ok()))",
                 "}",
                 "",
             ]
         )
+        lines.extend(
+            render_preinterned_bloom_filter(
+                sorted(
+                    set(preinterned_strings)
+                    | set(STARTUP_INTERNED_STRINGS)
+                    | set(UNIX_STARTUP_INTERNED_STRINGS)
+                    | set(compiler_interned_strings)
+                    | set(bootstrap_strings)
+                )
+            )
+        )
+        lines.append("")
         lookup = render_preinterned_lookup(
             preinterned_strings,
             STARTUP_INTERNED_STRINGS + UNIX_STARTUP_INTERNED_STRINGS,
