@@ -208,7 +208,7 @@ impl Assembler {
             && !(self.early_boolean_admissions_certified && self.has_early_boolean_admissions)
             && (self.has_only_linear_assertion_side_exits()
                 || self.has_only_linear_constant_return()
-                || (local_count <= 64 && self.has_only_linear_instructions()))
+                || (local_count <= 64 && self.has_only_linear_instructions(local_count)))
         {
             return self
                 .optimize_linear_assertion_side_exits(
@@ -1203,7 +1203,19 @@ impl OptimizationPipeline {
 
 impl LayoutAssembler {
     /// Computes wire operands without changing semantic instruction provenance.
+    #[inline]
     pub(in crate::assembler) fn encoded_operand(
+        &self,
+        instruction: &Instruction,
+    ) -> Result<Operand, CompileError> {
+        if self.python_version == crate::PythonVersion::Py314 {
+            Ok(instruction.operand())
+        } else {
+            self.encoded_version_specific_operand(instruction)
+        }
+    }
+
+    fn encoded_version_specific_operand(
         &self,
         instruction: &Instruction,
     ) -> Result<Operand, CompileError> {
@@ -1214,8 +1226,7 @@ impl LayoutAssembler {
 
         let operand = instruction.operand();
         if self.python_version != crate::PythonVersion::Py315 {
-            if self.python_version <= crate::PythonVersion::Py313
-                && instruction.opcode == RESUME
+            if instruction.opcode == RESUME
                 && let Operand::Value(argument) = operand
             {
                 let argument = if argument == GENEXPR_RESUME_ARGUMENT {

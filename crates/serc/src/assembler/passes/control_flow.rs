@@ -686,7 +686,7 @@ impl OptimizationPipeline {
         }
         let mut changed = false;
 
-        if has_forward_conditional {
+        if has_forward_conditional && features.has_boolean_conversion() {
             let mut positions = graph.item_positions();
             let mut conditional_targets =
                 vec![None; usize::try_from(self.next_label).expect("label count fits in usize")];
@@ -862,13 +862,22 @@ impl OptimizationPipeline {
         let graph = &self.graph;
         let mut label_offsets = FxHashMap::default();
         let mut instruction_positions = Vec::new();
+        let mut forward_jump_positions = Vec::new();
         for (block, contents) in graph.iter() {
             for (offset, item) in contents.items().iter().enumerate() {
                 match item {
                     Item::Label(label) => {
                         label_offsets.insert(*label, instruction_positions.len());
                     }
-                    Item::Instruction(_) => instruction_positions.push((block, offset)),
+                    Item::Instruction(instruction) => {
+                        if instruction.opcode == JUMP_FORWARD
+                            && matches!(instruction.operand(), Operand::Forward(_))
+                        {
+                            forward_jump_positions
+                                .push((instruction_positions.len(), (block, offset)));
+                        }
+                        instruction_positions.push((block, offset));
+                    }
                 }
             }
         }
@@ -1118,11 +1127,15 @@ impl OptimizationPipeline {
             })
             .filter_map(|label| graph.label_block(*label))
             .collect::<FxHashSet<_>>();
-        let planned_sources = instruction_positions
-            .iter()
-            .enumerate()
-            .filter_map(|(index, (block, _))| planned_blocks.contains(block).then_some(index))
-            .collect::<FxHashSet<_>>();
+        let planned_sources = if planned_blocks.is_empty() {
+            FxHashSet::default()
+        } else {
+            instruction_positions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (block, _))| planned_blocks.contains(block).then_some(index))
+                .collect::<FxHashSet<_>>()
+        };
         let region_ranges = self
             .exception_regions
             .iter()
@@ -1293,9 +1306,9 @@ impl OptimizationPipeline {
         for block in graph.order().iter().rev().copied() {
             for item in graph[block].items().iter().rev() {
                 match item {
-                    Item::Instruction(instruction) => next_instruction = Some(*instruction),
+                    Item::Instruction(instruction) => next_instruction = Some(instruction),
                     Item::Label(label) => {
-                        let Some(instruction) = next_instruction else {
+                        let Some(&instruction) = next_instruction else {
                             continue;
                         };
                         // CPython still sees the authored NOP before this loop backedge
@@ -1738,9 +1751,9 @@ impl OptimizationPipeline {
         // A cleanup-free break first copies its original loop-exit bridge, then
         // the small constant, local or tuple return. Keep that break's requested NOP through
         // our earlier threading only when all three original arrays still match.
-        let original_break_return_bridges = instruction_positions
+        let original_break_return_bridges = forward_jump_positions
             .iter()
-            .enumerate()
+            .map(|(index, position)| (*index, position))
             .filter_map(|(source_index, &(block, offset))| {
                 let source_items = graph[block].items();
                 let Item::Instruction(source) = source_items[offset] else {
@@ -1890,9 +1903,9 @@ impl OptimizationPipeline {
         // break and its handler's bare raise. CPython copies the bridge first,
         // preserving the break marker before copying the raise. Keep that request
         // only while all three original arrays have the same exception coverage.
-        let folded_loop_raise_breaks = instruction_positions
+        let folded_loop_raise_breaks = forward_jump_positions
             .iter()
-            .enumerate()
+            .map(|(index, position)| (*index, position))
             .filter_map(|(source_index, &(block, offset))| {
                 let source_items = graph[block].items();
                 let Item::Instruction(source) = source_items[offset] else {
@@ -1985,9 +1998,9 @@ impl OptimizationPipeline {
         let mut retained_break_policy = super::super::ir::JumpPolicy::default();
         retained_break_policy.retain_nop();
         retained_break_policy.prevent_threading_target();
-        let retained_break_backedges = instruction_positions
+        let retained_break_backedges = forward_jump_positions
             .iter()
-            .enumerate()
+            .map(|(index, position)| (*index, position))
             .filter_map(|(source_index, (block, offset))| {
                 let items = graph[*block].items();
                 let Item::Instruction(jump) = items[*offset] else {
@@ -2063,9 +2076,9 @@ impl OptimizationPipeline {
         // Prove the source's authored break slot or conditional false entry, then
         // require a clean single-jump target with the same original exception owner.
         // The usual threading path keeps the source line and accounts for the copied slot.
-        let retained_located_backedges = instruction_positions
+        let retained_located_backedges = forward_jump_positions
             .iter()
-            .enumerate()
+            .map(|(index, position)| (*index, position))
             .filter_map(|(source_index, &(block, offset))| {
                 let items = graph[block].items();
                 let Item::Instruction(jump) = items[offset] else {
@@ -2177,9 +2190,9 @@ impl OptimizationPipeline {
         // authored break enters it. Keep that edge on the certified empty array:
         // bypassing it would both strand the break's line and enter its cold
         // borrowed-load continuation. Other jumps keep their existing threading.
-        let original_break_empty_try_exits = instruction_positions
+        let original_break_empty_try_exits = forward_jump_positions
             .iter()
-            .enumerate()
+            .map(|(index, position)| (*index, position))
             .filter_map(|(source_index, (block, offset))| {
                 let items = graph[*block].items();
                 let Item::Instruction(jump) = items[*offset] else {
@@ -2251,9 +2264,9 @@ impl OptimizationPipeline {
         // normal try's POP_BLOCK/JUMP array copied onto that edge. Certify the
         // original sole entry before reusing the existing owner-transfer path;
         // keep the break's target, NOP retention, and copying policies unchanged.
-        let retained_break_try_owners = instruction_positions
+        let retained_break_try_owners = forward_jump_positions
             .iter()
-            .enumerate()
+            .map(|(index, position)| (*index, position))
             .filter_map(|(source_index, &(block, offset))| {
                 let source_items = graph[block].items();
                 let Item::Instruction(jump) = source_items[offset] else {
@@ -2361,9 +2374,9 @@ impl OptimizationPipeline {
         // The named-handler clear sequence can enter an original outer try's
         // unlocated normal-exit jump. That exact copy drops the source's ordinary
         // owner and inherits the target's sole scope fallback, including its policy.
-        let named_handler_scope_fallbacks = instruction_positions
+        let named_handler_scope_fallbacks = forward_jump_positions
             .iter()
-            .enumerate()
+            .map(|(index, position)| (*index, position))
             .filter_map(|(source_index, &(block, offset))| {
                 let items = graph[block].items();
                 let Item::Instruction(jump) = items[offset] else {
@@ -3201,6 +3214,9 @@ impl OptimizationPipeline {
         self.exception_owner_provenance
             .constant_pass_clusters
             .retain(|cluster| constant_pass_starts.contains(&cluster.start));
+        if !self.graph.features().has_pop_conditional() {
+            return;
+        }
         let conditional_targets = self
             .graph
             .iter_items()
@@ -4050,7 +4066,8 @@ impl OptimizationPipeline {
         &mut self,
         finalize_borrow_empty_blocks: bool,
     ) {
-        if !finalize_borrow_empty_blocks && !self.graph.features().has_forward_jump() {
+        let features = self.graph.features();
+        if !features.has_jump() || (!finalize_borrow_empty_blocks && !features.has_forward_jump()) {
             return;
         }
         let named_match_cleanup_jumps = if finalize_borrow_empty_blocks {

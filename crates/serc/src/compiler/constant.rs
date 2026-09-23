@@ -472,8 +472,12 @@ pub(super) fn can_order_early_boolean_admissions(body: &[Stmt]) -> bool {
     impl Owners {
         fn suite(&mut self, body: &[Stmt]) {
             for (index, statement) in body.iter().enumerate() {
+                if !self.certified {
+                    return;
+                }
                 if matches!(statement, Stmt::Return(_)) && index + 1 != body.len() {
                     self.certified = false;
+                    return;
                 }
                 self.visit_stmt(statement);
             }
@@ -493,6 +497,9 @@ pub(super) fn can_order_early_boolean_admissions(body: &[Stmt]) -> bool {
 
     impl<'ast> Visitor<'ast> for Owners {
         fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if !self.certified {
+                return;
+            }
             match statement {
                 Stmt::Assign(_) | Stmt::Return(_) | Stmt::Pass(_) => walk_stmt(self, statement),
                 // Keep existing tuple-not exclusions as modern sequence folding expands.
@@ -508,6 +515,9 @@ pub(super) fn can_order_early_boolean_admissions(body: &[Stmt]) -> bool {
                     self.visit_expr(&conditional.test);
                     self.suite(&conditional.body);
                     for clause in &conditional.elif_else_clauses {
+                        if !self.certified {
+                            return;
+                        }
                         if let Some(test) = &clause.test {
                             self.certified &= Self::dynamic_test(test);
                             self.visit_expr(test);
@@ -520,6 +530,9 @@ pub(super) fn can_order_early_boolean_admissions(body: &[Stmt]) -> bool {
         }
 
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if !self.certified {
+                return;
+            }
             match expression {
                 Expr::UnaryOp(unary)
                     if unary.op == UnaryOp::Not

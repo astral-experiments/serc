@@ -3248,29 +3248,30 @@ impl OptimizationPipeline {
     pub(in crate::assembler) fn capture_original_location_absence(&self) -> FxHashSet<Label> {
         // Without jumps, an instruction has at most its physical predecessor.
         // No sole-predecessor chain can reach the shared entry that proves absence.
-        if !self.graph.iter_items().any(|item| {
-            matches!(item, Item::Instruction(instruction)
-                if matches!(instruction.operand(), Operand::Forward(_) | Operand::Backward(_)))
-        }) {
+        if !self.graph.features().has_jump() {
             return FxHashSet::default();
         }
         let mut instructions = Vec::new();
         let mut label_entries = FxHashMap::default();
         let mut pending_labels = Vec::new();
         let mut possible_source = Vec::new();
-        for item in self.graph.iter_items() {
-            match item {
-                Item::Label(label) => pending_labels.push(*label),
-                Item::Instruction(instruction) => {
-                    let entry = instructions.len();
-                    let mut located = instruction.location.line >= 0
-                        || instruction.pre_fold_extra_instructions() > 0;
-                    for label in pending_labels.drain(..) {
-                        located |= self.original_nop_targets.contains(&label);
-                        label_entries.insert(label, entry);
+        for (_, block) in self.graph.iter() {
+            instructions.reserve(block.items().len());
+            possible_source.reserve(block.items().len());
+            for item in block.items() {
+                match item {
+                    Item::Label(label) => pending_labels.push(*label),
+                    Item::Instruction(instruction) => {
+                        let entry = instructions.len();
+                        let mut located = instruction.location.line >= 0
+                            || instruction.pre_fold_extra_instructions() > 0;
+                        for label in pending_labels.drain(..) {
+                            located |= self.original_nop_targets.contains(&label);
+                            label_entries.insert(label, entry);
+                        }
+                        instructions.push(instruction);
+                        possible_source.push(located);
                     }
-                    instructions.push(instruction);
-                    possible_source.push(located);
                 }
             }
         }
@@ -3294,7 +3295,14 @@ impl OptimizationPipeline {
         let mut absence = vec![None; instructions.len()];
         let mut visited = vec![usize::MAX; instructions.len()];
         let mut path = Vec::new();
-        for start in 0..instructions.len() {
+        // Only labeled entries can contribute to the result. Walk their predecessor
+        // chains on demand and share the memoized results for intermediate instructions.
+        #[expect(
+            clippy::iter_over_hash_type,
+            reason = "Each predecessor chain has an order-independent result."
+        )]
+        for &start in label_entries.values() {
+            path.clear();
             let mut entry = start;
             let absent = loop {
                 if let Some(absent) = absence[entry] {
@@ -3312,7 +3320,7 @@ impl OptimizationPipeline {
                 }
             };
             absence[start] = Some(absent);
-            for entry in path.drain(..) {
+            for &entry in &path {
                 absence[entry] = Some(absent);
             }
         }

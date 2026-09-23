@@ -4711,6 +4711,35 @@ fn ordinary_linear_instructions_match_the_block_graph_pipeline() {
     let ret = instruction(RETURN_VALUE, 0, 8, 0);
     let scenarios = [
         (
+            3,
+            1,
+            vec![
+                instruction(LOAD_FAST, 0, 2, 1),
+                instruction(UNPACK_SEQUENCE, 2, 2, 2),
+                instruction(STORE_FAST, 1, 2, 1),
+                instruction(STORE_FAST, 2, 2, 0),
+                instruction(LOAD_FAST, 1, 3, 1),
+                instruction(FORMAT_SIMPLE, 0, 3, 1),
+                instruction(LOAD_FAST, 2, 3, 2),
+                instruction(CONVERT_VALUE, 2, 3, 2),
+                instruction(LOAD_CONST, 0, 3, 3),
+                instruction(FORMAT_WITH_SPEC, 0, 3, 2),
+                instruction(BUILD_STRING, 2, 3, 1),
+            ],
+        ),
+        (
+            3,
+            1,
+            vec![
+                instruction(LOAD_FAST, 0, 2, 1),
+                instruction(UNPACK_EX, 1, 2, 2),
+                instruction(STORE_FAST, 1, 2, 1),
+                instruction(STORE_FAST, 2, 2, 0),
+                instruction(LOAD_FAST, 2, 3, 1),
+                instruction(GET_ITER, 0, 3, 1),
+            ],
+        ),
+        (
             0,
             0,
             vec![
@@ -4792,7 +4821,7 @@ fn ordinary_linear_instructions_match_the_block_graph_pipeline() {
                 }
             }
             let linear = Assembler::from_linear_items(items.clone());
-            assert!(linear.has_only_linear_instructions());
+            assert!(linear.has_only_linear_instructions(local_count));
             assert!(!linear.has_only_linear_constant_return());
             let graph = super::block_graph::BlockGraph::from_items(
                 items,
@@ -4803,7 +4832,7 @@ fn ordinary_linear_instructions_match_the_block_graph_pipeline() {
                 code: UnoptimizedCode::Prepared { graph, reachable },
                 ..Assembler::default()
             };
-            assert!(!generic.has_only_linear_instructions());
+            assert!(!generic.has_only_linear_instructions(local_count));
 
             let actual = linear.finish_code(1, local_count, parameter_count).unwrap();
             let expected = generic
@@ -4815,6 +4844,94 @@ fn ordinary_linear_instructions_match_the_block_graph_pipeline() {
             assert_eq!(actual.max_depth, expected.max_depth);
             assert_eq!(actual.removed_max_depth, expected.removed_max_depth);
         }
+    }
+}
+
+#[test]
+fn ordinary_linear_cells_and_closures_match_the_block_graph_pipeline() {
+    let instruction = |opcode, argument, line, depth| {
+        Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Value(argument),
+            if line < 0 {
+                SourceLocation::NONE
+            } else {
+                SourceLocation::new(line, line, 0, 0)
+            },
+            Some(depth),
+        ))
+    };
+    let resume = instruction(RESUME, ResumeLocation::AT_FUNC_START.argument(), 1, 0);
+    let ret = instruction(RETURN_VALUE, 0, 5, 0);
+    let mut closure_load = Instruction::new(
+        LOAD_FAST,
+        Operand::Value(1),
+        SourceLocation::new(2, 2, 0, 0),
+        Some(1),
+    );
+    closure_load.local_policy.mark_post_analysis_closure_load();
+    closure_load.fusion_policy.prevent_with_previous();
+    for (local_count, parameter_count, items) in [
+        (
+            0,
+            0,
+            vec![
+                instruction(MAKE_CELL, 0, -1, 0),
+                resume,
+                instruction(LOAD_LOCALS, 0, 1, 1),
+                instruction(STORE_DEREF, 0, 1, 0),
+                instruction(SETUP_ANNOTATIONS, 0, 1, 0),
+                instruction(LOAD_CONST, 0, 2, 1),
+                instruction(MAKE_FUNCTION, 0, -1, 1),
+                instruction(STORE_NAME, 0, 2, 0),
+                instruction(LOAD_FAST, 0, -1, 1),
+                instruction(STORE_NAME, 1, -1, 0),
+                instruction(LOAD_CONST, 1, -1, 1),
+                ret,
+            ],
+        ),
+        (
+            1,
+            1,
+            vec![
+                instruction(COPY_FREE_VARS, 1, -1, 0),
+                resume,
+                instruction(LOAD_DEREF, 1, 2, 1),
+                instruction(LOAD_FAST, 0, 2, 2),
+                instruction(BUILD_TUPLE, 2, 2, 1),
+                ret,
+            ],
+        ),
+        (
+            1,
+            0,
+            vec![
+                instruction(MAKE_CELL, 1, -1, 0),
+                resume,
+                Item::Instruction(closure_load),
+                instruction(BUILD_TUPLE, 1, 2, 1),
+                ret,
+            ],
+        ),
+    ] {
+        let linear = Assembler::from_linear_items(items.clone());
+        assert!(linear.has_only_linear_instructions(local_count));
+        let graph =
+            super::block_graph::BlockGraph::from_items(items, &rustc_hash::FxHashSet::default());
+        let reachable = graph.reachable_blocks(&[]);
+        let generic = Assembler {
+            code: UnoptimizedCode::Prepared { graph, reachable },
+            ..Assembler::default()
+        };
+        let actual = linear.finish_code(1, local_count, parameter_count).unwrap();
+        let expected = generic
+            .finish_code(1, local_count, parameter_count)
+            .unwrap();
+        assert_eq!(actual.bytecode, expected.bytecode);
+        assert_eq!(actual.line_table, expected.line_table);
+        assert_eq!(actual.exception_table, expected.exception_table);
+        assert_eq!(actual.max_depth, expected.max_depth);
+        assert_eq!(actual.removed_max_depth, expected.removed_max_depth);
     }
 }
 
@@ -4833,7 +4950,7 @@ fn ordinary_linear_unprotected_folds_and_class_footer_match_the_block_graph_pipe
         ))
     };
     for opcode in [LOAD_CONST, LOAD_SMALL_INT] {
-        for count in 1..4 {
+        for count in [1, 2, 3, 4, 9, 1023] {
             for class_footer in [false, true] {
                 let build = |recorded| {
                     let mut assembler = Assembler::from_linear_items(vec![
@@ -4856,9 +4973,9 @@ fn ordinary_linear_unprotected_folds_and_class_footer_match_the_block_graph_pipe
                     }
                     assembler
                 };
-                assert!(!build(false).has_only_linear_instructions());
+                assert!(build(false).has_only_linear_instructions(0));
                 let linear = build(true);
-                assert!(linear.has_only_linear_instructions());
+                assert!(linear.has_only_linear_instructions(0));
                 let mut generic = build(true);
                 let graph = super::block_graph::BlockGraph::from_items(
                     generic.linear_items().to_vec(),
@@ -4867,6 +4984,69 @@ fn ordinary_linear_unprotected_folds_and_class_footer_match_the_block_graph_pipe
                 let reachable = graph.reachable_blocks(&[]);
                 generic.code = UnoptimizedCode::Prepared { graph, reachable };
 
+                let actual = linear.finish_code(1, 0, 0).unwrap();
+                let expected = generic.finish_code(1, 0, 0).unwrap();
+                assert_eq!(actual.bytecode, expected.bytecode);
+                assert_eq!(actual.line_table, expected.line_table);
+                assert_eq!(actual.exception_table, expected.exception_table);
+                assert_eq!(actual.max_depth, expected.max_depth);
+                assert_eq!(actual.removed_max_depth, expected.removed_max_depth);
+            }
+        }
+    }
+}
+
+#[test]
+fn linear_literal_fold_history_matches_the_block_graph_pipeline() {
+    let item = |opcode, argument, depth| {
+        Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Value(argument),
+            SourceLocation::new(2, 2, 0, 0),
+            Some(depth),
+        ))
+    };
+    for opcode in [LOAD_CONST, LOAD_SMALL_INT, LIST_EXTEND, SET_UPDATE] {
+        for count in [1, 4, 9, 1023] {
+            for extra in [0, 4] {
+                let mut items = vec![item(RESUME, 0, 0)];
+                if matches!(opcode, LIST_EXTEND | SET_UPDATE) {
+                    items.push(item(
+                        if opcode == LIST_EXTEND {
+                            BUILD_LIST
+                        } else {
+                            BUILD_SET
+                        },
+                        0,
+                        1,
+                    ));
+                    items.push(item(LOAD_CONST, 0, 2));
+                }
+                let Item::Instruction(mut folded) = item(opcode, 1, 1) else {
+                    unreachable!()
+                };
+                folded.local_policy.add_hidden_exception_owner_slots(count);
+                folded.add_pre_fold_extra_instructions(extra);
+                folded.jump_policy.mark_original_uniform_fold();
+                items.push(Item::Instruction(folded));
+                items.push(item(RETURN_VALUE, 0, 0));
+                let build = || {
+                    let mut assembler = Assembler::from_linear_items(items.clone());
+                    assembler
+                        .exception_owner_provenance
+                        .original_uniform_folds
+                        .push(folded);
+                    assembler
+                };
+                let linear = build();
+                assert!(linear.has_only_linear_instructions(0));
+                let mut generic = build();
+                let graph = super::block_graph::BlockGraph::from_items(
+                    items.clone(),
+                    &rustc_hash::FxHashSet::default(),
+                );
+                let reachable = graph.reachable_blocks(&[]);
+                generic.code = UnoptimizedCode::Prepared { graph, reachable };
                 let actual = linear.finish_code(1, 0, 0).unwrap();
                 let expected = generic.finish_code(1, 0, 0).unwrap();
                 assert_eq!(actual.bytecode, expected.bytecode);
@@ -4900,7 +5080,30 @@ fn ordinary_linear_instructions_reject_control_flow_and_unhandled_policies() {
             Item::Instruction(instruction(RETURN_VALUE, 0, 0)),
         ]
     };
-    assert!(Assembler::from_linear_items(original()).has_only_linear_instructions());
+    assert!(Assembler::from_linear_items(original()).has_only_linear_instructions(0));
+
+    for possible_nop in [NOP, TO_BOOL, UNARY_NOT] {
+        let mut items = original();
+        items.insert(2, Item::Instruction(instruction(UNPACK_SEQUENCE, 1, 1)));
+        items.insert(3, Item::Instruction(instruction(possible_nop, 0, 1)));
+        assert!(!Assembler::from_linear_items(items).has_only_linear_instructions(0));
+    }
+
+    let cell_store = vec![
+        original()[0],
+        Item::Instruction(instruction(LOAD_FAST, 0, 1)),
+        Item::Instruction(instruction(STORE_DEREF, 0, 0)),
+        Item::Instruction(instruction(LOAD_FAST, 0, 1)),
+        original()[2],
+    ];
+    assert!(!Assembler::from_linear_items(cell_store).has_only_linear_instructions(1));
+
+    let mut policy_prefix = instruction(MAKE_CELL, 0, 0);
+    policy_prefix.location = SourceLocation::NONE;
+    policy_prefix.no_location_policy.preserve_location();
+    let mut prefixed = original();
+    prefixed.insert(0, Item::Instruction(policy_prefix));
+    assert!(!Assembler::from_linear_items(prefixed).has_only_linear_instructions(0));
 
     let mut hidden_slots = instruction(LOAD_FAST, 0, 1);
     hidden_slots
@@ -4917,7 +5120,6 @@ fn ordinary_linear_instructions_reject_control_flow_and_unhandled_policies() {
     let target = super::Label::from_u32(0);
     for replacement in [
         Item::Instruction(instruction(SWAP, 2, 1)),
-        Item::Instruction(instruction(UNPACK_SEQUENCE, 2, 1)),
         Item::Instruction(instruction(RETURN_VALUE, 0, 0)),
         Item::Instruction(instruction(RETURN_GENERATOR, 0, 0)),
         Item::Instruction(hidden_slots),
@@ -4935,19 +5137,19 @@ fn ordinary_linear_instructions_reject_control_flow_and_unhandled_policies() {
     ] {
         let mut items = original();
         items[1] = replacement;
-        assert!(!Assembler::from_linear_items(items).has_only_linear_instructions());
+        assert!(!Assembler::from_linear_items(items).has_only_linear_instructions(0));
     }
 
     let mut allocated = Assembler::from_linear_items(original());
     allocated.label();
-    assert!(!allocated.has_only_linear_instructions());
+    assert!(!allocated.has_only_linear_instructions(0));
     let mut provenance = Assembler::from_linear_items(original());
     provenance.exception_owner_provenance.omitted_nop_tail =
         Some((1, SourceLocation::new(2, 2, 0, 0), 1));
-    assert!(!provenance.has_only_linear_instructions());
+    assert!(!provenance.has_only_linear_instructions(0));
     let mut next_location = Assembler::from_linear_items(original());
     next_location.has_next_location = true;
-    assert!(!next_location.has_only_linear_instructions());
+    assert!(!next_location.has_only_linear_instructions(0));
 }
 
 #[test]

@@ -5,7 +5,7 @@ use rustc_hash::FxHashSet;
 
 use crate::target::opcodes::{
     LOAD_FAST, LOAD_FAST_BORROW, LOAD_FAST_CHECK, LOAD_FAST_LOAD_FAST, POP_JUMP_IF_FALSE,
-    POP_JUMP_IF_TRUE, STORE_FAST, SWAP, TO_BOOL, UNARY_NOT,
+    POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, STORE_FAST, SWAP, TO_BOOL, UNARY_NOT,
 };
 
 use super::{
@@ -84,16 +84,18 @@ impl BasicBlock {
 
 /// Conservative opcode and IR-policy summary for gating assembler passes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct PipelineFeatures(u8);
+pub(super) struct PipelineFeatures(u16);
 
 impl PipelineFeatures {
-    const FORWARD_JUMP: u8 = 1 << 0;
-    const FORWARD_CONDITIONAL: u8 = 1 << 1;
-    const SWAP_TRIGGER: u8 = 1 << 2;
-    const FAST_LOAD: u8 = 1 << 3;
-    const STORE_FAST_TRIGGER: u8 = 1 << 4;
-    const BOOLEAN_CONVERSION: u8 = 1 << 5;
-    const BORROW_EMPTY_BLOCK: u8 = 1 << 6;
+    const FORWARD_JUMP: u16 = 1 << 0;
+    const FORWARD_CONDITIONAL: u16 = 1 << 1;
+    const SWAP_TRIGGER: u16 = 1 << 2;
+    const FAST_LOAD: u16 = 1 << 3;
+    const STORE_FAST_TRIGGER: u16 = 1 << 4;
+    const BOOLEAN_CONVERSION: u16 = 1 << 5;
+    const BORROW_EMPTY_BLOCK: u16 = 1 << 6;
+    const JUMP: u16 = 1 << 7;
+    const POP_CONDITIONAL: u16 = 1 << 8;
 
     fn record(&mut self, instruction: &Instruction) {
         self.0 |= match instruction.opcode {
@@ -116,6 +118,18 @@ impl PipelineFeatures {
         };
         if instruction.jump_policy.borrow_empty_block() {
             self.0 |= Self::BORROW_EMPTY_BLOCK;
+        }
+        if matches!(
+            instruction.operand(),
+            Operand::Forward(_) | Operand::Backward(_)
+        ) {
+            self.0 |= Self::JUMP;
+        }
+        if matches!(
+            instruction.opcode,
+            POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
+        ) {
+            self.0 |= Self::POP_CONDITIONAL;
         }
     }
 
@@ -149,6 +163,14 @@ impl PipelineFeatures {
 
     pub(super) const fn has_borrow_empty_block(self) -> bool {
         self.0 & Self::BORROW_EMPTY_BLOCK != 0
+    }
+
+    pub(super) const fn has_jump(self) -> bool {
+        self.0 & Self::JUMP != 0
+    }
+
+    pub(super) const fn has_pop_conditional(self) -> bool {
+        self.0 & Self::POP_CONDITIONAL != 0
     }
 }
 
@@ -1177,6 +1199,8 @@ mod tests {
         assert!(features.has_store_fast());
         assert!(features.has_boolean_conversion());
         assert!(features.has_borrow_empty_block());
+        assert!(features.has_jump());
+        assert!(features.has_pop_conditional());
     }
 
     #[test]
@@ -1200,6 +1224,8 @@ mod tests {
         assert!(!features.has_store_fast());
         assert!(!features.has_boolean_conversion());
         assert!(!features.has_borrow_empty_block());
+        assert!(features.has_jump());
+        assert!(features.has_pop_conditional());
     }
 
     #[test]
@@ -1223,6 +1249,7 @@ mod tests {
 
         assert!(graph.features().has_forward_jump());
         assert!(graph.features().has_swap());
+        assert!(graph.features().has_jump());
     }
 
     #[test]

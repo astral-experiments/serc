@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -122,7 +123,7 @@ pub(super) struct CompilationContext<'source> {
     line_index: LineIndex,
     pub(super) scopes: ScopeArena,
     finally_bodies: FxHashMap<TextRange, &'source [Stmt]>,
-    constant_string_origins: FxHashMap<String, Cell<StringConstantOrigin>>,
+    constant_string_origins: FxHashMap<Cow<'source, str>, Cell<StringConstantOrigin>>,
     // Class qualified-name and synthesized character identity depend on the first cache admission,
     // even when that constant or the defining class is later removed as unreachable.
     constant_origins: Option<RefCell<ConstantOrigins>>,
@@ -552,30 +553,37 @@ impl<'source> CompilationContext<'source> {
     }
 
     /// Takes the completed module's string keys after all child compilers have been consumed.
+    /// Only frozenset reconstruction needs the full set of parser-interned identifiers.
     pub(super) fn finish_constant_string_provenance(
         context: &mut Rc<Self>,
+        has_frozenset_constants: bool,
     ) -> (FxHashSet<String>, FxHashSet<String>) {
         let context = Rc::get_mut(context)
             .expect("completed module should exclusively own its compilation context");
         let origins = std::mem::take(&mut context.constant_string_origins);
         let mut identifiers = FxHashSet::default();
-        identifiers.reserve(origins.len());
+        if has_frozenset_constants {
+            identifiers.reserve(origins.len());
+        }
         let mut canonical = FxHashSet::default();
         #[expect(
             clippy::iter_over_hash_type,
             reason = "Both provenance sets are only queried for membership."
         )]
         for (value, origin) in origins {
-            let generated = context.generated_mangled_strings.contains(&value);
             if origin.into_inner() == StringConstantOrigin::Interned {
-                if generated {
-                    canonical.insert(value);
+                if has_frozenset_constants
+                    && !context.generated_mangled_strings.contains(value.as_ref())
+                {
+                    canonical.insert(value.as_ref().to_string());
+                    identifiers.insert(value.into_owned());
                 } else {
-                    canonical.insert(value.clone());
-                    identifiers.insert(value);
+                    canonical.insert(value.into_owned());
                 }
-            } else if !generated {
-                identifiers.insert(value);
+            } else if has_frozenset_constants
+                && !context.generated_mangled_strings.contains(value.as_ref())
+            {
+                identifiers.insert(value.into_owned());
             }
         }
         (identifiers, canonical)
@@ -595,52 +603,50 @@ fn analyze_source<'ast>(
     static_attribute_names: &mut FxHashSet<String>,
     has_percent_replacement: &mut bool,
     finally_bodies: &mut FxHashMap<TextRange, &'ast [Stmt]>,
-) -> (FxHashMap<String, Cell<StringConstantOrigin>>, bool) {
+) -> (FxHashMap<Cow<'ast, str>, Cell<StringConstantOrigin>>, bool) {
     #[derive(Default)]
     struct SourceAnalysis<'ast> {
         python_version: crate::PythonVersion,
         finally_bodies: FxHashMap<TextRange, &'ast [Stmt]>,
-        origins: FxHashMap<String, Cell<StringConstantOrigin>>,
+        origins: FxHashMap<Cow<'ast, str>, Cell<StringConstantOrigin>>,
         private_name: Option<String>,
         mangled_names: Option<FxHashSet<String>>,
         generated_mangled_strings: FxHashSet<String>,
-        raw_private_identifiers: FxHashSet<String>,
+        raw_private_identifiers: FxHashSet<&'ast str>,
         restricted_private_identifier: bool,
         static_attribute_names: FxHashSet<String>,
         has_percent_replacement: bool,
         requires_empty_bytes_cache_trace: bool,
     }
 
-    impl SourceAnalysis<'_> {
-        fn mangled_name<'a>(&self, name: &'a str) -> std::borrow::Cow<'a, str> {
+    impl<'ast> SourceAnalysis<'ast> {
+        fn mangled_name<'a>(&self, name: &'a str) -> Cow<'a, str> {
             if self
                 .mangled_names
                 .as_ref()
                 .is_some_and(|names| !names.contains(name))
             {
-                std::borrow::Cow::Borrowed(name)
+                Cow::Borrowed(name)
             } else {
                 mangle_name(name, self.private_name.as_deref())
             }
         }
 
-        fn record_name(&mut self, name: &str) {
+        fn record_name(&mut self, name: &'ast str) {
             self.record_raw_name(name);
             let mangled = self.mangled_name(name);
             if mangled != name {
                 let mangled = mangled.into_owned();
                 self.generated_mangled_strings.insert(mangled.clone());
-                self.origins.entry(mangled).or_default();
+                self.origins.entry(Cow::Owned(mangled)).or_default();
             }
         }
 
-        fn record_raw_name(&mut self, name: &str) {
-            if !self.origins.contains_key(name) {
-                self.origins.insert(name.to_string(), Cell::default());
-            }
+        fn record_raw_name(&mut self, name: &'ast str) {
+            self.origins.entry(Cow::Borrowed(name)).or_default();
             if has_double_underscore(name) {
                 self.restricted_private_identifier |= self.mangled_names.is_some();
-                self.raw_private_identifiers.insert(name.to_string());
+                self.raw_private_identifiers.insert(name);
                 let mangled = self.mangled_name(name);
                 if mangled != name {
                     self.generated_mangled_strings.insert(mangled.into_owned());
@@ -666,7 +672,7 @@ fn analyze_source<'ast>(
                 Stmt::FunctionDef(definition) => {
                     self.record_raw_name(definition.name.as_str());
                     if definition.returns.is_some() {
-                        self.origins.entry("return".to_string()).or_default();
+                        self.origins.entry(Cow::Borrowed("return")).or_default();
                     }
                 }
                 Stmt::ClassDef(definition) => {
@@ -717,11 +723,13 @@ fn analyze_source<'ast>(
                 }
                 Stmt::Match(_) => {
                     // The parser interns soft keywords through its identifier-token path.
-                    self.origins.entry("case".to_string()).or_default();
+                    self.origins.entry(Cow::Borrowed("case")).or_default();
                 }
                 Stmt::TypeAlias(alias) => {
                     if let Expr::Name(name) = alias.name.as_ref() {
-                        self.origins.entry(name.id.to_string()).or_default();
+                        self.origins
+                            .entry(Cow::Borrowed(name.id.as_str()))
+                            .or_default();
                     }
                 }
                 _ => {}
@@ -821,7 +829,9 @@ fn analyze_source<'ast>(
         }
 
         fn visit_alias(&mut self, alias: &'a ruff_python_ast::Alias) {
-            self.origins.entry(alias.name.to_string()).or_default();
+            self.origins
+                .entry(Cow::Borrowed(alias.name.as_str()))
+                .or_default();
             for component in alias.name.as_str().split('.') {
                 self.record_raw_name(component);
             }
@@ -845,7 +855,7 @@ fn analyze_source<'ast>(
     }
     visitor
         .generated_mangled_strings
-        .retain(|name| !visitor.raw_private_identifiers.contains(name));
+        .retain(|name| !visitor.raw_private_identifiers.contains(name.as_str()));
     *requires_interning_trace =
         visitor.restricted_private_identifier || !visitor.generated_mangled_strings.is_empty();
     *generated_mangled_strings = visitor.generated_mangled_strings;
@@ -2179,7 +2189,7 @@ mod tests {
     #[test]
     fn parser_dunders_preserve_raw_and_generated_mangled_identities() {
         let parsed = ruff_python_parser::parse_module(
-            "class Café:\n    def f(self):\n        self.__secret\n        self.__already\n        self._Café__already\n        self.élan\n        self.ends_\n",
+            "class Café:\n    def f(self, __parameter: int):\n        self.__secret\n        self.__already\n        self._Café__already\n        self.élan\n        self.ends_\n",
         )
         .unwrap();
         let mut generated = FxHashSet::default();
@@ -2197,13 +2207,18 @@ mod tests {
             "Café",
             "__secret",
             "__already",
+            "__parameter",
             "_Café__already",
             "élan",
             "ends_",
         ] {
-            assert!(origins.contains_key(raw), "{raw:?}");
+            let (key, _) = origins.get_key_value(raw).expect("raw name is recorded");
+            assert!(matches!(key, Cow::Borrowed(_)), "{raw:?}");
         }
+        let (key, _) = origins.get_key_value("_Café__parameter").unwrap();
+        assert!(matches!(key, Cow::Owned(_)));
         assert!(generated.contains("_Café__secret"));
+        assert!(generated.contains("_Café__parameter"));
         assert!(!generated.contains("_Café__already"));
         assert!(requires_trace);
     }
@@ -2222,7 +2237,7 @@ mod tests {
             ("mangled_canonical", StringConstantOrigin::Interned),
         ]
         .into_iter()
-        .map(|(name, state)| (name.to_string(), Cell::new(state)))
+        .map(|(name, state)| (Cow::Owned(name.to_string()), Cell::new(state)))
         .collect();
         context.generated_mangled_strings = [
             "mangled_unused",
@@ -2259,7 +2274,7 @@ mod tests {
                 .collect(),
         );
 
-        let moved = CompilationContext::finish_constant_string_provenance(&mut context);
+        let moved = CompilationContext::finish_constant_string_provenance(&mut context, true);
         assert_eq!(moved, expected);
         assert_eq!(moved.0.get("unused").unwrap().as_ptr(), unused_address);
         assert_eq!(
@@ -2277,6 +2292,52 @@ mod tests {
         assert_eq!(
             context.record_interning_event(CompilationInterningEvent::CachedTuple(Vec::new())),
             1
+        );
+    }
+
+    #[test]
+    fn finishing_without_frozensets_keeps_only_canonical_provenance() {
+        let tokens = Tokens::new(Vec::new());
+        let body = Suite::new();
+        let mut context = CompilationContext::new("example.py", "", &tokens, &body);
+        context.constant_string_origins = [
+            (Cow::Borrowed("unused"), StringConstantOrigin::Unrecorded),
+            (
+                Cow::Borrowed("not_interned"),
+                StringConstantOrigin::Uninterned,
+            ),
+            (Cow::Borrowed("canonical"), StringConstantOrigin::Interned),
+            (
+                Cow::Owned("mangled_canonical".to_string()),
+                StringConstantOrigin::Interned,
+            ),
+        ]
+        .into_iter()
+        .map(|(name, state)| (name, Cell::new(state)))
+        .collect();
+        context
+            .generated_mangled_strings
+            .insert("mangled_canonical".to_string());
+        let mut context = Rc::new(context);
+        let mangled_address = context
+            .constant_string_origins
+            .get_key_value("mangled_canonical")
+            .unwrap()
+            .0
+            .as_ptr();
+
+        let (identifiers, canonical) =
+            CompilationContext::finish_constant_string_provenance(&mut context, false);
+        assert!(identifiers.is_empty());
+        assert_eq!(
+            canonical,
+            ["canonical".to_string(), "mangled_canonical".to_string()]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            canonical.get("mangled_canonical").unwrap().as_ptr(),
+            mangled_address
         );
     }
 }
