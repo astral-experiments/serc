@@ -86,6 +86,9 @@ pub(crate) struct Label;
 #[newtype_index]
 pub(crate) struct OperandPatchId;
 
+#[newtype_index]
+pub(crate) struct FoldAdmissionId;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct EmissionStreamId(u64);
 
@@ -1219,6 +1222,7 @@ pub(super) struct Instruction {
     // whatever exception target remains in its reused CFG slot, if there is one.
     metadata: InstructionMetadata,
     pub(super) early_boolean_admissions: EarlyBooleanAdmissions,
+    pub(super) folded_constant_admissions: Option<FoldAdmissionId>,
 }
 
 impl Instruction {
@@ -1243,6 +1247,7 @@ impl Instruction {
             jump_policy: JumpPolicy::default(),
             metadata: InstructionMetadata::default(),
             early_boolean_admissions: EarlyBooleanAdmissions::default(),
+            folded_constant_admissions: None,
         }
     }
 
@@ -1263,6 +1268,7 @@ impl Instruction {
             jump_policy: JumpPolicy::default(),
             metadata: InstructionMetadata::default(),
             early_boolean_admissions: EarlyBooleanAdmissions::default(),
+            folded_constant_admissions: None,
         }
     }
 
@@ -1518,6 +1524,8 @@ impl Instruction {
             early_boolean_admissions: first
                 .early_boolean_admissions
                 .followed_by(second.early_boolean_admissions),
+            // Constant admissions are consumed before superinstruction fusion.
+            folded_constant_admissions: None,
         }
     }
 }
@@ -1585,6 +1593,7 @@ pub(crate) struct Assembler {
     pub(super) operand_patches: Vec<OperandPatch>,
     pub(super) deferred_none_constant_index: Option<u32>,
     pub(super) discarded_fold_admissions: FxHashMap<Label, Vec<u32>>,
+    pub(super) folded_constant_admissions: Vec<Vec<u32>>,
     pub(super) early_boolean_admissions_certified: bool,
     pub(super) has_early_boolean_admissions: bool,
     pub(super) next_label: u32,
@@ -1708,6 +1717,7 @@ pub(super) struct OptimizationPipeline {
     pub(super) folded_loop_exit_anchors: FxHashSet<Label>,
     /// First-fold admissions retained before their next surviving source label.
     pub(super) discarded_fold_admissions: FxHashMap<Label, Vec<u32>>,
+    pub(super) folded_constant_admissions: Vec<Vec<u32>>,
     pub(super) early_boolean_admissions_certified: bool,
     pub(super) has_early_boolean_admissions: bool,
     pub(super) initial_reachable: Option<Vec<bool>>,
@@ -1847,6 +1857,7 @@ impl Default for Assembler {
             operand_patches: Vec::new(),
             deferred_none_constant_index: None,
             discarded_fold_admissions: FxHashMap::default(),
+            folded_constant_admissions: Vec::new(),
             early_boolean_admissions_certified: false,
             has_early_boolean_admissions: false,
             next_label: 0,

@@ -691,11 +691,11 @@ impl Compiler<'_> {
                     hidden_owner_slots +=
                         folded_constant_owner_slots(default, self.context.python_version);
                 }
-                for default in &positional_defaults {
-                    self.record_folded_value(default)?;
-                }
+                let operand_folds =
+                    self.record_folded_collection_operands(positional_defaults.iter().copied())?;
                 self.assembler.set_location(definition_location);
                 self.emit_deferred_constant(Constant::Tuple(defaults))?;
+                self.attach_folded_operand_admissions(operand_folds);
                 self.assembler
                     .add_last_hidden_exception_owner_slots(hidden_owner_slots);
                 // Literal defaults are folded before CFG copy sizing, but their

@@ -38,8 +38,8 @@ use crate::target::{
 #[cfg(any(test, debug_assertions))]
 use ir::AssemblerStage;
 pub(crate) use ir::{
-    AssembledCode, Assembler, EmittedInstruction, EmittedJump, ExceptionPolicy, Label,
-    OperandPatchId, SourceLocation,
+    AssembledCode, Assembler, EmittedInstruction, EmittedJump, ExceptionPolicy, FoldAdmissionId,
+    Label, OperandPatchId, SourceLocation,
 };
 use ir::{
     BorrowFallthrough, BorrowLoopExitPolicy, ExceptionExclusion, ExceptionRegion,
@@ -15940,6 +15940,16 @@ impl Assembler {
                 }
             });
         }
+        for admissions in &mut self.folded_constant_admissions {
+            admissions.retain_mut(|index| {
+                if let Some(remapped) = index_map[*index as usize] {
+                    *index = remapped;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
         let deferred_none = self.deferred_none_constant_index;
         // Retain the pre-remap witnesses throughout the pass so duplicate live
         // survivors stay duplicates when their constant indices change together.
@@ -16117,6 +16127,20 @@ impl Assembler {
             .entry(label)
             .or_default()
             .push(index);
+    }
+
+    /// Keeps removed operand folds attached to the instruction copied with their expression.
+    pub(crate) fn reserve_last_fold_admissions(&mut self) -> FoldAdmissionId {
+        let id = FoldAdmissionId::from_usize(self.folded_constant_admissions.len());
+        self.folded_constant_admissions.push(Vec::new());
+        self.required_last_instruction_mut("recording folded constant admissions")
+            .folded_constant_admissions = Some(id);
+        id
+    }
+
+    /// Resolves one deferred operand into its expression's admission sequence.
+    pub(crate) fn record_fold_admission(&mut self, id: FoldAdmissionId, index: u32) {
+        self.folded_constant_admissions[id.index()].push(index);
     }
 
     pub(crate) fn set_deferred_none_constant_index(&mut self, index: u32) {

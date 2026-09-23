@@ -2026,11 +2026,16 @@ impl<'source> Compiler<'source> {
                     self.source_aware_fold_constant(&expression.value).is_some()
                 }
             {
+                let mut operand_folds = None;
                 if self.context.python_version >= crate::PythonVersion::Py314
                     && literal_constant(&expression.value).is_none()
                 {
                     let first_fold = self.output.deferred_constants.len();
-                    self.record_folded_value(&expression.value)?;
+                    if self.context.python_version == crate::PythonVersion::Py314 {
+                        operand_folds = self.record_folded_collection_operands(std::iter::once(expression.value.as_ref()))?;
+                    } else {
+                        self.record_folded_value(&expression.value)?;
+                    }
                     if self.context.python_version == crate::PythonVersion::Py315 {
                         // This statement emits no load, but later sequence folding
                         // must retain its constant's original construction order.
@@ -2149,6 +2154,7 @@ impl<'source> Compiler<'source> {
                         let noop_end = self.assembler.label();
                         self.assembler.mark(noop_end);
                     }
+                    self.attach_folded_operand_admissions(operand_folds);
                 }
             } else if plain_function_suite
                 && !is_final

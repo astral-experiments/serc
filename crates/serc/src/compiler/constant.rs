@@ -12,7 +12,7 @@ use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use smallvec::SmallVec;
 
 use super::{LOAD_CONST, LOAD_SMALL_INT, NOP, STORE_NAME};
-use crate::assembler::{Label, OperandPatchId};
+use crate::assembler::{FoldAdmissionId, Label, OperandPatchId};
 use crate::target::operands::Conversion;
 use crate::{CompileError, PythonVersion};
 
@@ -254,6 +254,7 @@ pub(super) struct OutputState {
 pub(super) enum DeferredConstantTarget {
     Instruction(OperandPatchId),
     DiscardedExpression(Label),
+    FoldedOperand(FoldAdmissionId),
 }
 
 impl crate::assembler::ConstantTable for OutputState {
@@ -594,11 +595,13 @@ impl Compiler<'_> {
             // admitted here. Recording operands would change the first constant and its order.
             return self.emit_preprocessed_constant(expression, constant);
         }
+        let first_operand_fold = self.output.deferred_constants.len();
         if let Some(literal) = literal_constant(expression) {
             self.add_constant(literal)?;
         } else {
             self.record_folded_operands(expression)?;
         }
+        let operand_folds = first_operand_fold..self.output.deferred_constants.len();
         if matches!(expression, Expr::Tuple(_))
             || matches!(expression, Expr::UnaryOp(unary) if unary.op == UnaryOp::Not)
         {
@@ -616,6 +619,14 @@ impl Compiler<'_> {
         } else {
             self.record_fresh_empty_bytes_fold(expression, &constant);
             self.emit_deferred_constant(constant)?;
+        }
+        if !operand_folds.is_empty()
+            && contains_negative_empty_repetition(expression, self.context.python_version)
+        {
+            // An empty result can reuse a literal while its negative count is newly
+            // admitted. Keep that occurrence's operands before later folded results,
+            // without making the pooled empty literal depend on every later count.
+            self.attach_folded_operand_admissions(Some(operand_folds));
         }
         if self.assembler.early_boolean_admissions_certified() {
             let mut admissions = Vec::new();
@@ -652,6 +663,38 @@ impl Compiler<'_> {
                 .record_last_uniform_fold_owner_slots(hidden_owner_slots);
         }
         Ok(())
+    }
+
+    /// Captures removed operands for a collection synthesized from constant expressions.
+    pub(super) fn record_folded_collection_operands<'ast>(
+        &mut self,
+        expressions: impl Iterator<Item = &'ast Expr>,
+    ) -> Result<Option<std::ops::Range<usize>>, CompileError> {
+        if self.context.python_version <= PythonVersion::Py313 {
+            return Ok(None);
+        }
+        let first = self.output.deferred_constants.len();
+        let mut needs_admissions = false;
+        for expression in expressions {
+            self.record_folded_value(expression)?;
+            needs_admissions |=
+                contains_negative_empty_repetition(expression, self.context.python_version);
+        }
+        let operands = first..self.output.deferred_constants.len();
+        Ok((needs_admissions && !operands.is_empty()).then_some(operands))
+    }
+
+    /// Attaches one expression's removed operands to its surviving instruction.
+    pub(super) fn attach_folded_operand_admissions(
+        &mut self,
+        operands: Option<std::ops::Range<usize>>,
+    ) {
+        let Some(operands) = operands else { return };
+        let admission = self.assembler.reserve_last_fold_admissions();
+        for (target, _) in &mut self.output.deferred_constants[operands] {
+            debug_assert!(target.is_none());
+            *target = Some(DeferredConstantTarget::FoldedOperand(admission));
+        }
     }
 
     pub(super) fn record_folded_operands(&mut self, expression: &Expr) -> Result<(), CompileError> {
@@ -1972,7 +2015,11 @@ pub(super) fn fold_constant_with_literals(
                 }
                 (Constant::String(value), Operator::Mult, times)
                 | (times, Operator::Mult, Constant::String(value)) => {
-                    let times = sequence_repeat_count(&times, boolean_sequence_repetition)?;
+                    let times = sequence_repeat_count(
+                        &times,
+                        boolean_sequence_repetition,
+                        value.is_empty(),
+                    )?;
                     let length = value.chars().count();
                     let Some(max_times) = 4096_usize.checked_div(length) else {
                         return Some(Constant::String(String::new()));
@@ -1982,7 +2029,11 @@ pub(super) fn fold_constant_with_literals(
                 }
                 (Constant::SurrogateString(value), Operator::Mult, times)
                 | (times, Operator::Mult, Constant::SurrogateString(value)) => {
-                    let times = sequence_repeat_count(&times, boolean_sequence_repetition)?;
+                    let times = sequence_repeat_count(
+                        &times,
+                        boolean_sequence_repetition,
+                        value.is_empty(),
+                    )?;
                     let length = value.iter().filter(|byte| **byte & 0xc0 != 0x80).count();
                     let Some(max_times) = 4096_usize.checked_div(length) else {
                         return Some(Constant::String(String::new()));
@@ -1992,7 +2043,11 @@ pub(super) fn fold_constant_with_literals(
                 }
                 (Constant::Bytes(value), Operator::Mult, times)
                 | (times, Operator::Mult, Constant::Bytes(value)) => {
-                    let times = sequence_repeat_count(&times, boolean_sequence_repetition)?;
+                    let times = sequence_repeat_count(
+                        &times,
+                        boolean_sequence_repetition,
+                        value.is_empty(),
+                    )?;
                     let Some(max_times) = 4096_usize.checked_div(value.len()) else {
                         return Some(Constant::Bytes(Vec::new()));
                     };
@@ -2001,7 +2056,11 @@ pub(super) fn fold_constant_with_literals(
                 }
                 (Constant::Tuple(value), Operator::Mult, times)
                 | (times, Operator::Mult, Constant::Tuple(value)) => {
-                    let times = sequence_repeat_count(&times, boolean_sequence_repetition)?;
+                    let times = sequence_repeat_count(
+                        &times,
+                        boolean_sequence_repetition,
+                        value.is_empty(),
+                    )?;
                     let Some(max_times) = 256_usize.checked_div(value.len()) else {
                         return Some(Constant::Tuple(Vec::new()));
                     };
@@ -2026,13 +2085,61 @@ pub(super) fn fold_constant_with_literals(
     result.map(|constant| constant.with_non_reflexive_origin(origin))
 }
 
-fn sequence_repeat_count(value: &Constant, boolean_sequence_repetition: bool) -> Option<u64> {
+fn sequence_repeat_count(
+    value: &Constant,
+    boolean_sequence_repetition: bool,
+    empty: bool,
+) -> Option<u64> {
     match value {
         Constant::Bool(value) if boolean_sequence_repetition => Some(u64::from(*value)),
         // The pinned targets convert counts to 64-bit Py_ssize_t even for empty sequences.
         Constant::Int(value) if i64::try_from(*value).is_ok() => Some(*value),
+        Constant::SignedInt(_) if empty => Some(0),
         _ => None,
     }
+}
+
+/// Identifies the newly folded repetitions whose reused result hides operand admissions.
+fn contains_negative_empty_repetition(expression: &Expr, python_version: PythonVersion) -> bool {
+    struct Finder {
+        python_version: PythonVersion,
+        found: bool,
+    }
+    impl<'ast> Visitor<'ast> for Finder {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if self.found {
+                return;
+            }
+            if let Expr::BinOp(binary) = expression
+                && binary.op == Operator::Mult
+            {
+                let left = fold_constant_for_version(&binary.left, self.python_version);
+                let right = fold_constant_for_version(&binary.right, self.python_version);
+                let sequence = match (&left, &right) {
+                    (Some(Constant::SignedInt(_)), Some(sequence))
+                    | (Some(sequence), Some(Constant::SignedInt(_))) => Some(sequence),
+                    _ => None,
+                };
+                self.found = match sequence {
+                    Some(Constant::String(value)) => value.is_empty(),
+                    Some(Constant::Bytes(value) | Constant::SurrogateString(value)) => {
+                        value.is_empty()
+                    }
+                    Some(Constant::Tuple(value)) => value.is_empty(),
+                    _ => false,
+                };
+            }
+            if !self.found {
+                walk_expr(self, expression);
+            }
+        }
+    }
+    let mut finder = Finder {
+        python_version,
+        found: false,
+    };
+    finder.visit_expr(expression);
+    finder.found
 }
 
 // CPython also limits recursively contained tuple items when folding repetition.

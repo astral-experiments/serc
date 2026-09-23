@@ -3694,12 +3694,12 @@ impl Compiler<'_> {
                     hidden_owner_slots +=
                         folded_constant_owner_slots(default, self.context.python_version);
                 }
-                for default in &positional_defaults {
-                    self.record_folded_value(default)?;
-                }
+                let operand_folds =
+                    self.record_folded_collection_operands(positional_defaults.iter().copied())?;
                 self.assembler
                     .set_location(self.source_location(lambda.range));
                 self.emit_deferred_constant(Constant::Tuple(defaults))?;
+                self.attach_folded_operand_admissions(operand_folds);
                 self.assembler
                     .add_last_hidden_exception_owner_slots(hidden_owner_slots);
             } else {
@@ -6417,16 +6417,13 @@ impl Compiler<'_> {
                     .map(|element| self.source_aware_fold_constant(element))
                     .collect::<Option<Vec<_>>>()
             {
-                for element in elements {
-                    if self.context.python_version >= PythonVersion::Py314 {
-                        self.record_folded_value(element)?;
-                    }
-                }
+                let operand_folds = self.record_folded_collection_operands(elements.iter())?;
                 for element in elements {
                     self.emit_folded_tuple_not_nops(element)?;
                 }
                 self.assembler.set_location(collection_location);
                 self.emit_collection_constant(Constant::Tuple(constants))?;
+                self.attach_folded_operand_admissions(operand_folds);
                 let hidden_owner_slots = folded_elements_owner_slots(
                     self.context.python_version,
                     elements,
@@ -6466,11 +6463,7 @@ impl Compiler<'_> {
                     .map(|element| self.source_aware_fold_constant(element))
                     .collect::<Option<Vec<_>>>()
             {
-                for element in elements {
-                    if self.context.python_version >= PythonVersion::Py314 {
-                        self.record_folded_value(element)?;
-                    }
-                }
+                let operand_folds = self.record_folded_collection_operands(elements.iter())?;
                 for element in elements {
                     self.emit_folded_tuple_not_nops(element)?;
                 }
@@ -6482,6 +6475,7 @@ impl Compiler<'_> {
                 };
                 self.emit(kind.build_opcode_for_unpacking(), 0, 1)?;
                 self.emit_collection_constant(constant)?;
+                self.attach_folded_operand_admissions(operand_folds);
                 self.emit(
                     if kind == CollectionKind::List {
                         LIST_EXTEND
@@ -6546,11 +6540,8 @@ impl Compiler<'_> {
                 .map(|element| self.source_aware_fold_constant(element))
                 .collect::<Option<Vec<_>>>()
         {
-            for element in &elements[..unpacking_start] {
-                if self.context.python_version >= PythonVersion::Py314 {
-                    self.record_folded_value(element)?;
-                }
-            }
+            let operand_folds =
+                self.record_folded_collection_operands(elements[..unpacking_start].iter())?;
             for element in &elements[..unpacking_start] {
                 self.emit_folded_tuple_not_nops(element)?;
             }
@@ -6562,6 +6553,7 @@ impl Compiler<'_> {
             };
             self.emit(kind.build_opcode_for_unpacking(), 0, 1)?;
             self.emit_collection_constant(constant)?;
+            self.attach_folded_operand_admissions(operand_folds);
             self.emit(kind.extend_opcode(), 1, -1)?;
             self.assembler
                 .add_last_constant_fold_slots(folded_elements_owner_slots(
@@ -6622,16 +6614,13 @@ impl Compiler<'_> {
                         .map(|element| self.source_aware_fold_constant(element))
                         .collect::<Option<Vec<_>>>()
                 {
-                    for element in &list.elts {
-                        if self.context.python_version >= PythonVersion::Py314 {
-                            self.record_folded_value(element)?;
-                        }
-                    }
+                    let operand_folds = self.record_folded_collection_operands(list.elts.iter())?;
                     for element in &list.elts {
                         self.emit_folded_tuple_not_nops(element)?;
                     }
                     self.assembler.set_location(expression_location);
                     self.emit_collection_constant(Constant::Tuple(constants))?;
+                    self.attach_folded_operand_admissions(operand_folds);
                     self.assembler
                         .add_last_constant_fold_slots(folded_elements_owner_slots(
                             self.context.python_version,
@@ -6665,19 +6654,19 @@ impl Compiler<'_> {
                         .iter()
                         .all(|element| self.source_aware_fold_constant(element).is_some()) =>
             {
-                let mut constants = Vec::with_capacity(set.elts.len());
-                for element in &set.elts {
-                    if self.context.python_version >= PythonVersion::Py314 {
-                        self.record_folded_value(element)?;
-                    }
-                    constants.push(self.source_aware_fold_constant(element).unwrap());
-                }
+                let operand_folds = self.record_folded_collection_operands(set.elts.iter())?;
+                let constants = set
+                    .elts
+                    .iter()
+                    .map(|element| self.source_aware_fold_constant(element).unwrap())
+                    .collect();
                 for element in &set.elts {
                     self.emit_folded_tuple_not_nops(element)?;
                 }
                 self.assembler.set_location(expression_location);
                 let constant = self.fold_frozenset_constant(constants);
                 self.emit_collection_constant(constant)?;
+                self.attach_folded_operand_admissions(operand_folds);
                 self.assembler
                     .add_last_constant_fold_slots(folded_elements_owner_slots(
                         self.context.python_version,
