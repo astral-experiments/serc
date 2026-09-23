@@ -479,8 +479,7 @@ impl Compiler<'_> {
         {
             return Ok(self.active_temporary_index(name));
         }
-        if self.context.python_version <= PythonVersion::Py313
-            && let Scope::Class { free_indices, .. } = &self.unit.scope
+        if let Scope::Class { free_indices, .. } = &self.unit.scope
             && let Some(index) = free_indices.get(&name)
             && !(self.is_cell_id(name)
                 && (matches!(self.resolve_name(name), "__class__" | "__classdict__")
