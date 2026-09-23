@@ -2641,13 +2641,19 @@ fn fold_literal_subscript(
     literal: &impl Fn(&Expr) -> Option<Constant>,
     boolean_sequence_repetition: bool,
 ) -> Option<Constant> {
-    fn integer(expression: &Expr, boolean_sequence_repetition: bool) -> Option<usize> {
+    fn component(
+        expression: &Expr,
+        default: usize,
+        boolean_sequence_repetition: bool,
+    ) -> Option<usize> {
         match fold_constant_with_literals(
             expression,
             PythonVersion::Py314,
             &literal_constant,
             boolean_sequence_repetition,
         )? {
+            // Computed None bounds miss CPython's early constant-slice construction.
+            Constant::None if matches!(expression, Expr::NoneLiteral(_)) => Some(default),
             Constant::Bool(value) => Some(usize::from(value)),
             Constant::Int(value) => usize::try_from(value).ok(),
             Constant::SignedInt(value) if value >= 0 => usize::try_from(value).ok(),
@@ -2669,7 +2675,7 @@ fn fold_literal_subscript(
         let Some(expression) = expression else {
             return Some(default);
         };
-        integer(expression, boolean_sequence_repetition).map(|value| value.min(length))
+        component(expression, default, boolean_sequence_repetition).map(|value| value.min(length))
     }
 
     fn indices(
@@ -2690,7 +2696,7 @@ fn fold_literal_subscript(
             boolean_sequence_repetition,
         )?;
         let step = slice.step.as_deref().map_or(Some(1), |expression| {
-            integer(expression, boolean_sequence_repetition)
+            component(expression, 1, boolean_sequence_repetition)
         })?;
         if step == 0 {
             return None;

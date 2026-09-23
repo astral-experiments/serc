@@ -409,6 +409,50 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
             writeln!(scalar_source, "def scalar_{index}(a):\n    return {value}, a[{value}:{value}:{value}], a[{value}:{value}:{value}]").unwrap();
         }
     }
+    let mut slice_source = String::new();
+    for (sequence_index, sequence) in ["'aébc'", "b'abcd'", "(1, 2, 3, 4)", r"'a\ud800bc'"]
+        .into_iter()
+        .enumerate()
+    {
+        for (slice_index, slice) in [
+            ":",
+            "None:2",
+            "1:None",
+            "::None",
+            "None:None:None",
+            "None:3:2",
+            "1:None:2",
+            "1:3:None",
+            "None:None:True",
+            "False:None",
+            "None:True",
+            ":0:None",
+            // Zero, negative, invalid, and dynamic components retain native runtime behavior.
+            "None:None:0",
+            "None:None:False",
+            "None:None:-1",
+            "-2:None",
+            "None:-1",
+            "None:2.0",
+            "'start':None",
+            "None:None:1.5",
+            "value:None",
+            "None:value",
+            "None:None:value",
+            "(None,)[0]:2",
+            ":(None,)[0]",
+            "None:None:(None,)[0]",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            writeln!(
+                slice_source,
+                "def slice_{sequence_index}_{slice_index}(value):\n    return {sequence}[{slice}]"
+            )
+            .unwrap();
+        }
+    }
     for version in [
         serc::PythonVersion::Py312,
         serc::PythonVersion::Py313,
@@ -421,6 +465,7 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
             .join(format!("__pycache__/module.cpython-3{minor}.pyc"));
         let mut sources = vec![
             scalar_source.as_str(),
+            slice_source.as_str(),
             include_str!("../../serc/tests/fixtures/generator_eager_headers.py"),
             "from __future__ import annotations\ndef outer():\n    def inner(value: (lambda: (yield 1))): pass\n    return inner\n",
             include_str!("../../serc/tests/fixtures/complex_division_signed_zeros.py"),
