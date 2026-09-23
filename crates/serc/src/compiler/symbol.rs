@@ -487,7 +487,13 @@ impl Compiler<'_> {
         {
             return Ok(self.active_temporary_index(name));
         }
-        if (self.context.python_version <= PythonVersion::Py313 || !self.is_cell_id(name))
+        if (!self.is_cell_id(name)
+            || self.context.python_version <= PythonVersion::Py313
+                && !self
+                    .control
+                    .comprehensions
+                    .active_comprehension_local_names
+                    .is_empty())
             && let Scope::Class { free_indices, .. } = &self.unit.scope
             && let Some(index) = free_indices.get(&name)
             && !(self.is_cell_id(name)
@@ -500,7 +506,7 @@ impl Compiler<'_> {
                         .any(|locals| locals.contains(name))))
         {
             // Plain comprehension temporaries cannot supply an enclosing free cell.
-            // Legacy targets also prefer free names to inactive comprehension cells.
+            // Within a legacy comprehension, other captured names use enclosing free cells.
             // Own class cells and active comprehension target cells take precedence.
             return Ok(*index);
         }
