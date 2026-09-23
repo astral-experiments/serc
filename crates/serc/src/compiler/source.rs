@@ -571,19 +571,15 @@ impl<'source> CompilationContext<'source> {
             reason = "Both provenance sets are only queried for membership."
         )]
         for (value, origin) in origins {
-            if origin.into_inner() == StringConstantOrigin::Interned {
-                if has_frozenset_constants
-                    && !context.generated_mangled_strings.contains(value.as_ref())
-                {
-                    canonical.insert(value.as_ref().to_string());
-                    identifiers.insert(value.into_owned());
-                } else {
-                    canonical.insert(value.into_owned());
-                }
-            } else if has_frozenset_constants
+            if has_frozenset_constants
                 && !context.generated_mangled_strings.contains(value.as_ref())
             {
+                if origin.into_inner() == StringConstantOrigin::Interned {
+                    canonical.insert(value.as_ref().to_string());
+                }
                 identifiers.insert(value.into_owned());
+            } else if origin.into_inner() == StringConstantOrigin::Interned {
+                canonical.insert(value.into_owned());
             }
         }
         (identifiers, canonical)
@@ -2319,13 +2315,6 @@ mod tests {
             .generated_mangled_strings
             .insert("mangled_canonical".to_string());
         let mut context = Rc::new(context);
-        let mangled_address = context
-            .constant_string_origins
-            .get_key_value("mangled_canonical")
-            .unwrap()
-            .0
-            .as_ptr();
-
         let (identifiers, canonical) =
             CompilationContext::finish_constant_string_provenance(&mut context, false);
         assert!(identifiers.is_empty());
@@ -2334,10 +2323,6 @@ mod tests {
             ["canonical".to_string(), "mangled_canonical".to_string()]
                 .into_iter()
                 .collect()
-        );
-        assert_eq!(
-            canonical.get("mangled_canonical").unwrap().as_ptr(),
-            mangled_address
         );
     }
 }

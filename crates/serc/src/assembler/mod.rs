@@ -747,7 +747,6 @@ impl Assembler {
                 break;
             }
             if !matches!(prefix.operand(), Operand::Value(_))
-                || prefix.location != SourceLocation::NONE
                 || *prefix
                     != Instruction::new(
                         prefix.opcode,
@@ -900,9 +899,8 @@ impl Assembler {
                 instruction.opcode,
                 LOAD_CONST | LOAD_SMALL_INT | LIST_EXTEND | SET_UPDATE | LOAD_SUPER_ATTR
             ) {
-                // These historical slots only affect CFG copy sizing and exception ownership.
-                // The admitted block has no labels or exception regions. Keep the counts and
-                // original-fold marker intact, while still checking every other policy below.
+                // Fold history only affects block copying and exception ownership;
+                // neither applies to this block without labels or exception regions.
                 ordinary.local_policy.add_hidden_exception_owner_slots(
                     instruction.local_policy.hidden_exception_owner_slots(),
                 );

@@ -1753,8 +1753,7 @@ impl OptimizationPipeline {
         // our earlier threading only when all three original arrays still match.
         let original_break_return_bridges = forward_jump_positions
             .iter()
-            .map(|(index, position)| (*index, position))
-            .filter_map(|(source_index, &(block, offset))| {
+            .filter_map(|&(source_index, (block, offset))| {
                 let source_items = graph[block].items();
                 let Item::Instruction(source) = source_items[offset] else {
                     return None;
@@ -1905,8 +1904,7 @@ impl OptimizationPipeline {
         // only while all three original arrays have the same exception coverage.
         let folded_loop_raise_breaks = forward_jump_positions
             .iter()
-            .map(|(index, position)| (*index, position))
-            .filter_map(|(source_index, &(block, offset))| {
+            .filter_map(|&(source_index, (block, offset))| {
                 let source_items = graph[block].items();
                 let Item::Instruction(source) = source_items[offset] else {
                     return None;
@@ -2000,10 +1998,9 @@ impl OptimizationPipeline {
         retained_break_policy.prevent_threading_target();
         let retained_break_backedges = forward_jump_positions
             .iter()
-            .map(|(index, position)| (*index, position))
-            .filter_map(|(source_index, (block, offset))| {
-                let items = graph[*block].items();
-                let Item::Instruction(jump) = items[*offset] else {
+            .filter_map(|&(source_index, (block, offset))| {
+                let items = graph[block].items();
+                let Item::Instruction(jump) = items[offset] else {
                     return None;
                 };
                 if jump.opcode != JUMP_FORWARD
@@ -2014,8 +2011,8 @@ impl OptimizationPipeline {
                     || jump.local_policy.hidden_exception_owner_slots() != 0
                     || jump.exception_policy() != super::super::ExceptionPolicy::default()
                     || jump.no_location_policy != super::super::ir::NoLocationPolicy::default()
-                    || *offset + 1 != items.len()
-                    || items[..*offset]
+                    || offset + 1 != items.len()
+                    || items[..offset]
                         .iter()
                         .any(|item| !matches!(item, Item::Label(_)))
                 {
@@ -2078,8 +2075,7 @@ impl OptimizationPipeline {
         // The usual threading path keeps the source line and accounts for the copied slot.
         let retained_located_backedges = forward_jump_positions
             .iter()
-            .map(|(index, position)| (*index, position))
-            .filter_map(|(source_index, &(block, offset))| {
+            .filter_map(|&(source_index, (block, offset))| {
                 let items = graph[block].items();
                 let Item::Instruction(jump) = items[offset] else {
                     return None;
@@ -2192,10 +2188,9 @@ impl OptimizationPipeline {
         // borrowed-load continuation. Other jumps keep their existing threading.
         let original_break_empty_try_exits = forward_jump_positions
             .iter()
-            .map(|(index, position)| (*index, position))
-            .filter_map(|(source_index, (block, offset))| {
-                let items = graph[*block].items();
-                let Item::Instruction(jump) = items[*offset] else {
+            .filter_map(|&(source_index, (block, offset))| {
+                let items = graph[block].items();
+                let Item::Instruction(jump) = items[offset] else {
                     return None;
                 };
                 let Operand::Forward(entry) = jump.operand() else {
@@ -2212,8 +2207,8 @@ impl OptimizationPipeline {
                 original.jump_policy.prevent_threading_target();
                 if jump != original
                     || jump.location.line < 0
-                    || *offset + 1 != items.len()
-                    || items[..*offset]
+                    || offset + 1 != items.len()
+                    || items[..offset]
                         .iter()
                         .any(|item| !matches!(item, Item::Label(_)))
                 {
@@ -2266,8 +2261,7 @@ impl OptimizationPipeline {
         // keep the break's target, NOP retention, and copying policies unchanged.
         let retained_break_try_owners = forward_jump_positions
             .iter()
-            .map(|(index, position)| (*index, position))
-            .filter_map(|(source_index, &(block, offset))| {
+            .filter_map(|&(source_index, (block, offset))| {
                 let source_items = graph[block].items();
                 let Item::Instruction(jump) = source_items[offset] else {
                     return None;
@@ -2376,8 +2370,7 @@ impl OptimizationPipeline {
         // owner and inherits the target's sole scope fallback, including its policy.
         let named_handler_scope_fallbacks = forward_jump_positions
             .iter()
-            .map(|(index, position)| (*index, position))
-            .filter_map(|(source_index, &(block, offset))| {
+            .filter_map(|&(source_index, (block, offset))| {
                 let items = graph[block].items();
                 let Item::Instruction(jump) = items[offset] else {
                     return None;

@@ -4689,6 +4689,33 @@ fn linear_constant_return_rejects_nontrivial_instructions_and_metadata() {
     assert!(!assembler.has_only_linear_constant_return());
 }
 
+fn assert_linear_matches_graph(
+    build: impl Fn() -> Assembler,
+    local_count: usize,
+    parameter_count: usize,
+) {
+    let linear = build();
+    assert!(linear.has_only_linear_instructions(local_count));
+    let mut generic = build();
+    let graph = super::block_graph::BlockGraph::from_items(
+        generic.linear_items().to_vec(),
+        &rustc_hash::FxHashSet::default(),
+    );
+    let reachable = graph.reachable_blocks(&[]);
+    generic.code = UnoptimizedCode::Prepared { graph, reachable };
+    assert!(!generic.has_only_linear_instructions(local_count));
+
+    let actual = linear.finish_code(1, local_count, parameter_count).unwrap();
+    let expected = generic
+        .finish_code(1, local_count, parameter_count)
+        .unwrap();
+    assert_eq!(actual.bytecode, expected.bytecode);
+    assert_eq!(actual.line_table, expected.line_table);
+    assert_eq!(actual.exception_table, expected.exception_table);
+    assert_eq!(actual.max_depth, expected.max_depth);
+    assert_eq!(actual.removed_max_depth, expected.removed_max_depth);
+}
+
 #[test]
 fn ordinary_linear_instructions_match_the_block_graph_pipeline() {
     let instruction = |opcode, argument, line, depth| {
@@ -4820,29 +4847,12 @@ fn ordinary_linear_instructions_match_the_block_graph_pipeline() {
                     }
                 }
             }
-            let linear = Assembler::from_linear_items(items.clone());
-            assert!(linear.has_only_linear_instructions(local_count));
-            assert!(!linear.has_only_linear_constant_return());
-            let graph = super::block_graph::BlockGraph::from_items(
-                items,
-                &rustc_hash::FxHashSet::default(),
+            assert!(!Assembler::from_linear_items(items.clone()).has_only_linear_constant_return());
+            assert_linear_matches_graph(
+                || Assembler::from_linear_items(items.clone()),
+                local_count,
+                parameter_count,
             );
-            let reachable = graph.reachable_blocks(&[]);
-            let generic = Assembler {
-                code: UnoptimizedCode::Prepared { graph, reachable },
-                ..Assembler::default()
-            };
-            assert!(!generic.has_only_linear_instructions(local_count));
-
-            let actual = linear.finish_code(1, local_count, parameter_count).unwrap();
-            let expected = generic
-                .finish_code(1, local_count, parameter_count)
-                .unwrap();
-            assert_eq!(actual.bytecode, expected.bytecode);
-            assert_eq!(actual.line_table, expected.line_table);
-            assert_eq!(actual.exception_table, expected.exception_table);
-            assert_eq!(actual.max_depth, expected.max_depth);
-            assert_eq!(actual.removed_max_depth, expected.removed_max_depth);
         }
     }
 }
@@ -4914,24 +4924,11 @@ fn ordinary_linear_cells_and_closures_match_the_block_graph_pipeline() {
             ],
         ),
     ] {
-        let linear = Assembler::from_linear_items(items.clone());
-        assert!(linear.has_only_linear_instructions(local_count));
-        let graph =
-            super::block_graph::BlockGraph::from_items(items, &rustc_hash::FxHashSet::default());
-        let reachable = graph.reachable_blocks(&[]);
-        let generic = Assembler {
-            code: UnoptimizedCode::Prepared { graph, reachable },
-            ..Assembler::default()
-        };
-        let actual = linear.finish_code(1, local_count, parameter_count).unwrap();
-        let expected = generic
-            .finish_code(1, local_count, parameter_count)
-            .unwrap();
-        assert_eq!(actual.bytecode, expected.bytecode);
-        assert_eq!(actual.line_table, expected.line_table);
-        assert_eq!(actual.exception_table, expected.exception_table);
-        assert_eq!(actual.max_depth, expected.max_depth);
-        assert_eq!(actual.removed_max_depth, expected.removed_max_depth);
+        assert_linear_matches_graph(
+            || Assembler::from_linear_items(items.clone()),
+            local_count,
+            parameter_count,
+        );
     }
 }
 
@@ -4974,23 +4971,7 @@ fn ordinary_linear_unprotected_folds_and_class_footer_match_the_block_graph_pipe
                     assembler
                 };
                 assert!(build(false).has_only_linear_instructions(0));
-                let linear = build(true);
-                assert!(linear.has_only_linear_instructions(0));
-                let mut generic = build(true);
-                let graph = super::block_graph::BlockGraph::from_items(
-                    generic.linear_items().to_vec(),
-                    &rustc_hash::FxHashSet::default(),
-                );
-                let reachable = graph.reachable_blocks(&[]);
-                generic.code = UnoptimizedCode::Prepared { graph, reachable };
-
-                let actual = linear.finish_code(1, 0, 0).unwrap();
-                let expected = generic.finish_code(1, 0, 0).unwrap();
-                assert_eq!(actual.bytecode, expected.bytecode);
-                assert_eq!(actual.line_table, expected.line_table);
-                assert_eq!(actual.exception_table, expected.exception_table);
-                assert_eq!(actual.max_depth, expected.max_depth);
-                assert_eq!(actual.removed_max_depth, expected.removed_max_depth);
+                assert_linear_matches_graph(|| build(true), 0, 0);
             }
         }
     }
@@ -5038,22 +5019,7 @@ fn linear_literal_fold_history_matches_the_block_graph_pipeline() {
                         .push(folded);
                     assembler
                 };
-                let linear = build();
-                assert!(linear.has_only_linear_instructions(0));
-                let mut generic = build();
-                let graph = super::block_graph::BlockGraph::from_items(
-                    items.clone(),
-                    &rustc_hash::FxHashSet::default(),
-                );
-                let reachable = graph.reachable_blocks(&[]);
-                generic.code = UnoptimizedCode::Prepared { graph, reachable };
-                let actual = linear.finish_code(1, 0, 0).unwrap();
-                let expected = generic.finish_code(1, 0, 0).unwrap();
-                assert_eq!(actual.bytecode, expected.bytecode);
-                assert_eq!(actual.line_table, expected.line_table);
-                assert_eq!(actual.exception_table, expected.exception_table);
-                assert_eq!(actual.max_depth, expected.max_depth);
-                assert_eq!(actual.removed_max_depth, expected.removed_max_depth);
+                assert_linear_matches_graph(build, 0, 0);
             }
         }
     }

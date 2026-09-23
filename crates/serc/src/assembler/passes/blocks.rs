@@ -3295,8 +3295,7 @@ impl OptimizationPipeline {
         let mut absence = vec![None; instructions.len()];
         let mut visited = vec![usize::MAX; instructions.len()];
         let mut path = Vec::new();
-        // Only labeled entries can contribute to the result. Walk their predecessor
-        // chains on demand and share the memoized results for intermediate instructions.
+        // Only labeled entries can contribute to the result.
         #[expect(
             clippy::iter_over_hash_type,
             reason = "Each predecessor chain has an order-independent result."

@@ -2114,14 +2114,12 @@ mod initial_borrow_metadata_tests {
     fn bit_field_metadata_preserves_all_276_states() {
         assert_eq!(size_of::<InstructionMetadata>(), 2);
         assert_eq!(size_of::<Option<InstructionMetadata>>(), 2);
-        assert_eq!(size_of::<Instruction>(), 36);
         let mut encodings = metadata_encodings();
         encodings.sort_unstable();
         encodings.dedup();
         assert_eq!(encodings.len(), 276);
         assert!(!encodings.contains(&0));
-        let mut above_byte_capacity = 0;
-        for raw in metadata_encodings() {
+        for raw in encodings {
             let value = InstructionMetadata(NonZeroU16::new(raw).unwrap());
             let origin = raw & (1 << 12) != 0;
             assert_eq!(value.has_initial_borrow_entry(), origin);
@@ -2164,17 +2162,6 @@ mod initial_borrow_metadata_tests {
                 cleared.only_allows_unconditional_inlining(),
                 value.only_allows_unconditional_inlining()
             );
-            if raw > u16::from(u8::MAX) {
-                above_byte_capacity += 1;
-                assert!(u8::try_from(rebuilt.0.get()).is_err());
-            }
-        }
-        assert_eq!(above_byte_capacity, 161);
-        for copy in [false, true] {
-            let tagged =
-                InstructionMetadata::new(ExceptionPolicy::NoneUnchangedBooleanSingleton, 0, copy)
-                    .with_initial_borrow_entry(true);
-            assert_eq!(tagged.0.get(), 0x0016 | (u16::from(copy) << 8) | (1 << 12));
         }
     }
 

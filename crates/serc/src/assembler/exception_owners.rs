@@ -4694,9 +4694,7 @@ impl LayoutAssembler {
         if self.exception_regions.is_empty() {
             return FxHashMap::default();
         }
-        // Ordinary instructions only update replay state. Owner decisions require
-        // an inserted marker or a dynamic policy, except for the independent
-        // captured-array certificates replayed after the loop.
+        // Only markers, dynamic policies, or captured arrays can change owners.
         let provenance = &self.exception_owner_provenance;
         if provenance.normal_try_break_pop_owners.is_empty()
             && provenance.named_handler_truth_prefixes.is_empty()

@@ -242,8 +242,7 @@ impl OptimizationPipeline {
         let mut blocks = graph.partition_positions(&block_labels, |instruction| {
             !matches!(instruction.operand(), Operand::Value(_)) || ends_scope(instruction.opcode)
         });
-        // Both swap phases operate within these partitions. A partition without
-        // a swap cannot produce a rotation, a rewritten slot, or a static store gap.
+        // Both swap phases operate within partitions containing a swap.
         blocks.retain(|block| {
             block.iter().any(|&position| {
                 matches!(graph.item(position), Item::Instruction(instruction)
