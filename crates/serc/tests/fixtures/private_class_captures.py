@@ -104,3 +104,57 @@ Annotated = annotated(int)
 assert Annotated().method() is int
 assert Annotated.__annotations__ == {"field": int, "conditional": int}
 assert Annotated.method.__annotations__ == {"return": int}
+
+
+def unbound_private_headers():
+    class Outer:
+        class Container[T: __key]:
+            pass
+    return Outer
+
+
+unbound_private_headers()
+
+
+def mixed_private_headers(__key, _Outer__key):
+    class Outer:
+        body = __key
+        class Container[T: __key]:
+            pass
+    return Outer
+
+
+Mixed = mixed_private_headers(41, 42)
+assert Mixed.body == 42
+assert Mixed.Container.__type_params__[0].__bound__ == 41
+
+
+def private_parameter_header(__key):
+    class C[__key]:
+        class Child[T: __key]:
+            pass
+    return C
+
+
+assert private_parameter_header(42).Child.__type_params__[0].__bound__ == 42
+
+
+def unmangled_parameter_header(__key):
+    class _[__key]:
+        class Child[T: __key]:
+            pass
+    return _
+
+
+ParameterHeader = unmangled_parameter_header(42)
+assert ParameterHeader.Child.__type_params__[0].__bound__ is ParameterHeader.__type_params__[0]
+
+
+class Same:
+    def generic_context(__key):
+        class _Same[T]:
+            value = __key
+        return _Same
+
+
+assert Same.generic_context(42).value == 42

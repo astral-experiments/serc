@@ -29,9 +29,24 @@ impl Compiler<'_> {
 
     /// Direct annotation references honor class bindings before enclosing closure cells.
     pub(super) fn class_scope_shadows_annotation_name(&self, name: NameId) -> bool {
+        if self
+            .unit
+            .mangled_names
+            .as_ref()
+            .is_some_and(|names| !names.contains(self.resolve_name(name)))
+        {
+            return self.class_scope_shadows_unmangled_annotation_name(name);
+        }
         self.scope_arena()
             .class(self.unit.scope_id)
             .is_some_and(|plan| plan.globals.contains(&name) || plan.bound_names.contains(&name))
+    }
+
+    /// Restricted generic headers compare raw names against emitted class bindings.
+    pub(super) fn class_scope_shadows_unmangled_annotation_name(&self, name: NameId) -> bool {
+        self.scope_arena()
+            .class(self.unit.scope_id)
+            .is_some_and(|plan| plan.canonical_annotation_shadows.contains(&name))
     }
 
     pub(super) fn function_scope_id(
@@ -379,6 +394,8 @@ pub(super) struct ScopeBodyFacts {
     pub(super) nested_lambda_requirements: BTreeSet<String>,
     pub(super) nested_generator_requirements: BTreeSet<String>,
     pub(super) nested_annotation_scope_requirements: BTreeSet<String>,
+    unmangled_class_header_requirements: BTreeSet<String>,
+    unmangled_class_header_captures: BTreeSet<String>,
     nested_annotation_class_closure: bool,
     annotation_class_reference: bool,
     annotation_comprehension_requirements: AnnotationComprehensionRequirements,
@@ -851,10 +868,13 @@ struct ClassPlan {
     globals: FxHashSet<NameId>,
     nonlocals: FxHashSet<NameId>,
     bound_names: FxHashSet<NameId>,
+    canonical_annotation_shadows: FxHashSet<NameId>,
     comprehension_targets: Vec<(NameId, bool)>,
     comprehension_cells: FxHashSet<NameId>,
     required: FxHashSet<NameId>,
     type_parameter_names: FxHashSet<NameId>,
+    canonical_type_parameter_names: FxHashSet<NameId>,
+    unmangled_required: FxHashSet<NameId>,
     enclosing_names: FxHashMap<NameId, NameId>,
     needs_class_closure: bool,
     needs_classdict: bool,
@@ -869,6 +889,7 @@ pub(super) struct LoweringClassPlan {
     pub(super) comprehension_targets: Vec<(NameId, bool)>,
     pub(super) comprehension_cells: FxHashSet<NameId>,
     pub(super) required: FxHashSet<NameId>,
+    pub(super) unmangled_required: FxHashSet<NameId>,
     pub(super) enclosing_names: FxHashMap<NameId, NameId>,
     pub(super) needs_class_closure: bool,
     pub(super) needs_classdict: bool,
@@ -885,6 +906,7 @@ impl ClassPlan {
         method_requirements: &FxHashSet<NameId>,
         method_annotation_references: &FxHashSet<NameId>,
         nested_class_requirements: &FxHashSet<NameId>,
+        nested_unmangled_requirements: &FxHashSet<NameId>,
         child_needs_class_closure: bool,
     ) -> Self {
         // Symbol analysis records every annotation in a compound statement, even
@@ -903,6 +925,8 @@ impl ClassPlan {
             nested_lambda_requirements,
             nested_generator_requirements,
             nested_annotation_scope_requirements: annotation_scope_requirements,
+            unmangled_class_header_requirements,
+            unmangled_class_header_captures,
             nested_annotation_class_closure,
             annotation_class_reference,
             annotation_comprehension_requirements,
@@ -982,6 +1006,24 @@ impl ClassPlan {
                 .into_iter()
                 .filter(|name| !is_bound(name) && !is_global(name)),
         );
+        // A generic class header restricts mangling to its own type parameters.
+        // Its other private spellings are raw names, independent of body bindings.
+        let mut unmangled_required = unmangled_class_header_requirements
+            .into_iter()
+            .filter(|name| {
+                !locals.seen.iter().any(|bound| {
+                    mangle_name(bound.as_str(), Some(definition.name.as_str())) == name.as_str()
+                }) && !locals.globals.iter().any(|global| {
+                    mangle_name(global, Some(definition.name.as_str())) == name.as_str()
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        unmangled_required.extend(unmangled_class_header_captures);
+        unmangled_required.extend(
+            nested_unmangled_requirements
+                .iter()
+                .map(|name| names.resolve(*name).to_string()),
+        );
         let body_requires_dunder_class =
             body_explicitly_references_dunder_class && required.contains("__class__");
 
@@ -1055,7 +1097,15 @@ impl ClassPlan {
             .into_iter()
             .map(|(name, requires_free)| (names.intern(name.as_str()), requires_free))
             .collect();
+        let canonical_annotation_shadows = locals
+            .seen
+            .iter()
+            .map(Name::as_str)
+            .chain(locals.globals.iter().map(String::as_str))
+            .map(|name| names.intern(&mangle_name(name, Some(definition.name.as_str()))))
+            .collect();
         Self {
+            canonical_annotation_shadows,
             globals: names.intern_set(locals.globals),
             nonlocals: names.intern_set(locals.nonlocals),
             bound_names: locals
@@ -1066,11 +1116,23 @@ impl ClassPlan {
             comprehension_targets,
             comprehension_cells: names.intern_set(inlined_comprehension_cellvars),
             required: names.intern_set(required),
+            unmangled_required: names.intern_set(unmangled_required),
             type_parameter_names: definition
                 .type_params
                 .iter()
                 .flat_map(|parameters| parameters.iter())
                 .map(|parameter| names.intern(parameter.name().as_str()))
+                .collect(),
+            canonical_type_parameter_names: definition
+                .type_params
+                .iter()
+                .flat_map(|parameters| parameters.iter())
+                .map(|parameter| {
+                    names.intern(&mangle_name(
+                        parameter.name().as_str(),
+                        Some(definition.name.as_str()),
+                    ))
+                })
                 .collect(),
             enclosing_names: FxHashMap::default(),
             needs_class_closure,
@@ -1088,6 +1150,7 @@ impl ClassPlan {
             comprehension_cells: self.comprehension_cells.clone(),
             required: self.required.clone(),
             enclosing_names: self.enclosing_names.clone(),
+            unmangled_required: self.unmangled_required.clone(),
             needs_class_closure: self.needs_class_closure,
             needs_classdict: self.needs_classdict,
             has_conditional_annotations: self.has_conditional_annotations,
@@ -1389,7 +1452,8 @@ impl ScopeArena {
         };
         let (nested_function_requirements, nested_function_annotation_references) =
             self.nested_function_requirements(id);
-        let class_requirements = self.nested_class_requirements(id);
+        let (mut class_requirements, unmangled_requirements) = self.nested_class_requirements(id);
+        class_requirements.extend(unmangled_requirements);
         let plan = FunctionPlan::build(
             &mut self.names,
             definition,
@@ -1424,7 +1488,8 @@ impl ScopeArena {
         }
         let (method_requirements, method_annotation_references) =
             self.nested_function_requirements(id);
-        let nested_class_requirements = self.nested_class_requirements(id);
+        let (nested_class_requirements, nested_unmangled_requirements) =
+            self.nested_class_requirements(id);
         let dunder_class = self.names.get("__class__");
         let child_needs_class_closure = self.nodes[id].children.iter().any(|child| {
             dunder_class.is_some_and(|dunder_class| match &self.nodes[*child].plan {
@@ -1442,6 +1507,7 @@ impl ScopeArena {
             &method_requirements,
             &method_annotation_references,
             &nested_class_requirements,
+            &nested_unmangled_requirements,
             child_needs_class_closure,
         );
         if enclosing_private_name.map(|name| name.trim_start_matches('_'))
@@ -1504,22 +1570,28 @@ impl ScopeArena {
         (required, annotation_references)
     }
 
-    fn nested_class_requirements(&self, parent: ScopeId) -> FxHashSet<NameId> {
-        self.nodes[parent]
-            .children
-            .iter()
-            .filter_map(|child| match &self.nodes[*child].plan {
-                ScopePlan::Class(plan) => Some(plan),
-                ScopePlan::Module | ScopePlan::Function(_) => None,
-            })
-            .flat_map(|plan| {
+    fn nested_class_requirements(&self, parent: ScopeId) -> (FxHashSet<NameId>, FxHashSet<NameId>) {
+        let mut required = FxHashSet::default();
+        let mut unmangled_required = FxHashSet::default();
+        for child in &self.nodes[parent].children {
+            let ScopePlan::Class(plan) = &self.nodes[*child].plan else {
+                continue;
+            };
+            required.extend(
                 plan.required
                     .iter()
                     // The synthetic generic scope provides these cells to the class.
                     .filter(|name| !plan.type_parameter_names.contains(*name))
-                    .map(|name| plan.enclosing_names.get(name).copied().unwrap_or(*name))
-            })
-            .collect()
+                    .map(|name| plan.enclosing_names.get(name).copied().unwrap_or(*name)),
+            );
+            unmangled_required.extend(
+                plan.unmangled_required
+                    .iter()
+                    .filter(|name| !plan.canonical_type_parameter_names.contains(*name))
+                    .copied(),
+            );
+        }
+        (required, unmangled_required)
     }
 
     fn child(&self, parent: ScopeId, origin: ScopeOrigin) -> Option<ScopeId> {
@@ -3252,6 +3324,11 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
             return;
         };
         self.facts.has_generic_definition = true;
+        // Keep this restricted header's captures separate until their lexical origin
+        // has been recorded; an earlier body use can have the same source spelling.
+        let body_lambda_requirements = std::mem::take(&mut self.facts.nested_lambda_requirements);
+        let body_comprehension_captures =
+            std::mem::take(&mut self.facts.annotation_comprehension_requirements.captures);
         self.collect_type_parameter_class_closures(type_params);
         self.collect_type_parameter_comprehensions(type_params);
         let type_names: BTreeSet<_> = type_params
@@ -3286,9 +3363,53 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
                 }
             }
         }
+        let is_unmangled_private = |name: &str| {
+            self.class_scope
+                && name.starts_with("__")
+                && !name.ends_with("__")
+                && !name.contains('.')
+        };
+        for name in required.difference(&type_names) {
+            if is_unmangled_private(name) {
+                self.facts
+                    .unmangled_class_header_requirements
+                    .insert(name.clone());
+            } else {
+                self.facts
+                    .nested_annotation_scope_requirements
+                    .insert(name.clone());
+            }
+        }
+        self.facts.nested_lambda_requirements.retain(|name| {
+            if is_unmangled_private(name) {
+                self.facts
+                    .unmangled_class_header_captures
+                    .insert(name.clone());
+                false
+            } else {
+                true
+            }
+        });
         self.facts
-            .nested_annotation_scope_requirements
-            .extend(required.difference(&type_names).cloned());
+            .annotation_comprehension_requirements
+            .captures
+            .retain(|name| {
+                if is_unmangled_private(name) {
+                    self.facts
+                        .unmangled_class_header_captures
+                        .insert(name.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        self.facts
+            .nested_lambda_requirements
+            .extend(body_lambda_requirements);
+        self.facts
+            .annotation_comprehension_requirements
+            .captures
+            .extend(body_comprehension_captures);
     }
 
     /// Annotation scopes request the current class cell, independently of class-body captures.

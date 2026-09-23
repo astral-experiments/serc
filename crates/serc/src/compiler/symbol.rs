@@ -473,7 +473,7 @@ impl Compiler<'_> {
         self.closure_index_id(name_id)
     }
 
-    fn closure_index_id(&self, name: NameId) -> Result<u32, CompileError> {
+    pub(super) fn closure_index_id(&self, name: NameId) -> Result<u32, CompileError> {
         if self.symbols.active_temporaries.contains(name)
             && self.symbols.active_temporary_free_cells.contains(name)
         {
@@ -509,13 +509,13 @@ impl Compiler<'_> {
                         self.resolve_name(name)
                     ))
                 }),
-            Scope::Class { .. } => self
-                .symbols
-                .locals
+            Scope::Class { free_indices, .. } => self.symbols.locals
+                [..self.symbols.locals.len() - self.symbols.free_names.len()]
                 .iter()
                 .position(|local| *local == name)
                 .map(|index| to_u32(index, "class closure variable index"))
                 .transpose()?
+                .or_else(|| free_indices.get(&name).copied())
                 .ok_or_else(|| {
                     let name = self.resolve_name(name);
                     let locals = self.name_strings(self.symbols.locals.iter().copied());
@@ -578,9 +578,44 @@ impl Compiler<'_> {
         }
     }
 
+    /// Resolve an emitted capture identity without applying the current source-name context.
+    pub(super) fn physical_closure_index(&self, name: NameId) -> Result<Option<u32>, CompileError> {
+        let spelling = self.resolve_name(name);
+        // Own synthetic class cells and active comprehension cells retain their precedence.
+        for candidate in self.symbols.cell_names.iter_unordered() {
+            if self.mangled_name(self.resolve_name(candidate)) == spelling
+                && (!self.symbols.hidden_names.contains(candidate)
+                    || self.symbols.active_temporaries.contains(candidate))
+                && self.can_provide_closure_id(candidate)
+            {
+                return self.closure_index_id(candidate).map(Some);
+            }
+        }
+        let start = self.symbols.locals.len() - self.symbols.free_names.len();
+        for (index, candidate) in self.symbols.free_names.iter().enumerate() {
+            let matches = if self.unit.free_names_are_final {
+                *candidate == name
+            } else {
+                self.mangled_name(self.resolve_name(*candidate)) == spelling
+            };
+            if matches {
+                return to_u32(start + index, "physical closure variable index").map(Some);
+            }
+        }
+        Ok(None)
+    }
+
     pub(super) fn emit_closure_tuple(&mut self, names: &[NameId]) -> Result<(), CompileError> {
-        for name in names {
-            let local = self.closure_index_id(*name)?;
+        let indices = names
+            .iter()
+            .map(|name| self.closure_index_id(*name))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.emit_closure_indices(&indices)
+    }
+
+    /// Emit a closure tuple whose lexical identities have already resolved to physical slots.
+    pub(super) fn emit_closure_indices(&mut self, indices: &[u32]) -> Result<(), CompileError> {
+        for &local in indices {
             if self.context.python_version == PythonVersion::Py312 {
                 self.emit(crate::target::opcodes::LOAD_CLOSURE, local, 1)?;
                 continue;
@@ -593,7 +628,7 @@ impl Compiler<'_> {
             self.assembler
                 .prevent_instruction_fusion_with_previous(emitted);
         }
-        self.emit_build(BUILD_TUPLE, names.len())
+        self.emit_build(BUILD_TUPLE, indices.len())
     }
 
     pub(super) fn emit_pending_comprehension_restores(

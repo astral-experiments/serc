@@ -504,11 +504,6 @@ fn generic_class_headers_respect_enclosing_class_bindings() {
 fn private_class_captures_match_native_marshal_and_execution() {
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("private_class_captures.py");
-    fs_err::write(
-        &source_path,
-        include_str!("../../serc/tests/fixtures/private_class_captures.py"),
-    )
-    .unwrap();
 
     for version in [
         serc::PythonVersion::Py312,
@@ -516,6 +511,14 @@ fn private_class_captures_match_native_marshal_and_execution() {
         serc::PythonVersion::Py314,
         serc::PythonVersion::Py315,
     ] {
+        let mut source =
+            include_str!("../../serc/tests/fixtures/private_class_captures.py").to_string();
+        if version >= serc::PythonVersion::Py313 {
+            source.push_str(include_str!(
+                "../../serc/tests/fixtures/private_class_header_lambdas.py"
+            ));
+        }
+        fs_err::write(&source_path, source).unwrap();
         let oracle = || match version {
             serc::PythonVersion::Py312 => common::python_312_command(),
             serc::PythonVersion::Py313 => common::python_313_command(),
