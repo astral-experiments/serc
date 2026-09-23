@@ -778,13 +778,17 @@ impl Compiler<'_> {
         let type_parameter_requirements = self.type_parameter_scope_requirements(type_params);
         let mut type_parameter_cell_requirements = type_parameter_requirements.clone();
         let mut wrapper_requirements = type_parameter_requirements;
+        let mut header_references = ReferenceCollector::default();
         if let Some(arguments) = definition.arguments.as_deref() {
             for argument in &arguments.args {
-                wrapper_requirements.extend(expression_required_names(argument));
+                header_references.visit_expr(argument);
+                wrapper_requirements.extend(self.class_visible_annotation_requirements(argument));
                 type_parameter_cell_requirements.extend(nested_expression_required_names(argument));
             }
             for keyword in &arguments.keywords {
-                wrapper_requirements.extend(expression_required_names(&keyword.value));
+                header_references.visit_expr(&keyword.value);
+                wrapper_requirements
+                    .extend(self.class_visible_annotation_requirements(&keyword.value));
                 type_parameter_cell_requirements
                     .extend(nested_expression_required_names(&keyword.value));
             }
@@ -820,8 +824,18 @@ impl Compiler<'_> {
             let classdict = self.required_name_id("__classdict__");
             self.insert_lexical_name(&mut freevars, classdict);
         }
+        // Direct header loads honor class bindings even when a nested expression still
+        // captures the same name. Type parameters keep their own fast-local or cell lookup.
+        let globals = header_references
+            .references
+            .iter()
+            .map(|name| self.required_name_id(name))
+            .filter(|name| !type_names.contains(name))
+            .filter(|name| self.class_scope_shadows_annotation_name(*name))
+            .collect();
         let plan = LoweringFunctionPlan {
             locals,
+            globals,
             cellvars,
             freevars,
             ..LoweringFunctionPlan::default()

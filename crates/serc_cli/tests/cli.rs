@@ -365,6 +365,142 @@ fn compile_preserves_empty_sequence_repetition_boundaries() {
 }
 
 #[test]
+fn generic_class_headers_respect_enclosing_class_bindings() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("generic_class_header.py");
+    let prelude =
+        "class Base:\n    def __init_subclass__(cls, *, value):\n        cls.value = value\n";
+    for version in [
+        serc::PythonVersion::Py312,
+        serc::PythonVersion::Py313,
+        serc::PythonVersion::Py314,
+        serc::PythonVersion::Py315,
+    ] {
+        let mut sources = Vec::new();
+        for keyword in [false, true] {
+            for (before, after, expected) in [
+                ("        x = tuple\n        del x\n", "", "list"),
+                ("", "        x = tuple\n", "list"),
+                (
+                    "        global x\n        locals()['x'] = tuple\n",
+                    "",
+                    "list",
+                ),
+                ("        x = tuple\n", "", "tuple"),
+                ("", "", "dict"),
+            ] {
+                let (header, result) = if keyword {
+                    ("Base, value=x", "C.D.value")
+                } else {
+                    ("x", "C.D.__bases__[0]")
+                };
+                sources.push(format!(
+                    "{prelude}x = list\ndef outer(x):\n    class C:\n{before}        def keep(self): return x\n        class D[T]({header}): pass\n{after}    return C\nC = outer(dict)\nassert {result} is {expected}\nassert C.keep(None) is dict\n"
+                ));
+            }
+            let (header, result) = if keyword {
+                ("Base, value=x", "C.D.value")
+            } else {
+                ("x", "C.D.__bases__[0]")
+            };
+            sources.push(format!(
+                "{prelude}x = list\ndef outer(x):\n    class C:\n        x = tuple\n        del x\n        class D[T]({header}):\n            def keep(self): return x\n    return C\nC = outer(dict)\nassert {result} is list\nassert C.D.keep(None) is dict\n"
+            ));
+            // CPython 3.12 rejects lambdas and comprehensions in class-visible annotation scopes.
+            if version >= serc::PythonVersion::Py313 {
+                for before in [
+                    "        x = tuple\n        del x\n",
+                    "        global x\n        locals()['x'] = tuple\n",
+                ] {
+                    for (expression, expected) in [
+                        ("(lambda: x)()", "dict"),
+                        ("(x, lambda: x)[0]", "list"),
+                        ("[x for _ in (0,)][0]", "dict"),
+                        ("(x, [x for _ in (0,)])[0]", "list"),
+                        ("[x for x in (x,)][0]", "list"),
+                        ("next(x for _ in (0,))", "dict"),
+                        ("(x, (x for _ in (0,)))[0]", "list"),
+                        ("next(item for item in (x,))", "list"),
+                    ] {
+                        let (header, result) = if keyword {
+                            (format!("Base, value={expression}"), "C.D.value")
+                        } else {
+                            (expression.to_string(), "C.D.__bases__[0]")
+                        };
+                        for seed in ["", "        def keep(self): return x\n"] {
+                            sources.push(format!(
+                                "{prelude}x = list\ndef outer(x):\n    class C:\n{before}{seed}        class D[T]({header}): pass\n    return C\nC = outer(dict)\nassert {result} is {expected}\n"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        for (declaration, captured_direct) in [
+            ("    T = int\n", "int"),
+            ("    T = int\n    del T\n", "C.D.__type_params__[0]"),
+            ("    global T\n", "C.D.__type_params__[0]"),
+        ] {
+            sources.push(format!(
+                "{prelude}T = str\nclass C:\n{declaration}    class D[T](Base, value=T): pass\nassert C.D.value is C.D.__type_params__[0]\n"
+            ));
+            if version >= serc::PythonVersion::Py313 {
+                sources.push(format!(
+                    "{prelude}T = str\nclass C:\n{declaration}    class D[T](Base, value=(T, lambda: T)): pass\nassert C.D.value[0] is {captured_direct}\nassert C.D.value[1]() is C.D.__type_params__[0]\n"
+                ));
+            }
+        }
+        let (_, minor, _) = version.target().version;
+        let pyc_path = directory.path().join(format!(
+            "__pycache__/generic_class_header.cpython-3{minor}.pyc"
+        ));
+        let native_path = directory.path().join("native.pyc");
+        let oracle = || match version {
+            serc::PythonVersion::Py312 => common::python_312_command(),
+            serc::PythonVersion::Py313 => common::python_313_command(),
+            serc::PythonVersion::Py314 => common::python_3145_command(),
+            serc::PythonVersion::Py315 => common::python_315_command(),
+        };
+        for source in sources {
+            fs_err::write(&source_path, &source).unwrap();
+            let output = serc()
+                .args([
+                    "compile",
+                    "--quiet",
+                    "--python-version",
+                    &version.to_string(),
+                ])
+                .arg(&source_path)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{version}: {source}: {output:?}");
+            let native = oracle()
+                .args([
+                    "-B", "-c",
+                    "import py_compile, sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True, optimize=0, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)",
+                ])
+                .arg(&source_path)
+                .arg(&native_path)
+                .output()
+                .unwrap();
+            assert!(native.status.success(), "{version}: {source}: {native:?}");
+            assert_eq!(
+                fs_err::read(&pyc_path).unwrap(),
+                fs_err::read(&native_path).unwrap(),
+                "Python {version}: {source}"
+            );
+            for artifact in [&native_path, &pyc_path] {
+                let output = oracle().arg("-B").arg(artifact).output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{version}: {artifact:?}: {source}: {output:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn compile_matches_cpython_for_version_specific_marshal_identity() {
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("module.py");

@@ -3260,9 +3260,15 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
             .map(|parameter| parameter.name().as_str().to_string())
             .collect();
         let mut required = type_parameter_required_names(type_params);
+        // Nested captures bypass class bindings; direct header loads use the class namespace.
         if let Some(arguments) = definition.arguments.as_deref() {
             for argument in &arguments.args {
                 self.collect_annotation_comprehensions(argument, Some(type_params));
+                self.facts.nested_lambda_requirements.extend(
+                    annotation_nested_required_names(argument)
+                        .difference(&type_names)
+                        .cloned(),
+                );
                 required.extend(expression_required_names(argument));
                 if !type_names.contains("__class__") {
                     self.collect_annotation_class_reference(argument);
@@ -3270,6 +3276,11 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
             }
             for keyword in &arguments.keywords {
                 self.collect_annotation_comprehensions(&keyword.value, Some(type_params));
+                self.facts.nested_lambda_requirements.extend(
+                    annotation_nested_required_names(&keyword.value)
+                        .difference(&type_names)
+                        .cloned(),
+                );
                 required.extend(expression_required_names(&keyword.value));
                 if !type_names.contains("__class__") {
                     self.collect_annotation_class_reference(&keyword.value);
