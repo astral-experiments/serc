@@ -19,12 +19,11 @@ fn instruction_items_remain_cache_compact() {
         4
     );
 
-    // Five copied-slot counts plus the original-entry state give six metadata states.
-    // 23 policies * 6 states * 2 copy modes require 276 nonzero values, so metadata
-    // uses NonZeroU16. The intentional 32-to-36-byte increase costs 12.5% per item.
-    // Keep the Item and Option layouts compact despite the wider metadata.
-    assert_eq!(std::mem::size_of::<Instruction>(), 36);
-    assert_eq!(std::mem::size_of::<Item>(), 36);
+    // NonZeroU16 policy metadata preserves a niche for Item and Option<Instruction>.
+    // The full-width folded-admission handle raises the previous 36-byte budget to
+    // 40 bytes (11.1% per item), keeping occurrence identity intact through exit copies.
+    assert_eq!(std::mem::size_of::<Instruction>(), 40);
+    assert_eq!(std::mem::size_of::<Item>(), 40);
     assert_eq!(
         std::mem::size_of::<Option<Instruction>>(),
         std::mem::size_of::<Instruction>(),
