@@ -502,9 +502,9 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
     }
 
     #[inline]
-    fn strings(&mut self, values: &'code [String]) -> bool {
+    fn names(&mut self, code: &'code CodeObject) -> bool {
         let object = self.next_object(OccurrenceKind::Strings);
-        self.tuple_header(object, values.len(), ReferenceMode::IfShared)
+        self.tuple_header(object, code.names.len(), ReferenceMode::IfShared)
     }
 
     #[inline]

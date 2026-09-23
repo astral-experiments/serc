@@ -3,6 +3,7 @@ use ruff_index::IndexVec;
 use std::collections::hash_map::Entry;
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 use crate::code_object::{
     CodeInterningSummary, CodeObject, CompilationInterningEvent, Constant, MetadataId,
@@ -179,6 +180,7 @@ pub(super) struct ObjectGraph<'a> {
     cached_empty_tuple: Option<ObjectId>,
     cached_scalar_ids: Option<Box<[Option<ObjectId>]>>,
     cache_scalars: bool,
+    preallocated_interned_strings: bool,
     uncached_percent_constant: bool,
     fresh_empty_bytes_constant: bool,
     needs_reference_sorting: bool,
@@ -247,11 +249,27 @@ impl<'a> ObjectGraph<'a> {
         let explicitly_interned = (!explicitly_interned.is_empty()).then_some(&explicitly_interned);
         let recreated_frozensets =
             (!recreated_frozensets.is_empty()).then_some(&recreated_frozensets);
-        let metadata_slots = usize::try_from(code.marshal_provenance.metadata_ids.domain_len)
+        let metadata_domain = usize::try_from(code.marshal_provenance.metadata_ids.domain_len)
             .ok()
-            .filter(|len| *len <= MAX_DENSE_METADATA_SLOTS)
+            .filter(|len| *len <= MAX_DENSE_METADATA_SLOTS);
+        let metadata_slots = metadata_domain
             .map(|len| vec![None; len].into_boxed_slice())
             .unwrap_or_default();
+        // The compiler's metadata domain spans every nested code object. Reserving that map once
+        // avoids repeated growth from recounting the same local and metadata spellings per code.
+        // A sorting replay already knows the exact number of strings its first graph discovered.
+        let interned_capacity = sort_graph
+            .map(|graph| graph.interned_strings.len())
+            .or_else(|| {
+                code.marshal_provenance
+                    .metadata_tuple_properties
+                    .as_ref()
+                    .and(metadata_domain)
+            });
+        let mut interned_strings = FxHashMap::default();
+        if let Some(capacity) = interned_capacity {
+            interned_strings.reserve(capacity);
+        }
         let mut graph = Self {
             python_version,
             legacy_qualified_name_aliases: if python_version == PythonVersion::Py312 {
@@ -261,6 +279,8 @@ impl<'a> ObjectGraph<'a> {
             },
             metadata_aliased_constants: collect_metadata_aliased_constants(code, &metadata_tuples),
             cache_scalars: code.constants.len() >= MIN_CACHED_SCALAR_CONSTANTS,
+            preallocated_interned_strings: interned_capacity.is_some(),
+            interned_strings,
             uncached_percent_constant: code.marshal_provenance.uncached_percent_constant,
             fresh_empty_bytes_constant: code.marshal_provenance.fresh_empty_bytes_constant,
             metadata_slots,
@@ -338,7 +358,9 @@ impl<'a> ObjectGraph<'a> {
             .saturating_add(3);
         self.objects
             .reserve(estimated_descendants.saturating_sub(interned_strings));
-        self.interned_strings.reserve(interned_strings);
+        if !self.preallocated_interned_strings {
+            self.interned_strings.reserve(interned_strings);
+        }
         self.objects_by_id
             .raw
             .reserve(estimated_descendants.saturating_add(1));
@@ -359,7 +381,11 @@ impl<'a> ObjectGraph<'a> {
     }
 
     fn record_keyed(&mut self, kind: OccurrenceKind, key: ObjectKey<'a>) -> bool {
-        let (id, first) = self.record_object(key.into());
+        self.record_hashed(kind, key.into())
+    }
+
+    fn record_hashed(&mut self, kind: OccurrenceKind, key: HashedObjectKey<'a>) -> bool {
+        let (id, first) = self.record_object(key);
         self.occurrences.push(Occurrence { object: id, kind });
         first
     }
@@ -704,11 +730,33 @@ fn collect_metadata_tuple_keys<'a>(
     code: &'a CodeObject,
     keys: &mut FxHashSet<HashedObjectKey<'a>>,
 ) {
-    if code.names.iter().any(|value| !should_intern(value)) {
-        keys.insert(strings_tuple_key(&code.names).into());
+    if let Some(properties) = code.marshal_provenance.metadata_tuple_properties {
+        if !properties.names.automatically_interned {
+            keys.insert(HashedObjectKey::with_hash(
+                strings_tuple_key(&code.names),
+                properties.names.hash,
+            ));
+        }
+        if !properties.locals.automatically_interned {
+            keys.insert(hashed_locals_tuple_key(code, properties.locals.hash));
+        }
+    } else {
+        if code.names.iter().any(|value| !should_intern(value)) {
+            keys.insert(strings_tuple_key(&code.names).into());
+        }
+        if code.locals.iter().any(|value| !should_intern(value)) {
+            keys.insert(locals_tuple_key(code).into());
+        }
     }
-    if code.locals.iter().any(|value| !should_intern(value)) {
-        keys.insert(locals_tuple_key(code).into());
+}
+
+fn hashed_locals_tuple_key(code: &CodeObject, hash: u64) -> HashedObjectKey<'_> {
+    let key = locals_tuple_key(code);
+    if matches!(&key, ObjectKey::AnnotationLocals(_)) {
+        // Fresh annotation locals use the code object's eventual address, not their values.
+        key.into()
+    } else {
+        HashedObjectKey::with_hash(key, hash)
     }
 }
 
@@ -728,62 +776,60 @@ fn collect_explicitly_interned<'a>(
             .iter()
             .map(String::as_str),
     );
-    let (has_qualified_name_constant, frozenset_recreation_need) =
-        if !code.marshal_provenance.subtree_has_frozenset_constants {
-            (
-                collect_interning_provenance_without_frozensets(
-                    code,
-                    values,
-                    metadata_tuples,
-                    needs_metadata_alias_scan,
-                ),
-                FrozensetRecreationNeed::None,
-            )
-        } else {
-            collect_interning_provenance(
-                code,
-                python_version,
-                values,
-                metadata_tuples,
-                needs_metadata_alias_scan,
-            )
-        };
-    if !has_qualified_name_constant || python_version == PythonVersion::Py312 {
+    let mut qualified_names = QualifiedNameConstants {
+        track: python_version != PythonVersion::Py312,
+        ..QualifiedNameConstants::default()
+    };
+    let frozenset_recreation_need = if !code.marshal_provenance.subtree_has_frozenset_constants {
+        collect_interning_provenance_without_frozensets(
+            code,
+            values,
+            metadata_tuples,
+            needs_metadata_alias_scan,
+            &mut qualified_names,
+        );
+        FrozensetRecreationNeed::None
+    } else {
+        collect_interning_provenance(
+            code,
+            python_version,
+            values,
+            metadata_tuples,
+            needs_metadata_alias_scan,
+            &mut qualified_names,
+        )
+    };
+    if qualified_names.origins.is_empty() {
         return frozenset_recreation_need;
     }
 
     // A class body normally loads the same qualified-name object that becomes its interned code
     // metadata. If an equal ordinary constant reached the compilation-wide constant cache first,
     // the class constant instead reuses that plain object and remains distinct from the metadata.
-    let mut qualified_name_constants = FxHashSet::default();
-    let mut qualified_name_values = FxHashSet::default();
-    let mut recorded_origins = FxHashMap::default();
-    collect_qualified_name_constants(
-        code,
-        &mut qualified_name_constants,
-        &mut qualified_name_values,
-        &mut recorded_origins,
-    );
-    let mut seen = FxHashSet::default();
     let mut ordinary_first = FxHashSet::default();
-    if recorded_origins.len() != qualified_name_values.len() {
+    if qualified_names.origins.values().any(Option::is_none) {
+        // Compiler provenance includes earlier admissions from discarded code. Only spellings
+        // without a recorded origin require reconstructing their surviving constant order.
         collect_qualified_name_origins(
             code,
-            &qualified_name_constants,
-            &qualified_name_values,
-            &mut seen,
+            &qualified_names.constants.into_iter().collect(),
+            &qualified_names.origins,
+            &mut FxHashSet::default(),
             &mut ordinary_first,
         );
     }
-    values.extend(qualified_name_values.into_iter().filter(|value| {
-        // Interning metadata replaces its pointer when an equal canonical object
-        // already exists; the class's fresh constant remains a separate plain string.
-        recorded_origins
-            .get(value)
-            .copied()
-            .unwrap_or_else(|| !ordinary_first.contains(value))
-            && !initial_intern_state.contains_for(python_version, value)
-    }));
+    values.extend(
+        qualified_names
+            .origins
+            .into_iter()
+            .filter_map(|(value, origin)| {
+                // Interning metadata replaces its pointer when an equal canonical object
+                // already exists; the class's fresh constant remains a separate plain string.
+                (origin.unwrap_or_else(|| !ordinary_first.contains(value))
+                    && !initial_intern_state.contains_for(python_version, value))
+                .then_some(value)
+            }),
+    );
     frozenset_recreation_need
 }
 
@@ -803,7 +849,8 @@ fn collect_interning_provenance_without_frozensets<'a>(
     values: &mut FxHashSet<&'a str>,
     metadata_tuples: &mut FxHashSet<HashedObjectKey<'a>>,
     needs_metadata_alias_scan: bool,
-) -> bool {
+    qualified_names: &mut QualifiedNameConstants<'a>,
+) {
     if needs_metadata_alias_scan {
         collect_metadata_tuple_keys(code, metadata_tuples);
     }
@@ -813,18 +860,18 @@ fn collect_interning_provenance_without_frozensets<'a>(
             .iter()
             .map(String::as_str),
     );
-    let mut has_qualified_name_constant = qualified_name_constant_requiring_origin(code).is_some();
+    qualified_names.record(code);
     for constant in &code.constants {
         if let Constant::Code(code) = constant {
-            has_qualified_name_constant |= collect_interning_provenance_without_frozensets(
+            collect_interning_provenance_without_frozensets(
                 code,
                 values,
                 metadata_tuples,
                 needs_metadata_alias_scan,
+                qualified_names,
             );
         }
     }
-    has_qualified_name_constant
 }
 
 fn collect_interning_provenance<'a>(
@@ -833,7 +880,8 @@ fn collect_interning_provenance<'a>(
     values: &mut FxHashSet<&'a str>,
     metadata_tuples: &mut FxHashSet<HashedObjectKey<'a>>,
     needs_metadata_alias_scan: bool,
-) -> (bool, FrozensetRecreationNeed) {
+    qualified_names: &mut QualifiedNameConstants<'a>,
+) -> FrozensetRecreationNeed {
     if needs_metadata_alias_scan {
         collect_metadata_tuple_keys(code, metadata_tuples);
     }
@@ -843,27 +891,27 @@ fn collect_interning_provenance<'a>(
             .iter()
             .map(String::as_str),
     );
-    let mut has_qualified_name_constant = qualified_name_constant_requiring_origin(code).is_some();
+    qualified_names.record(code);
     // Reuse the provenance walk to classify frozenset recreation for code trees that can contain
     // one (and for hand-built objects without a conservative compiler hint).
     let mut frozenset_recreation_need = FrozensetRecreationNeed::None;
     for constant in &code.constants {
         if let Constant::Code(code) = constant {
-            let (has_qualified_name, recreation_need) = collect_interning_provenance(
+            let recreation_need = collect_interning_provenance(
                 code,
                 python_version,
                 values,
                 metadata_tuples,
                 needs_metadata_alias_scan,
+                qualified_names,
             );
-            has_qualified_name_constant |= has_qualified_name;
             frozenset_recreation_need = frozenset_recreation_need.max(recreation_need);
         } else {
             frozenset_recreation_need = frozenset_recreation_need
                 .max(constant_frozenset_recreation_need(constant, python_version));
         }
     }
-    (has_qualified_name_constant, frozenset_recreation_need)
+    frozenset_recreation_need
 }
 
 /// Identifies class qualified names that first entered the compilation's constant cache.
@@ -940,23 +988,25 @@ fn legacy_qualified_name_aliases(code: &CodeObject) -> FxHashSet<usize> {
     aliases
 }
 
-fn collect_qualified_name_constants<'a>(
-    code: &'a CodeObject,
-    constants: &mut FxHashSet<usize>,
-    values: &mut FxHashSet<&'a str>,
-    recorded_origins: &mut FxHashMap<&'a str, bool>,
-) {
-    if let Some((constant, value)) = qualified_name_constant_requiring_origin(code) {
-        constants.insert(std::ptr::from_ref(constant).addr());
-        values.insert(value);
-        if let Some(canonical) = code.marshal_provenance.qualified_name_is_canonical {
-            // Compilation provenance includes earlier admissions from discarded code.
-            recorded_origins.insert(value, canonical);
+#[derive(Default)]
+struct QualifiedNameConstants<'a> {
+    track: bool,
+    constants: SmallVec<[usize; 4]>,
+    origins: FxHashMap<&'a str, Option<bool>>,
+}
+
+impl<'a> QualifiedNameConstants<'a> {
+    fn record(&mut self, code: &'a CodeObject) {
+        if !self.track {
+            return;
         }
-    }
-    for constant in &code.constants {
-        if let Constant::Code(code) = constant {
-            collect_qualified_name_constants(code, constants, values, recorded_origins);
+        let Some((constant, value)) = qualified_name_constant_requiring_origin(code) else {
+            return;
+        };
+        self.constants.push(std::ptr::from_ref(constant).addr());
+        let origin = self.origins.entry(value).or_default();
+        if let Some(canonical) = code.marshal_provenance.qualified_name_is_canonical {
+            *origin = Some(canonical);
         }
     }
 }
@@ -964,7 +1014,7 @@ fn collect_qualified_name_constants<'a>(
 fn collect_qualified_name_origins<'a>(
     code: &'a CodeObject,
     qualified_name_constants: &FxHashSet<usize>,
-    qualified_name_values: &FxHashSet<&'a str>,
+    qualified_name_values: &FxHashMap<&'a str, Option<bool>>,
     seen: &mut FxHashSet<&'a str>,
     ordinary_first: &mut FxHashSet<&'a str>,
 ) {
@@ -982,12 +1032,12 @@ fn collect_qualified_name_origins<'a>(
 fn collect_qualified_name_origin_from_constant<'a>(
     constant: &'a Constant,
     qualified_name_constants: &FxHashSet<usize>,
-    qualified_name_values: &FxHashSet<&'a str>,
+    qualified_name_values: &FxHashMap<&'a str, Option<bool>>,
     seen: &mut FxHashSet<&'a str>,
     ordinary_first: &mut FxHashSet<&'a str>,
 ) {
     match constant {
-        Constant::String(value) if qualified_name_values.contains(value.as_str()) => {
+        Constant::String(value) if qualified_name_values.contains_key(value.as_str()) => {
             let value = value.as_str();
             if seen.insert(value)
                 && !qualified_name_constants.contains(&std::ptr::from_ref(constant).addr())
@@ -2189,14 +2239,19 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     }
 
     #[inline]
-    fn strings(&mut self, values: &'code [String]) -> bool {
-        if values.is_empty() {
-            return self
-                .graph
-                .record_cached_value(OccurrenceKind::Strings, CachedObject::EmptyTuple);
+    fn names(&mut self, code: &'code CodeObject) -> bool {
+        if code.names.is_empty() {
+            self.graph
+                .record_cached_value(OccurrenceKind::Strings, CachedObject::EmptyTuple)
+        } else if let Some(properties) = code.marshal_provenance.metadata_tuple_properties {
+            self.graph.record_hashed(
+                OccurrenceKind::Strings,
+                HashedObjectKey::with_hash(strings_tuple_key(&code.names), properties.names.hash),
+            )
+        } else {
+            self.graph
+                .record_keyed(OccurrenceKind::Strings, strings_tuple_key(&code.names))
         }
-        self.graph
-            .record_keyed(OccurrenceKind::Strings, strings_tuple_key(values))
     }
 
     #[inline]
@@ -2209,6 +2264,11 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
         let key = locals_tuple_key(code);
         if matches!(&key, ObjectKey::AnnotationLocals(_)) {
             self.graph.record_unique_value(OccurrenceKind::Locals, key)
+        } else if let Some(properties) = code.marshal_provenance.metadata_tuple_properties {
+            self.graph.record_hashed(
+                OccurrenceKind::Locals,
+                HashedObjectKey::with_hash(key, properties.locals.hash),
+            )
         } else {
             self.graph.record_keyed(OccurrenceKind::Locals, key)
         }

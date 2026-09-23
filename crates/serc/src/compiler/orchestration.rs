@@ -1229,7 +1229,7 @@ impl<'source> Compiler<'source> {
                     }
             })
             .collect();
-        let (output_locals, local_ids) = self
+        let (output_locals, local_ids): (Vec<String>, Vec<MetadataId>) = self
             .symbols
             .locals
             .iter()
@@ -1325,6 +1325,8 @@ impl<'source> Compiler<'source> {
             } else {
                 (FxHashSet::default(), FxHashSet::default())
             };
+        let metadata_tuple_properties =
+            crate::marshal::metadata_tuple_properties(&self.output.names, &output_locals);
         let mut code = CodeObject {
             arg_count: self.unit.arg_count,
             positional_only_arg_count: self.unit.positional_only_arg_count,
@@ -1363,6 +1365,7 @@ impl<'source> Compiler<'source> {
                 qualified_name_is_canonical: self.output.qualified_name_is_canonical,
                 uncached_percent_constant: self.context.has_uncached_percent_constant(),
                 metadata_ids,
+                metadata_tuple_properties: Some(metadata_tuple_properties),
                 subtree_has_frozenset_constants: self.output.has_frozenset_constants,
                 metadata_alias_scan_unnecessary: false,
                 fresh_empty_bytes_constant: self.context.fresh_empty_bytes_constant(),

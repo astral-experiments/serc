@@ -5,7 +5,10 @@ use rustc_hash::{FxHashMap, FxHasher};
 use smallvec::SmallVec;
 
 use crate::PythonVersion;
-use crate::code_object::{CodeObject, Constant, LocalsIdentity, NonReflexiveKey};
+use crate::code_object::{
+    CodeObject, Constant, LocalsIdentity, MarshalMetadataTupleProperties,
+    MarshalStringTupleProperties, NonReflexiveKey,
+};
 use crate::target::small_int_bounds_for;
 
 use super::v5::{
@@ -74,6 +77,11 @@ impl<'a> HashedObjectKey<'a> {
 
     pub(super) fn key(&self) -> &ObjectKey<'a> {
         &self.key
+    }
+
+    pub(super) fn with_hash(key: ObjectKey<'a>, hash: u64) -> Self {
+        debug_assert_eq!(Self::new(key.clone()).hash, hash, "marshal key hash");
+        Self { key, hash }
     }
 }
 
@@ -712,6 +720,43 @@ pub(super) fn locals_tuple_key(code: &CodeObject) -> ObjectKey<'_> {
             LocalsIdentity::ByValue => strings_tuple_key(&code.locals),
             LocalsIdentity::Fresh => ObjectKey::AnnotationLocals(std::ptr::from_ref(code).addr()),
         }
+    }
+}
+
+/// Precomputes the value-only metadata work shared by all marshal graph traversals.
+pub(crate) fn metadata_tuple_properties(
+    names: &[String],
+    locals: &[String],
+) -> MarshalMetadataTupleProperties {
+    fn strings(values: &[String]) -> MarshalStringTupleProperties {
+        let key = strings_tuple_key(values);
+        if values.is_empty() {
+            return MarshalStringTupleProperties {
+                hash: HashedObjectKey::from(key).hash,
+                automatically_interned: true,
+            };
+        }
+        // Match the derived ObjectKey::StringTuple hash and StringTupleKey's value hash while
+        // classifying the same strings. The borrowed key remains the equality check on lookup.
+        let mut hasher = FxHasher::default();
+        std::mem::discriminant(&key).hash(&mut hasher);
+        values.len().hash(&mut hasher);
+        let mut automatically_interned = true;
+        for value in values {
+            value.hash(&mut hasher);
+            automatically_interned = automatically_interned && should_intern(value);
+        }
+        let hash = hasher.finish();
+        debug_assert_eq!(HashedObjectKey::from(key).hash, hash, "metadata tuple hash");
+        MarshalStringTupleProperties {
+            hash,
+            automatically_interned,
+        }
+    }
+
+    MarshalMetadataTupleProperties {
+        names: strings(names),
+        locals: strings(locals),
     }
 }
 
