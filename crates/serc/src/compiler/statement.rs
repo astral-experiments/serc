@@ -33850,7 +33850,12 @@ pub(super) fn suite_contains_yield(body: &[Stmt]) -> bool {
 
 /// Legacy function annotations execute in the enclosing scope unless postponed.
 pub(super) fn legacy_suite_contains_yield(body: &[Stmt], future_annotations: bool) -> bool {
-    suite_contains_yield_with_headers(body, true, !future_annotations)
+    function_body_contains_yield(body, !future_annotations)
+}
+
+/// Defaults and decorators execute in the enclosing function; annotations may be deferred.
+pub(super) fn function_body_contains_yield(body: &[Stmt], eager_annotations: bool) -> bool {
+    suite_contains_yield_with_headers(body, true, eager_annotations)
 }
 
 fn suite_contains_yield_with_headers(

@@ -3812,7 +3812,7 @@ impl Compiler<'_> {
         } else {
             0
         }) | (self.unit.flags & SUPPORTED_FUTURE_FLAGS);
-        if expression_contains_yield(&lambda.body) {
+        if expression_contains_yield_with_defaults(&lambda.body, true) {
             parameter_flags |= CO_GENERATOR;
         }
         let qualified_name = self.child_qualified_name("<lambda>");
@@ -9155,14 +9155,27 @@ fn legacy_not_comparison(expression: &Expr) -> Option<(&ruff_python_ast::ExprCom
 }
 
 pub(super) fn expression_contains_yield(expression: &Expr) -> bool {
+    expression_contains_yield_with_defaults(expression, false)
+}
+
+/// Lambda defaults execute in the enclosing expression, independently of their bodies.
+fn expression_contains_yield_with_defaults(expression: &Expr, visit_defaults: bool) -> bool {
     #[derive(Default)]
     struct Collector {
         found: bool,
+        visit_defaults: bool,
     }
 
     impl<'ast> Visitor<'ast> for Collector {
         fn visit_expr(&mut self, expression: &'ast Expr) {
-            if matches!(expression, Expr::Lambda(_)) {
+            if let Expr::Lambda(lambda) = expression {
+                if self.visit_defaults
+                    && let Some(parameters) = lambda.parameters.as_deref()
+                {
+                    for default in parameter_default_expressions(parameters) {
+                        self.visit_expr(default);
+                    }
+                }
                 return;
             }
             if matches!(expression, Expr::Yield(_) | Expr::YieldFrom(_)) {
@@ -9173,7 +9186,10 @@ pub(super) fn expression_contains_yield(expression: &Expr) -> bool {
         }
     }
 
-    let mut collector = Collector::default();
+    let mut collector = Collector {
+        visit_defaults,
+        ..Collector::default()
+    };
     collector.visit_expr(expression);
     collector.found
 }
