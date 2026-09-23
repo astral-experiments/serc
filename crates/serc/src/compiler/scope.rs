@@ -567,9 +567,9 @@ impl FunctionPlan {
     ) -> Self {
         let ScopeBodyFacts {
             mut globals,
-            nonlocals,
+            mut nonlocals,
             mut references,
-            outside_inlined_comprehension_references,
+            mut outside_inlined_comprehension_references,
             outside_inlined_comprehension_requirements,
             explicit_dunder_class_reference,
             nested_lambda_requirements: lambda_requirements,
@@ -586,18 +586,25 @@ impl FunctionPlan {
 
         // Native declarations and name lookups use the same mangled symbol identity.
         // Keep both source spellings available to the raw-name lowering maps.
-        if let Some(private_name) = private_name.filter(|_| !globals.is_empty()) {
+        if let Some(private_name) =
+            private_name.filter(|_| !globals.is_empty() || !nonlocals.is_empty())
+        {
             let prefix = format!("_{}", private_name.trim_start_matches('_'));
-            for name in globals.iter().cloned().collect::<Vec<_>>() {
-                let canonical = mangle_name(&name, Some(private_name)).into_owned();
-                if let Some(alias) = canonical.strip_prefix(&prefix)
-                    && mangle_name(alias, Some(private_name)) == canonical
-                {
-                    globals.insert(alias.to_string());
+            for declarations in [&mut globals, &mut nonlocals] {
+                for name in declarations.iter().cloned().collect::<Vec<_>>() {
+                    let canonical = mangle_name(&name, Some(private_name)).into_owned();
+                    if let Some(alias) = canonical.strip_prefix(&prefix)
+                        && mangle_name(alias, Some(private_name)) == canonical
+                    {
+                        declarations.insert(alias.to_string());
+                    }
+                    declarations.insert(canonical);
                 }
-                globals.insert(canonical);
             }
         }
+        // A declaration establishes the outer binding for every private spelling,
+        // including when an inlined comprehension temporarily shadows that name.
+        outside_inlined_comprehension_references.extend(nonlocals.iter().cloned());
 
         // Record potential local loads and actual bindings in one source-order pass. Filtering the
         // potential names after the pass preserves CPython's load-before-store local ordering

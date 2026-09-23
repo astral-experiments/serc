@@ -234,6 +234,66 @@ for template, expected in cases:
 }
 
 #[test]
+fn private_nonlocal_aliases_match_native_bindings_and_pyc() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("private_nonlocal_aliases.py");
+    fs_err::write(
+        &source_path,
+        include_str!("../../serc/tests/fixtures/private_nonlocal_aliases.py"),
+    )
+    .unwrap();
+    for version in [
+        serc::PythonVersion::Py312,
+        serc::PythonVersion::Py313,
+        serc::PythonVersion::Py314,
+        serc::PythonVersion::Py315,
+    ] {
+        let oracle = || match version {
+            serc::PythonVersion::Py312 => common::python_312_command(),
+            serc::PythonVersion::Py313 => common::python_313_command(),
+            serc::PythonVersion::Py314 => common::python_3145_command(),
+            serc::PythonVersion::Py315 => common::python_315_command(),
+        };
+        let output = serc()
+            .args([
+                "compile",
+                "--quiet",
+                "--python-version",
+                &version.to_string(),
+            ])
+            .arg(&source_path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{version}: {output:?}");
+        let (_, minor, _) = version.target().version;
+        let cache_path = directory.path().join(format!(
+            "__pycache__/private_nonlocal_aliases.cpython-3{minor}.pyc"
+        ));
+        let native_path = directory.path().join(format!("native-3{minor}.pyc"));
+        let native = oracle()
+            .args([
+                "-B",
+                "-c",
+                "import py_compile, sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True, optimize=0, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)",
+            ])
+            .arg(&source_path)
+            .arg(&native_path)
+            .output()
+            .unwrap();
+        assert!(native.status.success(), "{version}: {native:?}");
+        assert_eq!(
+            fs_err::read(&cache_path).unwrap(),
+            fs_err::read(&native_path).unwrap(),
+            "Python {version}"
+        );
+        for artifact in [&native_path, &cache_path] {
+            let output = oracle().arg("-B").arg(artifact).output().unwrap();
+            assert!(output.status.success(), "{version}: {artifact:?}: {output:?}");
+        }
+    }
+}
+
+#[test]
 fn private_local_aliases_match_native_bindings_and_marshal() {
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("private_local_aliases.py");
