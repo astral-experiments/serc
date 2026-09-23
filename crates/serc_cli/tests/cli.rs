@@ -628,7 +628,7 @@ fn parallel_compile_writes_identical_caches_including_colliding_names() {
     ] {
         fs_err::write(directory.path().join(path), source).unwrap();
     }
-    let deeply_nested = format!("value = {}1{}\n", "call(".repeat(180), ")".repeat(180));
+    let deeply_nested = format!("value = {}1{}\n", "call(".repeat(24), ")".repeat(24));
     fs_err::write(directory.path().join("deep.py"), deeply_nested).unwrap();
     let caches = [
         directory.path().join("__pycache__/py.cpython-314.pyc"),
@@ -664,6 +664,39 @@ fn parallel_compile_writes_identical_caches_including_colliding_names() {
             caches.each_ref().map(|path| fs_err::read(path).unwrap()),
             expected
         );
+    }
+}
+
+#[test]
+fn parallel_workers_compile_deeply_nested_source_with_sufficient_stack() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("deep.py");
+    let cache = directory.path().join("__pycache__");
+    let output = cache.join("deep.cpython-314.pyc");
+    let deeply_nested = format!("value = {}1{}\n", "call(".repeat(180), ")".repeat(180));
+    fs_err::write(&source, deeply_nested).unwrap();
+    fs_err::write(directory.path().join("other.py"), "value = 1\n").unwrap();
+
+    let python = common::python_3145_command()
+        .args(["-m", "py_compile"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(python.status.success(), "{python:?}");
+    let expected = fs_err::read(&output).unwrap();
+
+    for jobs in [Some("2"), None] {
+        fs_err::remove_dir_all(&cache).unwrap();
+        let mut command = serc();
+        command
+            .args(["compile", "--quiet"])
+            .env("RAYON_NUM_THREADS", "2");
+        if let Some(jobs) = jobs {
+            command.args(["--jobs", jobs]);
+        }
+        let parallel = command.arg(directory.path()).output().unwrap();
+        assert!(parallel.status.success(), "{parallel:?}");
+        assert_eq!(fs_err::read(&output).unwrap(), expected);
     }
 }
 

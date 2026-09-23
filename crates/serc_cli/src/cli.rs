@@ -92,7 +92,12 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
         ..CompileOptions::default()
     };
 
-    let jobs = jobs_for_inputs(command.jobs, paths.len());
+    let (jobs, output_groups) = prepare_compilation(
+        &paths,
+        options.python_version,
+        command.check,
+        jobs_for_inputs(command.jobs, paths.len()),
+    );
     if jobs <= 1 {
         for path in &paths {
             if let Err(message) = compile_path(path, command.check, &options) {
@@ -108,18 +113,8 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
             .build()
             .map_err(|error| format!("failed to start compilation workers: {error}"))?;
         let mut errors: Vec<(usize, String)> = pool.install(|| {
-            if command.check {
-                paths
-                    .par_iter()
-                    .enumerate()
-                    .filter_map(|(index, path)| {
-                        compile_path(path, true, &options)
-                            .err()
-                            .map(|message| (index, message))
-                    })
-                    .collect()
-            } else {
-                compilation_groups(&paths, options.python_version)
+            if let Some(output_groups) = output_groups {
+                output_groups
                     .into_par_iter()
                     .flat_map_iter(|group| {
                         group.into_iter().filter_map(|(index, path)| {
@@ -127,6 +122,16 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
                                 .err()
                                 .map(|message| (index, message))
                         })
+                    })
+                    .collect()
+            } else {
+                paths
+                    .par_iter()
+                    .enumerate()
+                    .filter_map(|(index, path)| {
+                        compile_path(path, true, &options)
+                            .err()
+                            .map(|message| (index, message))
                     })
                     .collect()
             }
@@ -189,11 +194,27 @@ fn default_jobs(
     }
 }
 
+type CompilationGroup<'a> = Vec<(usize, &'a Path)>;
+
+/// Limit cache-writing workers to groups that can make progress independently.
+fn prepare_compilation(
+    paths: &[PathBuf],
+    python_version: PythonVersion,
+    check: bool,
+    jobs: usize,
+) -> (usize, Option<Vec<CompilationGroup<'_>>>) {
+    if check || jobs <= 1 {
+        return (jobs, None);
+    }
+    let groups = compilation_groups(paths, python_version);
+    (jobs.min(groups.len()), Some(groups))
+}
+
 /// Keep inputs that share an output in discovery order so the same cache wins as in serial mode.
 fn compilation_groups(
     paths: &[PathBuf],
     python_version: PythonVersion,
-) -> Vec<Vec<(usize, &Path)>> {
+) -> Vec<CompilationGroup<'_>> {
     use std::collections::HashSet;
     use std::sync::Arc;
 
@@ -506,7 +527,7 @@ fn write_error(message: &str) {
 mod tests {
     use super::{
         cache_path, cache_tag, compilation_groups, compile_path_with_metadata, discover,
-        encode_mtime, has_python_suffix,
+        encode_mtime, has_python_suffix, prepare_compilation,
     };
     use super::{default_jobs, jobs_for_inputs};
     use serc::{CompileOptions, PythonVersion};
@@ -521,6 +542,7 @@ mod tests {
         assert_eq!(default_jobs(Some("1"), Some("4"), || 8), 1);
         assert_eq!(default_jobs(Some("0"), Some("4"), || 8), 8);
         assert_eq!(default_jobs(Some("invalid"), None, || 8), 8);
+        assert_eq!(default_jobs(Some("invalid"), Some("4"), || 8), 4);
         assert_eq!(default_jobs(None, Some("4"), || 8), 4);
         assert_eq!(default_jobs(None, Some("0"), || 8), 8);
         assert_eq!(default_jobs(None, None, || 1), 1);
@@ -528,6 +550,48 @@ mod tests {
         assert_eq!(jobs_for_inputs(None, 1), 1);
         assert_eq!(jobs_for_inputs(NonZeroUsize::new(1), 4), 1);
         assert_eq!(jobs_for_inputs(NonZeroUsize::new(8), 4), 4);
+    }
+
+    #[test]
+    fn cache_writing_limits_workers_to_independent_outputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = [
+            directory.path().join("Alpha.py"),
+            directory.path().join("alpha.py"),
+            directory.path().join("other.py"),
+            directory.path().join("caf\u{e9}.py"),
+        ];
+
+        let (jobs, groups) = prepare_compilation(&paths[..3], PythonVersion::Py314, false, 3);
+        assert_eq!(jobs, 2);
+        assert_eq!(groups.unwrap().len(), 2);
+
+        let (jobs, groups) = prepare_compilation(&paths, PythonVersion::Py314, false, 4);
+        assert_eq!(jobs, 1);
+        assert_eq!(
+            groups.unwrap()[0]
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        assert_eq!(
+            prepare_compilation(&paths, PythonVersion::Py314, true, 4),
+            (4, None)
+        );
+        assert_eq!(
+            prepare_compilation(&paths, PythonVersion::Py314, false, 1),
+            (1, None)
+        );
+        assert_eq!(
+            prepare_compilation(
+                &paths[..1],
+                PythonVersion::Py314,
+                false,
+                jobs_for_inputs(None, 1)
+            ),
+            (1, None)
+        );
     }
 
     #[test]
