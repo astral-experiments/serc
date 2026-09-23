@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+"""Build Serc with PGO from pinned production sources and compatibility fixtures."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+# Python's safe-path mode omits the script directory from the import path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from pgo_corpus import (
+    bytecode_hashes,
+    clean_bytecode,
+    prepare_corpus,
+    require_profiles,
+    tree_summary,
+    verify_bytecode,
+)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("python", help="exact CPython 3.14.5 oracle executable")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Use debug builds to smoke-test the complete pipeline",
+    )
+    parser.add_argument(
+        "--train-only",
+        action="store_true",
+        help="Produce a merged profile without building the final executable",
+    )
+    parser.add_argument(
+        "--toolchain", help="Rustup toolchain, e.g. ohm for local development"
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="build/profile root (default: target/pgo-release)",
+    )
+    args = parser.parse_args()
+    repo = Path(__file__).resolve().parent.parent
+    output = (args.output_dir or repo / "target/pgo-release").resolve()
+    if (
+        output.is_relative_to(repo)
+        and subprocess.run(
+            ["git", "check-ignore", "--quiet", "--", str(output)], cwd=repo
+        ).returncode
+        != 0
+    ):
+        parser.error(
+            "--output-dir inside the checkout must be Git-ignored; use target/pgo-release "
+            "or a directory outside the checkout"
+        )
+    output.mkdir(parents=True, exist_ok=True)
+    run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=output))
+    manifest = {
+        "commands": [],
+        "status": "building",
+        "build_profile": "dev" if args.debug else "release",
+        "train_only": args.train_only,
+    }
+    manifest_path = run_dir / "manifest.json"
+
+    def save():
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+    def run(argv, env=None):
+        argv = [str(arg) for arg in argv]
+        index = len(manifest["commands"])
+        manifest["commands"].append({"argv": argv, "env": env or {}})
+        save()
+        print("Running:", subprocess.list2cmdline(argv), flush=True)
+        result = subprocess.run(
+            argv, cwd=repo, env=os.environ | (env or {}), capture_output=True, text=True
+        )
+        (run_dir / f"{index:02d}.stdout").write_text(result.stdout)
+        (run_dir / f"{index:02d}.stderr").write_text(result.stderr)
+        print(result.stderr, end="", file=sys.stderr, flush=True)
+        result.check_returncode()
+        return result.stdout.strip()
+
+    def sha(path):
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    def source_hash():
+        files = subprocess.check_output(
+            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            cwd=repo,
+        ).split(b"\0")
+        digest = hashlib.sha256()
+        for name in sorted(set(files) - {b"", b"vendor/ruff"}):
+            path = repo / os.fsdecode(name)
+            if path.is_file():
+                digest.update(name + b"\0" + sha(path).encode() + b"\0")
+        return digest.hexdigest()
+
+    try:
+        if os.environ.get("RUSTFLAGS") or os.environ.get("CARGO_ENCODED_RUSTFLAGS"):
+            raise ValueError(
+                "unset RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS before building"
+            )
+        selector = [f"+{args.toolchain}"] if args.toolchain else []
+        cargo, rustc = ["cargo", *selector], ["rustc", *selector]
+        rust_version = run([*rustc, "-vV"])
+        host = re.search(r"^host: (.+)$", rust_version, re.M).group(1)
+        llvm_version = re.search(r"^LLVM version: (.+)$", rust_version, re.M).group(1)
+        sysroot = Path(run([*rustc, "--print", "sysroot"]))
+        profdata = os.environ.get("LLVM_PROFDATA") or str(
+            sysroot / "lib/rustlib" / host / "bin/llvm-profdata"
+        )
+        profdata_version = run([profdata, "--version"])
+        match = re.search(r"LLVM version (\d+)\.(\d+)", profdata_version)
+        if not match or list(match.groups()) != llvm_version.split(".")[:2]:
+            raise ValueError(
+                "llvm-profdata must match rustc's LLVM major and minor versions"
+            )
+        run([repo / "scripts/check-ruff-pin"])
+        python_identity = json.loads(
+            run(
+                [
+                    args.python,
+                    "-I",
+                    "-S",
+                    "-c",
+                    "import importlib.util,json,sys; print(json.dumps(dict("
+                    "executable=sys.executable,version=sys.version,"
+                    "implementation=sys.implementation.name,"
+                    "version_info=list(sys.version_info),"
+                    "magic=importlib.util.MAGIC_NUMBER.hex())))",
+                ]
+            )
+        )
+        if (
+            python_identity["implementation"] != "cpython"
+            or python_identity["version_info"] != [3, 14, 5, "final", 0]
+            or python_identity["magic"] != "2b0e0d0a"
+        ):
+            raise ValueError(
+                f"expected CPython 3.14.5 with magic 2b0e0d0a, got {python_identity}"
+            )
+        manifest.update(
+            {
+                "source_head": run(["git", "rev-parse", "HEAD"]),
+                "source_sha256": source_hash(),
+                "rustc": rust_version,
+                "cargo": run([*cargo, "--version"]),
+                "host": host,
+                "llvm_profdata": profdata_version,
+                "ruff_revision": run(["git", "-C", "vendor/ruff", "rev-parse", "HEAD"]),
+                "python": python_identity,
+                "build_environment": {
+                    key: value
+                    for key, value in os.environ.items()
+                    if key.startswith(
+                        (
+                            "CARGO_PROFILE_RELEASE_",
+                            "CARGO_BUILD_",
+                            "CARGO_UNSTABLE_OHM_",
+                        )
+                    )
+                },
+            }
+        )
+        shared = os.environ.get("CARGO_BUILD_BUILD_DIR")
+        if shared and Path(shared).resolve().is_relative_to(output):
+            raise ValueError(
+                "the shared build directory must be separate from the PGO output directory"
+            )
+
+        common = {
+            "CARGO_INCREMENTAL": "0",
+            "CARGO_PROFILE_RELEASE_PANIC": "unwind",
+            "CARGO_PROFILE_DEV_PANIC": "unwind",
+        }
+
+        def build(package, target, target_dir, flags):
+            messages = run(
+                [
+                    *cargo,
+                    "build",
+                    "--locked",
+                    "--profile",
+                    manifest["build_profile"],
+                    "--target",
+                    host,
+                    "--message-format=json-render-diagnostics",
+                    "-p",
+                    package,
+                    *target,
+                ],
+                common
+                | {
+                    "CARGO_TARGET_DIR": str(target_dir),
+                    "CARGO_ENCODED_RUSTFLAGS": flags,
+                },
+            )
+            artifacts = [
+                json.loads(line)
+                for line in messages.splitlines()
+                if line.startswith("{")
+            ]
+            return Path(
+                next(
+                    item["executable"]
+                    for item in reversed(artifacts)
+                    if item.get("reason") == "compiler-artifact"
+                    and item.get("executable")
+                )
+            )
+
+        corpus = run_dir / "corpus"
+        manifest["projects"] = prepare_corpus(output / "corpus-cache", corpus, run)
+        manifest["corpus_sources"] = tree_summary(corpus, ".py")
+
+        def verify_sources():
+            if tree_summary(corpus, ".py") != manifest["corpus_sources"]:
+                raise ValueError("Training sources changed during the build")
+
+        def compile_corpus(binary, jobs, env=None):
+            clean_bytecode(corpus)
+            run(
+                [
+                    binary,
+                    "compile",
+                    "--quiet",
+                    "--python-version",
+                    "3.14",
+                    "--jobs",
+                    jobs,
+                    corpus,
+                ],
+                env,
+            )
+            verify_sources()
+
+        run(
+            [
+                args.python,
+                "-I",
+                "-S",
+                "-m",
+                "compileall",
+                "-q",
+                "-f",
+                "-j",
+                "1",
+                "-o",
+                "0",
+                "--invalidation-mode",
+                "timestamp",
+                corpus,
+            ]
+        )
+        verify_sources()
+        cpython_outputs = bytecode_hashes(corpus)
+        if len(cpython_outputs) != manifest["corpus_sources"]["files"]:
+            raise ValueError("CPython did not produce one cache file per source")
+        control = build(
+            "serc-cli", ["--bin", "serc"], output / "control-target", ""
+        )
+        compile_corpus(control, 1)
+        control_outputs = bytecode_hashes(corpus)
+        if control_outputs.keys() != cpython_outputs.keys():
+            raise ValueError(
+                "Ordinary Serc did not produce the expected cache paths"
+            )
+        differences = [
+            {
+                "path": path,
+                "cpython_sha256": cpython_outputs[path],
+                "serc_sha256": control_outputs[path],
+            }
+            for path in sorted(cpython_outputs)
+            if cpython_outputs[path] != control_outputs[path]
+        ]
+        manifest["cpython_comparison"] = {
+            "files": len(cpython_outputs),
+            "exact": len(cpython_outputs) - len(differences),
+            "differences": differences,
+        }
+        manifest["control_outputs"] = control_outputs
+        control_artifact = run_dir / f"serc-control{control.suffix}"
+        shutil.copy2(control, control_artifact)
+        manifest["control_binary"] = str(control_artifact)
+        manifest["control_binary_sha256"] = sha(control_artifact)
+        print(
+            f"Ordinary Serc versus CPython: {len(cpython_outputs) - len(differences)}/{len(cpython_outputs)} exact; {len(differences)} differences recorded in manifest",
+            flush=True,
+        )
+
+        raw = run_dir / "raw"
+        raw.mkdir()
+        instrumented = build(
+            "serc-cli",
+            ["--bin", "serc"],
+            output / "generate-target",
+            f"-Cprofile-generate={raw}",
+        )
+        profiles = []
+        manifest["profile_groups"] = {}
+        parallel_jobs = min(4, os.cpu_count() or 1)
+        for group, jobs in (
+            ("cli-serial", 1),
+            ("cli-parallel", parallel_jobs),
+        ):
+            compile_corpus(
+                instrumented,
+                jobs,
+                {"LLVM_PROFILE_FILE": str(raw / f"{group}-%m-%p.profraw")},
+            )
+            verify_bytecode(corpus, control_outputs)
+            group_profiles = require_profiles(raw, group)
+            manifest["profile_groups"][group] = [path.name for path in group_profiles]
+            profiles.extend(group_profiles)
+        training = build(
+            "serc",
+            ["--example", "compare_cpython_corpus"],
+            output / "generate-target",
+            f"-Cprofile-generate={raw}",
+        )
+        # Use the comparator's default roots; keep expectations in sync with
+        # check-cpython-compatibility (3.14).
+        outcomes = {
+            "matched-rejection": 207,
+            "rejection-mismatch": 12,
+            "byte-mismatch": 0,
+            "unsupported": 0,
+            "parse-mismatch": 0,
+            "compiler-failure": 2,
+            "non-utf8": 0,
+            "oracle-failure": 0,
+        }
+        expectations = [
+            arg
+            for kind, count in outcomes.items()
+            for arg in ("--expected-outcome", f"{kind}={count}")
+        ]
+        run(
+            [
+                training,
+                "--python",
+                args.python,
+                "--python-version",
+                "3.14",
+                "--expected-files",
+                "2451",
+                "--expected-exact",
+                "2230",
+                "--expected-cpython-rejected",
+                "221",
+                *expectations,
+                "--require-all",
+            ],
+            {
+                "RAYON_NUM_THREADS": "1",
+                "LLVM_PROFILE_FILE": str(raw / "ruff-%m-%p.profraw"),
+            },
+        )
+        group_profiles = require_profiles(raw, "ruff")
+        manifest["profile_groups"]["ruff"] = [path.name for path in group_profiles]
+        profiles.extend(group_profiles)
+        merged = run_dir / "training.profdata"
+        run([profdata, "merge", "-o", merged, *profiles])
+        if not args.train_only:
+            binary = build(
+                "serc-cli",
+                ["--bin", "serc"],
+                output / "use-target",
+                f"-Cprofile-use={merged}",
+            )
+            for jobs in (1, parallel_jobs):
+                compile_corpus(binary, jobs)
+                verify_bytecode(corpus, control_outputs)
+            artifact = run_dir / binary.name
+            shutil.copy2(binary, artifact)
+            manifest.update({"binary": str(artifact), "binary_sha256": sha(artifact)})
+            print(f"PGO executable: {artifact}", flush=True)
+        verify_sources()
+        if source_hash() != manifest["source_sha256"]:
+            raise ValueError(
+                "source changed during the PGO build; rerun with an unchanged checkout"
+            )
+        run([repo / "scripts/check-ruff-pin"])
+        manifest.update(
+            {
+                "status": "complete",
+                "profile_sha256": sha(merged),
+            }
+        )
+        print(f"Merged PGO profile: {merged}\nBuild manifest: {manifest_path}")
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        manifest.update({"status": "failed", "error": str(error)})
+        print(f"error: {error}\nBuild manifest: {manifest_path}", file=sys.stderr)
+        return 1
+    finally:
+        save()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
