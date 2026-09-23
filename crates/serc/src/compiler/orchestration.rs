@@ -43,6 +43,93 @@ use super::statement::{
 use super::symbol::{ReraiseStackState, ResumeDepth, SymbolState, to_u32};
 use super::{Compiler, Scope};
 
+/// Proves that the surviving constants cannot be changed by interning a metadata tuple.
+///
+/// Ordinary ASCII identifier strings are already interned independently. For every other string
+/// in an all-string constant tuple, conservatively check for an equal name or local anywhere in
+/// this module, including recorded metadata from discarded code. Equality of the complete tuple
+/// is left to marshal when any string can match.
+fn metadata_alias_scan_unnecessary(code: &CodeObject) -> bool {
+    fn collect_candidates<'a>(values: &'a [Constant], candidates: &mut FxHashSet<&'a str>) {
+        if values
+            .iter()
+            .all(|value| matches!(value, Constant::String(_)))
+        {
+            for value in values {
+                let Constant::String(value) = value else {
+                    unreachable!("all-string tuple");
+                };
+                if value
+                    .bytes()
+                    .any(|byte| byte != b'_' && !byte.is_ascii_alphanumeric())
+                {
+                    candidates.insert(value);
+                }
+            }
+            return;
+        }
+
+        for value in values {
+            collect_nested_candidates(value, candidates);
+        }
+    }
+
+    fn collect_nested_candidates<'a>(value: &'a Constant, candidates: &mut FxHashSet<&'a str>) {
+        match value {
+            Constant::Tuple(values) => collect_candidates(values, candidates),
+            Constant::FrozenSet(values) => {
+                for value in values {
+                    collect_nested_candidates(value, candidates);
+                }
+            }
+            Constant::Code(code) => collect_candidates(&code.constants, candidates),
+            Constant::Slice { lower, upper, step } => {
+                for value in [lower.as_ref(), upper.as_ref(), step.as_ref()] {
+                    collect_nested_candidates(value, candidates);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn metadata_matches(code: &CodeObject, candidates: &FxHashSet<&str>) -> bool {
+        if code
+            .names
+            .iter()
+            .chain(&code.locals)
+            .chain(
+                code.marshal_provenance
+                    .interned_metadata_tuples
+                    .iter()
+                    .flatten(),
+            )
+            .any(|value| candidates.contains(value.as_str()))
+        {
+            return true;
+        }
+        code.constants
+            .iter()
+            .any(|value| nested_metadata_matches(value, candidates))
+    }
+
+    fn nested_metadata_matches(value: &Constant, candidates: &FxHashSet<&str>) -> bool {
+        match value {
+            Constant::Code(code) => metadata_matches(code, candidates),
+            Constant::Tuple(values) | Constant::FrozenSet(values) => values
+                .iter()
+                .any(|value| nested_metadata_matches(value, candidates)),
+            Constant::Slice { lower, upper, step } => [lower, upper, step]
+                .into_iter()
+                .any(|value| nested_metadata_matches(value, candidates)),
+            _ => false,
+        }
+    }
+
+    let mut candidates = FxHashSet::default();
+    collect_candidates(&code.constants, &mut candidates);
+    candidates.is_empty() || !metadata_matches(code, &candidates)
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct CodeUnit {
     pub(super) scope: Scope,
@@ -1271,6 +1358,7 @@ impl<'source> Compiler<'source> {
                 uncached_percent_constant: self.context.has_uncached_percent_constant(),
                 metadata_ids,
                 subtree_has_frozenset_constants: self.output.has_frozenset_constants,
+                metadata_alias_scan_unnecessary: false,
                 fresh_empty_bytes_constant: self.context.fresh_empty_bytes_constant(),
             },
         };
@@ -1280,6 +1368,8 @@ impl<'source> Compiler<'source> {
             code.marshal_provenance.interning_events = self.context.take_interning_events();
             code.marshal_provenance.interned_metadata_tuples =
                 self.context.take_interned_metadata_tuples();
+            code.marshal_provenance.metadata_alias_scan_unnecessary =
+                metadata_alias_scan_unnecessary(&code);
         }
         Ok(code)
     }

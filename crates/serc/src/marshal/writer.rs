@@ -120,6 +120,7 @@ fn encode_code_into_with_mode(
     root_reference: ReferenceMode,
 ) {
     let graph = ObjectGraph::for_code_with_options(code, python_version, initial_intern_state);
+    output.reserve(graph.estimated_wire_size());
     let mut writer = Writer {
         graph: &graph,
         output,

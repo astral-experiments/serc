@@ -47,6 +47,45 @@ fn optional_marshal_ids_remain_four_bytes() {
 }
 
 #[test]
+fn reserves_output_for_nested_code_and_shared_long_values() {
+    let value = "abcde".repeat(2_000);
+    let bytes = "12345".repeat(2_000);
+    let identifier = format!("long_identifier_{}", "x".repeat(2_000));
+    let source = format!(
+        "{identifier} = ({value:?}, b{bytes:?})\ndef nested():\n    return {identifier}, ({value:?}, b{bytes:?})\n"
+    );
+    let module = crate::compile(&source, "marshal_reservation.py").unwrap();
+    let estimated = ObjectGraph::for_code(&module.code).estimated_wire_size();
+    let encoded = module.marshal();
+    assert!(
+        estimated >= encoded.len(),
+        "{estimated} < {}",
+        encoded.len()
+    );
+    assert!(
+        estimated < encoded.len() + 1_024,
+        "shared values should not be reserved again: {estimated} vs {}",
+        encoded.len()
+    );
+
+    for workload in serc_fixtures::MARSHAL_MICRO_WORKLOADS
+        .iter()
+        .chain(serc_fixtures::COMPOSITE_WORKLOADS)
+        .chain(serc_fixtures::LARGE_WORKLOADS)
+    {
+        let module = crate::compile(workload.source, workload.filename).unwrap();
+        let estimated = ObjectGraph::for_code(&module.code).estimated_wire_size();
+        let encoded = module.marshal();
+        assert!(
+            estimated >= encoded.len(),
+            "{}: {estimated} < {}",
+            workload.id,
+            encoded.len()
+        );
+    }
+}
+
+#[test]
 #[should_panic(expected = "marshal occurrence 0 mismatch")]
 fn occurrence_cursor_rejects_a_mismatched_kind() {
     let code = code_object(Vec::new());
@@ -1794,6 +1833,84 @@ fn metadata_tuple_aliases_intern_only_the_shared_constant_slots() {
                 .count(),
             1
         );
+    }
+}
+
+#[test]
+fn compiled_metadata_tuple_aliases_match_pinned_cpython() {
+    use sha2::{Digest, Sha256};
+
+    // SHA-256 of complete marshal streams from CPython 3.14.5. The positive cases
+    // retain a plain scalar beside a distinct, interned member of the shared tuple.
+    let cases = [
+        (
+            "plain = \"pkg.child\"\ndef imported():\n    import pkg.child\nshared = (\"pkg.child\",)\n",
+            false,
+            "a2f9b34a96f7ec64eb93865e092a49e8e0364604f9da23a67731f9c29290e042",
+        ),
+        (
+            "plain = \"café\"\ndef metadata():\n    return café\nshared = (\"café\",)\n",
+            false,
+            "639c5f08fa280abcf32468a72816feb04cc600a533fe24c3e67b38c8b7e3ddf5",
+        ),
+        (
+            "plain = \"café\"\nif False:\n    def discarded():\n        return café\nshared = (\"café\",)\n",
+            false,
+            "cc6c43a785f740c2f42e66c2212195a305846bdbc9bc629b8159d86cb4d83c7b",
+        ),
+        (
+            "plain = \".0\"\nshared = (\".0\", \"value\")\nitems = (value for value in ())\n",
+            false,
+            "59a2507c0e2ec332178e0db90f2e71e065db1763b5cc57b591a19292349c4d5a",
+        ),
+        (
+            "plain = \"not an identifier!\"\ndef imported():\n    import pkg.child\nshared = (\"not an identifier!\",)\n",
+            true,
+            "49be849abd0950f75d79683c70aa62ca1bfd0343d2ef7902cfc52daac162e276",
+        ),
+    ];
+
+    for (source, scan_unnecessary, cpython_sha256) in cases {
+        let module = crate::compile(source, "metadata_alias.py").unwrap();
+        assert_eq!(
+            module
+                .code
+                .marshal_provenance
+                .metadata_alias_scan_unnecessary,
+            scan_unnecessary,
+            "{source}"
+        );
+        let encoded = module.marshal();
+        let mut fallback = module.code.clone();
+        fallback.marshal_provenance.metadata_alias_scan_unnecessary = false;
+        assert_eq!(encoded, encode_code(&fallback), "{source}");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&encoded)),
+            cpython_sha256,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn skipping_unrelated_metadata_tuple_aliases_preserves_benchmark_streams() {
+    let workloads = [
+        &serc_fixtures::MARSHAL_MICRO_WORKLOADS[1],
+        &serc_fixtures::LARGE_WORKLOADS[0],
+    ];
+    for workload in workloads {
+        let module = crate::compile(workload.source, workload.filename).unwrap();
+        assert!(
+            module
+                .code
+                .marshal_provenance
+                .metadata_alias_scan_unnecessary,
+            "{}",
+            workload.id
+        );
+        let mut fallback = module.code.clone();
+        fallback.marshal_provenance.metadata_alias_scan_unnecessary = false;
+        assert_eq!(module.marshal(), encode_code(&fallback), "{}", workload.id);
     }
 }
 

@@ -135,6 +135,8 @@ pub(crate) struct MarshalProvenance {
     pub(crate) metadata_ids: MarshalMetadataIds,
     /// Whether this code tree can contain a frozenset constant.
     pub(crate) subtree_has_frozenset_constants: bool,
+    /// Whether no surviving constant tuple can share a non-identifier string with code metadata.
+    pub(crate) metadata_alias_scan_unnecessary: bool,
     /// Whether the constant cache first admitted a fresh empty bytes object.
     pub(crate) fresh_empty_bytes_constant: bool,
 }
@@ -144,8 +146,8 @@ impl MarshalProvenance {
     pub(crate) fn equal_for_constant_pool(&self, other: &Self) -> bool {
         // CPython gives annotation-scope locals fresh identity, which distinguishes otherwise
         // equal code constants. String origins, qualified-name origins, metadata IDs,
-        // frozenset hints, and assembly events only affect graph planning and are omitted
-        // from constant-pool equality.
+        // frozenset and metadata-alias hints, and assembly events only affect graph planning and
+        // are omitted from constant-pool equality.
         self.locals_identity == other.locals_identity
     }
 }
@@ -533,6 +535,7 @@ mod tests {
                 qualified_name: Some(MetadataId::from_u32(1)),
             },
             subtree_has_frozenset_constants: true,
+            metadata_alias_scan_unnecessary: true,
             ..MarshalProvenance::default()
         };
 
