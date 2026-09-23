@@ -359,6 +359,8 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
             .join(format!("__pycache__/module.cpython-3{minor}.pyc"));
         let mut sources = vec![
             scalar_source.as_str(),
+            include_str!("../../serc/tests/fixtures/generator_eager_headers.py"),
+            "from __future__ import annotations\ndef outer():\n    def inner(value: (lambda: (yield 1))): pass\n    return inner\n",
             include_str!("../../serc/tests/fixtures/complex_division_signed_zeros.py"),
             include_str!("../../serc/tests/fixtures/nonfinite_complex_division.py"),
             "def answer():\n    return 42\n",

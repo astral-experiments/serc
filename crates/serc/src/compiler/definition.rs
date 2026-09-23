@@ -33,7 +33,7 @@ use super::scope::{
     inlined_comprehension_local_names_in_expression, nested_expression_required_names,
 };
 use super::source::unparse_annotation;
-use super::statement::{legacy_suite_contains_yield, suite_contains_yield};
+use super::statement::function_body_contains_yield;
 use super::symbol::{ComparisonMode, to_u32, unsupported};
 use super::{CPYTHON_STACK_USE_GUIDELINE, Compiler, SUPPORTED_FUTURE_FLAGS, Scope};
 
@@ -538,14 +538,10 @@ impl Compiler<'_> {
             0
         }) | (self.unit.flags & SUPPORTED_FUTURE_FLAGS);
         let contains_yield = self.context.module_plan().has_yield_expressions
-            && if self.has_deferred_annotations() {
-                suite_contains_yield(&definition.body)
-            } else {
-                legacy_suite_contains_yield(
-                    &definition.body,
-                    self.unit.flags & CO_FUTURE_ANNOTATIONS != 0,
-                )
-            };
+            && function_body_contains_yield(
+                &definition.body,
+                !self.has_deferred_annotations() && self.unit.flags & CO_FUTURE_ANNOTATIONS == 0,
+            );
         if definition.is_async && contains_yield {
             parameter_flags |= CO_ASYNC_GENERATOR;
         } else if definition.is_async {
