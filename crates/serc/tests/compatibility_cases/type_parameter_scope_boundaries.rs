@@ -176,3 +176,59 @@ fn python_312_still_rejects_lambdas_in_class_type_alias_scopes() {
         compile_with_options(source, "class_alias_nested_capture.py", &options).unwrap();
     }
 }
+
+#[test]
+fn nested_generic_class_parameters_shadow_other_private_names() {
+    for (binding_index, binding) in [
+        "__T = 'different private name'",
+        "global __T",
+        "_Inner__T = 'same private name'",
+        "global _Inner__T",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (parameter_index, parameters) in [
+            "__T: __T",
+            "__T, U: __T",
+            "__T: (__T, int)",
+            "__T: lambda: __T",
+            "__T: [__T for _ in (0,)]",
+            "__T = __T",
+            "__T, U = __T",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source =
+                format!("class Outer:\n    {binding}\n    class Inner[{parameters}]: pass\n");
+            let filename =
+                format!("nested_generic_class_private_{binding_index}_{parameter_index}.py");
+            common::assert_matches_cpython_marshal(&source, &filename);
+        }
+    }
+
+    common::assert_executes(
+        r"class Outer:
+    __T = 'different private name'
+    class Inner[__T: __T]: pass
+    class Pair[__T, U: __T]: pass
+    class Nested[__T: lambda: __T]: pass
+    class Default[__T = __T]: pass
+    _Spelled__T = 'same private name'
+    class Spelled[__T: __T]: pass
+    T = 'public name'
+    class Public[T: T]: pass
+    class Outer[__T: __T]: pass
+
+print(Outer.Inner.__type_params__[0].__bound__ is Outer.Inner.__type_params__[0])
+print(Outer.Pair.__type_params__[1].__bound__ is Outer.Pair.__type_params__[0])
+print(Outer.Nested.__type_params__[0].__bound__() is Outer.Nested.__type_params__[0])
+print(Outer.Default.__type_params__[0].__default__ is Outer.Default.__type_params__[0])
+print(Outer.Spelled.__type_params__[0].__bound__)
+print(Outer.Public.__type_params__[0].__bound__)
+print(Outer.Outer.__type_params__[0].__bound__)
+",
+        "True\nTrue\nTrue\nTrue\nsame private name\npublic name\ndifferent private name\n",
+    );
+}

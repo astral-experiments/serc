@@ -28,7 +28,15 @@ impl Compiler<'_> {
     pub(super) fn class_scope_declares_global(&self, name: NameId) -> bool {
         self.scope_arena()
             .class(self.unit.scope_id)
-            .is_some_and(|plan| plan.globals.contains(&name))
+            .is_some_and(|plan| {
+                if self.unit.mangled_names.is_some() && !plan.globals.is_empty() {
+                    let name = self.mangled_name_cow(self.resolve_name(name));
+                    plan.canonical_globals
+                        .contains(&self.required_name_id(&name))
+                } else {
+                    plan.globals.contains(&name)
+                }
+            })
     }
 
     /// Class namespace bindings exclude the temporary targets of inlined comprehensions.
@@ -44,20 +52,19 @@ impl Compiler<'_> {
 
     /// Direct annotation references honor class bindings before enclosing closure cells.
     pub(super) fn class_scope_shadows_annotation_name(&self, name: NameId) -> bool {
-        if self
-            .unit
-            .mangled_names
-            .as_ref()
-            .is_some_and(|names| !names.contains(self.resolve_name(name)))
-        {
-            return self.class_scope_shadows_unmangled_annotation_name(name);
+        if self.unit.mangled_names.is_some() {
+            // Generic class headers can use a different private-name context than their
+            // enclosing class. Compare the emitted spelling with that class's bindings.
+            let name = self.mangled_name_cow(self.resolve_name(name));
+            return self
+                .class_scope_shadows_unmangled_annotation_name(self.required_name_id(&name));
         }
         self.scope_arena()
             .class(self.unit.scope_id)
             .is_some_and(|plan| plan.globals.contains(&name) || plan.bound_names.contains(&name))
     }
 
-    /// Restricted generic headers compare raw names against emitted class bindings.
+    /// Compare an already resolved header spelling with emitted class bindings.
     pub(super) fn class_scope_shadows_unmangled_annotation_name(&self, name: NameId) -> bool {
         self.scope_arena()
             .class(self.unit.scope_id)
@@ -1203,6 +1210,7 @@ impl FunctionPlan {
 #[derive(Clone, Debug, Default)]
 struct ClassPlan {
     globals: FxHashSet<NameId>,
+    canonical_globals: FxHashSet<NameId>,
     nonlocals: FxHashSet<NameId>,
     bound_names: FxHashSet<NameId>,
     canonical_annotation_shadows: FxHashSet<NameId>,
@@ -1442,14 +1450,19 @@ impl ClassPlan {
             .into_iter()
             .map(|(name, requires_free)| (names.intern(name.as_str()), requires_free))
             .collect();
+        let canonical_globals = locals
+            .globals
+            .iter()
+            .map(|name| names.intern(&mangle_name(name.as_str(), Some(definition.name.as_str()))))
+            .collect::<FxHashSet<_>>();
         let canonical_annotation_shadows = locals
             .seen
             .iter()
-            .map(Name::as_str)
-            .chain(locals.globals.iter().map(String::as_str))
-            .map(|name| names.intern(&mangle_name(name, Some(definition.name.as_str()))))
+            .map(|name| names.intern(&mangle_name(name.as_str(), Some(definition.name.as_str()))))
+            .chain(canonical_globals.iter().copied())
             .collect();
         Self {
+            canonical_globals,
             canonical_annotation_shadows,
             namespace_bindings: locals
                 .non_comprehension_bindings
