@@ -3081,6 +3081,13 @@ fn fold_complex_arithmetic(
                         left_real.mul_add(right_imag, left_imag * right_real),
                     )
                 }
+                Operator::Mult if python_version >= PythonVersion::Py314 => {
+                    versioned_complex_product(
+                        (left_real, left_imag),
+                        (right_real, right_imag),
+                        python_version,
+                    )
+                }
                 Operator::Mult => complex_product((left_real, left_imag), (right_real, right_imag)),
                 _ => unreachable!(),
             }
@@ -3109,8 +3116,8 @@ fn complex_product(left: (f64, f64), right: (f64, f64)) -> (f64, f64) {
     )
 }
 
-/// Recover infinities as modern CPython's `_Py_c_prod` does during integer powers.
-fn complex_power_product(
+/// Recovers infinities in modern CPython's direct and integer-power complex products.
+fn versioned_complex_product(
     (mut a, mut b): (f64, f64),
     (mut c, mut d): (f64, f64),
     python_version: PythonVersion,
@@ -3360,10 +3367,10 @@ fn fold_complex_power(
     let mut mask = 1_u64;
     while mask > 0 && magnitude >= mask {
         if magnitude & mask != 0 {
-            result = complex_power_product(result, power, python_version);
+            result = versioned_complex_product(result, power, python_version);
         }
         mask <<= 1;
-        power = complex_power_product(power, power, python_version);
+        power = versioned_complex_product(power, power, python_version);
     }
     if exponent < 0 {
         result = complex_power_reciprocal(result, python_version)?;
@@ -4145,14 +4152,64 @@ fn big_integer_digits(token: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
+    use ruff_python_ast::Operator;
+
     use super::{
         CONSTANT_INDEX_THRESHOLD, ConstantEquality, ConstantIndices, ConstantPool,
-        FORCE_GENERIC_CONSTANT_ADMISSION, constant_pool_fingerprint,
+        FORCE_GENERIC_CONSTANT_ADMISSION, constant_pool_fingerprint, fold_complex_arithmetic,
     };
     use crate::code_object::{
         CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance, MetadataId,
     };
     use crate::{CompileOptions, PythonVersion, compile_with_options};
+
+    #[test]
+    fn complex_multiplication_recovery_follows_the_target() {
+        let real_infinity = Constant::Complex {
+            real: f64::INFINITY,
+            imag: f64::NAN,
+        };
+        let finite = Constant::Complex {
+            real: 1.0,
+            imag: 1.0,
+        };
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            for (left, right) in [(&real_infinity, &finite), (&finite, &real_infinity)] {
+                let Some(Constant::Complex { real, imag }) =
+                    fold_complex_arithmetic(left, Operator::Mult, right, python_version)
+                else {
+                    panic!("complex multiplication should be folded");
+                };
+                if python_version >= PythonVersion::Py314 {
+                    assert_eq!(real.to_bits(), f64::INFINITY.to_bits());
+                    assert_eq!(imag.to_bits(), f64::INFINITY.to_bits());
+                } else {
+                    assert!(real.is_nan());
+                    assert!(imag.is_nan());
+                }
+            }
+
+            if python_version >= PythonVersion::Py314 {
+                for (left, right) in [
+                    (&real_infinity, &Constant::Float(1.0)),
+                    (&Constant::Float(1.0), &real_infinity),
+                ] {
+                    let Some(Constant::Complex { real, imag }) =
+                        fold_complex_arithmetic(left, Operator::Mult, right, python_version)
+                    else {
+                        panic!("mixed complex multiplication should be folded");
+                    };
+                    assert_eq!(real.to_bits(), f64::INFINITY.to_bits());
+                    assert!(imag.is_nan());
+                }
+            }
+        }
+    }
 
     fn code_object(constants: Vec<Constant>) -> CodeObject {
         CodeObject {
