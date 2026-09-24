@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
 use ruff_python_ast::{
-    BoolOp, Expr, ExprBinOp, ExprContext, ExprStringLiteral, FStringPart,
+    BoolOp, Expr, ExprBinOp, ExprContext, ExprStringLiteral, ExprUnaryOp, FStringPart,
     InterpolatedStringElement, Number, Operator, Stmt, UnaryOp,
 };
 use ruff_text_size::Ranged;
@@ -564,8 +564,8 @@ pub(super) fn can_order_early_boolean_admissions(body: &[Stmt]) -> bool {
                         && literal_constant(&unary.operand).is_some()
                         && fold_constant(expression).is_none() =>
                 {
-                    // An early native Boolean with no folded owner (currently Ellipsis)
-                    // cannot contribute an instruction witness to the copied graph.
+                    // An early native Boolean with no folded owner cannot contribute an
+                    // instruction witness to the copied graph.
                     self.certified = false;
                 }
                 Expr::Name(_)
@@ -640,7 +640,16 @@ impl Compiler<'_> {
             self.record_folded_operands(expression)?;
         }
         let operand_folds = first_operand_fold..self.output.deferred_constants.len();
-        if matches!(expression, Expr::Tuple(_))
+        let double_ellipsis = double_negated_ellipsis(expression);
+        if let Some(inner) = double_ellipsis {
+            // The flowgraph keeps the folded load in the inner `not` slot and leaves
+            // the outer operation's line marker after it.
+            self.assembler
+                .set_location(self.source_location(inner.operand.range()));
+            self.emit(NOP, 0, 0)?;
+            self.assembler
+                .set_location(self.source_location(inner.range));
+        } else if matches!(expression, Expr::Tuple(_))
             || matches!(expression, Expr::UnaryOp(unary) if unary.op == UnaryOp::Not)
         {
             self.emit_folded_tuple_not_nops(expression)?;
@@ -699,6 +708,14 @@ impl Compiler<'_> {
             // source line keeps all nested operands in the same owner without line NOPs.
             self.assembler
                 .record_last_uniform_fold_owner_slots(hidden_owner_slots);
+        }
+        if let Some(inner) = double_ellipsis
+            && self.source_location(expression.range()).line
+                != self.source_location(inner.range).line
+        {
+            self.assembler
+                .set_location(self.source_location(expression.range()));
+            self.emit(NOP, 0, 0)?;
         }
         Ok(())
     }
@@ -911,9 +928,26 @@ impl Compiler<'_> {
                 }
             }
             Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => {
-                self.assembler
-                    .set_location(self.source_location(unary.operand.range()));
-                self.emit(NOP, 0, 0)?;
+                let double_ellipsis = double_negated_ellipsis(expression).is_some();
+                if double_ellipsis {
+                    // A later tuple fold also removes the inner surviving load, while
+                    // both negation locations still precede the tuple's own load.
+                    self.emit_folded_tuple_not_nops(&unary.operand)?;
+                    if self.source_location(expression.range()).line
+                        != self.source_location(unary.operand.range()).line
+                    {
+                        self.assembler
+                            .set_location(self.source_location(unary.operand.range()));
+                        self.emit(NOP, 0, 0)?;
+                    }
+                    self.assembler
+                        .set_location(self.source_location(expression.range()));
+                    self.emit(NOP, 0, 0)?;
+                } else {
+                    self.assembler
+                        .set_location(self.source_location(unary.operand.range()));
+                    self.emit(NOP, 0, 0)?;
+                }
             }
             _ => {}
         }
@@ -1815,6 +1849,45 @@ pub(super) fn fold_constant_for_version(
     fold_constant_with_literals(expression, python_version, &literal_constant, true)
 }
 
+/// Counts the consecutive negations applied directly to an Ellipsis literal.
+fn negated_ellipsis_depth(mut expression: &Expr) -> Option<usize> {
+    let mut depth = 0;
+    while let Expr::UnaryOp(unary) = expression {
+        if unary.op != UnaryOp::Not {
+            return None;
+        }
+        depth += 1;
+        expression = &unary.operand;
+    }
+    matches!(expression, Expr::EllipsisLiteral(_)).then_some(depth)
+}
+
+/// Finds the inner operation when exactly two negations are applied to Ellipsis.
+pub(super) fn double_negated_ellipsis(expression: &Expr) -> Option<&ExprUnaryOp> {
+    if let Expr::UnaryOp(outer) = expression
+        && outer.op == UnaryOp::Not
+        && let Expr::UnaryOp(inner) = outer.operand.as_ref()
+        && inner.op == UnaryOp::Not
+        && matches!(inner.operand.as_ref(), Expr::EllipsisLiteral(_))
+    {
+        Some(inner)
+    } else {
+        None
+    }
+}
+
+/// Finds the one or two Ellipsis negations folded by the modern instruction pass.
+pub(super) fn instruction_folded_ellipsis_depth(expression: &Expr) -> Option<usize> {
+    if let Expr::UnaryOp(unary) = expression
+        && unary.op == UnaryOp::Not
+        && matches!(unary.operand.as_ref(), Expr::EllipsisLiteral(_))
+    {
+        Some(1)
+    } else {
+        double_negated_ellipsis(expression).map(|_| 2)
+    }
+}
+
 /// Folds the same expression shapes using source-aware literal values when supplied.
 pub(super) fn fold_constant_with_literals(
     expression: &Expr,
@@ -1893,6 +1966,18 @@ pub(super) fn fold_constant_with_literals(
                 None
             }
             UnaryOp::Not => {
+                // This flag also distinguishes modern instruction folding from the
+                // neutral legacy AST folding used by `fold_constant`.
+                let ellipsis_depth = if boolean_sequence_repetition {
+                    instruction_folded_ellipsis_depth(expression)
+                } else {
+                    negated_ellipsis_depth(expression)
+                };
+                if let Some(depth) = ellipsis_depth {
+                    // Modern flowgraph optimization has already visited the initial
+                    // conversion when it removes the second negation.
+                    return Some(Constant::Bool(depth.is_multiple_of(2)));
+                }
                 if matches!(unary.operand.as_ref(), Expr::Tuple(_)) {
                     fold_constant_with_literals(
                         &unary.operand,

@@ -11,6 +11,115 @@ fn serc() -> Command {
 }
 
 #[test]
+fn compile_matches_cpython_for_negated_ellipsis() {
+    use serc::PythonVersion;
+
+    let cases = [
+        "result = not ...\n",
+        "def f():\n    return not ...\n",
+        "result = not not ...\n",
+        "result = not not not ...\n",
+        "result = not not not not ...\n",
+        "result = (not ..., ...)\n",
+        "result = (not ..., not not ..., ...)\n",
+        "result = True and not ...\n",
+        "result = False or not not ...\n",
+        "result = 1 and not ...\n",
+        "result = 0 or not ...\n",
+        "result = 257 and not ...\n",
+        "result = None or not ...\n",
+        "result = ... and not ...\n",
+        "result = True and 257 and not ...\n",
+        "def f():\n    return True and not ...\n",
+        "def f():\n    return False or not not ...\n",
+        "result = (\n    None or\n    not not ...\n)\n",
+        "result = (\n    True and\n    not not ...\n)\n",
+        "result = (\n    True and\n    not (\n        not ...\n    )\n)\n",
+        "result = (\n    None or not (\n       not ...\n    )\n)\n",
+        "result = ... and not not not ...\n",
+        "result = ... and not not not not ...\n",
+        "result = (\n    ... and\n    not not not ...\n)\n",
+        "result = (\n    ... and\n    not not not not ...\n)\n",
+        "result = ... and value\n",
+        "result = ... or value\n",
+        "result = value and ... and other\n",
+        "not ...\n",
+        "if not ...:\n    result = 1\nelse:\n    result = 2\n",
+        "if not not ...:\n    result = 1\nelse:\n    result = 2\n",
+        "def f():\n    while not ...:\n        return 1\n    return 2\n",
+        "def f():\n    return (\n        not\n        ...\n    )\n",
+        "result = (\n not (\n  not (\n   ...)))\n",
+        "result = (\n not (\n  not (\n   not ...)))\n",
+        "result = (\n not ...,\n not (\n  not ...),\n ...)\n",
+        "result = (\n not (\n  not (\n   ...)),\n)\n",
+        "result = (\n    not not ...,\n)\n",
+        "result = (\n    not not ...,\n    not not ...,\n)\n",
+        "result = (\n    (not not ...),\n)\n",
+        "result = (\n    (not not ...,),\n)\n",
+        "result = (\n    not ...,\n    not not ...,\n)\n",
+        "result = ...\n",
+        "if ...:\n    result = 1\nelse:\n    result = 2\n",
+        "result = ... or 2\n",
+        "result = not value\n",
+        "result = not Ellipsis\n",
+        "result = not ()\n",
+    ];
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("negated_ellipsis.py");
+    let native_path = directory.path().join("native.pyc");
+    for version in [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
+    ] {
+        for source in cases {
+            fs_err::write(&source_path, source).unwrap();
+            let mut oracle = match version {
+                PythonVersion::Py312 => common::python_312_command(),
+                PythonVersion::Py313 => common::python_313_command(),
+                PythonVersion::Py314 => common::python_3145_command(),
+                PythonVersion::Py315 => common::python_315_command(),
+            };
+            let native = oracle
+                .args([
+                    "-c",
+                    "import py_compile, sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True, optimize=0)",
+                ])
+                .arg(&source_path)
+                .arg(&native_path)
+                .output()
+                .unwrap();
+            assert!(native.status.success(), "{version}: {source}: {native:?}");
+
+            let compiled = serc()
+                .args([
+                    "compile",
+                    "--quiet",
+                    "--python-version",
+                    &version.to_string(),
+                ])
+                .arg(&source_path)
+                .output()
+                .unwrap();
+            assert!(
+                compiled.status.success(),
+                "{version}: {source}: {compiled:?}"
+            );
+            let (_, minor, _) = version.target().version;
+            let pyc_path = directory
+                .path()
+                .join(format!("__pycache__/negated_ellipsis.cpython-3{minor}.pyc"));
+            assert_eq!(
+                fs_err::read(pyc_path).unwrap(),
+                fs_err::read(&native_path).unwrap(),
+                "{version}: {source}"
+            );
+        }
+    }
+}
+
+#[test]
 fn help_describes_compile_command() {
     let output = serc().arg("--help").output().unwrap();
 
