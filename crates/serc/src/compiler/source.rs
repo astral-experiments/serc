@@ -2,10 +2,13 @@ use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use ruff_python_ast::token::{TokenKind, Tokens};
 use ruff_python_ast::visitor::transformer::{Transformer, walk_expr as transform_expr};
-use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
+#[cfg(test)]
+use ruff_python_ast::visitor::walk_stmt;
+use ruff_python_ast::visitor::{Visitor, walk_expr};
 use ruff_python_ast::{
     Expr, ExprContext, FStringPart, InterpolatedStringElement, Operator, Stmt, StringLiteralFlags,
     StringLiteralValue, Suite,
@@ -22,7 +25,7 @@ use super::constant::{
     constant_slice_with_literals, explicit_surrogate_string, fold_constant,
     fold_constant_for_version, fold_constant_with_literals, is_literal_constant, literal_constant,
 };
-use super::scope::{ModulePlan, ScopeArena};
+use super::scope::{ModulePlan, NameId, ScopeArena};
 use super::symbol::mangle_name;
 use super::{CachedSourceLine, Compiler};
 
@@ -101,7 +104,8 @@ impl ConstantOrigins {
 
     fn record_code_assembly(&mut self, code: &CodeObject) {
         if code.names.iter().any(|value| self.tracks(value)) {
-            self.string_tuples.insert(code.names.clone());
+            self.string_tuples
+                .insert(code.names.iter().map(ToString::to_string).collect());
         }
         if let Some(strings) = self.string_tuple(&code.constants) {
             self.string_tuples.insert(strings);
@@ -109,7 +113,8 @@ impl ConstantOrigins {
         if code.marshal_provenance.locals_identity == crate::code_object::LocalsIdentity::ByValue
             && code.locals.iter().any(|value| self.tracks(value))
         {
-            self.string_tuples.insert(code.locals.clone());
+            self.string_tuples
+                .insert(code.locals.iter().map(ToString::to_string).collect());
         }
     }
 }
@@ -117,7 +122,7 @@ impl ConstantOrigins {
 #[derive(Debug)]
 pub(super) struct CompilationContext<'source> {
     pub(super) python_version: crate::PythonVersion,
-    pub(super) filename: String,
+    pub(super) filename: Arc<str>,
     pub(super) source: &'source str,
     pub(super) tokens: &'source Tokens,
     line_index: LineIndex,
@@ -168,19 +173,19 @@ impl<'source> CompilationContext<'source> {
         body: &'source Suite,
         python_version: crate::PythonVersion,
     ) -> Self {
-        let scopes = if python_version == crate::PythonVersion::Py314 {
-            ScopeArena::analyze(body)
+        let name_capacity = if body.is_empty() {
+            0
         } else {
-            ScopeArena::analyze_with_python_version(body, python_version)
+            body.len().max(tokens.len() / 20).clamp(32, 4096)
         };
+        let mut source_analysis = SourceAnalysis::new(python_version, name_capacity);
+        let scopes = ScopeArena::analyze_with_source(body, python_version, &mut source_analysis);
         let mut generated_mangled_strings = FxHashSet::default();
         let mut requires_interning_trace = false;
         let mut static_attribute_names = FxHashSet::default();
         let mut has_percent_replacement = false;
         let mut finally_bodies = FxHashMap::default();
-        let (constant_string_origins, requires_empty_bytes_cache_trace) = analyze_source(
-            body,
-            python_version,
+        let (constant_string_origins, requires_empty_bytes_cache_trace) = source_analysis.finish(
             &mut generated_mangled_strings,
             &mut requires_interning_trace,
             &mut static_attribute_names,
@@ -205,7 +210,7 @@ impl<'source> CompilationContext<'source> {
             .then(RefCell::default);
         Self {
             python_version,
-            filename: filename.to_string(),
+            filename: Arc::from(filename),
             source,
             tokens,
             line_index: LineIndex::from_source_text(source),
@@ -434,13 +439,13 @@ impl<'source> CompilationContext<'source> {
         if let Some(tuples) = &self.interned_metadata_tuples {
             let mut tuples = tuples.borrow_mut();
             if code.names.iter().any(|name| !name.is_ascii()) {
-                tuples.push(code.names.clone());
+                tuples.push(code.names.iter().map(ToString::to_string).collect());
             }
             if code.marshal_provenance.locals_identity
                 == crate::code_object::LocalsIdentity::ByValue
                 && code.locals.iter().any(|name| !name.is_ascii())
             {
-                tuples.push(code.locals.clone());
+                tuples.push(code.locals.iter().map(ToString::to_string).collect());
             }
         }
         if let Some(origins) = &self.constant_origins {
@@ -516,7 +521,7 @@ impl<'source> CompilationContext<'source> {
             return None;
         }
         let metadata_already_interned =
-            value == self.filename || origins.interned_qualified_names.contains(value);
+            value == self.filename.as_ref() || origins.interned_qualified_names.contains(value);
         match origins.strings.entry(value.to_string()) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 // A dotted import interns its complete spelling while parsing. In 3.13,
@@ -591,274 +596,444 @@ fn has_double_underscore(name: &str) -> bool {
     name.as_bytes().windows(2).any(|pair| pair == b"__")
 }
 
+/// Whether folding can carry a bytes literal to a result, possibly through tuple indexing.
+fn can_fold_bytes(expression: &Expr) -> bool {
+    match expression {
+        Expr::BytesLiteral(_) => true,
+        Expr::BinOp(binary) if matches!(binary.op, Operator::Add | Operator::Mult) => {
+            can_fold_bytes(&binary.left) || can_fold_bytes(&binary.right)
+        }
+        Expr::Tuple(tuple) => tuple.elts.iter().any(can_fold_bytes),
+        Expr::Subscript(subscript) => can_fold_bytes(&subscript.value),
+        _ => false,
+    }
+}
+
+#[derive(Default)]
+pub(super) struct SourceAnalysis<'ast> {
+    python_version: crate::PythonVersion,
+    finally_bodies: FxHashMap<TextRange, &'ast [Stmt]>,
+    origins: FxHashMap<Cow<'ast, str>, Cell<StringConstantOrigin>>,
+    // Source-only identifiers still enter `origins` directly, in their original visitation order.
+    expression_origin_names: Vec<u64>,
+    private_name: Option<String>,
+    mangled_names: Option<FxHashSet<String>>,
+    generated_mangled_strings: FxHashSet<String>,
+    raw_private_identifiers: FxHashSet<&'ast str>,
+    restricted_private_identifier: bool,
+    static_attribute_names: FxHashSet<String>,
+    has_percent_replacement: bool,
+    requires_empty_bytes_cache_trace: bool,
+}
+
+pub(super) struct SourceClassState {
+    private_name: Option<String>,
+    mangled_names: Option<FxHashSet<String>>,
+}
+
+impl<'ast> SourceAnalysis<'ast> {
+    pub(super) fn new(python_version: crate::PythonVersion, name_capacity: usize) -> Self {
+        Self {
+            python_version,
+            origins: FxHashMap::with_capacity_and_hasher(name_capacity, rustc_hash::FxBuildHasher),
+            ..Self::default()
+        }
+    }
+
+    fn mangled_name<'a>(&self, name: &'a str) -> Cow<'a, str> {
+        if self
+            .mangled_names
+            .as_ref()
+            .is_some_and(|names| !names.contains(name))
+        {
+            Cow::Borrowed(name)
+        } else {
+            mangle_name(name, self.private_name.as_deref())
+        }
+    }
+
+    fn record_name(&mut self, name: &'ast str) {
+        self.record_raw_name(name);
+        let mangled = self.mangled_name(name);
+        if mangled != name {
+            let mangled = mangled.into_owned();
+            self.generated_mangled_strings.insert(mangled.clone());
+            self.origins.entry(Cow::Owned(mangled)).or_default();
+        }
+    }
+
+    fn record_raw_name(&mut self, name: &'ast str) {
+        self.origins.entry(Cow::Borrowed(name)).or_default();
+        self.record_raw_name_effects(name);
+    }
+
+    #[inline]
+    fn record_raw_name_with_id(&mut self, name: &'ast str, name_id: NameId) {
+        let index = name_id.index();
+        let word_index = index / u64::BITS as usize;
+        if word_index >= self.expression_origin_names.len() {
+            self.expression_origin_names.resize(word_index + 1, 0);
+        }
+        let word = &mut self.expression_origin_names[word_index];
+        let bit = 1 << (index % u64::BITS as usize);
+        if *word & bit == 0 {
+            *word |= bit;
+            self.origins.entry(Cow::Borrowed(name)).or_default();
+        }
+        self.record_raw_name_effects(name);
+    }
+
+    fn record_raw_name_effects(&mut self, name: &'ast str) {
+        if has_double_underscore(name) {
+            self.restricted_private_identifier |= self.mangled_names.is_some();
+            self.raw_private_identifiers.insert(name);
+            let mangled = self.mangled_name(name);
+            if mangled != name {
+                self.generated_mangled_strings.insert(mangled.into_owned());
+            }
+        }
+    }
+
+    pub(super) fn observe_stmt(&mut self, statement: &'ast Stmt) {
+        if let Stmt::Try(statement) = statement
+            && !statement.finalbody.is_empty()
+        {
+            self.finally_bodies
+                .insert(statement.range, &statement.finalbody);
+        }
+        match statement {
+            Stmt::AnnAssign(assignment) => {
+                if let Expr::Name(target) = assignment.target.as_ref() {
+                    self.record_name(target.id.as_str());
+                }
+            }
+            Stmt::FunctionDef(definition) => {
+                self.record_raw_name(definition.name.as_str());
+                if definition.returns.is_some() {
+                    self.origins.entry(Cow::Borrowed("return")).or_default();
+                }
+            }
+            Stmt::ClassDef(definition) => {
+                self.record_raw_name(definition.name.as_str());
+            }
+            Stmt::ImportFrom(import) => {
+                if let Some(module) = &import.module {
+                    for component in module.as_str().split('.') {
+                        self.record_raw_name(component);
+                    }
+                }
+            }
+            Stmt::Global(declaration) => {
+                for name in &declaration.names {
+                    self.record_raw_name(name.as_str());
+                }
+            }
+            Stmt::Nonlocal(declaration) => {
+                for name in &declaration.names {
+                    self.record_raw_name(name.as_str());
+                }
+            }
+            Stmt::Match(_) => {
+                // The parser interns soft keywords through its identifier-token path.
+                self.origins.entry(Cow::Borrowed("case")).or_default();
+            }
+            Stmt::TypeAlias(alias) => {
+                if let Expr::Name(name) = alias.name.as_ref() {
+                    self.origins
+                        .entry(Cow::Borrowed(name.id.as_str()))
+                        .or_default();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn enter_class_header(
+        &mut self,
+        definition: &'ast ruff_python_ast::StmtClassDef,
+    ) -> SourceClassState {
+        let previous = SourceClassState {
+            private_name: self.private_name.clone(),
+            mangled_names: self.mangled_names.clone(),
+        };
+        if let Some(type_params) = &definition.type_params {
+            self.private_name = Some(definition.name.to_string());
+            // `_Py_MaybeMangle` restricts generic-class annotation scopes to
+            // declared type parameters. The class body has ordinary mangling.
+            self.mangled_names = Some(
+                type_params
+                    .iter()
+                    .map(|parameter| parameter.name().to_string())
+                    .collect(),
+            );
+        }
+        previous
+    }
+
+    pub(super) fn enter_class_body(&mut self, definition: &ruff_python_ast::StmtClassDef) {
+        self.private_name = Some(definition.name.to_string());
+        self.mangled_names = None;
+    }
+
+    pub(super) fn leave_class(&mut self, previous: SourceClassState) {
+        self.private_name = previous.private_name;
+        self.mangled_names = previous.mangled_names;
+    }
+
+    pub(super) fn observe_parameters(&mut self, parameters: &'ast ruff_python_ast::Parameters) {
+        for parameter in &parameters.kwonlyargs {
+            if parameter.default.is_some() {
+                self.record_name(parameter.name().as_str());
+            }
+        }
+    }
+
+    pub(super) fn observe_parameter(&mut self, parameter: &'ast ruff_python_ast::Parameter) {
+        self.record_raw_name(parameter.name.as_str());
+        if parameter.annotation.is_some() {
+            self.record_name(parameter.name.as_str());
+        }
+    }
+
+    pub(super) fn observe_expr(&mut self, expression: &'ast Expr) {
+        match expression {
+            Expr::Name(name) => {
+                self.record_raw_name(name.id.as_str());
+            }
+            Expr::BinOp(binary) if binary.op == Operator::Mod => {
+                if let Expr::StringLiteral(format) = binary.left.as_ref() {
+                    self.has_percent_replacement |= format.value.to_str().contains("%%");
+                }
+            }
+            Expr::BinOp(binary)
+                if binary.op == Operator::Mult
+                    && !self.requires_empty_bytes_cache_trace
+                    && self.python_version >= crate::PythonVersion::Py314
+                    && can_fold_bytes(expression) =>
+            {
+                self.requires_empty_bytes_cache_trace = matches!(
+                    fold_constant_for_version(expression, self.python_version),
+                    Some(Constant::Bytes(value)) if value.is_empty()
+                );
+            }
+            Expr::Attribute(attribute) => {
+                self.record_raw_name(attribute.attr.as_str());
+                self.record_attribute_effects(attribute);
+            }
+            _ => {}
+        }
+    }
+
+    #[inline]
+    pub(super) fn observe_name_with_id(
+        &mut self,
+        name: &'ast ruff_python_ast::ExprName,
+        id: NameId,
+    ) {
+        self.record_raw_name_with_id(name.id.as_str(), id);
+    }
+
+    #[inline]
+    pub(super) fn observe_attribute_with_id(
+        &mut self,
+        attribute: &'ast ruff_python_ast::ExprAttribute,
+        id: NameId,
+    ) {
+        self.record_raw_name_with_id(attribute.attr.as_str(), id);
+        self.record_attribute_effects(attribute);
+    }
+
+    fn record_attribute_effects(&mut self, attribute: &ruff_python_ast::ExprAttribute) {
+        // Collect a conservative cache filter in this existing traversal.
+        // Actual class ownership is determined by the lowering Store path.
+        if attribute.ctx == ExprContext::Store
+            && matches!(attribute.value.as_ref(), Expr::Name(name) if name.id.as_str() == "self")
+        {
+            self.static_attribute_names
+                .insert(attribute.attr.to_string());
+        }
+    }
+
+    pub(super) fn observe_except_handler(&mut self, handler: &'ast ruff_python_ast::ExceptHandler) {
+        let ruff_python_ast::ExceptHandler::ExceptHandler(handler) = handler;
+        if let Some(name) = &handler.name {
+            self.record_raw_name(name.as_str());
+        }
+    }
+
+    pub(super) fn observe_pattern(&mut self, pattern: &'ast ruff_python_ast::Pattern) {
+        let capture = match pattern {
+            ruff_python_ast::Pattern::MatchAs(pattern) => pattern.name.as_ref(),
+            ruff_python_ast::Pattern::MatchStar(pattern) => pattern.name.as_ref(),
+            ruff_python_ast::Pattern::MatchMapping(pattern) => pattern.rest.as_ref(),
+            _ => None,
+        };
+        if let Some(name) = capture {
+            self.record_raw_name(name.as_str());
+        }
+    }
+
+    pub(super) fn observe_type_param(&mut self, parameter: &'ast ruff_python_ast::TypeParam) {
+        let name = parameter.name().as_str();
+        if let Some(names) = &mut self.mangled_names {
+            names.insert(name.to_string());
+        }
+        self.record_raw_name(name);
+    }
+
+    pub(super) fn observe_keyword(&mut self, keyword: &'ast ruff_python_ast::Keyword) {
+        if let Some(name) = &keyword.arg {
+            self.record_raw_name(name.as_str());
+        }
+    }
+
+    pub(super) fn observe_alias(&mut self, alias: &'ast ruff_python_ast::Alias) {
+        self.origins
+            .entry(Cow::Borrowed(alias.name.as_str()))
+            .or_default();
+        for component in alias.name.as_str().split('.') {
+            self.record_raw_name(component);
+        }
+        if let Some(name) = &alias.asname {
+            self.record_raw_name(name.as_str());
+        }
+    }
+
+    pub(super) fn observe_pattern_keyword(
+        &mut self,
+        keyword: &'ast ruff_python_ast::PatternKeyword,
+    ) {
+        self.record_raw_name(keyword.attr.as_str());
+    }
+
+    fn finish(
+        mut self,
+        generated_mangled_strings: &mut FxHashSet<String>,
+        requires_interning_trace: &mut bool,
+        static_attribute_names: &mut FxHashSet<String>,
+        has_percent_replacement: &mut bool,
+        finally_bodies: &mut FxHashMap<TextRange, &'ast [Stmt]>,
+    ) -> (FxHashMap<Cow<'ast, str>, Cell<StringConstantOrigin>>, bool) {
+        self.generated_mangled_strings
+            .retain(|name| !self.raw_private_identifiers.contains(name.as_str()));
+        *requires_interning_trace =
+            self.restricted_private_identifier || !self.generated_mangled_strings.is_empty();
+        *generated_mangled_strings = self.generated_mangled_strings;
+        *static_attribute_names = self.static_attribute_names;
+        *has_percent_replacement = self.has_percent_replacement;
+        *finally_bodies = self.finally_bodies;
+        (self.origins, self.requires_empty_bytes_cache_trace)
+    }
+}
+
+#[cfg(test)]
+impl<'ast> Visitor<'ast> for SourceAnalysis<'ast> {
+    fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        self.observe_stmt(statement);
+        if let Stmt::ClassDef(definition) = statement {
+            for decorator in &definition.decorator_list {
+                self.visit_decorator(decorator);
+            }
+            let previous = self.enter_class_header(definition);
+            if let Some(type_params) = &definition.type_params {
+                self.visit_type_params(type_params);
+            }
+            if let Some(arguments) = &definition.arguments {
+                self.visit_arguments(arguments);
+            }
+            self.enter_class_body(definition);
+            self.visit_body(&definition.body);
+            self.leave_class(previous);
+            return;
+        }
+        walk_stmt(self, statement);
+    }
+
+    fn visit_parameters(&mut self, parameters: &'ast ruff_python_ast::Parameters) {
+        self.observe_parameters(parameters);
+        ruff_python_ast::visitor::walk_parameters(self, parameters);
+    }
+
+    fn visit_parameter(&mut self, parameter: &'ast ruff_python_ast::Parameter) {
+        self.observe_parameter(parameter);
+        if let Some(annotation) = &parameter.annotation {
+            self.visit_expr(annotation);
+        }
+    }
+
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        self.observe_expr(expression);
+        match expression {
+            Expr::Name(_)
+            | Expr::StringLiteral(_)
+            | Expr::BytesLiteral(_)
+            | Expr::NumberLiteral(_)
+            | Expr::BooleanLiteral(_)
+            | Expr::NoneLiteral(_)
+            | Expr::EllipsisLiteral(_)
+            | Expr::IpyEscapeCommand(_) => {}
+            Expr::Attribute(attribute) => self.visit_expr(&attribute.value),
+            _ => walk_expr(self, expression),
+        }
+    }
+
+    fn visit_except_handler(&mut self, handler: &'ast ruff_python_ast::ExceptHandler) {
+        self.observe_except_handler(handler);
+        let ruff_python_ast::ExceptHandler::ExceptHandler(handler) = handler;
+        if let Some(type_) = &handler.type_ {
+            self.visit_expr(type_);
+        }
+        self.visit_body(&handler.body);
+    }
+
+    fn visit_pattern(&mut self, pattern: &'ast ruff_python_ast::Pattern) {
+        self.observe_pattern(pattern);
+        ruff_python_ast::visitor::walk_pattern(self, pattern);
+    }
+
+    fn visit_type_param(&mut self, parameter: &'ast ruff_python_ast::TypeParam) {
+        self.observe_type_param(parameter);
+        ruff_python_ast::visitor::walk_type_param(self, parameter);
+    }
+
+    fn visit_keyword(&mut self, keyword: &'ast ruff_python_ast::Keyword) {
+        self.observe_keyword(keyword);
+        self.visit_expr(&keyword.value);
+    }
+
+    fn visit_alias(&mut self, alias: &'ast ruff_python_ast::Alias) {
+        self.observe_alias(alias);
+    }
+
+    fn visit_pattern_keyword(&mut self, keyword: &'ast ruff_python_ast::PatternKeyword) {
+        self.observe_pattern_keyword(keyword);
+        self.visit_pattern(&keyword.pattern);
+    }
+}
+
+#[cfg(test)]
 fn analyze_source<'ast>(
     body: &'ast Suite,
     python_version: crate::PythonVersion,
+    name_capacity: usize,
     generated_mangled_strings: &mut FxHashSet<String>,
     requires_interning_trace: &mut bool,
     static_attribute_names: &mut FxHashSet<String>,
     has_percent_replacement: &mut bool,
     finally_bodies: &mut FxHashMap<TextRange, &'ast [Stmt]>,
 ) -> (FxHashMap<Cow<'ast, str>, Cell<StringConstantOrigin>>, bool) {
-    #[derive(Default)]
-    struct SourceAnalysis<'ast> {
-        python_version: crate::PythonVersion,
-        finally_bodies: FxHashMap<TextRange, &'ast [Stmt]>,
-        origins: FxHashMap<Cow<'ast, str>, Cell<StringConstantOrigin>>,
-        private_name: Option<String>,
-        mangled_names: Option<FxHashSet<String>>,
-        generated_mangled_strings: FxHashSet<String>,
-        raw_private_identifiers: FxHashSet<&'ast str>,
-        restricted_private_identifier: bool,
-        static_attribute_names: FxHashSet<String>,
-        has_percent_replacement: bool,
-        requires_empty_bytes_cache_trace: bool,
-    }
-
-    impl<'ast> SourceAnalysis<'ast> {
-        fn mangled_name<'a>(&self, name: &'a str) -> Cow<'a, str> {
-            if self
-                .mangled_names
-                .as_ref()
-                .is_some_and(|names| !names.contains(name))
-            {
-                Cow::Borrowed(name)
-            } else {
-                mangle_name(name, self.private_name.as_deref())
-            }
-        }
-
-        fn record_name(&mut self, name: &'ast str) {
-            self.record_raw_name(name);
-            let mangled = self.mangled_name(name);
-            if mangled != name {
-                let mangled = mangled.into_owned();
-                self.generated_mangled_strings.insert(mangled.clone());
-                self.origins.entry(Cow::Owned(mangled)).or_default();
-            }
-        }
-
-        fn record_raw_name(&mut self, name: &'ast str) {
-            self.origins.entry(Cow::Borrowed(name)).or_default();
-            if has_double_underscore(name) {
-                self.restricted_private_identifier |= self.mangled_names.is_some();
-                self.raw_private_identifiers.insert(name);
-                let mangled = self.mangled_name(name);
-                if mangled != name {
-                    self.generated_mangled_strings.insert(mangled.into_owned());
-                }
-            }
-        }
-    }
-
-    impl<'a> Visitor<'a> for SourceAnalysis<'a> {
-        fn visit_stmt(&mut self, statement: &'a Stmt) {
-            if let Stmt::Try(statement) = statement
-                && !statement.finalbody.is_empty()
-            {
-                self.finally_bodies
-                    .insert(statement.range, &statement.finalbody);
-            }
-            match statement {
-                Stmt::AnnAssign(assignment) => {
-                    if let Expr::Name(target) = assignment.target.as_ref() {
-                        self.record_name(target.id.as_str());
-                    }
-                }
-                Stmt::FunctionDef(definition) => {
-                    self.record_raw_name(definition.name.as_str());
-                    if definition.returns.is_some() {
-                        self.origins.entry(Cow::Borrowed("return")).or_default();
-                    }
-                }
-                Stmt::ClassDef(definition) => {
-                    self.record_raw_name(definition.name.as_str());
-                    for decorator in &definition.decorator_list {
-                        self.visit_decorator(decorator);
-                    }
-                    let previous = self.private_name.clone();
-                    let previous_mangled_names = self.mangled_names.clone();
-                    if let Some(type_params) = &definition.type_params {
-                        self.private_name = Some(definition.name.to_string());
-                        // `_Py_MaybeMangle` restricts generic-class annotation scopes to
-                        // declared type parameters. The class body has ordinary mangling.
-                        self.mangled_names = Some(
-                            type_params
-                                .iter()
-                                .map(|parameter| parameter.name().to_string())
-                                .collect(),
-                        );
-                        self.visit_type_params(type_params);
-                    }
-                    if let Some(arguments) = &definition.arguments {
-                        self.visit_arguments(arguments);
-                    }
-                    self.private_name = Some(definition.name.to_string());
-                    self.mangled_names = None;
-                    self.visit_body(&definition.body);
-                    self.private_name = previous;
-                    self.mangled_names = previous_mangled_names;
-                    return;
-                }
-                Stmt::ImportFrom(import) => {
-                    if let Some(module) = &import.module {
-                        for component in module.as_str().split('.') {
-                            self.record_raw_name(component);
-                        }
-                    }
-                }
-                Stmt::Global(declaration) => {
-                    for name in &declaration.names {
-                        self.record_raw_name(name.as_str());
-                    }
-                }
-                Stmt::Nonlocal(declaration) => {
-                    for name in &declaration.names {
-                        self.record_raw_name(name.as_str());
-                    }
-                }
-                Stmt::Match(_) => {
-                    // The parser interns soft keywords through its identifier-token path.
-                    self.origins.entry(Cow::Borrowed("case")).or_default();
-                }
-                Stmt::TypeAlias(alias) => {
-                    if let Expr::Name(name) = alias.name.as_ref() {
-                        self.origins
-                            .entry(Cow::Borrowed(name.id.as_str()))
-                            .or_default();
-                    }
-                }
-                _ => {}
-            }
-            walk_stmt(self, statement);
-        }
-
-        fn visit_parameters(&mut self, parameters: &'a ruff_python_ast::Parameters) {
-            for parameter in &parameters.kwonlyargs {
-                if parameter.default.is_some() {
-                    self.record_name(parameter.name().as_str());
-                }
-            }
-            ruff_python_ast::visitor::walk_parameters(self, parameters);
-        }
-
-        fn visit_parameter(&mut self, parameter: &'a ruff_python_ast::Parameter) {
-            self.record_raw_name(parameter.name.as_str());
-            if let Some(annotation) = &parameter.annotation {
-                self.record_name(parameter.name.as_str());
-                self.visit_expr(annotation);
-            }
-        }
-
-        fn visit_expr(&mut self, expression: &'a Expr) {
-            match expression {
-                Expr::BinOp(binary) if binary.op == Operator::Mod => {
-                    if let Expr::StringLiteral(format) = binary.left.as_ref() {
-                        self.has_percent_replacement |= format.value.to_str().contains("%%");
-                    }
-                }
-                Expr::BinOp(binary)
-                    if binary.op == Operator::Mult
-                        && !self.requires_empty_bytes_cache_trace
-                        && self.python_version >= crate::PythonVersion::Py314 =>
-                {
-                    self.requires_empty_bytes_cache_trace = matches!(
-                        fold_constant_for_version(expression, self.python_version),
-                        Some(Constant::Bytes(value)) if value.is_empty()
-                    );
-                }
-                Expr::Name(name) => self.record_raw_name(name.id.as_str()),
-                Expr::Attribute(attribute) => {
-                    self.record_raw_name(attribute.attr.as_str());
-                    // Collect a conservative cache filter in this existing traversal.
-                    // Actual class ownership is determined by the lowering Store path.
-                    if attribute.ctx == ExprContext::Store
-                        && matches!(attribute.value.as_ref(), Expr::Name(name) if name.id.as_str() == "self")
-                    {
-                        self.static_attribute_names
-                            .insert(attribute.attr.to_string());
-                    }
-                }
-                _ => {}
-            }
-            walk_expr(self, expression);
-        }
-
-        fn visit_except_handler(&mut self, handler: &'a ruff_python_ast::ExceptHandler) {
-            let ruff_python_ast::ExceptHandler::ExceptHandler(handler) = handler;
-            if let Some(name) = &handler.name {
-                self.record_raw_name(name.as_str());
-            }
-            if let Some(type_) = &handler.type_ {
-                self.visit_expr(type_);
-            }
-            self.visit_body(&handler.body);
-        }
-
-        fn visit_pattern(&mut self, pattern: &'a ruff_python_ast::Pattern) {
-            let capture = match pattern {
-                ruff_python_ast::Pattern::MatchAs(pattern) => pattern.name.as_ref(),
-                ruff_python_ast::Pattern::MatchStar(pattern) => pattern.name.as_ref(),
-                ruff_python_ast::Pattern::MatchMapping(pattern) => pattern.rest.as_ref(),
-                _ => None,
-            };
-            if let Some(name) = capture {
-                self.record_raw_name(name.as_str());
-            }
-            ruff_python_ast::visitor::walk_pattern(self, pattern);
-        }
-
-        fn visit_type_param(&mut self, parameter: &'a ruff_python_ast::TypeParam) {
-            let name = parameter.name().as_str();
-            if let Some(names) = &mut self.mangled_names {
-                names.insert(name.to_string());
-            }
-            self.record_raw_name(name);
-            ruff_python_ast::visitor::walk_type_param(self, parameter);
-        }
-
-        fn visit_keyword(&mut self, keyword: &'a ruff_python_ast::Keyword) {
-            if let Some(name) = &keyword.arg {
-                self.record_raw_name(name.as_str());
-            }
-            self.visit_expr(&keyword.value);
-        }
-
-        fn visit_alias(&mut self, alias: &'a ruff_python_ast::Alias) {
-            self.origins
-                .entry(Cow::Borrowed(alias.name.as_str()))
-                .or_default();
-            for component in alias.name.as_str().split('.') {
-                self.record_raw_name(component);
-            }
-            if let Some(name) = &alias.asname {
-                self.record_raw_name(name.as_str());
-            }
-        }
-
-        fn visit_pattern_keyword(&mut self, keyword: &'a ruff_python_ast::PatternKeyword) {
-            self.record_raw_name(keyword.attr.as_str());
-            self.visit_pattern(&keyword.pattern);
-        }
-    }
-
-    let mut visitor = SourceAnalysis {
+    let mut visitor = SourceAnalysis::new(
         python_version,
-        ..SourceAnalysis::default()
-    };
-    for statement in body {
-        visitor.visit_stmt(statement);
-    }
-    visitor
-        .generated_mangled_strings
-        .retain(|name| !visitor.raw_private_identifiers.contains(name.as_str()));
-    *requires_interning_trace =
-        visitor.restricted_private_identifier || !visitor.generated_mangled_strings.is_empty();
-    *generated_mangled_strings = visitor.generated_mangled_strings;
-    *static_attribute_names = visitor.static_attribute_names;
-    *has_percent_replacement = visitor.has_percent_replacement;
-    *finally_bodies = visitor.finally_bodies;
-    (visitor.origins, visitor.requires_empty_bytes_cache_trace)
+        if body.is_empty() { 0 } else { name_capacity },
+    );
+    visitor.visit_body(body);
+    visitor.finish(
+        generated_mangled_strings,
+        requires_interning_trace,
+        static_attribute_names,
+        has_percent_replacement,
+        finally_bodies,
+    )
 }
 
 impl Compiler<'_> {
@@ -941,28 +1116,62 @@ impl Compiler<'_> {
         )
     }
 
+    #[inline]
     fn source_line(&self, offset: TextSize) -> CachedSourceLine {
-        if let Some(line) = self.cached_source_line.get()
+        let [recent, previous] = self.cached_source_lines.get();
+        if let Some(line) = recent
             && line.contains(offset)
         {
             return line;
         }
+        if let Some(line) = previous
+            && line.contains(offset)
+        {
+            self.cached_source_lines.set([previous, recent]);
+            return line;
+        }
 
-        let line = self.context.line_index.line_index(offset);
-        let line_index = line.to_zero_indexed();
+        self.uncached_source_line(offset, recent)
+    }
+
+    #[inline(never)]
+    fn uncached_source_line(
+        &self,
+        offset: TextSize,
+        recent: Option<CachedSourceLine>,
+    ) -> CachedSourceLine {
         let line_starts = self.context.line_index.line_starts();
+        let adjacent = recent.and_then(|line| {
+            let current = usize::try_from(line.number).ok()?.checked_sub(1)?;
+            if offset >= line.end && !line.is_last {
+                let next = current + 1;
+                if line_starts.get(next + 1).is_none_or(|end| offset < *end) {
+                    return Some(next);
+                }
+            } else if offset < line.start {
+                let previous = current.checked_sub(1)?;
+                if offset >= line_starts[previous] {
+                    return Some(previous);
+                }
+            }
+            None
+        });
+        let line_index = adjacent
+            .unwrap_or_else(|| self.context.line_index.line_index(offset).to_zero_indexed());
         let start = line_starts[line_index];
         let end = line_starts
             .get(line_index + 1)
             .copied()
             .unwrap_or_else(|| self.source_offset(u32::MAX));
         let cached = CachedSourceLine {
-            number: u32::try_from(line.get()).unwrap_or(u32::MAX),
+            number: u32::try_from(line_index + 1).unwrap_or(u32::MAX),
             start,
             end,
             is_last: line_index + 1 == line_starts.len(),
         };
-        self.cached_source_line.set(Some(cached));
+        // A multiline range visits its start and end, then often returns to the start while
+        // lowering its children. Retain both ends rather than replacing one with the other.
+        self.cached_source_lines.set([Some(cached), recent]);
         cached
     }
 
@@ -2053,6 +2262,50 @@ mod tests {
     }
 
     #[test]
+    fn empty_bytes_cache_trace_only_folds_possible_byte_sequences() {
+        use crate::PythonVersion::{Py313, Py314, Py315};
+
+        for (source, possible_bytes, requires_trace) in [
+            ("b'abc' * 0", true, true),
+            ("False * (b'a' + b'b')", true, true),
+            ("(b'abc'[1:] + b'd') * 0", true, true),
+            ("((1,), (b'a',))[1][0] * 0", true, true),
+            ("((0,) + (b'a',))[1] * 0", true, true),
+            ("((b'a',) * 2)[1] * 0", true, true),
+            ("b'' * -1", true, true),
+            ("b'a' * 2", true, false),
+            ("(b'a',) * 0", true, false),
+            ("(1, b'a')[0] * 0", true, false),
+            ("b'a'[0] * 0", true, false),
+            ("42 * (12 + 13)", false, false),
+            ("'abc' * 0", false, false),
+            ("f'{b\"a\"}' * 0", false, false),
+            ("method(b'abc') * 0", false, false),
+            ("(1, 2)[b'abc'[0]] * 0", false, false),
+        ] {
+            let parsed = ruff_python_parser::parse_module(source).unwrap();
+            let [Stmt::Expr(statement)] = parsed.suite().as_slice() else {
+                unreachable!("test cases are expressions");
+            };
+            assert_eq!(can_fold_bytes(&statement.value), possible_bytes, "{source}");
+            for version in [Py313, Py314, Py315] {
+                let context = CompilationContext::with_python_version(
+                    "bytes.py",
+                    source,
+                    parsed.tokens(),
+                    parsed.suite(),
+                    version,
+                );
+                assert_eq!(
+                    context.requires_empty_bytes_cache_trace,
+                    requires_trace && version >= Py314,
+                    "{version:?} {source}",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn python315_lazy_import_checks_precede_dead_code_elimination() {
         let options = crate::CompileOptions {
             python_version: crate::PythonVersion::Py315,
@@ -2193,6 +2446,7 @@ mod tests {
         let (origins, _) = analyze_source(
             parsed.suite(),
             crate::PythonVersion::Py314,
+            0,
             &mut generated,
             &mut requires_trace,
             &mut FxHashSet::default(),
@@ -2217,6 +2471,185 @@ mod tests {
         assert!(generated.contains("_Café__parameter"));
         assert!(!generated.contains("_Café__already"));
         assert!(requires_trace);
+    }
+
+    #[test]
+    fn source_analysis_visits_names_inside_attributes_and_interpolated_literals() {
+        let source = r#"
+self.attribute = receiver.inner.outer
+value = ("ordinary" " adjacent", b"literal", 3, True, None, ...)
+formatted = f"text {inside.member}"
+templated = t"text {template.member}"
+percent = "%%" % operand
+"#;
+        let parsed = ruff_python_parser::parse_module(source).unwrap();
+        let mut attributes = FxHashSet::default();
+        let mut percent = false;
+        let (origins, empty_bytes) = analyze_source(
+            parsed.suite(),
+            crate::PythonVersion::Py314,
+            32,
+            &mut FxHashSet::default(),
+            &mut false,
+            &mut attributes,
+            &mut percent,
+            &mut FxHashMap::default(),
+        );
+        for name in [
+            "self",
+            "attribute",
+            "receiver",
+            "inner",
+            "outer",
+            "inside",
+            "member",
+            "template",
+            "operand",
+        ] {
+            assert!(origins.contains_key(name), "{name}");
+        }
+        for literal in ["ordinary adjacent", "literal", "text "] {
+            assert!(!origins.contains_key(literal), "{literal}");
+        }
+        assert_eq!(attributes, FxHashSet::from_iter(["attribute".to_owned()]));
+        assert!(percent);
+        assert!(!empty_bytes);
+    }
+
+    #[test]
+    fn combined_source_and_scope_walk_matches_independent_source_walk() {
+        use crate::PythonVersion::{Py312, Py313, Py314, Py315};
+
+        let source = r#"
+_Before__x
+_Before__x.attr
+__shared
+prefix__suffix
+import alpha.beta as __module
+from __origin.inner import __member as __alias
+@decorate(__outside)
+class __Outer[__T: __bound = __default](factory(__T, __external, __key=__value)):
+    __field: __type = __value
+    @decorate(__enclosing)
+    class __Inner[__U: __T](factory(__U, __other)):
+        def method[__V](self, __argument: __T, *, __option=__fallback) -> __result:
+            nonlocal __field
+            global __global
+            self.__attribute = __receiver.__middle.__leaf
+            self.__attribute += __increment
+            try:
+                __operation()
+            except __Error as __caught:
+                __handler(__caught)
+            finally:
+                __cleanup()
+            match __subject:
+                case __Point(__pattern=__capture, value=[*__rest]):
+                    pass
+                case {"key": __entry, **__remaining}:
+                    pass
+            type __Alias[__W] = tuple[__W, __V]
+            return lambda __lambda=__fallback: __lambda.__attribute
+        __ordinary = (__item.__element for __item in __iterable if __item)
+try:
+    text = "%%" % __operand
+    empty = b"value" * 0
+except __RootError as __root_caught:
+    __root_handler(__root_caught)
+finally:
+    __root_cleanup()
+def flat():
+    __flat_receiver.__flat_attribute += __flat_increment
+    try:
+        __flat_operation()
+    except __FlatError as __flat_caught:
+        __flat_handler(__flat_caught)
+    return __flat_receiver.__flat_inner.__flat_leaf
+class Before:
+    __x: object
+    self.__x
+class After:
+    __x: object
+    self.__x
+_After__x
+_After__x.attr
+class RepeatOuter[__T: (__shared, prefix__suffix)]:
+    self.__shared = __shared
+    class RepeatInner[__T: (__shared, prefix__suffix)]:
+        self.__shared = __shared
+        self.__shared
+    self.__shared
+"#;
+        let parsed = ruff_python_parser::parse_module(source).unwrap();
+        for version in [Py312, Py313, Py314, Py315] {
+            let mut reference = SourceAnalysis::new(version, 0);
+            reference.visit_body(parsed.suite());
+            let mut combined = SourceAnalysis::new(version, 0);
+            ScopeArena::analyze_with_source(parsed.suite(), version, &mut combined);
+
+            let origin_spellings = |analysis: &SourceAnalysis<'_>| {
+                analysis
+                    .origins
+                    .iter()
+                    .map(|(name, origin)| {
+                        (
+                            name.to_string(),
+                            (matches!(name, Cow::Owned(_)), origin.get()),
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            assert_eq!(origin_spellings(&combined), origin_spellings(&reference));
+            for (spelling, owned) in [("_Before__x", false), ("_After__x", true)] {
+                let (name, _) = combined.origins.get_key_value(spelling).unwrap();
+                assert_eq!(matches!(name, Cow::Owned(_)), owned, "{spelling}");
+            }
+            for generated in ["_RepeatOuter__shared", "_RepeatInner__shared"] {
+                assert!(combined.generated_mangled_strings.contains(generated));
+            }
+            assert!(combined.static_attribute_names.contains("__shared"));
+            assert_eq!(combined.finally_bodies, reference.finally_bodies);
+            assert_eq!(
+                combined.generated_mangled_strings,
+                reference.generated_mangled_strings
+            );
+            assert_eq!(
+                combined.raw_private_identifiers,
+                reference.raw_private_identifiers
+            );
+            assert_eq!(
+                combined.restricted_private_identifier,
+                reference.restricted_private_identifier
+            );
+            assert_eq!(
+                combined.static_attribute_names,
+                reference.static_attribute_names
+            );
+            assert_eq!(
+                combined.has_percent_replacement,
+                reference.has_percent_replacement
+            );
+            assert_eq!(
+                combined.requires_empty_bytes_cache_trace,
+                reference.requires_empty_bytes_cache_trace
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_expression_name_still_records_restricted_private_context() {
+        let source = "prefix__suffix\nclass Restricted[T: prefix__suffix]:\n    pass\n";
+        let parsed = ruff_python_parser::parse_module(source).unwrap();
+        let mut combined = SourceAnalysis::new(crate::PythonVersion::Py314, 0);
+        ScopeArena::analyze_with_source(parsed.suite(), crate::PythonVersion::Py314, &mut combined);
+        let mut reference = SourceAnalysis::new(crate::PythonVersion::Py314, 0);
+        reference.visit_body(parsed.suite());
+        assert!(combined.restricted_private_identifier);
+        assert_eq!(
+            combined.restricted_private_identifier,
+            reference.restricted_private_identifier
+        );
+        assert!(combined.raw_private_identifiers.contains("prefix__suffix"));
     }
 
     #[test]

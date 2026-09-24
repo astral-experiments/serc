@@ -186,6 +186,15 @@ impl OptimizationPipeline {
             return;
         }
         let graph = &self.graph;
+        // Every scheduled copy must terminate at one of these two exact original arrays.
+        // Most graphs with a forward jump contain neither, so avoid building their indexes
+        // and authenticating every block before discovering that there is nothing to copy.
+        if !graph.iter().any(|(_, block)| {
+            original_local_tuple_return(block.items()).is_some()
+                || original_local_subscript_return(block.items()).is_some()
+        }) {
+            return;
+        }
         let order = graph.order();
         let positions = order
             .iter()

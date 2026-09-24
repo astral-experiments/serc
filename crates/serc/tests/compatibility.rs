@@ -27,6 +27,48 @@ mod tests {
     }
 
     #[test]
+    fn terminal_guard_returns_and_raises_match_cpython() {
+        let source = "def guard(flag, other):\n    if flag:\n        return flag + 1\n    if other is None:\n        raise ValueError('missing', other)\n    return other\n\ndef side_local(flag):\n    if flag:\n        value = 4\n        return value\n    return value\n\ndef side_deletion(flag):\n    if flag:\n        del flag\n        raise RuntimeError('deleted')\n    return flag\n\ndef continuing_binding(flag, value):\n    prepared = value\n    if flag:\n        prepared = flag\n        return prepared\n    if prepared is None:\n        return 42\n    return prepared\n\ndef side_check(flag):\n    if flag:\n        result\n        raise RuntimeError\n    return result\n";
+        assert_matches_cpython_marshal(source, "terminal_guard_paths.py");
+    }
+
+    #[test]
+    fn short_circuit_and_exhaustive_terminal_paths_match_cpython() {
+        let source = r"
+def reraise():
+    raise
+
+def chained(exception, cause):
+    message = str(exception)
+    raise ValueError(message) from cause
+
+def exhaustive(first, second):
+    if first:
+        return 1
+    elif second:
+        raise TypeError(second)
+    else:
+        return 3
+
+def conjunction(first, second, third):
+    if first and second and third:
+        return first + third
+    return second
+
+def partial_assignment(first, second):
+    if first and (local := second):
+        return local
+    return local
+
+def continuing_assignment(first, second):
+    if (local := first) and second:
+        return second
+    return local
+";
+        assert_matches_cpython_marshal(source, "short_circuit_terminal_paths.py");
+    }
+
+    #[test]
     fn emits_a_python_3145_pyc_header() {
         let pyc = compile_to_pyc("answer = 42\n", "answer.py", 123).unwrap();
         assert_eq!(&pyc[..4], &CPYTHON_TARGET.magic_number);
@@ -1238,6 +1280,24 @@ def parent():
     fn matches_cpython_marshal_for_string_slice_constants() {
         let source = "subject[\"fine\":\"fine\"]\nsubject[\"x\":\"x\"]\n";
         assert_matches_cpython_marshal(source, "slice.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_empty_string_slice_bounds() {
+        for source in [
+            "subject['':]\n",
+            "subject[:'']\n",
+            "subject[::'']\n",
+            "subject['':'':'']\n",
+            "subject['':'%']\n",
+            "subject['':'fine':'é']\nsubject['x':'': 'Ā']\n",
+            "before = ('', '-')\nsubject['':'-']\n",
+            "subject['':'-']\nafter = ('', '-')\n",
+            "before = ''\nsubject['':]\nsubject[:'']\nsubject[::'']\nafter = ''\n",
+            "def first(subject):\n    return subject['':]\ndef second(subject):\n    return '', subject[:'']\n",
+        ] {
+            assert_matches_cpython_marshal(source, "empty_string_slice.py");
+        }
     }
 
     #[test]
@@ -12605,6 +12665,30 @@ match subject:
     fn matches_cpython_marshal_for_a_tuple_containing_a_constant_slice() {
         let source = "constant = lambda value: value[:, 1]\ndynamic = lambda value: value[::-1]\nwith_defaults = lambda value=1, other=2: value\nstring_slice = 'héllo'[1:4]\nstepped_string_slice = 'abcdef'[1:5:2]\nboolean_slice = 'abc'[False:True:True]\nbytes_slice = b'prefix'[2:]\ntuple_slice = (1, 2, 3)[1:]\nnegative_slice = 'abc'[:-1]\nstring_index = 'héllo'[1]\nfstring_index = f'abc'[0]\nbytes_index = b'prefix'[-1]\ntuple_index = (1, 2, 3)[-2]\ndynamic_list_index = [1, 2, 3][0]\nmember = item in [1, 2]\ndouble_negation = not not item\n5.0 ** 5.0\nTrue ** True\nFalse ** False\n() << 0 ** 99999999999999999999999999\n1 - 2\ninverted = ~1\nnegative_zero = -0000\nmixed = 1 + 2.5\nassert (False, 'x')\nassert (False,)\nassert ()\nassert True\npacked = fn('User', **{'name': str})\nunicode_keyword = fn(café=1)\nhuge = -999999999999999999999999999999999999999999\nadjacent = ('' f'prefix {item}')\nleft if condition else right\n'%s' % ('value',)\nif (1, 2):\n    pass\n";
         assert_matches_cpython_marshal(source, "example.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_constant_sequence_slice_bound_folding_order() {
+        for sequence in ["'abcd'", "'aébc'", "b'abcd'", "(1, 2, 3, 4)"] {
+            for slice in [
+                ":0 + 1",
+                "-0:",
+                "0 + 1:",
+                ":(1 if True else 2)",
+                ":(1,)[0]",
+                ":+1",
+                "not True:",
+                "::0 + 1",
+                "0 + 1::1",
+                ":1",
+                "0:",
+                "::1",
+                ":True",
+            ] {
+                let source = format!("def f():\n    return {sequence}[{slice}]\n");
+                assert_matches_cpython_marshal(&source, "constant_sequence_slice_bounds.py");
+            }
+        }
     }
 
     #[test]

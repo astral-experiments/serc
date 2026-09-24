@@ -184,7 +184,13 @@ const COLD_BLOCK: u8 = 2;
 ///
 /// Item positions distinguish labels before and after a jump within the same block.
 fn normalize_unmoved_interruptible_jumps(graph: &mut BlockGraph) {
-    if !graph.features().has_forward_jump() {
+    if !graph.features().has_forward_jump()
+        || !graph.iter_items().any(|item| {
+            matches!(item, Item::Instruction(instruction)
+                if instruction.opcode == JUMP_BACKWARD
+                    && matches!(instruction.operand(), Operand::Forward(_)))
+        })
+    {
         return;
     }
     let items = graph
@@ -781,6 +787,15 @@ struct ExitBlockAnalysis {
     requires_copy: bool,
 }
 
+#[derive(Clone, Copy, Default)]
+struct ExitTargetAnalysis {
+    inline_small_exit: bool,
+    implicit_small_raise: bool,
+    copy_conditional_split_return: bool,
+    no_location_exit: bool,
+    shared_exit: bool,
+}
+
 // Most multi-block code objects reach this pass without an eligible exit copy. Returning an
 // analysis proves that the copy-producing loop below cannot run while retaining the location
 // propagation performed at the end of the full pass.
@@ -816,17 +831,15 @@ fn exit_block_analysis(
     let mut conditional_predecessors = vec![0; vector_len];
     predecessors[order[0].index()] = 1;
     for (position, block) in order.iter().copied().enumerate() {
-        if block_has_fallthrough(graph[block].items())
-            && let Some(next) = order.get(position + 1)
-        {
+        let has_fallthrough = block_has_fallthrough(graph[block].items());
+        if has_fallthrough && let Some(next) = order.get(position + 1) {
             predecessors[next.index()] += 1;
         }
         if let Some(target) =
             block_jump_target(graph[block].items()).and_then(|label| graph.label_block(label))
         {
             predecessors[target.index()] += 1;
-            conditional_predecessors[target.index()] +=
-                usize::from(block_has_fallthrough(graph[block].items()));
+            conditional_predecessors[target.index()] += usize::from(has_fallthrough);
             if jump_predecessors[target.index()].is_none() {
                 jump_predecessors[target.index()] = Some(block);
             }
@@ -906,108 +919,105 @@ fn exit_block_analysis(
         .iter()
         .flat_map(|region| [region.start, region.end])
         .collect::<FxHashSet<_>>();
+    let mut target_analyses = vec![None; vector_len];
     for source in order.iter().copied() {
         let Some(target) =
             block_jump_target(graph[source].items()).and_then(|label| graph.label_block(label))
         else {
             continue;
         };
-        let target_position = positions[target.index()];
-        let target_blocks = metadata_split_exit_chain(
-            graph,
-            order,
-            target_position,
-            &predecessors,
-            &exception_split_labels,
-        );
-        let target_chain_end = target_position + target_blocks.len() - 1;
-        let target_exit = *target_blocks.last().expect("target chain is nonempty");
-        let Some(target_last) = graph[target_exit].last_instruction() else {
-            continue;
-        };
-        let represented_setups = represented_setup_nops(graph, target_blocks, provenance);
-        let mut at_target_entry = true;
-        let target_pre_fusion_size = target_blocks
-            .iter()
-            .flat_map(|block| graph[*block].items())
-            .map(|item| match item {
-                Item::Instruction(instruction) => {
-                    at_target_entry = false;
-                    let fused_push_null = instruction.opcode == LOAD_GLOBAL
-                        && matches!(instruction.operand(), Operand::Value(argument) if argument & 1 != 0);
-                    1 + usize::from(fused_push_null)
-                        + usize::from(instruction.pre_fold_extra_instructions())
-                }
-                Item::Label(label) => usize::from(
-                    target_chain_end > target_position
-                        && exception_split_labels.contains(label)
-                        && !provenance.return_region_reentries.contains(label)
-                        && !represented_setups.labels.contains(label)
-                        && !(at_target_entry
-                            && is_metadata_range_entry(
-                                *label,
-                                exception_regions,
-                                &provenance.setups,
-                            )),
-                ),
-            })
-            .sum::<usize>();
-        let target_terminal_opcode = target_blocks
-            .iter()
-            .rev()
-            .flat_map(|block| graph[*block].items().iter().rev())
-            .find_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction.opcode),
-                Item::Label(_) => None,
+        let analysis = target_analyses[target.index()].get_or_insert_with(|| {
+            let target_position = positions[target.index()];
+            let target_blocks = metadata_split_exit_chain(
+                graph,
+                order,
+                target_position,
+                &predecessors,
+                &exception_split_labels,
+            );
+            let target_chain_end = target_position + target_blocks.len() - 1;
+            let target_exit = *target_blocks.last().expect("target chain is nonempty");
+            let Some(target_last) = graph[target_exit].last_instruction() else {
+                return ExitTargetAnalysis::default();
+            };
+            let represented_setups = represented_setup_nops(graph, target_blocks, provenance);
+            let mut at_target_entry = true;
+            let target_pre_fusion_size = target_blocks
+                .iter()
+                .flat_map(|block| graph[*block].items())
+                .map(|item| match item {
+                    Item::Instruction(instruction) => {
+                        at_target_entry = false;
+                        let fused_push_null = instruction.opcode == LOAD_GLOBAL
+                            && matches!(instruction.operand(), Operand::Value(argument) if argument & 1 != 0);
+                        1 + usize::from(fused_push_null)
+                            + usize::from(instruction.pre_fold_extra_instructions())
+                    }
+                    Item::Label(label) => usize::from(
+                        target_chain_end > target_position
+                            && exception_split_labels.contains(label)
+                            && !provenance.return_region_reentries.contains(label)
+                            && !represented_setups.labels.contains(label)
+                            && !(at_target_entry
+                                && is_metadata_range_entry(
+                                    *label,
+                                    exception_regions,
+                                    &provenance.setups,
+                                )),
+                    ),
+                })
+                .sum::<usize>();
+            let target_is_small_exit = target_pre_fusion_size <= 4
+                && ends_scope(target_last.opcode)
+                && (target_chain_end == target_position
+                    || matches!(target_last.opcode, RAISE_VARARGS | RETURN_VALUE));
+            let target_has_no_location = target_blocks.iter().all(|block| {
+                graph[*block].items().iter().all(|item| {
+                    !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
+                })
             });
+            ExitTargetAnalysis {
+                inline_small_exit: target_is_small_exit
+                    && !exception_handler_blocks[target.index()]
+                    && !target_blocks.iter().any(|block| {
+                        graph[*block].items().iter().any(|item| {
+                            matches!(item, Item::Instruction(instruction) if instruction.opcode == END_SEND)
+                        })
+                    }),
+                implicit_small_raise: target_is_small_exit
+                    && target_chain_end == target_position
+                    && (block_is_bare_raise(graph[target].items(), original_nop_targets)
+                        || block_is_local_raise(graph[target].items(), original_nop_targets)),
+                copy_conditional_split_return: target_is_small_exit
+                    && predecessors[target.index()] > 1
+                    && !exception_handler_blocks[target.index()],
+                no_location_exit: target_has_no_location
+                    && !block_has_fallthrough(graph[target_exit].items())
+                    && target_last.no_location_policy.allows_block_inlining(),
+                shared_exit: predecessors[target.index()] > 1
+                    && ((target_has_no_location
+                        && (ends_scope(target_last.opcode) || has_jump_eval_check(target_last)))
+                        || target_last.no_location_policy.is_artificial_eval_break()),
+            }
+        });
         let source_copies_split_return = graph[source]
             .last_instruction()
             .is_some_and(|instruction| instruction.no_location_policy.copies_split_return_exit());
-        let target_is_small_exit = target_pre_fusion_size <= 4
-            && target_terminal_opcode.is_some_and(|opcode| {
-                ends_scope(opcode)
-                    && (target_chain_end == target_position
-                        || matches!(opcode, RAISE_VARARGS | RETURN_VALUE))
-            });
         let source_has_fallthrough = block_has_fallthrough(graph[source].items());
         let inline_small_exit = !source_has_fallthrough
-            && target_is_small_exit
-            && ((target_chain_end == target_position
-                && (block_is_bare_raise(graph[target].items(), original_nop_targets)
-                    || block_is_local_raise(graph[target].items(), original_nop_targets)))
+            && analysis.inline_small_exit
+            && (analysis.implicit_small_raise
                 || graph[source]
                     .last_instruction()
-                    .is_some_and(|instruction| instruction.jump_policy.inline_small_exit()))
-            && !target_blocks.iter().any(|block| {
-                graph[*block].items().iter().any(|item| {
-                    matches!(item, Item::Instruction(instruction) if instruction.opcode == END_SEND)
-                })
-            })
-            && !exception_handler_blocks[target.index()];
+                    .is_some_and(|instruction| instruction.jump_policy.inline_small_exit()));
         let copy_conditional_split_return = source_has_fallthrough
             && source_copies_split_return
-            && target_is_small_exit
-            && predecessors[target.index()] > 1
-            && !exception_handler_blocks[target.index()];
-        let target_has_no_location = target_blocks.iter().all(|block| {
-            graph[*block].items().iter().all(|item| {
-                !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
-            })
-        });
-        let no_location_exit = target_has_no_location
-            && !block_has_fallthrough(graph[target_exit].items())
-            && target_last.no_location_policy.allows_block_inlining();
-        let shared_exit = predecessors[target.index()] > 1
-            && ((target_has_no_location
-                && (ends_scope(target_last.opcode)
-                    || graph[target_exit]
-                        .last_instruction()
-                        .is_some_and(has_jump_eval_check)))
-                || target_last.no_location_policy.is_artificial_eval_break());
+            && analysis.copy_conditional_split_return;
         if inline_small_exit
             || copy_conditional_split_return
-            || (!source_has_fallthrough && no_location_exit)
-            || (predecessors[target.index()] > 1 && (shared_exit || no_location_exit))
+            || (!source_has_fallthrough && analysis.no_location_exit)
+            || (predecessors[target.index()] > 1
+                && (analysis.shared_exit || analysis.no_location_exit))
         {
             return ExitBlockAnalysis {
                 positions,
@@ -2396,6 +2406,9 @@ impl OptimizationPipeline {
     pub(in crate::assembler) fn normalize_backward_conditionals(
         &mut self,
     ) -> Result<bool, crate::CompileError> {
+        if !self.graph.features().has_pop_conditional() {
+            return Ok(false);
+        }
         let has_branch_markers = self.python_version >= crate::PythonVersion::Py314;
         let mut changed = false;
         let mut position = 0;
@@ -3248,11 +3261,17 @@ impl OptimizationPipeline {
     pub(in crate::assembler) fn capture_original_location_absence(&self) -> FxHashSet<Label> {
         // Without jumps, an instruction has at most its physical predecessor.
         // No sole-predecessor chain can reach the shared entry that proves absence.
-        if !self.graph.features().has_jump() {
+        if !self.graph.features().has_jump()
+            || !self.graph.iter_items().any(|item| {
+                matches!(item, Item::Instruction(instruction)
+                    if instruction.location.line < 0
+                        && instruction.pre_fold_extra_instructions() == 0)
+            })
+        {
             return FxHashSet::default();
         }
         let mut instructions = Vec::new();
-        let mut label_entries = FxHashMap::default();
+        let mut label_entries = vec![None; usize::try_from(self.next_label).unwrap()];
         let mut pending_labels = Vec::new();
         let mut possible_source = Vec::new();
         for (_, block) in self.graph.iter() {
@@ -3267,7 +3286,10 @@ impl OptimizationPipeline {
                             || instruction.pre_fold_extra_instructions() > 0;
                         for label in pending_labels.drain(..) {
                             located |= self.original_nop_targets.contains(&label);
-                            label_entries.insert(label, entry);
+                            if label.index() >= label_entries.len() {
+                                label_entries.resize(label.index() + 1, None);
+                            }
+                            label_entries[label.index()] = Some(entry);
                         }
                         instructions.push(instruction);
                         possible_source.push(located);
@@ -3284,7 +3306,7 @@ impl OptimizationPipeline {
                 }
             }
             if let Operand::Forward(label) | Operand::Backward(label) = instruction.operand()
-                && let Some(&target) = label_entries.get(&label)
+                && let Some(target) = label_entries.get(label.index()).copied().flatten()
             {
                 predecessors[target].add(index);
             }
@@ -3296,11 +3318,7 @@ impl OptimizationPipeline {
         let mut visited = vec![usize::MAX; instructions.len()];
         let mut path = Vec::new();
         // Only labeled entries can contribute to the result.
-        #[expect(
-            clippy::iter_over_hash_type,
-            reason = "Each predecessor chain has an order-independent result."
-        )]
-        for &start in label_entries.values() {
+        for start in label_entries.iter().copied().flatten() {
             path.clear();
             let mut entry = start;
             let absent = loop {
@@ -3325,7 +3343,12 @@ impl OptimizationPipeline {
         }
         label_entries
             .into_iter()
-            .filter_map(|(label, entry)| (absence[entry] == Some(true)).then_some(label))
+            .enumerate()
+            .filter_map(|(label, entry)| {
+                entry
+                    .filter(|entry| absence[*entry] == Some(true))
+                    .map(|_| Label::from_u32(u32::try_from(label).unwrap()))
+            })
             .collect()
     }
 
@@ -8624,6 +8647,47 @@ mod represented_setup_nop_tests {
                 &provenance,
             );
             assert_eq!(analysis.requires_copy, count == 2, "{count} setup records");
+        }
+    }
+
+    #[test]
+    fn shared_exit_target_keeps_each_predecessors_copy_policy() {
+        for copy_source in [None, Some(0), Some(1)] {
+            let target = Label::from_u32(3);
+            let location = SourceLocation::new(2, 2, 0, 5);
+            let mut items = Vec::new();
+            for source in 0..2 {
+                items.push(Item::Label(Label::from_u32(source)));
+                let mut jump = Instruction::new(
+                    POP_JUMP_IF_FALSE,
+                    Operand::Forward(target),
+                    location,
+                    Some(0),
+                );
+                if copy_source == Some(source) {
+                    jump.no_location_policy.allow_split_return_exit_copy();
+                }
+                items.push(Item::Instruction(jump));
+            }
+            items.extend([
+                Item::Label(target),
+                Item::Instruction(Instruction::new(
+                    RETURN_VALUE,
+                    Operand::Value(0),
+                    location,
+                    Some(0),
+                )),
+            ]);
+            let graph = BlockGraph::from_items(items, &FxHashSet::default());
+            let analysis = exit_block_analysis(
+                &graph,
+                graph.order(),
+                &[],
+                &FxHashSet::default(),
+                &FxHashSet::default(),
+                &ExceptionOwnerProvenance::default(),
+            );
+            assert_eq!(analysis.requires_copy, copy_source.is_some());
         }
     }
 

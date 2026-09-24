@@ -305,10 +305,9 @@ impl Compiler<'_> {
                 if let Some(index) = free_indices.get(&name_id).copied() {
                     // An inlined comprehension can use a temporary fast-local slot with the
                     // same spelling as a free variable. Outside the comprehension, resolve the
-                    // name through the closure.
-                    if let Some(classdict) = annotation_classdict_index
-                        && name != "__classdict__"
-                    {
+                    // name through the closure. Class annotations check their namespace first,
+                    // even when the source name is `__classdict__` itself.
+                    if let Some(classdict) = annotation_classdict_index {
                         self.emit(LOAD_DEREF, classdict, 1)?;
                         return self.emit(LOAD_FROM_DICT_OR_DEREF, index, 0);
                     }
@@ -771,15 +770,19 @@ impl Compiler<'_> {
     }
 
     pub(super) fn mangled_name(&self, name: &str) -> String {
+        self.mangled_name_cow(name).into_owned()
+    }
+
+    pub(super) fn mangled_name_cow<'a>(&self, name: &'a str) -> Cow<'a, str> {
         if self
             .unit
             .mangled_names
             .as_ref()
             .is_some_and(|names| !names.contains(name))
         {
-            return name.to_string();
+            return Cow::Borrowed(name);
         }
-        mangle_name(name, self.unit.private_name.as_deref()).into_owned()
+        mangle_name(name, self.unit.private_name.as_deref())
     }
 
     pub(super) fn pre_register_suite_names(&mut self, body: &[Stmt]) -> Result<(), CompileError> {

@@ -1385,12 +1385,8 @@ def render_marshal(sources: dict[str, str]) -> str:
 
 
 def check_numeric_authority() -> None:
-    compiler = CRATE_ROOT / "src" / "compiler"
-    paths = (
-        sorted(compiler.rglob("*.rs"))
-        if compiler.is_dir()
-        else [CRATE_ROOT / "src" / "compiler.rs"]
-    )
+    paths = [CRATE_ROOT / "src" / "compiler.rs"]
+    paths.extend(sorted((CRATE_ROOT / "src" / "compiler").rglob("*.rs")))
     paths.extend(sorted((CRATE_ROOT / "src" / "assembler").rglob("*.rs")))
     operand_opcodes = (
         "BINARY_OP",

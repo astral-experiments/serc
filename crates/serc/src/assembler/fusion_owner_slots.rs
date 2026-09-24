@@ -1585,17 +1585,15 @@ impl HandlerDispatchCertificate {
     ) -> Option<Self> {
         use crate::target::opcodes::CHECK_EXC_MATCH;
 
-        let instructions = origin
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction) => Some(*instruction),
-                Item::Label(_) => None,
-            })
-            .collect::<Vec<_>>();
-        let [.., check, condition, marker] = instructions.as_slice() else {
-            return None;
-        };
+        let mut instructions = origin.items.iter().rev().filter_map(|item| match item {
+            Item::Instruction(instruction) => Some(instruction),
+            Item::Label(_) => None,
+        });
+        let (marker, condition, check) = (
+            instructions.next()?,
+            instructions.next()?,
+            instructions.next()?,
+        );
         if check.opcode != CHECK_EXC_MATCH
             || condition.opcode != POP_JUMP_IF_FALSE
             || marker.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
@@ -2125,17 +2123,62 @@ impl FusionOwnerCertificates {
     }
 
     /// Retains authored certificates before capturing new certificates on the same fused graph.
-    pub(super) fn after_fusion(mut self, before: &[Item], p: &OptimizationPipeline) -> Self {
+    pub(super) fn after_fusion(
+        self,
+        before: Vec<Item>,
+        p: &OptimizationPipeline,
+        changed: bool,
+    ) -> Self {
+        self.after_fusion_with_snapshot_reuse::<true>(before, p, changed)
+    }
+
+    fn after_fusion_with_snapshot_reuse<const REUSE_UNCHANGED: bool>(
+        mut self,
+        mut before: Vec<Item>,
+        p: &OptimizationPipeline,
+        changed: bool,
+    ) -> Self {
         if before.is_empty() {
-            self.retain_after_fusion(before, p);
+            self.retain_after_fusion(&before, p);
             let mut result = Self::default();
             result.extend_original_owners(self);
             return result;
         }
+
+        // The fusion pass reports every changed instruction or following location.
+        // When unchanged, one snapshot and one index describe both sides of the
+        // transaction, including certificates that admit the original owner as-is.
+        if REUSE_UNCHANGED && !changed {
+            let Some(view) = View::new(
+                &before,
+                &p.exception_regions,
+                &p.exception_owner_provenance,
+                &p.preserved_block_boundaries,
+            ) else {
+                self.retain_pipeline(p);
+                let mut result = Self::default();
+                result.extend_original_owners(self);
+                return result;
+            };
+            let retain_tables = self.retain_captured_fusion_views(&view, &view);
+            let mut result = Self::capture_views(&view, &view);
+            if retain_tables {
+                let mut tables = view.into_tables();
+                tables.clear();
+                before.clear();
+                self.scratch = Some(Box::new(RetentionScratch {
+                    items: before,
+                    tables,
+                }));
+            }
+            result.extend_original_owners(self);
+            return result;
+        }
+
         let mut after = p.graph.copy_items();
         let (Some(before_view), Some(after_view)) = (
             View::new(
-                before,
+                &before,
                 &p.exception_regions,
                 &p.exception_owner_provenance,
                 &p.preserved_block_boundaries,
@@ -2152,20 +2195,7 @@ impl FusionOwnerCertificates {
             result.extend_original_owners(self);
             return result;
         };
-        let retain_tables = if self.has_fusion_transfer_certificates() {
-            self.retain_fusion_views(&before_view, &after_view);
-            false
-        } else if self.is_empty() {
-            false
-        } else {
-            self.retain_view(&after_view);
-            if self.is_empty() {
-                self.scratch = None;
-                false
-            } else {
-                self.scratch.is_none()
-            }
-        };
+        let retain_tables = self.retain_captured_fusion_views(&before_view, &after_view);
         let mut result = Self::capture_views(&before_view, &after_view);
         if retain_tables {
             let mut tables = after_view.into_tables();
@@ -2178,6 +2208,23 @@ impl FusionOwnerCertificates {
         }
         result.extend_original_owners(self);
         result
+    }
+
+    fn retain_captured_fusion_views(&mut self, before: &View<'_>, after: &View<'_>) -> bool {
+        if self.has_fusion_transfer_certificates() {
+            self.retain_fusion_views(before, after);
+            false
+        } else if self.is_empty() {
+            false
+        } else {
+            self.retain_view(after);
+            if self.is_empty() {
+                self.scratch = None;
+                false
+            } else {
+                self.scratch.is_none()
+            }
+        }
     }
 
     #[cfg(test)]
@@ -2238,23 +2285,18 @@ impl FusionOwnerCertificates {
                                 } else if let Item::Label(l) = before[start] {
                                     Some(Anchor::Label(l))
                                 } else {
-                                    let prior = before[..start]
-                                        .iter()
-                                        .filter_map(|x| match x {
+                                    let mut prior =
+                                        before[..start].iter().rev().filter_map(|x| match x {
                                             Item::Instruction(i) => Some(*i),
                                             Item::Label(_) => None,
-                                        })
-                                        .collect::<Vec<_>>();
-                                    if prior.len() >= 2
-                                        && key(prior[prior.len() - 2], prior[prior.len() - 1])
-                                            .is_some()
-                                    {
-                                        Some(Anchor::Marker(
-                                            prior[prior.len() - 2],
-                                            prior[prior.len() - 1],
-                                        ))
-                                    } else {
-                                        None
+                                        });
+                                    match (prior.next(), prior.next()) {
+                                        (Some(marker), Some(condition))
+                                            if key(condition, marker).is_some() =>
+                                        {
+                                            Some(Anchor::Marker(condition, marker))
+                                        }
+                                        _ => None,
                                     }
                                 };
                                 if let (Some(anchor), Some(owner)) =
@@ -2342,21 +2384,17 @@ impl FusionOwnerCertificates {
         {
             let mut transferred = Vec::new();
             for region in &certificate.manager_regions {
-                let replacements = region_retargets
-                    .iter()
-                    .filter_map(|(original, rebuilt)| {
-                        let mut original_shape = *rebuilt;
-                        original_shape.start = region.start;
-                        original_shape.end = region.end;
-                        (same_manager_region(original, region)
-                            && same_manager_region(&original_shape, region))
-                        .then_some(*rebuilt)
-                    })
-                    .collect::<Vec<_>>();
-                if replacements.is_empty() {
+                let previous_len = transferred.len();
+                transferred.extend(region_retargets.iter().filter_map(|(original, rebuilt)| {
+                    let mut original_shape = *rebuilt;
+                    original_shape.start = region.start;
+                    original_shape.end = region.end;
+                    (same_manager_region(original, region)
+                        && same_manager_region(&original_shape, region))
+                    .then_some(*rebuilt)
+                }));
+                if transferred.len() == previous_len {
                     transferred.push(*region);
-                } else {
-                    transferred.extend(replacements);
                 }
             }
             certificate.manager_regions = transferred;
@@ -2442,21 +2480,17 @@ impl FusionOwnerCertificates {
         for certificate in &mut self.fresh_singleton_certificates {
             let mut transferred = Vec::new();
             for region in &certificate.manager_regions {
-                let replacements = retargets
-                    .iter()
-                    .filter_map(|(original, rebuilt)| {
-                        let mut original_shape = *rebuilt;
-                        original_shape.start = region.start;
-                        original_shape.end = region.end;
-                        (same_manager_region(original, region)
-                            && same_manager_region(&original_shape, region))
-                        .then_some(*rebuilt)
-                    })
-                    .collect::<Vec<_>>();
-                if replacements.is_empty() {
+                let previous_len = transferred.len();
+                transferred.extend(retargets.iter().filter_map(|(original, rebuilt)| {
+                    let mut original_shape = *rebuilt;
+                    original_shape.start = region.start;
+                    original_shape.end = region.end;
+                    (same_manager_region(original, region)
+                        && same_manager_region(&original_shape, region))
+                    .then_some(*rebuilt)
+                }));
+                if transferred.len() == previous_len {
                     transferred.push(*region);
-                } else {
-                    transferred.extend(replacements);
                 }
             }
             certificate.manager_regions = transferred;
@@ -3097,6 +3131,56 @@ mod tests {
         let (a, b) = pair();
         assert!(one_fusion(&a, &b));
     }
+
+    #[test]
+    fn captures_fusion_after_only_the_immediately_preceding_marker_pair() {
+        let first_target = Label::from_u32(1);
+        let second_target = Label::from_u32(2);
+        let bookkeeping = Item::Label(Label::from_u32(3));
+        let first_condition = instruction(POP_JUMP_IF_TRUE, Operand::Forward(first_target));
+        let second_condition = instruction(POP_JUMP_IF_TRUE, Operand::Forward(second_target));
+        let marker = instruction(NOT_TAKEN, Operand::Value(0));
+        let nop = Item::Instruction(instruction(NOP, Operand::Value(0)));
+        let provenance = ExceptionOwnerProvenance::default();
+        let preserved = FxHashSet::default();
+
+        for (separator, captured) in [(bookkeeping, true), (nop, false)] {
+            let make_items = |fusing: Vec<Item>| {
+                let mut items = vec![nop; 64];
+                items.extend([
+                    Item::Instruction(first_condition),
+                    separator,
+                    Item::Instruction(marker),
+                ]);
+                items.extend(fusing);
+                items.extend([
+                    Item::Instruction(second_condition),
+                    Item::Instruction(marker),
+                    Item::Label(first_target),
+                    Item::Label(second_target),
+                ]);
+                items
+            };
+            let (original, fused) = pair();
+            let before_items = make_items(original);
+            let after_items = make_items(fused);
+            let before = View::new(&before_items, &[], &provenance, &preserved).unwrap();
+            let after = View::new(&after_items, &[], &provenance, &preserved).unwrap();
+            let certificates = FusionOwnerCertificates::capture_views(&before, &after);
+            if captured {
+                let [certificate] = certificates.certificates.as_slice() else {
+                    panic!("exactly one fusion should be captured");
+                };
+                assert!(
+                    matches!(certificate.anchor, Anchor::Marker(condition, actual_marker)
+                        if condition == first_condition && actual_marker == marker)
+                );
+            } else {
+                assert!(certificates.certificates.is_empty());
+            }
+        }
+    }
+
     #[test]
     fn rejects_two_actual_fusions() {
         let (mut a, mut b) = pair();
@@ -3269,6 +3353,103 @@ mod tests {
             }
         });
         pipeline
+    }
+
+    fn compare_fusion_snapshot_reuse(
+        mut pipeline: OptimizationPipeline,
+        changed: bool,
+        has_fallback: bool,
+        has_manager: bool,
+    ) {
+        fn counts(certificates: &FusionOwnerCertificates) -> [usize; 6] {
+            [
+                certificates.certificates.len(),
+                certificates.handler_dispatch_certificates.len(),
+                certificates.manager_setup_certificates.len(),
+                certificates.fallback_certificates.len(),
+                certificates.fresh_singleton_certificates.len(),
+                certificates.folded_assert_success_certificates.len(),
+            ]
+        }
+
+        let original_fast = FusionOwnerCertificates::capture_original_owners(&pipeline);
+        let original_general = FusionOwnerCertificates::capture_original_owners(&pipeline);
+        let before = FusionOwnerCertificates::snapshot(&pipeline);
+        assert!(!before.is_empty());
+        let before_len = before.len();
+        let actual_changed = pipeline.fuse_superinstructions();
+        assert_eq!(pipeline.graph.item_count() < before_len, changed);
+        assert_eq!(actual_changed, changed);
+        let fast = original_fast.after_fusion(before.clone(), &pipeline, changed);
+        let general =
+            original_general.after_fusion_with_snapshot_reuse::<false>(before, &pipeline, changed);
+        assert_eq!(counts(&fast), counts(&general));
+        assert_eq!(!fast.fallback_certificates.is_empty(), has_fallback);
+        assert_eq!(!fast.manager_setup_certificates.is_empty(), has_manager);
+        assert_eq!(fast.scratch.is_some(), general.scratch.is_some());
+        if let Some(scratch) = fast.scratch.as_ref() {
+            assert!(scratch.items.capacity() >= pipeline.graph.item_count());
+        }
+
+        let mut fast_items = pipeline.graph.copy_items();
+        let mut general_items = fast_items.clone();
+        let fast_owners = fast.finalize(
+            &mut fast_items,
+            &pipeline.exception_regions,
+            &pipeline.exception_owner_provenance,
+            &pipeline.preserved_block_boundaries,
+        );
+        let general_owners = general.finalize(
+            &mut general_items,
+            &pipeline.exception_regions,
+            &pipeline.exception_owner_provenance,
+            &pipeline.preserved_block_boundaries,
+        );
+        assert_eq!(fast_items, general_items);
+        assert_eq!(fast_owners.len(), general_owners.len());
+        for ((fast_condition, fast_marker, fast_owner), (condition, marker, owner)) in
+            fast_owners.into_iter().zip(general_owners)
+        {
+            assert_eq!(fast_condition, condition);
+            assert_eq!(fast_marker, marker);
+            assert!(same_manager_region(&fast_owner, &owner));
+        }
+    }
+
+    #[test]
+    fn unchanged_fusion_snapshot_still_captures_fallback_and_manager_owners() {
+        compare_fusion_snapshot_reuse(
+            fallback_pipeline(1, ExceptionPolicy::NoneAbsent),
+            false,
+            true,
+            false,
+        );
+
+        let mut manager = fallback_pipeline(1, ExceptionPolicy::NoneAbsent);
+        let start = Label::from_u32(0);
+        manager.exception_regions[0].is_scope_fallback = false;
+        manager.exception_owner_provenance.block_boundaries.clear();
+        manager
+            .exception_owner_provenance
+            .setups
+            .push((start, None));
+        manager
+            .exception_owner_provenance
+            .synchronous_with_setups
+            .insert(start);
+        compare_fusion_snapshot_reuse(manager, false, false, true);
+
+        compare_fusion_snapshot_reuse(
+            singleton_pipeline(true, false, ExceptionPolicy::NoneUnchangedBooleanSingleton),
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn changed_fusion_snapshot_keeps_the_original_and_fused_owner_views() {
+        compare_fusion_snapshot_reuse(post_try_fusion_pipeline(), true, true, false);
     }
 
     #[test]

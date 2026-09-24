@@ -40,6 +40,46 @@ pub(crate) struct Opcode {
     code: u8,
 }
 
+/// Cache widths indexed by the semantic IR opcode for one exact target release.
+#[derive(Clone, Copy)]
+pub(crate) struct OpcodeCacheWidths(&'static [u8; 256]);
+
+impl OpcodeCacheWidths {
+    #[inline]
+    pub(crate) const fn for_version(version: PythonVersion) -> Self {
+        let index = match version {
+            PythonVersion::Py312 => 0,
+            PythonVersion::Py313 => 1,
+            PythonVersion::Py314 => 2,
+            PythonVersion::Py315 => 3,
+        };
+        Self(&OPCODE_CACHE_WIDTHS[index])
+    }
+
+    #[inline]
+    pub(crate) const fn get(self, opcode: Opcode) -> u8 {
+        self.0[opcode.code() as usize]
+    }
+}
+
+static OPCODE_CACHE_WIDTHS: [[u8; 256]; 4] = {
+    let mut widths = [[0; 256]; 4];
+    let mut code = 0_u8;
+    loop {
+        let opcode = Opcode::new(code);
+        let index = code as usize;
+        widths[0][index] = cpython_3_12_14::caches(opcode);
+        widths[1][index] = cpython_3_13_15::caches(opcode);
+        widths[2][index] = opcode.caches();
+        widths[3][index] = cpython_3_15_0rc2::caches(opcode);
+        if code == u8::MAX {
+            break;
+        }
+        code += 1;
+    }
+    widths
+};
+
 impl Opcode {
     /// Read mnemonics from the same generated metadata that defines the IR opcodes.
     #[cfg(test)]
@@ -87,13 +127,9 @@ impl Opcode {
     }
 
     /// Returns the selected release's inline-cache width.
+    #[inline]
     pub(crate) const fn caches_for(self, version: PythonVersion) -> u8 {
-        match version {
-            PythonVersion::Py312 => cpython_3_12_14::caches(self),
-            PythonVersion::Py313 => cpython_3_13_15::caches(self),
-            PythonVersion::Py314 => self.caches(),
-            PythonVersion::Py315 => cpython_3_15_0rc2::caches(self),
-        }
+        OpcodeCacheWidths::for_version(version).get(self)
     }
 
     pub(crate) const fn has_jump_for(self, version: PythonVersion) -> bool {
@@ -183,6 +219,30 @@ pub(crate) const fn end_send_offset_for(version: PythonVersion) -> u32 {
 mod tests {
     use super::cpython_3_14_5::{COMPILER_INTERNED_STRINGS, PREINTERNED_STRINGS};
     use super::is_preinterned_string;
+
+    #[test]
+    fn cache_width_tables_match_every_generated_semantic_opcode() {
+        use super::{
+            Opcode, OpcodeCacheWidths, cpython_3_12_14, cpython_3_13_15, cpython_3_15_0rc2,
+        };
+        use crate::PythonVersion::{Py312, Py313, Py314, Py315};
+
+        type CacheWidth = fn(Opcode) -> u8;
+        let generated: [(crate::PythonVersion, CacheWidth); 4] = [
+            (Py312, cpython_3_12_14::caches),
+            (Py313, cpython_3_13_15::caches),
+            (Py314, Opcode::caches),
+            (Py315, cpython_3_15_0rc2::caches),
+        ];
+        for (version, expected) in generated {
+            let table = OpcodeCacheWidths::for_version(version);
+            for code in u8::MIN..=u8::MAX {
+                let opcode = Opcode::new(code);
+                assert_eq!(table.get(opcode), expected(opcode));
+                assert_eq!(opcode.caches_for(version), expected(opcode));
+            }
+        }
+    }
 
     #[test]
     fn legacy_targets_keep_semantic_identity_and_exact_stack_shapes() {

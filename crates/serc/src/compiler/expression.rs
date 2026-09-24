@@ -169,6 +169,56 @@ fn flush_interpolated_literal(
     }
 }
 
+/// Match CPython's tokenizer when `!=` precedes an interpolation format specifier.
+fn interpolation_not_equal_truncation(
+    interpolation: &ruff_python_ast::InterpolatedElement,
+    source: &str,
+) -> Option<ruff_text_size::TextSize> {
+    if interpolation.format_spec.is_none() || interpolation.conversion != ConversionFlag::None {
+        return None;
+    }
+    let start = interpolation.start() + ruff_text_size::TextSize::new(1);
+    let expression = &source[usize::from(start)..usize::from(interpolation.expression.end())];
+    if !expression.contains("!=") {
+        return None;
+    }
+    let parsed = ruff_python_parser::parse_unchecked(
+        expression,
+        ruff_python_parser::ParseOptions::from(ruff_python_parser::Mode::ParenthesizedExpression),
+    );
+    let mut depth = 0_u32;
+    let mut last_operator = None;
+    for token in parsed.tokens() {
+        match token.kind() {
+            TokenKind::Lpar
+            | TokenKind::Lsqb
+            | TokenKind::Lbrace
+            | TokenKind::FStringStart
+            | TokenKind::TStringStart => depth += 1,
+            TokenKind::Rpar
+            | TokenKind::Rsqb
+            | TokenKind::Rbrace
+            | TokenKind::FStringEnd
+            | TokenKind::TStringEnd => depth -= 1,
+            TokenKind::NotEqual if depth == 0 => last_operator = Some(start + token.start()),
+            _ => {}
+        }
+    }
+    last_operator
+}
+
+fn interpolation_debug_text(
+    interpolation: &ruff_python_ast::InterpolatedElement,
+    source: &str,
+) -> Option<String> {
+    let debug = interpolation.debug_text.as_ref()?;
+    let text = interpolation_not_equal_truncation(interpolation, source).map_or_else(
+        || debug.as_str(),
+        |operator| &source[usize::from(interpolation.start()) + 1..usize::from(operator)],
+    );
+    Some(strip_expression_comments(text))
+}
+
 fn append_interpolated_elements<'ast>(
     elements: &'ast ruff_python_ast::InterpolatedStringElements,
     is_raw: bool,
@@ -194,11 +244,11 @@ fn append_interpolated_elements<'ast>(
                 );
             }
             InterpolatedStringElement::Interpolation(interpolation) => {
-                if let Some(debug) = &interpolation.debug_text {
+                if let Some(debug) = interpolation_debug_text(interpolation, source) {
                     PendingInterpolatedLiteral::append(
                         pending,
                         source,
-                        &strip_expression_comments(debug.as_str()),
+                        &debug,
                         debug_text_range(interpolation),
                         debug_text_range(interpolation),
                         true,
@@ -2521,11 +2571,13 @@ impl Compiler<'_> {
                         );
                     }
                     InterpolatedStringElement::Interpolation(interpolation) => {
-                        if let Some(debug) = &interpolation.debug_text {
+                        if let Some(debug) =
+                            interpolation_debug_text(interpolation, self.context.source)
+                        {
                             PendingInterpolatedLiteral::append(
                                 strings.last_mut().unwrap(),
                                 self.context.source,
-                                &strip_expression_comments(debug.as_str()),
+                                &debug,
                                 debug_text_range(interpolation),
                                 debug_text_range(interpolation),
                                 true,
@@ -2619,15 +2671,8 @@ impl Compiler<'_> {
         interpolation: &ruff_python_ast::InterpolatedElement,
     ) -> String {
         let start = usize::from(interpolation.range.start()) + 1;
-        let expression_end = usize::from(interpolation.expression.range().end());
-        // CPython truncates the stored expression text at a top-level `!=`
-        // when the interpolation has a format specifier.
-        if interpolation.format_spec.is_some()
-            && interpolation.debug_text.is_none()
-            && interpolation.conversion == ConversionFlag::None
-            && let Expr::Compare(comparison) = interpolation.expression.as_ref()
-            && comparison.ops.contains(&CmpOp::NotEq)
-            && let Some(operator) = self.interpolation_top_level_not_equal(interpolation)
+        if let Some(operator) =
+            interpolation_not_equal_truncation(interpolation, self.context.source)
         {
             return strip_expression_comments(
                 self.context.source[start..usize::from(operator)].trim_end(),
@@ -2638,49 +2683,27 @@ impl Compiler<'_> {
             let source = &self.context.source[usize::from(range.start())..usize::from(range.end())];
             return strip_expression_comments(source).trim_end().to_string();
         }
-        let interpolation_end = usize::from(interpolation.range.end()).saturating_sub(1);
-        let trailing = &self.context.source[expression_end..interpolation_end];
-        let delimiter = if interpolation.conversion != ConversionFlag::None {
-            trailing.find('!')
-        } else if interpolation.format_spec.is_some() {
-            trailing.find(':')
+        let end = if interpolation.conversion != ConversionFlag::None {
+            self.context
+                .tokens
+                .in_range(ruff_text_size::TextRange::new(
+                    interpolation.expression.end(),
+                    interpolation.end(),
+                ))
+                .iter()
+                .find(|token| token.kind() == TokenKind::Exclamation)
+                .expect("template conversion has an exclamation token")
+                .start()
         } else {
-            None
+            interpolation
+                .format_spec
+                .as_deref()
+                .map_or(interpolation.end(), Ranged::start)
+                - ruff_text_size::TextSize::new(1)
         };
-        let end = delimiter.map_or(interpolation_end, |offset| expression_end + offset);
-        strip_expression_comments(&self.context.source[start..end])
+        strip_expression_comments(&self.context.source[start..usize::from(end)])
             .trim_end()
             .to_string()
-    }
-
-    /// Find the native expression-text truncation point without matching grouped operators or
-    /// tokens inside a nested interpolated string.
-    fn interpolation_top_level_not_equal(
-        &self,
-        interpolation: &ruff_python_ast::InterpolatedElement,
-    ) -> Option<ruff_text_size::TextSize> {
-        let range = ruff_text_size::TextRange::new(
-            interpolation.range.start() + ruff_text_size::TextSize::new(1),
-            interpolation.expression.range().end(),
-        );
-        let mut depth = 0_u32;
-        for token in self.context.tokens.in_range(range) {
-            match token.kind() {
-                TokenKind::Lpar
-                | TokenKind::Lsqb
-                | TokenKind::Lbrace
-                | TokenKind::FStringStart
-                | TokenKind::TStringStart => depth += 1,
-                TokenKind::Rpar
-                | TokenKind::Rsqb
-                | TokenKind::Rbrace
-                | TokenKind::FStringEnd
-                | TokenKind::TStringEnd => depth -= 1,
-                TokenKind::NotEqual if depth == 0 => return Some(token.start()),
-                _ => {}
-            }
-        }
-        None
     }
 
     fn compile_interpolated_elements(

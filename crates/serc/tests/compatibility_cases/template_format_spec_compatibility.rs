@@ -68,6 +68,79 @@ for template in templates:
     );
 }
 
+const INTERPOLATION_SOURCE_TEXT: &str = r#"class Echo:
+    def __format__(self, spec):
+        return spec
+
+a, b, c = 1, 2, 3
+formatted = (
+    f"{a != b=:}",
+    f"{a!=b=:}",
+    f"{a != b != c=:}",
+    f"{a != b and b != c=:}",
+    f"{a if b != c else a=:}",
+    f"{(a != b)=:}",
+    f"{a != b=!s:}",
+    f"{Echo():{a != b=:}}",
+)
+templates = (
+    t"{a != b != c:}",
+    t"{a != b != c=:}",
+    t"{a != b and b != c:}",
+    t"{a if b != c else a:}",
+    t"{(a != b):}",
+    t"{a != b!s:}",
+    t"{a != b=}",
+    t"""{(a # : fake ! conversion
+):}""",
+    t"""{(a # : fake ! conversion
+)!s}""",
+    t"""{(a # ! fake : conversion
+)!r:>4}""",
+    t"""{(a # ! fake : conversion
+)}""",
+)
+"#;
+
+#[test]
+fn matches_cpython_marshal_for_interpolation_source_text() {
+    common::assert_matches_cpython_marshal(
+        INTERPOLATION_SOURCE_TEXT,
+        "interpolation_source_text.py",
+    );
+}
+
+#[test]
+fn executes_interpolation_source_text() {
+    let source = format!(
+        "{INTERPOLATION_SOURCE_TEXT}\n\
+         for value in formatted:\n    print(repr(value))\n\
+         for value in templates:\n    print(repr(value.strings), repr(value.interpolations[0].expression))\n"
+    );
+    common::assert_executes(
+        &source,
+        "'a True'\n\
+         'aTrue'\n\
+         'a != b True'\n\
+         'a != b and b True'\n\
+         'a if b 1'\n\
+         '(a != b)=True'\n\
+         'a != b=True'\n\
+         'a True'\n\
+         ('', '') 'a != b'\n\
+         ('a != b ', '') 'a != b'\n\
+         ('', '') 'a != b and b'\n\
+         ('', '') 'a if b'\n\
+         ('', '') '(a != b)'\n\
+         ('', '') 'a != b'\n\
+         ('a != b=', '') 'a != b'\n\
+         ('', '') '(a \\n)'\n\
+         ('', '') '(a \\n)'\n\
+         ('', '') '(a \\n)'\n\
+         ('', '') '(a \\n)'\n",
+    );
+}
+
 #[test]
 fn large_template_string_tuple_matches_cpython_stack_folding_limit() {
     use std::fmt::Write as _;

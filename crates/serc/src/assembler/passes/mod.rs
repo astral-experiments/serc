@@ -208,7 +208,9 @@ impl Assembler {
             && !(self.early_boolean_admissions_certified && self.has_early_boolean_admissions)
             && (self.has_only_linear_assertion_side_exits()
                 || self.has_only_linear_constant_return()
-                || (local_count <= 64 && self.has_only_linear_instructions(local_count)))
+                || (local_count <= 64
+                    && (self.has_only_linear_instructions(local_count)
+                        || self.has_only_linear_terminal_guards())))
         {
             return self
                 .optimize_linear_assertion_side_exits(
@@ -931,9 +933,8 @@ impl OptimizationPipeline {
             original_owners.retain_pipeline(&self);
         }
         let before_fusion = FusionOwnerCertificates::snapshot(&self);
-        self.fuse_superinstructions();
-        let mut fusion_owners = original_owners.after_fusion(&before_fusion, &self);
-        drop(before_fusion);
+        let fusion_changed = self.fuse_superinstructions();
+        let mut fusion_owners = original_owners.after_fusion(before_fusion, &self, fusion_changed);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::FuseSuperinstructions)?;
         let omitted_borrow_markers = if !assertion_side_exits {
@@ -1293,6 +1294,25 @@ impl LayoutAssembler {
             self.resolve_next_locations();
         }
         let mut labels = vec![None; usize::try_from(self.next_label).unwrap()];
+        if self.python_version == crate::PythonVersion::Py314
+            && let Some(((bytecode, line_table, max_depth), instruction_count)) =
+                self.encode_small_final_artifacts(&mut labels, first_line_number)?
+        {
+            #[cfg(any(test, debug_assertions))]
+            self.validate_structure(AssemblerStage::FinalLayout)?;
+            let exception_table = if self.exception_regions.is_empty() {
+                Vec::new()
+            } else {
+                self.exception_table(&vec![0; instruction_count], &labels)?
+            };
+            return Ok(AssembledCode {
+                bytecode,
+                line_table,
+                exception_table,
+                max_depth,
+                removed_max_depth: self.removed_max_depth,
+            });
+        }
         let mut instruction_count = 0;
         let mut code_units = 0;
         let mut can_be_unextended = true;

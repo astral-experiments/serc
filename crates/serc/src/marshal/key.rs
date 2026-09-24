@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
+use std::slice;
 
 use rustc_hash::{FxHashMap, FxHasher};
 use smallvec::SmallVec;
@@ -7,7 +8,7 @@ use smallvec::SmallVec;
 use crate::PythonVersion;
 use crate::code_object::{
     CodeObject, Constant, LocalsIdentity, MarshalMetadataTupleProperties,
-    MarshalStringTupleProperties, NonReflexiveKey,
+    MarshalStringTupleProperties, MetadataName as Name, NonReflexiveKey,
 };
 use crate::target::small_int_bounds_for;
 
@@ -152,7 +153,36 @@ pub(super) struct StringTupleKey<'a>(StringTupleKind<'a>);
 enum StringTupleKind<'a> {
     Constants(&'a [Constant]),
     Strings(&'a [String]),
+    Names(&'a [Name]),
 }
+
+enum StringTupleIter<'a> {
+    Constants(slice::Iter<'a, Constant>),
+    Strings(slice::Iter<'a, String>),
+    Names(slice::Iter<'a, Name>),
+}
+
+impl<'a> Iterator for StringTupleIter<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Constants(values) => values.next().map(constant_string),
+            Self::Strings(values) => values.next().map(String::as_str),
+            Self::Names(values) => values.next().map(Name::as_str),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Constants(values) => values.size_hint(),
+            Self::Strings(values) => values.size_hint(),
+            Self::Names(values) => values.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for StringTupleIter<'_> {}
 
 impl<'a> StringTupleKey<'a> {
     fn constants(values: &'a [Constant]) -> Self {
@@ -168,15 +198,16 @@ impl<'a> StringTupleKey<'a> {
         Self(StringTupleKind::Strings(values))
     }
 
-    fn iter(&self) -> impl Iterator<Item = &'a str> {
-        let (constants, strings): (&[Constant], &[String]) = match self.0 {
-            StringTupleKind::Constants(values) => (values, &[]),
-            StringTupleKind::Strings(values) => (&[], values),
-        };
-        constants
-            .iter()
-            .map(constant_string)
-            .chain(strings.iter().map(String::as_str))
+    fn names(values: &'a [Name]) -> Self {
+        Self(StringTupleKind::Names(values))
+    }
+
+    fn iter(&self) -> impl ExactSizeIterator<Item = &'a str> {
+        match self.0 {
+            StringTupleKind::Constants(values) => StringTupleIter::Constants(values.iter()),
+            StringTupleKind::Strings(values) => StringTupleIter::Strings(values.iter()),
+            StringTupleKind::Names(values) => StringTupleIter::Names(values.iter()),
+        }
     }
 }
 
@@ -193,6 +224,7 @@ impl Hash for StringTupleKey<'_> {
         let length = match self.0 {
             StringTupleKind::Constants(values) => values.len(),
             StringTupleKind::Strings(values) => values.len(),
+            StringTupleKind::Names(values) => values.len(),
         };
         length.hash(state);
         for value in self.iter() {
@@ -384,7 +416,7 @@ pub(super) fn slice_member_uses_identity_for(
         | Constant::Float(_)
         | Constant::Complex { .. }
         | Constant::NonReflexive(_) => true,
-        Constant::String(value) => !is_cached_character(value),
+        Constant::String(value) => !value.is_empty() && !is_cached_character(value),
         Constant::SurrogateString(_) => true,
         Constant::Bytes(value) => value.len() > 1,
         Constant::None
@@ -712,12 +744,20 @@ pub(super) fn strings_tuple_key(values: &[String]) -> ObjectKey<'_> {
     }
 }
 
+pub(super) fn names_tuple_key(values: &[Name]) -> ObjectKey<'_> {
+    if values.is_empty() {
+        ObjectKey::EmptyTuple
+    } else {
+        ObjectKey::StringTuple(StringTupleKey::names(values))
+    }
+}
+
 pub(super) fn locals_tuple_key(code: &CodeObject) -> ObjectKey<'_> {
     if code.locals.is_empty() {
         ObjectKey::EmptyTuple
     } else {
         match code.marshal_provenance.locals_identity {
-            LocalsIdentity::ByValue => strings_tuple_key(&code.locals),
+            LocalsIdentity::ByValue => names_tuple_key(&code.locals),
             LocalsIdentity::Fresh => ObjectKey::AnnotationLocals(std::ptr::from_ref(code).addr()),
         }
     }
@@ -725,11 +765,11 @@ pub(super) fn locals_tuple_key(code: &CodeObject) -> ObjectKey<'_> {
 
 /// Precomputes the value-only metadata work shared by all marshal graph traversals.
 pub(crate) fn metadata_tuple_properties(
-    names: &[String],
-    locals: &[String],
+    names: &[Name],
+    locals: &[Name],
 ) -> MarshalMetadataTupleProperties {
-    fn strings(values: &[String]) -> MarshalStringTupleProperties {
-        let key = strings_tuple_key(values);
+    fn strings(values: &[Name]) -> MarshalStringTupleProperties {
+        let key = names_tuple_key(values);
         if values.is_empty() {
             return MarshalStringTupleProperties {
                 hash: HashedObjectKey::from(key).hash,
@@ -743,7 +783,7 @@ pub(crate) fn metadata_tuple_properties(
         values.len().hash(&mut hasher);
         let mut automatically_interned = true;
         for value in values {
-            value.hash(&mut hasher);
+            value.as_str().hash(&mut hasher);
             automatically_interned = automatically_interned && should_intern(value);
         }
         let hash = hasher.finish();

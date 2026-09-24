@@ -20,7 +20,7 @@ use super::Compiler;
 use super::expression::{jump_constant_truthiness, literal_truthiness};
 use super::scope::NameId;
 use super::symbol::{mangle_name, to_u32};
-use crate::code_object::{CodeObject, Constant, MetadataId, NonReflexiveRemap};
+use crate::code_object::{CodeObject, Constant, MetadataId, MetadataName, NonReflexiveRemap};
 
 #[derive(Debug, Default)]
 pub(super) struct ConstantPool {
@@ -29,6 +29,21 @@ pub(super) struct ConstantPool {
 }
 
 const CONSTANT_INDEX_THRESHOLD: usize = 12;
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_GENERIC_CONSTANT_ADMISSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Pool keys never match different constant variants, including numerically equal types.
+#[inline]
+fn find_pool_constant(values: &[Constant], constant: &Constant) -> Option<usize> {
+    let kind = std::mem::discriminant(constant);
+    values.iter().position(|existing| {
+        std::mem::discriminant(existing) == kind
+            && ConstantEquality::PoolKey.equal(existing, constant)
+    })
+}
 
 #[derive(Debug, Default)]
 struct ConstantIndices {
@@ -68,6 +83,19 @@ impl ConstantIndices {
             ConstantEquality::PoolKey.equal(&values[index], constant)
         };
         if let Some(fingerprint) = fingerprint {
+            if self.fallback.is_empty() {
+                let primary = *self.primary.get(&fingerprint)?;
+                if matches(&primary) {
+                    return Some(primary);
+                }
+                // The pool inserts indices in order, so the first matching collision is earliest.
+                return self
+                    .collisions
+                    .get(&fingerprint)?
+                    .iter()
+                    .copied()
+                    .find(matches);
+            }
             return self
                 .primary
                 .get(&fingerprint)
@@ -78,9 +106,7 @@ impl ConstantIndices {
                 .copied()
                 .min();
         }
-        values
-            .iter()
-            .position(|existing| ConstantEquality::PoolKey.equal(existing, constant))
+        find_pool_constant(values, constant)
             .map(|index| u32::try_from(index).expect("constant index fits in u32"))
     }
 }
@@ -95,6 +121,11 @@ impl ConstantPool {
     }
 
     pub(super) fn intern(&mut self, constant: Constant) -> Result<u32, CompileError> {
+        if matches!(&constant, Constant::None)
+            && matches!(self.values.first(), Some(Constant::None))
+        {
+            return Ok(0);
+        }
         if self.indices.is_none() && self.values.len() >= CONSTANT_INDEX_THRESHOLD {
             let mut indices = ConstantIndices::default();
             indices.primary.reserve(self.values.len().saturating_mul(2));
@@ -118,11 +149,7 @@ impl ConstantPool {
             return Ok(index);
         }
 
-        if let Some(index) = self
-            .values
-            .iter()
-            .position(|existing| ConstantEquality::PoolKey.equal(existing, &constant))
-        {
+        if let Some(index) = find_pool_constant(&self.values, &constant) {
             return to_u32(index, "constant index");
         }
         let index = to_u32(self.values.len(), "constant count")?;
@@ -240,7 +267,7 @@ pub(super) struct OutputState {
     pub(super) folded_constant_dependencies: Vec<(Constant, Vec<Constant>)>,
     pub(super) has_untracked_discarded_collection: bool,
     pub(super) deferred_names: Vec<(OperandPatchId, String)>,
-    pub(super) names: Vec<String>,
+    pub(super) names: Vec<MetadataName>,
     pub(super) name_ids: Vec<MetadataId>,
     name_indices: FxHashMap<NameId, u32>,
     pub(super) interned_constant_strings: FxHashSet<String>,
@@ -366,9 +393,7 @@ impl crate::assembler::ConstantTable for OutputState {
                     .find(&pool.values, constant, constant_pool_fingerprint(constant))
                     .map(|index| index as usize)
             } else {
-                pool.values
-                    .iter()
-                    .position(|value| ConstantEquality::PoolKey.equal(value, constant))
+                find_pool_constant(&pool.values, constant)
             };
             if let Some(index) = index
                 && index >= first_deferred
@@ -1002,7 +1027,7 @@ impl Compiler<'_> {
             Entry::Occupied(entry) => Ok(*entry.get()),
             Entry::Vacant(entry) => {
                 let index = to_u32(self.output.names.len(), "name count")?;
-                self.output.names.push(name.into_owned());
+                self.output.names.push(MetadataName::from(name));
                 self.output.name_ids.push(MetadataId::from(name_id));
                 entry.insert(index);
                 Ok(index)
@@ -1022,6 +1047,41 @@ impl Compiler<'_> {
     }
 
     pub(super) fn add_constant(&mut self, constant: Constant) -> Result<u32, CompileError> {
+        #[cfg(test)]
+        if FORCE_GENERIC_CONSTANT_ADMISSION.get() {
+            return self.add_constant_generic(constant);
+        }
+
+        match &constant {
+            Constant::None
+            | Constant::Bool(_)
+            | Constant::Ellipsis
+            | Constant::Int(_)
+            | Constant::SignedInt(_)
+            | Constant::BigInt { .. }
+            | Constant::Float(_)
+            | Constant::Complex { .. }
+            | Constant::SurrogateString(_) => {
+                // These leaves carry no numeric allocation or native-cache provenance.
+            }
+            Constant::String(_) => self
+                .context
+                .record_constant_string_origins(&constant, false),
+            Constant::Bytes(_) => self.context.record_constant_empty_bytes_origin(&constant),
+            Constant::Code(code) => {
+                // Nested constants were already admitted while compiling their own code.
+                self.output.has_frozenset_constants |=
+                    code.marshal_provenance.subtree_has_frozenset_constants;
+            }
+            Constant::NonReflexive(_)
+            | Constant::Tuple(_)
+            | Constant::FrozenSet(_)
+            | Constant::Slice { .. } => return self.add_constant_generic(constant),
+        }
+        self.output.constants.intern(constant)
+    }
+
+    fn add_constant_generic(&mut self, constant: Constant) -> Result<u32, CompileError> {
         let constant = if self.context.python_version >= PythonVersion::Py314
             && constant.has_source_non_reflexive_number()
         {
@@ -1995,7 +2055,7 @@ pub(super) fn fold_constant_with_literals(
                     if matches!(left, Constant::Complex { .. })
                         || matches!(right, Constant::Complex { .. }) =>
                 {
-                    fold_complex_power(&left, &right)
+                    fold_complex_power(&left, &right, python_version)
                 }
                 (Constant::String(mut left), Operator::Add, Constant::String(right)) => {
                     left.push_str(&right);
@@ -2268,6 +2328,16 @@ fn constant_as_float(constant: &Constant) -> Option<f64> {
     reason = "CPython checks real exponents for exact binary64 integrality"
 )]
 fn fold_float_power(base: f64, exponent: f64) -> Option<Constant> {
+    // float_pow returns the selected NaN operand directly, preserving its sign and payload.
+    if exponent == 0.0 {
+        return Some(Constant::Float(1.0));
+    }
+    if base.is_nan() {
+        return Some(Constant::Float(base));
+    }
+    if exponent.is_nan() {
+        return Some(Constant::Float(if base == 1.0 { 1.0 } else { exponent }));
+    }
     if base.is_finite() && exponent.is_finite() && base < 0.0 && exponent != exponent.floor() {
         // float_pow delegates negative fractional powers to complex_pow. Follow
         // _Py_c_pow with positive imaginary zeros for both real operands.
@@ -2866,9 +2936,8 @@ fn fold_literal_subscript(
     let Expr::Slice(slice) = index else {
         unreachable!();
     };
-    if slice.step.is_some() && constant_slice(slice).is_none() {
-        return None;
-    }
+    // CPython constructs constant slices before folding their bound expressions.
+    constant_slice(slice)?;
 
     match value {
         Constant::String(value) => {
@@ -3040,6 +3109,68 @@ fn complex_product(left: (f64, f64), right: (f64, f64)) -> (f64, f64) {
     )
 }
 
+/// Recover infinities as modern CPython's `_Py_c_prod` does during integer powers.
+fn complex_power_product(
+    (mut a, mut b): (f64, f64),
+    (mut c, mut d): (f64, f64),
+    python_version: PythonVersion,
+) -> (f64, f64) {
+    let (ac, bd, ad, bc) = (a * c, b * d, a * d, b * c);
+    let result = (ac - bd, ad + bc);
+    if python_version <= PythonVersion::Py313 || !result.0.is_nan() || !result.1.is_nan() {
+        return result;
+    }
+
+    let zero_nan = |value: f64| {
+        if value.is_nan() {
+            0.0_f64.copysign(value)
+        } else {
+            value
+        }
+    };
+    let boxed = |value: f64| f64::from(value.is_infinite()).copysign(value);
+    let mut recalculate = false;
+    if a.is_infinite() || b.is_infinite() {
+        (a, b, c, d) = (boxed(a), boxed(b), zero_nan(c), zero_nan(d));
+        recalculate = true;
+    }
+    if c.is_infinite() || d.is_infinite() {
+        (a, b, c, d) = (zero_nan(a), zero_nan(b), boxed(c), boxed(d));
+        recalculate = true;
+    }
+    if !recalculate && [ac, bd, ad, bc].into_iter().any(f64::is_infinite) {
+        (a, b, c, d) = (zero_nan(a), zero_nan(b), zero_nan(c), zero_nan(d));
+        recalculate = true;
+    }
+    if recalculate {
+        (
+            f64::INFINITY * (a * c - b * d),
+            f64::INFINITY * (a * d + b * c),
+        )
+    } else {
+        result
+    }
+}
+
+/// Recover signed zeros as modern CPython's `_Py_c_quot` does for a reciprocal.
+fn complex_power_reciprocal(
+    divisor: (f64, f64),
+    python_version: PythonVersion,
+) -> Option<(f64, f64)> {
+    let result = complex_quotient((1.0, 0.0), divisor, false)?;
+    if python_version >= PythonVersion::Py314
+        && result.0.is_nan()
+        && result.1.is_nan()
+        && (divisor.0.is_infinite() || divisor.1.is_infinite())
+    {
+        let x = f64::from(divisor.0.is_infinite()).copysign(divisor.0);
+        let y = f64::from(divisor.1.is_infinite()).copysign(divisor.1);
+        Some((0.0 * (x + 0.0 * y), 0.0 * (0.0 * x - y)))
+    } else {
+        Some(result)
+    }
+}
+
 fn complex_quotient(left: (f64, f64), right: (f64, f64), contract: bool) -> Option<(f64, f64)> {
     let abs_real = right.0.abs();
     let abs_imag = right.1.abs();
@@ -3168,7 +3299,11 @@ fn fold_complex_division(
     clippy::float_cmp,
     reason = "CPython checks complex exponents for exact binary64 integrality"
 )]
-fn fold_complex_power(base: &Constant, exponent: &Constant) -> Option<Constant> {
+fn fold_complex_power(
+    base: &Constant,
+    exponent: &Constant,
+    python_version: PythonVersion,
+) -> Option<Constant> {
     let base = constant_complex_parts(base)?;
     let (exponent_real, exponent_imag) = constant_complex_parts(exponent)?;
     if exponent_imag != 0.0 || exponent_real != exponent_real.floor() || exponent_real.abs() > 100.0
@@ -3197,8 +3332,20 @@ fn fold_complex_power(base: &Constant, exponent: &Constant) -> Option<Constant> 
         if phase.is_infinite() && !cfg!(target_os = "macos") {
             return None;
         }
-        let real = magnitude * phase.cos();
-        let imag = magnitude * phase.sin();
+        let component = |value: f64| {
+            // The pinned Linux x86-64 build keeps the libm result in the destination
+            // of the final multiplication, which preserves its NaN when both are NaN.
+            if cfg!(all(target_os = "linux", target_arch = "x86_64"))
+                && magnitude.is_nan()
+                && value.is_nan()
+            {
+                value
+            } else {
+                magnitude * value
+            }
+        };
+        let real = component(phase.cos());
+        let imag = component(phase.sin());
         return (!real.is_infinite() && !imag.is_infinite())
             .then_some(Constant::Complex { real, imag });
     }
@@ -3213,15 +3360,15 @@ fn fold_complex_power(base: &Constant, exponent: &Constant) -> Option<Constant> 
     let mut mask = 1_u64;
     while mask > 0 && magnitude >= mask {
         if magnitude & mask != 0 {
-            result = complex_product(result, power);
+            result = complex_power_product(result, power, python_version);
         }
         mask <<= 1;
-        power = complex_product(power, power);
+        power = complex_power_product(power, power, python_version);
     }
     if exponent < 0 {
-        result = complex_quotient((1.0, 0.0), result, false)?;
+        result = complex_power_reciprocal(result, python_version)?;
     }
-    (result.0.is_finite() && result.1.is_finite()).then_some(Constant::Complex {
+    (!result.0.is_infinite() && !result.1.is_infinite()).then_some(Constant::Complex {
         real: result.0,
         imag: result.1,
     })
@@ -4000,11 +4147,12 @@ fn big_integer_digits(token: &str) -> Vec<u16> {
 mod tests {
     use super::{
         CONSTANT_INDEX_THRESHOLD, ConstantEquality, ConstantIndices, ConstantPool,
-        constant_pool_fingerprint,
+        FORCE_GENERIC_CONSTANT_ADMISSION, constant_pool_fingerprint,
     };
     use crate::code_object::{
         CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance, MetadataId,
     };
+    use crate::{CompileOptions, PythonVersion, compile_with_options};
 
     fn code_object(constants: Vec<Constant>) -> CodeObject {
         CodeObject {
@@ -4016,9 +4164,9 @@ mod tests {
             bytecode: Vec::new(),
             constants,
             names: Vec::new(),
-            locals: vec!["value".to_string()],
+            locals: vec!["value".into()],
             local_kinds: Vec::new(),
-            filename: "module.py".to_string(),
+            filename: "module.py".into(),
             name: "<module>".to_string(),
             qualified_name: "<module>".to_string(),
             first_line_number: 1,
@@ -4064,6 +4212,129 @@ mod tests {
             pool.into_values().as_slice(),
             [Constant::None, Constant::String(value)] if value == "kept"
         ));
+    }
+
+    #[test]
+    fn direct_scalar_admission_matches_generic_provenance_and_serialization() {
+        struct ResetGenericAdmission(bool);
+
+        impl Drop for ResetGenericAdmission {
+            fn drop(&mut self) {
+                FORCE_GENERIC_CONSTANT_ADMISSION.set(self.0);
+            }
+        }
+
+        let sources = [
+            r"
+values = (None, False, True, ..., 300, -300, 123456789012345678901234567890,
+          1.25, -0.0, 2.5j, 'normal', 'one.two', 'méthode', '\ud800', b'', b'value')
+def outer(argument):
+    def inner():
+        return argument, 12.5, '\ud800', b''
+    return inner, (3.5, 0j, 'one.two')
+",
+            r#"
+class Outer:
+    """Outer.Inner"""
+    dotted = 'Outer.Inner'
+    def method(self):
+        self.méthode = '%'
+        def inner(value):
+            return value in {'set', 'cache'}, ('méthode', '%')
+        return inner
+before = b'' * 0
+after = b''
+values = (1e1000 % 1, (1e1000 % 1, 2j), b'kept')
+"#,
+            r"
+def outer(argument):
+    if False:
+        class Discarded:
+            value = ('one.two', '%', 'café')
+            def inner(self, value):
+                return value in {'set', 'member'}
+    return argument, ('one.two', '%', 'café'), b''
+",
+        ];
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let options = CompileOptions {
+                python_version,
+                ..CompileOptions::default()
+            };
+            for source in sources {
+                let fast = compile_with_options(source, "constant_admission.py", &options).unwrap();
+                let generic = {
+                    let _reset =
+                        ResetGenericAdmission(FORCE_GENERIC_CONSTANT_ADMISSION.replace(true));
+                    compile_with_options(source, "constant_admission.py", &options).unwrap()
+                };
+                assert_eq!(
+                    format!("{:?}", fast.code),
+                    format!("{:?}", generic.code),
+                    "{python_version:?}: {source}"
+                );
+                assert_eq!(fast.marshal(), generic.marshal(), "{python_version:?}");
+                let source_size = u32::try_from(source.len()).unwrap();
+                assert_eq!(
+                    fast.to_timestamp_pyc(17, source_size),
+                    generic.to_timestamp_pyc(17, source_size),
+                    "{python_version:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reserved_none_does_not_build_the_constant_index() {
+        let mut pool = ConstantPool::default();
+        pool.intern(Constant::None).unwrap();
+        for value in 1..CONSTANT_INDEX_THRESHOLD {
+            pool.intern(Constant::Int(u64::try_from(value).unwrap()))
+                .unwrap();
+        }
+
+        assert!(pool.indices.is_none());
+        assert_eq!(pool.intern(Constant::None).unwrap(), 0);
+        assert!(pool.indices.is_none());
+        assert_eq!(pool.intern(Constant::Int(1)).unwrap(), 1);
+        assert!(pool.indices.is_some());
+        assert_eq!(pool.intern(Constant::None).unwrap(), 0);
+
+        let mut unreserved = ConstantPool::default();
+        unreserved
+            .intern(Constant::String("docstring".to_string()))
+            .unwrap();
+        assert_eq!(unreserved.intern(Constant::None).unwrap(), 1);
+        assert_eq!(unreserved.intern(Constant::None).unwrap(), 1);
+    }
+
+    #[test]
+    fn small_constant_pool_preserves_numeric_types_and_string_kinds() {
+        let mut pool = ConstantPool::default();
+        let values = [
+            Constant::Bool(false),
+            Constant::Int(0),
+            Constant::SignedInt(0),
+            Constant::Float(0.0),
+            Constant::Float(-0.0),
+            Constant::String(String::new()),
+            Constant::SurrogateString(Vec::new()),
+            Constant::Bytes(Vec::new()),
+        ];
+        for _ in 0..2 {
+            for (index, value) in values.iter().enumerate() {
+                assert_eq!(
+                    pool.intern(value.clone()).unwrap(),
+                    u32::try_from(index).unwrap()
+                );
+            }
+        }
+        assert!(pool.indices.is_none());
     }
 
     #[test]
@@ -4160,13 +4431,36 @@ mod tests {
 
     #[test]
     fn constant_indices_resolve_fingerprint_collisions() {
-        let values = [Constant::Int(1), Constant::Int(2)];
+        let values = [Constant::Int(1), Constant::Int(2), Constant::Int(2)];
         let mut indices = ConstantIndices::default();
         indices.insert(Some(0), 0);
         indices.insert(Some(0), 1);
+        indices.insert(Some(0), 2);
 
+        assert_eq!(indices.find(&values, &Constant::Int(1), Some(0)), Some(0));
         assert_eq!(indices.find(&values, &Constant::Int(2), Some(0)), Some(1));
         assert_eq!(indices.find(&values, &Constant::Int(3), Some(0)), None);
+        assert_eq!(indices.find(&values, &Constant::Int(1), Some(1)), None);
+    }
+
+    #[test]
+    fn constant_indices_preserve_earliest_fallback_or_fingerprint_match() {
+        let values = [
+            Constant::Int(2),
+            Constant::Int(1),
+            Constant::Int(2),
+            Constant::Int(1),
+        ];
+        let mut indices = ConstantIndices::default();
+        indices.insert(None, 0);
+        indices.insert(Some(0), 1);
+        indices.insert(Some(0), 2);
+        indices.insert(None, 3);
+
+        assert_eq!(indices.find(&values, &Constant::Int(1), Some(0)), Some(1));
+        assert_eq!(indices.find(&values, &Constant::Int(2), Some(0)), Some(0));
+        assert_eq!(indices.find(&values, &Constant::Int(2), Some(1)), Some(0));
+        assert_eq!(indices.find(&values, &Constant::Int(1), None), Some(1));
     }
 
     #[test]
