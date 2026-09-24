@@ -140,6 +140,29 @@ class RenderPreinternedLookupTest(unittest.TestCase):
             '"quote\\" slash\\\\ \\n\\r\\t\\0 ☃\\x01\\x7f"',
         )
 
+    def test_compact_rust_strings_wrap_only_between_literals(self) -> None:
+        long = "x" * 85
+        self.assertEqual(
+            generator.render_compact_rust_strings([long, 'quote"', "two words"]),
+            [f'    "{long}",', '    "quote\\"", "two words",'],
+        )
+
+    def test_renders_combined_strings_against_the_named_table(self) -> None:
+        static = ["", "alpha", "beta"]
+        bootstrap = ["alpine", "beta", "méthode"]
+        rendered = generator.render_preinterned_lookup(
+            sorted(set(static) | set(bootstrap)),
+            ("albatross",),
+            table_name="LINUX_PREINTERNED_STRINGS",
+        )
+        self.assertIn("            (1, 3)", rendered)
+        self.assertIn("        0x6265 => (3, 4),", rendered)
+        self.assertIn("        0x6dc3 => (4, 5),", rendered)
+        self.assertIn(
+            "    LINUX_PREINTERNED_STRINGS[start..end].binary_search(&value).is_ok()",
+            rendered,
+        )
+
     def test_gates_unix_startup_candidates(self) -> None:
         rendered = generator.render_preinterned_lookup(
             ["package"], ("patterns", "pause")

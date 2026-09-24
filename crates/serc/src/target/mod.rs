@@ -495,4 +495,19 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn preinterned_lookup_rejects_nonmembers_with_shared_prefixes() {
+        for value in [
+            "BuiltinImporter\0",
+            "find_spec_suffix",
+            "__name__\0",
+            "utf_8_suffix",
+            "\0",
+            "méthode",
+            "☃",
+        ] {
+            assert!(!is_preinterned_string(value), "unexpected member {value:?}");
+        }
+    }
 }

@@ -410,10 +410,25 @@ def rust_string_literal(value: str) -> str:
     return f'"{"".join(escaped)}"'
 
 
+def render_compact_rust_strings(values: list[str]) -> list[str]:
+    lines = []
+    row = "    "
+    for value in values:
+        literal = rust_string_literal(value) + ","
+        if row.strip() and len(row) + len(literal) > 100:
+            lines.append(row.rstrip())
+            row = "    "
+        row += literal + " "
+    if row.strip():
+        lines.append(row.rstrip())
+    return lines
+
+
 def render_preinterned_lookup(
     preinterned_strings: list[str],
     startup_strings: tuple[str, ...],
     compiler_strings: tuple[str, ...] = (),
+    table_name: str = "PREINTERNED_STRINGS",
 ) -> list[str]:
     def prefix(value: str) -> int:
         encoded = value.encode()
@@ -476,7 +491,7 @@ def render_preinterned_lookup(
         [
             "        _ => return false,",
             "    };",
-            "    PREINTERNED_STRINGS[start..end].binary_search(&value).is_ok()",
+            f"    {table_name}[start..end].binary_search(&value).is_ok()",
             "}",
         ]
     )
@@ -1057,6 +1072,8 @@ def render(sources: dict[str, str]) -> str:
             f"pub(crate) const SMALL_INT_MAX: i64 = {small_ints['_PY_NSMALLPOSINTS'] - 1};"
         )
         lines.append("")
+    if TARGET_MINOR == "3.14":
+        lines.append('#[cfg(any(not(target_os = "linux"), test))]')
     lines.append("pub(crate) static PREINTERNED_STRINGS: &[&str] = &[")
     lines.extend(f"    {rust_string_literal(value)}," for value in preinterned_strings)
     lines.extend(["];", ""])
@@ -1072,36 +1089,48 @@ def render(sources: dict[str, str]) -> str:
     )
     lines.extend(["];", ""])
     if TARGET_MINOR == "3.14":
+        bootstrap_strings = read_bootstrap_strings(sources)
         lines.extend(
             [
                 "// Source-derived identifiers and live owners from neutral Linux bootstrap.",
+                "#[cfg(test)]",
                 "pub(crate) static BOOTSTRAP_INTERNED_STRINGS: &[&str] = &[",
             ]
         )
         lines.extend(
-            f"    {rust_string_literal(value)},"
-            for value in read_bootstrap_strings(sources)
+            f"    {rust_string_literal(value)}," for value in bootstrap_strings
+        )
+        linux_preinterned_strings = sorted(
+            set(preinterned_strings) | set(bootstrap_strings)
         )
         lines.extend(
             [
                 "];",
                 "",
-                "pub(crate) fn is_preinterned_string(value: &str) -> bool {",
-                "    static STARTUP: std::sync::LazyLock<rustc_hash::FxHashSet<&'static str>> =",
-                "        std::sync::LazyLock::new(|| BOOTSTRAP_INTERNED_STRINGS.iter().copied().collect());",
-                "    is_preinterned_static_string(value)",
-                '        || (cfg!(target_os = "linux") && STARTUP.contains(value))',
-                "}",
-                "",
+                "// Include Linux bootstrap strings in the same exact prefix lookup.",
+                '#[cfg(target_os = "linux")]',
+                "#[rustfmt::skip]",
+                "static LINUX_PREINTERNED_STRINGS: &[&str] = &[",
             ]
         )
-        lookup = render_preinterned_lookup(
-            preinterned_strings,
-            STARTUP_INTERNED_STRINGS + UNIX_STARTUP_INTERNED_STRINGS,
-            tuple(compiler_interned_strings),
+        lines.extend(render_compact_rust_strings(linux_preinterned_strings))
+        lines.extend(["];", "", '#[cfg(target_os = "linux")]'])
+        lines.extend(
+            render_preinterned_lookup(
+                linux_preinterned_strings,
+                STARTUP_INTERNED_STRINGS + UNIX_STARTUP_INTERNED_STRINGS,
+                tuple(compiler_interned_strings),
+                "LINUX_PREINTERNED_STRINGS",
+            )
         )
-        lookup[0] = "fn is_preinterned_static_string(value: &str) -> bool {"
-        lines.extend(lookup)
+        lines.extend(["", '#[cfg(not(target_os = "linux"))]'])
+        lines.extend(
+            render_preinterned_lookup(
+                preinterned_strings,
+                STARTUP_INTERNED_STRINGS + UNIX_STARTUP_INTERNED_STRINGS,
+                tuple(compiler_interned_strings),
+            )
+        )
     else:
         lines.extend(
             [
