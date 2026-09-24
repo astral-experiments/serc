@@ -6,8 +6,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use crate::code_object::{
-    CodeInterningSummary, CodeObject, CompilationInterningEvent, Constant, MetadataId,
-    MetadataName as Name,
+    CodeFilename, CodeInterningSummary, CodeObject, CompilationInterningEvent, Constant,
+    MetadataId, MetadataName as Name,
 };
 use crate::target::{is_preinterned_string_for, small_int_bounds_for};
 use crate::{CompileError, InitialInternState, PythonVersion};
@@ -491,6 +491,20 @@ impl<'a> ObjectGraph<'a> {
             *slot = Some(id);
         }
         self.occurrences.push(Occurrence { object: id, kind });
+        first
+    }
+
+    fn record_surrogate_filename(&mut self, value: &'a [u8]) -> bool {
+        let (id, first) = self.record_object(ObjectKey::SurrogateFilename(value).into());
+        if self.python_version >= PythonVersion::Py313 {
+            let object = &mut self.objects_by_id[id];
+            object.cached = true;
+            object.interned = true;
+        }
+        self.occurrences.push(Occurrence {
+            object: id,
+            kind: OccurrenceKind::MetadataString,
+        });
         first
     }
 
@@ -2195,7 +2209,9 @@ fn intern_code_object<'a>(
         interned_constant_strings,
     );
     if interned_strings.python_version >= PythonVersion::Py313 {
-        interned_strings.insert(&code.filename);
+        if let Some(filename) = code.filename.as_utf8() {
+            interned_strings.insert(filename);
+        }
         interned_strings.insert(&code.name);
         interned_strings.insert(&code.qualified_name);
     }
@@ -2232,11 +2248,12 @@ fn intern_code_summary<'a>(
     // Discarded code may release these mortal owners. In partial states, this
     // invalidates initial absence without establishing retained presence.
     if interned_strings.python_version >= PythonVersion::Py313 {
-        for value in [
-            summary.filename.as_ref(),
-            summary.name.as_str(),
-            summary.qualified_name.as_str(),
-        ] {
+        for value in summary
+            .filename
+            .as_utf8()
+            .into_iter()
+            .chain([summary.name.as_str(), summary.qualified_name.as_str()])
+        {
             if interned_strings.initial.has_unknown_entries() {
                 if interned_strings.tracks_origin(value) {
                     interned_strings.possibly_added.insert(value);
@@ -2468,16 +2485,25 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     fn first_line(&mut self, _value: u32) {}
 
     fn code_filename(&mut self, code: &'code CodeObject, metadata_id: Option<MetadataId>) {
-        if self.graph.python_version != PythonVersion::Py312
-            || code.filename.is_empty()
-            || is_cached_character(&code.filename)
-        {
-            self.metadata_string(&code.filename, metadata_id);
-        } else if self.graph.record_keyed(
-            OccurrenceKind::MetadataString,
-            ObjectKey::Filename(&code.filename),
-        ) {
-            self.graph.estimate_long_payload(code.filename.len());
+        match &code.filename {
+            CodeFilename::Utf8(filename) => {
+                if self.graph.python_version != PythonVersion::Py312
+                    || filename.is_empty()
+                    || is_cached_character(filename)
+                {
+                    self.metadata_string(filename, metadata_id);
+                } else if self.graph.record_keyed(
+                    OccurrenceKind::MetadataString,
+                    ObjectKey::Filename(filename),
+                ) {
+                    self.graph.estimate_long_payload(filename.len());
+                }
+            }
+            CodeFilename::Surrogate(filename) => {
+                if self.graph.record_surrogate_filename(filename) {
+                    self.graph.estimate_long_payload(filename.len());
+                }
+            }
         }
     }
 

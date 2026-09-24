@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::ops::Deref;
+use std::path::Path;
 use std::sync::Arc;
 
 use ruff_index::newtype_index;
@@ -10,6 +11,87 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::CompileError;
 use crate::target::code_flags::{CO_VARARGS, CO_VARKEYWORDS};
 use crate::target::local_kinds::CO_FAST_LOCAL;
+
+/// A Python filename, preserving lone surrogates that Rust strings cannot represent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CodeFilename {
+    Utf8(Arc<str>),
+    Surrogate(Arc<[u8]>),
+}
+
+impl CodeFilename {
+    pub(crate) fn from_path(path: &Path) -> Self {
+        if let Some(value) = path.to_str() {
+            return Self::from(value);
+        }
+        Self::Surrogate(Self::path_surrogate_bytes(path).into())
+    }
+
+    pub(crate) fn as_utf8(&self) -> Option<&str> {
+        match self {
+            Self::Utf8(value) => Some(value),
+            Self::Surrogate(_) => None,
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn path_surrogate_bytes(path: &Path) -> Vec<u8> {
+        let mut remaining = path.as_os_str().as_encoded_bytes();
+        let mut output = Vec::with_capacity(remaining.len());
+        while let Err(error) = std::str::from_utf8(remaining) {
+            let (valid, invalid) = remaining.split_at(error.valid_up_to());
+            output.extend_from_slice(valid);
+            let invalid_length = error.error_len().unwrap_or(invalid.len());
+            let (invalid, rest) = invalid.split_at(invalid_length);
+            for &byte in invalid {
+                Self::push_surrogate(&mut output, 0xdc00 | u16::from(byte));
+            }
+            remaining = rest;
+        }
+        output.extend_from_slice(remaining);
+        output
+    }
+
+    #[cfg(windows)]
+    fn path_surrogate_bytes(path: &Path) -> Vec<u8> {
+        use std::os::windows::ffi::OsStrExt;
+
+        let mut output = Vec::new();
+        for character in char::decode_utf16(path.as_os_str().encode_wide()) {
+            match character {
+                Ok(character) => {
+                    output.extend_from_slice(character.encode_utf8(&mut [0; 4]).as_bytes());
+                }
+                Err(error) => Self::push_surrogate(&mut output, error.unpaired_surrogate()),
+            }
+        }
+        output
+    }
+
+    fn push_surrogate(output: &mut Vec<u8>, value: u16) {
+        debug_assert!((0xd800..=0xdfff).contains(&value));
+        output.extend_from_slice(&[
+            0xe0 | u8::try_from(value >> 12).expect("UTF-8 leading surrogate bits fit in u8"),
+            0x80 | u8::try_from((value >> 6) & 0x3f).expect("UTF-8 continuation bits fit in u8"),
+            0x80 | u8::try_from(value & 0x3f).expect("UTF-8 continuation bits fit in u8"),
+        ]);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Utf8(left), Self::Utf8(right)) => Arc::ptr_eq(left, right),
+            (Self::Surrogate(left), Self::Surrogate(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+impl From<&str> for CodeFilename {
+    fn from(value: &str) -> Self {
+        Self::Utf8(Arc::from(value))
+    }
+}
 
 /// An immutable metadata spelling that keeps short names inline.
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -138,7 +220,7 @@ pub(crate) struct CodeInterningSummary {
     pub(crate) constant_strings: Vec<String>,
     pub(crate) explicitly_interned_strings: FxHashSet<String>,
     pub(crate) constants_tuple: Option<Vec<String>>,
-    pub(crate) filename: Arc<str>,
+    pub(crate) filename: CodeFilename,
     pub(crate) name: String,
     pub(crate) qualified_name: String,
 }
@@ -183,7 +265,7 @@ impl CodeInterningSummary {
                     _ => None,
                 })
                 .collect(),
-            filename: Arc::clone(&code.filename),
+            filename: code.filename.clone(),
             name: code.name.clone(),
             qualified_name: code.qualified_name.clone(),
         }
@@ -489,7 +571,7 @@ pub(crate) struct CodeObject {
     pub(crate) locals: Vec<MetadataName>,
     pub(crate) local_kinds: Vec<u8>,
     /// The caller's immutable filename, shared by all scopes in the compilation.
-    pub(crate) filename: Arc<str>,
+    pub(crate) filename: CodeFilename,
     pub(crate) name: String,
     pub(crate) qualified_name: String,
     pub(crate) first_line_number: u32,
