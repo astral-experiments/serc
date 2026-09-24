@@ -18,13 +18,48 @@ use super::key::{
     is_cached_character, local_kinds_key, locals_tuple_key, names_tuple_key, should_intern,
     strings_tuple_key,
 };
-use super::plan::{MarshalVisitor, ObjectId, ReferenceMode, traverse_code};
+use super::plan::{MarshalVisitor, ObjectId, ReferenceId, ReferenceMode, traverse_code};
 
 #[derive(Debug)]
-struct Object {
+pub(super) struct Object {
     shared: bool,
     cached: bool,
     interned: bool,
+    reference: Option<ReferenceId>,
+}
+
+const _: [(); 8] = [(); std::mem::size_of::<Object>()];
+
+impl Object {
+    pub(super) fn is_interned(&self) -> bool {
+        self.interned
+    }
+
+    /// Resolves the next wire occurrence without looking up the same object a second time.
+    #[inline]
+    pub(super) fn reference_for_write(
+        &mut self,
+        mode: ReferenceMode,
+        reference_count: &mut usize,
+    ) -> ObjectReference {
+        if mode == ReferenceMode::IfShared && !self.shared && !self.cached {
+            return ObjectReference::Unshared;
+        }
+        if let Some(index) = self.reference {
+            return ObjectReference::Existing(index);
+        }
+        let index = ReferenceId::from_usize(*reference_count);
+        *reference_count += 1;
+        self.reference = Some(index);
+        ObjectReference::New
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ObjectReference {
+    Unshared,
+    New,
+    Existing(ReferenceId),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,7 +78,7 @@ pub(super) enum OccurrenceKind {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Occurrence {
+pub(super) struct Occurrence {
     object: ObjectId,
     kind: OccurrenceKind,
 }
@@ -51,17 +86,18 @@ struct Occurrence {
 const _: [(); 8] = [(); std::mem::size_of::<Occurrence>()];
 
 #[derive(Debug)]
-pub(super) struct OccurrenceCursor<'a> {
-    occurrences: &'a [Occurrence],
+pub(super) struct OccurrenceCursor<T> {
+    occurrences: T,
     next: usize,
 }
 
-impl OccurrenceCursor<'_> {
+impl<T: AsRef<[Occurrence]>> OccurrenceCursor<T> {
     #[inline]
     pub(super) fn consume(&mut self, expected: OccurrenceKind) -> ObjectId {
         let index = self.next;
-        let Some(occurrence) = self.occurrences.get(index).copied() else {
-            missing_occurrence(index, expected, self.occurrences.len());
+        let occurrences = self.occurrences.as_ref();
+        let Some(occurrence) = occurrences.get(index).copied() else {
+            missing_occurrence(index, expected, occurrences.len());
         };
         if occurrence.kind != expected {
             mismatched_occurrence(index, expected, occurrence.kind);
@@ -71,12 +107,13 @@ impl OccurrenceCursor<'_> {
     }
 
     pub(super) fn finish(self) {
+        let occurrences = self.occurrences.as_ref();
         assert_eq!(
             self.next,
-            self.occurrences.len(),
+            occurrences.len(),
             "marshal writer consumed {} of {} recorded occurrences",
             self.next,
-            self.occurrences.len()
+            occurrences.len()
         );
     }
 }
@@ -296,6 +333,7 @@ impl<'a> ObjectGraph<'a> {
                 explicitly_interned,
                 recreated_frozensets,
                 sort_graph,
+                root_constants: true,
             },
         );
         graph
@@ -469,6 +507,7 @@ impl<'a> ObjectGraph<'a> {
                     shared: false,
                     cached: true,
                     interned: true,
+                    reference: None,
                 });
                 (next_id, true)
             }
@@ -525,6 +564,7 @@ impl<'a> ObjectGraph<'a> {
             shared: false,
             cached: false,
             interned: false,
+            reference: None,
         });
         id
     }
@@ -545,6 +585,7 @@ impl<'a> ObjectGraph<'a> {
                 shared: false,
                 cached: true,
                 interned: false,
+                reference: None,
             });
             *slot = Some(id);
             return (id, true);
@@ -563,6 +604,7 @@ impl<'a> ObjectGraph<'a> {
             shared: false,
             cached: true,
             interned: matches!(cached, CachedObject::Character(_)),
+            reference: None,
         });
         *slot = Some(id);
         (id, true)
@@ -586,6 +628,7 @@ impl<'a> ObjectGraph<'a> {
                     shared: false,
                     cached,
                     interned: false,
+                    reference: None,
                 });
                 (next_id, true)
             }
@@ -634,8 +677,13 @@ impl<'a> ObjectGraph<'a> {
         self.python_version
     }
 
+    #[cfg(test)]
     pub(super) fn object_count(&self) -> usize {
         self.objects_by_id.len()
+    }
+
+    pub(super) fn object_for_writing(&mut self, id: ObjectId) -> &mut Object {
+        &mut self.objects_by_id[id]
     }
 
     /// Estimates space for the writer from the same traversal that records object identities.
@@ -664,13 +712,23 @@ impl<'a> ObjectGraph<'a> {
         self.objects.len()
     }
 
-    pub(super) fn occurrence_cursor(&self) -> OccurrenceCursor<'_> {
+    #[cfg(test)]
+    pub(super) fn occurrence_cursor(&self) -> OccurrenceCursor<&[Occurrence]> {
         OccurrenceCursor {
             occurrences: &self.occurrences,
             next: 0,
         }
     }
 
+    /// Separates the read-only occurrence stream before the writer mutates object references.
+    pub(super) fn take_occurrences(&mut self) -> OccurrenceCursor<Vec<Occurrence>> {
+        OccurrenceCursor {
+            occurrences: std::mem::take(&mut self.occurrences),
+            next: 0,
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn is_interned_object(&self, id: ObjectId) -> bool {
         self.objects_by_id[id].interned
     }
@@ -2241,6 +2299,7 @@ struct GraphVisitor<'graph, 'code> {
     explicitly_interned: Option<&'graph FxHashSet<&'code str>>,
     recreated_frozensets: Option<&'graph FxHashSet<usize>>,
     sort_graph: Option<&'graph ObjectGraph<'code>>,
+    root_constants: bool,
 }
 
 impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
@@ -2265,16 +2324,20 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
 
     #[inline]
     fn constants(&mut self, values: &'code [Constant], _reference_mode: ReferenceMode) -> bool {
+        let root_constants = std::mem::take(&mut self.root_constants);
         if values.is_empty() {
             return self
                 .graph
                 .record_cached_value(OccurrenceKind::Constants, CachedObject::EmptyTuple);
         }
         let key = constants_tuple_key(values);
+        // The root constant tuple cannot equal one of its own descendants. Only all-string
+        // roots can alias a metadata tuple, and those retain their ordinary value lookup.
         if matches!(&key, ObjectKey::ConstantTuple(_))
-            && values
-                .iter()
-                .any(|value| matches!(value, Constant::Code(_)))
+            && (root_constants
+                || values
+                    .iter()
+                    .any(|value| matches!(value, Constant::Code(_))))
         {
             self.graph
                 .record_unique_value(OccurrenceKind::Constants, key)
@@ -2596,3 +2659,50 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
 
 #[cfg(test)]
 mod snapshots;
+
+#[cfg(test)]
+mod wire_reference_tests {
+    use super::{Object, ObjectReference, ReferenceMode};
+
+    #[test]
+    fn object_references_preserve_forcing_and_the_full_reference_index() {
+        let mut unique = Object {
+            shared: false,
+            cached: false,
+            interned: false,
+            reference: None,
+        };
+        let mut cached = Object {
+            shared: false,
+            cached: true,
+            interned: false,
+            reference: None,
+        };
+        let mut next_reference = (u32::MAX - 2) as usize;
+        assert!(matches!(
+            unique.reference_for_write(ReferenceMode::IfShared, &mut next_reference),
+            ObjectReference::Unshared
+        ));
+        assert!(matches!(
+            unique.reference_for_write(ReferenceMode::Forced, &mut next_reference),
+            ObjectReference::New
+        ));
+        assert!(matches!(
+            unique.reference_for_write(ReferenceMode::Forced, &mut next_reference),
+            ObjectReference::Existing(index) if index.as_u32() == u32::MAX - 2
+        ));
+        assert!(matches!(
+            unique.reference_for_write(ReferenceMode::IfShared, &mut next_reference),
+            ObjectReference::Unshared
+        ));
+        assert!(matches!(
+            cached.reference_for_write(ReferenceMode::IfShared, &mut next_reference),
+            ObjectReference::New
+        ));
+        assert!(matches!(
+            cached.reference_for_write(ReferenceMode::IfShared, &mut next_reference),
+            ObjectReference::Existing(index) if index.as_u32() == u32::MAX - 1
+        ));
+        assert_eq!(next_reference, u32::MAX as usize);
+    }
+}

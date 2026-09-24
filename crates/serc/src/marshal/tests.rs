@@ -737,6 +737,34 @@ fn short_and_long_compiler_names_keep_marshaled_metadata_identity() {
 }
 
 #[test]
+fn root_constant_tuples_are_unique_unless_they_alias_string_metadata() {
+    let tuple = Constant::Tuple(vec![Constant::Int(1000)]);
+    let code = code_object(vec![tuple.clone(), tuple]);
+    let graph = ObjectGraph::for_code(&code);
+    // The nested tuple and its integer need value lookup; the root tuple cannot be shared.
+    assert_eq!(graph.hashed_object_count(), 2);
+    assert!(!graph.is_shared(&constants_tuple_key(&code.constants), false));
+    let Constant::Tuple(values) = &code.constants[0] else {
+        unreachable!();
+    };
+    assert!(graph.is_shared(&constants_tuple_key(values), false));
+
+    let mut code = code_object(vec![Constant::String("alpha".to_string())]);
+    code.names.push("alpha".into());
+    code.marshal_provenance.metadata_ids.names = vec![MetadataId::from_u32(0)];
+    let graph = ObjectGraph::for_code(&code);
+    assert!(graph.is_shared(&constants_tuple_key(&code.constants), false));
+    assert!(graph.is_shared(&names_tuple_key(&code.names), false));
+    let mut occurrences = graph.occurrence_cursor();
+    occurrences.consume(OccurrenceKind::Code);
+    occurrences.consume(OccurrenceKind::CodeBytes);
+    let constants = occurrences.consume(OccurrenceKind::Constants);
+    occurrences.consume(OccurrenceKind::Constant);
+    assert_eq!(occurrences.consume(OccurrenceKind::Strings), constants);
+    assert!(!encode_code(&code).is_empty());
+}
+
+#[test]
 fn graph_shares_long_string_tuples_with_literal_and_metadata_occurrences() {
     let strings: Vec<_> = (0..32).map(|index| format!("name_{index}")).collect();
     let constants: Vec<_> = strings.iter().cloned().map(Constant::String).collect();

@@ -11,6 +11,10 @@ use super::key::{
 #[newtype_index]
 pub(super) struct ObjectId;
 
+/// Identifies an object in the serialized marshal reference table.
+#[newtype_index]
+pub(super) struct ReferenceId;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ReferenceMode {
     IfShared,

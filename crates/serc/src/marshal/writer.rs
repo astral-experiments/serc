@@ -1,9 +1,7 @@
-use ruff_index::{IndexVec, newtype_index};
-
 use crate::code_object::{CodeObject, Constant, MetadataId};
 use crate::{InitialInternState, PythonVersion};
 
-use super::graph::{ObjectGraph, OccurrenceCursor, OccurrenceKind};
+use super::graph::{ObjectGraph, ObjectReference, Occurrence, OccurrenceCursor, OccurrenceKind};
 use super::key::FrozenSetMembers;
 use super::plan::{MarshalVisitor, ObjectId, ReferenceMode, traverse_code_with_mode};
 use super::v5::{
@@ -65,10 +63,6 @@ const _: () = {
     assert!(super::v5::TYPE_UNICODE == super::v6::TYPE_UNICODE);
 };
 
-/// Identifies an object in the serialized marshal reference table.
-#[newtype_index]
-struct ReferenceId;
-
 #[cfg(test)]
 pub(crate) fn encode_code(code: &CodeObject) -> Vec<u8> {
     encode_code_with_options(code, PythonVersion::Py314, &InitialInternState::default())
@@ -119,14 +113,14 @@ fn encode_code_into_with_mode(
     output: &mut Vec<u8>,
     root_reference: ReferenceMode,
 ) {
-    let graph = ObjectGraph::for_code_with_options(code, python_version, initial_intern_state);
+    let mut graph = ObjectGraph::for_code_with_options(code, python_version, initial_intern_state);
     output.reserve(graph.estimated_wire_size());
+    let occurrences = graph.take_occurrences();
     let mut writer = Writer {
-        graph: &graph,
+        graph: &mut graph,
         output,
-        references: IndexVec::from_raw(vec![None; graph.object_count()]),
         reference_count: 0,
-        occurrences: graph.occurrence_cursor(),
+        occurrences,
         frozen_set_order_index: 0,
     };
     traverse_code_with_mode(code, root_reference, &mut writer);
@@ -134,11 +128,10 @@ fn encode_code_into_with_mode(
 }
 
 struct Writer<'output, 'graph, 'code> {
-    graph: &'graph ObjectGraph<'code>,
+    graph: &'graph mut ObjectGraph<'code>,
     output: &'output mut Vec<u8>,
-    references: IndexVec<ObjectId, Option<ReferenceId>>,
     reference_count: usize,
-    occurrences: OccurrenceCursor<'graph>,
+    occurrences: OccurrenceCursor<Vec<Occurrence>>,
     frozen_set_order_index: usize,
 }
 
@@ -195,18 +188,29 @@ impl Writer<'_, '_, '_> {
         self.output.extend_from_slice(&header);
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "specialize reference checks at the forced structural-object call sites"
+    )]
+    #[inline(always)]
     fn begin_object(&mut self, object: ObjectId, reference_mode: ReferenceMode) -> Option<u8> {
-        if reference_mode == ReferenceMode::IfShared && !self.graph.is_shared_object(object) {
-            return Some(0);
+        let reference = self
+            .graph
+            .object_for_writing(object)
+            .reference_for_write(reference_mode, &mut self.reference_count);
+        self.write_reference(reference)
+    }
+
+    #[inline]
+    fn write_reference(&mut self, reference: ObjectReference) -> Option<u8> {
+        match reference {
+            ObjectReference::Unshared => Some(0),
+            ObjectReference::New => Some(FLAG_REF),
+            ObjectReference::Existing(index) => {
+                self.byte_and_long(TYPE_REF, index.as_u32());
+                None
+            }
         }
-        if let Some(index) = self.references[object] {
-            self.byte_and_long(TYPE_REF, index.as_u32());
-            return None;
-        }
-        let index = ReferenceId::from_usize(self.reference_count);
-        self.reference_count += 1;
-        self.references[object] = Some(index);
-        Some(FLAG_REF)
     }
 
     fn bytes_with_object(&mut self, object: ObjectId, value: &[u8], reference_mode: ReferenceMode) {
@@ -221,13 +225,15 @@ impl Writer<'_, '_, '_> {
     }
 
     fn string_with_object(&mut self, object: ObjectId, value: &str, reference_mode: ReferenceMode) {
-        let interned = self.graph.is_interned_object(object);
+        let object = self.graph.object_for_writing(object);
+        let interned = object.is_interned();
         let reference_mode = if interned {
             ReferenceMode::Forced
         } else {
             reference_mode
         };
-        let Some(flag) = self.begin_object(object, reference_mode) else {
+        let reference = object.reference_for_write(reference_mode, &mut self.reference_count);
+        let Some(flag) = self.write_reference(reference) else {
             return;
         };
         let bytes = value.as_bytes();
