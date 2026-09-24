@@ -17282,9 +17282,15 @@ impl<'source> Compiler<'source> {
                 if nested.orelse.is_empty()
                     && suite_contains_loop_break(&nested.body)
                     && !suite_contains_loop_break_with_finally(&nested.body))
+                || (self.context.python_version >= crate::PythonVersion::Py314
+                    && matches!(statement.body.last(), Some(Stmt::While(nested))
+                        if early_condition_truthiness(&nested.test).is_none()
+                            && matches!(nested.body.as_slice(), [Stmt::Break(_)])
+                            && !nested.orelse.is_empty()))
             {
                 // The final nested loop's break exit is an empty block containing the
-                // outer artificial backedge. Copy it before propagating predecessor lines.
+                // outer artificial backedge. Copy it before propagating predecessor lines,
+                // so a while break never borrows the line of its unexecuted else suite.
                 self.assembler
                     .prepare_no_location_block_for_inlining(backedge);
             }
