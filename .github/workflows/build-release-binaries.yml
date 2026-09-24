@@ -56,11 +56,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: x86_64-apple-darwin, runner: macos-15-intel, python-arch: x64 }
-          - { target: aarch64-apple-darwin, runner: macos-15, python-arch: arm64 }
-          - { target: x86_64-pc-windows-msvc, runner: windows-2025, python-arch: x64 }
-          - { target: i686-pc-windows-msvc, runner: windows-2025, python-arch: x86 }
-          - { target: aarch64-pc-windows-msvc, runner: windows-11-arm, python-arch: arm64 }
+          - {
+              target: x86_64-apple-darwin,
+              runner: macos-15-intel,
+              python-arch: x64,
+            }
+          - {
+              target: aarch64-apple-darwin,
+              runner: macos-15,
+              python-arch: arm64,
+            }
+          - {
+              target: x86_64-pc-windows-msvc,
+              runner: windows-2025,
+              python-arch: x64,
+            }
+          - {
+              target: i686-pc-windows-msvc,
+              runner: windows-2025,
+              python-arch: x86,
+            }
+          - {
+              target: aarch64-pc-windows-msvc,
+              runner: windows-11-arm,
+              python-arch: arm64,
+            }
     steps:
       - name: Enable long paths for Ruff's Git checkout
         if: runner.os == 'Windows'

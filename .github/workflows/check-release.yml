@@ -3,15 +3,15 @@ name: Check release
 on:
   pull_request:
     paths:
-      - '.github/workflows/*release*.yml'
-      - '.github/workflows/*publish*.yml'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'crates/**/Cargo.toml'
-      - 'pyproject.toml'
-      - 'python/**'
-      - 'scripts/*release*'
-      - 'scripts/publish-crates.py'
+      - ".github/workflows/*release*.yml"
+      - ".github/workflows/*publish*.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**/Cargo.toml"
+      - "pyproject.toml"
+      - "python/**"
+      - "scripts/*release*"
+      - "scripts/publish-crates.py"
   workflow_dispatch:
 
 permissions: {}
