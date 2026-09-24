@@ -37,6 +37,8 @@ pub(super) enum ObjectKey<'a> {
     String(&'a str),
     // Python 3.12 retains the caller's filename object without interning it.
     Filename(&'a str),
+    // Lone surrogates cannot occur in Python identifiers or share an interned source constant.
+    SurrogateFilename(&'a [u8]),
     // Dynamically allocated code names stay distinct even when their values match.
     UninternedMetadata(usize),
     SurrogateString(&'a [u8]),

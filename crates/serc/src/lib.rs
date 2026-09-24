@@ -15,8 +15,9 @@ mod target;
 
 use std::error::Error;
 use std::fmt;
+use std::path::Path;
 
-use code_object::CodeObject;
+use code_object::{CodeFilename, CodeObject};
 use compiler::Compiler;
 pub use config::{CompileOptions, ParsePythonVersionError, PythonVersion};
 pub use initial_intern_state::InitialInternState;
@@ -247,7 +248,7 @@ pub fn compile_with_options(
         return Err(CompileError::Decode(SourceDecodeError::NullByte));
     }
     let source = source::normalize_source(source);
-    compile_normalized(&source, filename, options)
+    compile_normalized(&source, filename.into(), options)
 }
 
 /// Decode and compile Python source bytes for CPython 3.14.5.
@@ -287,7 +288,24 @@ pub fn compile_bytes_with_options(
 ) -> Result<CompiledModule, CompileError> {
     validate_filename(filename)?;
     let source = decode_source(source).map_err(CompileError::Decode)?;
-    compile_normalized(&source, filename, options)
+    compile_normalized(&source, filename.into(), options)
+}
+
+/// Decode and compile source bytes with an operating-system filename and the selected options.
+///
+/// This function performs no filesystem I/O. Unlike [`compile_bytes_with_options`], it also
+/// preserves filenames that are not valid Unicode, using Python's filesystem representation.
+/// Paths containing a null character are rejected before the source is decoded.
+pub fn compile_bytes_with_path_and_options(
+    source: &[u8],
+    filename: &Path,
+    options: &CompileOptions,
+) -> Result<CompiledModule, CompileError> {
+    if filename.as_os_str().as_encoded_bytes().contains(&0) {
+        return Err(CompileError::InvalidFilename);
+    }
+    let source = decode_source(source).map_err(CompileError::Decode)?;
+    compile_normalized(&source, CodeFilename::from_path(filename), options)
 }
 
 fn validate_filename(filename: &str) -> Result<(), CompileError> {
@@ -299,7 +317,7 @@ fn validate_filename(filename: &str) -> Result<(), CompileError> {
 
 fn compile_normalized(
     source: &str,
-    filename: &str,
+    filename: CodeFilename,
     options: &CompileOptions,
 ) -> Result<CompiledModule, CompileError> {
     let target_version = match options.python_version {

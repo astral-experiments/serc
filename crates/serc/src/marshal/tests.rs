@@ -1040,6 +1040,8 @@ impl<'a> MarshalVisitor<'a> for RecordingVisitor<'a> {
 
     fn metadata_string(&mut self, _value: &'a str, _metadata_id: Option<MetadataId>) {}
 
+    fn code_filename(&mut self, _code: &'a CodeObject, _metadata_id: Option<MetadataId>) {}
+
     fn first_line(&mut self, _value: u32) {}
 
     fn bytes(&mut self, _value: &'a [u8]) {}

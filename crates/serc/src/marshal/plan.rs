@@ -33,9 +33,7 @@ pub(super) trait MarshalVisitor<'a> {
     fn locals(&mut self, code: &'a CodeObject) -> bool;
     fn local_kinds(&mut self, code: &'a CodeObject);
     fn metadata_string(&mut self, value: &'a str, metadata_id: Option<MetadataId>);
-    fn code_filename(&mut self, code: &'a CodeObject, metadata_id: Option<MetadataId>) {
-        self.metadata_string(&code.filename, metadata_id);
-    }
+    fn code_filename(&mut self, code: &'a CodeObject, metadata_id: Option<MetadataId>);
     fn code_name(&mut self, code: &'a CodeObject, metadata_id: Option<MetadataId>) {
         self.metadata_string(&code.name, metadata_id);
     }

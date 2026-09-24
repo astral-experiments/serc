@@ -256,6 +256,71 @@ for filename in ["\0", "\0prefix", "in\0side", "suffix\0"]:
     }
 
     #[test]
+    fn rejects_null_characters_in_path_filenames_before_reading_source() {
+        use std::path::Path;
+
+        use serc::{
+            CompileOptions, PythonVersion, SourceDecodeError, compile_bytes_with_options,
+            compile_bytes_with_path_and_options,
+        };
+
+        let sources: &[&[u8]] = &[b"pass", b"if =", b"\0", b"\xff", b"# coding: unknown\npass"];
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let options = CompileOptions {
+                python_version,
+                ..CompileOptions::default()
+            };
+            for filename in ["\0", "\0prefix", "in\0side", "suffix\0"] {
+                for &source in sources {
+                    assert_eq!(
+                        compile_bytes_with_path_and_options(source, Path::new(filename), &options)
+                            .unwrap_err(),
+                        CompileError::InvalidFilename,
+                        "{python_version:?}, {filename:?}, {source:?}"
+                    );
+                }
+            }
+
+            let source = b"def nested():\n    return 42\n";
+            for filename in ["", "plain.py", "literal\\0.py", "near␀nul.py"] {
+                assert_eq!(
+                    compile_bytes_with_path_and_options(source, Path::new(filename), &options)
+                        .unwrap()
+                        .marshal(),
+                    compile_bytes_with_options(source, filename, &options)
+                        .unwrap()
+                        .marshal(),
+                    "{python_version:?}, {filename:?}"
+                );
+            }
+
+            let filename = Path::new("normal.py");
+            assert!(matches!(
+                compile_bytes_with_path_and_options(b"if =", filename, &options),
+                Err(CompileError::Parse(_))
+            ));
+            assert_eq!(
+                compile_bytes_with_path_and_options(b"\0", filename, &options).unwrap_err(),
+                CompileError::Decode(SourceDecodeError::NullByte)
+            );
+            assert!(matches!(
+                compile_bytes_with_path_and_options(b"\xff", filename, &options),
+                Err(CompileError::Decode(SourceDecodeError::InvalidUtf8(_)))
+            ));
+            assert_eq!(
+                compile_bytes_with_path_and_options(b"# coding: unknown\npass", filename, &options)
+                    .unwrap_err(),
+                CompileError::Decode(SourceDecodeError::UnsupportedEncoding("unknown".to_owned()))
+            );
+        }
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_supported_source_encodings() {
         let cases: [(&str, &[u8]); 9] = [
             ("latin_1.py", b"# coding: latin-1\nvalue = '\xe9'\n"),

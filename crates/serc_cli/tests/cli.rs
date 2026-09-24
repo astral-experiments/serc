@@ -1567,6 +1567,175 @@ fn compile_matches_cpython_cache_paths_and_pyc() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn compile_matches_cpython_for_non_utf8_paths() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    fn oracle(version: serc::PythonVersion) -> Command {
+        match version {
+            serc::PythonVersion::Py312 => common::python_312_command(),
+            serc::PythonVersion::Py313 => common::python_313_command(),
+            serc::PythonVersion::Py314 => common::python_3145_command(),
+            serc::PythonVersion::Py315 => common::python_315_command(),
+        }
+    }
+
+    let versions = [
+        serc::PythonVersion::Py312,
+        serc::PythonVersion::Py313,
+        serc::PythonVersion::Py314,
+        serc::PythonVersion::Py315,
+    ];
+    let directory = tempfile::tempdir().unwrap();
+    let nested = directory
+        .path()
+        .join(OsString::from_vec(b"dir_\xf0\x9f\x90\xa7_\xfe".to_vec()));
+    fs_err::create_dir(&nested).unwrap();
+
+    let stems = [
+        b"caf\xc3\xa9_\xff_mid_\xe2\x82".as_slice(),
+        b"replacement_\xef\xbf\xbd_\x80".as_slice(),
+        b"sequence_\xed\xa0\x80_\xf0\x9f\x92".as_slice(),
+        b"valid_\xc3\xa9".as_slice(),
+    ];
+    let mut paths = Vec::new();
+    for stem in stems {
+        let source_path = nested.join(OsString::from_vec([stem, b".py"].concat()));
+        let source = common::python_3145_command()
+            .args([
+                "-X",
+                "utf8",
+                "-c",
+                r"
+import sys
+
+filename = repr(sys.argv[1])
+source = f'''literal = {filename}
+def outer():
+    def inner():
+        return {filename}
+    return inner
+class Holder:
+    def method(self):
+        return {filename}
+'''
+sys.stdout.buffer.write(source.encode())
+",
+            ])
+            .arg(&source_path)
+            .output()
+            .unwrap();
+        assert!(source.status.success(), "{source_path:?}: {source:?}");
+        fs_err::write(&source_path, source.stdout).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&source_path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            )
+            .unwrap();
+
+        for version in versions {
+            let output = serc()
+                .args(["compile", "--check", "--quiet", "--python-version"])
+                .arg(version.to_string())
+                .arg(&source_path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "Python {version}, {source_path:?}: {output:?}"
+            );
+            assert!(output.stdout.is_empty(), "{source_path:?}: {output:?}");
+            assert!(output.stderr.is_empty(), "{source_path:?}: {output:?}");
+        }
+        paths.push((source_path, stem));
+    }
+    assert!(!nested.join("__pycache__").exists());
+
+    for version in versions {
+        let output = serc()
+            .args(["compile", "--quiet", "--python-version"])
+            .arg(version.to_string())
+            .arg(directory.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "Python {version}: {output:?}");
+        assert!(output.stdout.is_empty(), "Python {version}: {output:?}");
+        assert!(output.stderr.is_empty(), "Python {version}: {output:?}");
+
+        let (_, minor, _) = version.target().version;
+        let suffix = format!(".cpython-3{minor}.pyc");
+        for (index, (source_path, stem)) in paths.iter().enumerate() {
+            let pyc_path = nested
+                .join("__pycache__")
+                .join(OsString::from_vec([*stem, suffix.as_bytes()].concat()));
+            let oracle_path = directory
+                .path()
+                .join(format!("oracle-{version}-{index}.pyc"));
+            let native = oracle(version)
+                .args([
+                    "-X",
+                    "utf8",
+                    "-c",
+                    r"
+import importlib.util
+import marshal
+import os
+import pathlib
+import py_compile
+import sys
+import types
+
+source, cache, oracle = sys.argv[1:]
+assert importlib.util.cache_from_source(source) == cache
+py_compile.compile(source, cfile=oracle, doraise=True, optimize=0,
+                   invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+
+def check_filenames(path):
+    code = marshal.loads(pathlib.Path(path).read_bytes()[16:])
+    literal = next(value for value in code.co_consts if value == source)
+    assert literal is not code.co_filename
+    names = set()
+    def check_child(child):
+        names.add(child.co_name)
+        assert os.fsencode(child.co_filename) == os.fsencode(source)
+        assert child.co_filename is code.co_filename
+        for value in child.co_consts:
+            if isinstance(value, types.CodeType):
+                check_child(value)
+            elif value == source:
+                assert value is literal
+    check_child(code)
+    assert names == {'<module>', 'outer', 'inner', 'Holder', 'method'}
+
+check_filenames(oracle)
+check_filenames(cache)
+sys.stdout.buffer.write(pathlib.Path(oracle).read_bytes())
+",
+                ])
+                .arg(source_path)
+                .arg(&pyc_path)
+                .arg(&oracle_path)
+                .output()
+                .unwrap();
+            assert!(
+                native.status.success(),
+                "Python {version}, {source_path:?}: {native:?}"
+            );
+            assert_eq!(
+                fs_err::read(pyc_path).unwrap(),
+                native.stdout,
+                "Python {version}, {source_path:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn compile_matches_cpython_for_utf8_encoding_cookies() {
     let directory = tempfile::tempdir().unwrap();
