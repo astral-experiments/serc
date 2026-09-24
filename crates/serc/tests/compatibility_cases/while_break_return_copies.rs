@@ -158,6 +158,75 @@ fn matches_cpython_terminal_while_chained_breaks_after_work() {
 }
 
 #[test]
+fn matches_cpython_terminal_while_else_chained_break_returns() {
+    let source = "def f(items):\n    while items:\n        if a < value < b:\n            break\n        finish()\n    else:\n        tail()\n";
+    for condition in [
+        "a < value < b",
+        "not a < value < b",
+        "flag and a < value < b",
+        "flag or a < value < b",
+        "a < value is not None",
+        "a < value < b and flag",
+        "a < value < b or flag",
+        "a < value",
+    ] {
+        common::assert_matches_cpython_marshal(
+            &source.replace("a < value < b", condition),
+            "terminal_while_else_chained_break_condition.py",
+        );
+    }
+    for condition in ["items", "True", "False", "active()", "items and active"] {
+        common::assert_matches_cpython_marshal(
+            &source.replace("while items:", &format!("while {condition}:")),
+            "terminal_while_else_chained_break_while_condition.py",
+        );
+    }
+    for (filename, source) in [
+        (
+            "terminal_async_while_else_chained_break.py",
+            source.replacen("def f", "async def f", 1),
+        ),
+        (
+            "terminal_generator_while_else_chained_break.py",
+            source.replace("    while items:", "    yield 1\n    while items:"),
+        ),
+        (
+            "terminal_while_else_chained_break_to_name.py",
+            format!("{source}    return name\n"),
+        ),
+        (
+            "terminal_while_else_chained_break_to_local.py",
+            format!("{source}    return items\n"),
+        ),
+        (
+            "terminal_while_chained_break_to_name.py",
+            format!(
+                "{}    return name\n",
+                source.replace("    else:\n        tail()\n", "")
+            ),
+        ),
+        (
+            "terminal_while_else_chained_break_nested_if.py",
+            "def f(items):\n    if outer:\n        while items:\n            if a < value < b:\n                break\n            finish()\n        else:\n            tail()\n".to_owned(),
+        ),
+        (
+            "nonterminal_while_else_chained_break.py",
+            format!("{source}    after()\n"),
+        ),
+        (
+            "terminal_while_else_chained_break_to_authored_return.py",
+            format!("{source}    return\n"),
+        ),
+        (
+            "terminal_while_else_chained_break_with_work.py",
+            source.replace("            break", "            work()\n            break"),
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(&source, filename);
+    }
+}
+
+#[test]
 fn original_loop_exit_bridges_preserve_local_and_cell_return_copies() {
     for (filename, source) in [
         (

@@ -62,6 +62,7 @@ struct LoopContext {
     finally_end_depth: usize,
     exception_region_depth: usize,
     break_target_keeps_exception_owner: bool,
+    break_target_is_short_return: bool,
     protected_finally_break_owner: bool,
     break_policy: LoopBreakPolicy,
 }
@@ -651,6 +652,8 @@ pub(super) struct StatementState {
 pub(super) struct StatementContext {
     // Whether the statement currently entered by `compile_suite` has a sibling successor.
     pub(super) has_following: bool,
+    // The statement ends a suite that falls directly through to the function's implicit return.
+    followed_by_implicit_return: bool,
     // This exact statement reaches a source successor without crossing a compound
     // statement's cleanup. Only conditional arms inherit that continuation.
     same_region_continuation: Option<TextRange>,
@@ -1003,6 +1006,7 @@ impl<'source> Compiler<'source> {
                             .active_exception_region_exclusions
                             .len()
                 }),
+            break_target_is_short_return: false,
             protected_finally_break_owner: self.control.finally.protected_finally_break_owner,
             break_policy,
         }
@@ -2444,6 +2448,9 @@ impl<'source> Compiler<'source> {
                     propagates_following_to_suites: matches!(statement, Stmt::If(_) | Stmt::With(_)),
                     same_region_continuation,
                     has_following: !is_final,
+                    followed_by_implicit_return: is_final
+                        && final_expression_becomes_return
+                        && matches!(self.unit.scope, Scope::Function { .. }),
                     followed_by_break,
                     followed_by_name_return,
                     followed_by_literal_return,
@@ -3101,6 +3108,22 @@ impl<'source> Compiler<'source> {
         let Some(Stmt::While(statement)) = body.last() else {
             return false;
         };
+        if self.context.python_version >= crate::PythonVersion::Py314
+            && early_condition_truthiness(&statement.test) != Some(false)
+            && suite_has_linear_borrow_fallthrough(&statement.orelse)
+            && !suite_contains_nested_exception_cleanup(&statement.body)
+            && let Some((_, prefix)) = statement.body.split_last()
+            && prefix.iter().any(|statement| {
+                matches!(statement, Stmt::If(statement)
+                    if statement.elif_else_clauses.is_empty()
+                        && matches!(statement.body.as_slice(), [Stmt::Break(_)])
+                        && final_chained_comparison_jump(&statement.test).is_some())
+            })
+        {
+            // The while's success edge is copied before the outer conditional footer.
+            // Its authored break and the linear else each donate their own return span.
+            return true;
+        }
         let Some(Stmt::If(tail)) = statement.orelse.last() else {
             return false;
         };
@@ -11845,8 +11868,8 @@ impl<'source> Compiler<'source> {
                                         == self.control.exceptions.active_exception_region_exclusions.len()
                             }))))
                 .then(|| test.range());
-                // Terminal while lowering turns a cleanup-free break into the same
-                // short implicit return that the chained-comparison success edge copies.
+                // A cleanup-free break into a while's short implicit or name return is
+                // copied onto the chained-comparison success edge, including with an else.
                 let terminal_break_return = matches!(body, [Stmt::Break(_)])
                     && (self.control.statements.context.has_following
                         || self.control.loops.split_loop_tail_prefix_end == Some(statement.range))
@@ -11875,7 +11898,7 @@ impl<'source> Compiler<'source> {
                         .is_empty()
                     && self.control.finally.copied_return_finally_preserved_values == 0
                     && self.control.loops.contexts.last().is_some_and(|context| {
-                        context.break_policy.returns()
+                        (context.break_policy.returns() || context.break_target_is_short_return)
                             && context.iterator_cleanup == IteratorCleanup::None
                             && context.with_depth == 0
                             && context.finally_end_depth == 0
@@ -16432,6 +16455,11 @@ impl<'source> Compiler<'source> {
                 IteratorCleanup::None,
                 self.loop_break_policy(statement.range),
             );
+            context.break_target_is_short_return = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && ((!statement.orelse.is_empty()
+                    && self.control.statements.context.followed_by_implicit_return)
+                    || self.control.statements.context.followed_by_name_return);
             context.break_target_keeps_exception_owner |= has_source_continuation;
             let body_start = self.assembler.instruction_count();
             let tail_jumps = self.with_loop_context(context, |compiler| {
@@ -17022,6 +17050,9 @@ impl<'source> Compiler<'source> {
             IteratorCleanup::None,
             self.loop_break_policy(statement.range),
         );
+        context.break_target_is_short_return = (!statement.orelse.is_empty()
+            && self.control.statements.context.followed_by_implicit_return)
+            || self.control.statements.context.followed_by_name_return;
         context.break_target_keeps_exception_owner |= has_source_continuation;
         let body_start = self.assembler.instruction_count();
         let tail_jumps = self.with_loop_context(context, |compiler| {
