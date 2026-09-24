@@ -20743,6 +20743,34 @@ impl<'source> Compiler<'source> {
                     .prepare_no_location_block_for_inlining(normal_exit);
                 self.assembler.allow_last_unconditional_block_inlining();
             }
+            if self.context.python_version >= crate::PythonVersion::Py314
+                && handlers_terminate
+                && !statement.is_star
+                && statement.handlers.iter().all(|handler| {
+                    handler.as_except_handler().is_some_and(|handler| {
+                        matches!(handler.body.last(), Some(Stmt::Raise(_)))
+                    })
+                })
+                && statement.orelse.is_empty()
+                && matches!(statement.finalbody.as_slice(), [Stmt::Pass(_)])
+                && self.control.loops.uncopied_loop_tail_statement == Some(statement.range)
+                && self.control.loops.contexts.last().is_some_and(|context| {
+                    context.iterator_cleanup == IteratorCleanup::Sync
+                })
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.exceptions.active_exception_region_exclusions.len() == 1
+                && self.control.finally.active_finally_try_bodies == 1
+                && suite_has_linear_borrow_fallthrough(&statement.body)
+                && matches!(statement.body.last(), Some(Stmt::Expr(expression))
+                    if matches!(expression.value.as_ref(), Expr::Call(_)))
+            {
+                // Only the protected call reaches the no-op finalizer. Its converted
+                // POP_BLOCK retains the call's location before the iterator backedge
+                // and is outside the exception regions it just left.
+                self.assembler.exclude_last_from_exception_table();
+                self.assembler
+                    .preserve_redundant_jump_nop_after_threading(normal_exit);
+            }
             if retained_return_guard_exit {
                 // POP_BLOCK disappears beside the same-line normal jump. Cold
                 // handler placement later converts this original jump to a NOP.
