@@ -141,6 +141,53 @@ fn matches_cpython_nested_comprehension_target_restoration() {
 }
 
 #[test]
+fn matches_cpython_outer_comprehension_reads_shadowed_only_by_a_child() {
+    for expression in [
+        "[(item, [item for item in parts]) for outer in values]",
+        "[[item for item in parts] for outer in values if item]",
+        "[item for outer in values if [item for item in parts]]",
+        "[[item for item in parts] for holder[item] in values]",
+        "[item for holder[[item for item in parts][0]] in values]",
+        "{item for outer in values if {item for item in parts}}",
+        "{item: outer for outer in values if {item: item for item in parts}}",
+        "[[item for item in parts] for outer in values]",
+        "[(item, [item for item in parts]) for item in values]",
+    ] {
+        for body in [
+            format!("result = {expression}\n"),
+            format!("class Class:\n    result = {expression}\n"),
+            format!("def function(values, parts, holder):\n    return {expression}\n"),
+            format!(
+                "def function(values, parts, holder):\n    item = 2\n    return {expression}\n"
+            ),
+            format!(
+                "def function(values, parts, holder):\n    global item\n    return {expression}\n"
+            ),
+            format!("def function(values, parts, holder, item):\n    return {expression}\n"),
+            format!(
+                "def outer(item):\n    def function(values, parts, holder):\n        return {expression}\n    return function\n"
+            ),
+        ] {
+            common::assert_matches_cpython_marshal(&body, "outer_comprehension_read.py");
+        }
+    }
+
+    let source = r"
+item = 0
+def function(values, parts, holder):
+    one = [(item, [item for item in parts]) for outer in values]
+    two = [[item for item in parts] for holder[item] in values]
+    three = [item for holder[[item for item in parts][0]] in values]
+    return one, two, three, holder
+print(function([1, 2], [1, 2], [0, 0, 0]))
+";
+    common::assert_executes(
+        source,
+        "([(0, [1, 2]), (0, [1, 2])], [[1, 2], [1, 2]], [0, 0], [2, 2, 0])\n",
+    );
+}
+
+#[test]
 fn matches_cpython_comprehension_temporaries_in_type_parameter_thunks() {
     for kind in ["list", "set", "dict"] {
         for element in ["item", "(lambda: item)"] {
