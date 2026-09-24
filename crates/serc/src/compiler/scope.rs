@@ -1888,6 +1888,7 @@ impl ScopeArena {
             true,
             ScopeBodyContext::Function,
             eager_annotations,
+            self.deferred_annotations && !future_annotations,
             private_name,
         );
         let (nested_function_requirements, nested_function_annotation_references) =
@@ -1921,6 +1922,7 @@ impl ScopeArena {
             future_annotations,
             ScopeBodyContext::Class,
             !self.deferred_annotations && !future_annotations,
+            false,
             Some(definition.name.as_str()),
         );
         if self.python_version == PythonVersion::Py312 {
@@ -3670,7 +3672,7 @@ impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
 #[cfg(test)]
 impl ScopeBodyFacts {
     pub(super) fn for_function(body: &[Stmt]) -> Self {
-        ScopeBodyFactsCollector::collect(body, true, ScopeBodyContext::Function, false, None)
+        ScopeBodyFactsCollector::collect(body, true, ScopeBodyContext::Function, false, true, None)
     }
 
     pub(super) fn for_class(body: &[Stmt], future_annotations: bool) -> Self {
@@ -3678,6 +3680,7 @@ impl ScopeBodyFacts {
             body,
             future_annotations,
             ScopeBodyContext::Class,
+            false,
             false,
             None,
         )
@@ -3697,6 +3700,7 @@ struct ScopeBodyFactsCollector<'ast> {
     skip_annotations: bool,
     collect_function_scope_facts: bool,
     eager_function_annotations: bool,
+    deferred_local_annotations: bool,
     class_scope: bool,
     generator_depth: usize,
     inlined_comprehension_depth: usize,
@@ -3729,6 +3733,7 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
         skip_annotations: bool,
         context: ScopeBodyContext,
         eager_function_annotations: bool,
+        deferred_local_annotations: bool,
         private_name: Option<&str>,
     ) -> ScopeBodyFacts {
         let collect_function_scope_facts = matches!(context, ScopeBodyContext::Function);
@@ -3740,6 +3745,7 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
             skip_annotations,
             collect_function_scope_facts,
             eager_function_annotations,
+            deferred_local_annotations,
             class_scope,
             generator_depth: 0,
             inlined_comprehension_depth: 0,
@@ -4212,8 +4218,18 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
                     if let Some(value) = &annotation.value {
                         self.visit_expr(value);
                     }
-                    if self.eager_function_annotations && self.collect_function_scope_facts {
-                        self.collect_local_annotation(&annotation.annotation);
+                    if self.collect_function_scope_facts {
+                        if self.eager_function_annotations {
+                            self.collect_local_annotation(&annotation.annotation);
+                        } else if self.deferred_local_annotations {
+                            // The annotation never executes, but its nested functions and
+                            // comprehensions still capture names from the real function scope.
+                            let required = self.expression_requirements(
+                                &annotation.annotation,
+                                annotation_nested_required_names,
+                            );
+                            self.facts.nested_lambda_requirements.extend(required);
+                        }
                     }
                     return;
                 }
@@ -6466,6 +6482,40 @@ def trailing():
                 ["values", "item"]
             );
             assert!(plan.cellvars.contains(&arena.names.get("item").unwrap()));
+        }
+    }
+
+    #[test]
+    fn deferred_local_annotations_propagate_only_nested_captures() {
+        for version in [PythonVersion::Py314, PythonVersion::Py315] {
+            for future in [false, true] {
+                let source = format!(
+                    "{}def outer(direct, first_iterable, captured):\n    def inner():\n        ignored: (direct, [item for item in first_iterable], [captured for item in ()], [(lambda: item) for item in ()])\n    return inner\n",
+                    if future {
+                        "from __future__ import annotations\n"
+                    } else {
+                        ""
+                    },
+                );
+                let parsed = parse_module(&source).unwrap();
+                let arena = ScopeArena::analyze_with_python_version(parsed.suite(), version);
+                let outer = arena.function(ScopeId::from_usize(1)).unwrap();
+                let inner = arena.function(ScopeId::from_usize(2)).unwrap();
+                for name in ["direct", "first_iterable", "captured", "item"] {
+                    let name_id = arena.names.get(name).unwrap();
+                    assert_eq!(
+                        outer.cellvars.contains(&name_id),
+                        !future && name == "captured",
+                        "outer: {version:?}, future={future}, {name}",
+                    );
+                    assert_eq!(
+                        inner.required.contains(&name_id),
+                        !future && name == "captured",
+                        "inner: {version:?}, future={future}, {name}",
+                    );
+                }
+                assert!(inner.locals.is_empty());
+            }
         }
     }
 

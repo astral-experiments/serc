@@ -67,3 +67,67 @@ fn annotation_lambdas_capture_enclosing_names_despite_class_globals() {
         "global outer\nglobal outer\n",
     );
 }
+
+#[test]
+fn discarded_local_annotations_preserve_only_nested_captures() {
+    for expression in [
+        "value",
+        "lambda: value",
+        "lambda arg=value: arg",
+        "lambda arg=(lambda: value): arg",
+        "[value for item in ()]",
+        "{value for item in ()}",
+        "{item: value for item in ()}",
+        "(value for item in ())",
+        "[item for item in value]",
+        "(item for item in value)",
+        "[value for value in ()]",
+        "[(lambda: item) for item in ()]",
+        "lambda: later",
+        "[later for item in ()]",
+    ] {
+        for target in ["ignored", "obj.attribute", "obj[0]"] {
+            for nested in [false, true] {
+                let declaration = format!("{target}: {expression}\n");
+                let source = if nested {
+                    format!(
+                        "def outer(value, obj):\n    def inner():\n        {declaration}    later = 1\n    return inner\n"
+                    )
+                } else {
+                    format!("def outer(value, obj):\n    {declaration}    later = 1\n")
+                };
+                for future in ["", "from __future__ import annotations\n"] {
+                    common::assert_matches_cpython_marshal(
+                        &format!("{future}{source}"),
+                        "discarded_annotation_captures.py",
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn discarded_local_annotations_expose_cells_without_evaluating_the_annotation() {
+    let source = r"class C:
+    def method(self, __value):
+        ignored: [(__value, self) for item in ()]
+        return tuple(sorted(locals()))
+
+def outer(value):
+    def inner():
+        ignored: (lambda: value) if False else (value for item in ())
+    return inner
+
+print(C.method.__code__.co_cellvars)
+print(C().method(42))
+print(outer.__code__.co_cellvars)
+print(outer(42).__code__.co_freevars)
+print(outer(42)())
+";
+    common::assert_matches_cpython_marshal(source, "discarded_annotation_runtime.py");
+    common::assert_executes(
+        source,
+        "('self', '_C__value')\n('_C__value', 'self')\n('value',)\n('value',)\nNone\n",
+    );
+}
