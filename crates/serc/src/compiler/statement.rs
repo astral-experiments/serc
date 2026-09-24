@@ -633,6 +633,8 @@ pub(super) struct StatementState {
     retained_branch_pass: Option<TextRange>,
     // Whether the current statement is nested directly in a terminal if branch suite.
     pub(super) in_terminal_if_branch_suite: bool,
+    // A sibling terminal arm delays copying a nested while break onto the comparison edge.
+    terminal_if_branch_has_siblings: bool,
     // An assignment whose implicit return starts at the terminal if's outer join.
     terminal_assignment_return_boundary: Option<TextRange>,
     // Whether a final assertion may split its successful terminal-branch returns.
@@ -2450,7 +2452,8 @@ impl<'source> Compiler<'source> {
                     has_following: !is_final,
                     followed_by_implicit_return: is_final
                         && final_expression_becomes_return
-                        && matches!(self.unit.scope, Scope::Function { .. }),
+                        && matches!(self.unit.scope, Scope::Function { .. })
+                        && !self.control.statements.terminal_if_branch_has_siblings,
                     followed_by_break,
                     followed_by_name_return,
                     followed_by_literal_return,
@@ -3474,7 +3477,11 @@ impl<'source> Compiler<'source> {
                             true,
                             |compiler| {
                                 compiler.with_fallthrough_tracking(|compiler| {
-                                    compiler.compile_terminal_if_branch_suite(body, false)
+                                    compiler.compile_terminal_if_branch_suite(
+                                        body,
+                                        false,
+                                        !statement.elif_else_clauses.is_empty(),
+                                    )
                                 })
                             },
                         )
@@ -3550,7 +3557,7 @@ impl<'source> Compiler<'source> {
                             true,
                             |compiler| {
                                 compiler.with_fallthrough_tracking(|compiler| {
-                                    compiler.compile_terminal_if_branch_suite(body, true)
+                                    compiler.compile_terminal_if_branch_suite(body, true, true)
                                 })
                             },
                         )
@@ -3613,6 +3620,7 @@ impl<'source> Compiler<'source> {
         &mut self,
         body: &[Stmt],
         is_final_else: bool,
+        has_siblings: bool,
     ) -> Result<(), CompileError> {
         if is_final_else
             && matches!(body, [Stmt::Expr(expression)] if is_literal_constant(&expression.value))
@@ -3637,10 +3645,17 @@ impl<'source> Compiler<'source> {
             }
             _ => None,
         });
+        let has_siblings = has_siblings || self.control.statements.terminal_if_branch_has_siblings;
         self.with_control_override(
-            |control| &mut control.statements.terminal_assignment_return_boundary,
-            assignment,
-            |compiler| compiler.compile_suite_inner(body, true),
+            |control| &mut control.statements.terminal_if_branch_has_siblings,
+            has_siblings,
+            |compiler| {
+                compiler.with_control_override(
+                    |control| &mut control.statements.terminal_assignment_return_boundary,
+                    assignment,
+                    |compiler| compiler.compile_suite_inner(body, true),
+                )
+            },
         )
     }
 

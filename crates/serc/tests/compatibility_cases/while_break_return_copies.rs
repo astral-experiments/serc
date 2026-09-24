@@ -210,6 +210,14 @@ fn matches_cpython_terminal_while_else_chained_break_returns() {
             "def f(items):\n    if outer:\n        while items:\n            if a < value < b:\n                break\n            finish()\n        else:\n            tail()\n".to_owned(),
         ),
         (
+            "terminal_while_else_chained_break_nested_elif.py",
+            "def f(items):\n    if outer:\n        while items:\n            if a < value < b:\n                break\n            finish()\n        else:\n            tail()\n    elif second:\n        alternative()\n".to_owned(),
+        ),
+        (
+            "terminal_while_else_chained_break_nested_else.py",
+            "def f(items):\n    if outer:\n        while items:\n            if a < value < b:\n                break\n            finish()\n        else:\n            tail()\n    else:\n        alternative()\n".to_owned(),
+        ),
+        (
             "nonterminal_while_else_chained_break.py",
             format!("{source}    after()\n"),
         ),
