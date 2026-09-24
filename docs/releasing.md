@@ -39,6 +39,12 @@ the `serc-cli` package (`cargo install serc-cli`).
    deployed stack's `PolicyAudience` output; GitHub does not reveal existing secret
    values. No new broker deployment or App private key is needed. This token allows
    the release PR to trigger ordinary CI.
+5. Grant the existing `astral-releases-bot` GitHub App access to Serc and add
+   `RELEASES_STS_API_URL` to the `release` environment, using the same release broker
+   base URL as uv. Its policy is `.github/secure-token-service-release.json` and
+   permits `release.yml` on `main` to request `contents: write` and `workflows: write`.
+   The latter allows the release to tag its selected commit even if `main` advances
+   across workflow changes while artifacts are building.
 
 The trusted publisher uses the calling workflow filename (`release.yml`), even
 though the publishing jobs are implemented in reusable workflows. No persistent
@@ -53,12 +59,17 @@ updates Python and Cargo versions, the CLI's library dependency, and both lockfi
 then opens a PR from `charlie/release-VERSION`. Review and merge that PR before
 publishing. The same preparation is available locally through `scripts/release.sh`.
 
-The **Release** workflow defaults to `tag=dry-run`. Run it on `main` to build and
-check all wheels, the source distribution, and Cargo packages without publishing. Inspect
-the artifacts and successful checks, then run it with the package version as the
-tag (for example, `0.1.0`). Once its build and package checks succeed, the workflow
-publishes the verified Python artifacts and both crates, then creates the GitHub
-release without another approval. Published packages, including the source
+Like [uv's release workflow](https://github.com/astral-sh/uv/blob/c73db78f0b00580b3c67279b59b85153a9d0264d/.github/workflows/release.yml),
+**Release** is manually dispatched with a **Release Tag** input that defaults to
+`dry-run`. Run it on `main` with that default to build and check all wheels, the
+source distribution, and Cargo packages without publishing. To publish, enter the
+version from the merged release PR (for example, `0.1.0`). The workflow checks that
+the tag matches the packages being released, as Cargo Dist does for uv.
+
+After successful builds, the workflow publishes to PyPI, then starts crates.io
+publishing and creates the GitHub release using the prepared changelog. A crates.io
+failure does not block the GitHub release, matching uv. There is no separate
+approval job. Published packages, including the source
 distribution and crate sources, are public even when the GitHub repository is
 private.
 

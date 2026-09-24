@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag matching the package version, or dry-run
+        description: Release Tag
         required: true
         default: dry-run
         type: string
@@ -67,32 +67,55 @@ jobs:
       id-token: write
 
   publish-crates:
-    needs: [plan, build, check-crates]
+    needs: [plan, build, check-crates, publish-pypi]
     if: needs.plan.outputs.publishing == 'true'
     uses: ./.github/workflows/publish-crates.yml
     permissions:
       contents: read
       id-token: write
 
-  announce:
-    needs: [plan, build, publish-pypi, publish-crates]
+  publish-github:
+    # Match uv: a crates.io failure must not block the GitHub release.
+    needs: [plan, build, publish-pypi]
     runs-on: ubuntu-24.04
     environment: release
     permissions:
-      contents: write
+      contents: read
+      id-token: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Download published distributions
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.build.outputs.distributions }}
           path: dist
-      - name: Announce release
+      - name: Get release token
+        id: release-token
+        uses: open-security-tools/ost-simple-sts@974a63a2daaaa40f7c6dec40d334f3da4421469e
+        with:
+          exchange-url: ${{ secrets.RELEASES_STS_API_URL }}/exchange
+          audience: ${{ secrets.RELEASES_STS_API_URL }}
+          repository: astral-sh/serc
+          # Tag the selected commit even if main advances across workflow changes.
+          permissions: |
+            contents: write
+            workflows: write
+      - name: Create GitHub release
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
           RELEASE_SHA: ${{ github.sha }}
         run: |
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" --target "$RELEASE_SHA" --title "$RELEASE_TAG" --generate-notes dist/*
+            awk -v version="$RELEASE_VERSION" '
+              $0 == "## " version { found = 1; next }
+              found && /^## / { exit }
+              found { print }
+            ' CHANGELOG.md > "$RUNNER_TEMP/notes.txt"
+            test -s "$RUNNER_TEMP/notes.txt"
+            gh release create "$RELEASE_TAG" --target "$RELEASE_SHA" --title "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/notes.txt" dist/*
           fi
