@@ -39,9 +39,6 @@ the `serc-cli` package (`cargo install serc-cli`).
    deployed stack's `PolicyAudience` output; GitHub does not reveal existing secret
    values. No new broker deployment or App private key is needed. This token allows
    the release PR to trigger ordinary CI.
-5. Set the repository Actions variable `SERC_RELEASES_ENABLED` to `true` after
-   registry registration and the `main` environment restriction are complete. It starts as
-   `false`; build-only dry runs work while publishing is disabled.
 
 The trusted publisher uses the calling workflow filename (`release.yml`), even
 though the publishing jobs are implemented in reusable workflows. No persistent
@@ -56,8 +53,8 @@ updates Python and Cargo versions, the CLI's library dependency, and both lockfi
 then opens a PR from `charlie/release-VERSION`. Review and merge that PR before
 publishing. The same preparation is available locally through `scripts/release.sh`.
 
-Run the **Release** workflow on `main` with `tag=dry-run` to build and check all
-wheels, the source distribution, and Cargo packages without publishing. Inspect
+The **Release** workflow defaults to `tag=dry-run`. Run it on `main` to build and
+check all wheels, the source distribution, and Cargo packages without publishing. Inspect
 the artifacts and successful checks, then run it with the package version as the
 tag (for example, `0.1.0`). Once its build and package checks succeed, the workflow
 publishes the verified Python artifacts and both crates, then creates the GitHub

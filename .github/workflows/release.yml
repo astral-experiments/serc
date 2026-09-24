@@ -36,7 +36,6 @@ jobs:
         run: python3 scripts/check-release.py "$RELEASE_TAG"
         env:
           RELEASE_TAG: ${{ inputs.tag }}
-          SERC_RELEASES_ENABLED: ${{ vars.SERC_RELEASES_ENABLED }}
       - name: Verify existing release tag
         if: steps.plan.outputs.publishing == 'true'
         env:

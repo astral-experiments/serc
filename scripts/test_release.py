@@ -39,27 +39,27 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Release versions disagree"):
                 CHECK["release_version"](root)
 
-    def test_publishing_requires_explicit_enablement_and_main(self):
+    def test_publishing_requires_serc_main(self):
         version = CHECK["release_version"](ROOT)
-        for enabled, ref in (
-            ("false", "refs/heads/main"),
-            ("true", "refs/heads/feature"),
+        for repository, ref, allowed in (
+            ("astral-sh/serc", "refs/heads/main", True),
+            ("astral-sh/serc", "refs/heads/feature", False),
+            ("example/serc", "refs/heads/main", False),
         ):
-            with self.subTest(enabled=enabled, ref=ref):
+            with self.subTest(repository=repository, ref=ref):
                 env = dict(os.environ)
                 env.pop("GITHUB_OUTPUT", None)
                 env.update(
                     GITHUB_ACTIONS="true",
-                    GITHUB_REPOSITORY="astral-sh/serc",
+                    GITHUB_REPOSITORY=repository,
                     GITHUB_REF=ref,
-                    SERC_RELEASES_ENABLED=enabled,
                 )
                 result = subprocess.run(
                     [sys.executable, ROOT / "scripts/check-release.py", version],
                     env=env,
                     capture_output=True,
                 )
-                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.returncode == 0, allowed, result.stderr)
                 dry_run = subprocess.run(
                     [sys.executable, ROOT / "scripts/check-release.py", "dry-run"],
                     env=env,

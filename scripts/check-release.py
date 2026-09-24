@@ -38,10 +38,6 @@ def main() -> None:
         if args.tag not in {version, f"v{version}"}:
             raise ValueError(f"Release tag must match version {version}")
         if os.environ.get("GITHUB_ACTIONS"):
-            if os.environ.get("SERC_RELEASES_ENABLED") != "true":
-                raise ValueError(
-                    "Complete the release setup in docs/releasing.md first"
-                )
             if os.environ.get("GITHUB_REPOSITORY") != "astral-sh/serc":
                 raise ValueError("Publishing is restricted to astral-sh/serc")
             if os.environ.get("GITHUB_REF") != "refs/heads/main":
