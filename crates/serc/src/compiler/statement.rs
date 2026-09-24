@@ -27649,7 +27649,29 @@ impl<'source> Compiler<'source> {
                         .is_empty()
                         && !pass_finally_leaves_manager)
                 {
-                    compiler.emit(NOP, 0, 0)?;
+                    if compiler.context.python_version >= crate::PythonVersion::Py314
+                        && !statement.is_star
+                        && statement.handlers.iter().any(|handler| {
+                            handler.as_except_handler().is_some_and(|handler| {
+                                !suite_terminates(&handler.body)
+                            })
+                        })
+                        && compiler.control.loops.uncopied_loop_tail_statement == Some(statement.range)
+                        && compiler.control.loops.contexts.last().is_some_and(|context| {
+                            context.iterator_cleanup == IteratorCleanup::Sync
+                        })
+                    {
+                        // The handler joins enter before this authored marker. Retain its
+                        // boundaries, as for an authored constant, so NOP compaction can
+                        // move the Pass location onto the shared iterator backedge.
+                        let pass_start = compiler.assembler.label();
+                        compiler.assembler.mark(pass_start);
+                        compiler.emit(NOP, 0, 0)?;
+                        let pass_end = compiler.assembler.label();
+                        compiler.assembler.mark(pass_end);
+                    } else {
+                        compiler.emit(NOP, 0, 0)?;
+                    }
                 } else {
                     // The normal finally copy is outside an enclosing try's exception ownership.
                     // Mark both the pass and its exit because CFG optimization can keep either NOP.

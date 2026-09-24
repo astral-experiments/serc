@@ -531,3 +531,63 @@ fn matches_cpython_omitted_pass_before_nested_branch_jump() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_noop_finally_on_loop_backedges() {
+    for (filename, source) in [
+        (
+            "pass_handler_pass_finally.py",
+            "def f(x, y):\n    for q in y:\n        try:\n            x()\n        except Exception:\n            pass\n        finally:\n            pass\n",
+        ),
+        (
+            "pass_handler_literal_finally.py",
+            "def f(x, y):\n    for q in y:\n        try:\n            x()\n        except Exception:\n            pass\n        finally:\n            42\n",
+        ),
+        (
+            "call_handler_pass_finally.py",
+            "def f(x, y):\n    for q in y:\n        try:\n            x()\n        except Exception:\n            x()\n        finally:\n            pass\n",
+        ),
+        (
+            "bare_handler_pass_finally.py",
+            "def f(x, y):\n    for q in y:\n        try:\n            x()\n        except:\n            pass\n        finally:\n            pass\n",
+        ),
+        (
+            "named_handler_pass_finally.py",
+            "def f(x, y):\n    for q in y:\n        try:\n            x()\n        except Exception as error:\n            pass\n        finally:\n            pass\n",
+        ),
+        (
+            "else_handler_pass_finally.py",
+            "def f(x, y):\n    for q in y:\n        try:\n            x()\n        except Exception:\n            pass\n        else:\n            pass\n        finally:\n            pass\n",
+        ),
+        (
+            "while_pass_handler_pass_finally.py",
+            "def f(x, y):\n    while y:\n        try:\n            x()\n        except Exception:\n            pass\n        finally:\n            pass\n",
+        ),
+        (
+            "pass_handler_two_pass_finally.py",
+            "def f(x, y):\n    for q in y:\n        try:\n            x()\n        except Exception:\n            pass\n        finally:\n            pass\n            pass\n",
+        ),
+        (
+            "generator_pass_handler_pass_finally.py",
+            "def f(x, y):\n    yield\n    for q in y:\n        try:\n            x()\n        except Exception:\n            pass\n        finally:\n            pass\n",
+        ),
+        (
+            "coroutine_pass_handler_pass_finally.py",
+            "async def f(x, y):\n    for q in y:\n        try:\n            x()\n        except Exception:\n            pass\n        finally:\n            pass\n",
+        ),
+        (
+            "async_for_pass_handler_pass_finally.py",
+            "async def f(x, y):\n    async for q in y:\n        try:\n            x()\n        except Exception:\n            pass\n        finally:\n            pass\n",
+        ),
+        (
+            "no_handler_pass_finally.py",
+            "def f(x, y):\n    for q in y:\n        try:\n            x()\n        finally:\n            pass\n",
+        ),
+        (
+            "pass_handler_following_pass_finally.py",
+            "def f(x, y):\n    for q in y:\n        try:\n            x()\n        except Exception:\n            pass\n        finally:\n            pass\n        x()\n",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
