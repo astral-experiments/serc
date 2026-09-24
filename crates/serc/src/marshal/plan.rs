@@ -50,7 +50,7 @@ pub(super) trait MarshalVisitor<'a> {
         self.constant(value, ReferenceMode::IfShared);
     }
 
-    fn frozen_set_members(&self, values: &'a [Constant]) -> FrozenSetMembers<'a> {
+    fn frozen_set_members(&mut self, values: &'a [Constant]) -> FrozenSetMembers<'a> {
         frozen_set_members_in_wire_order(values)
     }
 }
@@ -151,7 +151,7 @@ where
         }
         Constant::FrozenSet(values) => {
             if visitor.constant(value, reference_mode) {
-                for (_, value) in visitor.frozen_set_members(values) {
+                for value in visitor.frozen_set_members(values) {
                     traverse_constant(value, ReferenceMode::Forced, visitor);
                 }
             }

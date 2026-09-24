@@ -127,6 +127,7 @@ fn encode_code_into_with_mode(
         references: IndexVec::from_raw(vec![None; graph.object_count()]),
         reference_count: 0,
         occurrences: graph.occurrence_cursor(),
+        frozen_set_order_index: 0,
     };
     traverse_code_with_mode(code, root_reference, &mut writer);
     writer.finish();
@@ -138,11 +139,17 @@ struct Writer<'output, 'graph, 'code> {
     references: IndexVec<ObjectId, Option<ReferenceId>>,
     reference_count: usize,
     occurrences: OccurrenceCursor<'graph>,
+    frozen_set_order_index: usize,
 }
 
 impl Writer<'_, '_, '_> {
     fn finish(self) {
         self.occurrences.finish();
+        assert_eq!(
+            self.frozen_set_order_index,
+            self.graph.frozen_set_order_count(),
+            "marshal writer did not consume every frozen set recorded by the graph"
+        );
     }
 
     fn next_object(&mut self, kind: OccurrenceKind) -> ObjectId {
@@ -475,8 +482,14 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
         self.graph.python_version()
     }
 
-    fn frozen_set_members(&self, values: &'code [Constant]) -> FrozenSetMembers<'code> {
-        self.graph.frozen_set_members(values)
+    fn frozen_set_members(&mut self, values: &'code [Constant]) -> FrozenSetMembers<'code> {
+        if values.len() <= 1 {
+            return values.iter().collect();
+        }
+
+        let index = self.frozen_set_order_index;
+        self.frozen_set_order_index += 1;
+        self.graph.frozen_set_members(values, index)
     }
 
     #[inline]
