@@ -40,10 +40,10 @@ use crate::target::{Opcode, is_scope_exit};
 use crate::{CompileError, PythonVersion};
 
 use super::constant::{
-    PercentFormatPart, explicit_surrogate_string, first_literal_constant, fold_constant,
-    fold_constant_for_version, folded_bool_operand, folded_constant_owner_slots,
-    is_small_literal_tuple_element, number_constant, optimized_percent_format,
-    python_constant_values_equal, two_element_slice_optimization,
+    PercentFormatPart, double_negated_ellipsis, explicit_surrogate_string, first_literal_constant,
+    fold_constant, fold_constant_for_version, folded_bool_operand, folded_constant_owner_slots,
+    instruction_folded_ellipsis_depth, is_small_literal_tuple_element, number_constant,
+    optimized_percent_format, python_constant_values_equal, two_element_slice_optimization,
 };
 use super::scope::{
     LoweringFunctionPlan, NameId, NameSet, analyze_lambda_scope, analyze_lambda_scope_with_mangler,
@@ -2218,9 +2218,21 @@ impl Compiler<'_> {
             && let Some(constant) = self.source_aware_fold_constant(origin)
         {
             self.pre_register_expression_names(expression)?;
+            if instruction_folded_ellipsis_depth(origin).is_some() {
+                // The preceding operands reach the original constant table before the
+                // flowgraph turns Ellipsis into a Boolean. Its first entry survives.
+                for value in &boolean.values {
+                    if value.range() == origin.range() {
+                        break;
+                    }
+                    self.record_folded_value(value)?;
+                }
+            }
             let expression_location = self.source_location(expression.range());
             let origin_location = self.source_location(origin.range());
-            if expression_location.line != origin_location.line {
+            let folded_location = double_negated_ellipsis(origin)
+                .map_or(origin_location, |inner| self.source_location(inner.range));
+            if expression_location.line != folded_location.line {
                 self.assembler.set_location(expression_location);
                 self.emit(NOP, 0, 0)?;
             }
@@ -7497,7 +7509,8 @@ impl Compiler<'_> {
                 }
                 continue;
             }
-            if !is_last && let Some(truthiness) = early_condition_truthiness(value) {
+            // The original value-preserving jump also folds a loaded Ellipsis constant.
+            if !is_last && let Some(truthiness) = jump_constant_truthiness(value) {
                 let decisive = matches!(expression.op, BoolOp::And) && !truthiness
                     || matches!(expression.op, BoolOp::Or) && truthiness;
                 if decisive {
