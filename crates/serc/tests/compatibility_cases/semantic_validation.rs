@@ -353,10 +353,10 @@ print(json.dumps([diagnostic(source), diagnostic(source.encode())]))
             compile_bytes_with_options(source.as_bytes(), "starred.py", &options),
         ] {
             let error = result.expect_err(source);
-            let (message, range) = match (&error, pattern_error) {
-                (CompileError::InvalidSyntax { message, range }, false)
-                | (CompileError::InvalidPattern { message, range }, true) => (message, range),
-                _ => panic!("unexpected semantic error for {python_version} {source:?}: {error:?}"),
+            let ((CompileError::InvalidSyntax { message, range }, false)
+            | (CompileError::InvalidPattern { message, range }, true)) = (&error, pattern_error)
+            else {
+                panic!("unexpected semantic error for {python_version} {source:?}: {error:?}");
             };
             assert_eq!(message, expected_message, "{python_version}: {source:?}");
             assert_eq!(
