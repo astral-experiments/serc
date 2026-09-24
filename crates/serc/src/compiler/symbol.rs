@@ -243,43 +243,35 @@ impl Compiler<'_> {
                 free_indices,
                 ..
             } => {
-                if globals.contains(name_id) {
+                let in_comprehension = !self
+                    .control
+                    .comprehensions
+                    .active_comprehension_local_names
+                    .is_empty();
+                if globals.contains(name_id)
+                    && !(in_comprehension && free_indices.contains_key(&name_id))
+                {
                     let index = self.name_index_with_id(name, name_id)?;
                     self.emit(LOAD_GLOBAL, index << 1, 1)
                 } else if let Some(index) = free_indices.get(&name_id).copied()
                     // A cell carried through for a method does not change class-local lookup.
-                    && (!self.class_scope_binds_name(name)
-                        || !self
-                            .control
-                            .comprehensions
-                            .active_comprehension_local_names
-                            .is_empty())
+                    && (!self.class_scope_binds_name(name) || in_comprehension)
                 {
-                    if self
-                        .control
-                        .comprehensions
-                        .active_comprehension_local_names
-                        .is_empty()
-                    {
+                    if in_comprehension {
+                        self.emit(LOAD_DEREF, index, 1)
+                    } else {
                         self.emit(LOAD_LOCALS, 0, 1)?;
                         self.emit(LOAD_FROM_DICT_OR_DEREF, index, 0)
-                    } else {
-                        self.emit(LOAD_DEREF, index, 1)
                     }
                 } else {
                     let index = self.name_index_with_id(name, name_id)?;
-                    if self
-                        .control
-                        .comprehensions
-                        .active_comprehension_local_names
-                        .is_empty()
-                    {
-                        self.emit(LOAD_NAME, index, 1)
-                    } else {
+                    if in_comprehension {
                         // The first iterable runs in the class namespace, but the inlined
-                        // comprehension body retains the globals-only lookup semantics of its
-                        // former implicit function scope.
+                        // comprehension body falls back to globals as its former implicit
+                        // function scope would.
                         self.emit(LOAD_GLOBAL, index << 1, 1)
+                    } else {
+                        self.emit(LOAD_NAME, index, 1)
                     }
                 }
             }
