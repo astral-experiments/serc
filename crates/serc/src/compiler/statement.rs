@@ -5876,7 +5876,6 @@ impl<'source> Compiler<'source> {
                 // exception state. Unwind that inner suffix before FINALLY_END, then
                 // leave older iterators for the later return cleanup.
                 let loops_before_finally_end = (!return_is_overridden
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     && self.control.finally.active_finally_end_blocks == 1
                     && self.control.finally.active_normal_finally_bodies == 0
                     && self.control.finally.active_copied_finally_bodies == 0
@@ -5915,12 +5914,9 @@ impl<'source> Compiler<'source> {
                             && context.with_depth == 0
                     }) && self.control.loops.contexts[depth..]
                         .iter()
-                        .any(|context| context.iterator_cleanup == IteratorCleanup::Sync)
+                        .any(|context| context.iterator_cleanup != IteratorCleanup::None)
                         && self.control.loops.contexts[depth..].iter().all(|context| {
-                            matches!(
-                                context.iterator_cleanup,
-                                IteratorCleanup::None | IteratorCleanup::Sync
-                            ) && context.finally_end_depth == 1
+                            context.finally_end_depth == 1
                                 && context.exception_region_depth == 1
                                 && context.with_depth == 0
                         })
