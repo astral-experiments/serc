@@ -416,7 +416,7 @@ pub(super) fn slice_member_uses_identity_for(
         | Constant::Float(_)
         | Constant::Complex { .. }
         | Constant::NonReflexive(_) => true,
-        Constant::String(value) => !is_cached_character(value),
+        Constant::String(value) => !value.is_empty() && !is_cached_character(value),
         Constant::SurrogateString(_) => true,
         Constant::Bytes(value) => value.len() > 1,
         Constant::None

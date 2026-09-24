@@ -803,6 +803,7 @@ fn distinguishes_cached_slice_members_from_fresh_objects() {
     for value in [
         Constant::Int(256),
         Constant::SignedInt(-5),
+        Constant::String(String::new()),
         Constant::String("é".to_string()),
         Constant::Bytes(vec![0]),
     ] {
@@ -812,6 +813,7 @@ fn distinguishes_cached_slice_members_from_fresh_objects() {
         Constant::Int(257),
         Constant::SignedInt(-6),
         Constant::String("Ā".to_string()),
+        Constant::String("aa".to_string()),
         Constant::Bytes(vec![0, 1]),
         Constant::Float(1.0),
     ] {
