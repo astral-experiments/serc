@@ -98,8 +98,8 @@ jobs:
           - { target: x86_64-unknown-linux-gnu, manylinux: "2_17", test: true }
           - { target: i686-unknown-linux-gnu, manylinux: "2_17" }
           - { target: aarch64-unknown-linux-gnu, manylinux: "2_28" }
-          - { target: armv7-unknown-linux-gnueabihf, manylinux: "2_17", zig: true }
-          - { target: powerpc64le-unknown-linux-gnu, manylinux: "2_17", zig: true }
+          - { target: armv7-unknown-linux-gnueabihf, manylinux: "2_17" }
+          - { target: powerpc64le-unknown-linux-gnu, manylinux: "2_17" }
           - { target: s390x-unknown-linux-gnu, manylinux: "2_17" }
           - { target: riscv64gc-unknown-linux-gnu, manylinux: "2_31" }
           - { target: x86_64-unknown-linux-musl, manylinux: musllinux_1_1 }
@@ -122,10 +122,25 @@ jobs:
           sccache: false
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
-          # The old cross GCC images cannot compile mimalloc's date-time warning flag.
-          zig: ${{ matrix.zig || false }}
           args: --release --locked --out dist --compatibility pypi
           before-script-linux: |
+            # These images bundle GCC versions too old for mimalloc. Keep their
+            # glibc sysroots and linkers, but use a current cross C compiler.
+            case "${{ matrix.target }}" in
+              armv7-unknown-linux-gnueabihf) compiler=arm-linux-gnueabihf-gcc; package=gcc-arm-linux-gnueabihf ;;
+              powerpc64le-unknown-linux-gnu) compiler=powerpc64le-linux-gnu-gcc; package=gcc-powerpc64le-linux-gnu ;;
+              s390x-unknown-linux-gnu) compiler=s390x-linux-gnu-gcc; package=gcc-s390x-linux-gnu ;;
+              *) compiler= ;;
+            esac
+            if [[ -n "$compiler" ]]; then
+              target="${{ matrix.target }}"
+              cc_variable="CC_${target//-/_}"
+              sysroot="$("${!cc_variable}" -print-sysroot)"
+              test -d "$sysroot/usr/include"
+              apt-get update
+              apt-get install -y "$package"
+              export "$cc_variable=$compiler --sysroot=$sysroot"
+            fi
             if [[ "${{ matrix.target }}" == "s390x-unknown-linux-gnu" ]]; then
               # psm uses long-displacement instructions; match Rust's z10 baseline.
               export CFLAGS_s390x_unknown_linux_gnu="-march=z10"
