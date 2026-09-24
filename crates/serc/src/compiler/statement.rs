@@ -22880,8 +22880,15 @@ impl<'source> Compiler<'source> {
                     // A literal return on exhaustion leaves only the breaks reaching that
                     // cleanup in an unnamed handler.
                     // Named cleanup uses the same unlocated exit-copy rule regardless of size.
+                    // From 3.14 an async loop with no else also has two separate exits into a
+                    // terminal handler cleanup: the authored break and END_ASYNC_FOR.
                     Stmt::For(tail) => {
-                        !tail.is_async
+                        (!tail.is_async
+                            || (terminal
+                                && self.context.python_version >= crate::PythonVersion::Py314
+                                && !self.control.statements.context.has_following
+                                && !self.control.statements.context.inherited_has_following
+                                && tail.orelse.is_empty()))
                             && (tail.orelse.is_empty()
                                 || (handler.name.is_none()
                                     && matches!(tail.orelse.as_slice(), [Stmt::Return(ret)]
@@ -22894,7 +22901,7 @@ impl<'source> Compiler<'source> {
                                     && matches!(tail.orelse.as_slice(), [Stmt::Assign(_)])
                                     && self.assembler.at_original_authored_break_join()))
                             && suite_contains_loop_break(&tail.body)
-                            && !suite_contains_loop_break_with_finally(&tail.body)
+                            && (tail.is_async || !suite_contains_loop_break_with_finally(&tail.body))
                     }
                     Stmt::If(tail) => {
                         (tail.elif_else_clauses.is_empty()
