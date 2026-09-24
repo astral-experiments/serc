@@ -34,8 +34,6 @@ fn optional_compiler_ids_remain_four_bytes() {
 
 #[test]
 fn compiled_modules_share_their_filename_and_remain_send_sync() {
-    use std::sync::Arc;
-
     use crate::code_object::{CodeInterningSummary, CompilationInterningEvent};
 
     fn assert_send_sync<T: Send + Sync>() {}
@@ -72,19 +70,19 @@ fn compiled_modules_share_their_filename_and_remain_send_sync() {
         let class = child(root, "Holder");
         let method = child(class, "method");
         let nested = child(method, "nested");
-        assert_eq!(root.filename.as_ref(), filename);
+        assert_eq!(root.filename.as_utf8(), Some(filename));
         for code in [class, method, nested] {
-            assert!(Arc::ptr_eq(&root.filename, &code.filename));
+            assert!(root.filename.same_allocation(&code.filename));
         }
         let clone = module.clone();
-        assert!(Arc::ptr_eq(&root.filename, &clone.code.filename));
+        assert!(root.filename.same_allocation(&clone.code.filename));
         let summary = CodeInterningSummary::from_code(nested);
-        assert!(Arc::ptr_eq(&root.filename, &summary.filename));
+        assert!(root.filename.same_allocation(&summary.filename));
 
         let mut summaries = 0;
         for event in &root.marshal_provenance.interning_events {
             if let CompilationInterningEvent::CodeAssembly(summary) = event {
-                assert!(Arc::ptr_eq(&root.filename, &summary.filename));
+                assert!(root.filename.same_allocation(&summary.filename));
                 summaries += 1;
             }
         }

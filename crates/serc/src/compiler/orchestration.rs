@@ -1,7 +1,6 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use ruff_python_ast::token::Tokens;
 use ruff_python_ast::{Expr, Stmt, Suite};
@@ -16,8 +15,8 @@ use super::{
 };
 use crate::assembler::{AssembledCode, Assembler, ConstantTable, SourceLocation};
 use crate::code_object::{
-    CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance, MetadataId,
-    MetadataName,
+    CodeFilename, CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance,
+    MetadataId, MetadataName,
 };
 use crate::target::code_flags::{
     CO_ASYNC_GENERATOR, CO_COROUTINE, CO_FUTURE_ANNOTATIONS, CO_GENERATOR, CO_HAS_DOCSTRING,
@@ -280,14 +279,14 @@ impl<'source> Compiler<'source> {
     }
 
     pub(crate) fn module_with_python_version(
-        filename: &str,
+        filename: impl Into<CodeFilename>,
         source: &'source str,
         tokens: &'source Tokens,
         body: &'source Suite,
         python_version: crate::PythonVersion,
     ) -> Box<Self> {
         let context = Rc::new(CompilationContext::with_python_version(
-            filename,
+            filename.into(),
             source,
             tokens,
             body,
@@ -1353,7 +1352,7 @@ impl<'source> Compiler<'source> {
             names: self.output.names,
             locals: output_locals,
             local_kinds,
-            filename: Arc::clone(&self.context.filename),
+            filename: self.context.filename.clone(),
             name: self.unit.name,
             qualified_name: self.unit.qualified_name,
             first_line_number: self.unit.first_line_number,

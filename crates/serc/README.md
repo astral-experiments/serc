@@ -10,7 +10,8 @@ for local checks.
 `compile_bytes` accepts source bytes without filesystem I/O. It validates encoding cookies and
 UTF-8 BOMs, rejects null bytes, and normalizes CRLF and CR newlines. Supported encodings are UTF-8,
 ASCII, Latin-1, Latin-9, EUC-JP, KOI8-R, and Windows-1251. `compile` accepts decoded UTF-8 text.
-Both default to Python 3.14.
+Both default to Python 3.14 and reject filenames containing a null character before processing the
+source.
 
 When the source timestamp is known, `compile_bytes_to_pyc` also writes a timestamp-invalidated
 header with the original source byte length:
@@ -37,6 +38,9 @@ let pyc = module.to_timestamp_pyc(1_700_000_000, 12);
 the selected target for marshal and `.pyc` output. `compile_with_options` accepts UTF-8 text;
 `CompileOptions::initial_intern_state` supplies an oracle process's existing interned strings.
 Partial intern states reject unresolved membership when it can affect marshal sharing.
+`compile_bytes_with_path_and_options` accepts a filesystem path and preserves filename values
+that Rust strings cannot represent, including non-UTF-8 filenames on Unix. It also rejects paths
+containing a null character before decoding the source.
 
 Filesystem callers should snapshot metadata before reading the source, then pass that timestamp
 and raw byte length to `to_timestamp_pyc`. This prevents a concurrent edit from receiving a cache

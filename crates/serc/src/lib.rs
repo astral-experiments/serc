@@ -15,12 +15,13 @@ mod target;
 
 use std::error::Error;
 use std::fmt;
+use std::path::Path;
 
-use code_object::CodeObject;
+use code_object::{CodeFilename, CodeObject};
 use compiler::Compiler;
 pub use config::{CompileOptions, ParsePythonVersionError, PythonVersion};
 pub use initial_intern_state::InitialInternState;
-use ruff_text_size::TextRange;
+use ruff_text_size::{TextRange, TextSize};
 pub use source::{SourceDecodeError, decode_source};
 
 /// The exact CPython implementation targeted by this compiler backend.
@@ -122,10 +123,12 @@ impl CompiledModule {
     }
 }
 
-/// A source decoding, parsing, or bytecode generation error.
+/// A filename validation, source decoding, parsing, or bytecode generation error.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum CompileError {
+    /// The filename contains a null character.
+    InvalidFilename,
     /// The Python source bytes could not be decoded.
     Decode(SourceDecodeError),
     /// Ruff rejected the Python source.
@@ -161,7 +164,8 @@ impl CompileError {
         match self {
             Self::Parse(error) => Some(error.location),
             Self::InvalidPattern { range, .. } | Self::InvalidSyntax { range, .. } => Some(*range),
-            Self::Decode(_)
+            Self::InvalidFilename
+            | Self::Decode(_)
             | Self::Unsupported(_)
             | Self::UnresolvedInternState { .. }
             | Self::Internal(_) => None,
@@ -179,6 +183,7 @@ impl CompileError {
 impl fmt::Display for CompileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidFilename => formatter.write_str("embedded null character"),
             Self::Decode(error) => write!(formatter, "failed to decode Python source: {error}"),
             Self::Parse(error) => write!(formatter, "failed to parse Python source: {error}"),
             Self::InvalidPattern { message, .. } | Self::InvalidSyntax { message, .. } => {
@@ -198,7 +203,8 @@ impl Error for CompileError {
         match self {
             Self::Decode(error) => Some(error),
             Self::Parse(error) => Some(error),
-            Self::InvalidPattern { .. }
+            Self::InvalidFilename
+            | Self::InvalidPattern { .. }
             | Self::InvalidSyntax { .. }
             | Self::Unsupported(_)
             | Self::UnresolvedInternState { .. }
@@ -237,11 +243,20 @@ pub fn compile_with_options(
     filename: &str,
     options: &CompileOptions,
 ) -> Result<CompiledModule, CompileError> {
+    validate_filename(filename)?;
     if source.contains('\0') {
         return Err(CompileError::Decode(SourceDecodeError::NullByte));
     }
+    if source.starts_with('\u{feff}') {
+        // Only byte source can use a leading BOM as an encoding signature. Ruff accepts
+        // it in UTF-8 text as well, so reject it before parsing already decoded source.
+        return Err(CompileError::invalid_syntax(
+            "invalid non-printable character U+FEFF",
+            TextRange::new(TextSize::new(0), TextSize::new(3)),
+        ));
+    }
     let source = source::normalize_source(source);
-    compile_normalized(&source, filename, options)
+    compile_normalized(&source, filename.into(), options)
 }
 
 /// Decode and compile Python source bytes for CPython 3.14.5.
@@ -279,13 +294,38 @@ pub fn compile_bytes_with_options(
     filename: &str,
     options: &CompileOptions,
 ) -> Result<CompiledModule, CompileError> {
+    validate_filename(filename)?;
     let source = decode_source(source).map_err(CompileError::Decode)?;
-    compile_normalized(&source, filename, options)
+    compile_normalized(&source, filename.into(), options)
+}
+
+/// Decode and compile source bytes with an operating-system filename and the selected options.
+///
+/// This function performs no filesystem I/O. Unlike [`compile_bytes_with_options`], it also
+/// preserves filenames that are not valid Unicode, using Python's filesystem representation.
+/// Paths containing a null character are rejected before the source is decoded.
+pub fn compile_bytes_with_path_and_options(
+    source: &[u8],
+    filename: &Path,
+    options: &CompileOptions,
+) -> Result<CompiledModule, CompileError> {
+    if filename.as_os_str().as_encoded_bytes().contains(&0) {
+        return Err(CompileError::InvalidFilename);
+    }
+    let source = decode_source(source).map_err(CompileError::Decode)?;
+    compile_normalized(&source, CodeFilename::from_path(filename), options)
+}
+
+fn validate_filename(filename: &str) -> Result<(), CompileError> {
+    if filename.contains('\0') {
+        return Err(CompileError::InvalidFilename);
+    }
+    Ok(())
 }
 
 fn compile_normalized(
     source: &str,
-    filename: &str,
+    filename: CodeFilename,
     options: &CompileOptions,
 ) -> Result<CompiledModule, CompileError> {
     let target_version = match options.python_version {
@@ -333,6 +373,7 @@ pub fn compile_bytes_to_pyc(
     filename: &str,
     source_mtime: u32,
 ) -> Result<Vec<u8>, CompileError> {
+    validate_filename(filename)?;
     let source_size = u32::try_from(source.len()).map_err(|_| {
         CompileError::Unsupported("Python source exceeds the 4 GiB `.pyc` limit".to_string())
     })?;
@@ -345,6 +386,7 @@ pub fn compile_to_pyc(
     filename: &str,
     source_mtime: u32,
 ) -> Result<Vec<u8>, CompileError> {
+    validate_filename(filename)?;
     let source_size = u32::try_from(source.len()).map_err(|_| {
         CompileError::Unsupported("Python source exceeds the 4 GiB `.pyc` limit".to_string())
     })?;

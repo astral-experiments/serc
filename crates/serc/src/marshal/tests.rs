@@ -120,9 +120,9 @@ fn counts_repeated_objects_without_reexpanding_them() {
     let mut graph = ObjectGraph::default();
     let key = ObjectKey::Float(1.0_f64.to_bits());
 
-    assert!(graph.record(key.clone()));
+    assert!(graph.record(key));
     assert!(!graph.is_shared(&key, false));
-    assert!(!graph.record(key.clone()));
+    assert!(!graph.record(key));
     assert!(graph.is_shared(&key, false));
 }
 
@@ -254,7 +254,7 @@ fn bypasses_value_lookup_for_common_cpython_cached_objects() {
         ObjectKey::Bytes(&[0]),
         ObjectKey::String("é"),
     ] {
-        assert!(graph.record(key.clone()));
+        assert!(graph.record(key));
         assert!(!graph.record(key));
     }
 
@@ -265,11 +265,11 @@ fn bypasses_value_lookup_for_common_cpython_cached_objects() {
 
 #[test]
 fn cached_scalar_slots_preserve_domains_and_cross_source_identity() {
-    let mut graph = ObjectGraph::default();
     let first_character = String::from("é");
     let second_character = String::from("é");
     let first_byte = [0];
     let second_byte = [0];
+    let mut graph = ObjectGraph::default();
 
     assert!(graph.record(ObjectKey::Int(1)));
     assert!(graph.record(ObjectKey::SignedInt(1)));
@@ -698,9 +698,9 @@ fn borrowed_string_tuple_keys_compare_across_sources() {
             }
         }
         let mut graph = ObjectGraph::default();
-        assert!(graph.record(left_keys[0].clone()));
-        assert!(!graph.record(left_keys[1].clone()));
-        assert!(!graph.record(left_keys[2].clone()));
+        assert!(graph.record(left_keys[0]));
+        assert!(!graph.record(left_keys[1]));
+        assert!(!graph.record(left_keys[2]));
     }
 }
 
@@ -734,6 +734,34 @@ fn short_and_long_compiler_names_keep_marshaled_metadata_identity() {
     child.marshal_provenance.metadata_tuple_properties = None;
     fallback.marshal_provenance.metadata_tuple_properties = None;
     assert_eq!(encode_code(&fallback), expected);
+}
+
+#[test]
+fn root_constant_tuples_are_unique_unless_they_alias_string_metadata() {
+    let tuple = Constant::Tuple(vec![Constant::Int(1000)]);
+    let code = code_object(vec![tuple.clone(), tuple]);
+    let graph = ObjectGraph::for_code(&code);
+    // The nested tuple and its integer need value lookup; the root tuple cannot be shared.
+    assert_eq!(graph.hashed_object_count(), 2);
+    assert!(!graph.is_shared(&constants_tuple_key(&code.constants), false));
+    let Constant::Tuple(values) = &code.constants[0] else {
+        unreachable!();
+    };
+    assert!(graph.is_shared(&constants_tuple_key(values), false));
+
+    let mut code = code_object(vec![Constant::String("alpha".to_string())]);
+    code.names.push("alpha".into());
+    code.marshal_provenance.metadata_ids.names = vec![MetadataId::from_u32(0)];
+    let graph = ObjectGraph::for_code(&code);
+    assert!(graph.is_shared(&constants_tuple_key(&code.constants), false));
+    assert!(graph.is_shared(&names_tuple_key(&code.names), false));
+    let mut occurrences = graph.occurrence_cursor();
+    occurrences.consume(OccurrenceKind::Code);
+    occurrences.consume(OccurrenceKind::CodeBytes);
+    let constants = occurrences.consume(OccurrenceKind::Constants);
+    occurrences.consume(OccurrenceKind::Constant);
+    assert_eq!(occurrences.consume(OccurrenceKind::Strings), constants);
+    assert!(!encode_code(&code).is_empty());
 }
 
 #[test]
@@ -799,10 +827,109 @@ fn borrowed_constant_tuple_keys_preserve_recursive_value_and_identity() {
 }
 
 #[test]
+fn borrowed_set_and_slice_keys_keep_canonical_hashes_without_drop_glue() {
+    use std::hash::{Hash, Hasher};
+
+    use rustc_hash::FxHasher;
+
+    assert!(!std::mem::needs_drop::<ObjectKey<'_>>());
+    assert!(!std::mem::needs_drop::<HashedObjectKey<'_>>());
+
+    let nested = Constant::FrozenSet(vec![
+        Constant::FrozenSet(vec![Constant::Int(2), Constant::Int(1)]),
+        Constant::Tuple(vec![
+            Constant::Float(-0.0),
+            Constant::String("value".into()),
+        ]),
+    ]);
+    for value in [
+        Constant::FrozenSet(Vec::new()),
+        Constant::FrozenSet((0..8).rev().map(Constant::Int).collect()),
+        nested.clone(),
+        Constant::Slice {
+            lower: Box::new(nested),
+            upper: Box::new(Constant::Float(f64::NAN)),
+            step: Box::new(Constant::SignedInt(-1)),
+        },
+    ] {
+        let key = constant_key(&value);
+        let mut expected = FxHasher::default();
+        std::mem::discriminant(&key).hash(&mut expected);
+        match &value {
+            Constant::FrozenSet(values) => {
+                let mut members: Vec<_> = values.iter().map(constant_key).collect();
+                members.sort_unstable();
+                members.hash(&mut expected);
+            }
+            Constant::Slice { lower, upper, step } => {
+                for member in [lower, upper, step] {
+                    constant_key(member).hash(&mut expected);
+                }
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            HashedObjectKey::from(key),
+            HashedObjectKey::with_hash(key, expected.finish())
+        );
+    }
+}
+
+#[test]
+fn nested_frozen_keys_preserve_order_and_hash_through_tuple_and_slice_members() {
+    use std::cmp::Ordering;
+
+    fn tree(depth: usize, seed: u64, reversed: bool) -> Constant {
+        if depth == 0 {
+            return Constant::Tuple(vec![
+                Constant::Tuple(Vec::new()),
+                Constant::Tuple(vec![Constant::String("shared".into())]),
+                Constant::Int(seed),
+            ]);
+        }
+        let mut members = vec![
+            tree(depth - 1, seed, reversed),
+            tree(depth - 1, seed + 1, reversed),
+        ];
+        if reversed {
+            members.reverse();
+        }
+        Constant::FrozenSet(members)
+    }
+
+    fn wrapped(value: Constant) -> Constant {
+        Constant::FrozenSet(vec![
+            Constant::Tuple(vec![value.clone(), Constant::Float(-0.0)]),
+            Constant::Slice {
+                lower: Box::new(value),
+                upper: Box::new(Constant::Float(f64::NAN).with_non_reflexive_origin(17)),
+                step: Box::new(Constant::None),
+            },
+        ])
+    }
+
+    let first = wrapped(tree(5, 0, false));
+    let reversed = wrapped(tree(5, 0, true));
+    let greater = wrapped(tree(5, 1, true));
+    let first_key = constant_key(&first);
+    let reversed_key = constant_key(&reversed);
+    let greater_key = constant_key(&greater);
+    assert_eq!(first_key, reversed_key);
+    assert_eq!(first_key.cmp(&reversed_key), Ordering::Equal);
+    assert_eq!(first_key.cmp(&greater_key), Ordering::Less);
+    assert_ne!(first_key, greater_key);
+    assert_eq!(
+        HashedObjectKey::from(first_key),
+        HashedObjectKey::from(reversed_key)
+    );
+}
+
+#[test]
 fn distinguishes_cached_slice_members_from_fresh_objects() {
     for value in [
         Constant::Int(256),
         Constant::SignedInt(-5),
+        Constant::String(String::new()),
         Constant::String("é".to_string()),
         Constant::Bytes(vec![0]),
     ] {
@@ -812,6 +939,7 @@ fn distinguishes_cached_slice_members_from_fresh_objects() {
         Constant::Int(257),
         Constant::SignedInt(-6),
         Constant::String("Ā".to_string()),
+        Constant::String("aa".to_string()),
         Constant::Bytes(vec![0, 1]),
         Constant::Float(1.0),
     ] {
@@ -914,10 +1042,10 @@ fn python_312_frozenset_sort_keys_borrow_member_roots() {
                     version,
                     &InitialInternState::default(),
                 );
-                let ordered = graph.frozen_set_members(members);
+                let ordered = graph.frozen_set_members(members, 0);
                 let first_index = usize::from(version != PythonVersion::Py312 || shared);
                 assert!(
-                    std::ptr::eq(ordered[0].1, &raw const members[first_index]),
+                    std::ptr::eq(ordered[0], &raw const members[first_index]),
                     "unexpected member order for {version}, shared={shared}, first={first:?}"
                 );
             }
@@ -991,6 +1119,53 @@ fn nested_frozen_set_wire_order_uses_recursive_member_keys() {
     assert_eq!(encode_code(&first), encode_code(&second));
 }
 
+#[test]
+fn frozen_set_order_replay_handles_nested_sets_and_skips_references() {
+    use super::writer::encode_code_with_options;
+    use crate::{InitialInternState, PythonVersion};
+
+    fn reverse_sets(value: &mut Constant) {
+        if let Constant::FrozenSet(members) = value {
+            members.reverse();
+            for member in members {
+                reverse_sets(member);
+            }
+        }
+    }
+
+    let outer = Constant::FrozenSet(vec![
+        Constant::Tuple(vec![Constant::Int(1000), Constant::Int(1001)]),
+        Constant::FrozenSet(vec![Constant::Int(2000), Constant::Int(2001)]),
+        Constant::FrozenSet(vec![Constant::Int(2002)]),
+        Constant::FrozenSet(vec![]),
+    ]);
+    let code = code_object(vec![
+        outer.clone(),
+        outer,
+        Constant::FrozenSet(vec![Constant::Int(2002)]),
+        Constant::FrozenSet(vec![Constant::Int(4), Constant::Int(2)]),
+    ]);
+    let mut reversed = code.clone();
+    for constant in &mut reversed.constants {
+        reverse_sets(constant);
+    }
+
+    let state = InitialInternState::default();
+    for version in [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
+    ] {
+        let graph = ObjectGraph::for_code_with_options(&code, version, &state);
+        assert_eq!(graph.frozen_set_order_count(), 3);
+        assert_eq!(
+            encode_code_with_options(&code, version, &state),
+            encode_code_with_options(&reversed, version, &state)
+        );
+    }
+}
+
 #[derive(Clone, Copy)]
 enum RecordedValue<'a> {
     Code(&'a CodeObject),
@@ -1039,6 +1214,8 @@ impl<'a> MarshalVisitor<'a> for RecordingVisitor<'a> {
     fn local_kinds(&mut self, _code: &'a CodeObject) {}
 
     fn metadata_string(&mut self, _value: &'a str, _metadata_id: Option<MetadataId>) {}
+
+    fn code_filename(&mut self, _code: &'a CodeObject, _metadata_id: Option<MetadataId>) {}
 
     fn first_line(&mut self, _value: u32) {}
 
@@ -1231,8 +1408,10 @@ fn complete_intern_state_preserves_identifier_dependent_frozenset_recreation() {
         ]);
         let graph = ObjectGraph::for_code_with_options(&code, PythonVersion::Py314, &empty);
         assert!(graph.is_shared(&constant_key(&code.constants[0]), false));
+        drop(graph);
         let graph = ObjectGraph::for_code_with_options(&code, PythonVersion::Py314, &retained);
         assert!(!graph.is_shared(&constant_key(&code.constants[0]), false));
+        drop(graph);
 
         code.marshal_provenance
             .parser_interned_strings

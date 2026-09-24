@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::builder::Styles;
 use clap::builder::styling::{AnsiColor, Effects};
 use clap::{Parser, Subcommand, ValueHint};
-use serc::{CompileError, CompileOptions, PythonVersion, compile_bytes_with_options};
+use serc::{CompileError, CompileOptions, PythonVersion, compile_bytes_with_path_and_options};
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
@@ -397,18 +397,15 @@ fn compile_path_with_metadata(
         .transpose()?;
     let source_bytes = fs_err::read(path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    let filename = path
-        .to_str()
-        .ok_or_else(|| format!("path is not UTF-8: {}", path.display()))?;
     let module =
-        compile_bytes_with_options(&source_bytes, filename, options).map_err(
-            |error| match &error {
+        compile_bytes_with_path_and_options(&source_bytes, path, options).map_err(|error| {
+            match &error {
                 CompileError::Decode(error) => {
                     format!("failed to decode {}: {error}", path.display())
                 }
                 _ => format!("failed to compile {}: {error}", path.display()),
-            },
-        )?;
+            }
+        })?;
 
     let Some(metadata) = metadata else {
         black_box(module);
