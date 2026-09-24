@@ -3072,6 +3072,9 @@ fn fold_complex_arithmetic(
                         left_real.mul_add(right_imag, left_imag * right_real),
                     )
                 }
+                Operator::Mult if python_version >= PythonVersion::Py314 => {
+                    modern_complex_product((left_real, left_imag), (right_real, right_imag))
+                }
                 Operator::Mult => complex_product((left_real, left_imag), (right_real, right_imag)),
                 _ => unreachable!(),
             }
@@ -3098,6 +3101,45 @@ fn complex_product(left: (f64, f64), right: (f64, f64)) -> (f64, f64) {
         left.0 * right.0 - left.1 * right.1,
         left.0 * right.1 + left.1 * right.0,
     )
+}
+
+/// Recovers infinities when modern CPython's `_Py_c_prod` first computes two NaNs.
+fn modern_complex_product((mut a, mut b): (f64, f64), (mut c, mut d): (f64, f64)) -> (f64, f64) {
+    let (ac, bd, ad, bc) = (a * c, b * d, a * d, b * c);
+    let result = (ac - bd, ad + bc);
+    if !result.0.is_nan() || !result.1.is_nan() {
+        return result;
+    }
+
+    let zero_nan = |value: f64| {
+        if value.is_nan() {
+            0.0_f64.copysign(value)
+        } else {
+            value
+        }
+    };
+    let boxed = |value: f64| f64::from(value.is_infinite()).copysign(value);
+    let mut recalculate = false;
+    if a.is_infinite() || b.is_infinite() {
+        (a, b, c, d) = (boxed(a), boxed(b), zero_nan(c), zero_nan(d));
+        recalculate = true;
+    }
+    if c.is_infinite() || d.is_infinite() {
+        (a, b, c, d) = (zero_nan(a), zero_nan(b), boxed(c), boxed(d));
+        recalculate = true;
+    }
+    if !recalculate && [ac, bd, ad, bc].into_iter().any(f64::is_infinite) {
+        (a, b, c, d) = (zero_nan(a), zero_nan(b), zero_nan(c), zero_nan(d));
+        recalculate = true;
+    }
+    if recalculate {
+        (
+            f64::INFINITY * (a * c - b * d),
+            f64::INFINITY * (a * d + b * c),
+        )
+    } else {
+        result
+    }
 }
 
 fn complex_quotient(left: (f64, f64), right: (f64, f64), contract: bool) -> Option<(f64, f64)> {
@@ -4058,14 +4100,64 @@ fn big_integer_digits(token: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
+    use ruff_python_ast::Operator;
+
     use super::{
         CONSTANT_INDEX_THRESHOLD, ConstantEquality, ConstantIndices, ConstantPool,
-        FORCE_GENERIC_CONSTANT_ADMISSION, constant_pool_fingerprint,
+        FORCE_GENERIC_CONSTANT_ADMISSION, constant_pool_fingerprint, fold_complex_arithmetic,
     };
     use crate::code_object::{
         CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance, MetadataId,
     };
     use crate::{CompileOptions, PythonVersion, compile_with_options};
+
+    #[test]
+    fn complex_multiplication_recovery_follows_the_target() {
+        let real_infinity = Constant::Complex {
+            real: f64::INFINITY,
+            imag: f64::NAN,
+        };
+        let finite = Constant::Complex {
+            real: 1.0,
+            imag: 1.0,
+        };
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            for (left, right) in [(&real_infinity, &finite), (&finite, &real_infinity)] {
+                let Some(Constant::Complex { real, imag }) =
+                    fold_complex_arithmetic(left, Operator::Mult, right, python_version)
+                else {
+                    panic!("complex multiplication should be folded");
+                };
+                if python_version >= PythonVersion::Py314 {
+                    assert_eq!(real.to_bits(), f64::INFINITY.to_bits());
+                    assert_eq!(imag.to_bits(), f64::INFINITY.to_bits());
+                } else {
+                    assert!(real.is_nan());
+                    assert!(imag.is_nan());
+                }
+            }
+
+            if python_version >= PythonVersion::Py314 {
+                for (left, right) in [
+                    (&real_infinity, &Constant::Float(1.0)),
+                    (&Constant::Float(1.0), &real_infinity),
+                ] {
+                    let Some(Constant::Complex { real, imag }) =
+                        fold_complex_arithmetic(left, Operator::Mult, right, python_version)
+                    else {
+                        panic!("mixed complex multiplication should be folded");
+                    };
+                    assert_eq!(real.to_bits(), f64::INFINITY.to_bits());
+                    assert!(imag.is_nan());
+                }
+            }
+        }
+    }
 
     fn code_object(constants: Vec<Constant>) -> CodeObject {
         CodeObject {
