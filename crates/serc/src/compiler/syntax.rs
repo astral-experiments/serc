@@ -1149,7 +1149,9 @@ impl<const PRUNE_STATEMENTS: bool> SemanticSyntaxContext for Validator<'_, '_, P
         // CPython statement, including parameters and module-level nonlocals.
         if matches!(
             error.kind,
-            Kind::GlobalParameter(_) | Kind::NonlocalDeclarationAtModuleLevel
+            Kind::GlobalParameter(_)
+                | Kind::NonlocalParameter(_)
+                | Kind::NonlocalDeclarationAtModuleLevel
         ) {
             return;
         }

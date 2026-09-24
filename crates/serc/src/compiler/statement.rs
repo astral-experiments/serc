@@ -3147,7 +3147,7 @@ impl<'source> Compiler<'source> {
             }
             let opcode = if let Expr::Compare(comparison) = value
                 && comparison.ops.len() == 1
-                && matches!(comparison.comparators[0], Expr::NoneLiteral(_))
+                && matches!(comparison.comparators()[0], Expr::NoneLiteral(_))
                 && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
             {
                 if jump_on == (comparison.ops[0] == CmpOp::Is) {
@@ -3631,7 +3631,7 @@ impl<'source> Compiler<'source> {
         let body = self.assembler.label();
         let condition_false = self.assembler.label();
         self.compile_conditional_comparison_prefix(comparison, cleanup)?;
-        let final_comparator = comparison.comparators.last().unwrap();
+        let final_comparator = comparison.comparators().last().unwrap();
         let final_operator = *comparison.ops.last().unwrap();
         let specialized_none_jump = matches!(final_comparator, Expr::NoneLiteral(_))
             && matches!(final_operator, CmpOp::Is | CmpOp::IsNot);
@@ -3741,7 +3741,7 @@ impl<'source> Compiler<'source> {
         let otherwise = self.assembler.label();
         self.compile_conditional_comparison_prefix(comparison, cleanup)?;
 
-        let final_comparator = comparison.comparators.last().unwrap();
+        let final_comparator = comparison.comparators().last().unwrap();
         let final_operator = *comparison.ops.last().unwrap();
         let specialized_none_jump = matches!(final_comparator, Expr::NoneLiteral(_))
             && matches!(final_operator, CmpOp::Is | CmpOp::IsNot);
@@ -4104,11 +4104,11 @@ impl<'source> Compiler<'source> {
         let cleanup = self.assembler.label();
         self.assembler
             .set_location(self.source_location(expression.range));
-        self.compile_expression(&expression.left)?;
+        self.compile_expression(expression.first_operand())?;
         for (operator, comparator) in expression
             .ops
             .iter()
-            .zip(&expression.comparators)
+            .zip(expression.comparators())
             .take(expression.ops.len() - 1)
         {
             self.compile_expression(comparator)?;
@@ -4123,7 +4123,7 @@ impl<'source> Compiler<'source> {
             self.emit(POP_TOP, 0, -1)?;
         }
         let operator = *expression.ops.last().unwrap();
-        self.compile_comparison_rhs(operator, expression.comparators.last().unwrap())?;
+        self.compile_comparison_rhs(operator, expression.comparators().last().unwrap())?;
         let (opcode, argument) = comparison_operator(operator, self.context.python_version);
         self.emit(opcode, argument, -1)?;
         self.assembler
@@ -4318,7 +4318,7 @@ impl<'source> Compiler<'source> {
                 let discarded_comprehension = match expression.value.as_ref() {
                     Expr::ListComp(comprehension) => {
                         self.compile_comprehension(
-                            &comprehension.generators,
+                            &comprehension.generators[..],
                             None,
                             &comprehension.elt,
                             BUILD_LIST,
@@ -4329,7 +4329,7 @@ impl<'source> Compiler<'source> {
                     }
                     Expr::SetComp(comprehension) => {
                         self.compile_comprehension(
-                            &comprehension.generators,
+                            &comprehension.generators[..],
                             None,
                             &comprehension.elt,
                             BUILD_SET,
@@ -4340,7 +4340,7 @@ impl<'source> Compiler<'source> {
                     }
                     Expr::DictComp(comprehension) => {
                         self.compile_comprehension(
-                            &comprehension.generators,
+                            &comprehension.generators[..],
                             comprehension.key.as_deref(),
                             &comprehension.value,
                             BUILD_MAP,
@@ -4998,10 +4998,10 @@ impl<'source> Compiler<'source> {
                                     && matches!(finally.body, [Stmt::If(guard)]
                                         if guard.elif_else_clauses.is_empty()
                                             && matches!(guard.test.as_ref(), Expr::Compare(comparison)
-                                                if matches!(comparison.left.as_ref(), Expr::Name(_))
+                                                if matches!(comparison.first_operand(), Expr::Name(_))
                                                     && comparison.ops[..] == [CmpOp::IsNot]
-                                                    && matches!(&comparison.comparators[..], [Expr::NoneLiteral(none)]
-                                                        if self.source_location(comparison.left.range()).line
+                                                    && matches!(comparison.comparators(), [Expr::NoneLiteral(none)]
+                                                        if self.source_location(comparison.first_operand().range()).line
                                                             == self.source_location(none.range).line))))))
                     .then(|| self.assembler.item_count());
                 // A copied None guard follows the authored continue NOP and one
@@ -5061,10 +5061,10 @@ impl<'source> Compiler<'source> {
                                     && matches!(cleanup.body.as_slice(), [Stmt::If(guard)]
                                         if guard.elif_else_clauses.is_empty()
                                             && matches!(guard.test.as_ref(), Expr::Compare(comparison)
-                                                if matches!(comparison.left.as_ref(), Expr::Name(_))
+                                                if matches!(comparison.first_operand(), Expr::Name(_))
                                                     && comparison.ops[..] == [CmpOp::IsNot]
-                                                    && matches!(&comparison.comparators[..], [Expr::NoneLiteral(none)]
-                                                        if self.source_location(comparison.left.range()).line
+                                                    && matches!(comparison.comparators(), [Expr::NoneLiteral(none)]
+                                                        if self.source_location(comparison.first_operand().range()).line
                                                             == self.source_location(none.range).line))))))
                     .then(|| self.assembler.item_count());
                 let copied_finally_exclusion_lengths = self
@@ -5261,10 +5261,10 @@ impl<'source> Compiler<'source> {
                                 }
                                 Expr::Compare(comparison) => {
                                     context.iterator_cleanup == IteratorCleanup::None
-                                        && matches!(comparison.left.as_ref(), Expr::Name(_))
+                                        && matches!(comparison.first_operand(), Expr::Name(_))
                                         && matches!(&comparison.ops[..], [CmpOp::Is | CmpOp::IsNot])
-                                        && matches!(&comparison.comparators[..], [Expr::NoneLiteral(none)]
-                                            if self.source_location(comparison.left.range()).line
+                                        && matches!(comparison.comparators(), [Expr::NoneLiteral(none)]
+                                            if self.source_location(comparison.first_operand().range()).line
                                                 == self.source_location(none.range).line)
                                 }
                                 _ => false,
@@ -5659,9 +5659,9 @@ impl<'source> Compiler<'source> {
                             && matches!(finally.body.first(), Some(Stmt::If(guard))
                                 if guard.elif_else_clauses.is_empty()
                                     && matches!(guard.test.as_ref(), Expr::Compare(test)
-                                        if matches!(test.left.as_ref(), Expr::Name(_))
+                                        if matches!(test.first_operand(), Expr::Name(_))
                                             && matches!(test.ops.as_ref(), [CmpOp::Is | CmpOp::IsNot])
-                                            && matches!(test.comparators.as_ref(), [Expr::NoneLiteral(_)]))));
+                                            && matches!(test.comparators(), [Expr::NoneLiteral(_)]))));
                 let copied_handler_return_item = self.assembler.item_count();
                 if !preserve_tos {
                     let range = statement
@@ -7876,9 +7876,9 @@ impl<'source> Compiler<'source> {
                                     && let [Expr::Name(assigned)] = assignment.targets.as_slice()
                                     && let Some(Stmt::If(entry)) = outer.body.first()
                                     && let Expr::Compare(test) = entry.test.as_ref()
-                                    && matches!(test.left.as_ref(), Expr::Name(tested) if tested.id == assigned.id)
+                                    && matches!(test.first_operand(), Expr::Name(tested) if tested.id == assigned.id)
                                     && matches!(test.ops.as_ref(), [CmpOp::Is | CmpOp::IsNot])
-                                    && matches!(test.comparators.as_ref(), [Expr::NoneLiteral(_)])
+                                    && matches!(test.comparators(), [Expr::NoneLiteral(_)])
                                 {
                                     copied_handler_assignment_span = Some((start, end));
                                 }
@@ -8573,14 +8573,14 @@ impl<'source> Compiler<'source> {
                         && matches!(finally_context.body.first(), Some(Stmt::If(guard))
                         if guard.elif_else_clauses.is_empty()
                             && match guard.test.as_ref() {
-                                Expr::Compare(comparison) => matches!(comparison.left.as_ref(), Expr::Name(_))
+                                Expr::Compare(comparison) => matches!(comparison.first_operand(), Expr::Name(_))
                                     && matches!(comparison.ops.as_ref(), [CmpOp::Is | CmpOp::IsNot])
-                                    && matches!(comparison.comparators.as_ref(), [Expr::NoneLiteral(_)]),
+                                    && matches!(comparison.comparators(), [Expr::NoneLiteral(_)]),
                                 Expr::BoolOp(boolean) => boolean.op == BoolOp::Or
                                     && matches!(boolean.values.first(), Some(Expr::Compare(comparison))
-                                        if matches!(comparison.left.as_ref(), Expr::Name(_))
+                                        if matches!(comparison.first_operand(), Expr::Name(_))
                                             && matches!(comparison.ops.as_ref(), [CmpOp::Is | CmpOp::IsNot])
-                                            && matches!(comparison.comparators.as_ref(), [Expr::NoneLiteral(_)])),
+                                            && matches!(comparison.comparators(), [Expr::NoneLiteral(_)])),
                                 // Direct attribute truth guards consume the same original POP pair.
                                 Expr::Attribute(attribute) => matches!(attribute.value.as_ref(), Expr::Name(_)),
                                 Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => matches!(unary.operand.as_ref(),
@@ -8675,9 +8675,9 @@ impl<'source> Compiler<'source> {
                         && matches!(finally_context.body.first(), Some(Stmt::If(guard))
                             if guard.elif_else_clauses.is_empty()
                                 && matches!(guard.test.as_ref(), Expr::Compare(comparison)
-                                    if matches!(comparison.left.as_ref(), Expr::Name(_))
+                                    if matches!(comparison.first_operand(), Expr::Name(_))
                                         && matches!(comparison.ops.as_ref(), [CmpOp::Is | CmpOp::IsNot])
-                                        && matches!(comparison.comparators.as_ref(), [Expr::NoneLiteral(_)])));
+                                        && matches!(comparison.comparators(), [Expr::NoneLiteral(_)])));
                     // A value return through a while needs no iterator stack cleanup.
                     // Ordinary tries entered inside that while still contribute their
                     // own NULL POP_BLOCK records before the finalizer POP.
@@ -8750,9 +8750,9 @@ impl<'source> Compiler<'source> {
                                                 if matches!(attribute.value.as_ref(), Expr::Name(_)))))
                                 && matches!(outer.body.first(), Some(Stmt::If(guard))
                                     if matches!(guard.test.as_ref(), Expr::Compare(test)
-                                        if matches!(test.left.as_ref(), Expr::Name(_))
+                                        if matches!(test.first_operand(), Expr::Name(_))
                                             && matches!(test.ops.as_ref(), [CmpOp::Is | CmpOp::IsNot])
-                                            && matches!(test.comparators.as_ref(), [Expr::NoneLiteral(_)]))));
+                                            && matches!(test.comparators(), [Expr::NoneLiteral(_)]))));
                     if restores_nested_finalizer_try_pops {
                         let before = return_finally_contexts.get(context_index + 1).map_or(
                             self.control.exceptions.active_try_marker_slots.len(),
@@ -9458,9 +9458,9 @@ impl<'source> Compiler<'source> {
                         && matches!(finally_context.body.first(), Some(Stmt::If(guard))
                             if guard.elif_else_clauses.is_empty()
                                 && matches!(guard.test.as_ref(), Expr::Compare(comparison)
-                                    if matches!(comparison.left.as_ref(), Expr::Name(_))
+                                    if matches!(comparison.first_operand(), Expr::Name(_))
                                         && matches!(comparison.ops.as_ref(), [CmpOp::Is | CmpOp::IsNot])
-                                        && matches!(comparison.comparators.as_ref(), [Expr::NoneLiteral(_)]))))
+                                        && matches!(comparison.comparators(), [Expr::NoneLiteral(_)]))))
                         .then(|| match (
                             self.control.withs.active_with_exits.as_slice(),
                             self.control.loops.contexts.as_slice(),
@@ -9868,9 +9868,9 @@ impl<'source> Compiler<'source> {
                                     if matches!(value.body.as_ref(), Expr::Name(_))
                                         && matches!(value.orelse.as_ref(), Expr::NoneLiteral(_))
                                         && matches!(value.test.as_ref(), Expr::Compare(test)
-                                            if matches!(test.left.as_ref(), Expr::Name(_))
+                                            if matches!(test.first_operand(), Expr::Name(_))
                                                 && matches!(test.ops.as_ref(), [CmpOp::In])
-                                                && matches!(test.comparators.as_ref(), [Expr::Set(set)]
+                                                && matches!(test.comparators(), [Expr::Set(set)]
                                                     if set.elts.len() == 3
                                                         && set.elts.iter().all(|element| matches!(element, Expr::StringLiteral(_)))))))
                         {
@@ -11069,7 +11069,7 @@ impl<'source> Compiler<'source> {
                 Expr::Compare(comparison)
                     if comparison.ops.len() == 1
                         && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
-                        && matches!(comparison.comparators[0], Expr::NoneLiteral(_))
+                        && matches!(comparison.comparators()[0], Expr::NoneLiteral(_))
             )
             && (!self.control.in_iterator_loop()
                 || self.control.exceptions.direct_try_body_has_successor)
@@ -11375,7 +11375,7 @@ impl<'source> Compiler<'source> {
                     && matches!(test, Expr::Compare(comparison)
                         if comparison.ops.len() == 1
                             && comparison.ops[0] == CmpOp::Is
-                            && matches!(comparison.comparators[0], Expr::NoneLiteral(_)))
+                            && matches!(comparison.comparators()[0], Expr::NoneLiteral(_)))
                     && !self.control.withs.active_with_region_exclusions.is_empty()
                     && self
                         .control
@@ -11388,7 +11388,7 @@ impl<'source> Compiler<'source> {
                     && matches!(test, Expr::Compare(comparison)
                         if comparison.ops.len() == 1
                             && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
-                            && matches!(comparison.comparators[0], Expr::NoneLiteral(_)))
+                            && matches!(comparison.comparators()[0], Expr::NoneLiteral(_)))
                     && (self.assembler.current_block_has_dynamic_exception_owner()
                         || self
                             .assembler
@@ -11453,7 +11453,7 @@ impl<'source> Compiler<'source> {
                                 || matches!(test, Expr::Compare(comparison)
                                     if comparison.ops.len() == 1
                                         && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
-                                        && matches!(comparison.comparators[0], Expr::NoneLiteral(_)))
+                                        && matches!(comparison.comparators()[0], Expr::NoneLiteral(_)))
                                 || terminal_condition_contains_owner_wrapper(test)
                                 || terminal_condition_contains_global_callable(test, |name| {
                                     let name_id = self.required_name_id(name);
@@ -11474,7 +11474,7 @@ impl<'source> Compiler<'source> {
                                 && if matches!(test, Expr::Compare(comparison)
                                     if comparison.ops.len() == 1
                                         && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
-                                        && matches!(comparison.comparators[0], Expr::NoneLiteral(_)))
+                                        && matches!(comparison.comparators()[0], Expr::NoneLiteral(_)))
                                 {
                                     !self.assembler.contains_opcode_since_item(
                                         LOAD_FAST_AND_CLEAR,
@@ -11514,7 +11514,7 @@ impl<'source> Compiler<'source> {
                         || matches!(test, Expr::Compare(comparison)
                             if comparison.ops.len() == 1
                                 && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
-                                && matches!(comparison.comparators[0], Expr::NoneLiteral(_))))
+                                && matches!(comparison.comparators()[0], Expr::NoneLiteral(_))))
                     && !expression_contains_inline_branch(test);
                 let preserve_sync_with_direct_return_chain_owner =
                     self.control.withs.sync_with_direct_return_chain
@@ -11556,7 +11556,7 @@ impl<'source> Compiler<'source> {
                                 if matches!(conditional.test.as_ref(), Expr::Compare(comparison)
                                     if comparison.ops.len() == 1
                                         && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
-                                        && matches!(comparison.comparators[0], Expr::NoneLiteral(_))))
+                                        && matches!(comparison.comparators()[0], Expr::NoneLiteral(_))))
                     );
                 let exclude_normal_finally_short_circuit = branch_index == 0
                     && self.control.finally.active_normal_finally_bodies > 0
@@ -11888,7 +11888,7 @@ impl<'source> Compiler<'source> {
                                 (self.control.statements.context.has_following
                                     && matches!(test, Expr::Compare(comparison)
                                         if comparison.ops.len() > 1
-                                            && !matches!(comparison.comparators.last(), Some(Expr::NoneLiteral(_)))))
+                                            && !matches!(comparison.comparators().last(), Some(Expr::NoneLiteral(_)))))
                                 .then(|| test.range())
                             })
                         })
@@ -11951,8 +11951,8 @@ impl<'source> Compiler<'source> {
                             && matches!(test, Expr::Compare(comparison)
                                 if comparison.ops.len() == 1
                                     && matches!(comparison.ops[0], CmpOp::Is)
-                                    && matches!(comparison.left.as_ref(), Expr::Call(_))
-                                    && matches!(comparison.comparators[0], Expr::NoneLiteral(_)))
+                                    && matches!(comparison.first_operand(), Expr::Call(_))
+                                    && matches!(comparison.comparators()[0], Expr::NoneLiteral(_)))
                             && matches!(body, [Stmt::Expr(expression), Stmt::For(loop_statement)]
                             if matches!(expression.value.as_ref(), Expr::Call(_))
                                 && !loop_statement.is_async
@@ -11981,11 +11981,11 @@ impl<'source> Compiler<'source> {
                                     && matches!(boolean.values.last(), Some(Expr::Compare(comparison))
                                         if comparison.ops.len() == 1
                                             && comparison.ops[0] == CmpOp::IsNot
-                                            && matches!(comparison.comparators[0], Expr::NoneLiteral(_))))
+                                            && matches!(comparison.comparators()[0], Expr::NoneLiteral(_))))
                                 || matches!(test, Expr::Compare(comparison)
                                     if comparison.ops.len() == 1
                                         && comparison.ops[0] == CmpOp::Is
-                                        && matches!(comparison.comparators[0], Expr::NoneLiteral(_))))));
+                                        && matches!(comparison.comparators()[0], Expr::NoneLiteral(_))))));
                 let exclude_handler_condition_after_return = branch_index == 0
                     && self.control.in_exception_handler()
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
@@ -12253,8 +12253,8 @@ impl<'source> Compiler<'source> {
                             if matches!(assertion.test.as_ref(), Expr::Compare(comparison)
                                 if comparison.ops.len() == 1
                                     && matches!(comparison.ops[0], CmpOp::IsNot)
-                                    && matches!(comparison.left.as_ref(), Expr::Name(_))
-                                    && matches!(comparison.comparators[0], Expr::NoneLiteral(_)))
+                                    && matches!(comparison.first_operand(), Expr::Name(_))
+                                    && matches!(comparison.comparators()[0], Expr::NoneLiteral(_)))
                     );
                 self.with_control_override(
                     |control| &mut control.generators.copy_optimized_tuple_branch_exit,
@@ -13578,7 +13578,7 @@ impl<'source> Compiler<'source> {
         matches!(body.first(), Some(Stmt::If(guard))
             if guard.elif_else_clauses.is_empty()
                 && matches!(guard.test.as_ref(), Expr::Compare(comparison)
-                    if matches!(comparison.left.as_ref(), Expr::Name(name)
+                    if matches!(comparison.first_operand(), Expr::Name(name)
                         if self.is_initialized(name.id.as_str())
                             && matches!(&self.unit.scope, Scope::Function {
                                 indices, free_indices, cells, globals,
@@ -13587,8 +13587,8 @@ impl<'source> Compiler<'source> {
                                 && !self.contains_name(cells, name.id.as_str())
                                 && !self.contains_name(globals, name.id.as_str())))
                         && comparison.ops[..] == [CmpOp::IsNot]
-                        && matches!(&comparison.comparators[..], [Expr::NoneLiteral(none)]
-                            if self.source_location(comparison.left.range()).line
+                        && matches!(comparison.comparators(), [Expr::NoneLiteral(none)]
+                            if self.source_location(comparison.first_operand().range()).line
                                 == self.source_location(none.range).line))
                 && matches!(guard.body.as_slice(), [Stmt::Try(cleanup)] if !cleanup.is_star))
     }
@@ -14801,7 +14801,7 @@ impl<'source> Compiler<'source> {
         let failure = self.assembler.label();
         let failure_body = self.assembler.label();
         self.compile_conditional_comparison_prefix(comparison, cleanup)?;
-        let last = comparison.comparators.last().unwrap();
+        let last = comparison.comparators().last().unwrap();
         let operator = *comparison.ops.last().unwrap();
         let none_jump =
             matches!(last, Expr::NoneLiteral(_)) && matches!(operator, CmpOp::Is | CmpOp::IsNot);
@@ -16182,7 +16182,7 @@ impl<'source> Compiler<'source> {
 
         self.compile_conditional_comparison_prefix(comparison, cleanup)?;
 
-        let final_comparator = comparison.comparators.last().unwrap();
+        let final_comparator = comparison.comparators().last().unwrap();
         let final_operator = *comparison.ops.last().unwrap();
         let specialized_none_jump = matches!(final_comparator, Expr::NoneLiteral(_))
             && matches!(final_operator, CmpOp::Is | CmpOp::IsNot);
@@ -18094,7 +18094,7 @@ impl<'source> Compiler<'source> {
                     && self.control.generators.coroutine_suspension_epoch == 0
                     && matches!(optimized_generator_callable(call), Some("all" | "any")) =>
             {
-                Some(call.range)
+                Some(call.range())
             }
             Expr::UnaryOp(unary)
                 if unary.op == UnaryOp::Not
@@ -18103,7 +18103,7 @@ impl<'source> Compiler<'source> {
             {
                 match unary.operand.as_ref() {
                     Expr::Call(call) if optimized_generator_callable(call) == Some("any") => {
-                        Some(call.range)
+                        Some(call.range())
                     }
                     _ => None,
                 }
@@ -21220,11 +21220,11 @@ impl<'source> Compiler<'source> {
                         || matches!(context.body, [Stmt::If(conditional)]
                             if conditional.elif_else_clauses.is_empty()
                                 && matches!(conditional.test.as_ref(), Expr::Compare(comparison)
-                                    if matches!(comparison.left.as_ref(), Expr::Name(_))
+                                    if matches!(comparison.first_operand(), Expr::Name(_))
                                         && comparison.ops.len() == 1
                                         && comparison.ops[0] == CmpOp::IsNot
-                                        && comparison.comparators.len() == 1
-                                        && matches!(comparison.comparators[0], Expr::NoneLiteral(_)))
+                                        && comparison.comparators().len() == 1
+                                        && matches!(comparison.comparators()[0], Expr::NoneLiteral(_)))
                                 && matches!(conditional.body.as_slice(), [Stmt::Expr(expression)]
                                     if matches!(expression.value.as_ref(), Expr::Call(_))
                                         && !expression_contains_inline_branch(&expression.value)
@@ -25255,9 +25255,9 @@ impl<'source> Compiler<'source> {
             && matches!(statement.finalbody.as_slice(), [Stmt::If(cleanup)]
                 if cleanup.elif_else_clauses.is_empty()
                     && matches!(cleanup.test.as_ref(), Expr::Compare(compare)
-                        if matches!(compare.left.as_ref(), Expr::Name(_))
+                        if matches!(compare.first_operand(), Expr::Name(_))
                             && compare.ops[..] == [CmpOp::IsNot]
-                            && matches!(&compare.comparators[..], [Expr::NoneLiteral(_)]))
+                            && matches!(compare.comparators(), [Expr::NoneLiteral(_)]))
                     && suite_has_linear_borrow_fallthrough(&cleanup.body));
         // A synchronous manager in a coroutine emits a located normal __exit__
         // call after its terminal await. That original array can jump from a live
@@ -25888,9 +25888,9 @@ impl<'source> Compiler<'source> {
                 && matches!(cleanup.test.as_ref(), Expr::BoolOp(boolean)
                     if boolean.op == BoolOp::And
                         && matches!(boolean.values.as_slice(), [Expr::Name(_), Expr::Compare(compare)]
-                            if matches!(compare.left.as_ref(), Expr::Name(_))
+                            if matches!(compare.first_operand(), Expr::Name(_))
                                 && compare.ops[..] == [CmpOp::IsNot]
-                                && matches!(&compare.comparators[..], [Expr::NoneLiteral(_)])))
+                                && matches!(compare.comparators(), [Expr::NoneLiteral(_)])))
                 && matches!(cleanup.body.as_slice(), [Stmt::Expr(expression)]
                     if matches!(expression.value.as_ref(), Expr::Call(call)
                         if matches!(call.func.as_ref(), Expr::Name(_))
@@ -25913,9 +25913,9 @@ impl<'source> Compiler<'source> {
                     if boolean.op == BoolOp::And && boolean.values.len() == 2
                         && boolean.values.iter().all(|value| {
                             matches!(value, Expr::Compare(compare)
-                                if matches!(compare.left.as_ref(), Expr::Name(_))
+                                if matches!(compare.first_operand(), Expr::Name(_))
                                     && compare.ops[..] == [CmpOp::IsNot]
-                                    && matches!(&compare.comparators[..], [Expr::NoneLiteral(_)]))
+                                    && matches!(compare.comparators(), [Expr::NoneLiteral(_)]))
                         }))
                 && matches!(cleanup.body.as_slice(), [Stmt::Try(recovery)]
                     if !recovery.is_star
@@ -26573,9 +26573,9 @@ impl<'source> Compiler<'source> {
                     && matches!(statement.finalbody.as_slice(), [Stmt::If(cleanup)]
                         if cleanup.elif_else_clauses.is_empty()
                             && matches!(cleanup.test.as_ref(), Expr::Compare(comparison)
-                                if matches!(comparison.left.as_ref(), Expr::Name(_))
+                                if matches!(comparison.first_operand(), Expr::Name(_))
                                     && comparison.ops[..] == [CmpOp::IsNot]
-                                    && matches!(&comparison.comparators[..], [Expr::NoneLiteral(_)]))
+                                    && matches!(comparison.comparators(), [Expr::NoneLiteral(_)]))
                             && matches!(cleanup.body.as_slice(), [Stmt::Expr(call)]
                                 if cleanup_set_count_call_has_eager_entry(&call.value)))));
         // An else-suite break can enter the same nonempty normal cleanup as a
@@ -27741,7 +27741,7 @@ impl<'source> Compiler<'source> {
                                 || (matches!(tail.test.as_ref(), Expr::Compare(comparison)
                                         if comparison.ops.len() == 1
                                             && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
-                                            && matches!(comparison.comparators[0], Expr::NoneLiteral(_)))
+                                            && matches!(comparison.comparators()[0], Expr::NoneLiteral(_)))
                                     && matches!(tail.body.as_slice(), [Stmt::Expr(_), Stmt::Expr(_)])
                                     && matches!(statement.body.last(), Some(Stmt::Assert(_)))))
                 ) || (compiler.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
@@ -27766,7 +27766,7 @@ impl<'source> Compiler<'source> {
                                             || matches!(tail.test.as_ref(), Expr::Compare(comparison)
                                                 if comparison.ops.len() == 1
                                                     && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
-                                                    && matches!(comparison.comparators[0], Expr::NoneLiteral(_))))
+                                                    && matches!(comparison.comparators()[0], Expr::NoneLiteral(_))))
                                 })
                         })) || (compiler.unit.flags & CO_COROUTINE != 0
                     && statement.handlers.is_empty()
@@ -29265,7 +29265,7 @@ impl<'source> Compiler<'source> {
                                     && matches!(boolean.values.as_slice(), [Expr::Compare(comparison), Expr::Call(_)]
                                         if comparison.ops.len() == 1
                                             && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
-                                            && matches!(comparison.comparators[0], Expr::NoneLiteral(_))))
+                                            && matches!(comparison.comparators()[0], Expr::NoneLiteral(_))))
                                 && !matches!(&boolean.values[0], Expr::UnaryOp(unary)
                                     if matches!(unary.operand.as_ref(), Expr::Attribute(_))))
                                 || (matches!(statement.body.last(), Some(Stmt::Raise(_)))
@@ -29281,8 +29281,8 @@ impl<'source> Compiler<'source> {
                                                 && second.ops.len() == 1
                                                 && matches!(first.ops[0], CmpOp::Is | CmpOp::IsNot)
                                                 && matches!(second.ops[0], CmpOp::Is | CmpOp::IsNot)
-                                                && matches!(first.comparators[0], Expr::NoneLiteral(_))
-                                                && matches!(second.comparators[0], Expr::NoneLiteral(_)))))));
+                                                && matches!(first.comparators()[0], Expr::NoneLiteral(_))
+                                                && matches!(second.comparators()[0], Expr::NoneLiteral(_)))))));
                 let exclude_terminal_coroutine_with_markers = self.unit.flags & CO_COROUTINE != 0
                     && self.control.loops.contexts.is_empty()
                     && self
@@ -32294,7 +32294,7 @@ fn suite_ends_in_retained_try_exit_join(body: &[Stmt]) -> bool {
             || matches!(statement.test.as_ref(), Expr::Compare(comparison)
                 if comparison.ops.len() == 1
                     && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
-                    && matches!(comparison.comparators[0], Expr::NoneLiteral(_)));
+                    && matches!(comparison.comparators()[0], Expr::NoneLiteral(_)));
     }
     let Stmt::If(statement) = last else {
         return false;
@@ -32329,9 +32329,9 @@ fn coroutine_try_has_asserted_identity_recovery(statement: &ruff_python_ast::Stm
         && matches!(statement.orelse.as_slice(), [Stmt::Assert(assertion)]
             if assertion.msg.is_none()
                 && matches!(assertion.test.as_ref(), Expr::Compare(comparison)
-                    if matches!(comparison.left.as_ref(), Expr::Name(_))
+                    if matches!(comparison.first_operand(), Expr::Name(_))
                         && comparison.ops[..] == [CmpOp::Is]
-                        && matches!(&comparison.comparators[..], [Expr::NoneLiteral(_)])))
+                        && matches!(comparison.comparators(), [Expr::NoneLiteral(_)])))
         && matches!(statement.handlers.as_slice(), [handler]
         if handler.as_except_handler().is_some_and(|handler| {
             handler.type_.is_some()
@@ -32339,9 +32339,9 @@ fn coroutine_try_has_asserted_identity_recovery(statement: &ruff_python_ast::Stm
                 && matches!(handler.body.as_slice(), [Stmt::Assert(assertion)]
                     if assertion.msg.is_none()
                         && matches!(assertion.test.as_ref(), Expr::Compare(comparison)
-                            if matches!(comparison.left.as_ref(), Expr::Name(_))
+                            if matches!(comparison.first_operand(), Expr::Name(_))
                                 && comparison.ops[..] == [CmpOp::Is]
-                                && matches!(&comparison.comparators[..], [Expr::Name(_)])))
+                                && matches!(comparison.comparators(), [Expr::Name(_)])))
         }))
 }
 
@@ -32553,9 +32553,9 @@ fn guarded_compound_finally_exit_test(statement: &ruff_python_ast::StmtTry) -> O
     };
     (guard.elif_else_clauses.is_empty()
         && matches!(guard.test.as_ref(), Expr::Compare(compare)
-            if matches!(compare.left.as_ref(), Expr::Name(_))
+            if matches!(compare.first_operand(), Expr::Name(_))
                 && compare.ops.as_ref() == [CmpOp::IsNot]
-                && matches!(compare.comparators.as_ref(), [Expr::NoneLiteral(_)]))
+                && matches!(compare.comparators(), [Expr::NoneLiteral(_)]))
         && (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
         && !nested.is_star
         && nested.handlers.is_empty()
@@ -32589,9 +32589,9 @@ fn guarded_cleanup_false_exit_test(body: &[Stmt]) -> Option<&Expr> {
         return guarded_cleanup_false_exit_test(&last.body);
     }
     if !matches!(branch.test.as_ref(), Expr::Compare(comparison)
-        if matches!(comparison.left.as_ref(), Expr::Name(_))
+        if matches!(comparison.first_operand(), Expr::Name(_))
             && comparison.ops.as_ref() == [CmpOp::IsNot]
-            && matches!(comparison.comparators.as_ref(), [Expr::NoneLiteral(_)]))
+            && matches!(comparison.comparators(), [Expr::NoneLiteral(_)]))
     {
         return None;
     }
@@ -32837,11 +32837,11 @@ fn is_simple_none_default_assignment(test: &Expr, body: &[Stmt]) -> bool {
     };
     if comparison.ops.len() != 1
         || comparison.ops[0] != CmpOp::Is
-        || !matches!(comparison.comparators.as_ref(), [Expr::NoneLiteral(_)])
+        || !matches!(comparison.comparators(), [Expr::NoneLiteral(_)])
     {
         return false;
     }
-    let Expr::Name(name) = comparison.left.as_ref() else {
+    let Expr::Name(name) = comparison.first_operand() else {
         return false;
     };
     matches!(
@@ -32858,11 +32858,11 @@ fn is_call_none_default_assignment(test: &Expr, body: &[Stmt]) -> bool {
     };
     if comparison.ops.len() != 1
         || comparison.ops[0] != CmpOp::Is
-        || !matches!(comparison.comparators.as_ref(), [Expr::NoneLiteral(_)])
+        || !matches!(comparison.comparators(), [Expr::NoneLiteral(_)])
     {
         return false;
     }
-    let Expr::Name(name) = comparison.left.as_ref() else {
+    let Expr::Name(name) = comparison.first_operand() else {
         return false;
     };
     matches!(
@@ -32910,7 +32910,7 @@ fn is_specialized_none_condition(test: &Expr) -> bool {
         test,
         Expr::Compare(comparison)
             if comparison.ops.len() == 1
-                && matches!(comparison.comparators[0], Expr::NoneLiteral(_))
+                && matches!(comparison.comparators()[0], Expr::NoneLiteral(_))
                 && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
     )
 }
@@ -32933,9 +32933,9 @@ fn try_body_preserves_attribute_none_condition_owner(statement: &ruff_python_ast
                             && matches!(branch.test.as_ref(), Expr::Compare(comparison)
                                 if comparison.ops.len() == 1
                                     && comparison.ops[0] == CmpOp::IsNot
-                                    && matches!(comparison.left.as_ref(), Expr::Name(name)
+                                    && matches!(comparison.first_operand(), Expr::Name(name)
                                         if name.id == target.id)
-                                    && matches!(comparison.comparators.as_ref(), [Expr::NoneLiteral(_)])))
+                                    && matches!(comparison.comparators(), [Expr::NoneLiteral(_)])))
                     && branch.elif_else_clauses.is_empty()
                     && matches!(branch.body.as_slice(), [Stmt::Expr(expression)]
                         if matches!(expression.value.as_ref(), Expr::Call(_)))
@@ -34192,7 +34192,7 @@ fn terminal_condition_contains_owner_wrapper(expression: &Expr) -> bool {
                     || matches!(operand, Expr::Compare(comparison)
                         if comparison.ops.len() == 1
                             && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
-                            && matches!(comparison.comparators[0], Expr::NoneLiteral(_)))
+                            && matches!(comparison.comparators()[0], Expr::NoneLiteral(_)))
                 {
                     return true;
                 }
@@ -34730,11 +34730,11 @@ fn copied_finally_has_guarded_raise_cleanup(body: &[Stmt]) -> bool {
         let Expr::Compare(comparison) = test else {
             return None;
         };
-        let Expr::Name(name) = comparison.left.as_ref() else {
+        let Expr::Name(name) = comparison.first_operand() else {
             return None;
         };
         (comparison.ops.as_ref() == [CmpOp::IsNot]
-            && matches!(comparison.comparators.as_ref(), [Expr::NoneLiteral(_)]))
+            && matches!(comparison.comparators(), [Expr::NoneLiteral(_)]))
         .then_some(name.id.as_str())
     }
 
@@ -34876,9 +34876,9 @@ fn guarded_recovery_has_populated_handler_suffix(body: &[Stmt]) -> bool {
         let suffix = &body[index + 1..];
         guard.elif_else_clauses.is_empty()
             && matches!(guard.test.as_ref(), Expr::Compare(comparison)
-                if matches!(comparison.left.as_ref(), Expr::Name(_))
+                if matches!(comparison.first_operand(), Expr::Name(_))
                     && comparison.ops[..] == [CmpOp::IsNot]
-                    && matches!(&comparison.comparators[..], [Expr::NoneLiteral(_)]))
+                    && matches!(comparison.comparators(), [Expr::NoneLiteral(_)]))
             && (index == 0 || suite_has_linear_borrow_fallthrough(&body[..index]))
             && matches!(guard.body.as_slice(), [Stmt::Try(recovery)]
             if !recovery.is_star
@@ -34967,7 +34967,7 @@ fn handlers_have_live_guarded_recovery_cleanup(statement: &ruff_python_ast::Stmt
         };
         if !guard.elif_else_clauses.is_empty()
             || !matches!(guard.test.as_ref(), Expr::Compare(comparison)
-                if matches!(comparison.left.as_ref(), Expr::Name(_))
+                if matches!(comparison.first_operand(), Expr::Name(_))
                     && is_specialized_none_condition(&guard.test))
             || !matches!(guard.body.last(), Some(Stmt::Try(_)))
             || !normal_recovery_suite(&handler.body)
@@ -35630,8 +35630,8 @@ fn guarded_iterator_recovery_leaves_empty_try_exit(statement: &ruff_python_ast::
     if !guard.elif_else_clauses.is_empty()
         || !matches!(guard.test.as_ref(), Expr::Compare(comparison)
             if comparison.ops[..] == [CmpOp::IsNot]
-                && matches!(&comparison.comparators[..], [Expr::NoneLiteral(_)])
-                && !expression_contains_inline_branch(&comparison.left))
+                && matches!(comparison.comparators(), [Expr::NoneLiteral(_)])
+                && !expression_contains_inline_branch(comparison.first_operand()))
     {
         return false;
     }
@@ -35969,13 +35969,13 @@ fn copied_finally_has_closed_none_continue(
             let Expr::Compare(comparison) = value else {
                 return false;
             };
-            let mut operand = comparison.left.as_ref();
+            let mut operand = comparison.first_operand();
             while let Expr::Attribute(attribute) = operand {
                 operand = attribute.value.as_ref();
             }
             matches!(operand, Expr::Name(_))
                 && matches!(&comparison.ops[..], [CmpOp::Is | CmpOp::IsNot])
-                && matches!(&comparison.comparators[..], [Expr::NoneLiteral(_)])
+                && matches!(comparison.comparators(), [Expr::NoneLiteral(_)])
         })
     {
         return false;
@@ -36544,8 +36544,8 @@ fn terminal_assert_split_success_ranges(
             // Keep folded selectors and branching arms on their original lowering.
             // A runtime None comparison has one authored, located success edge.
             (is_specialized_none_condition(operand)
-                && condition_has_only_runtime_tests(&comparison.left)
-                && !expression_contains_inline_branch(&comparison.left))
+                && condition_has_only_runtime_tests(comparison.first_operand())
+                && !expression_contains_inline_branch(comparison.first_operand()))
             .then(|| operand.range())
         };
         return Some(vec![
@@ -37376,7 +37376,7 @@ fn cleanup_set_count_call_has_eager_entry(expression: &Expr) -> bool {
                 && matches!(count.func.as_ref(), Expr::Name(_))
                 && count.arguments.keywords.is_empty()
                 && !expression_contains_inline_branch(&comprehension.elt)
-                && matches!(comprehension.generators.as_slice(), [generator]
+                && matches!(&comprehension.generators[..], [generator]
                     if !generator.is_async
                         && generator.ifs.is_empty()
                         && matches!(generator.target, Expr::Name(_))
@@ -37452,7 +37452,7 @@ fn recovery_comprehension_call_has_nonempty_exit(expression: &Expr) -> bool {
             (matches!(comprehension.elt.as_ref(), Expr::Name(_))
                 || matches!(comprehension.elt.as_ref(), Expr::Attribute(attribute)
                     if matches!(attribute.value.as_ref(), Expr::Name(_))))
-                && matches!(comprehension.generators.as_slice(), [generator]
+                && matches!(&comprehension.generators[..], [generator]
                     if !generator.is_async
                         && generator.ifs.is_empty()
                         && matches!(generator.target, Expr::Name(_))
@@ -38320,8 +38320,8 @@ fn with_suite_has_terminal_none_and_raise(body: &[Stmt]) -> bool {
                                 && second.ops.len() == 1
                                 && matches!(first.ops[0], CmpOp::Is | CmpOp::IsNot)
                                 && matches!(second.ops[0], CmpOp::Is | CmpOp::IsNot)
-                                && matches!(first.comparators[0], Expr::NoneLiteral(_))
-                                && matches!(second.comparators[0], Expr::NoneLiteral(_))))
+                                && matches!(first.comparators()[0], Expr::NoneLiteral(_))
+                                && matches!(second.comparators()[0], Expr::NoneLiteral(_))))
     )
 }
 
@@ -38445,8 +38445,8 @@ fn shifted_async_with_terminal_owner_statements(body: &[Stmt]) -> Vec<TextRange>
                     boolean.op == BoolOp::And
                         && matches!(boolean.values.as_slice(), [Expr::Name(_), Expr::Compare(comparison)]
                             if comparison.ops.as_ref() == [CmpOp::LtE]
-                                && matches!(comparison.left.as_ref(), Expr::Name(_))
-                                && matches!(comparison.comparators.as_ref(), [Expr::Name(_)]))
+                                && matches!(comparison.first_operand(), Expr::Name(_))
+                                && matches!(comparison.comparators(), [Expr::Name(_)]))
                 }
                 _ => false,
             };
@@ -38540,8 +38540,8 @@ fn finally_suite_preserves_none_condition_owner(body: &[Stmt]) -> bool {
                         Expr::Compare(comparison)
                             if comparison.ops.len() == 1
                                 && comparison.ops[0] == CmpOp::IsNot
-                                && matches!(comparison.left.as_ref(), Expr::Name(_))
-                                && matches!(comparison.comparators.as_ref(), [Expr::NoneLiteral(_)])
+                                && matches!(comparison.first_operand(), Expr::Name(_))
+                                && matches!(comparison.comparators(), [Expr::NoneLiteral(_)])
                     ))
                 && matches!(
                     statement.body.as_slice(),

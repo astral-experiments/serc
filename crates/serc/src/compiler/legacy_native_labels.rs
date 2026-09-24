@@ -6,7 +6,7 @@
 //! the complete code object; it never supplies a partial seed to the assembler.
 
 use ruff_python_ast::{
-    BoolOp, Expr, FStringPart, InterpolatedStringElement, Pattern, Stmt, UnaryOp,
+    BoolOp, Expr, FStringPartRef, InterpolatedStringElement, Pattern, Stmt, UnaryOp,
 };
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -1157,8 +1157,8 @@ impl<'ast> Builder<'ast> {
                 // compiler_jump_if reserves Cleanup before visiting the left
                 // operand, but delays End until after the final conditional.
                 let cleanup = self.allocate(NativeRole::ConditionCompareCleanup(comparison.range));
-                self.expression(&comparison.left)?;
-                let (last, leading) = comparison.comparators.split_last()?;
+                self.expression(comparison.first_operand())?;
+                let (last, leading) = comparison.comparators().split_last()?;
                 for comparator in leading {
                     self.expression(comparator)?;
                     self.instruction(); // SWAP / COPY / COMPARE / conditional
@@ -1287,14 +1287,14 @@ impl<'ast> Builder<'ast> {
                 return Some(());
             }
             Expr::ListComp(comprehension) => {
-                return self.comprehension(&comprehension.generators, None, &comprehension.elt);
+                return self.comprehension(&comprehension.generators[..], None, &comprehension.elt);
             }
             Expr::SetComp(comprehension) => {
-                return self.comprehension(&comprehension.generators, None, &comprehension.elt);
+                return self.comprehension(&comprehension.generators[..], None, &comprehension.elt);
             }
             Expr::DictComp(comprehension) => {
                 return self.comprehension(
-                    &comprehension.generators,
+                    &comprehension.generators[..],
                     Some(comprehension.key.as_deref()?),
                     &comprehension.value,
                 );
@@ -1330,12 +1330,14 @@ impl<'ast> Builder<'ast> {
             Expr::FString(fstring) => {
                 for part in &fstring.value {
                     match part {
-                        FStringPart::Literal(literal) => {
+                        FStringPartRef::Literal(literal) => {
                             if !literal.value.is_empty() {
                                 self.instruction();
                             }
                         }
-                        FStringPart::FString(part) => self.interpolated_elements(&part.elements)?,
+                        FStringPartRef::FString(part) => {
+                            self.interpolated_elements(&part.elements)?;
+                        }
                     }
                 }
             }
@@ -1357,15 +1359,15 @@ impl<'ast> Builder<'ast> {
                 self.expression(&binary.right)?;
             }
             Expr::Compare(comparison) if comparison.ops.len() == 1 => {
-                self.expression(&comparison.left)?;
-                self.expression(&comparison.comparators[0])?;
+                self.expression(comparison.first_operand())?;
+                self.expression(&comparison.comparators()[0])?;
             }
             Expr::Compare(comparison) if comparison.ops.len() > 1 => {
                 // Unlike condition lowering, compiler_compare visits the left
                 // operand before reserving its failed-comparison cleanup.
-                self.expression(&comparison.left)?;
+                self.expression(comparison.first_operand())?;
                 let cleanup = self.allocate(NativeRole::ValueCompareCleanup(comparison.range));
-                let (last, leading) = comparison.comparators.split_last()?;
+                let (last, leading) = comparison.comparators().split_last()?;
                 for comparator in leading {
                     self.expression(comparator)?;
                     self.instruction(); // SWAP / COPY / COMPARE / conditional / POP
@@ -2808,7 +2810,7 @@ mod comprehension_family_tests {
         let Expr::ListComp(comprehension) = assignment.value.as_ref() else {
             panic!()
         };
-        let [outer, inner] = comprehension.generators.as_slice() else {
+        let [outer, inner] = &comprehension.generators[..] else {
             panic!()
         };
         let Expr::BoolOp(result) = comprehension.elt.as_ref() else {
@@ -2961,10 +2963,10 @@ mod expression_family_tests {
         let Expr::Compare(comparison) = assignment.value.as_ref() else {
             panic!()
         };
-        let Expr::If(left) = comparison.left.as_ref() else {
+        let Expr::If(left) = comparison.first_operand() else {
             panic!()
         };
-        let Expr::If(right) = &comparison.comparators[1] else {
+        let Expr::If(right) = &comparison.comparators()[1] else {
             panic!()
         };
         let plan = NativeLabelPlan::function(&function.body, false).unwrap();
@@ -2996,10 +2998,10 @@ mod expression_family_tests {
         let Expr::Compare(comparison) = statement.test.as_ref() else {
             panic!()
         };
-        let Expr::If(left) = comparison.left.as_ref() else {
+        let Expr::If(left) = comparison.first_operand() else {
             panic!()
         };
-        let Expr::If(right) = &comparison.comparators[1] else {
+        let Expr::If(right) = &comparison.comparators()[1] else {
             panic!()
         };
         let plan = NativeLabelPlan::function(&function.body, false).unwrap();
@@ -4969,14 +4971,16 @@ mod comprehension_result_await_tests {
                 panic!()
             };
             let (generators, values) = match assignment.value.as_ref() {
-                Expr::ListComp(comprehension) => {
-                    (&comprehension.generators, vec![comprehension.elt.as_ref()])
-                }
-                Expr::SetComp(comprehension) => {
-                    (&comprehension.generators, vec![comprehension.elt.as_ref()])
-                }
+                Expr::ListComp(comprehension) => (
+                    &comprehension.generators[..],
+                    vec![comprehension.elt.as_ref()],
+                ),
+                Expr::SetComp(comprehension) => (
+                    &comprehension.generators[..],
+                    vec![comprehension.elt.as_ref()],
+                ),
                 Expr::DictComp(comprehension) => (
-                    &comprehension.generators,
+                    &comprehension.generators[..],
                     vec![
                         comprehension.key.as_deref().unwrap(),
                         comprehension.value.as_ref(),

@@ -6,7 +6,7 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 if ! command -v ruff >/dev/null 2>&1; then
-  echo "error: Ruff 0.15.15 is required; install it with: python3 -m pip install ruff==0.15.15" >&2
+  echo "error: Ruff 0.16.8 is required; install it with: python3 -m pip install ruff==0.16.8" >&2
   exit 1
 fi
 

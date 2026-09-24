@@ -15,7 +15,7 @@
 //! native frame unwinding; pattern failure stacks remain unsupported.
 
 use ruff_python_ast::{
-    Comprehension, Expr, FStringPart, InterpolatedStringElement, Parameters, Stmt, UnaryOp,
+    Comprehension, Expr, FStringPartRef, InterpolatedStringElement, Parameters, Stmt, UnaryOp,
 };
 
 /// Proves that native source generation and every CFG allocation stay below 256.
@@ -384,8 +384,8 @@ impl<'ast> Counter<'ast> {
             Expr::Compare(comparison) if comparison.ops.len() > 1 => {
                 self.counts
                     .add(2, count(comparison.ops.len()).saturating_add(2), 0);
-                self.expression(&comparison.left)?;
-                for comparator in &comparison.comparators {
+                self.expression(comparison.first_operand())?;
+                for comparator in comparison.comparators() {
                     self.expression(comparator)?;
                 }
             }
@@ -481,8 +481,8 @@ impl<'ast> Counter<'ast> {
                 if comparison.ops.len() > 1 {
                     self.counts.add(2, count(comparison.ops.len()), 0);
                 }
-                self.expression(&comparison.left)?;
-                for comparator in &comparison.comparators {
+                self.expression(comparison.first_operand())?;
+                for comparator in comparison.comparators() {
                     self.expression(comparator)?;
                 }
             }
@@ -493,14 +493,14 @@ impl<'ast> Counter<'ast> {
             }
             Expr::Generator(generator) => self.expression(&generator.generators.first()?.iter)?,
             Expr::ListComp(comprehension) => {
-                self.comprehension(&comprehension.generators, &comprehension.elt, None)?;
+                self.comprehension(&comprehension.generators[..], &comprehension.elt, None)?;
             }
             Expr::SetComp(comprehension) => {
-                self.comprehension(&comprehension.generators, &comprehension.elt, None)?;
+                self.comprehension(&comprehension.generators[..], &comprehension.elt, None)?;
             }
             Expr::DictComp(comprehension) => {
                 self.comprehension(
-                    &comprehension.generators,
+                    &comprehension.generators[..],
                     &comprehension.value,
                     Some(comprehension.key.as_deref()?),
                 )?;
@@ -557,7 +557,7 @@ impl<'ast> Counter<'ast> {
             }
             Expr::FString(fstring) => {
                 for part in &fstring.value {
-                    if let FStringPart::FString(part) = part {
+                    if let FStringPartRef::FString(part) = part {
                         self.interpolated_elements(&part.elements)?;
                     }
                 }

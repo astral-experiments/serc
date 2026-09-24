@@ -1,0 +1,32 @@
+name: Publish to crates.io
+
+on:
+  workflow_call:
+
+permissions: {}
+
+env:
+  ACTIONS_CACHE_MODE: none
+
+jobs:
+  publish:
+    name: Upload Serc to crates.io
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the publishing toolchain
+        # Match uv's extended indexing timeout for publishing dependent workspace crates.
+        run: rustup toolchain install nightly-2026-06-12 --profile minimal --no-self-update
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+      - name: Publish unpublished workspace versions
+        # The release workflow requires a successful package verification before this job.
+        run: python3 scripts/publish-crates.py --cargo cargo +nightly-2026-06-12 --no-verify -- -Zpublish-timeout --config 'publish.timeout=600'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

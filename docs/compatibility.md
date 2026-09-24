@@ -22,17 +22,16 @@ git submodule update --init vendor/ruff
 ./scripts/check-cpython-compatibility /path/to/python3.15.0rc2 3.15
 ```
 
-The gate checks 2,451 `.py` fixtures from Ruff's parser, linter, formatter, and
-ty semantic resources. Ruff's dependencies, lockfile, and clean submodule must
-all match revision `e4a063a136ae0e3d6801bd0dad47d09a0f419530`. All four gates
-run in CI with these frozen outcomes:
+The baseline covers 2,470 `.py` fixtures from Ruff's parser, linter, formatter,
+and ty semantic resources. Ruff's dependencies, lockfile, and clean submodule
+must all match revision `62914c4b9b79a9e5004374a9c482ad2ed69290e1`.
 
 | CPython   | Byte-identical accepted | CPython-rejected | Matched rejections | Serc accepted | Compiler failures |
 | --------- | ----------------------: | ---------------: | -----------------: | ------------: | ----------------: |
-| 3.12.14   |                   2,174 |              277 |                267 |             8 |                 2 |
-| 3.13.15   |                   2,193 |              258 |                254 |             2 |                 2 |
-| 3.14.5    |                   2,230 |              221 |                217 |             2 |                 2 |
-| 3.15.0rc2 |                   2,249 |              202 |                199 |             1 |                 2 |
+| 3.12.14   |                   2,190 |              280 |                269 |             9 |                 2 |
+| 3.13.15   |                   2,209 |              261 |                256 |             3 |                 2 |
+| 3.14.5    |                   2,246 |              224 |                219 |             3 |                 2 |
+| 3.15.0rc2 |                   2,266 |              204 |                200 |             2 |                 2 |
 
 The last three columns partition CPython-rejected inputs and expose existing
 rejection discrepancies. All other failure categories must be zero. Every

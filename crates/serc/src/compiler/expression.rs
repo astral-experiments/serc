@@ -4,8 +4,9 @@ use std::rc::Rc;
 use ruff_python_ast::token::TokenKind;
 use ruff_python_ast::visitor::{Visitor, walk_expr};
 use ruff_python_ast::{
-    BoolOp, CmpOp, ConversionFlag, Expr, ExprBinOp, ExprContext, ExprIf, FStringPart, Identifier,
-    InterpolatedStringElement, Keyword, Number, Operator, Pattern, Singleton, Stmt, UnaryOp,
+    BoolOp, CmpOp, ConversionFlag, Expr, ExprBinOp, ExprContext, ExprIf, FStringPartRef,
+    Identifier, InterpolatedStringElement, Keyword, Number, Operator, Pattern, Singleton, Stmt,
+    UnaryOp,
 };
 use ruff_text_size::Ranged;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -273,7 +274,7 @@ pub(super) fn fstring_components<'ast>(
     let mut pending = None;
     for part in &fstring.value {
         match part {
-            FStringPart::Literal(literal) => PendingInterpolatedLiteral::append(
+            FStringPartRef::Literal(literal) => PendingInterpolatedLiteral::append(
                 &mut pending,
                 source,
                 &literal.value,
@@ -281,7 +282,7 @@ pub(super) fn fstring_components<'ast>(
                 literal.range,
                 literal.flags.prefix().is_raw(),
             ),
-            FStringPart::FString(fstring) => append_interpolated_elements(
+            FStringPartRef::FString(fstring) => append_interpolated_elements(
                 &fstring.elements,
                 fstring.flags.prefix().is_raw(),
                 source,
@@ -393,14 +394,18 @@ impl Compiler<'_> {
             return false;
         }
         let (generators, key, value) = match assignment.value.as_ref() {
-            Expr::ListComp(comprehension) => {
-                (&comprehension.generators, None, comprehension.elt.as_ref())
-            }
-            Expr::SetComp(comprehension) => {
-                (&comprehension.generators, None, comprehension.elt.as_ref())
-            }
+            Expr::ListComp(comprehension) => (
+                &comprehension.generators[..],
+                None,
+                comprehension.elt.as_ref(),
+            ),
+            Expr::SetComp(comprehension) => (
+                &comprehension.generators[..],
+                None,
+                comprehension.elt.as_ref(),
+            ),
             Expr::DictComp(comprehension) => (
-                &comprehension.generators,
+                &comprehension.generators[..],
                 comprehension.key.as_deref(),
                 comprehension.value.as_ref(),
             ),
@@ -474,7 +479,7 @@ impl Compiler<'_> {
                 if pattern.pattern.is_none() && pattern.name.is_some())
             && matches!(guard, Expr::Compare(comparison)
                 if comparison.ops.len() == 2
-                    && !(matches!(comparison.comparators.last(), Some(Expr::NoneLiteral(_)))
+                    && !(matches!(comparison.comparators().last(), Some(Expr::NoneLiteral(_)))
                         && matches!(comparison.ops.last(), Some(CmpOp::Is | CmpOp::IsNot))))
             && matches!(body, [Stmt::Return(returned)]
                 if self.is_direct_global_attribute_return(returned))
@@ -1545,6 +1550,14 @@ impl Compiler<'_> {
                 if let Some(constant) =
                     fold_constant_for_version(&pattern.value, self.context.python_version)
                 {
+                    // CPython omits unary plus from literal patterns' expression AST,
+                    // so the constant load uses the numeric operand's location.
+                    if let Expr::UnaryOp(unary) = pattern.value.as_ref()
+                        && unary.op == UnaryOp::UAdd
+                    {
+                        self.assembler
+                            .set_location(self.source_location(unary.operand.range()));
+                    }
                     self.emit_preprocessed_constant(&pattern.value, constant)?;
                 } else {
                     self.compile_expression(&pattern.value)?;
@@ -2355,7 +2368,7 @@ impl Compiler<'_> {
             Expr::Slice(slice) => self.compile_slice(slice)?,
             Expr::FString(fstring) => self.compile_fstring(fstring)?,
             Expr::ListComp(comprehension) => self.compile_comprehension(
-                &comprehension.generators,
+                &comprehension.generators[..],
                 None,
                 &comprehension.elt,
                 BUILD_LIST,
@@ -2363,7 +2376,7 @@ impl Compiler<'_> {
                 false,
             )?,
             Expr::SetComp(comprehension) => self.compile_comprehension(
-                &comprehension.generators,
+                &comprehension.generators[..],
                 None,
                 &comprehension.elt,
                 BUILD_SET,
@@ -2371,7 +2384,7 @@ impl Compiler<'_> {
                 false,
             )?,
             Expr::DictComp(comprehension) => self.compile_comprehension(
-                &comprehension.generators,
+                &comprehension.generators[..],
                 comprehension.key.as_deref(),
                 &comprehension.value,
                 BUILD_MAP,
@@ -3617,7 +3630,7 @@ impl Compiler<'_> {
         let super_index = self.name_index("super")?;
         self.emit(LOAD_GLOBAL, super_index << 1, 1)?;
         self.assembler
-            .set_location(self.source_location(call.range));
+            .set_location(self.source_location(call.range()));
         self.emit(LOAD_DEREF, class_index, 1)?;
         let receiver_opcode = if first_parameter_is_cell {
             LOAD_DEREF
@@ -5108,8 +5121,8 @@ impl Compiler<'_> {
         comparison: &ruff_python_ast::ExprCompare,
         element_location: SourceLocation,
     ) -> Result<(), CompileError> {
-        let left_location = self.source_location(comparison.left.range());
-        let none_location = self.source_location(comparison.comparators[0].range());
+        let left_location = self.source_location(comparison.first_operand().range());
+        let none_location = self.source_location(comparison.comparators()[0].range());
         if left_location.line == none_location.line {
             let comparison_location = self.source_location(comparison.range);
             if element_location.line != comparison_location.line
@@ -5240,10 +5253,10 @@ impl Compiler<'_> {
         }
         if let Expr::Compare(comparison) = condition
             && comparison.ops.len() == 1
-            && matches!(comparison.comparators[0], Expr::NoneLiteral(_))
+            && matches!(comparison.comparators()[0], Expr::NoneLiteral(_))
             && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
         {
-            self.compile_expression(&comparison.left)?;
+            self.compile_expression(comparison.first_operand())?;
             self.add_constant(Constant::None)?;
             self.emit_multiline_none_filter_nops(
                 comparison,
@@ -5456,10 +5469,10 @@ impl Compiler<'_> {
         }
         if let Expr::Compare(comparison) = operand
             && comparison.ops.len() == 1
-            && matches!(comparison.comparators[0], Expr::NoneLiteral(_))
+            && matches!(comparison.comparators()[0], Expr::NoneLiteral(_))
             && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
         {
-            self.compile_expression(&comparison.left)?;
+            self.compile_expression(comparison.first_operand())?;
             self.add_constant(Constant::None)?;
             self.emit_multiline_none_filter_nops(comparison, element_location)?;
             let exclusion_start = self.assembler.label();
@@ -5557,7 +5570,7 @@ impl Compiler<'_> {
         let comparison_location = self.source_location(comparison.range);
         self.compile_conditional_comparison_prefix(comparison, cleanup)?;
 
-        let last = comparison.comparators.last().unwrap();
+        let last = comparison.comparators().last().unwrap();
         let operator = *comparison.ops.last().unwrap();
         let none_jump =
             matches!(last, Expr::NoneLiteral(_)) && matches!(operator, CmpOp::Is | CmpOp::IsNot);
@@ -5835,9 +5848,9 @@ impl Compiler<'_> {
                 && matches!(leading, [Expr::Compare(comparison)]
                     if comparison.ops.len() == 1
                         && comparison.ops[0] == CmpOp::Is
-                        && matches!(comparison.left.as_ref(), Expr::Name(_) | Expr::Attribute(_))
-                        && comparison.comparators.len() == 1
-                        && matches!(comparison.comparators[0], Expr::NoneLiteral(_)))
+                        && matches!(comparison.first_operand(), Expr::Name(_) | Expr::Attribute(_))
+                        && comparison.comparators().len() == 1
+                        && matches!(comparison.comparators()[0], Expr::NoneLiteral(_)))
                 && (matches!(last, Expr::Call(call) if matches!(call.func.as_ref(), Expr::Attribute(_)))
                     || matches!(last, Expr::Compare(_)))
                 && self.assembler.location().line < self.source_location(leading[0].range()).line;
@@ -5887,10 +5900,10 @@ impl Compiler<'_> {
         }
         if let Expr::Compare(comparison) = condition
             && comparison.ops.len() == 1
-            && matches!(comparison.comparators[0], Expr::NoneLiteral(_))
+            && matches!(comparison.comparators()[0], Expr::NoneLiteral(_))
             && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
         {
-            self.compile_expression(&comparison.left)?;
+            self.compile_expression(comparison.first_operand())?;
             self.add_constant(Constant::None)?;
             self.emit_multiline_none_filter_nops(comparison, element_location)?;
             let exclusion_start = self.assembler.label();
@@ -7010,7 +7023,7 @@ impl Compiler<'_> {
             && matches!(expression.test.as_ref(), Expr::Compare(comparison)
                 if comparison.ops.len() == 1
                     && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
-                    && matches!(comparison.comparators[0], Expr::NoneLiteral(_)));
+                    && matches!(comparison.comparators()[0], Expr::NoneLiteral(_)));
         let preserve_generator_loop_condition_owner =
             self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
                 && self.control.in_iterator_loop()
@@ -7072,9 +7085,9 @@ impl Compiler<'_> {
                     && matches!(boolean.values.as_slice(), [Expr::Compare(first), Expr::Compare(_)]
                         if first.ops.len() == 1
                             && matches!(first.ops[0], CmpOp::Is | CmpOp::IsNot)
-                            && matches!(first.left.as_ref(), Expr::Name(_))
-                            && first.comparators.len() == 1
-                            && matches!(first.comparators[0], Expr::NoneLiteral(_))));
+                            && matches!(first.first_operand(), Expr::Name(_))
+                            && first.comparators().len() == 1
+                            && matches!(first.comparators()[0], Expr::NoneLiteral(_))));
         let include_scoped_none_condition_owner =
             preserve_unfiltered_comprehension_leading_none_owner
                 || self.control.conditions.include_scoped_none_condition_owner;
@@ -7923,11 +7936,11 @@ impl Compiler<'_> {
         comparison: &ruff_python_ast::ExprCompare,
         cleanup: Label,
     ) -> Result<(), CompileError> {
-        self.compile_expression(&comparison.left)?;
+        self.compile_expression(comparison.first_operand())?;
         for (operator, comparator) in comparison
             .ops
             .iter()
-            .zip(&comparison.comparators)
+            .zip(comparison.comparators())
             .take(comparison.ops.len() - 1)
         {
             self.compile_expression(comparator)?;
@@ -7946,9 +7959,9 @@ impl Compiler<'_> {
         &mut self,
         expression: &ruff_python_ast::ExprCompare,
     ) -> Result<(), CompileError> {
-        self.compile_expression(&expression.left)?;
+        self.compile_expression(expression.first_operand())?;
         if expression.ops.len() == 1 {
-            self.compile_comparison_rhs(expression.ops[0], &expression.comparators[0])?;
+            self.compile_comparison_rhs(expression.ops[0], &expression.comparators()[0])?;
             let (opcode, argument) =
                 comparison_operator(expression.ops[0], self.context.python_version);
             return self.emit(opcode, argument, -1);
@@ -7963,7 +7976,7 @@ impl Compiler<'_> {
         for (operator, comparator) in expression
             .ops
             .iter()
-            .zip(&expression.comparators)
+            .zip(expression.comparators())
             .take(expression.ops.len() - 1)
         {
             self.compile_expression(comparator)?;
@@ -8004,7 +8017,7 @@ impl Compiler<'_> {
             self.emit(POP_TOP, 0, -1)?;
         }
         let operator = *expression.ops.last().unwrap();
-        self.compile_comparison_rhs(operator, expression.comparators.last().unwrap())?;
+        self.compile_comparison_rhs(operator, expression.comparators().last().unwrap())?;
         let (opcode, argument) = comparison_operator(operator, self.context.python_version);
         self.emit(opcode, argument, -1)?;
         let end = self.assembler.label();
@@ -8267,7 +8280,7 @@ impl Compiler<'_> {
                 expression,
                 Expr::Compare(comparison)
                     if comparison.ops.len() != 1
-                        || matches!(comparison.comparators[0], Expr::NoneLiteral(_))
+                        || matches!(comparison.comparators()[0], Expr::NoneLiteral(_))
                             && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
             )
         {
@@ -8275,11 +8288,11 @@ impl Compiler<'_> {
         }
 
         let comparison_is_boolean = if let Expr::Compare(comparison) = expression {
-            self.compile_simple_expression_operand(&comparison.left)?;
+            self.compile_simple_expression_operand(comparison.first_operand())?;
             if matches!(comparison.ops[0], CmpOp::In | CmpOp::NotIn) {
-                self.compile_comparison_rhs(comparison.ops[0], &comparison.comparators[0])?;
+                self.compile_comparison_rhs(comparison.ops[0], &comparison.comparators()[0])?;
             } else {
-                self.compile_simple_expression_operand(&comparison.comparators[0])?;
+                self.compile_simple_expression_operand(&comparison.comparators()[0])?;
             }
             self.assembler
                 .set_location(self.source_location(expression.range()));
@@ -8694,7 +8707,7 @@ impl Compiler<'_> {
             );
             self.compile_conditional_comparison_prefix(comparison, cleanup)?;
 
-            let final_comparator = comparison.comparators.last().unwrap();
+            let final_comparator = comparison.comparators().last().unwrap();
             let final_operator = *comparison.ops.last().unwrap();
             let specialized_none_jump = matches!(final_comparator, Expr::NoneLiteral(_))
                 && matches!(final_operator, CmpOp::Is | CmpOp::IsNot);
@@ -8788,13 +8801,13 @@ impl Compiler<'_> {
         }
         if let Expr::Compare(comparison) = expression
             && comparison.ops.len() == 1
-            && matches!(comparison.comparators[0], Expr::NoneLiteral(_))
+            && matches!(comparison.comparators()[0], Expr::NoneLiteral(_))
             && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
         {
-            self.compile_expression(&comparison.left)?;
+            self.compile_expression(comparison.first_operand())?;
             self.add_constant(Constant::None)?;
-            let left_location = self.source_location(comparison.left.range());
-            let none_location = self.source_location(comparison.comparators[0].range());
+            let left_location = self.source_location(comparison.first_operand().range());
+            let none_location = self.source_location(comparison.comparators()[0].range());
             // CPython compacts the specialized LOAD_CONST(None) against the
             // preceding instruction in its original block, whose line need not
             // be the start of a multiline operand (for example, LOAD_ATTR).
@@ -8899,8 +8912,8 @@ impl Compiler<'_> {
         let comparison_is_boolean = if let Expr::Compare(comparison) = expression
             && comparison.ops.len() == 1
         {
-            self.compile_expression(&comparison.left)?;
-            self.compile_comparison_rhs(comparison.ops[0], &comparison.comparators[0])?;
+            self.compile_expression(comparison.first_operand())?;
+            self.compile_comparison_rhs(comparison.ops[0], &comparison.comparators()[0])?;
             self.assembler
                 .set_location(self.source_location(expression.range()));
             self.emit_boolean_comparison(comparison.ops[0])?;
@@ -9290,7 +9303,7 @@ fn comprehension_condition_has_trailing_none(expression: &Expr) -> bool {
         Expr::Compare(comparison) => {
             comparison.ops.len() == 1
                 && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
-                && matches!(comparison.comparators[0], Expr::NoneLiteral(_))
+                && matches!(comparison.comparators()[0], Expr::NoneLiteral(_))
         }
         _ => false,
     }

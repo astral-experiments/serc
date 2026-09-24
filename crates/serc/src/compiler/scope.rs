@@ -2599,7 +2599,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                     self.facts
                         .comprehension_cell_names
                         .extend(comprehension_cell_names(
-                            &comprehension.generators,
+                            &comprehension.generators[..],
                             None,
                             &comprehension.elt,
                         ));
@@ -2608,7 +2608,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                     self.facts
                         .comprehension_cell_names
                         .extend(comprehension_cell_names(
-                            &comprehension.generators,
+                            &comprehension.generators[..],
                             None,
                             &comprehension.elt,
                         ));
@@ -2617,7 +2617,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                     self.facts
                         .comprehension_cell_names
                         .extend(comprehension_cell_names(
-                            &comprehension.generators,
+                            &comprehension.generators[..],
                             comprehension.key.as_deref(),
                             &comprehension.value,
                         ));
@@ -2910,14 +2910,18 @@ impl LocalCollector {
         impl<'ast> Visitor<'ast> for Collector<'_> {
             fn visit_expr(&mut self, expression: &'ast Expr) {
                 let (generators, key, value) = match expression {
-                    Expr::ListComp(comprehension) => {
-                        (&comprehension.generators, None, comprehension.elt.as_ref())
-                    }
-                    Expr::SetComp(comprehension) => {
-                        (&comprehension.generators, None, comprehension.elt.as_ref())
-                    }
+                    Expr::ListComp(comprehension) => (
+                        &comprehension.generators[..],
+                        None,
+                        comprehension.elt.as_ref(),
+                    ),
+                    Expr::SetComp(comprehension) => (
+                        &comprehension.generators[..],
+                        None,
+                        comprehension.elt.as_ref(),
+                    ),
                     Expr::DictComp(comprehension) => (
-                        &comprehension.generators,
+                        &comprehension.generators[..],
                         comprehension.key.as_deref(),
                         comprehension.value.as_ref(),
                     ),
@@ -3520,9 +3524,9 @@ impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
             }
         }
         let generators = match expression {
-            Expr::ListComp(comprehension) => Some(comprehension.generators.as_slice()),
-            Expr::SetComp(comprehension) => Some(comprehension.generators.as_slice()),
-            Expr::DictComp(comprehension) => Some(comprehension.generators.as_slice()),
+            Expr::ListComp(comprehension) => Some(&comprehension.generators[..]),
+            Expr::SetComp(comprehension) => Some(&comprehension.generators[..]),
+            Expr::DictComp(comprehension) => Some(&comprehension.generators[..]),
             _ => None,
         };
         if let Some(generators) = generators {
@@ -4341,17 +4345,17 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
         if self.generator_depth == 0 {
             let comprehension = match expression {
                 Expr::ListComp(comprehension) => Some((
-                    comprehension.generators.as_slice(),
+                    &comprehension.generators[..],
                     None,
                     comprehension.elt.as_ref(),
                 )),
                 Expr::SetComp(comprehension) => Some((
-                    comprehension.generators.as_slice(),
+                    &comprehension.generators[..],
                     None,
                     comprehension.elt.as_ref(),
                 )),
                 Expr::DictComp(comprehension) => Some((
-                    comprehension.generators.as_slice(),
+                    &comprehension.generators[..],
                     comprehension.key.as_deref(),
                     comprehension.value.as_ref(),
                 )),
@@ -4485,13 +4489,13 @@ impl<'ast> Visitor<'ast> for ReferenceCollector {
                 Some(generator.generators.as_slice())
             }
             Expr::ListComp(comprehension) if self.skip_inlined_comprehension_bodies => {
-                Some(comprehension.generators.as_slice())
+                Some(&comprehension.generators[..])
             }
             Expr::SetComp(comprehension) if self.skip_inlined_comprehension_bodies => {
-                Some(comprehension.generators.as_slice())
+                Some(&comprehension.generators[..])
             }
             Expr::DictComp(comprehension) if self.skip_inlined_comprehension_bodies => {
-                Some(comprehension.generators.as_slice())
+                Some(&comprehension.generators[..])
             }
             _ => None,
         };
@@ -4843,14 +4847,18 @@ pub(super) fn annotation_comprehension_requirements(
     impl<'ast> Visitor<'ast> for Collector {
         fn visit_expr(&mut self, expression: &'ast Expr) {
             let (generators, key, value) = match expression {
-                Expr::ListComp(comprehension) => {
-                    (&comprehension.generators, None, comprehension.elt.as_ref())
-                }
-                Expr::SetComp(comprehension) => {
-                    (&comprehension.generators, None, comprehension.elt.as_ref())
-                }
+                Expr::ListComp(comprehension) => (
+                    &comprehension.generators[..],
+                    None,
+                    comprehension.elt.as_ref(),
+                ),
+                Expr::SetComp(comprehension) => (
+                    &comprehension.generators[..],
+                    None,
+                    comprehension.elt.as_ref(),
+                ),
                 Expr::DictComp(comprehension) => (
-                    &comprehension.generators,
+                    &comprehension.generators[..],
                     comprehension.key.as_deref(),
                     comprehension.value.as_ref(),
                 ),
@@ -4898,9 +4906,9 @@ pub(super) fn expression_requirements_outside_comprehensions(
     impl<'ast> Visitor<'ast> for Collector {
         fn visit_expr(&mut self, expression: &'ast Expr) {
             let generators = match expression {
-                Expr::ListComp(comprehension) => Some(comprehension.generators.as_slice()),
-                Expr::SetComp(comprehension) => Some(comprehension.generators.as_slice()),
-                Expr::DictComp(comprehension) => Some(comprehension.generators.as_slice()),
+                Expr::ListComp(comprehension) => Some(&comprehension.generators[..]),
+                Expr::SetComp(comprehension) => Some(&comprehension.generators[..]),
+                Expr::DictComp(comprehension) => Some(&comprehension.generators[..]),
                 Expr::Lambda(lambda) => {
                     visit_lambda_defaults(self, lambda);
                     self.required.extend(analyze_lambda_scope(lambda).required);
@@ -5282,14 +5290,18 @@ fn comprehension_symbol_names(
     impl<'ast> Visitor<'ast> for Collector<'_> {
         fn visit_expr(&mut self, expression: &'ast Expr) {
             let (generators, key, value) = match expression {
-                Expr::ListComp(comprehension) => {
-                    (&comprehension.generators, None, comprehension.elt.as_ref())
-                }
-                Expr::SetComp(comprehension) => {
-                    (&comprehension.generators, None, comprehension.elt.as_ref())
-                }
+                Expr::ListComp(comprehension) => (
+                    &comprehension.generators[..],
+                    None,
+                    comprehension.elt.as_ref(),
+                ),
+                Expr::SetComp(comprehension) => (
+                    &comprehension.generators[..],
+                    None,
+                    comprehension.elt.as_ref(),
+                ),
                 Expr::DictComp(comprehension) => (
-                    &comprehension.generators,
+                    &comprehension.generators[..],
                     comprehension.key.as_deref(),
                     comprehension.value.as_ref(),
                 ),
@@ -5446,14 +5458,18 @@ pub(super) fn comprehension_name_bindings(
     impl<'ast> Visitor<'ast> for Collector {
         fn visit_expr(&mut self, expression: &'ast Expr) {
             let (generators, key, value) = match expression {
-                Expr::ListComp(comprehension) => {
-                    (&comprehension.generators, None, comprehension.elt.as_ref())
-                }
-                Expr::SetComp(comprehension) => {
-                    (&comprehension.generators, None, comprehension.elt.as_ref())
-                }
+                Expr::ListComp(comprehension) => (
+                    &comprehension.generators[..],
+                    None,
+                    comprehension.elt.as_ref(),
+                ),
+                Expr::SetComp(comprehension) => (
+                    &comprehension.generators[..],
+                    None,
+                    comprehension.elt.as_ref(),
+                ),
                 Expr::DictComp(comprehension) => (
-                    &comprehension.generators,
+                    &comprehension.generators[..],
                     comprehension.key.as_deref(),
                     comprehension.value.as_ref(),
                 ),
@@ -5519,13 +5535,13 @@ fn comprehension_bindings_in_private_context(
 ) -> BTreeMap<String, bool> {
     let collect = |expression: &Expr| match expression {
         Expr::ListComp(comprehension) => {
-            comprehension_name_bindings(&comprehension.generators, None, &comprehension.elt)
+            comprehension_name_bindings(&comprehension.generators[..], None, &comprehension.elt)
         }
         Expr::SetComp(comprehension) => {
-            comprehension_name_bindings(&comprehension.generators, None, &comprehension.elt)
+            comprehension_name_bindings(&comprehension.generators[..], None, &comprehension.elt)
         }
         Expr::DictComp(comprehension) => comprehension_name_bindings(
-            &comprehension.generators,
+            &comprehension.generators[..],
             comprehension.key.as_deref(),
             &comprehension.value,
         ),
@@ -5573,9 +5589,9 @@ pub(super) fn collect_nested_comprehension_target_names(
     impl<'ast> Visitor<'ast> for Collector<'_> {
         fn visit_expr(&mut self, expression: &'ast Expr) {
             let generators = match expression {
-                Expr::ListComp(comprehension) => Some(comprehension.generators.as_slice()),
-                Expr::SetComp(comprehension) => Some(comprehension.generators.as_slice()),
-                Expr::DictComp(comprehension) => Some(comprehension.generators.as_slice()),
+                Expr::ListComp(comprehension) => Some(&comprehension.generators[..]),
+                Expr::SetComp(comprehension) => Some(&comprehension.generators[..]),
+                Expr::DictComp(comprehension) => Some(&comprehension.generators[..]),
                 Expr::Generator(generator) => {
                     if let Some(first) = generator.generators.first() {
                         self.visit_expr(&first.iter);
@@ -5610,9 +5626,9 @@ pub(super) fn collect_self_iterated_nested_comprehension_targets(
     impl<'ast> Visitor<'ast> for Collector<'_> {
         fn visit_expr(&mut self, expression: &'ast Expr) {
             let generators = match expression {
-                Expr::ListComp(comprehension) => Some(comprehension.generators.as_slice()),
-                Expr::SetComp(comprehension) => Some(comprehension.generators.as_slice()),
-                Expr::DictComp(comprehension) => Some(comprehension.generators.as_slice()),
+                Expr::ListComp(comprehension) => Some(&comprehension.generators[..]),
+                Expr::SetComp(comprehension) => Some(&comprehension.generators[..]),
+                Expr::DictComp(comprehension) => Some(&comprehension.generators[..]),
                 Expr::Generator(_) | Expr::Lambda(_) => return,
                 _ => None,
             };
@@ -5708,17 +5724,17 @@ pub(super) fn inlined_comprehension_cell_names_in_expression(
         fn visit_expr(&mut self, expression: &'ast Expr) {
             match expression {
                 Expr::ListComp(comprehension) => self.names.extend(comprehension_cell_names(
-                    &comprehension.generators,
+                    &comprehension.generators[..],
                     None,
                     &comprehension.elt,
                 )),
                 Expr::SetComp(comprehension) => self.names.extend(comprehension_cell_names(
-                    &comprehension.generators,
+                    &comprehension.generators[..],
                     None,
                     &comprehension.elt,
                 )),
                 Expr::DictComp(comprehension) => self.names.extend(comprehension_cell_names(
-                    &comprehension.generators,
+                    &comprehension.generators[..],
                     comprehension.key.as_deref(),
                     &comprehension.value,
                 )),

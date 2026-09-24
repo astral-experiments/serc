@@ -4,7 +4,6 @@ Run the following commands from a checkout cloned with `--recurse-submodules`:
 
 ```console
 cargo fmt --all --check
-npx prettier@3.9.0 --check .
 ./scripts/check-python-style
 SERC_TEST_PYTHON_312=/path/to/python3.12.14 \
 SERC_TEST_PYTHON_313=/path/to/python3.13.15 \
@@ -16,12 +15,8 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
 Oracle-dependent tests use the four executable paths above. Each interpreter is
 checked against its exact release and bytecode magic number. CI also checks
-generated target metadata. The Python style gate requires exactly Ruff 0.15.15;
-install it with `python3 -m pip install ruff==0.15.15`.
-
-The Prettier check requires Node.js and npm. Run `npx prettier@3.9.0 --write .`
-to format Markdown, YAML, JSON, and other supported files. Vendored sources,
-build output, and generated corpus data and CPython fixtures are excluded.
+generated target metadata. The Python style gate requires exactly Ruff 0.16.8;
+install it with `python3 -m pip install ruff==0.16.8`.
 
 `./scripts/check-ruff-pin` verifies that the Cargo manifest, lockfile, submodule
 gitlink, and initialized, clean Ruff submodule all use the same revision.

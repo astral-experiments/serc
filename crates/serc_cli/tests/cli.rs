@@ -184,6 +184,43 @@ fn compile_rejects_unsupported_python_version() {
 }
 
 #[test]
+fn unary_plus_patterns_match_cpython_315_marshal() {
+    for pattern in [
+        "+1",
+        "+1.5",
+        "+1j",
+        "+1+2j",
+        "-1",
+        "{+1: +2}",
+        "[+1, +2.5]",
+        "+1 | +2",
+    ] {
+        let source = format!(
+            "def f(subject):\n    match subject:\n        case {pattern}:\n            return True\n        case _:\n            return False\n"
+        );
+        let native = common::python_315_command()
+            .args([
+                "-c",
+                "import marshal, sys; code = compile(sys.argv[1], 'patterns.py', 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))",
+                &source,
+            ])
+            .output()
+            .unwrap();
+        assert!(native.status.success(), "{pattern}: {native:?}");
+        let compiled = serc::compile_with_options(
+            &source,
+            "patterns.py",
+            &serc::CompileOptions {
+                python_version: serc::PythonVersion::Py315,
+                ..serc::CompileOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(compiled.marshal(), native.stdout, "{pattern}");
+    }
+}
+
+#[test]
 fn compile_preserves_template_not_equal_expression_text() {
     let source = r#"a, b, c = 1, 2, 3
 cases = (

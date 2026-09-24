@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.94.0"
+rust-version = "1.96.0"
 homepage = "https://github.com/astral-sh/serc"
 repository = "https://github.com/astral-sh/serc"
 authors = ["Charlie Marsh"]
@@ -18,13 +18,13 @@ encoding_rs = "0.8.35"
 hashbrown = { version = "0.17.1", default-features = false }
 libmimalloc-sys = { version = "0.1.49", default-features = false }
 mimalloc = { version = "0.1.52", default-features = false }
-ruff_index = { git = "https://github.com/astral-sh/ruff", rev = "e4a063a136ae0e3d6801bd0dad47d09a0f419530" }
-ruff_python_ast = { git = "https://github.com/astral-sh/ruff", rev = "e4a063a136ae0e3d6801bd0dad47d09a0f419530" }
-ruff_python_codegen = { git = "https://github.com/astral-sh/ruff", rev = "e4a063a136ae0e3d6801bd0dad47d09a0f419530" }
-ruff_python_literal = { git = "https://github.com/astral-sh/ruff", rev = "e4a063a136ae0e3d6801bd0dad47d09a0f419530" }
-ruff_python_parser = { git = "https://github.com/astral-sh/ruff", rev = "e4a063a136ae0e3d6801bd0dad47d09a0f419530" }
-ruff_source_file = { git = "https://github.com/astral-sh/ruff", rev = "e4a063a136ae0e3d6801bd0dad47d09a0f419530" }
-ruff_text_size = { git = "https://github.com/astral-sh/ruff", rev = "e4a063a136ae0e3d6801bd0dad47d09a0f419530" }
+ruff_index = { version = "=0.0.14", git = "https://github.com/astral-sh/ruff", rev = "62914c4b9b79a9e5004374a9c482ad2ed69290e1" }
+ruff_python_ast = { version = "=0.0.14", git = "https://github.com/astral-sh/ruff", rev = "62914c4b9b79a9e5004374a9c482ad2ed69290e1" }
+ruff_python_codegen = { version = "=0.0.14", git = "https://github.com/astral-sh/ruff", rev = "62914c4b9b79a9e5004374a9c482ad2ed69290e1" }
+ruff_python_literal = { version = "=0.0.14", git = "https://github.com/astral-sh/ruff", rev = "62914c4b9b79a9e5004374a9c482ad2ed69290e1" }
+ruff_python_parser = { version = "=0.0.14", git = "https://github.com/astral-sh/ruff", rev = "62914c4b9b79a9e5004374a9c482ad2ed69290e1" }
+ruff_source_file = { version = "=0.0.14", git = "https://github.com/astral-sh/ruff", rev = "62914c4b9b79a9e5004374a9c482ad2ed69290e1" }
+ruff_text_size = { version = "=0.0.14", git = "https://github.com/astral-sh/ruff", rev = "62914c4b9b79a9e5004374a9c482ad2ed69290e1" }
 rustc-hash = "2.0.0"
 smallvec = "1.15.2"
 

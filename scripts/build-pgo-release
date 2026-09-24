@@ -328,8 +328,8 @@ def main():
         # Use the comparator's default roots; keep expectations in sync with
         # check-cpython-compatibility (3.14).
         outcomes = {
-            "matched-rejection": 217,
-            "rejection-mismatch": 2,
+            "matched-rejection": 219,
+            "rejection-mismatch": 3,
             "byte-mismatch": 0,
             "unsupported": 0,
             "parse-mismatch": 0,
@@ -350,11 +350,11 @@ def main():
                 "--python-version",
                 "3.14",
                 "--expected-files",
-                "2451",
+                "2470",
                 "--expected-exact",
-                "2230",
+                "2246",
                 "--expected-cpython-rejected",
-                "221",
+                "224",
                 *expectations,
                 "--require-all",
             ],

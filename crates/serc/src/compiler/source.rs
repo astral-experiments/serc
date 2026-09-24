@@ -9,8 +9,8 @@ use ruff_python_ast::visitor::transformer::{Transformer, walk_expr as transform_
 use ruff_python_ast::visitor::walk_stmt;
 use ruff_python_ast::visitor::{Visitor, walk_expr};
 use ruff_python_ast::{
-    Expr, ExprContext, FStringPart, InterpolatedStringElement, Operator, Stmt, StringLiteralFlags,
-    StringLiteralValue, Suite,
+    Expr, ExprContext, FStringPartRef, InterpolatedStringElement, Operator, Stmt,
+    StringLiteralFlags, StringLiteralValue, Suite,
 };
 use ruff_python_codegen::{Generator, Indentation, Mode as CodegenMode};
 use ruff_source_file::{LineEnding, LineIndex};
@@ -1358,10 +1358,10 @@ impl Compiler<'_> {
         let mut only_interpolation = None;
         for part in &fstring.value {
             match part {
-                FStringPart::Literal(literal) => {
+                FStringPartRef::Literal(literal) => {
                     pending_literal |= !literal.value.is_empty();
                 }
-                FStringPart::FString(fstring) => {
+                FStringPartRef::FString(fstring) => {
                     for element in &fstring.elements {
                         match element {
                             InterpolatedStringElement::Literal(literal) => {
@@ -1422,11 +1422,11 @@ impl Compiler<'_> {
 
     pub(super) fn call_opcode_location(&self, call: &ruff_python_ast::ExprCall) -> SourceLocation {
         let Expr::Attribute(attribute) = call.func.as_ref() else {
-            return self.source_location(call.range);
+            return self.source_location(call.range());
         };
         let attribute_location = self.source_location(attribute.range);
         if attribute_location.line == attribute_location.end_line {
-            return self.source_location(call.range);
+            return self.source_location(call.range());
         }
         self.call_opcode_location_with_method(call, self.call_shape(call).direct_method)
     }
@@ -1441,11 +1441,11 @@ impl Compiler<'_> {
             if attribute_location.line != attribute_location.end_line {
                 return self.source_location(ruff_text_size::TextRange::new(
                     attribute.attr.range().start(),
-                    call.range.end(),
+                    call.range().end(),
                 ));
             }
         }
-        self.source_location(call.range)
+        self.source_location(call.range())
     }
 
     pub(super) fn call_shape<'a>(&self, call: &'a ruff_python_ast::ExprCall) -> CallShape<'a> {
@@ -1546,8 +1546,8 @@ fn fstring_literal_span(
     };
     for part in &fstring.value {
         match part {
-            FStringPart::Literal(literal) => include(literal.range),
-            FStringPart::FString(fstring) => {
+            FStringPartRef::Literal(literal) => include(literal.range),
+            FStringPartRef::FString(fstring) => {
                 for element in &fstring.elements {
                     match element {
                         InterpolatedStringElement::Literal(literal) => {
@@ -1740,7 +1740,9 @@ pub(super) fn first_expression_instruction_range(
                 first_expression_instruction_range(expression, python_version)
             }),
         Expr::Call(call) => first_expression_instruction_range(&call.func, python_version),
-        Expr::Compare(compare) => first_expression_instruction_range(&compare.left, python_version),
+        Expr::Compare(compare) => {
+            first_expression_instruction_range(compare.first_operand(), python_version)
+        }
         Expr::If(conditional) => {
             first_expression_instruction_range(&conditional.test, python_version)
         }
@@ -1860,7 +1862,7 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
                     // ranges, while CPython's annotation unparser prints the AST argument
                     // list before its keyword list. These ranges only affect this clone's
                     // formatting order; the expressions retain their original source ranges.
-                    let end = call.range.end();
+                    let end = call.range().end();
                     for keyword in &mut call.arguments.keywords {
                         keyword.range = ruff_text_size::TextRange::empty(end);
                     }
@@ -2048,10 +2050,10 @@ fn unparse_annotation_fstring(string: &ruff_python_ast::ExprFString, source: &st
     let mut body = String::new();
     for part in &string.value {
         match part {
-            FStringPart::Literal(literal) => {
+            FStringPartRef::Literal(literal) => {
                 append_annotation_string_literal(&mut body, &literal.value);
             }
-            FStringPart::FString(part) => {
+            FStringPartRef::FString(part) => {
                 append_annotation_interpolations(&mut body, &part.elements, source, None);
             }
         }

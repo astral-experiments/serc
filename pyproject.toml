@@ -1,8 +1,71 @@
+[build-system]
+requires = ["maturin>=1.14.1,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "serc"
+version = "0.1.0"
+description = "A Rust compiler from Python source to CPython bytecode"
+authors = [{ name = "Astral Software Inc.", email = "hey@astral.sh" }]
+requires-python = ">=3.8"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-APACHE", "LICENSE-MIT"]
+readme = "README.md"
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Rust",
+  "Topic :: Software Development :: Compilers",
+]
+
+[project.urls]
+Repository = "https://github.com/astral-sh/serc"
+Releases = "https://github.com/astral-sh/serc/releases"
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "crates/serc_cli/Cargo.toml"
+module-name = "serc"
+python-source = "python"
+strip = true
+include = [
+  { path = "rust-toolchain.toml", format = "sdist" },
+  { path = "LICENSE-APACHE", format = "sdist" },
+  { path = "LICENSE-MIT", format = "sdist" },
+]
+
+[dependency-groups]
+release = ["rooster==0.1.1"]
+
+[tool.uv.dependency-groups]
+release = { requires-python = ">=3.12" }
+
+[tool.rooster]
+changelog-contributors = false
+major-labels = []
+minor-labels = ["breaking"]
+ignore-labels = ["internal", "internal:ci", "internal:testing", "internal:automations"]
+version-files = ["pyproject.toml", "crates/serc/Cargo.toml", "crates/serc_cli/Cargo.toml"]
+
+[tool.rooster.section-labels]
+"Breaking changes" = ["breaking"]
+"Enhancements" = ["enhancement", "compatibility"]
+"Performance" = ["performance"]
+"Bug fixes" = ["bug"]
+"Documentation" = ["documentation"]
+"Other changes" = ["__unknown__"]
+
 [tool.ruff]
-required-version = "==0.15.15"
+required-version = "==0.16.8"
 target-version = "py310"
 extend-include = ["scripts/build-pgo-release"]
 extend-exclude = ["crates/serc/tests/fixtures", "crates/serc_fixtures/resources", "vendor"]
+
+[tool.ruff.per-file-target-version]
+"python/**/*.py" = "py38"
+"scripts/*release*.py" = "py311"
 
 [tool.ruff.lint]
 select = [
