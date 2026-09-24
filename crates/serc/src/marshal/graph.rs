@@ -209,8 +209,9 @@ impl<'a> ObjectGraph<'a> {
         if graph.needs_reference_sorting {
             // Tuple members sort by complete marshal streams: their descendants' reference flags
             // depend on sharing across the entire code graph. Resolve that sharing before recording
-            // occurrences in the final member order. Python 3.12 also needs this pass for scalar
-            // members because it borrows their roots while computing sort keys.
+            // occurrences; explicitly interned scalar strings also sort by their interned tag.
+            // Python 3.12 also needs this pass for scalar members because it borrows their roots
+            // while computing sort keys.
             Self::build_for_code(code, python_version, initial_intern_state, Some(&graph))
         } else {
             graph
@@ -2379,6 +2380,20 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
         if let Constant::FrozenSet(values) = value {
             self.graph.needs_reference_sorting |=
                 (self.graph.python_version == PythonVersion::Py312 && values.len() > 1)
+                    || (values.len() > 1
+                        && values.iter().any(|value| {
+                            let Constant::String(value) = value else {
+                                return false;
+                            };
+                            !should_intern(value)
+                                && (self
+                                    .graph
+                                    .metadata_aliased_constants
+                                    .contains(&std::ptr::from_ref(value).addr())
+                                    || self
+                                        .explicitly_interned
+                                        .is_some_and(|values| values.contains(value.as_str())))
+                        }))
                     || (self.graph.uncached_percent_constant
                         && values
                             .iter()
