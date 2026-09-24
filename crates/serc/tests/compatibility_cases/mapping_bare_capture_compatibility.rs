@@ -22,6 +22,87 @@ def guarded_single(subject, use):
 }
 
 #[test]
+fn commits_mapping_captures_only_after_enclosing_patterns_succeed() {
+    let source = r"def guarded_sequence(value, condition):
+    a = 'initial'
+    match value:
+        case [{'x': a}, 0] if condition:
+            pass
+    return a
+
+def guarded_mapping(value, condition):
+    a = 'initial'
+    match value:
+        case {'nested': {'x': a}, 'tail': 0} if condition:
+            pass
+    return a
+
+def guarded_alternatives(value, condition):
+    a = 'initial'
+    match value:
+        case [{'x': a}, 0] | [{'x': a}, 2] if condition:
+            pass
+    return a
+
+def mixed_alternatives(value, condition):
+    a = 'initial'
+    match value:
+        case [{'x': a}, 0] | [_, a] if condition:
+            pass
+    return a
+
+def unguarded_alternatives(value, condition):
+    a = 'initial'
+    match value:
+        case [{'x': a}, 0] | [{'x': a}, 2]:
+            pass
+    return a
+
+def class_sequence(value, condition):
+    a = 'initial'
+    match value:
+        case [{'x': int() as a}, 0]:
+            pass
+    return a
+
+def class_alternatives(value, condition):
+    a = 'initial'
+    match value:
+        case [{'x': int() as a}, 0] | [{'x': int() as a}, 2]:
+            pass
+    return a
+
+def top_level_mapping(value, condition):
+    a = 'initial'
+    match value:
+        case {'x': a} if condition:
+            pass
+    return a
+
+def top_level_class(value, condition):
+    a = 'initial'
+    match value:
+        case {'x': int() as a} if condition:
+            pass
+    return a
+
+for f in (guarded_sequence, guarded_alternatives, mixed_alternatives,
+          unguarded_alternatives, class_sequence, class_alternatives):
+    print(f([{'x': 99}, 0], True), f([{'x': 99}, 1], True),
+          f([{'x': 99}, 2], True), f([{'x': 99}, 0], False))
+print(guarded_mapping({'nested': {'x': 99}, 'tail': 1}, True),
+      guarded_mapping({'nested': {'x': 99}, 'tail': 0}, False))
+for f in (top_level_mapping, top_level_class):
+    print(f({}, True), f({'x': 99}, False), f({'x': 99}, True))
+";
+    common::assert_matches_cpython_marshal(source, "enclosing_mapping_capture.py");
+    common::assert_executes(
+        source,
+        "99 initial initial 99\n99 initial 99 99\n99 1 2 99\n99 initial 99 99\n99 initial initial 99\n99 initial 99 99\ninitial 99\ninitial 99 99\ninitial 99 99\n",
+    );
+}
+
+#[test]
 fn preserves_mapping_literal_key_registration_order() {
     for prefix in ["", "    'documentation'\n", "    consume('prefix')\n"] {
         for key in ["'item'", "512", "-512", "3.5", "1+2j", "b'item'"] {

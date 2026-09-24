@@ -88,6 +88,7 @@ struct MatchContext {
     direct_loop_failure: Option<Label>,
     on_top: usize,
     ownerless_markers_after_specialized_none: bool,
+    top_level_mapping: Option<ruff_text_size::TextRange>,
     eager_final_mapping_capture: bool,
     empty_failure_jumps: Vec<(usize, usize, Option<Label>)>,
     empty_success_blocks: Vec<(Label, usize)>,
@@ -602,6 +603,10 @@ impl Compiler<'_> {
                 .then_some(end),
                 on_top: 0,
                 ownerless_markers_after_specialized_none: specialized_none_seen,
+                top_level_mapping: match &case.pattern {
+                    Pattern::MatchMapping(mapping) => Some(mapping.range),
+                    _ => None,
+                },
                 eager_final_mapping_capture: case.guard.is_some() && !copied_subject,
                 empty_failure_jumps: Vec::new(),
                 empty_success_blocks: Vec::new(),
@@ -1700,7 +1705,8 @@ impl Compiler<'_> {
                 on_top: 0,
                 ownerless_markers_after_specialized_none: context
                     .ownerless_markers_after_specialized_none,
-                eager_final_mapping_capture: context.eager_final_mapping_capture,
+                top_level_mapping: None,
+                eager_final_mapping_capture: false,
                 empty_failure_jumps: Vec::new(),
                 empty_success_blocks: Vec::new(),
             };
@@ -2028,6 +2034,7 @@ impl Compiler<'_> {
                 && let Pattern::MatchAs(capture) = subpattern
                 && let Some(name) = &capture.name
                 && capture.pattern.is_none()
+                && context.top_level_mapping == Some(pattern.range)
                 && context.eager_final_mapping_capture
             {
                 self.assembler
@@ -2036,6 +2043,7 @@ impl Compiler<'_> {
             } else if pattern.rest.is_none()
                 && pattern.keys.len() == 1
                 && context.stores.is_empty()
+                && context.top_level_mapping == Some(pattern.range)
                 && index + 1 == pattern.patterns.len()
                 && let Pattern::MatchAs(capture) = subpattern
                 && let Some(name) = &capture.name
@@ -2049,9 +2057,10 @@ impl Compiler<'_> {
                 self.emit(COPY, 1, 1)?;
                 self.compile_stack_pattern(inner, context)?;
                 context.on_top -= 1;
-                // With no pending captures, static swaps move this store ahead of the
-                // mapping cleanup. Otherwise keep the original rotation and deferred stores:
-                // their line boundaries can prevent the static-swap pass from moving it.
+                // Only a top-level mapping is guaranteed to have completed all structural
+                // checks; nested mappings must defer the store until their enclosing pattern
+                // succeeds. With no pending captures, static swaps can move this store ahead
+                // of the top-level mapping cleanup.
                 self.assembler
                     .set_location(self.source_location(pattern.range));
                 self.store_name(name.as_str())?;
