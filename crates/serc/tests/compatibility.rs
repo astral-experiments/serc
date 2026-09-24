@@ -109,6 +109,62 @@ def continuing_assignment(first, second):
     }
 
     #[test]
+    fn distinguishes_a_byte_order_mark_in_text_and_byte_source() {
+        use serc::{
+            CompileOptions, InitialInternState, PythonVersion, compile_bytes_with_options,
+            compile_with_intern_state, compile_with_options,
+        };
+
+        let text = "\u{feff}value = 1\r\n";
+        let expected_message = "invalid non-printable character U+FEFF";
+        let assert_rejected = |error: CompileError| {
+            assert!(error.to_string().contains(expected_message), "{error}");
+            assert_eq!(error.range().unwrap().start().to_u32(), 0);
+            assert_eq!(error.range().unwrap().end().to_u32(), 3);
+        };
+        assert_rejected(compile(text, "bom.py").unwrap_err());
+        assert_rejected(compile_to_pyc(text, "bom.py", 0).unwrap_err());
+        assert_rejected(
+            compile_with_intern_state(text, "bom.py", &InitialInternState::default()).unwrap_err(),
+        );
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let options = CompileOptions {
+                python_version,
+                ..CompileOptions::default()
+            };
+            assert_rejected(compile_with_options(text, "bom.py", &options).unwrap_err());
+            assert_eq!(
+                compile_bytes_with_options(text.as_bytes(), "bom.py", &options)
+                    .unwrap()
+                    .marshal(),
+                compile_with_options("value = 1\n", "bom.py", &options)
+                    .unwrap()
+                    .marshal(),
+            );
+        }
+
+        let output = super::common::python_3145_command()
+            .args([
+                "-c",
+                "try:\n compile(chr(0xfeff) + 'value = 1\\n', 'bom.py', 'exec')\nexcept SyntaxError as error:\n print(error.msg, error.lineno, error.offset)\nelse:\n raise AssertionError('accepted text BOM')",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            format!("{expected_message} 1 1"),
+        );
+        assert_matches_cpython_marshal_bytes(text.as_bytes(), "bom.py");
+        assert_matches_cpython_marshal("# \u{feff}\nvalue = '\u{feff}'\n", "literal_bom.py");
+    }
+
+    #[test]
     fn rejects_null_characters_in_text_source() {
         use serc::{
             CompileOptions, InitialInternState, PythonVersion, SourceDecodeError,
@@ -180,13 +236,21 @@ def continuing_assignment(first, second):
     }
 
     #[test]
-    fn normalizes_bom_and_newlines_before_compiling() {
+    fn normalizes_byte_source_bom_and_text_source_newlines_before_compiling() {
         let source =
             "\u{feff}def greet(name):\r\n    message = f\"héllo, {name}\"\r    return message\r\n";
         let normalized = "def greet(name):\n    message = f\"héllo, {name}\"\n    return message\n";
 
         assert_eq!(
-            compile(source, "greet.py").unwrap().marshal(),
+            compile_bytes(source.as_bytes(), "greet.py")
+                .unwrap()
+                .marshal(),
+            compile(normalized, "greet.py").unwrap().marshal()
+        );
+        assert_eq!(
+            compile(source.trim_start_matches('\u{feff}'), "greet.py")
+                .unwrap()
+                .marshal(),
             compile(normalized, "greet.py").unwrap().marshal()
         );
     }
@@ -1280,6 +1344,24 @@ def parent():
     fn matches_cpython_marshal_for_string_slice_constants() {
         let source = "subject[\"fine\":\"fine\"]\nsubject[\"x\":\"x\"]\n";
         assert_matches_cpython_marshal(source, "slice.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_empty_string_slice_bounds() {
+        for source in [
+            "subject['':]\n",
+            "subject[:'']\n",
+            "subject[::'']\n",
+            "subject['':'':'']\n",
+            "subject['':'%']\n",
+            "subject['':'fine':'é']\nsubject['x':'': 'Ā']\n",
+            "before = ('', '-')\nsubject['':'-']\n",
+            "subject['':'-']\nafter = ('', '-')\n",
+            "before = ''\nsubject['':]\nsubject[:'']\nsubject[::'']\nafter = ''\n",
+            "def first(subject):\n    return subject['':]\ndef second(subject):\n    return '', subject[:'']\n",
+        ] {
+            assert_matches_cpython_marshal(source, "empty_string_slice.py");
+        }
     }
 
     #[test]
@@ -12647,6 +12729,30 @@ match subject:
     fn matches_cpython_marshal_for_a_tuple_containing_a_constant_slice() {
         let source = "constant = lambda value: value[:, 1]\ndynamic = lambda value: value[::-1]\nwith_defaults = lambda value=1, other=2: value\nstring_slice = 'héllo'[1:4]\nstepped_string_slice = 'abcdef'[1:5:2]\nboolean_slice = 'abc'[False:True:True]\nbytes_slice = b'prefix'[2:]\ntuple_slice = (1, 2, 3)[1:]\nnegative_slice = 'abc'[:-1]\nstring_index = 'héllo'[1]\nfstring_index = f'abc'[0]\nbytes_index = b'prefix'[-1]\ntuple_index = (1, 2, 3)[-2]\ndynamic_list_index = [1, 2, 3][0]\nmember = item in [1, 2]\ndouble_negation = not not item\n5.0 ** 5.0\nTrue ** True\nFalse ** False\n() << 0 ** 99999999999999999999999999\n1 - 2\ninverted = ~1\nnegative_zero = -0000\nmixed = 1 + 2.5\nassert (False, 'x')\nassert (False,)\nassert ()\nassert True\npacked = fn('User', **{'name': str})\nunicode_keyword = fn(café=1)\nhuge = -999999999999999999999999999999999999999999\nadjacent = ('' f'prefix {item}')\nleft if condition else right\n'%s' % ('value',)\nif (1, 2):\n    pass\n";
         assert_matches_cpython_marshal(source, "example.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_constant_sequence_slice_bound_folding_order() {
+        for sequence in ["'abcd'", "'aébc'", "b'abcd'", "(1, 2, 3, 4)"] {
+            for slice in [
+                ":0 + 1",
+                "-0:",
+                "0 + 1:",
+                ":(1 if True else 2)",
+                ":(1,)[0]",
+                ":+1",
+                "not True:",
+                "::0 + 1",
+                "0 + 1::1",
+                ":1",
+                "0:",
+                "::1",
+                ":True",
+            ] {
+                let source = format!("def f():\n    return {sequence}[{slice}]\n");
+                assert_matches_cpython_marshal(&source, "constant_sequence_slice_bounds.py");
+            }
+        }
     }
 
     #[test]

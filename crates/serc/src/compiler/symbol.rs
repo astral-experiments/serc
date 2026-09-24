@@ -305,10 +305,9 @@ impl Compiler<'_> {
                 if let Some(index) = free_indices.get(&name_id).copied() {
                     // An inlined comprehension can use a temporary fast-local slot with the
                     // same spelling as a free variable. Outside the comprehension, resolve the
-                    // name through the closure.
-                    if let Some(classdict) = annotation_classdict_index
-                        && name != "__classdict__"
-                    {
+                    // name through the closure. Class annotations check their namespace first,
+                    // even when the source name is `__classdict__` itself.
+                    if let Some(classdict) = annotation_classdict_index {
                         self.emit(LOAD_DEREF, classdict, 1)?;
                         return self.emit(LOAD_FROM_DICT_OR_DEREF, index, 0);
                     }

@@ -285,7 +285,7 @@ fn classify_latin1_encoding(name: &str) -> bool {
 }
 
 pub(crate) fn normalize_source(source: &str) -> Cow<'_, str> {
-    normalize_newlines(source.strip_prefix('\u{feff}').unwrap_or(source))
+    normalize_newlines(source)
 }
 
 fn normalize_newlines(source: &str) -> Cow<'_, str> {
