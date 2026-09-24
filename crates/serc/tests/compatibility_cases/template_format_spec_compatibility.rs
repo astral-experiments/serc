@@ -140,3 +140,48 @@ fn executes_interpolation_source_text() {
          ('', '') '(a \\n)'\n",
     );
 }
+
+#[test]
+fn large_template_string_tuple_matches_cpython_stack_folding_limit() {
+    use std::fmt::Write as _;
+
+    for count in [0, 1, 28, 29, 30, 31, 40] {
+        for kind in ["adjacent", "distinct", "parts", "debug", "formatted"] {
+            let mut source = String::from("def work(value):\n    return (t\"");
+            for index in 0..count {
+                match kind {
+                    "adjacent" => source.push_str("{value}"),
+                    "distinct" => write!(source, "word{index}{{value}}").unwrap(),
+                    "parts" => source.push_str("word{value}\"\n        t\""),
+                    "debug" => source.push_str("{value=}"),
+                    "formatted" => source.push_str("{value:>3}"),
+                    _ => unreachable!(),
+                }
+            }
+            if kind == "distinct" {
+                source.push_str("last");
+            }
+            source.push_str("\")\n");
+            common::assert_matches_cpython_marshal(
+                &source,
+                &format!("template_string_tuple_{kind}_{count}.py"),
+            );
+        }
+    }
+}
+
+#[test]
+fn executes_large_template_strings_in_order() {
+    use std::fmt::Write as _;
+
+    let mut source = String::from(
+        "calls = []\ndef record(value):\n    calls.append(value)\n    return value\nresult = t\"",
+    );
+    for index in 0..31 {
+        write!(source, "part{index}{{record({index})}}").unwrap();
+    }
+    source.push_str(
+        "end\"\nprint(len(result.strings), len(result.interpolations))\nprint(result.strings[0], result.strings[-1])\nprint(calls == list(range(31)))\nprint([value.value for value in result.interpolations] == calls)\n",
+    );
+    common::assert_executes(&source, "32 31\npart0 end\nTrue\nTrue\n");
+}

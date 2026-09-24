@@ -2590,19 +2590,36 @@ impl Compiler<'_> {
             }
         }
 
-        let strings = strings
-            .into_iter()
-            .map(|literal| {
-                literal.map_or_else(
-                    || Constant::String(String::new()),
-                    PendingInterpolatedLiteral::into_constant,
-                )
-            })
-            .collect::<Vec<_>>();
-        for string in &strings {
-            self.add_constant(string.clone())?;
+        if strings.len() <= CPYTHON_STACK_USE_GUIDELINE {
+            let strings = strings
+                .into_iter()
+                .map(|literal| {
+                    literal.map_or_else(
+                        || Constant::String(String::new()),
+                        PendingInterpolatedLiteral::into_constant,
+                    )
+                })
+                .collect::<Vec<_>>();
+            for string in &strings {
+                self.add_constant(string.clone())?;
+            }
+            self.emit_deferred_constant(Constant::Tuple(strings))?;
+        } else {
+            // CPython's CFG optimizer leaves tuples above its constant-folding limit intact.
+            // Authored literals retain their locations; synthesized empty strings use the template.
+            let string_count = strings.len();
+            let template_location = self.source_location(tstring.range);
+            for string in strings {
+                if let Some(literal) = string {
+                    literal.load(self)?;
+                } else {
+                    self.assembler.set_location(template_location);
+                    self.load_string_constant("")?;
+                }
+            }
+            self.assembler.set_location(template_location);
+            self.emit_build(BUILD_TUPLE, string_count)?;
         }
-        self.emit_deferred_constant(Constant::Tuple(strings))?;
         for (interpolation, is_raw) in &interpolations {
             self.compile_expression(&interpolation.expression)?;
             self.assembler
