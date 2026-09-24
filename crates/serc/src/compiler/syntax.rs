@@ -3,7 +3,9 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 
-use ruff_python_ast::visitor::{Visitor, walk_expr, walk_parameters, walk_pattern, walk_stmt};
+use ruff_python_ast::visitor::{
+    Visitor, walk_expr, walk_interpolated_string_element, walk_parameters, walk_pattern, walk_stmt,
+};
 use ruff_python_ast::{self as ast, Expr, Pattern, Stmt};
 use ruff_python_parser::semantic_errors::{
     AwaitOutsideAsyncFunctionKind, InvalidExpressionKind, LazyImportContext, SemanticSyntaxChecker,
@@ -54,6 +56,8 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         error: RefCell::new(None),
         pending_pattern: None,
         lowering_pattern_error: false,
+        bare_starred: None,
+        check_bare_starred: true,
         source,
         body,
         python_version: match python_version {
@@ -72,11 +76,19 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         scopes: vec![Scope::new(ScopeKind::Module)],
     };
     validator.visit_body(body);
-    let lowering_pattern_error = validator.lowering_pattern_error;
-    let result = validator.error.into_inner().map_or(Ok(()), Err);
-    // CPython resolves declarations in the symbol table before lowering match patterns. Other
-    // errors from the shared checker retain their existing precedence over declarations.
-    if lowering_pattern_error {
+    let error = validator.error.into_inner();
+    let lowering_error =
+        validator.lowering_pattern_error || (error.is_none() && validator.bare_starred.is_some());
+    let result = error
+        .or_else(|| {
+            validator
+                .bare_starred
+                .map(|(range, kind)| CompileError::invalid_syntax(kind.message(), range))
+        })
+        .map_or(Ok(()), Err);
+    // CPython resolves declarations in the symbol table before lowering match patterns or bare
+    // stars. Other errors from the shared checker retain their precedence over declarations.
+    if lowering_error {
         validate_declarations(source, body, python_version)?;
         return result;
     }
@@ -98,6 +110,21 @@ enum CheckerPrefix {
     Initial,
     Open,
     Closed,
+}
+
+#[derive(Clone, Copy)]
+enum BareStarredKind {
+    Expression,
+    AssignmentTarget,
+}
+
+impl BareStarredKind {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Expression => "can't use starred expression here",
+            Self::AssignmentTarget => "starred assignment target must be in a list or tuple",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -139,6 +166,8 @@ struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool> {
     error: RefCell<Option<CompileError>>,
     pending_pattern: Option<PendingPattern<'ast>>,
     lowering_pattern_error: bool,
+    bare_starred: Option<(TextRange, BareStarredKind)>,
+    check_bare_starred: bool,
     source: &'source str,
     body: &'ast [Stmt],
     python_version: ast::PythonVersion,
@@ -296,6 +325,23 @@ fn pattern_capture_names(pattern: &Pattern) -> FxHashSet<&str> {
 }
 
 impl<'ast, const PRUNE_STATEMENTS: bool> Validator<'_, 'ast, PRUNE_STATEMENTS> {
+    fn record_bare_starred(&mut self, expression: &Expr, kind: BareStarredKind) {
+        if self.check_bare_starred
+            && self.bare_starred.is_none()
+            && self.error.borrow().is_none()
+            && expression.is_starred_expr()
+        {
+            self.bare_starred = Some((expression.range(), kind));
+        }
+    }
+
+    fn with_bare_starred_check(&mut self, check: bool, visit: impl FnOnce(&mut Self)) {
+        let previous = self.check_bare_starred;
+        self.check_bare_starred &= check;
+        visit(self);
+        self.check_bare_starred = previous;
+    }
+
     fn scope(&self) -> &Scope<'ast> {
         self.scopes
             .last()
@@ -607,6 +653,30 @@ impl<'ast, const PRUNE_STATEMENTS: bool> Visitor<'ast> for Validator<'_, 'ast, P
         if self.error.borrow().is_some() {
             return;
         }
+        let mut prechecked_match_cases = 0;
+        match statement {
+            Stmt::Expr(statement) => {
+                self.record_bare_starred(&statement.value, BareStarredKind::Expression);
+            }
+            Stmt::AnnAssign(statement) => {
+                if let Some(value) = &statement.value {
+                    self.record_bare_starred(value, BareStarredKind::Expression);
+                }
+            }
+            Stmt::Assign(statement) => {
+                self.record_bare_starred(&statement.value, BareStarredKind::Expression);
+            }
+            Stmt::For(statement) => {
+                self.record_bare_starred(&statement.iter, BareStarredKind::Expression);
+                if statement.target.is_starred_expr() {
+                    // Validate the iterable first even when the shared statement checker would
+                    // report the direct target before visiting a nested iterable expression.
+                    self.visit_expr(&statement.iter);
+                    self.record_bare_starred(&statement.target, BareStarredKind::AssignmentTarget);
+                }
+            }
+            _ => {}
+        }
         // This precedes return-value checks and except* transfer checks, as in CPython.
         if let Stmt::Return(statement) = statement
             && statement.value.is_some()
@@ -636,7 +706,18 @@ impl<'ast, const PRUNE_STATEMENTS: bool> Visitor<'ast> for Validator<'_, 'ast, P
         // Ruff checks reachability across whole cases but does not reject unreachable arms of an
         // OR pattern. Walk both boundaries in CPython's order before checking binding differences.
         if let Stmt::Match(statement) = statement {
+            self.visit_expr(&statement.subject);
             self.defer_pattern_reachability(statement);
+            if let Some(pending) = self.pending_pattern.take() {
+                for case in &statement.cases {
+                    if case.pattern.range().contains_range(pending.pattern.range) {
+                        break;
+                    }
+                    self.visit_match_case(case);
+                    prechecked_match_cases += 1;
+                }
+                self.pending_pattern = Some(pending);
+            }
         }
         // Relative imports of a module named __future__ are ordinary imports. The shared
         // checker identifies directives by their module spelling, so hide that spelling here.
@@ -655,7 +736,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool> Visitor<'ast> for Validator<'_, 'ast, P
             }
         }
         if let Some(pending) = self.pending_pattern.take() {
-            if self.error.borrow().is_none() {
+            if self.error.borrow().is_none() && self.bare_starred.is_none() {
                 self.lowering_pattern_error = true;
                 let message = match pending.pattern.kind {
                     ast::IrrefutablePatternKind::Name(name) => {
@@ -670,9 +751,37 @@ impl<'ast, const PRUNE_STATEMENTS: bool> Visitor<'ast> for Validator<'_, 'ast, P
                     range: pending.pattern.range,
                 });
             }
-            return;
+            if self.error.borrow().is_some() {
+                return;
+            }
         }
         match statement {
+            Stmt::Match(statement) => {
+                for case in statement.cases.iter().skip(prechecked_match_cases) {
+                    self.visit_match_case(case);
+                }
+            }
+            Stmt::AnnAssign(statement) => {
+                if let Some(value) = &statement.value {
+                    self.visit_expr(value);
+                }
+                // Local variable annotations and, from 3.14, complex variable annotations are
+                // not compiled; their interpolations are never evaluated.
+                let compiled = !self.in_function_scope()
+                    && (statement.simple || self.python_version < ast::PythonVersion::PY314);
+                self.with_bare_starred_check(compiled, |visitor| {
+                    visitor.visit_annotation(&statement.annotation);
+                });
+                self.visit_expr(&statement.target);
+            }
+            Stmt::Assign(statement) => {
+                // CPython compiles the right-hand side before any chained assignment target.
+                self.visit_expr(&statement.value);
+                for target in &statement.targets {
+                    self.record_bare_starred(target, BareStarredKind::AssignmentTarget);
+                    self.visit_expr(target);
+                }
+            }
             Stmt::FunctionDef(function) => {
                 for decorator in &function.decorator_list {
                     self.visit_decorator(decorator);
@@ -739,7 +848,9 @@ impl<'ast, const PRUNE_STATEMENTS: bool> Visitor<'ast> for Validator<'_, 'ast, P
                 }
             }
             Stmt::For(statement) => {
-                self.visit_expr(&statement.iter);
+                if !statement.target.is_starred_expr() {
+                    self.visit_expr(&statement.iter);
+                }
                 self.visit_expr(&statement.target);
                 self.scope_mut().loop_depth += 1;
                 self.visit_body(&statement.body);
@@ -903,6 +1014,27 @@ impl<'ast, const PRUNE_STATEMENTS: bool> Visitor<'ast> for Validator<'_, 'ast, P
         self.validate_private_parameters(parameters);
         walk_parameters(self, parameters);
     }
+
+    fn visit_annotation(&mut self, annotation: &'ast Expr) {
+        self.with_bare_starred_check(!self.future_annotations, |visitor| {
+            visitor.visit_expr(annotation);
+        });
+    }
+
+    fn visit_with_item(&mut self, item: &'ast ast::WithItem) {
+        self.visit_expr(&item.context_expr);
+        if let Some(target) = &item.optional_vars {
+            self.record_bare_starred(target, BareStarredKind::AssignmentTarget);
+            self.visit_expr(target);
+        }
+    }
+
+    fn visit_interpolated_string_element(&mut self, element: &'ast ast::InterpolatedStringElement) {
+        if let ast::InterpolatedStringElement::Interpolation(interpolation) = element {
+            self.record_bare_starred(&interpolation.expression, BareStarredKind::Expression);
+        }
+        walk_interpolated_string_element(self, element);
+    }
 }
 
 impl<const PRUNE_STATEMENTS: bool> SemanticSyntaxContext for Validator<'_, '_, PRUNE_STATEMENTS> {
@@ -1026,10 +1158,42 @@ impl<const PRUNE_STATEMENTS: bool> SemanticSyntaxContext for Validator<'_, '_, P
         {
             return;
         }
+        // Ruff reports this on statement entry and only for a sole assignment target. Check every
+        // direct target ourselves after visiting the right-hand side, in CPython compilation order.
+        if matches!(error.kind, Kind::SingleStarredAssignment) {
+            return;
+        }
         if let Kind::InvalidExpression(kind, _) = &error.kind
             && self.escapes_annotation_scope(error.range, kind)
         {
             return;
+        }
+        if self.bare_starred.is_some() {
+            // Bare stars fail during code generation. Keep walking for errors from earlier
+            // compiler phases; 3.14 moved await and writes to __debug__ into such a phase.
+            let code_generation_error = match &error.kind {
+                Kind::BreakOutsideLoop
+                | Kind::ContinueOutsideLoop
+                | Kind::ReturnOutsideFunction
+                | Kind::YieldFromInAsyncFunction
+                | Kind::InvalidStarExpression
+                | Kind::DifferentMatchPatternBindings
+                | Kind::MultipleCaseAssignment(_)
+                | Kind::MultipleStarredNamesInSequencePattern
+                | Kind::IrrefutableCasePattern(_)
+                | Kind::DuplicateMatchKey(_)
+                | Kind::DuplicateMatchClassAttribute(_) => true,
+                Kind::YieldOutsideFunction(kind) => {
+                    !kind.is_await() || self.python_version < ast::PythonVersion::PY314
+                }
+                Kind::AwaitOutsideAsyncFunction(_) | Kind::WriteToDebug(_) => {
+                    self.python_version < ast::PythonVersion::PY314
+                }
+                _ => false,
+            };
+            if code_generation_error {
+                return;
+            }
         }
         let mut reported = self.error.borrow_mut();
         if reported.is_some()
@@ -1094,6 +1258,61 @@ mod tests {
         PythonVersion::Py314,
         PythonVersion::Py315,
     ];
+
+    #[test]
+    fn bare_starred_errors_keep_cpython_validation_phase_order() {
+        for python_version in TARGETS {
+            let modern = python_version >= PythonVersion::Py314;
+            for (source, message, highlighted) in [
+                ("*first\n(yield second)\n", "starred", "*first"),
+                ("(yield first)\n*second\n", "yield", "yield first"),
+                ("*(yield item)\n", "starred", "*(yield item)"),
+                (
+                    "*first\nawait second\n",
+                    if modern { "await" } else { "starred" },
+                    if modern { "await second" } else { "*first" },
+                ),
+                (
+                    "*((yield first), (await second))\n",
+                    if modern { "await" } else { "starred" },
+                    if modern {
+                        "await second"
+                    } else {
+                        "*((yield first), (await second))"
+                    },
+                ),
+                (
+                    "*first\n(__debug__ := second)\n",
+                    if modern { "__debug__" } else { "starred" },
+                    if modern { "__debug__" } else { "*first" },
+                ),
+                ("first = *second = f'{*items}'\n", "starred", "*items"),
+            ] {
+                let parsed = parse_module(source).unwrap();
+                let error = validate(source, &parsed.syntax().body, python_version).unwrap_err();
+                let CompileError::InvalidSyntax {
+                    message: actual,
+                    range,
+                } = error
+                else {
+                    panic!("unexpected error for {python_version}: {source:?}: {error}");
+                };
+                assert!(
+                    actual.contains(message),
+                    "{python_version}: {source:?}: {actual}"
+                );
+                assert_eq!(&source[range], highlighted, "{python_version}: {source:?}");
+            }
+
+            let source = "*first\n[x for x in (bound := values)]\n";
+            let parsed = parse_module(source).unwrap();
+            let error = validate(source, &parsed.syntax().body, python_version).unwrap_err();
+            assert!(
+                error.to_string().contains("assignment expression"),
+                "{python_version}: {error}",
+            );
+        }
+    }
 
     #[test]
     fn leaf_expressions_keep_debug_and_interpolated_expression_checks() {

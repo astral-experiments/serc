@@ -1,5 +1,6 @@
 use serc::{
-    CompileError, CompileOptions, PythonVersion, compile, compile_bytes, compile_with_options,
+    CompileError, CompileOptions, PythonVersion, compile, compile_bytes,
+    compile_bytes_with_options, compile_with_options,
 };
 
 use crate::common::{assert_matches_cpython_marshal, python_3145_command};
@@ -272,5 +273,353 @@ fn declarations_precede_unreachable_pattern_lowering_but_not_existing_symbol_err
                 "{python_version:?}: {source}: {message}"
             );
         }
+    }
+}
+
+const STARRED_TARGETS: [PythonVersion; 4] = [
+    PythonVersion::Py312,
+    PythonVersion::Py313,
+    PythonVersion::Py314,
+    PythonVersion::Py315,
+];
+
+fn assert_rejects_raw_starred_expression(
+    source: &str,
+    highlighted: &str,
+    expected_message: &str,
+    versions: &[PythonVersion],
+) {
+    let start = source.find(highlighted).unwrap();
+    assert_selected_semantic_diagnostic(
+        source,
+        start..start + highlighted.len(),
+        expected_message,
+        versions,
+        false,
+    );
+}
+
+fn assert_selected_semantic_diagnostic(
+    source: &str,
+    expected_range: std::ops::Range<usize>,
+    expected_message: &str,
+    versions: &[PythonVersion],
+    pattern_error: bool,
+) {
+    let expected = python_3145_command()
+        .args([
+            "-c",
+            r"
+import json, sys
+
+source = sys.argv[1]
+lines = source.splitlines(keepends=True)
+
+def absolute(lineno, offset):
+    return sum(len(line.encode()) for line in lines[:lineno - 1]) + offset - 1
+
+def diagnostic(value):
+    try:
+        compile(value, 'starred.py', 'exec', dont_inherit=True)
+    except SyntaxError as error:
+        return [error.msg, absolute(error.lineno, error.offset),
+                absolute(error.end_lineno, error.end_offset)]
+    raise AssertionError('CPython accepted the source')
+
+print(json.dumps([diagnostic(source), diagnostic(source.encode())]))
+",
+            source,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        expected.status.success(),
+        "CPython failed for {source:?}: {}",
+        String::from_utf8_lossy(&expected.stderr)
+    );
+    let oracle: [(String, usize, usize); 2] = serde_json::from_slice(&expected.stdout).unwrap();
+    for (message, start, end) in oracle {
+        assert_eq!(message, expected_message, "CPython: {source:?}");
+        assert_eq!(start..end, expected_range, "CPython: {source:?}");
+    }
+
+    for &python_version in versions {
+        let options = CompileOptions {
+            python_version,
+            ..CompileOptions::default()
+        };
+        for result in [
+            compile_with_options(source, "starred.py", &options),
+            compile_bytes_with_options(source.as_bytes(), "starred.py", &options),
+        ] {
+            let error = result.expect_err(source);
+            let (message, range) = match (&error, pattern_error) {
+                (CompileError::InvalidSyntax { message, range }, false)
+                | (CompileError::InvalidPattern { message, range }, true) => (message, range),
+                _ => panic!("unexpected semantic error for {python_version} {source:?}: {error:?}"),
+            };
+            assert_eq!(message, expected_message, "{python_version}: {source:?}");
+            assert_eq!(
+                usize::from(range.start())..usize::from(range.end()),
+                expected_range,
+                "{python_version}: {source:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn declarations_precede_raw_stars_but_pattern_errors_compete_in_source_order() {
+    const STAR: &str = "can't use starred expression here";
+    const WILDCARD: &str = "wildcard makes remaining patterns unreachable";
+    const CAPTURE: &str = "name capture 'capture' makes remaining patterns unreachable";
+    const DUPLICATE: &str = "multiple assignments to name 'capture' in pattern";
+
+    for (source, highlighted, message, pattern_error) in [
+        (
+            "def f():\n    *values\n    value = 1\n    global value\n",
+            "global value",
+            "name 'value' is assigned to before global declaration",
+            false,
+        ),
+        (
+            "def f():\n    value = 1\n    global value\n    *values\n",
+            "global value",
+            "name 'value' is assigned to before global declaration",
+            false,
+        ),
+        (
+            "def f(value):\n    *values\n    global value\n",
+            "global value",
+            "name 'value' is parameter and global",
+            false,
+        ),
+        (
+            "def f(value):\n    global value\n    *values\n",
+            "global value",
+            "name 'value' is parameter and global",
+            false,
+        ),
+        (
+            "def f():\n    *values\n    nonlocal value\n",
+            "nonlocal value",
+            "no binding for nonlocal 'value' found",
+            false,
+        ),
+        (
+            "def f():\n    nonlocal value\n    *values\n",
+            "nonlocal value",
+            "no binding for nonlocal 'value' found",
+            false,
+        ),
+        (
+            "*values\nmatch subject:\n    case _ | 1: pass\n",
+            "*values",
+            STAR,
+            false,
+        ),
+        (
+            "match subject:\n    case _ | 1: pass\n*values\n",
+            "_",
+            WILDCARD,
+            true,
+        ),
+        (
+            "*values\nmatch subject:\n    case capture | 1: pass\n",
+            "*values",
+            STAR,
+            false,
+        ),
+        (
+            "match subject:\n    case capture | 1: pass\n*values\n",
+            "capture",
+            CAPTURE,
+            true,
+        ),
+        (
+            "*values\nmatch subject:\n    case [capture, capture]: pass\n",
+            "*values",
+            STAR,
+            false,
+        ),
+        (
+            "match subject:\n    case [capture, capture]: pass\n*values\n",
+            "capture",
+            DUPLICATE,
+            true,
+        ),
+        (
+            "match f\"{*values}\":\n    case _ | 1: pass\n",
+            "*values",
+            STAR,
+            false,
+        ),
+        (
+            "match subject:\n    case 1 if f\"{*values}\": pass\n    case _ | 2: pass\n",
+            "*values",
+            STAR,
+            false,
+        ),
+        (
+            "match subject:\n    case 1:\n        *values\n    case _ | 2: pass\n",
+            "*values",
+            STAR,
+            false,
+        ),
+        (
+            "match subject:\n    case _ | 1 if f\"{*values}\": pass\n",
+            "_",
+            WILDCARD,
+            true,
+        ),
+    ] {
+        let start = source.rfind(highlighted).unwrap();
+        assert_selected_semantic_diagnostic(
+            source,
+            start..start + highlighted.len(),
+            message,
+            &STARRED_TARGETS,
+            pattern_error,
+        );
+    }
+}
+
+#[test]
+fn rejects_raw_starred_values_before_discarding_code() {
+    const MESSAGE: &str = "can't use starred expression here";
+    for (source, highlighted) in [
+        ("*values\n", "*values"),
+        ("pass\n*values\n", "*values"),
+        ("é = 1; *values\n", "*values"),
+        ("def f():\n    *values\n", "*values"),
+        ("async def f():\n    *values\n", "*values"),
+        ("class C:\n    *values\n", "*values"),
+        ("if False:\n    *values\n", "*values"),
+        ("while False:\n    *values\n", "*values"),
+        ("def f():\n    return\n    *values\n", "*values"),
+        ("* (\n    values\n)\n", "* (\n    values\n)"),
+        ("*(first + second)\n", "*(first + second)"),
+        ("value: object = *values\n", "*values"),
+        ("obj.value: object = *values\n", "*values"),
+        ("def f():\n    value: object = *values\n", "*values"),
+        (
+            "from __future__ import annotations\nvalue: object = *values\n",
+            "*values",
+        ),
+        ("result = f'{*values}'\n", "*values"),
+        ("result = f'{*values!r}'\n", "*values"),
+        ("result = f'{value:{*values}}'\n", "*values"),
+        ("if False:\n    result = f'{*values}'\n", "*values"),
+        ("result = False and f'{*values}'\n", "*values"),
+        ("for item in *values: pass\n", "*values"),
+        ("for *item in *values: pass\n", "*values"),
+        ("for *item in f'{*values}': pass\n", "*values"),
+        ("first = *second = f'{*values}'\n", "*values"),
+    ] {
+        assert_rejects_raw_starred_expression(source, highlighted, MESSAGE, &STARRED_TARGETS);
+    }
+
+    for source in [
+        "result = t'{*values}'\n",
+        "result = t'{value:{*values}}'\n",
+        "if False:\n    result = t'{*values}'\n",
+    ] {
+        assert_rejects_raw_starred_expression(
+            source,
+            "*values",
+            MESSAGE,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
+fn rejects_raw_starred_targets_in_chained_assignments_and_with() {
+    const MESSAGE: &str = "starred assignment target must be in a list or tuple";
+    for (source, highlighted) in [
+        ("*first = second = values\n", "*first"),
+        ("first = *second = values\n", "*second"),
+        ("*first = *second = values\n", "*first"),
+        ("*obj.first = second = values\n", "*obj.first"),
+        ("if False:\n    first = *second = values\n", "*second"),
+        ("with manager as *target:\n    pass\n", "*target"),
+        (
+            "with first as valid, second as *target:\n    pass\n",
+            "*target",
+        ),
+        ("with (manager as *target):\n    pass\n", "*target"),
+        (
+            "async def f():\n    async with manager as *target:\n        pass\n",
+            "*target",
+        ),
+        ("if False:\n    with manager as *target: pass\n", "*target"),
+        ("for *target in values: pass\n", "*target"),
+        ("if False:\n    for *target in values: pass\n", "*target"),
+        (
+            "async def f():\n    async for *target in values: pass\n",
+            "*target",
+        ),
+    ] {
+        assert_rejects_raw_starred_expression(source, highlighted, MESSAGE, &STARRED_TARGETS);
+    }
+}
+
+fn assert_accepts_valid_starred_expression(source: &str, versions: &[PythonVersion]) {
+    assert_matches_cpython_marshal(source, "starred.py");
+    for &python_version in versions {
+        let options = CompileOptions {
+            python_version,
+            ..CompileOptions::default()
+        };
+        let text = compile_with_options(source, "starred.py", &options)
+            .unwrap_or_else(|error| panic!("{python_version}: {source:?}: {error:?}"));
+        let bytes = compile_bytes_with_options(source.as_bytes(), "starred.py", &options)
+            .unwrap_or_else(|error| panic!("{python_version}: {source:?}: {error:?}"));
+        assert_eq!(
+            text.marshal(),
+            bytes.marshal(),
+            "{python_version}: {source:?}"
+        );
+    }
+}
+
+#[test]
+fn preserves_valid_starred_unpacking_and_unevaluated_annotations() {
+    for source in [
+        "*values,\n",
+        "(*values,)\n",
+        "[*values]\n",
+        "{*values}\n",
+        "call(*values)\n",
+        "obj[*values]\n",
+        "class C(*values): pass\n",
+        "first = (*target,) = values\n",
+        "(*target,) = second = values\n",
+        "first = [*target] = values\n",
+        "with manager as (*target,): pass\n",
+        "with manager as [*target]: pass\n",
+        "for (*target,) in values: pass\n",
+        "for [*target] in values: pass\n",
+        "for item in (*values,): pass\n",
+        "async def f():\n    async for (*target,) in values: pass\n",
+        "value: object = (*values,)\n",
+        "result = f'{*values,}'\n",
+        "result = f'{value:{(*values,)}}'\n",
+        "def f(*args: *values): pass\n",
+        "from __future__ import annotations\nvalue: f'{*values}' = 1\n",
+        "def f():\n    value: f'{*values}' = 1\n",
+    ] {
+        assert_accepts_valid_starred_expression(source, &STARRED_TARGETS);
+    }
+
+    for source in [
+        "result = t'{*values,}'\n",
+        "result = t'{value:{(*values,)}}'\n",
+        "obj.attr: f'{*values}' = 1\n",
+    ] {
+        assert_accepts_valid_starred_expression(
+            source,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
     }
 }
