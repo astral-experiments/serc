@@ -4075,35 +4075,43 @@ impl Compiler<'_> {
         // An inner target read by its own iterable must keep the enclosing value live until the
         // inner comprehension starts and takes ownership of its save/restore.
         let direct_temporary_names = local_names.iter().cloned().collect::<FxHashSet<_>>();
+        let nested_temporary_names = active_temporary_names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !direct_temporary_names.contains(*name))
+            .collect::<FxHashSet<_>>();
         let self_iterated_nested_targets = self_iterated_nested_targets
             .into_iter()
             .collect::<FxHashSet<_>>();
-        let free_scope_names = if matches!(&self.unit.scope,
-            Scope::Function { free_indices, .. } if !free_indices.is_empty())
-        {
+        // A name referenced by this comprehension keeps its outer binding even when an
+        // inlined child uses the same name as an iteration target. The child owns that save.
+        let deferred_external_targets = if nested_temporary_names.is_empty() {
+            FxHashSet::default()
+        } else {
             comprehension_name_bindings(generators, key, value)
                 .into_iter()
-                .filter_map(|(name, bound)| (!bound).then_some(name))
-                .collect()
-        } else {
-            FxHashSet::default()
+                .filter(|(name, bound)| {
+                    if *bound || !nested_temporary_names.contains(name.as_str()) {
+                        return false;
+                    }
+                    let name_id = self.required_name_id(name);
+                    match &self.unit.scope {
+                        Scope::Function { free_indices, .. }
+                            if free_indices.contains_key(&name_id) =>
+                        {
+                            (!comprehension_cell_ids.contains(name_id) || self.is_cell(name))
+                                && (!self.symbols.active_temporaries.contains(name_id)
+                                    || self.symbols.active_temporary_free_cells.contains(name_id))
+                        }
+                        _ => true,
+                    }
+                })
+                .map(|(name, _)| name)
+                .collect::<FxHashSet<_>>()
         };
-        let deferred_free_targets = free_scope_names
-            .iter()
-            .filter(|name| {
-                let name_id = self.required_name_id(name);
-                !direct_temporary_names.contains(*name)
-                    && (!comprehension_cell_ids.contains(name_id) || self.is_cell(name))
-                    && matches!(&self.unit.scope, Scope::Function { free_indices, .. }
-                        if free_indices.contains_key(&name_id))
-                    && (!self.symbols.active_temporaries.contains(name_id)
-                        || self.symbols.active_temporary_free_cells.contains(name_id))
-            })
-            .cloned()
-            .collect::<FxHashSet<_>>();
-        active_temporary_names.retain(|name| !deferred_free_targets.contains(name));
-        temporary_names.retain(|name| !deferred_free_targets.contains(name));
+        active_temporary_names.retain(|name| !deferred_external_targets.contains(name));
         if !legacy_class_comprehension {
+            temporary_names.retain(|name| !deferred_external_targets.contains(name));
             temporary_names.retain(|name| {
                 direct_temporary_names.contains(name)
                     || !self_iterated_nested_targets.contains(name)
