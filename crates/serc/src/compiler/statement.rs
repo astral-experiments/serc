@@ -7,10 +7,10 @@ use super::{
     CALL, CHECK_EG_MATCH, CHECK_EXC_MATCH, CLEANUP_THROW, COPY, END_ASYNC_FOR, END_SEND, FOR_ITER,
     GET_AITER, GET_ANEXT, GET_ITER, IMPORT_FROM, IMPORT_NAME, JUMP_BACKWARD,
     JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, LIST_APPEND, LOAD_ATTR, LOAD_CONST, LOAD_DEREF,
-    LOAD_FAST_AND_CLEAR, LOAD_GLOBAL, MAP_ADD, NOP, NOT_TAKEN, POP_EXCEPT, POP_JUMP_IF_FALSE,
-    POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP, PUSH_EXC_INFO, PUSH_NULL,
-    RAISE_VARARGS, RETURN_VALUE, SEND, SET_ADD, STORE_ATTR, STORE_SLICE, STORE_SUBSCR, SWAP,
-    TO_BOOL, WITH_EXCEPT_START, YIELD_VALUE,
+    LOAD_FAST_AND_CLEAR, LOAD_GLOBAL, LOAD_NAME, MAP_ADD, NOP, NOT_TAKEN, POP_EXCEPT,
+    POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP,
+    PUSH_EXC_INFO, PUSH_NULL, RAISE_VARARGS, RETURN_VALUE, SEND, SET_ADD, STORE_ATTR, STORE_SLICE,
+    STORE_SUBSCR, SWAP, TO_BOOL, WITH_EXCEPT_START, YIELD_VALUE,
 };
 use crate::CompileError;
 use crate::assembler::{
@@ -17818,7 +17818,10 @@ impl<'source> Compiler<'source> {
                 }
                 self.assembler
                     .set_location(self.source_location(assignment.range));
-                self.load_name("__annotations__")?;
+                // The annotation mapping belongs to the current namespace even if an explicit
+                // source reference gave the same spelling a global or enclosing classification.
+                let annotations = self.name_index("__annotations__")?;
+                self.emit(LOAD_NAME, annotations, 1)?;
                 let mangled = self.mangled_name(target.id.as_str());
                 self.context
                     .record_identifier_constant_origin(target.id.as_str(), &mangled);

@@ -101,7 +101,12 @@ impl Compiler<'_> {
         let mut plan = source_plan.clone();
         plan.resolve_required(&arena.names, |name| match &self.unit.scope {
             Scope::Class { free_indices, .. } => {
-                arena.names.get("__class__") == Some(name) || free_indices.contains_key(&name)
+                arena.names.get("__class__") == Some(name)
+                    || matches!(
+                        arena.names.resolve(name),
+                        "__classdict__" | "__conditional_annotations__"
+                    ) && self.is_cell_id(name)
+                    || free_indices.contains_key(&name)
             }
             Scope::Module | Scope::Function { .. } => self.can_provide_closure_id(name),
         });
@@ -1333,7 +1338,21 @@ impl ClassPlan {
             .filter(|name| is_nonlocal(name) || (!is_global(name) && !is_bound(name)))
             .collect::<BTreeSet<_>>();
         required.extend(locals.nonlocals.iter().cloned());
-        let body_requires_classdict = !deferred_annotations && required.contains("__classdict__");
+        let body_requires_classdict = required.contains("__classdict__");
+        let body_requires_conditional_annotations =
+            required.contains("__conditional_annotations__");
+        let nested_requires = |name: &str| {
+            nested_lambda_requirements.contains(name)
+                || nested_generator_requirements.contains(name)
+                || names.get(name).is_some_and(|name| {
+                    method_requirements.contains(&name) || nested_class_requirements.contains(&name)
+                })
+        };
+        let nested_requires_classdict = nested_requires("__classdict__");
+        let nested_requires_conditional_annotations =
+            nested_requires("__conditional_annotations__");
+        let has_conditional_annotations = has_conditional_annotations
+            || deferred_annotations && nested_requires_conditional_annotations;
         let annotation_requires_class = !is_bound("__class__")
             && !is_global("__class__")
             && !is_nonlocal("__class__")
@@ -1391,7 +1410,9 @@ impl ClassPlan {
         if !body_requires_classdict {
             required.remove("__classdict__");
         }
-        required.remove("__conditional_annotations__");
+        if deferred_annotations && !body_requires_conditional_annotations {
+            required.remove("__conditional_annotations__");
+        }
 
         let comprehension_needs_class = annotation_comprehension_requirements
             .captures
@@ -1417,7 +1438,8 @@ impl ClassPlan {
                 .into_iter()
                 .filter(|name| name != "__class__"),
         );
-        let needs_classdict = has_type_alias
+        let needs_classdict = nested_requires_classdict
+            || has_type_alias
             || has_generic_definition
             || deferred_annotations
                 && !future_annotations
