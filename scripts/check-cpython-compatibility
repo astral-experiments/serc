@@ -11,31 +11,31 @@ fi
 python_version="${2:-3.14}"
 case "$python_version" in
     3.12)
-        expected_exact=2174
-        expected_rejected=277
-        expected_matched_rejection=267
-        expected_rejection_mismatch=8
+        expected_exact=2190
+        expected_rejected=280
+        expected_matched_rejection=269
+        expected_rejection_mismatch=9
         expected_compiler_failure=2
         ;;
     3.13)
-        expected_exact=2193
-        expected_rejected=258
-        expected_matched_rejection=254
-        expected_rejection_mismatch=2
+        expected_exact=2209
+        expected_rejected=261
+        expected_matched_rejection=256
+        expected_rejection_mismatch=3
         expected_compiler_failure=2
         ;;
     3.14)
-        expected_exact=2230
-        expected_rejected=221
-        expected_matched_rejection=217
-        expected_rejection_mismatch=2
+        expected_exact=2246
+        expected_rejected=224
+        expected_matched_rejection=219
+        expected_rejection_mismatch=3
         expected_compiler_failure=2
         ;;
     3.15)
-        expected_exact=2249
-        expected_rejected=202
-        expected_matched_rejection=199
-        expected_rejection_mismatch=1
+        expected_exact=2266
+        expected_rejected=204
+        expected_matched_rejection=200
+        expected_rejection_mismatch=2
         expected_compiler_failure=2
         ;;
     *)
@@ -67,7 +67,7 @@ done
 comparison_args=(
     --python "$python"
     --python-version "$python_version"
-    --expected-files 2451
+    --expected-files 2470
     --expected-exact "$expected_exact"
     --expected-cpython-rejected "$expected_rejected"
     --expected-outcome "matched-rejection=$expected_matched_rejection"

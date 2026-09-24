@@ -1550,6 +1550,14 @@ impl Compiler<'_> {
                 if let Some(constant) =
                     fold_constant_for_version(&pattern.value, self.context.python_version)
                 {
+                    // CPython omits unary plus from literal patterns' expression AST,
+                    // so the constant load uses the numeric operand's location.
+                    if let Expr::UnaryOp(unary) = pattern.value.as_ref()
+                        && unary.op == UnaryOp::UAdd
+                    {
+                        self.assembler
+                            .set_location(self.source_location(unary.operand.range()));
+                    }
                     self.emit_preprocessed_constant(&pattern.value, constant)?;
                 } else {
                     self.compile_expression(&pattern.value)?;
