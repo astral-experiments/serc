@@ -1293,6 +1293,25 @@ impl LayoutAssembler {
             self.resolve_next_locations();
         }
         let mut labels = vec![None; usize::try_from(self.next_label).unwrap()];
+        if self.python_version == crate::PythonVersion::Py314
+            && let Some(((bytecode, line_table, max_depth), instruction_count)) =
+                self.encode_small_final_artifacts(&mut labels, first_line_number)?
+        {
+            #[cfg(any(test, debug_assertions))]
+            self.validate_structure(AssemblerStage::FinalLayout)?;
+            let exception_table = if self.exception_regions.is_empty() {
+                Vec::new()
+            } else {
+                self.exception_table(&vec![0; instruction_count], &labels)?
+            };
+            return Ok(AssembledCode {
+                bytecode,
+                line_table,
+                exception_table,
+                max_depth,
+                removed_max_depth: self.removed_max_depth,
+            });
+        }
         let mut instruction_count = 0;
         let mut code_units = 0;
         let mut can_be_unextended = true;
