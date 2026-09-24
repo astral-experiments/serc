@@ -12650,6 +12650,30 @@ match subject:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_constant_sequence_slice_bound_folding_order() {
+        for sequence in ["'abcd'", "'aébc'", "b'abcd'", "(1, 2, 3, 4)"] {
+            for slice in [
+                ":0 + 1",
+                "-0:",
+                "0 + 1:",
+                ":(1 if True else 2)",
+                ":(1,)[0]",
+                ":+1",
+                "not True:",
+                "::0 + 1",
+                "0 + 1::1",
+                ":1",
+                "0:",
+                "::1",
+                ":True",
+            ] {
+                let source = format!("def f():\n    return {sequence}[{slice}]\n");
+                assert_matches_cpython_marshal(&source, "constant_sequence_slice_bounds.py");
+            }
+        }
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_shared_traversal_containers() {
         let source = r#"def outer():
     def nested(value):
