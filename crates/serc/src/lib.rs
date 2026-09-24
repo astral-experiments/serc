@@ -144,6 +144,13 @@ pub enum CompileError {
         /// The byte range of the invalid syntax in the normalized source.
         range: TextRange,
     },
+    /// CPython could not encode a docstring while preparing the parsed source.
+    InvalidDocstring {
+        /// The UTF-8 encoding error produced for the docstring.
+        message: String,
+        /// The byte range of the docstring literal in the normalized source.
+        range: TextRange,
+    },
     /// The source uses valid Python syntax that this backend does not support yet.
     Unsupported(String),
     /// Initial intern-state uncertainty can affect serialized object identity.
@@ -160,7 +167,9 @@ impl CompileError {
     pub fn range(&self) -> Option<TextRange> {
         match self {
             Self::Parse(error) => Some(error.location),
-            Self::InvalidPattern { range, .. } | Self::InvalidSyntax { range, .. } => Some(*range),
+            Self::InvalidPattern { range, .. }
+            | Self::InvalidSyntax { range, .. }
+            | Self::InvalidDocstring { range, .. } => Some(*range),
             Self::Decode(_)
             | Self::Unsupported(_)
             | Self::UnresolvedInternState { .. }
@@ -184,6 +193,7 @@ impl fmt::Display for CompileError {
             Self::InvalidPattern { message, .. } | Self::InvalidSyntax { message, .. } => {
                 write!(formatter, "failed to parse Python source: {message}")
             }
+            Self::InvalidDocstring { message, .. } => formatter.write_str(message),
             Self::Unsupported(message) => formatter.write_str(message),
             Self::UnresolvedInternState { value } => {
                 write!(formatter, "unresolved initial intern state for {value:?}")
@@ -200,6 +210,7 @@ impl Error for CompileError {
             Self::Parse(error) => Some(error),
             Self::InvalidPattern { .. }
             | Self::InvalidSyntax { .. }
+            | Self::InvalidDocstring { .. }
             | Self::Unsupported(_)
             | Self::UnresolvedInternState { .. }
             | Self::Internal(_) => None,

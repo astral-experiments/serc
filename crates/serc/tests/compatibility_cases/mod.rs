@@ -784,3 +784,4 @@ mod match_tuple_tail_wrappers;
 mod annotation_format_name;
 
 mod semantic_validation;
+mod surrogate_docstring;

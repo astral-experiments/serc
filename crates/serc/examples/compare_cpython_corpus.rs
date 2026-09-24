@@ -889,7 +889,8 @@ fn capture_compiler(compile: impl FnOnce() -> Result<Vec<u8>, CompileError>) -> 
         Ok(Err(CompileError::Parse(error))) => CompilerOutcome::Rejected(error.to_string()),
         Ok(Err(
             CompileError::InvalidPattern { message, .. }
-            | CompileError::InvalidSyntax { message, .. },
+            | CompileError::InvalidSyntax { message, .. }
+            | CompileError::InvalidDocstring { message, .. },
         )) => CompilerOutcome::Rejected(message),
         Ok(Err(CompileError::Decode(error))) => CompilerOutcome::Rejected(error.to_string()),
         Ok(Err(CompileError::Internal(message))) => CompilerOutcome::Failed(message),
@@ -1439,6 +1440,20 @@ mod tests {
             validate_outcome_counts(&counts, 1, 0, 1, &expected, Some(1), true, true),
             ["1 CPython-rejected files were not rejected cleanly by Serc"]
         );
+    }
+
+    #[test]
+    fn surrogate_docstring_errors_count_as_matched_rejections() {
+        let source = CompilerInput::Text("def f():\n    '\\ud800'\n".to_string());
+        let filename = "surrogate_docstring.py";
+        let compiled = compile_input(&source, filename, &CompileOptions::default(), None);
+        let outcome = classify(
+            Path::new(filename),
+            OracleOutcome::Rejected("UnicodeEncodeError: surrogates not allowed".to_string()),
+            compiled,
+        );
+        assert_eq!(outcome.kind, OutcomeKind::MatchedRejection);
+        assert!(outcome.oracle_rejected);
     }
 
     #[test]
