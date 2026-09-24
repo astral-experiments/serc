@@ -1,9 +1,10 @@
+mod allocator;
 mod cli;
 
 use std::process::ExitCode;
 
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: allocator::MiMalloc = allocator::MiMalloc;
 
 fn main() -> ExitCode {
     cli::main()
