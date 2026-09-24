@@ -2328,6 +2328,16 @@ fn constant_as_float(constant: &Constant) -> Option<f64> {
     reason = "CPython checks real exponents for exact binary64 integrality"
 )]
 fn fold_float_power(base: f64, exponent: f64) -> Option<Constant> {
+    // float_pow returns the selected NaN operand directly, preserving its sign and payload.
+    if exponent == 0.0 {
+        return Some(Constant::Float(1.0));
+    }
+    if base.is_nan() {
+        return Some(Constant::Float(base));
+    }
+    if exponent.is_nan() {
+        return Some(Constant::Float(if base == 1.0 { 1.0 } else { exponent }));
+    }
     if base.is_finite() && exponent.is_finite() && base < 0.0 && exponent != exponent.floor() {
         // float_pow delegates negative fractional powers to complex_pow. Follow
         // _Py_c_pow with positive imaginary zeros for both real operands.
