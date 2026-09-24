@@ -11,6 +11,27 @@ fn comprehension(kind: &str, element: &str, target: &str) -> String {
 }
 
 #[test]
+fn matches_cpython_external_closures_in_comprehension_assignment_targets() {
+    let source = r#"
+def collections(key, values):
+    holder = {}
+    lists = [key for holder[(lambda: key)()] in values]
+    sets = {key for holder[(lambda: key)()] in values}
+    dictionaries = {key: key for holder[(lambda: key)()] in values}
+    generators = tuple(key for holder[(lambda: key)()] in values)
+    direct_cells = [(lambda: item)() for item in values]
+    return lists, sets, dictionaries, generators, direct_cells, holder
+
+print(collections("index", [10, 20]))
+"#;
+    common::assert_matches_cpython_marshal(source, "comprehension_assignment_closures.py");
+    common::assert_executes(
+        source,
+        "(['index', 'index'], {'index'}, {'index': 'index'}, ('index', 'index'), [10, 20], {'index': 20})\n",
+    );
+}
+
+#[test]
 fn matches_cpython_child_globals_outside_comprehension_targets() {
     for kind in ["list", "set", "dict"] {
         for element in ["item", "(lambda: item)"] {

@@ -109,6 +109,62 @@ def continuing_assignment(first, second):
     }
 
     #[test]
+    fn distinguishes_a_byte_order_mark_in_text_and_byte_source() {
+        use serc::{
+            CompileOptions, InitialInternState, PythonVersion, compile_bytes_with_options,
+            compile_with_intern_state, compile_with_options,
+        };
+
+        let text = "\u{feff}value = 1\r\n";
+        let expected_message = "invalid non-printable character U+FEFF";
+        let assert_rejected = |error: CompileError| {
+            assert!(error.to_string().contains(expected_message), "{error}");
+            assert_eq!(error.range().unwrap().start().to_u32(), 0);
+            assert_eq!(error.range().unwrap().end().to_u32(), 3);
+        };
+        assert_rejected(compile(text, "bom.py").unwrap_err());
+        assert_rejected(compile_to_pyc(text, "bom.py", 0).unwrap_err());
+        assert_rejected(
+            compile_with_intern_state(text, "bom.py", &InitialInternState::default()).unwrap_err(),
+        );
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let options = CompileOptions {
+                python_version,
+                ..CompileOptions::default()
+            };
+            assert_rejected(compile_with_options(text, "bom.py", &options).unwrap_err());
+            assert_eq!(
+                compile_bytes_with_options(text.as_bytes(), "bom.py", &options)
+                    .unwrap()
+                    .marshal(),
+                compile_with_options("value = 1\n", "bom.py", &options)
+                    .unwrap()
+                    .marshal(),
+            );
+        }
+
+        let output = super::common::python_3145_command()
+            .args([
+                "-c",
+                "try:\n compile(chr(0xfeff) + 'value = 1\\n', 'bom.py', 'exec')\nexcept SyntaxError as error:\n print(error.msg, error.lineno, error.offset)\nelse:\n raise AssertionError('accepted text BOM')",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            format!("{expected_message} 1 1"),
+        );
+        assert_matches_cpython_marshal_bytes(text.as_bytes(), "bom.py");
+        assert_matches_cpython_marshal("# \u{feff}\nvalue = '\u{feff}'\n", "literal_bom.py");
+    }
+
+    #[test]
     fn rejects_null_characters_in_text_source() {
         use serc::{
             CompileOptions, InitialInternState, PythonVersion, SourceDecodeError,
@@ -151,6 +207,276 @@ def continuing_assignment(first, second):
     }
 
     #[test]
+    fn rejects_null_characters_in_filenames_before_reading_source() {
+        use serc::{
+            CompileOptions, InitialInternState, PythonVersion, SourceDecodeError,
+            compile_bytes_with_intern_state, compile_bytes_with_options, compile_with_intern_state,
+            compile_with_options,
+        };
+
+        let expected = CompileError::InvalidFilename;
+        assert_eq!(expected.to_string(), "embedded null character");
+        assert_eq!(expected.range(), None);
+        assert!(expected.source().is_none());
+
+        let initial_intern_state = InitialInternState::default();
+        let text_sources = ["pass", "if =", "\0"];
+        let byte_sources: &[&[u8]] =
+            &[b"pass", b"if =", b"\0", b"\xff", b"# coding: unknown\npass"];
+        for filename in ["\0", "\0prefix", "in\0side", "suffix\0"] {
+            for source in text_sources {
+                assert_eq!(compile(source, filename).unwrap_err(), expected);
+                assert_eq!(compile_to_pyc(source, filename, 0).unwrap_err(), expected);
+                assert_eq!(
+                    compile_with_intern_state(source, filename, &initial_intern_state).unwrap_err(),
+                    expected
+                );
+            }
+            for &source in byte_sources {
+                assert_eq!(compile_bytes(source, filename).unwrap_err(), expected);
+                assert_eq!(
+                    compile_bytes_to_pyc(source, filename, 0).unwrap_err(),
+                    expected
+                );
+                assert_eq!(
+                    compile_bytes_with_intern_state(source, filename, &initial_intern_state)
+                        .unwrap_err(),
+                    expected
+                );
+            }
+            for python_version in [
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ] {
+                let options = CompileOptions {
+                    python_version,
+                    ..CompileOptions::default()
+                };
+                for source in text_sources {
+                    assert_eq!(
+                        compile_with_options(source, filename, &options).unwrap_err(),
+                        expected
+                    );
+                }
+                for &source in byte_sources {
+                    assert_eq!(
+                        compile_bytes_with_options(source, filename, &options).unwrap_err(),
+                        expected
+                    );
+                }
+            }
+        }
+
+        for filename in [
+            "",
+            "plain.py",
+            "literal\\0.py",
+            "near␀nul.py",
+            "folder\nname.py",
+        ] {
+            assert_matches_cpython_marshal("pass", filename);
+            assert_matches_cpython_marshal_bytes(b"pass", filename);
+        }
+        assert!(matches!(
+            compile("if =", "normal.py"),
+            Err(CompileError::Parse(_))
+        ));
+        assert_eq!(
+            compile_bytes(b"\0", "normal.py").unwrap_err(),
+            CompileError::Decode(SourceDecodeError::NullByte)
+        );
+
+        let oracle = super::common::python_3145_command()
+            .args([
+                "-c",
+                r##"
+for filename in ["\0", "\0prefix", "in\0side", "suffix\0"]:
+    for source in ["pass", "if =", "\0", b"pass", b"if =", b"\0", b"\xff", b"# coding: unknown\npass"]:
+        try:
+            compile(source, filename, "exec")
+        except ValueError as error:
+            assert str(error) == "embedded null character", str(error)
+        else:
+            raise AssertionError((filename, source))
+"##,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            oracle.status.success(),
+            "{}",
+            String::from_utf8_lossy(&oracle.stderr)
+        );
+    }
+
+    #[test]
+    fn rejects_null_characters_in_path_filenames_before_reading_source() {
+        use std::path::Path;
+
+        use serc::{
+            CompileOptions, PythonVersion, SourceDecodeError, compile_bytes_with_options,
+            compile_bytes_with_path_and_options,
+        };
+
+        let sources: &[&[u8]] = &[b"pass", b"if =", b"\0", b"\xff", b"# coding: unknown\npass"];
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let options = CompileOptions {
+                python_version,
+                ..CompileOptions::default()
+            };
+            for filename in ["\0", "\0prefix", "in\0side", "suffix\0"] {
+                for &source in sources {
+                    assert_eq!(
+                        compile_bytes_with_path_and_options(source, Path::new(filename), &options)
+                            .unwrap_err(),
+                        CompileError::InvalidFilename,
+                        "{python_version:?}, {filename:?}, {source:?}"
+                    );
+                }
+            }
+
+            let source = b"def nested():\n    return 42\n";
+            for filename in ["", "plain.py", "literal\\0.py", "near␀nul.py"] {
+                assert_eq!(
+                    compile_bytes_with_path_and_options(source, Path::new(filename), &options)
+                        .unwrap()
+                        .marshal(),
+                    compile_bytes_with_options(source, filename, &options)
+                        .unwrap()
+                        .marshal(),
+                    "{python_version:?}, {filename:?}"
+                );
+            }
+
+            let filename = Path::new("normal.py");
+            assert!(matches!(
+                compile_bytes_with_path_and_options(b"if =", filename, &options),
+                Err(CompileError::Parse(_))
+            ));
+            assert_eq!(
+                compile_bytes_with_path_and_options(b"\0", filename, &options).unwrap_err(),
+                CompileError::Decode(SourceDecodeError::NullByte)
+            );
+            assert!(matches!(
+                compile_bytes_with_path_and_options(b"\xff", filename, &options),
+                Err(CompileError::Decode(SourceDecodeError::InvalidUtf8(_)))
+            ));
+            assert_eq!(
+                compile_bytes_with_path_and_options(b"# coding: unknown\npass", filename, &options)
+                    .unwrap_err(),
+                CompileError::Decode(SourceDecodeError::UnsupportedEncoding("unknown".to_owned()))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn matches_cpython_marshal_for_in_memory_unix_path_filenames() {
+        use std::ffi::OsStr;
+        use std::io::Write as _;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::path::Path;
+        use std::process::{Command, Stdio};
+
+        use serc::{CompileOptions, PythonVersion, compile_bytes_with_path_and_options};
+
+        let source = b"def outer():\n    def inner():\n        return 42\n    return inner\n";
+        let filenames: &[&[u8]] = &[
+            b"plain.py",
+            b"nested/path.py",
+            b"caf\xc3\xa9.py",
+            b"cafe\xcc\x81.py",
+            b"replacement-\xef\xbf\xbd.py",
+            b"invalid-\xff.py",
+            b"continuation-\x80\xbf.py",
+            b"truncated-\xe2\x82.py",
+            b"surrogate-\xed\xa0\x80.py",
+            b"mixed-\xc3\xa9-\xff-\xf0\x9f\x90\xa7.py",
+        ];
+        let oracle_script = r"
+import importlib.util, marshal, os, sys, types
+assert sys.implementation.name == 'cpython'
+assert sys.version.split()[0] == sys.argv[2]
+assert importlib.util.MAGIC_NUMBER.hex() == sys.argv[3]
+filename = os.fsdecode(bytes.fromhex(sys.argv[1]))
+code = compile(sys.stdin.buffer.read(), filename, 'exec', dont_inherit=True, optimize=0)
+def assert_filenames(code):
+    assert code.co_filename is filename
+    for constant in code.co_consts:
+        if isinstance(constant, types.CodeType):
+            assert_filenames(constant)
+assert_filenames(code)
+sys.stdout.buffer.write(marshal.dumps(code))
+";
+
+        for (python_version, variable, default) in [
+            (
+                PythonVersion::Py312,
+                "SERC_TEST_PYTHON_312",
+                "python3.12",
+            ),
+            (
+                PythonVersion::Py313,
+                "SERC_TEST_PYTHON_313",
+                "python3.13",
+            ),
+            (PythonVersion::Py314, "SERC_TEST_PYTHON", "python3.14"),
+            (
+                PythonVersion::Py315,
+                "SERC_TEST_PYTHON_315",
+                "python3.15",
+            ),
+        ] {
+            let executable = std::env::var_os(variable).unwrap_or_else(|| default.into());
+            let target = python_version.target();
+            let options = CompileOptions {
+                python_version,
+                ..CompileOptions::default()
+            };
+            for &filename in filenames {
+                let mut hex = String::new();
+                for byte in filename {
+                    write!(hex, "{byte:02x}").unwrap();
+                }
+                let mut oracle = Command::new(&executable)
+                    .args(["-B", "-I", "-S", "-X", "utf8", "-c", oracle_script])
+                    .args([
+                        &hex,
+                        target.tag.strip_prefix('v').unwrap(),
+                        &target.magic_hex(),
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap_or_else(|error| panic!("could not start {executable:?}: {error}"));
+                oracle.stdin.take().unwrap().write_all(source).unwrap();
+                let expected = oracle.wait_with_output().unwrap();
+                assert!(
+                    expected.status.success(),
+                    "{python_version}, {hex}: {}",
+                    String::from_utf8_lossy(&expected.stderr),
+                );
+                let actual = compile_bytes_with_path_and_options(
+                    source,
+                    Path::new(OsStr::from_bytes(filename)),
+                    &options,
+                )
+                .unwrap()
+                .marshal();
+                assert_eq!(actual, expected.stdout, "{python_version}, {hex}");
+            }
+        }
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_supported_source_encodings() {
         let cases: [(&str, &[u8]); 9] = [
             ("latin_1.py", b"# coding: latin-1\nvalue = '\xe9'\n"),
@@ -180,13 +506,21 @@ def continuing_assignment(first, second):
     }
 
     #[test]
-    fn normalizes_bom_and_newlines_before_compiling() {
+    fn normalizes_byte_source_bom_and_text_source_newlines_before_compiling() {
         let source =
             "\u{feff}def greet(name):\r\n    message = f\"héllo, {name}\"\r    return message\r\n";
         let normalized = "def greet(name):\n    message = f\"héllo, {name}\"\n    return message\n";
 
         assert_eq!(
-            compile(source, "greet.py").unwrap().marshal(),
+            compile_bytes(source.as_bytes(), "greet.py")
+                .unwrap()
+                .marshal(),
+            compile(normalized, "greet.py").unwrap().marshal()
+        );
+        assert_eq!(
+            compile(source.trim_start_matches('\u{feff}'), "greet.py")
+                .unwrap()
+                .marshal(),
             compile(normalized, "greet.py").unwrap().marshal()
         );
     }
@@ -1280,6 +1614,24 @@ def parent():
     fn matches_cpython_marshal_for_string_slice_constants() {
         let source = "subject[\"fine\":\"fine\"]\nsubject[\"x\":\"x\"]\n";
         assert_matches_cpython_marshal(source, "slice.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_empty_string_slice_bounds() {
+        for source in [
+            "subject['':]\n",
+            "subject[:'']\n",
+            "subject[::'']\n",
+            "subject['':'':'']\n",
+            "subject['':'%']\n",
+            "subject['':'fine':'é']\nsubject['x':'': 'Ā']\n",
+            "before = ('', '-')\nsubject['':'-']\n",
+            "subject['':'-']\nafter = ('', '-')\n",
+            "before = ''\nsubject['':]\nsubject[:'']\nsubject[::'']\nafter = ''\n",
+            "def first(subject):\n    return subject['':]\ndef second(subject):\n    return '', subject[:'']\n",
+        ] {
+            assert_matches_cpython_marshal(source, "empty_string_slice.py");
+        }
     }
 
     #[test]
@@ -12647,6 +12999,30 @@ match subject:
     fn matches_cpython_marshal_for_a_tuple_containing_a_constant_slice() {
         let source = "constant = lambda value: value[:, 1]\ndynamic = lambda value: value[::-1]\nwith_defaults = lambda value=1, other=2: value\nstring_slice = 'héllo'[1:4]\nstepped_string_slice = 'abcdef'[1:5:2]\nboolean_slice = 'abc'[False:True:True]\nbytes_slice = b'prefix'[2:]\ntuple_slice = (1, 2, 3)[1:]\nnegative_slice = 'abc'[:-1]\nstring_index = 'héllo'[1]\nfstring_index = f'abc'[0]\nbytes_index = b'prefix'[-1]\ntuple_index = (1, 2, 3)[-2]\ndynamic_list_index = [1, 2, 3][0]\nmember = item in [1, 2]\ndouble_negation = not not item\n5.0 ** 5.0\nTrue ** True\nFalse ** False\n() << 0 ** 99999999999999999999999999\n1 - 2\ninverted = ~1\nnegative_zero = -0000\nmixed = 1 + 2.5\nassert (False, 'x')\nassert (False,)\nassert ()\nassert True\npacked = fn('User', **{'name': str})\nunicode_keyword = fn(café=1)\nhuge = -999999999999999999999999999999999999999999\nadjacent = ('' f'prefix {item}')\nleft if condition else right\n'%s' % ('value',)\nif (1, 2):\n    pass\n";
         assert_matches_cpython_marshal(source, "example.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_constant_sequence_slice_bound_folding_order() {
+        for sequence in ["'abcd'", "'aébc'", "b'abcd'", "(1, 2, 3, 4)"] {
+            for slice in [
+                ":0 + 1",
+                "-0:",
+                "0 + 1:",
+                ":(1 if True else 2)",
+                ":(1,)[0]",
+                ":+1",
+                "not True:",
+                "::0 + 1",
+                "0 + 1::1",
+                ":1",
+                "0:",
+                "::1",
+                ":True",
+            ] {
+                let source = format!("def f():\n    return {sequence}[{slice}]\n");
+                assert_matches_cpython_marshal(&source, "constant_sequence_slice_bounds.py");
+            }
+        }
     }
 
     #[test]

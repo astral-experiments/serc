@@ -11,6 +11,10 @@ use super::key::{
 #[newtype_index]
 pub(super) struct ObjectId;
 
+/// Identifies an object in the serialized marshal reference table.
+#[newtype_index]
+pub(super) struct ReferenceId;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ReferenceMode {
     IfShared,
@@ -33,9 +37,7 @@ pub(super) trait MarshalVisitor<'a> {
     fn locals(&mut self, code: &'a CodeObject) -> bool;
     fn local_kinds(&mut self, code: &'a CodeObject);
     fn metadata_string(&mut self, value: &'a str, metadata_id: Option<MetadataId>);
-    fn code_filename(&mut self, code: &'a CodeObject, metadata_id: Option<MetadataId>) {
-        self.metadata_string(&code.filename, metadata_id);
-    }
+    fn code_filename(&mut self, code: &'a CodeObject, metadata_id: Option<MetadataId>);
     fn code_name(&mut self, code: &'a CodeObject, metadata_id: Option<MetadataId>) {
         self.metadata_string(&code.name, metadata_id);
     }
@@ -50,7 +52,7 @@ pub(super) trait MarshalVisitor<'a> {
         self.constant(value, ReferenceMode::IfShared);
     }
 
-    fn frozen_set_members(&self, values: &'a [Constant]) -> FrozenSetMembers<'a> {
+    fn frozen_set_members(&mut self, values: &'a [Constant]) -> FrozenSetMembers<'a> {
         frozen_set_members_in_wire_order(values)
     }
 }
@@ -151,7 +153,7 @@ where
         }
         Constant::FrozenSet(values) => {
             if visitor.constant(value, reference_mode) {
-                for (_, value) in visitor.frozen_set_members(values) {
+                for value in visitor.frozen_set_members(values) {
                     traverse_constant(value, ReferenceMode::Forced, visitor);
                 }
             }

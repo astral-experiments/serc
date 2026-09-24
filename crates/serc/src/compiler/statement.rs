@@ -20743,6 +20743,42 @@ impl<'source> Compiler<'source> {
                     .prepare_no_location_block_for_inlining(normal_exit);
                 self.assembler.allow_last_unconditional_block_inlining();
             }
+            if self.context.python_version >= crate::PythonVersion::Py314
+                && handlers_terminate
+                && !statement.is_star
+                && statement.handlers.iter().all(|handler| {
+                    handler
+                        .as_except_handler()
+                        .is_some_and(|handler| matches!(handler.body.last(), Some(Stmt::Raise(_))))
+                })
+                && statement.orelse.is_empty()
+                && matches!(statement.finalbody.as_slice(), [Stmt::Pass(_)])
+                && self.control.loops.uncopied_loop_tail_statement == Some(statement.range)
+                && self
+                    .control
+                    .loops
+                    .contexts
+                    .last()
+                    .is_some_and(|context| context.iterator_cleanup == IteratorCleanup::Sync)
+                && self.control.withs.active_with_exits.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .len()
+                    == 1
+                && self.control.finally.active_finally_try_bodies == 1
+                && suite_has_linear_borrow_fallthrough(&statement.body)
+                && matches!(statement.body.last(), Some(Stmt::Expr(expression))
+                    if matches!(expression.value.as_ref(), Expr::Call(_)))
+            {
+                // Only the protected call reaches the no-op finalizer. Its converted
+                // POP_BLOCK retains the call's location before the iterator backedge
+                // and is outside the exception regions it just left.
+                self.assembler.exclude_last_from_exception_table();
+                self.assembler
+                    .preserve_redundant_jump_nop_after_threading(normal_exit);
+            }
             if retained_return_guard_exit {
                 // POP_BLOCK disappears beside the same-line normal jump. Cold
                 // handler placement later converts this original jump to a NOP.
@@ -24721,7 +24757,9 @@ impl<'source> Compiler<'source> {
                         || (matches!(self.unit.scope, Scope::Function { .. })
                             && matches!(self.control.loops.contexts.as_slice(), [iterator]
                                 if iterator.iterator_cleanup == IteratorCleanup::Sync)
-                            && supports_loop_break_terminating_finally_returns(statement)))))
+                            && (supports_loop_break_terminating_finally_returns(statement)
+                                || (self.context.python_version >= crate::PythonVersion::Py314
+                                    && supports_handler_terminating_finally_returns(statement)))))))
         {
             return self.with_control_override(
                 |control| &mut control.finally.copies_terminating_finally_returns,
@@ -27649,7 +27687,29 @@ impl<'source> Compiler<'source> {
                         .is_empty()
                         && !pass_finally_leaves_manager)
                 {
-                    compiler.emit(NOP, 0, 0)?;
+                    if compiler.context.python_version >= crate::PythonVersion::Py314
+                        && !statement.is_star
+                        && statement.handlers.iter().any(|handler| {
+                            handler.as_except_handler().is_some_and(|handler| {
+                                !suite_terminates(&handler.body)
+                            })
+                        })
+                        && compiler.control.loops.uncopied_loop_tail_statement == Some(statement.range)
+                        && compiler.control.loops.contexts.last().is_some_and(|context| {
+                            context.iterator_cleanup == IteratorCleanup::Sync
+                        })
+                    {
+                        // The handler joins enter before this authored marker. Retain its
+                        // boundaries, as for an authored constant, so NOP compaction can
+                        // move the Pass location onto the shared iterator backedge.
+                        let pass_start = compiler.assembler.label();
+                        compiler.assembler.mark(pass_start);
+                        compiler.emit(NOP, 0, 0)?;
+                        let pass_end = compiler.assembler.label();
+                        compiler.assembler.mark(pass_end);
+                    } else {
+                        compiler.emit(NOP, 0, 0)?;
+                    }
                 } else {
                     // The normal finally copy is outside an enclosing try's exception ownership.
                     // Mark both the pass and its exit because CFG optimization can keep either NOP.
@@ -33226,6 +33286,42 @@ fn supports_direct_terminating_finally_returns(statement: &ruff_python_ast::Stmt
                     && !expression_suspends_current_scope(value)
             })
         })
+}
+
+/// Copies a named handler's pending return before an enclosing iterator is discarded.
+fn supports_handler_terminating_finally_returns(statement: &ruff_python_ast::StmtTry) -> bool {
+    let [Stmt::Expr(body)] = statement.body.as_slice() else {
+        return false;
+    };
+    let [handler] = statement.handlers.as_slice() else {
+        return false;
+    };
+    let Some(handler) = handler.as_except_handler() else {
+        return false;
+    };
+    let [Stmt::Return(pending)] = handler.body.as_slice() else {
+        return false;
+    };
+    let [Stmt::Return(finalizer)] = statement.finalbody.as_slice() else {
+        return false;
+    };
+    !statement.is_star
+        && statement.orelse.is_empty()
+        && handler.name.is_some()
+        && handler
+            .type_
+            .as_deref()
+            .is_some_and(|value| matches!(value, Expr::Name(_)))
+        && matches!(body.value.as_ref(), Expr::Call(_))
+        && !expression_contains_inline_branch(&body.value)
+        && !expression_suspends_current_scope(&body.value)
+        && pending.value.as_deref().is_none_or(|value| {
+            !expression_contains_inline_branch(value) && !expression_suspends_current_scope(value)
+        })
+        && finalizer
+            .value
+            .as_deref()
+            .is_some_and(|value| matches!(value, Expr::Name(_)))
 }
 
 /// Keeps a pending return live until a finalizer's conditional break or return.

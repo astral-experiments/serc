@@ -718,7 +718,7 @@ fn dump_mismatches(
             let source = if source_bytes {
                 CompilerInput::Bytes(fs_err::read(&outcome.path)?)
             } else {
-                CompilerInput::Text(fs_err::read_to_string(&outcome.path)?)
+                CompilerInput::Text(read_utf8_file(&outcome.path)?)
             };
             let filename = outcome.path.to_string_lossy();
             let ours = compile_module_input(&source, &filename, options, caller_model)
@@ -809,7 +809,7 @@ fn compare(
     let source = if source_bytes {
         fs_err::read(path).map(CompilerInput::Bytes)
     } else {
-        fs_err::read_to_string(path).map(CompilerInput::Text)
+        read_utf8_file(path).map(CompilerInput::Text)
     };
     let source = match source {
         Ok(source) => source,
@@ -834,6 +834,15 @@ fn compare(
     }
 
     classify(path, oracle, compiled)
+}
+
+/// Consume an optional file encoding signature before passing decoded text to the compiler.
+fn read_utf8_file(path: &Path) -> std::io::Result<String> {
+    let mut source = fs_err::read_to_string(path)?;
+    if source.starts_with('\u{feff}') {
+        source.replace_range(..'\u{feff}'.len_utf8(), "");
+    }
+    Ok(source)
 }
 
 fn compile_module_input(
@@ -876,6 +885,9 @@ fn compile_input(
 fn capture_compiler(compile: impl FnOnce() -> Result<Vec<u8>, CompileError>) -> CompilerOutcome {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(compile)) {
         Ok(Ok(marshal)) => CompilerOutcome::Compiled(marshal),
+        Ok(Err(error @ CompileError::InvalidFilename)) => {
+            CompilerOutcome::Rejected(error.to_string())
+        }
         Ok(Err(CompileError::Unsupported(message))) => CompilerOutcome::Unsupported(message),
         Ok(Err(CompileError::Parse(error))) => CompilerOutcome::Rejected(error.to_string()),
         Ok(Err(
@@ -1184,6 +1196,47 @@ mod tests {
                 assert_eq!(module.target(), python_version.target());
             }
         }
+    }
+
+    #[test]
+    fn text_file_input_consumes_exactly_one_byte_order_mark() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bom.py");
+        let filename = path.to_str().unwrap();
+        let options = CompileOptions::default();
+        for (source, expected) in [
+            ("value = '\u{feff}'\n", Some("value = '\u{feff}'\n")),
+            ("\u{feff}value = 1\n", Some("value = 1\n")),
+            ("\u{feff}\u{feff}value = 1\n", None),
+        ] {
+            fs::write(&path, source).unwrap();
+            let decoded = super::read_utf8_file(&path).unwrap();
+            let text =
+                compile_module_input(&CompilerInput::Text(decoded), filename, &options, None);
+            let bytes = compile_module_input(
+                &CompilerInput::Bytes(fs::read(&path).unwrap()),
+                filename,
+                &options,
+                None,
+            );
+            if let Some(expected) = expected {
+                let expected = serc::compile(expected, filename).unwrap().marshal();
+                assert_eq!(text.unwrap().marshal(), expected);
+                assert_eq!(bytes.unwrap().marshal(), expected);
+            } else {
+                assert!(text.is_err());
+                assert!(bytes.is_err());
+            }
+        }
+        assert!(
+            compile_module_input(
+                &CompilerInput::Text("\u{feff}value = 1\n".to_string()),
+                filename,
+                &options,
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[cfg(unix)]
