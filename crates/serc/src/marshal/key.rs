@@ -19,7 +19,7 @@ use super::v5::{
     TYPE_STRING, TYPE_TRUE, TYPE_TUPLE, TYPE_UNICODE,
 };
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) enum ObjectKey<'a> {
     // Scalar and immutable-container keys use Python value equality.
     None,
@@ -42,13 +42,13 @@ pub(super) enum ObjectKey<'a> {
     SurrogateString(&'a [u8]),
     Bytes(&'a [u8]),
     ConstantTuple(ConstantTupleKey<'a>),
-    FrozenSet(Vec<Self>),
+    FrozenSet(FrozenSetKey<'a>),
     StringTuple(StringTupleKey<'a>),
     // Annotation-scope locals retain identity even when their contents compare equal.
     AnnotationLocals(usize),
     // CPython reuses one canonical empty tuple.
     EmptyTuple,
-    Slice(Box<Self>, Box<Self>, Box<Self>),
+    Slice(SliceKey<'a>),
     // These objects also retain identity. The address is used only as a marshal-graph key and is
     // never written to the output.
     SliceMember(usize),
@@ -60,7 +60,7 @@ pub(super) enum ObjectKey<'a> {
     FreshEmptyBytes,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct HashedObjectKey<'a> {
     key: ObjectKey<'a>,
     hash: u64,
@@ -81,7 +81,7 @@ impl<'a> HashedObjectKey<'a> {
     }
 
     pub(super) fn with_hash(key: ObjectKey<'a>, hash: u64) -> Self {
-        debug_assert_eq!(Self::new(key.clone()).hash, hash, "marshal key hash");
+        debug_assert_eq!(Self::new(key).hash, hash, "marshal key hash");
         Self { key, hash }
     }
 }
@@ -143,6 +143,247 @@ impl Ord for ConstantTupleKey<'_> {
             .iter()
             .map(constant_key)
             .cmp(other.0.iter().map(constant_key))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct FrozenSetKey<'a>(&'a [Constant]);
+
+impl<'a> FrozenSetKey<'a> {
+    fn has_nested_sets(self) -> bool {
+        fn contains_set(value: &Constant) -> bool {
+            match value {
+                Constant::FrozenSet(_) => true,
+                Constant::Tuple(values) => values.iter().any(contains_set),
+                Constant::Slice { lower, upper, step } => {
+                    contains_set(lower) || contains_set(upper) || contains_set(step)
+                }
+                _ => false,
+            }
+        }
+        self.0.iter().any(contains_set)
+    }
+
+    fn sorted_members(self) -> SmallVec<[ObjectKey<'a>; 4]> {
+        let mut members: SmallVec<_> = self.0.iter().map(constant_key).collect();
+        members.sort_unstable();
+        members
+    }
+
+    #[inline(never)]
+    fn canonical_members(self) -> Vec<CanonicalKey<'a>> {
+        let mut members: Vec<_> = self.0.iter().map(CanonicalKey::new).collect();
+        members.sort_unstable();
+        members
+    }
+}
+
+impl PartialEq for FrozenSetKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        if std::ptr::eq(self.0, other.0) {
+            true
+        } else if self.0.len() != other.0.len() {
+            false
+        } else if self.has_nested_sets() || other.has_nested_sets() {
+            self.canonical_members() == other.canonical_members()
+        } else {
+            self.sorted_members() == other.sorted_members()
+        }
+    }
+}
+
+impl Eq for FrozenSetKey<'_> {}
+
+impl Hash for FrozenSetKey<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        if self.has_nested_sets() {
+            self.canonical_members().hash(state);
+        } else {
+            self.sorted_members().as_slice().hash(state);
+        }
+    }
+}
+
+impl PartialOrd for FrozenSetKey<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for FrozenSetKey<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        if std::ptr::eq(self.0, other.0) {
+            Ordering::Equal
+        } else if self.has_nested_sets() || other.has_nested_sets() {
+            self.canonical_members().cmp(&other.canonical_members())
+        } else {
+            self.sorted_members().cmp(&other.sorted_members())
+        }
+    }
+}
+
+/// Prepares descendants once before comparing nested set members. Retaining this tree for the
+/// operation prevents each parent comparison from recursively sorting the same descendants.
+struct CanonicalKey<'a> {
+    value: &'a Constant,
+    key: ObjectKey<'a>,
+    children: CanonicalChildren<'a>,
+}
+
+enum CanonicalChildren<'a> {
+    None,
+    Tuple(Vec<CanonicalKey<'a>>),
+    FrozenSet(Vec<CanonicalKey<'a>>),
+    Slice(Box<[CanonicalKey<'a>; 3]>),
+}
+
+impl<'a> CanonicalKey<'a> {
+    fn new(value: &'a Constant) -> Self {
+        let key = constant_key(value);
+        let children = match value {
+            Constant::Tuple(values) if matches!(key, ObjectKey::ConstantTuple(_)) => {
+                CanonicalChildren::Tuple(values.iter().map(Self::new).collect())
+            }
+            Constant::FrozenSet(values) => {
+                let mut members: Vec<_> = values.iter().map(Self::new).collect();
+                members.sort_unstable();
+                CanonicalChildren::FrozenSet(members)
+            }
+            Constant::Slice { lower, upper, step } => CanonicalChildren::Slice(Box::new([
+                Self::new(lower),
+                Self::new(upper),
+                Self::new(step),
+            ])),
+            _ => CanonicalChildren::None,
+        };
+        Self {
+            value,
+            key,
+            children,
+        }
+    }
+
+    // ConstantTupleKey has a distinct hash stream from ObjectKey's derived enum hash.
+    fn hash_constant<H: Hasher>(&self, state: &mut H) {
+        match &self.children {
+            CanonicalChildren::None => hash_constant(self.value, state),
+            CanonicalChildren::Tuple(members) => {
+                11_u8.hash(state);
+                members.len().hash(state);
+                for member in members {
+                    member.hash_constant(state);
+                }
+            }
+            CanonicalChildren::FrozenSet(_) => {
+                12_u8.hash(state);
+                self.hash(state);
+            }
+            CanonicalChildren::Slice(members) => {
+                13_u8.hash(state);
+                for member in members.iter() {
+                    member.hash_constant(state);
+                }
+            }
+        }
+    }
+}
+
+impl PartialEq for CanonicalKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for CanonicalKey<'_> {}
+
+impl Hash for CanonicalKey<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        if matches!(self.children, CanonicalChildren::None) {
+            self.key.hash(state);
+            return;
+        }
+        std::mem::discriminant(&self.key).hash(state);
+        match &self.children {
+            CanonicalChildren::None => unreachable!(),
+            CanonicalChildren::Tuple(members) => {
+                members.len().hash(state);
+                for member in members {
+                    member.hash_constant(state);
+                }
+            }
+            CanonicalChildren::FrozenSet(members) => members.hash(state),
+            CanonicalChildren::Slice(members) => {
+                for member in members.iter() {
+                    member.hash(state);
+                }
+            }
+        }
+    }
+}
+
+impl PartialOrd for CanonicalKey<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CanonicalKey<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (&self.children, &other.children) {
+            (CanonicalChildren::Tuple(left), CanonicalChildren::Tuple(right))
+            | (CanonicalChildren::FrozenSet(left), CanonicalChildren::FrozenSet(right)) => {
+                left.cmp(right)
+            }
+            (CanonicalChildren::Slice(left), CanonicalChildren::Slice(right)) => left.cmp(right),
+            // Different prepared kinds have different ObjectKey variants. Leaf keys include
+            // empty and all-string tuples, preserving their existing metadata alias domains.
+            _ => self.key.cmp(&other.key),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SliceKey<'a> {
+    lower: &'a Constant,
+    upper: &'a Constant,
+    step: &'a Constant,
+}
+
+impl<'a> SliceKey<'a> {
+    fn members(self) -> [ObjectKey<'a>; 3] {
+        [
+            constant_key(self.lower),
+            constant_key(self.upper),
+            constant_key(self.step),
+        ]
+    }
+}
+
+impl PartialEq for SliceKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.members() == other.members()
+    }
+}
+
+impl Eq for SliceKey<'_> {}
+
+impl Hash for SliceKey<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for member in self.members() {
+            member.hash(state);
+        }
+    }
+}
+
+impl PartialOrd for SliceKey<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SliceKey<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.members().cmp(&other.members())
     }
 }
 
@@ -445,22 +686,14 @@ pub(super) fn constant_key(value: &Constant) -> ObjectKey<'_> {
         Constant::SurrogateString(value) => ObjectKey::SurrogateString(value),
         Constant::Bytes(value) => ObjectKey::Bytes(value),
         Constant::Tuple(values) => constants_tuple_key(values),
-        Constant::FrozenSet(values) => {
-            let mut values: Vec<_> = values.iter().map(constant_key).collect();
-            values.sort_unstable();
-            ObjectKey::FrozenSet(values)
-        }
-        Constant::Slice { lower, upper, step } => ObjectKey::Slice(
-            Box::new(constant_key(lower)),
-            Box::new(constant_key(upper)),
-            Box::new(constant_key(step)),
-        ),
+        Constant::FrozenSet(values) => ObjectKey::FrozenSet(FrozenSetKey(values)),
+        Constant::Slice { lower, upper, step } => ObjectKey::Slice(SliceKey { lower, upper, step }),
         Constant::Code(code) => code_key(code),
     }
 }
 
 pub(super) type ConstantSortKey = SmallVec<[u8; 16]>;
-pub(super) type FrozenSetMembers<'a> = SmallVec<[(ConstantSortKey, &'a Constant); 4]>;
+pub(super) type FrozenSetMembers<'a> = SmallVec<[&'a Constant; 4]>;
 
 pub(super) fn constant_sort_key(value: &Constant) -> ConstantSortKey {
     constant_sort_key_with_properties(value, PythonVersion::Py314, &|value| {
@@ -669,7 +902,7 @@ fn constant_sort_key_with_properties<'a>(
                         .to_le_bytes(),
                 );
                 for (_, value) in
-                    frozen_set_members_with_properties(values, python_version, properties)
+                    sorted_frozen_set_members_with_properties(values, python_version, properties)
                 {
                     append(output, value, true, python_version, properties, references);
                 }
@@ -699,12 +932,12 @@ fn constant_sort_key_with_properties<'a>(
 }
 
 pub(super) fn frozen_set_members_in_wire_order(values: &[Constant]) -> FrozenSetMembers<'_> {
-    let mut members = FrozenSetMembers::new();
+    let mut members = SmallVec::<[(ConstantSortKey, &Constant); 4]>::new();
     for value in values {
         members.push((constant_sort_key(value), value));
     }
     members.sort_by(|(left, _), (right, _)| left.cmp(right));
-    members
+    members.into_iter().map(|(_, value)| value).collect()
 }
 
 pub(super) fn frozen_set_members_with_properties<'a>(
@@ -712,7 +945,18 @@ pub(super) fn frozen_set_members_with_properties<'a>(
     python_version: PythonVersion,
     properties: &impl Fn(&'a Constant) -> (bool, bool),
 ) -> FrozenSetMembers<'a> {
-    let mut members = FrozenSetMembers::new();
+    sorted_frozen_set_members_with_properties(values, python_version, properties)
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect()
+}
+
+fn sorted_frozen_set_members_with_properties<'a>(
+    values: &'a [Constant],
+    python_version: PythonVersion,
+    properties: &impl Fn(&'a Constant) -> (bool, bool),
+) -> SmallVec<[(ConstantSortKey, &'a Constant); 4]> {
+    let mut members = SmallVec::<[(ConstantSortKey, &Constant); 4]>::new();
     for value in values {
         members.push((
             constant_sort_key_with_properties(value, python_version, properties),
