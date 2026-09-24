@@ -20,7 +20,7 @@ use super::Compiler;
 use super::expression::{jump_constant_truthiness, literal_truthiness};
 use super::scope::NameId;
 use super::symbol::{mangle_name, to_u32};
-use crate::code_object::{CodeObject, Constant, MetadataId, NonReflexiveRemap};
+use crate::code_object::{CodeObject, Constant, MetadataId, MetadataName, NonReflexiveRemap};
 
 #[derive(Debug, Default)]
 pub(super) struct ConstantPool {
@@ -29,6 +29,21 @@ pub(super) struct ConstantPool {
 }
 
 const CONSTANT_INDEX_THRESHOLD: usize = 12;
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_GENERIC_CONSTANT_ADMISSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Pool keys never match different constant variants, including numerically equal types.
+#[inline]
+fn find_pool_constant(values: &[Constant], constant: &Constant) -> Option<usize> {
+    let kind = std::mem::discriminant(constant);
+    values.iter().position(|existing| {
+        std::mem::discriminant(existing) == kind
+            && ConstantEquality::PoolKey.equal(existing, constant)
+    })
+}
 
 #[derive(Debug, Default)]
 struct ConstantIndices {
@@ -68,6 +83,19 @@ impl ConstantIndices {
             ConstantEquality::PoolKey.equal(&values[index], constant)
         };
         if let Some(fingerprint) = fingerprint {
+            if self.fallback.is_empty() {
+                let primary = *self.primary.get(&fingerprint)?;
+                if matches(&primary) {
+                    return Some(primary);
+                }
+                // The pool inserts indices in order, so the first matching collision is earliest.
+                return self
+                    .collisions
+                    .get(&fingerprint)?
+                    .iter()
+                    .copied()
+                    .find(matches);
+            }
             return self
                 .primary
                 .get(&fingerprint)
@@ -78,9 +106,7 @@ impl ConstantIndices {
                 .copied()
                 .min();
         }
-        values
-            .iter()
-            .position(|existing| ConstantEquality::PoolKey.equal(existing, constant))
+        find_pool_constant(values, constant)
             .map(|index| u32::try_from(index).expect("constant index fits in u32"))
     }
 }
@@ -95,6 +121,11 @@ impl ConstantPool {
     }
 
     pub(super) fn intern(&mut self, constant: Constant) -> Result<u32, CompileError> {
+        if matches!(&constant, Constant::None)
+            && matches!(self.values.first(), Some(Constant::None))
+        {
+            return Ok(0);
+        }
         if self.indices.is_none() && self.values.len() >= CONSTANT_INDEX_THRESHOLD {
             let mut indices = ConstantIndices::default();
             indices.primary.reserve(self.values.len().saturating_mul(2));
@@ -118,11 +149,7 @@ impl ConstantPool {
             return Ok(index);
         }
 
-        if let Some(index) = self
-            .values
-            .iter()
-            .position(|existing| ConstantEquality::PoolKey.equal(existing, &constant))
-        {
+        if let Some(index) = find_pool_constant(&self.values, &constant) {
             return to_u32(index, "constant index");
         }
         let index = to_u32(self.values.len(), "constant count")?;
@@ -240,7 +267,7 @@ pub(super) struct OutputState {
     pub(super) folded_constant_dependencies: Vec<(Constant, Vec<Constant>)>,
     pub(super) has_untracked_discarded_collection: bool,
     pub(super) deferred_names: Vec<(OperandPatchId, String)>,
-    pub(super) names: Vec<String>,
+    pub(super) names: Vec<MetadataName>,
     pub(super) name_ids: Vec<MetadataId>,
     name_indices: FxHashMap<NameId, u32>,
     pub(super) interned_constant_strings: FxHashSet<String>,
@@ -366,9 +393,7 @@ impl crate::assembler::ConstantTable for OutputState {
                     .find(&pool.values, constant, constant_pool_fingerprint(constant))
                     .map(|index| index as usize)
             } else {
-                pool.values
-                    .iter()
-                    .position(|value| ConstantEquality::PoolKey.equal(value, constant))
+                find_pool_constant(&pool.values, constant)
             };
             if let Some(index) = index
                 && index >= first_deferred
@@ -1002,7 +1027,7 @@ impl Compiler<'_> {
             Entry::Occupied(entry) => Ok(*entry.get()),
             Entry::Vacant(entry) => {
                 let index = to_u32(self.output.names.len(), "name count")?;
-                self.output.names.push(name.into_owned());
+                self.output.names.push(MetadataName::from(name));
                 self.output.name_ids.push(MetadataId::from(name_id));
                 entry.insert(index);
                 Ok(index)
@@ -1022,6 +1047,41 @@ impl Compiler<'_> {
     }
 
     pub(super) fn add_constant(&mut self, constant: Constant) -> Result<u32, CompileError> {
+        #[cfg(test)]
+        if FORCE_GENERIC_CONSTANT_ADMISSION.get() {
+            return self.add_constant_generic(constant);
+        }
+
+        match &constant {
+            Constant::None
+            | Constant::Bool(_)
+            | Constant::Ellipsis
+            | Constant::Int(_)
+            | Constant::SignedInt(_)
+            | Constant::BigInt { .. }
+            | Constant::Float(_)
+            | Constant::Complex { .. }
+            | Constant::SurrogateString(_) => {
+                // These leaves carry no numeric allocation or native-cache provenance.
+            }
+            Constant::String(_) => self
+                .context
+                .record_constant_string_origins(&constant, false),
+            Constant::Bytes(_) => self.context.record_constant_empty_bytes_origin(&constant),
+            Constant::Code(code) => {
+                // Nested constants were already admitted while compiling their own code.
+                self.output.has_frozenset_constants |=
+                    code.marshal_provenance.subtree_has_frozenset_constants;
+            }
+            Constant::NonReflexive(_)
+            | Constant::Tuple(_)
+            | Constant::FrozenSet(_)
+            | Constant::Slice { .. } => return self.add_constant_generic(constant),
+        }
+        self.output.constants.intern(constant)
+    }
+
+    fn add_constant_generic(&mut self, constant: Constant) -> Result<u32, CompileError> {
         let constant = if self.context.python_version >= PythonVersion::Py314
             && constant.has_source_non_reflexive_number()
         {
@@ -4000,11 +4060,12 @@ fn big_integer_digits(token: &str) -> Vec<u16> {
 mod tests {
     use super::{
         CONSTANT_INDEX_THRESHOLD, ConstantEquality, ConstantIndices, ConstantPool,
-        constant_pool_fingerprint,
+        FORCE_GENERIC_CONSTANT_ADMISSION, constant_pool_fingerprint,
     };
     use crate::code_object::{
         CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance, MetadataId,
     };
+    use crate::{CompileOptions, PythonVersion, compile_with_options};
 
     fn code_object(constants: Vec<Constant>) -> CodeObject {
         CodeObject {
@@ -4016,9 +4077,9 @@ mod tests {
             bytecode: Vec::new(),
             constants,
             names: Vec::new(),
-            locals: vec!["value".to_string()],
+            locals: vec!["value".into()],
             local_kinds: Vec::new(),
-            filename: "module.py".to_string(),
+            filename: "module.py".into(),
             name: "<module>".to_string(),
             qualified_name: "<module>".to_string(),
             first_line_number: 1,
@@ -4064,6 +4125,129 @@ mod tests {
             pool.into_values().as_slice(),
             [Constant::None, Constant::String(value)] if value == "kept"
         ));
+    }
+
+    #[test]
+    fn direct_scalar_admission_matches_generic_provenance_and_serialization() {
+        struct ResetGenericAdmission(bool);
+
+        impl Drop for ResetGenericAdmission {
+            fn drop(&mut self) {
+                FORCE_GENERIC_CONSTANT_ADMISSION.set(self.0);
+            }
+        }
+
+        let sources = [
+            r"
+values = (None, False, True, ..., 300, -300, 123456789012345678901234567890,
+          1.25, -0.0, 2.5j, 'normal', 'one.two', 'méthode', '\ud800', b'', b'value')
+def outer(argument):
+    def inner():
+        return argument, 12.5, '\ud800', b''
+    return inner, (3.5, 0j, 'one.two')
+",
+            r#"
+class Outer:
+    """Outer.Inner"""
+    dotted = 'Outer.Inner'
+    def method(self):
+        self.méthode = '%'
+        def inner(value):
+            return value in {'set', 'cache'}, ('méthode', '%')
+        return inner
+before = b'' * 0
+after = b''
+values = (1e1000 % 1, (1e1000 % 1, 2j), b'kept')
+"#,
+            r"
+def outer(argument):
+    if False:
+        class Discarded:
+            value = ('one.two', '%', 'café')
+            def inner(self, value):
+                return value in {'set', 'member'}
+    return argument, ('one.two', '%', 'café'), b''
+",
+        ];
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let options = CompileOptions {
+                python_version,
+                ..CompileOptions::default()
+            };
+            for source in sources {
+                let fast = compile_with_options(source, "constant_admission.py", &options).unwrap();
+                let generic = {
+                    let _reset =
+                        ResetGenericAdmission(FORCE_GENERIC_CONSTANT_ADMISSION.replace(true));
+                    compile_with_options(source, "constant_admission.py", &options).unwrap()
+                };
+                assert_eq!(
+                    format!("{:?}", fast.code),
+                    format!("{:?}", generic.code),
+                    "{python_version:?}: {source}"
+                );
+                assert_eq!(fast.marshal(), generic.marshal(), "{python_version:?}");
+                let source_size = u32::try_from(source.len()).unwrap();
+                assert_eq!(
+                    fast.to_timestamp_pyc(17, source_size),
+                    generic.to_timestamp_pyc(17, source_size),
+                    "{python_version:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reserved_none_does_not_build_the_constant_index() {
+        let mut pool = ConstantPool::default();
+        pool.intern(Constant::None).unwrap();
+        for value in 1..CONSTANT_INDEX_THRESHOLD {
+            pool.intern(Constant::Int(u64::try_from(value).unwrap()))
+                .unwrap();
+        }
+
+        assert!(pool.indices.is_none());
+        assert_eq!(pool.intern(Constant::None).unwrap(), 0);
+        assert!(pool.indices.is_none());
+        assert_eq!(pool.intern(Constant::Int(1)).unwrap(), 1);
+        assert!(pool.indices.is_some());
+        assert_eq!(pool.intern(Constant::None).unwrap(), 0);
+
+        let mut unreserved = ConstantPool::default();
+        unreserved
+            .intern(Constant::String("docstring".to_string()))
+            .unwrap();
+        assert_eq!(unreserved.intern(Constant::None).unwrap(), 1);
+        assert_eq!(unreserved.intern(Constant::None).unwrap(), 1);
+    }
+
+    #[test]
+    fn small_constant_pool_preserves_numeric_types_and_string_kinds() {
+        let mut pool = ConstantPool::default();
+        let values = [
+            Constant::Bool(false),
+            Constant::Int(0),
+            Constant::SignedInt(0),
+            Constant::Float(0.0),
+            Constant::Float(-0.0),
+            Constant::String(String::new()),
+            Constant::SurrogateString(Vec::new()),
+            Constant::Bytes(Vec::new()),
+        ];
+        for _ in 0..2 {
+            for (index, value) in values.iter().enumerate() {
+                assert_eq!(
+                    pool.intern(value.clone()).unwrap(),
+                    u32::try_from(index).unwrap()
+                );
+            }
+        }
+        assert!(pool.indices.is_none());
     }
 
     #[test]
@@ -4160,13 +4344,36 @@ mod tests {
 
     #[test]
     fn constant_indices_resolve_fingerprint_collisions() {
-        let values = [Constant::Int(1), Constant::Int(2)];
+        let values = [Constant::Int(1), Constant::Int(2), Constant::Int(2)];
         let mut indices = ConstantIndices::default();
         indices.insert(Some(0), 0);
         indices.insert(Some(0), 1);
+        indices.insert(Some(0), 2);
 
+        assert_eq!(indices.find(&values, &Constant::Int(1), Some(0)), Some(0));
         assert_eq!(indices.find(&values, &Constant::Int(2), Some(0)), Some(1));
         assert_eq!(indices.find(&values, &Constant::Int(3), Some(0)), None);
+        assert_eq!(indices.find(&values, &Constant::Int(1), Some(1)), None);
+    }
+
+    #[test]
+    fn constant_indices_preserve_earliest_fallback_or_fingerprint_match() {
+        let values = [
+            Constant::Int(2),
+            Constant::Int(1),
+            Constant::Int(2),
+            Constant::Int(1),
+        ];
+        let mut indices = ConstantIndices::default();
+        indices.insert(None, 0);
+        indices.insert(Some(0), 1);
+        indices.insert(Some(0), 2);
+        indices.insert(None, 3);
+
+        assert_eq!(indices.find(&values, &Constant::Int(1), Some(0)), Some(1));
+        assert_eq!(indices.find(&values, &Constant::Int(2), Some(0)), Some(0));
+        assert_eq!(indices.find(&values, &Constant::Int(2), Some(1)), Some(0));
+        assert_eq!(indices.find(&values, &Constant::Int(1), None), Some(1));
     }
 
     #[test]

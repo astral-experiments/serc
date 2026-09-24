@@ -771,15 +771,19 @@ impl Compiler<'_> {
     }
 
     pub(super) fn mangled_name(&self, name: &str) -> String {
+        self.mangled_name_cow(name).into_owned()
+    }
+
+    pub(super) fn mangled_name_cow<'a>(&self, name: &'a str) -> Cow<'a, str> {
         if self
             .unit
             .mangled_names
             .as_ref()
             .is_some_and(|names| !names.contains(name))
         {
-            return name.to_string();
+            return Cow::Borrowed(name);
         }
-        mangle_name(name, self.unit.private_name.as_deref()).into_owned()
+        mangle_name(name, self.unit.private_name.as_deref())
     }
 
     pub(super) fn pre_register_suite_names(&mut self, body: &[Stmt]) -> Result<(), CompileError> {

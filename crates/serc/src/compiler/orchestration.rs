@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use ruff_python_ast::token::Tokens;
 use ruff_python_ast::{Expr, Stmt, Suite};
@@ -16,6 +17,7 @@ use super::{
 use crate::assembler::{AssembledCode, Assembler, ConstantTable, SourceLocation};
 use crate::code_object::{
     CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance, MetadataId,
+    MetadataName,
 };
 use crate::target::code_flags::{
     CO_ASYNC_GENERATOR, CO_COROUTINE, CO_FUTURE_ANNOTATIONS, CO_GENERATOR, CO_HAS_DOCSTRING,
@@ -97,13 +99,15 @@ fn metadata_alias_scan_unnecessary(code: &CodeObject) -> bool {
             .names
             .iter()
             .chain(&code.locals)
+            .map(MetadataName::as_str)
             .chain(
                 code.marshal_provenance
                     .interned_metadata_tuples
                     .iter()
-                    .flatten(),
+                    .flatten()
+                    .map(String::as_str),
             )
-            .any(|value| candidates.contains(value.as_str()))
+            .any(|value| candidates.contains(value))
         {
             return true;
         }
@@ -220,18 +224,23 @@ impl ConstantTable for InterningConstantTable<'_, '_> {
 }
 
 impl<'source> Compiler<'source> {
-    fn new(context: Rc<CompilationContext<'source>>, unit: CodeUnit, symbols: SymbolState) -> Self {
+    /// Keep each compiler in place across fallible construction, body lowering, and assembly.
+    fn new(
+        context: Rc<CompilationContext<'source>>,
+        unit: CodeUnit,
+        symbols: SymbolState,
+    ) -> Box<Self> {
         let assembler = Assembler::with_python_version(context.python_version);
-        Self {
+        Box::new(Self {
             context,
-            cached_source_line: Cell::new(None),
+            cached_source_lines: Cell::new([None; 2]),
             unit,
             output: OutputState::default(),
             symbols,
             control: ControlFlowState::default(),
             assembler,
             native_label_plan: None,
-        }
+        })
     }
 
     /// Inherit the enclosing scope's name mangling and imported-name context.
@@ -246,7 +255,7 @@ impl<'source> Compiler<'source> {
     }
 
     /// Shares lexical context while keeping discarded parent instructions in a fresh emitter.
-    pub(super) fn discarded_builder(&self) -> Self {
+    pub(super) fn discarded_builder(&self) -> Box<Self> {
         Self::new(
             Rc::clone(&self.context),
             self.unit.clone(),
@@ -260,7 +269,7 @@ impl<'source> Compiler<'source> {
         source: &'source str,
         tokens: &'source Tokens,
         body: &'source Suite,
-    ) -> Self {
+    ) -> Box<Self> {
         Self::module_with_python_version(
             filename,
             source,
@@ -276,7 +285,7 @@ impl<'source> Compiler<'source> {
         tokens: &'source Tokens,
         body: &'source Suite,
         python_version: crate::PythonVersion,
-    ) -> Self {
+    ) -> Box<Self> {
         let context = Rc::new(CompilationContext::with_python_version(
             filename,
             source,
@@ -311,7 +320,7 @@ impl<'source> Compiler<'source> {
         positional_only_arg_count: u32,
         keyword_only_arg_count: u32,
         parameter_flags: u32,
-    ) -> Result<Self, CompileError> {
+    ) -> Result<Box<Self>, CompileError> {
         let parameter_count = usize::try_from(
             arg_count
                 + keyword_only_arg_count
@@ -444,7 +453,7 @@ impl<'source> Compiler<'source> {
         has_methods: bool,
         has_conditional_annotations: bool,
         future_flags: u32,
-    ) -> Self {
+    ) -> Box<Self> {
         let mut locals = comprehension_targets.to_vec();
         let fast_local_count = locals.len();
         let mut cell_names: NameSet = comprehension_cells.iter().copied().collect();
@@ -529,7 +538,10 @@ impl<'source> Compiler<'source> {
         Self::new(context, unit, symbols)
     }
 
-    pub(crate) fn compile_module(mut self, body: &Suite) -> Result<CodeObject, CompileError> {
+    pub(crate) fn compile_module(
+        mut self: Box<Self>,
+        body: &Suite,
+    ) -> Result<CodeObject, CompileError> {
         self.assembler.reserve_items(body.len().saturating_mul(16));
         if self.context.python_version == PythonVersion::Py312 {
             if super::legacy_native_seed_bound::certifies(body) {
@@ -728,7 +740,7 @@ impl<'source> Compiler<'source> {
     }
 
     pub(super) fn compile_function_body(
-        mut self,
+        mut self: Box<Self>,
         body: &Suite,
     ) -> Result<CodeObject, CompileError> {
         self.assembler.reserve_items(body.len().saturating_mul(16));
@@ -813,7 +825,10 @@ impl<'source> Compiler<'source> {
         self.finish_inner(add_implicit_return)
     }
 
-    pub(super) fn compile_class_body(mut self, body: &Suite) -> Result<CodeObject, CompileError> {
+    pub(super) fn compile_class_body(
+        mut self: Box<Self>,
+        body: &Suite,
+    ) -> Result<CodeObject, CompileError> {
         if self.context.python_version != PythonVersion::Py312 {
             self.context.begin_class_static_attributes();
         }
@@ -1067,12 +1082,12 @@ impl<'source> Compiler<'source> {
         }
     }
 
-    pub(super) fn finish(self) -> Result<CodeObject, CompileError> {
+    pub(super) fn finish(self: Box<Self>) -> Result<CodeObject, CompileError> {
         self.finish_inner(true)
     }
 
     pub(super) fn finish_inner(
-        mut self,
+        mut self: Box<Self>,
         add_implicit_return: bool,
     ) -> Result<CodeObject, CompileError> {
         for (instruction, constant) in
@@ -1229,7 +1244,7 @@ impl<'source> Compiler<'source> {
                     }
             })
             .collect();
-        let (output_locals, local_ids): (Vec<String>, Vec<MetadataId>) = self
+        let (output_locals, local_ids): (Vec<MetadataName>, Vec<MetadataId>) = self
             .symbols
             .locals
             .iter()
@@ -1239,23 +1254,23 @@ impl<'source> Compiler<'source> {
                 if self.unit.free_names_are_final
                     && index >= self.symbols.locals.len() - self.symbols.free_names.len()
                 {
-                    return (spelling.to_string(), MetadataId::from(*name_id));
+                    return (MetadataName::new(spelling), MetadataId::from(*name_id));
                 }
                 // The annotation argument has a separate internal identity so user names
                 // and comprehension targets spelled `format` do not bind to its slot.
                 if self.unit.annotation_thunk && spelling == ".format" {
                     return (
-                        "format".to_string(),
+                        MetadataName::new_static("format"),
                         MetadataId::from(self.required_name_id("format")),
                     );
                 }
-                let name = self.mangled_name(spelling);
+                let name = self.mangled_name_cow(spelling);
                 let id = if name == spelling {
                     MetadataId::from(*name_id)
                 } else {
                     MetadataId::from(self.required_name_id(&name))
                 };
-                (name, id)
+                (MetadataName::from(name), id)
             })
             .unzip();
         let interner = &self.context.scopes.names;
@@ -1338,7 +1353,7 @@ impl<'source> Compiler<'source> {
             names: self.output.names,
             locals: output_locals,
             local_kinds,
-            filename: self.context.filename.clone(),
+            filename: Arc::clone(&self.context.filename),
             name: self.unit.name,
             qualified_name: self.unit.qualified_name,
             first_line_number: self.unit.first_line_number,
