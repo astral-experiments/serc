@@ -4560,6 +4560,117 @@ fn linear_assertion_optimizer_matches_the_block_graph_pipeline() {
 }
 
 #[test]
+fn terminal_guard_optimizer_matches_the_graph_and_keeps_side_local_state_isolated() {
+    for final_line in [-1, 4] {
+        for terminal in [RETURN_VALUE, RAISE_VARARGS] {
+            let first = super::Label::from_u32(0);
+            let second = super::Label::from_u32(1);
+            let value = |opcode, argument, line, depth| {
+                Item::Instruction(Instruction::new(
+                    opcode,
+                    Operand::Value(argument),
+                    SourceLocation::new(line, line, 0, 0),
+                    Some(depth),
+                ))
+            };
+            let jump = |opcode, target, line| {
+                Item::Instruction(Instruction::new(
+                    opcode,
+                    Operand::Forward(target),
+                    SourceLocation::new(line, line, 0, 0),
+                    Some(0),
+                ))
+            };
+            let build = || {
+                let mut assembler = Assembler::from_linear_items(vec![
+                    value(RESUME, ResumeLocation::AT_FUNC_START.argument(), 1, 0),
+                    value(LOAD_FAST, 0, 1, 1),
+                    jump(POP_JUMP_IF_FALSE, first, 1),
+                    value(NOT_TAKEN, 0, 1, 0),
+                    value(LOAD_CONST, 1, 2, 1),
+                    value(STORE_FAST, 1, 2, 0),
+                    value(LOAD_FAST, 1, 2, 1),
+                    value(terminal, u32::from(terminal == RAISE_VARARGS), 2, 0),
+                    Item::Label(first),
+                    value(LOAD_FAST, 0, 3, 1),
+                    jump(POP_JUMP_IF_NONE, second, 3),
+                    value(NOT_TAKEN, 0, 3, 0),
+                    value(DELETE_FAST, 0, 3, 0),
+                    value(LOAD_CONST, 3, 3, 1),
+                    value(RETURN_VALUE, 0, 3, 0),
+                    Item::Label(second),
+                    value(LOAD_CONST, 4, final_line, 1),
+                    value(POP_TOP, 0, final_line, 0),
+                    value(LOAD_FAST, 1, final_line, 1),
+                    value(POP_TOP, 0, final_line, 0),
+                    value(LOAD_FAST, 0, final_line, 1),
+                    value(RETURN_VALUE, 0, final_line, 0),
+                ]);
+                assembler.next_label = 2;
+                assembler
+            };
+            let mut linear = build();
+            assert!(linear.has_only_linear_terminal_guards());
+            assert_eq!(
+                linear.used_constant_indices(6),
+                [false, true, false, true, true, false]
+            );
+            assert!(matches!(linear.code, UnoptimizedCode::Linear(_)));
+
+            let mut generic = build();
+            let graph = super::block_graph::BlockGraph::from_items(
+                generic.linear_items().to_vec(),
+                &rustc_hash::FxHashSet::default(),
+            );
+            let reachable = graph.reachable_blocks(&[]);
+            generic.code = UnoptimizedCode::Prepared { graph, reachable };
+            let actual = linear.finish_code(1, 2, 1).unwrap();
+            let expected = generic.finish_code(1, 2, 1).unwrap();
+            assert_eq!(actual.bytecode, expected.bytecode);
+            assert_eq!(actual.line_table, expected.line_table);
+            assert_eq!(actual.exception_table, expected.exception_table);
+            assert_eq!(actual.max_depth, expected.max_depth);
+            assert_eq!(actual.removed_max_depth, expected.removed_max_depth);
+        }
+    }
+}
+
+#[test]
+fn terminal_guard_recognition_keeps_nested_and_nonterminal_branches_on_the_graph() {
+    let first = super::Label::from_u32(0);
+    let second = super::Label::from_u32(1);
+    let jump = |target| {
+        Item::Instruction(Instruction::new(
+            POP_JUMP_IF_FALSE,
+            Operand::Forward(target),
+            SourceLocation::new(1, 1, 0, 0),
+            Some(0),
+        ))
+    };
+    for side in [
+        vec![pass_instruction(POP_TOP, 0, 2)],
+        vec![
+            jump(second),
+            pass_instruction(NOT_TAKEN, 0, 2),
+            pass_instruction(RAISE_VARARGS, 0, 2),
+            Item::Label(second),
+            pass_instruction(RETURN_VALUE, 0, 2),
+        ],
+    ] {
+        let mut items = vec![
+            pass_instruction(LOAD_FAST, 0, 1),
+            jump(first),
+            pass_instruction(NOT_TAKEN, 0, 1),
+        ];
+        items.extend(side);
+        items.extend([Item::Label(first), pass_instruction(RETURN_VALUE, 0, 3)]);
+        let mut assembler = Assembler::from_linear_items(items);
+        assembler.next_label = 2;
+        assert!(!assembler.has_only_linear_terminal_guards());
+    }
+}
+
+#[test]
 fn linear_constant_return_matches_the_block_graph_pipeline() {
     let resume = SourceLocation::new(0, 1, 0, 0);
     let pass = SourceLocation::new(2, 2, 4, 8);
@@ -5174,6 +5285,40 @@ fn local_rewrites_report_only_instruction_changes() {
     );
     assert!(!loads.remove_redundant_checked_loads());
     assert_eq!(loads.graph.copy_items(), checked);
+}
+
+#[test]
+fn initialization_passes_record_new_checked_loads_for_later_cleanup() {
+    for (multiple_blocks, assertion_pass) in [(false, false), (true, false), (true, true)] {
+        let mut items = vec![pass_instruction(LOAD_FAST, 0, 1)];
+        if multiple_blocks {
+            let target = super::Label::from_u32(0);
+            items.extend([
+                Item::Instruction(Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(target),
+                    SourceLocation::NONE,
+                    None,
+                )),
+                Item::Label(target),
+            ]);
+        }
+        items.push(pass_instruction(LOAD_FAST, 0, 2));
+        let mut assembler = optimization_pipeline(items);
+        assert!(assembler.graph.features().has_fast_load());
+        assert!(!assembler.graph.features().has_checked_fast_load());
+        assert!(!assembler.remove_redundant_checked_loads());
+
+        if assertion_pass {
+            assembler.add_checks_for_assertion_side_exits(1, 0);
+        } else {
+            let donors = assembler.capture_local_nop_donors();
+            assembler.add_checks_for_uninitialized_loads(1, 0, &donors);
+        }
+
+        assert!(assembler.graph.features().has_checked_fast_load());
+        assert_eq!(graph_opcodes(&assembler)[0], LOAD_FAST_CHECK);
+    }
 }
 
 #[test]
@@ -6285,6 +6430,47 @@ fn canceled_unpack_rotations_preserve_distinct_capture_nop_lines() {
 }
 
 #[test]
+fn original_location_absence_tracks_sparse_aliases_and_transitive_predecessors() {
+    let left = super::Label::from_u32(2);
+    let right = super::Label::from_u32(16);
+    let join = super::Label::from_u32(33);
+    let alias = super::Label::from_u32(57);
+    let chained = super::Label::from_u32(80);
+    let trailing = super::Label::from_u32(96);
+    let jump = |opcode, target, line| {
+        Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Forward(target),
+            SourceLocation::new(line, line, 0, 0),
+            None,
+        ))
+    };
+    let mut assembler = optimization_pipeline(vec![
+        pass_instruction(LOAD_CONST, 0, 1),
+        jump(POP_JUMP_IF_TRUE, right, 1),
+        Item::Label(left),
+        pass_instruction(LOAD_CONST, 0, 2),
+        jump(JUMP_FORWARD, join, -1),
+        Item::Label(right),
+        pass_instruction(LOAD_CONST, 0, 3),
+        jump(JUMP_FORWARD, join, -1),
+        Item::Label(join),
+        Item::Label(alias),
+        pass_instruction(NOP, 0, -1),
+        jump(JUMP_FORWARD, chained, -1),
+        Item::Label(chained),
+        pass_instruction(RETURN_VALUE, 0, -1),
+        Item::Label(trailing),
+    ]);
+    assembler.next_label = 0;
+
+    assert_eq!(
+        assembler.capture_original_location_absence(),
+        [join, alias, chained].into_iter().collect()
+    );
+}
+
+#[test]
 fn cleanup_prefix_locations_retain_original_donors_through_late_writers() {
     for full_copy_path in [false, true] {
         for original_donor in [false, true] {
@@ -7186,5 +7372,677 @@ fn iterator_break_finalizers_copy_every_target_iterator_cell() {
             // whether they then copy a return or jump to an ordinary continuation.
             assert_eq!(copied_disposals, 2, "{version:?}, guarded={guarded}");
         }
+    }
+}
+
+#[test]
+fn ordinary_linear_terminal_raises_match_the_block_graph_pipeline() {
+    let item = |opcode, argument, line, depth| {
+        Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Value(argument),
+            if line < 0 {
+                SourceLocation::NONE
+            } else {
+                SourceLocation::new(line, line, 2, 15)
+            },
+            Some(depth),
+        ))
+    };
+    let resume = item(RESUME, ResumeLocation::AT_FUNC_START.argument(), 1, 0);
+    let scenarios = [
+        (0, 0, 0, vec![]),
+        (
+            0,
+            0,
+            0,
+            vec![
+                item(LOAD_GLOBAL, 1, 2, 2),
+                item(LOAD_CONST, 300, 2, 3),
+                item(CALL, 1, 2, 1),
+                item(POP_TOP, 0, 2, 0),
+                item(NOP, 0, 3, 0),
+            ],
+        ),
+        (1, 1, 1, vec![item(LOAD_FAST, 0, 5, 1)]),
+        (1, 0, 1, vec![item(LOAD_FAST, 0, 5, 1)]),
+        (
+            1,
+            1,
+            0,
+            vec![
+                item(LOAD_GLOBAL, 1, 4, 2),
+                item(LOAD_FAST, 0, 4, 3),
+                item(CALL, 1, 4, 1),
+                item(COPY, 1, 4, 2),
+                item(POP_TOP, 0, 4, 1),
+            ],
+        ),
+        (
+            2,
+            2,
+            2,
+            vec![item(LOAD_FAST, 0, 5, 1), item(LOAD_FAST, 1, 5, 2)],
+        ),
+        (
+            2,
+            2,
+            1,
+            vec![
+                item(LOAD_FAST, 0, 3, 1),
+                item(STORE_FAST, 1, 3, 0),
+                item(DELETE_FAST, 1, 4, 0),
+                item(LOAD_FAST, 1, 4, 1),
+                item(LOAD_GLOBAL, 1, 5, 3),
+                item(LOAD_CONST, 300, 5, 4),
+                item(CALL, 1, -1, 2),
+            ],
+        ),
+    ];
+    for (argument, local_count, parameter_count, body) in scenarios {
+        for raise_line in [-1, 5] {
+            let mut items = vec![resume];
+            items.extend_from_slice(&body);
+            items.push(item(RAISE_VARARGS, argument, raise_line, 0));
+            assert_linear_matches_graph(
+                || Assembler::from_linear_items(items.clone()),
+                local_count,
+                parameter_count,
+            );
+        }
+    }
+
+    for argument in 0..=2 {
+        let mut items = vec![item(COPY_FREE_VARS, 1, -1, 0), resume];
+        if argument > 0 {
+            items.push(item(LOAD_DEREF, 0, 4, 1));
+        }
+        if argument == 2 {
+            items.push(item(LOAD_CONST, 300, 5, 2));
+        }
+        items.push(item(RAISE_VARARGS, argument, 5, 0));
+        assert_linear_matches_graph(|| Assembler::from_linear_items(items.clone()), 0, 0);
+    }
+}
+
+#[test]
+fn ordinary_linear_terminal_raises_reject_other_exits_and_metadata() {
+    let location = SourceLocation::new(5, 5, 2, 15);
+    let value = |opcode, argument, depth| {
+        Instruction::new(opcode, Operand::Value(argument), location, Some(depth))
+    };
+    let resume = Item::Instruction(value(RESUME, ResumeLocation::AT_FUNC_START.argument(), 0));
+    let load = Item::Instruction(value(LOAD_CONST, 1, 1));
+    for terminal in [
+        value(RETURN_VALUE, 0, 0),
+        value(RAISE_VARARGS, 1, 0),
+        value(RAISE_VARARGS, 2, 0),
+    ] {
+        let assembler = Assembler::from_linear_items(vec![resume, Item::Instruction(terminal)]);
+        assert!(!assembler.has_only_linear_instructions(0));
+    }
+
+    let mut inline = value(RAISE_VARARGS, 1, 0);
+    inline.location = SourceLocation::NONE;
+    inline.no_location_policy.allow_block_inlining();
+    let mut preserved = value(RAISE_VARARGS, 1, 0);
+    preserved.no_location_policy.preserve_location();
+    let mut exceptional = value(RAISE_VARARGS, 1, 0);
+    exceptional.set_exception_policy(ExceptionPolicy::NonePresent);
+    let mut folding = value(RAISE_VARARGS, 1, 0);
+    folding.add_pre_fold_extra_instructions(1);
+    for terminal in [
+        value(RAISE_VARARGS, 3, 0),
+        value(RAISE_VARARGS, 1, 1),
+        value(RERAISE, 0, 0),
+        inline,
+        preserved,
+        exceptional,
+        folding,
+    ] {
+        let assembler =
+            Assembler::from_linear_items(vec![resume, load, Item::Instruction(terminal)]);
+        assert!(!assembler.has_only_linear_instructions(0));
+    }
+
+    let raise = Item::Instruction(value(RAISE_VARARGS, 1, 0));
+    for items in [
+        vec![resume, load, raise, load, raise],
+        vec![resume, load, raise, Item::Label(super::Label::from_u32(0))],
+        vec![resume, Item::Label(super::Label::from_u32(0)), load, raise],
+    ] {
+        assert!(!Assembler::from_linear_items(items).has_only_linear_instructions(0));
+    }
+}
+
+fn assert_terminal_guards_match_graph(
+    build: impl Fn() -> Assembler,
+    local_count: usize,
+    parameter_count: usize,
+) {
+    let linear = build();
+    assert!(linear.has_only_linear_terminal_guards());
+    let mut generic = build();
+    let graph = super::block_graph::BlockGraph::from_items(
+        generic.linear_items().to_vec(),
+        &rustc_hash::FxHashSet::default(),
+    );
+    let reachable = graph.reachable_blocks(&[]);
+    generic.code = UnoptimizedCode::Prepared { graph, reachable };
+    let actual = linear.finish_code(1, local_count, parameter_count).unwrap();
+    let expected = generic
+        .finish_code(1, local_count, parameter_count)
+        .unwrap();
+    assert_eq!(actual.bytecode, expected.bytecode);
+    assert_eq!(actual.line_table, expected.line_table);
+    assert_eq!(actual.exception_table, expected.exception_table);
+    assert_eq!(actual.max_depth, expected.max_depth);
+    assert_eq!(actual.removed_max_depth, expected.removed_max_depth);
+}
+
+#[test]
+fn terminal_guards_with_unreferenced_trailing_labels_match_the_block_graph_pipeline() {
+    let location = |line| {
+        if line < 0 {
+            SourceLocation::NONE
+        } else {
+            SourceLocation::new(line, line, 2, 15)
+        }
+    };
+    let item = |opcode, argument, line, depth| {
+        Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Value(argument),
+            location(line),
+            Some(depth),
+        ))
+    };
+    let jump = |target, line| {
+        Item::Instruction(Instruction::new(
+            POP_JUMP_IF_FALSE,
+            Operand::Forward(target),
+            location(line),
+            Some(0),
+        ))
+    };
+    let first = super::Label::from_u32(0);
+    let second = super::Label::from_u32(1);
+    let trailing = super::Label::from_u32(2);
+    let extra = super::Label::from_u32(3);
+    for (terminal, argument) in [(RETURN_VALUE, 0), (RAISE_VARARGS, 0), (RAISE_VARARGS, 2)] {
+        for line in [-1, 6] {
+            for suffix in [
+                vec![Item::Label(trailing)],
+                vec![Item::Label(trailing), Item::Label(extra)],
+            ] {
+                let mut items = vec![
+                    item(RESUME, ResumeLocation::AT_FUNC_START.argument(), 1, 0),
+                    item(LOAD_FAST, 0, 2, 1),
+                    item(TO_BOOL, 0, 2, 1),
+                    jump(first, 2),
+                    item(NOT_TAKEN, 0, 2, 0),
+                    item(LOAD_CONST, 1, 3, 1),
+                    item(RETURN_VALUE, 0, 3, 0),
+                    Item::Label(first),
+                    item(LOAD_FAST, 1, 4, 1),
+                    item(TO_BOOL, 0, 4, 1),
+                    jump(second, 4),
+                    item(NOT_TAKEN, 0, 4, 0),
+                    item(LOAD_FAST, 0, 5, 1),
+                    item(RAISE_VARARGS, 1, 5, 0),
+                    Item::Label(second),
+                ];
+                if terminal == RETURN_VALUE || argument > 0 {
+                    items.push(item(LOAD_FAST, 1, line, 1));
+                }
+                if argument == 2 {
+                    items.push(item(LOAD_CONST, 2, line, 2));
+                }
+                items.push(item(terminal, argument, line, 0));
+                items.extend(suffix);
+                assert_terminal_guards_match_graph(
+                    || {
+                        let mut assembler = Assembler::from_linear_items(items.clone());
+                        assembler.next_label = 4;
+                        assembler
+                    },
+                    2,
+                    2,
+                );
+            }
+        }
+    }
+
+    let original = vec![
+        item(RESUME, ResumeLocation::AT_FUNC_START.argument(), 1, 0),
+        item(LOAD_FAST, 0, 2, 1),
+        item(TO_BOOL, 0, 2, 1),
+        jump(first, 2),
+        item(NOT_TAKEN, 0, 2, 0),
+        item(RAISE_VARARGS, 0, 3, 0),
+        Item::Label(first),
+        item(RAISE_VARARGS, 0, 4, 0),
+    ];
+    for suffix in [
+        vec![Item::Label(first)],
+        vec![Item::Label(trailing), Item::Label(first)],
+        vec![Item::Label(trailing), Item::Label(trailing)],
+        vec![Item::Label(trailing), item(NOP, 0, 5, 0)],
+        vec![Item::Label(trailing), item(RAISE_VARARGS, 0, 5, 0)],
+    ] {
+        let mut items = original.clone();
+        items.extend(suffix);
+        let mut assembler = Assembler::from_linear_items(items);
+        assembler.next_label = 3;
+        assert!(!assembler.has_only_linear_terminal_guards());
+    }
+}
+
+#[test]
+fn short_circuit_terminal_guards_merge_local_state_like_the_block_graph_pipeline() {
+    let location = |line| SourceLocation::new(line, line, 2, 15);
+    let value = |opcode, argument, line, depth| {
+        Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Value(argument),
+            location(line),
+            Some(depth),
+        ))
+    };
+    let target = super::Label::from_u32(0);
+    let jump = |opcode, line| {
+        Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Forward(target),
+            location(line),
+            Some(0),
+        ))
+    };
+    for mode in ["before", "walrus between", "delete between", "unset"] {
+        for (terminal, argument) in [(RETURN_VALUE, 0), (RAISE_VARARGS, 0), (RAISE_VARARGS, 1)] {
+            for third in [false, true] {
+                let mut items = vec![value(
+                    RESUME,
+                    ResumeLocation::AT_FUNC_START.argument(),
+                    1,
+                    0,
+                )];
+                if matches!(mode, "before" | "delete between") {
+                    items.extend([value(LOAD_CONST, 1, 2, 1), value(STORE_FAST, 1, 2, 0)]);
+                }
+                items.extend([
+                    value(LOAD_FAST, 0, 3, 1),
+                    value(TO_BOOL, 0, 3, 1),
+                    jump(POP_JUMP_IF_FALSE, 3),
+                    value(NOT_TAKEN, 0, 3, 0),
+                ]);
+                if mode == "delete between" {
+                    items.push(value(DELETE_FAST, 1, 4, 0));
+                }
+                items.push(value(LOAD_FAST, 0, 4, 1));
+                if mode == "walrus between" {
+                    items.extend([value(COPY, 1, 4, 2), value(STORE_FAST, 1, 4, 1)]);
+                }
+                items.extend([
+                    value(TO_BOOL, 0, 4, 1),
+                    jump(POP_JUMP_IF_FALSE, 4),
+                    value(NOT_TAKEN, 0, 4, 0),
+                ]);
+                if third {
+                    items.extend([
+                        value(LOAD_FAST, 0, 5, 1),
+                        jump(POP_JUMP_IF_NONE, 5),
+                        value(NOT_TAKEN, 0, 5, 0),
+                    ]);
+                }
+                if terminal == RETURN_VALUE || argument != 0 {
+                    items.push(value(LOAD_FAST, 0, 6, 1));
+                }
+                items.extend([
+                    value(terminal, argument, 6, 0),
+                    Item::Label(target),
+                    value(LOAD_FAST, 1, 8, 1),
+                    value(RETURN_VALUE, 0, 8, 0),
+                ]);
+                let build = || {
+                    let mut assembler = Assembler::from_linear_items(items.clone());
+                    assembler.next_label = 1;
+                    assembler
+                };
+                assert_terminal_guards_match_graph(build, 2, 1);
+                let code = build().finish_code(1, 2, 1).unwrap();
+                let last_load = code
+                    .bytecode
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .rev()
+                    .nth(1)
+                    .unwrap();
+                assert_eq!(last_load[0] == LOAD_FAST_CHECK.code(), mode != "before");
+            }
+        }
+    }
+}
+
+#[test]
+fn short_circuit_terminal_guards_reject_graph_only_exit_and_value_rewrites() {
+    let location = SourceLocation::new(2, 2, 2, 15);
+    let value = |opcode, argument, depth| {
+        Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Value(argument),
+            location,
+            Some(depth),
+        ))
+    };
+    let target = super::Label::from_u32(0);
+    let other = super::Label::from_u32(1);
+    let jump = |target| {
+        Item::Instruction(Instruction::new(
+            POP_JUMP_IF_FALSE,
+            Operand::Forward(target),
+            location,
+            Some(0),
+        ))
+    };
+    let baseline = vec![
+        value(RESUME, ResumeLocation::AT_FUNC_START.argument(), 0),
+        value(LOAD_FAST, 0, 1),
+        value(TO_BOOL, 0, 1),
+        jump(target),
+        value(NOT_TAKEN, 0, 0),
+        value(LOAD_FAST, 0, 1),
+        value(TO_BOOL, 0, 1),
+        jump(target),
+        value(NOT_TAKEN, 0, 0),
+        value(RAISE_VARARGS, 0, 0),
+        Item::Label(target),
+        value(LOAD_FAST, 0, 1),
+        value(RETURN_VALUE, 0, 0),
+    ];
+    let recognize = |items| {
+        let mut assembler = Assembler::from_linear_items(items);
+        assembler.next_label = 2;
+        assembler.has_only_linear_terminal_guards()
+    };
+    assert!(recognize(baseline.clone()));
+    for change in [
+        "unlocated target",
+        "only unstable target location",
+        "first split-copy policy",
+        "second split-copy policy",
+        "artificial target exit",
+        "value-preserving conditional",
+        "different target",
+        "missing marker",
+    ] {
+        let mut items = baseline.clone();
+        match change {
+            "unlocated target" | "only unstable target location" => {
+                for item in &mut items[11..] {
+                    let Item::Instruction(instruction) = item else {
+                        unreachable!();
+                    };
+                    instruction.location = SourceLocation::NONE;
+                }
+                if change == "only unstable target location" {
+                    items.insert(11, value(NOP, 0, 0));
+                }
+            }
+            "first split-copy policy" | "second split-copy policy" => {
+                let index = if change == "first split-copy policy" {
+                    3
+                } else {
+                    7
+                };
+                let Item::Instruction(instruction) = &mut items[index] else {
+                    unreachable!();
+                };
+                instruction
+                    .no_location_policy
+                    .allow_split_return_exit_copy();
+            }
+            "artificial target exit" => {
+                let Item::Instruction(instruction) = &mut items[12] else {
+                    unreachable!();
+                };
+                instruction.no_location_policy.mark_artificial_eval_break();
+            }
+            "value-preserving conditional" => items.insert(2, value(COPY, 1, 2)),
+            "different target" => items[7] = jump(other),
+            "missing marker" => items[8] = value(POP_TOP, 0, 0),
+            _ => unreachable!(),
+        }
+        assert!(!recognize(items), "{change}");
+    }
+}
+
+#[test]
+fn falling_forward_guards_match_the_block_graph_pipeline() {
+    let location = |line| SourceLocation::new(line, line, 2, 15);
+    let value = |opcode, argument, line, depth| {
+        Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Value(argument),
+            location(line),
+            Some(depth),
+        ))
+    };
+    let first = super::Label::from_u32(0);
+    let second = super::Label::from_u32(1);
+    let jump = |opcode, target, line| {
+        Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Forward(target),
+            location(line),
+            Some(0),
+        ))
+    };
+    for mode in ["call", "store", "delete", "side walrus", "condition walrus"] {
+        for second_guard in [false, true] {
+            let mut items = vec![value(
+                RESUME,
+                ResumeLocation::AT_FUNC_START.argument(),
+                1,
+                0,
+            )];
+            if matches!(mode, "call" | "delete") {
+                items.extend([value(LOAD_CONST, 1, 2, 1), value(STORE_FAST, 2, 2, 0)]);
+            }
+            items.push(value(LOAD_FAST, 0, 3, 1));
+            if mode == "condition walrus" {
+                items.extend([value(COPY, 1, 3, 2), value(STORE_FAST, 2, 3, 1)]);
+            }
+            items.extend([
+                value(TO_BOOL, 0, 3, 1),
+                jump(POP_JUMP_IF_FALSE, first, 3),
+                value(NOT_TAKEN, 0, 3, 0),
+            ]);
+            match mode {
+                "store" => {
+                    items.extend([value(LOAD_FAST, 1, 4, 1), value(STORE_FAST, 2, 4, 0)]);
+                }
+                "delete" => items.push(value(DELETE_FAST, 2, 4, 0)),
+                "side walrus" => items.extend([
+                    value(LOAD_FAST, 1, 4, 1),
+                    value(COPY, 1, 4, 2),
+                    value(STORE_FAST, 2, 4, 1),
+                    value(POP_TOP, 0, 4, 0),
+                ]),
+                "call" | "condition walrus" => items.extend([
+                    value(LOAD_FAST, 1, 4, 1),
+                    value(PUSH_NULL, 0, 4, 2),
+                    value(CALL, 0, 4, 1),
+                    value(POP_TOP, 0, 4, 0),
+                ]),
+                _ => unreachable!(),
+            }
+            items.push(Item::Label(first));
+            if second_guard {
+                items.extend([
+                    value(LOAD_FAST, 0, 5, 1),
+                    jump(POP_JUMP_IF_NONE, second, 5),
+                    value(NOT_TAKEN, 0, 5, 0),
+                    value(LOAD_CONST, 3, 6, 1),
+                    value(STORE_GLOBAL, 0, 6, 0),
+                    Item::Label(second),
+                ]);
+            }
+            items.extend([
+                value(LOAD_FAST, 2, 8, 1),
+                value(LOAD_CONST, 4, 8, 2),
+                value(BUILD_TUPLE, 2, 8, 1),
+                value(RETURN_VALUE, 0, 8, 0),
+            ]);
+            let build = || {
+                let mut assembler = Assembler::from_linear_items(items.clone());
+                assembler.next_label = 2;
+                assembler
+            };
+            assert_terminal_guards_match_graph(build, 3, 2);
+            let mut assembler = build();
+            assert_eq!(
+                assembler.used_constant_indices(5),
+                [
+                    false,
+                    matches!(mode, "call" | "delete"),
+                    false,
+                    second_guard,
+                    true,
+                ]
+            );
+            assert!(matches!(assembler.code, UnoptimizedCode::Linear(_)));
+            let code = assembler.finish_code(1, 3, 2).unwrap();
+            let checked = code
+                .bytecode
+                .as_chunks::<2>()
+                .0
+                .contains(&[LOAD_FAST_CHECK.code(), 2]);
+            assert_eq!(checked, matches!(mode, "store" | "delete" | "side walrus"));
+        }
+    }
+
+    let items = vec![
+        value(RESUME, ResumeLocation::AT_FUNC_START.argument(), 1, 0),
+        value(LOAD_FAST, 0, 3, 1),
+        value(TO_BOOL, 0, 3, 1),
+        jump(POP_JUMP_IF_FALSE, first, 3),
+        value(NOT_TAKEN, 0, 3, 0),
+        value(LOAD_FAST, 1, 4, 1),
+        value(TO_BOOL, 0, 4, 1),
+        jump(POP_JUMP_IF_FALSE, first, 4),
+        value(NOT_TAKEN, 0, 4, 0),
+        value(LOAD_FAST, 0, 5, 1),
+        value(STORE_FAST, 2, 5, 0),
+        Item::Label(first),
+        value(LOAD_FAST, 2, 8, 1),
+        value(RETURN_VALUE, 0, 8, 0),
+    ];
+    assert_terminal_guards_match_graph(
+        || {
+            let mut assembler = Assembler::from_linear_items(items.clone());
+            assembler.next_label = 1;
+            assembler
+        },
+        3,
+        2,
+    );
+}
+
+#[test]
+fn falling_forward_guards_reject_unstable_joins_and_nonstatement_arms() {
+    let location = SourceLocation::new(2, 2, 2, 15);
+    let value = |opcode, argument, depth| {
+        Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Value(argument),
+            location,
+            Some(depth),
+        ))
+    };
+    let target = super::Label::from_u32(0);
+    let jump = Item::Instruction(Instruction::new(
+        POP_JUMP_IF_FALSE,
+        Operand::Forward(target),
+        location,
+        Some(0),
+    ));
+    let baseline = vec![
+        value(RESUME, ResumeLocation::AT_FUNC_START.argument(), 0),
+        value(LOAD_FAST, 0, 1),
+        value(TO_BOOL, 0, 1),
+        jump,
+        value(NOT_TAKEN, 0, 0),
+        value(LOAD_FAST, 0, 1),
+        value(STORE_FAST, 1, 0),
+        Item::Label(target),
+        value(LOAD_FAST, 0, 1),
+        value(RETURN_VALUE, 0, 0),
+    ];
+    let recognizes = |items| {
+        let mut assembler = Assembler::from_linear_items(items);
+        assembler.next_label = 1;
+        assembler.has_only_linear_terminal_guards()
+    };
+    assert!(recognizes(baseline.clone()));
+    for change in [
+        "no genuine action",
+        "side keeps a stack value",
+        "guard has a stack value",
+        "marker has a stack value",
+        "unlocated first join instruction",
+        "unstable first join instruction",
+        "copy policy",
+        "artificial join exit",
+        "threadable copy",
+        "generator",
+    ] {
+        let mut items = baseline.clone();
+        match change {
+            "no genuine action" => items[6] = value(POP_TOP, 0, 0),
+            "side keeps a stack value" => items.insert(7, value(LOAD_FAST, 0, 1)),
+            "guard has a stack value" | "marker has a stack value" => {
+                let index = if change == "guard has a stack value" {
+                    3
+                } else {
+                    4
+                };
+                let Item::Instruction(instruction) = &mut items[index] else {
+                    unreachable!();
+                };
+                *instruction = Instruction::new(
+                    instruction.opcode,
+                    instruction.operand(),
+                    instruction.location,
+                    Some(1),
+                );
+            }
+            "unlocated first join instruction" => {
+                let Item::Instruction(instruction) = &mut items[8] else {
+                    unreachable!();
+                };
+                instruction.location = SourceLocation::NONE;
+            }
+            "unstable first join instruction" => items.insert(8, value(NOP, 0, 0)),
+            "copy policy" => {
+                let Item::Instruction(instruction) = &mut items[3] else {
+                    unreachable!();
+                };
+                instruction
+                    .no_location_policy
+                    .allow_split_return_exit_copy();
+            }
+            "artificial join exit" => {
+                let Item::Instruction(instruction) = &mut items[9] else {
+                    unreachable!();
+                };
+                instruction.no_location_policy.mark_artificial_eval_break();
+            }
+            "threadable copy" => items.insert(2, value(COPY, 1, 2)),
+            "generator" => items.insert(1, value(RETURN_GENERATOR, 0, 0)),
+            _ => unreachable!(),
+        }
+        assert!(!recognizes(items), "{change}");
     }
 }

@@ -4,8 +4,9 @@ use ruff_index::{IndexVec, newtype_index};
 use rustc_hash::FxHashSet;
 
 use crate::target::opcodes::{
-    LOAD_FAST, LOAD_FAST_BORROW, LOAD_FAST_CHECK, LOAD_FAST_LOAD_FAST, POP_JUMP_IF_FALSE,
-    POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, STORE_FAST, SWAP, TO_BOOL, UNARY_NOT,
+    COPY, IS_OP, LOAD_FAST, LOAD_FAST_BORROW, LOAD_FAST_CHECK, LOAD_FAST_LOAD_FAST,
+    POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, STORE_FAST, SWAP,
+    TO_BOOL, UNARY_NOT,
 };
 
 use super::{
@@ -96,6 +97,9 @@ impl PipelineFeatures {
     const BORROW_EMPTY_BLOCK: u16 = 1 << 6;
     const JUMP: u16 = 1 << 7;
     const POP_CONDITIONAL: u16 = 1 << 8;
+    const COPY_TOP: u16 = 1 << 9;
+    const CHECKED_FAST_LOAD: u16 = 1 << 10;
+    const IDENTITY_COMPARISON: u16 = 1 << 11;
 
     fn record(&mut self, instruction: &Instruction) {
         self.0 |= match instruction.opcode {
@@ -111,9 +115,12 @@ impl PipelineFeatures {
                 Self::FORWARD_CONDITIONAL
             }
             SWAP => Self::SWAP_TRIGGER,
-            LOAD_FAST | LOAD_FAST_CHECK | LOAD_FAST_BORROW | LOAD_FAST_LOAD_FAST => Self::FAST_LOAD,
+            LOAD_FAST_CHECK => Self::FAST_LOAD | Self::CHECKED_FAST_LOAD,
+            LOAD_FAST | LOAD_FAST_BORROW | LOAD_FAST_LOAD_FAST => Self::FAST_LOAD,
             STORE_FAST => Self::STORE_FAST_TRIGGER,
             TO_BOOL | UNARY_NOT => Self::BOOLEAN_CONVERSION,
+            IS_OP => Self::IDENTITY_COMPARISON,
+            COPY if instruction.operand() == Operand::Value(1) => Self::COPY_TOP,
             _ => 0,
         };
         if instruction.jump_policy.borrow_empty_block() {
@@ -153,12 +160,20 @@ impl PipelineFeatures {
         self.0 & Self::FAST_LOAD != 0
     }
 
+    pub(super) const fn has_checked_fast_load(self) -> bool {
+        self.0 & Self::CHECKED_FAST_LOAD != 0
+    }
+
     pub(super) const fn has_store_fast(self) -> bool {
         self.0 & Self::STORE_FAST_TRIGGER != 0
     }
 
     pub(super) const fn has_boolean_conversion(self) -> bool {
         self.0 & Self::BOOLEAN_CONVERSION != 0
+    }
+
+    pub(super) const fn has_identity_comparison(self) -> bool {
+        self.0 & Self::IDENTITY_COMPARISON != 0
     }
 
     pub(super) const fn has_borrow_empty_block(self) -> bool {
@@ -171,6 +186,10 @@ impl PipelineFeatures {
 
     pub(super) const fn has_pop_conditional(self) -> bool {
         self.0 & Self::POP_CONDITIONAL != 0
+    }
+
+    pub(super) const fn has_copy_top(self) -> bool {
+        self.0 & Self::COPY_TOP != 0
     }
 }
 
@@ -253,7 +272,7 @@ fn collect_segments<T>(
 pub(super) fn fuse_adjacent_instructions(
     items: &mut Vec<Item>,
     mut fuse: impl FnMut(&Instruction, &Instruction) -> Option<Instruction>,
-) {
+) -> bool {
     let original_len = items.len();
     let mut read = 0;
     let mut write = 0;
@@ -294,6 +313,7 @@ pub(super) fn fuse_adjacent_instructions(
         write += 1;
     }
     items.truncate(write);
+    write != original_len
 }
 
 impl BlockGraph {
@@ -342,8 +362,17 @@ impl BlockGraph {
         self.order.len()
     }
 
+    pub(super) fn item_count(&self) -> usize {
+        self.iter().map(|(_, block)| block.items().len()).sum()
+    }
+
     pub(super) const fn features(&self) -> PipelineFeatures {
         self.features
+    }
+
+    /// Records a local-initialization pass creating a checked load in existing graph items.
+    pub(super) fn record_checked_fast_load(&mut self) {
+        self.features.0 |= PipelineFeatures::CHECKED_FAST_LOAD;
     }
 
     /// Returns whether normalization would leave one jump-free block unchanged.
@@ -749,8 +778,8 @@ impl BlockGraph {
         &mut self,
         block: BasicBlockId,
         fuse: impl FnMut(&Instruction, &Instruction) -> Option<Instruction>,
-    ) {
-        fuse_adjacent_instructions(&mut self.blocks[block].items, fuse);
+    ) -> bool {
+        fuse_adjacent_instructions(&mut self.blocks[block].items, fuse)
     }
 
     fn validate_order(&self, order: &[BasicBlockId]) -> Result<(), String> {
@@ -829,8 +858,7 @@ impl BlockGraph {
 
     /// Copies the ordered item stream into a single allocation.
     pub(super) fn copy_items(&self) -> Vec<Item> {
-        let item_count = self.iter().map(|(_, block)| block.items().len()).sum();
-        let mut items = Vec::with_capacity(item_count);
+        let mut items = Vec::with_capacity(self.item_count());
         for (_, block) in self.iter() {
             items.extend_from_slice(block.items());
         }
@@ -892,36 +920,43 @@ impl BlockGraph {
         positions
     }
 
-    /// Builds a pass-local ordered view of block contents without moving the
-    /// graph's owned items or changing stable block identities.
-    pub(super) fn partition_positions(
+    /// Builds an ordered view of matching partitions without moving the graph's owned items.
+    pub(super) fn matching_partition_positions(
         &self,
         boundary_labels: &FxHashSet<Label>,
         ends_block: impl Fn(&Instruction) -> bool,
+        matches: impl Fn(&Instruction) -> bool,
     ) -> Vec<Vec<ItemPosition>> {
-        let positions = self.item_positions();
-        let mut segment_lengths = Vec::with_capacity(positions.len());
-        let mut segment_length = 0;
-        for position in &positions {
-            let item = self.item(*position);
-            if matches!(item, Item::Label(label) if boundary_labels.contains(label))
-                && segment_length > 0
-            {
-                segment_lengths.push(segment_length);
-                segment_length = 0;
+        let mut partitions = Vec::new();
+        let mut segment = Vec::new();
+        let mut contains_match = false;
+        let finish = |segment: &mut Vec<_>, contains_match: &mut bool, partitions: &mut Vec<_>| {
+            if std::mem::take(contains_match) {
+                partitions.push(std::mem::take(segment));
+            } else {
+                segment.clear();
             }
-            let ends_here =
-                matches!(item, Item::Instruction(instruction) if ends_block(instruction));
-            segment_length += 1;
-            if ends_here {
-                segment_lengths.push(segment_length);
-                segment_length = 0;
+        };
+        for (block, contents) in self.iter() {
+            for (offset, item) in contents.items().iter().enumerate() {
+                if matches!(item, Item::Label(label) if boundary_labels.contains(label))
+                    && !segment.is_empty()
+                {
+                    finish(&mut segment, &mut contains_match, &mut partitions);
+                }
+                segment.push(ItemPosition { block, offset });
+                if let Item::Instruction(instruction) = item {
+                    contains_match |= matches(instruction);
+                    if ends_block(instruction) {
+                        finish(&mut segment, &mut contains_match, &mut partitions);
+                    }
+                }
             }
         }
-        if segment_length > 0 {
-            segment_lengths.push(segment_length);
+        if contains_match {
+            partitions.push(segment);
         }
-        collect_segments(positions, segment_lengths)
+        partitions
     }
 
     pub(super) fn item(&self, position: ItemPosition) -> &Item {
@@ -1184,6 +1219,8 @@ mod tests {
                 instruction(LOAD_FAST_CHECK, Operand::Value(0)),
                 instruction(STORE_FAST, Operand::Value(0)),
                 instruction(TO_BOOL, Operand::Value(0)),
+                instruction(IS_OP, Operand::Value(0)),
+                instruction(COPY, Operand::Value(1)),
                 Item::Instruction(borrow_marker),
                 Item::Label(target),
                 instruction(RETURN_VALUE, Operand::Value(0)),
@@ -1196,11 +1233,14 @@ mod tests {
         assert!(features.has_forward_conditional());
         assert!(features.has_swap());
         assert!(features.has_fast_load());
+        assert!(features.has_checked_fast_load());
         assert!(features.has_store_fast());
         assert!(features.has_boolean_conversion());
+        assert!(features.has_identity_comparison());
         assert!(features.has_borrow_empty_block());
         assert!(features.has_jump());
         assert!(features.has_pop_conditional());
+        assert!(features.has_copy_top());
     }
 
     #[test]
@@ -1210,6 +1250,7 @@ mod tests {
             vec![
                 instruction(JUMP_BACKWARD, Operand::Backward(target)),
                 instruction(POP_JUMP_IF_NONE, Operand::Forward(target)),
+                instruction(COPY, Operand::Value(2)),
                 Item::Label(target),
                 instruction(RETURN_VALUE, Operand::Value(0)),
             ],
@@ -1221,11 +1262,14 @@ mod tests {
         assert!(!features.has_forward_conditional());
         assert!(!features.has_swap());
         assert!(!features.has_fast_load());
+        assert!(!features.has_checked_fast_load());
         assert!(!features.has_store_fast());
         assert!(!features.has_boolean_conversion());
+        assert!(!features.has_identity_comparison());
         assert!(!features.has_borrow_empty_block());
         assert!(features.has_jump());
         assert!(features.has_pop_conditional());
+        assert!(!features.has_copy_top());
     }
 
     #[test]
@@ -1300,6 +1344,57 @@ mod tests {
 
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].as_ptr(), pointer);
+    }
+
+    #[test]
+    fn matching_partitions_keep_their_prefix_and_stop_at_the_requested_boundaries() {
+        let first = Label::from_u32(0);
+        let consecutive = Label::from_u32(1);
+        let last = Label::from_u32(2);
+        let items = vec![
+            instruction(NOP, Operand::Value(0)),
+            Item::Label(first),
+            instruction(NOP, Operand::Value(1)),
+            instruction(SWAP, Operand::Value(2)),
+            instruction(RETURN_VALUE, Operand::Value(0)),
+            instruction(NOP, Operand::Value(3)),
+            Item::Label(consecutive),
+            Item::Label(last),
+            instruction(NOP, Operand::Value(4)),
+            instruction(SWAP, Operand::Value(3)),
+            instruction(NOP, Operand::Value(5)),
+        ];
+        let boundaries = FxHashSet::from_iter([first, consecutive, last]);
+        let graph = BlockGraph::from_items(items.clone(), &boundaries);
+
+        let partitions = graph.matching_partition_positions(
+            &boundaries,
+            |instruction| instruction.opcode == RETURN_VALUE,
+            |instruction| instruction.opcode == SWAP,
+        );
+        let actual = partitions
+            .iter()
+            .map(|partition| {
+                partition
+                    .iter()
+                    .map(|position| graph.item(*position))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual.len(), 2);
+        for (actual, expected) in actual.into_iter().zip([&items[1..5], &items[7..]]) {
+            assert_eq!(actual.len(), expected.len());
+            for (actual, expected) in actual.into_iter().zip(expected) {
+                match (actual, expected) {
+                    (Item::Label(actual), Item::Label(expected)) => assert_eq!(actual, expected),
+                    (Item::Instruction(actual), Item::Instruction(expected)) => {
+                        assert_eq!(actual.opcode, expected.opcode);
+                        assert_eq!(actual.operand(), expected.operand());
+                    }
+                    _ => panic!("partition item differs from input"),
+                }
+            }
+        }
     }
 
     #[test]
