@@ -162,9 +162,11 @@ impl LayoutAssembler {
                         late_exception_exclusions.push((position, end));
                     }
                     let dynamic_owner = (!instruction.jump_policy.is_authored_branch_marker())
-                        .then(|| dynamic_exception_owners.get(&instruction_index))
+                        .then(|| dynamic_exception_owners.get(instruction_index))
                         .flatten();
-                    if let Some(region) = dynamic_owner.and_then(|owner| owner.source_region()) {
+                    if let Some(region) = dynamic_owner
+                        .and_then(super::exception_owners::ExceptionOwnerDecision::source_region)
+                    {
                         late_source_exception_owners.push((position, end, region));
                     } else {
                         if instruction
@@ -190,7 +192,9 @@ impl LayoutAssembler {
                             == NormalizedExceptionOwner::Absent
                             || (instruction.exception_policy().owner()
                                 == NormalizedExceptionOwner::DynamicCondition
-                                && !dynamic_owner.is_some_and(|owner| owner.has_owner()))
+                                && !dynamic_owner.is_some_and(
+                                    super::exception_owners::ExceptionOwnerDecision::has_owner,
+                                ))
                         {
                             if block_has_applied_comprehension_swap {
                                 late_exception_inclusions.push((position, end));
