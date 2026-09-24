@@ -24236,6 +24236,10 @@ impl<'source> Compiler<'source> {
                 && matches!(handler.body.last(), Some(Stmt::If(tail))
                     if tail.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none()))
                 && self.assembler.at_original_shared_handler_join();
+            let copy_shared_final_cleanup = handler_index + 1 == statement.handlers.len()
+                && self.context.python_version >= crate::PythonVersion::Py314
+                && matches!(handler.body.last(), Some(Stmt::If(tail))
+                    if !tail.elif_else_clauses.is_empty());
             let body_end = self.assembler.label();
             self.assembler.mark(body_end);
             if self.context.python_version == crate::PythonVersion::Py312 {
@@ -24258,6 +24262,10 @@ impl<'source> Compiler<'source> {
                 self.emit(LOAD_CONST, none, 1)?;
                 if preserve_cleanup_no_location {
                     self.assembler.preserve_last_no_location();
+                    if copy_shared_final_cleanup {
+                        self.assembler
+                            .make_last_no_location_copy_inherit_shared_predecessor();
+                    }
                 }
                 self.store_name(name.as_str())?;
                 self.delete_name(name.as_str())?;
@@ -24267,8 +24275,18 @@ impl<'source> Compiler<'source> {
                 self.emit(LIST_APPEND, 1, -1)?;
                 if preserve_cleanup_no_location && handler.name.is_none() {
                     self.assembler.preserve_last_no_location();
+                    if copy_shared_final_cleanup {
+                        self.assembler
+                            .make_last_no_location_copy_inherit_shared_predecessor();
+                    }
                 }
                 self.emit_jump_forward(JUMP_FORWARD, reraise_star, 0)?;
+                if copy_shared_final_cleanup {
+                    // Starting in 3.14 the final handler appends its unmatched subgroup
+                    // on each authored arm that jumps to this unlocated cleanup.
+                    self.assembler.allow_last_no_location_block_inlining();
+                    self.assembler.allow_last_unconditional_block_inlining();
+                }
             } else {
                 self.emit_jump_forward(JUMP_FORWARD, next_handler, 0)?;
                 if preserve_cleanup_no_location && handler.name.is_none() {
