@@ -229,12 +229,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: macos-latest
-            runner: namespace-profile-macos-15
-          - os: windows-latest
-            runner: namespace-profile-windows-2022-x86-64-16x32
-    runs-on: ${{ github.repository == 'astral-sh/serc' && matrix.runner || matrix.os }}
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: read
     env:
