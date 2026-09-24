@@ -4122,20 +4122,39 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
             self.collect_type_parameter_comprehensions(parameters);
         }
         let mut required = expression_required_names(&statement.value);
+        let mut nested =
+            self.expression_requirements(&statement.value, annotation_nested_required_names);
         if let Some(type_params) = statement.type_params.as_deref() {
             let type_names: BTreeSet<_> = type_params
                 .iter()
                 .map(|parameter| parameter.name().as_str().to_string())
                 .collect();
             required.extend(type_parameter_required_names(type_params));
+            for parameter in type_params {
+                if let TypeParam::TypeVar(parameter) = parameter
+                    && let Some(bound) = parameter.bound.as_deref()
+                {
+                    nested.extend(
+                        self.expression_requirements(bound, annotation_nested_required_names),
+                    );
+                }
+                if let Some(default) = parameter.default() {
+                    nested.extend(
+                        self.expression_requirements(default, annotation_nested_required_names),
+                    );
+                }
+            }
             self.facts
                 .nested_annotation_scope_requirements
                 .extend(required.difference(&type_names).cloned());
+            nested.retain(|name| !type_names.contains(name));
         } else {
             self.facts
                 .nested_annotation_scope_requirements
                 .extend(required);
         }
+        // A nested function skips class bindings even when the alias itself can see them.
+        self.facts.nested_lambda_requirements.extend(nested);
     }
 
     fn insert_reference(&mut self, name: &'ast str) {
