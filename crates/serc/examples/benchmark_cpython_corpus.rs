@@ -1491,8 +1491,7 @@ mod tests {
             }
         }
 
-        let python =
-            std::env::var("SERC_TEST_PYTHON").unwrap_or_else(|_| "python3.14".to_string());
+        let python = std::env::var("SERC_TEST_PYTHON").unwrap_or_else(|_| "python3.14".to_string());
         let sources = [
             (
                 "accepted.py",

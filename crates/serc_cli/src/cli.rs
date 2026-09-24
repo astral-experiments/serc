@@ -11,8 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::builder::Styles;
 use clap::builder::styling::{AnsiColor, Effects};
 use clap::{Parser, Subcommand, ValueHint};
-use serc::{CompileError, CompileOptions, PythonVersion, compile_bytes_with_options};
 use rayon::prelude::*;
+use serc::{CompileError, CompileOptions, PythonVersion, compile_bytes_with_options};
 use walkdir::WalkDir;
 
 const STYLES: Styles = Styles::styled()
@@ -819,10 +819,9 @@ mod tests {
         })
         .unwrap();
 
-        let expected =
-            serc::compile_bytes(replacement.as_bytes(), source_path.to_str().unwrap())
-                .unwrap()
-                .to_timestamp_pyc(1_700_000_000, u32::try_from(replacement.len()).unwrap());
+        let expected = serc::compile_bytes(replacement.as_bytes(), source_path.to_str().unwrap())
+            .unwrap()
+            .to_timestamp_pyc(1_700_000_000, u32::try_from(replacement.len()).unwrap());
         assert_eq!(
             fs_err::read(cache_path(&source_path, PythonVersion::Py314).unwrap()).unwrap(),
             expected

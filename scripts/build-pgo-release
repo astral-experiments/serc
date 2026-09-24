@@ -266,15 +266,11 @@ def main():
         cpython_outputs = bytecode_hashes(corpus)
         if len(cpython_outputs) != manifest["corpus_sources"]["files"]:
             raise ValueError("CPython did not produce one cache file per source")
-        control = build(
-            "serc-cli", ["--bin", "serc"], output / "control-target", ""
-        )
+        control = build("serc-cli", ["--bin", "serc"], output / "control-target", "")
         compile_corpus(control, 1)
         control_outputs = bytecode_hashes(corpus)
         if control_outputs.keys() != cpython_outputs.keys():
-            raise ValueError(
-                "Ordinary Serc did not produce the expected cache paths"
-            )
+            raise ValueError("Ordinary Serc did not produce the expected cache paths")
         differences = [
             {
                 "path": path,

@@ -225,6 +225,4 @@ def verify_bytecode(corpus: Path, expected):
             for path in actual.keys() | expected.keys()
             if actual.get(path) != expected.get(path)
         )
-        raise ValueError(
-            f"Corpus .pyc contents differ from ordinary Serc: {changed}"
-        )
+        raise ValueError(f"Corpus .pyc contents differ from ordinary Serc: {changed}")

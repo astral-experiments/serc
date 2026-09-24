@@ -1335,8 +1335,7 @@ mod tests {
 
     #[test]
     fn oracle_distinguishes_compilation_rejections_and_io_failures() {
-        let python =
-            std::env::var("SERC_TEST_PYTHON").unwrap_or_else(|_| "python3.14".to_string());
+        let python = std::env::var("SERC_TEST_PYTHON").unwrap_or_else(|_| "python3.14".to_string());
         verify_python(&python, PythonVersion::Py314).unwrap();
         let directory = tempfile::tempdir().unwrap();
 

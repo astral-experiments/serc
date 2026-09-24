@@ -534,6 +534,41 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn admitted_inventory_requires_exact_nonempty_partition() {
+        let artifact = json!({"path": "unused", "sha256": "unused", "bytes": 0});
+        let mut admission: Admission = serde_json::from_value(json!({
+            "schema": 1, "status": "synthetic", "files": 10, "eligible": 8,
+            "cpython_rejected": 2, "native_identity": null,
+            "corpus_manifest": artifact, "index": artifact, "closed_evidence": {},
+        }))
+        .unwrap();
+        let mut config: Config = serde_json::from_value(json!({
+            "expected_files": 10, "expected_eligible": 8, "expected_cpython_rejected": 2,
+            "admission": artifact, "admission_actual": artifact,
+            "compiler_source_manifest": artifact, "compiler_support_manifest": artifact,
+            "compiler_build": artifact, "output_directory": "unused",
+        }))
+        .unwrap();
+        assert!(admitted_counts_match(&admission, &config));
+        for (files, eligible, rejected) in [(11, 8, 2), (10, 7, 2), (10, 8, 1)] {
+            config.expected_files = files;
+            config.expected_eligible = eligible;
+            config.expected_cpython_rejected = rejected;
+            assert!(!admitted_counts_match(&admission, &config));
+        }
+        for (files, eligible, rejected) in [(0, 0, 0), (10, 0, 10), (10, 8, 3), (1, usize::MAX, 2)]
+        {
+            admission.files = files;
+            admission.eligible = eligible;
+            admission.cpython_rejected = rejected;
+            config.expected_files = files;
+            config.expected_eligible = eligible;
+            config.expected_cpython_rejected = rejected;
+            assert!(!admitted_counts_match(&admission, &config));
+        }
+    }
+
+    #[test]
     fn admitted_cache_identity_is_bound_to_its_python_target() {
         for python_version in [
             PythonVersion::Py312,
