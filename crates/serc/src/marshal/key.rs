@@ -19,7 +19,7 @@ use super::v5::{
     TYPE_STRING, TYPE_TRUE, TYPE_TUPLE, TYPE_UNICODE,
 };
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) enum ObjectKey<'a> {
     // Scalar and immutable-container keys use Python value equality.
     None,
@@ -42,13 +42,13 @@ pub(super) enum ObjectKey<'a> {
     SurrogateString(&'a [u8]),
     Bytes(&'a [u8]),
     ConstantTuple(ConstantTupleKey<'a>),
-    FrozenSet(Vec<Self>),
+    FrozenSet(FrozenSetKey<'a>),
     StringTuple(StringTupleKey<'a>),
     // Annotation-scope locals retain identity even when their contents compare equal.
     AnnotationLocals(usize),
     // CPython reuses one canonical empty tuple.
     EmptyTuple,
-    Slice(Box<Self>, Box<Self>, Box<Self>),
+    Slice(SliceKey<'a>),
     // These objects also retain identity. The address is used only as a marshal-graph key and is
     // never written to the output.
     SliceMember(usize),
@@ -60,7 +60,7 @@ pub(super) enum ObjectKey<'a> {
     FreshEmptyBytes,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct HashedObjectKey<'a> {
     key: ObjectKey<'a>,
     hash: u64,
@@ -81,7 +81,7 @@ impl<'a> HashedObjectKey<'a> {
     }
 
     pub(super) fn with_hash(key: ObjectKey<'a>, hash: u64) -> Self {
-        debug_assert_eq!(Self::new(key.clone()).hash, hash, "marshal key hash");
+        debug_assert_eq!(Self::new(key).hash, hash, "marshal key hash");
         Self { key, hash }
     }
 }
@@ -143,6 +143,93 @@ impl Ord for ConstantTupleKey<'_> {
             .iter()
             .map(constant_key)
             .cmp(other.0.iter().map(constant_key))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct FrozenSetKey<'a>(&'a [Constant]);
+
+impl<'a> FrozenSetKey<'a> {
+    fn sorted_members(self) -> SmallVec<[ObjectKey<'a>; 4]> {
+        let mut members: SmallVec<_> = self.0.iter().map(constant_key).collect();
+        members.sort_unstable();
+        members
+    }
+}
+
+impl PartialEq for FrozenSetKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0, other.0)
+            || (self.0.len() == other.0.len() && self.sorted_members() == other.sorted_members())
+    }
+}
+
+impl Eq for FrozenSetKey<'_> {}
+
+impl Hash for FrozenSetKey<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.sorted_members().as_slice().hash(state);
+    }
+}
+
+impl PartialOrd for FrozenSetKey<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for FrozenSetKey<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        if std::ptr::eq(self.0, other.0) {
+            Ordering::Equal
+        } else {
+            self.sorted_members().cmp(&other.sorted_members())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SliceKey<'a> {
+    lower: &'a Constant,
+    upper: &'a Constant,
+    step: &'a Constant,
+}
+
+impl<'a> SliceKey<'a> {
+    fn members(self) -> [ObjectKey<'a>; 3] {
+        [
+            constant_key(self.lower),
+            constant_key(self.upper),
+            constant_key(self.step),
+        ]
+    }
+}
+
+impl PartialEq for SliceKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.members() == other.members()
+    }
+}
+
+impl Eq for SliceKey<'_> {}
+
+impl Hash for SliceKey<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for member in self.members() {
+            member.hash(state);
+        }
+    }
+}
+
+impl PartialOrd for SliceKey<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SliceKey<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.members().cmp(&other.members())
     }
 }
 
@@ -445,22 +532,14 @@ pub(super) fn constant_key(value: &Constant) -> ObjectKey<'_> {
         Constant::SurrogateString(value) => ObjectKey::SurrogateString(value),
         Constant::Bytes(value) => ObjectKey::Bytes(value),
         Constant::Tuple(values) => constants_tuple_key(values),
-        Constant::FrozenSet(values) => {
-            let mut values: Vec<_> = values.iter().map(constant_key).collect();
-            values.sort_unstable();
-            ObjectKey::FrozenSet(values)
-        }
-        Constant::Slice { lower, upper, step } => ObjectKey::Slice(
-            Box::new(constant_key(lower)),
-            Box::new(constant_key(upper)),
-            Box::new(constant_key(step)),
-        ),
+        Constant::FrozenSet(values) => ObjectKey::FrozenSet(FrozenSetKey(values)),
+        Constant::Slice { lower, upper, step } => ObjectKey::Slice(SliceKey { lower, upper, step }),
         Constant::Code(code) => code_key(code),
     }
 }
 
 pub(super) type ConstantSortKey = SmallVec<[u8; 16]>;
-pub(super) type FrozenSetMembers<'a> = SmallVec<[(ConstantSortKey, &'a Constant); 4]>;
+pub(super) type FrozenSetMembers<'a> = SmallVec<[&'a Constant; 4]>;
 
 pub(super) fn constant_sort_key(value: &Constant) -> ConstantSortKey {
     constant_sort_key_with_properties(value, PythonVersion::Py314, &|value| {
@@ -669,7 +748,7 @@ fn constant_sort_key_with_properties<'a>(
                         .to_le_bytes(),
                 );
                 for (_, value) in
-                    frozen_set_members_with_properties(values, python_version, properties)
+                    sorted_frozen_set_members_with_properties(values, python_version, properties)
                 {
                     append(output, value, true, python_version, properties, references);
                 }
@@ -699,12 +778,12 @@ fn constant_sort_key_with_properties<'a>(
 }
 
 pub(super) fn frozen_set_members_in_wire_order(values: &[Constant]) -> FrozenSetMembers<'_> {
-    let mut members = FrozenSetMembers::new();
+    let mut members = SmallVec::<[(ConstantSortKey, &Constant); 4]>::new();
     for value in values {
         members.push((constant_sort_key(value), value));
     }
     members.sort_by(|(left, _), (right, _)| left.cmp(right));
-    members
+    members.into_iter().map(|(_, value)| value).collect()
 }
 
 pub(super) fn frozen_set_members_with_properties<'a>(
@@ -712,7 +791,18 @@ pub(super) fn frozen_set_members_with_properties<'a>(
     python_version: PythonVersion,
     properties: &impl Fn(&'a Constant) -> (bool, bool),
 ) -> FrozenSetMembers<'a> {
-    let mut members = FrozenSetMembers::new();
+    sorted_frozen_set_members_with_properties(values, python_version, properties)
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect()
+}
+
+fn sorted_frozen_set_members_with_properties<'a>(
+    values: &'a [Constant],
+    python_version: PythonVersion,
+    properties: &impl Fn(&'a Constant) -> (bool, bool),
+) -> SmallVec<[(ConstantSortKey, &'a Constant); 4]> {
+    let mut members = SmallVec::<[(ConstantSortKey, &Constant); 4]>::new();
     for value in values {
         members.push((
             constant_sort_key_with_properties(value, python_version, properties),
