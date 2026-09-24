@@ -648,15 +648,32 @@ impl Compiler<'_> {
                         let redundant_capture_line = truthiness
                             && !context.stores.is_empty()
                             && self.source_location(case.pattern.range()).line == location.line;
-                        self.assembler.set_location(if redundant_capture_line {
-                            SourceLocation::NONE
-                        } else {
-                            location
-                        });
+                        let redundant_pattern_line = self.context.python_version
+                            >= PythonVersion::Py314
+                            && context.stores.is_empty()
+                            && ((truthiness
+                                && !matches!(
+                                    case.pattern,
+                                    Pattern::MatchValue(_) | Pattern::MatchSingleton(_)
+                                ))
+                                || (!truthiness
+                                    && has_default
+                                    && matches!(case.pattern, Pattern::MatchOr(_))))
+                            && self
+                                .assembler
+                                .last_instruction_location()
+                                .is_some_and(|previous| previous.line == location.line);
+                        self.assembler.set_location(
+                            if redundant_capture_line || redundant_pattern_line {
+                                SourceLocation::NONE
+                            } else {
+                                location
+                            },
+                        );
                         self.emit(NOP, 0, 0)?;
-                        if redundant_capture_line {
-                            // Native constant folding removes the guard's line after the
-                            // same-line capture store. Keep its slot for original block sizing.
+                        if redundant_capture_line || redundant_pattern_line {
+                            // Keep the folded guard's slot for original block sizing without
+                            // giving it a duplicate source line at the pattern success join.
                             self.assembler.preserve_last_no_location();
                         }
                     }

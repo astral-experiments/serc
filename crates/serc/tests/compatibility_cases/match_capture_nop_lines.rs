@@ -130,3 +130,51 @@ fn drops_constant_true_guard_line_after_same_line_capture() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn drops_redundant_constant_guard_line_after_refutable_pattern() {
+    for (filename, source) in [
+        (
+            "match_mapping_true_guard_line.py",
+            "def f(value):\n    match value:\n        case {} if True:\n            pass\n",
+        ),
+        (
+            "match_wildcard_sequence_true_guard_line.py",
+            "def f(value):\n    match value:\n        case [_, *_, _] if 1:\n            pass\n",
+        ),
+        (
+            "match_or_false_guard_line.py",
+            "def f(value):\n    match value:\n        case 1 | 2 if False:\n            return 1\n        case _:\n            return 2\n",
+        ),
+        (
+            "match_mapping_separate_true_guard_line.py",
+            "def f(value):\n    match value:\n        case {} if (\n            True\n        ):\n            pass\n",
+        ),
+        (
+            "match_or_separate_false_guard_line.py",
+            "def f(value):\n    match value:\n        case 1 | 2 if (\n            False\n        ):\n            return 1\n        case _:\n            return 2\n",
+        ),
+        (
+            "match_mapping_runtime_guard_line.py",
+            "def f(value, condition):\n    match value:\n        case {} if condition:\n            pass\n",
+        ),
+        (
+            "match_value_true_guard_line.py",
+            "def f(value):\n    match value:\n        case 1 if True:\n            pass\n",
+        ),
+        (
+            "match_singleton_false_guard_line.py",
+            "def f(value):\n    match value:\n        case None if False:\n            return 1\n        case _:\n            return 2\n",
+        ),
+        (
+            "match_mapping_false_guard_line.py",
+            "def f(value):\n    match value:\n        case {} if False:\n            return 1\n        case _:\n            return 2\n",
+        ),
+        (
+            "match_or_false_guard_without_default.py",
+            "def f(value):\n    match value:\n        case 1 | 2 if False:\n            return 1\n",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
