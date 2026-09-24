@@ -27,6 +27,48 @@ mod tests {
     }
 
     #[test]
+    fn terminal_guard_returns_and_raises_match_cpython() {
+        let source = "def guard(flag, other):\n    if flag:\n        return flag + 1\n    if other is None:\n        raise ValueError('missing', other)\n    return other\n\ndef side_local(flag):\n    if flag:\n        value = 4\n        return value\n    return value\n\ndef side_deletion(flag):\n    if flag:\n        del flag\n        raise RuntimeError('deleted')\n    return flag\n\ndef continuing_binding(flag, value):\n    prepared = value\n    if flag:\n        prepared = flag\n        return prepared\n    if prepared is None:\n        return 42\n    return prepared\n\ndef side_check(flag):\n    if flag:\n        result\n        raise RuntimeError\n    return result\n";
+        assert_matches_cpython_marshal(source, "terminal_guard_paths.py");
+    }
+
+    #[test]
+    fn short_circuit_and_exhaustive_terminal_paths_match_cpython() {
+        let source = r"
+def reraise():
+    raise
+
+def chained(exception, cause):
+    message = str(exception)
+    raise ValueError(message) from cause
+
+def exhaustive(first, second):
+    if first:
+        return 1
+    elif second:
+        raise TypeError(second)
+    else:
+        return 3
+
+def conjunction(first, second, third):
+    if first and second and third:
+        return first + third
+    return second
+
+def partial_assignment(first, second):
+    if first and (local := second):
+        return local
+    return local
+
+def continuing_assignment(first, second):
+    if (local := first) and second:
+        return second
+    return local
+";
+        assert_matches_cpython_marshal(source, "short_circuit_terminal_paths.py");
+    }
+
+    #[test]
     fn emits_a_python_3145_pyc_header() {
         let pyc = compile_to_pyc("answer = 42\n", "answer.py", 123).unwrap();
         assert_eq!(&pyc[..4], &CPYTHON_TARGET.magic_number);

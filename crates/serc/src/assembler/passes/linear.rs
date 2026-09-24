@@ -8,7 +8,10 @@ use super::super::{
 use crate::CompileError;
 use crate::assembler::ConstantTable;
 use crate::assembler::block_graph::{ItemMut, fuse_adjacent_instructions};
-use crate::target::opcodes::{POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE};
+use crate::target::opcodes::{
+    COPY, LOAD_FAST, LOAD_FAST_BORROW, LOAD_FAST_CHECK, LOAD_FAST_LOAD_FAST, POP_JUMP_IF_NONE,
+    POP_JUMP_IF_NOT_NONE,
+};
 
 use super::control_flow::{
     clear_redundant_boolean_nop_location, optimize_boolean_pair, optimize_redundant_store_pair,
@@ -18,10 +21,61 @@ use super::locals::{
     fuse_pair, optimize_linear_assertion_load_fast, update_assertion_local_checks,
 };
 
+#[derive(Default)]
+struct LinearCandidates {
+    boolean_conversion: bool,
+    adjacent_stores: bool,
+    copy_top: bool,
+    individual_load: bool,
+    combined_load: bool,
+    fusable_instructions: usize,
+}
+
+impl LinearCandidates {
+    fn from_items(items: &[Item]) -> Self {
+        let mut candidates = Self::default();
+        let mut previous_was_store = false;
+        for item in items {
+            let Item::Instruction(instruction) = item else {
+                previous_was_store = false;
+                continue;
+            };
+            let opcode = instruction.opcode;
+            let is_store = opcode == STORE_FAST;
+            candidates.adjacent_stores |= previous_was_store && is_store;
+            previous_was_store = is_store;
+            candidates.boolean_conversion |= matches!(opcode, TO_BOOL | UNARY_NOT);
+            candidates.copy_top |= opcode == COPY && instruction.operand() == Operand::Value(1);
+            candidates.individual_load |= matches!(opcode, LOAD_FAST | LOAD_FAST_CHECK);
+            candidates.combined_load |= opcode == LOAD_FAST_LOAD_FAST;
+            candidates.fusable_instructions += usize::from(matches!(
+                opcode,
+                LOAD_FAST | LOAD_FAST_BORROW | LOAD_FAST_CHECK | STORE_FAST
+            ));
+        }
+        candidates
+    }
+}
+
 fn optimize_boolean_conversions_and_redundant_stores(
     items: &mut [Item],
     constants: Option<&dyn ConstantTable>,
+    candidates: &LinearCandidates,
 ) {
+    if !candidates.boolean_conversion {
+        if candidates.adjacent_stores {
+            for index in 0..items.len().saturating_sub(1) {
+                let (before, after) = items.split_at_mut(index + 1);
+                if let (Item::Instruction(current), Item::Instruction(next)) =
+                    (&mut before[index], &after[0])
+                {
+                    optimize_redundant_store_pair(current, next);
+                }
+            }
+        }
+        return;
+    }
+
     let was_boolean_conversion = items
         .iter()
         // Match the graph pass: a comparison moved into TO_BOOL leaves a folded slot.
@@ -74,8 +128,15 @@ fn propagate_assertion_exit_locations(items: &mut [Item]) {
             position += 1;
             continue;
         }
-        let target = position + 4;
-        debug_assert!(matches!(items.get(target), Some(Item::Label(_))));
+        let Operand::Forward(label) = jump.operand() else {
+            unreachable!("a terminal guard must jump forward");
+        };
+        let target = position
+            + 1
+            + items[position + 1..]
+                .iter()
+                .position(|item| matches!(item, Item::Label(candidate) if *candidate == label))
+                .expect("a terminal guard has a bound continuation");
         let mut end = target + 1;
         while end < items.len() {
             match items[end] {
@@ -119,9 +180,19 @@ fn add_checks_for_uninitialized_loads(
         .unwrap_or(0);
     let mut unsafe_high_locals = vec![true; local_count.saturating_sub(64)];
     let mut block_has_instruction = false;
+    let mut continuing_state = None;
     for item in items {
         let instruction = match item {
-            Item::Label(_) => {
+            Item::Label(label) => {
+                if let Some((target, initialized)) = continuing_state.take() {
+                    debug_assert_eq!(*label, target);
+                    if block_has_instruction {
+                        // The last side arm can fall through to the same continuing target.
+                        unsafe_locals |= initialized;
+                    } else {
+                        unsafe_locals = initialized;
+                    }
+                }
                 if block_has_instruction {
                     unsafe_high_locals.fill(true);
                     block_has_instruction = false;
@@ -131,6 +202,20 @@ fn add_checks_for_uninitialized_loads(
             Item::Instruction(instruction) => instruction,
         };
         block_has_instruction = true;
+        if matches!(
+            instruction.opcode,
+            POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
+        ) && let Operand::Forward(target) = instruction.operand()
+        {
+            if let Some((pending_target, pending_unsafe)) = &mut continuing_state {
+                debug_assert_eq!(*pending_target, target);
+                // A short-circuit continuation can be reached before later operands set or
+                // delete locals; a load is safe only if every predecessor initialized it.
+                *pending_unsafe |= unsafe_locals;
+            } else {
+                continuing_state = Some((target, unsafe_locals));
+            }
+        }
         update_assertion_local_checks(
             instruction,
             local_count,
@@ -141,6 +226,34 @@ fn add_checks_for_uninitialized_loads(
             unsafe_high_locals.fill(true);
             block_has_instruction = false;
         }
+    }
+}
+
+fn optimize_guard_load_fast(python_version: crate::PythonVersion, mut items: &mut [Item]) {
+    loop {
+        let mut block_has_instruction = false;
+        let boundary = items.iter().position(|item| match item {
+            Item::Label(_) => block_has_instruction,
+            Item::Instruction(instruction) => {
+                block_has_instruction = matches!(instruction.operand(), Operand::Value(_))
+                    && !ends_scope(instruction.opcode)
+                    && instruction.opcode != crate::target::opcodes::NOT_TAKEN
+                    && !(instruction.opcode == NOP && instruction.jump_policy.always_retains_nop())
+                    && !instruction.jump_policy.borrow_empty_block()
+                    && instruction.no_location_policy.borrow_fallthrough()
+                        != crate::assembler::ir::BorrowFallthrough::Barrier;
+                false
+            }
+        });
+        let Some(boundary) = boundary else {
+            optimize_linear_assertion_load_fast(python_version, items);
+            return;
+        };
+        let (before, after) = items.split_at_mut(boundary);
+        // The graph resets its reference stack before a targeted label reached both from a
+        // conditional and its fallthrough arm. Terminal arms already end the borrow range.
+        optimize_linear_assertion_load_fast(python_version, before);
+        items = &mut after[1..];
     }
 }
 
@@ -242,7 +355,8 @@ impl Assembler {
         let UnoptimizedCode::Linear(mut items) = self.code else {
             unreachable!("linear assertion optimizer requires linear instructions");
         };
-        optimize_boolean_conversions_and_redundant_stores(&mut items, constants);
+        let candidates = LinearCandidates::from_items(&items);
+        optimize_boolean_conversions_and_redundant_stores(&mut items, constants, &candidates);
         #[cfg(any(test, debug_assertions))]
         super::validate_structure(
             &items,
@@ -250,7 +364,9 @@ impl Assembler {
             None,
             AssemblerStage::OptimizeBooleanConversions,
         )?;
-        propagate_assertion_exit_locations(&mut items);
+        if self.next_label != 0 {
+            propagate_assertion_exit_locations(&mut items);
+        }
         #[cfg(any(test, debug_assertions))]
         super::validate_structure(
             &items,
@@ -259,15 +375,19 @@ impl Assembler {
             AssemblerStage::DuplicateExitBlocks,
         )?;
         let mut removed_max_depth = None;
-        for index in redundant_copy_pop_indices(&items).into_iter().rev() {
-            if let Item::Instruction(instruction) = items.remove(index)
-                && let Some(depth) = instruction.depth_after()
-            {
-                removed_max_depth =
-                    Some(removed_max_depth.map_or(depth, |current: u32| current.max(depth)));
+        if candidates.copy_top {
+            for index in redundant_copy_pop_indices(&items).into_iter().rev() {
+                if let Item::Instruction(instruction) = items.remove(index)
+                    && let Some(depth) = instruction.depth_after()
+                {
+                    removed_max_depth =
+                        Some(removed_max_depth.map_or(depth, |current: u32| current.max(depth)));
+                }
             }
         }
-        add_checks_for_uninitialized_loads(&mut items, local_count, parameter_count);
+        if candidates.individual_load {
+            add_checks_for_uninitialized_loads(&mut items, local_count, parameter_count);
+        }
         #[cfg(any(test, debug_assertions))]
         super::validate_structure(
             &items,
@@ -275,7 +395,9 @@ impl Assembler {
             None,
             AssemblerStage::AddChecksForUninitializedLoads,
         )?;
-        fuse_adjacent_instructions(&mut items, fuse_pair);
+        if candidates.fusable_instructions > 1 {
+            fuse_adjacent_instructions(&mut items, fuse_pair);
+        }
         #[cfg(any(test, debug_assertions))]
         super::validate_structure(
             &items,
@@ -291,7 +413,13 @@ impl Assembler {
             None,
             AssemblerStage::PropagateLocationsWithinBlocks,
         )?;
-        optimize_linear_assertion_load_fast(self.python_version, &mut items);
+        if candidates.individual_load || candidates.combined_load {
+            if self.next_label == 0 {
+                optimize_linear_assertion_load_fast(self.python_version, &mut items);
+            } else {
+                optimize_guard_load_fast(self.python_version, &mut items);
+            }
+        }
         #[cfg(any(test, debug_assertions))]
         super::validate_structure(
             &items,
@@ -310,5 +438,60 @@ impl Assembler {
             next_label: self.next_label,
             has_next_location: self.has_next_location,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LinearCandidates, optimize_boolean_conversions_and_redundant_stores};
+    use crate::assembler::{Instruction, Item, Label, Operand, SourceLocation};
+    use crate::target::opcodes::{
+        COPY, LOAD_CONST, LOAD_FAST_CHECK, LOAD_FAST_LOAD_FAST, NOP, POP_TOP, STORE_FAST, TO_BOOL,
+    };
+
+    #[test]
+    fn linear_candidates_preserve_store_and_boolean_rewrites() {
+        let location = SourceLocation::new(1, 1, 0, 1);
+        let instruction = |opcode, argument| {
+            Item::Instruction(Instruction::new(
+                opcode,
+                Operand::Value(argument),
+                location,
+                None,
+            ))
+        };
+        let label = Item::Label(Label::from_u32(0));
+        let mut stores = [
+            instruction(STORE_FAST, 0),
+            instruction(STORE_FAST, 0),
+            label,
+            instruction(STORE_FAST, 0),
+        ];
+        let candidates = LinearCandidates::from_items(&stores);
+        assert!(candidates.adjacent_stores);
+        assert!(!candidates.boolean_conversion);
+        optimize_boolean_conversions_and_redundant_stores(&mut stores, None, &candidates);
+        assert!(matches!(stores[0], Item::Instruction(current) if current.opcode == POP_TOP));
+        assert!(matches!(stores[1], Item::Instruction(current) if current.opcode == STORE_FAST));
+        assert!(!LinearCandidates::from_items(&stores).adjacent_stores);
+
+        let mut conversions = [
+            instruction(LOAD_CONST, 0),
+            instruction(TO_BOOL, 0),
+            instruction(TO_BOOL, 0),
+            instruction(COPY, 2),
+            instruction(LOAD_FAST_CHECK, 0),
+            instruction(LOAD_FAST_LOAD_FAST, 1),
+        ];
+        let candidates = LinearCandidates::from_items(&conversions);
+        assert!(candidates.boolean_conversion);
+        assert!(candidates.individual_load);
+        assert!(candidates.combined_load);
+        assert_eq!(candidates.fusable_instructions, 1);
+        assert!(!candidates.copy_top);
+        assert!(LinearCandidates::from_items(&[instruction(COPY, 1)]).copy_top);
+        optimize_boolean_conversions_and_redundant_stores(&mut conversions, None, &candidates);
+        assert!(matches!(conversions[1], Item::Instruction(current) if current.opcode == NOP));
+        assert!(matches!(conversions[2], Item::Instruction(current) if current.opcode == TO_BOOL));
     }
 }

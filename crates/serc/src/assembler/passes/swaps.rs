@@ -239,16 +239,15 @@ impl OptimizationPipeline {
             // swaptimize still cannot move stores across that block's entry.
             block_labels.extend(&self.exception_owner_provenance.block_boundaries);
         }
-        let mut blocks = graph.partition_positions(&block_labels, |instruction| {
-            !matches!(instruction.operand(), Operand::Value(_)) || ends_scope(instruction.opcode)
-        });
         // Both swap phases operate within partitions containing a swap.
-        blocks.retain(|block| {
-            block.iter().any(|&position| {
-                matches!(graph.item(position), Item::Instruction(instruction)
-                    if instruction.opcode == SWAP)
-            })
-        });
+        let blocks = graph.matching_partition_positions(
+            &block_labels,
+            |instruction| {
+                !matches!(instruction.operand(), Operand::Value(_))
+                    || ends_scope(instruction.opcode)
+            },
+            |instruction| instruction.opcode == SWAP,
+        );
         // Admit cleanups from their complete original partition before any swap run is
         // rewritten. A newly simplified suffix cannot certify an emitted owner slot.
         let mut capture_cleanup_swaps = FxHashSet::default();

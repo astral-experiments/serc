@@ -578,6 +578,223 @@ fn assertion_constant_indices(items: &[Item], used: &mut [bool]) -> Option<bool>
     (assertion_count > 0 && ended_scope).then_some(linear_eligible)
 }
 
+/// Marks reachable constants in forward guards whose arms exit or rejoin without another branch.
+fn terminal_guard_constant_indices(items: &[Item], used: &mut [bool]) -> Option<bool> {
+    let stable_location = |instruction: &Instruction| {
+        instruction.location.line >= 0
+            && matches!(
+                instruction.opcode,
+                RETURN_VALUE
+                    | RAISE_VARARGS
+                    | LOAD_FAST
+                    | LOAD_GLOBAL
+                    | crate::target::opcodes::LOAD_NAME
+                    | LOAD_ATTR
+                    | crate::target::opcodes::LOAD_DEREF
+                    | LOAD_SMALL_INT
+                    | RESUME
+            )
+    };
+    let all_items = items;
+    let mut items = items.iter();
+    let mut guards = 0;
+    let mut has_shared_target = false;
+    let mut has_fallthrough_guard = false;
+    let mut has_generator_opcode = false;
+    let mut shared_targets_eligible = true;
+    let mut ended_scope = false;
+    let mut eligible = true;
+    let mut has_unpack = false;
+    let mut may_have_nops = false;
+    let mut inspect = |instruction: &Instruction| {
+        eligible &= instruction.opcode != SWAP
+            && instruction.opcode != STORE_DEREF
+            && !instruction.local_policy.is_post_analysis_closure_load()
+            && !instruction.jump_policy.borrow_empty_block()
+            && instruction.no_location_policy.borrow_fallthrough() != BorrowFallthrough::Barrier;
+        has_unpack |= instruction.opcode == UNPACK_SEQUENCE;
+        may_have_nops |= matches!(instruction.opcode, NOP | TO_BOOL | UNARY_NOT);
+        has_generator_opcode |= matches!(
+            instruction.opcode,
+            crate::target::opcodes::RETURN_GENERATOR | crate::target::opcodes::YIELD_VALUE
+        );
+        if uses_constant_index(instruction.opcode)
+            && let Operand::Value(index) = instruction.operand()
+            && let Some(slot) = used.get_mut(index as usize)
+        {
+            *slot = true;
+        }
+    };
+    while let Some(item) = items.next() {
+        if ended_scope {
+            let Item::Label(label) = item else {
+                return None;
+            };
+            if all_items.iter().any(|item| {
+                matches!(item, Item::Instruction(instruction) if matches!(instruction.operand(), Operand::Forward(target) if target == *label))
+            }) || items
+                .as_slice()
+                .iter()
+                .any(|item| matches!(item, Item::Label(later) if later == label))
+            {
+                return None;
+            }
+            continue;
+        }
+        let Item::Instruction(instruction) = item else {
+            return None;
+        };
+        inspect(instruction);
+        if matches!(
+            instruction.opcode,
+            POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
+        ) {
+            let Operand::Forward(target) = instruction.operand() else {
+                return None;
+            };
+            let Some(Item::Instruction(marker)) = items.next() else {
+                return None;
+            };
+            if marker.opcode != NOT_TAKEN || marker.operand() != Operand::Value(0) {
+                return None;
+            }
+            inspect(marker);
+            let mut shared_target = false;
+            let mut allows_shared_target =
+                !instruction.no_location_policy.copies_split_return_exit();
+            let mut ordinary_guard_depths =
+                instruction.depth_after() == Some(0) && marker.depth_after() == Some(0);
+            let mut side_has_action = false;
+            let mut side_depth = None;
+            let mut falls_through = false;
+            loop {
+                let side = match items.next() {
+                    Some(Item::Instruction(side)) => side,
+                    Some(Item::Label(label))
+                        if *label == target && side_has_action && side_depth == Some(0) =>
+                    {
+                        falls_through = true;
+                        break;
+                    }
+                    _ => return None,
+                };
+                if matches!(
+                    side.opcode,
+                    POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
+                ) {
+                    if side.operand() != Operand::Forward(target) {
+                        return None;
+                    }
+                    inspect(side);
+                    shared_target = true;
+                    allows_shared_target &= !side.no_location_policy.copies_split_return_exit();
+                    let Some(Item::Instruction(marker)) = items.next() else {
+                        return None;
+                    };
+                    if marker.opcode != NOT_TAKEN || marker.operand() != Operand::Value(0) {
+                        return None;
+                    }
+                    inspect(marker);
+                    ordinary_guard_depths &=
+                        side.depth_after() == Some(0) && marker.depth_after() == Some(0);
+                    side_has_action = false;
+                    side_depth = None;
+                    continue;
+                }
+                if !matches!(side.operand(), Operand::Value(_)) || side.opcode == NOT_TAKEN {
+                    return None;
+                }
+                inspect(side);
+                side_depth = side.depth_after();
+                // These authored actions survive the pre-copy graph rewrites. A marker or
+                // folded expression alone cannot stand in for a genuine fallthrough arm.
+                side_has_action |= matches!(
+                    side.opcode,
+                    STORE_FAST
+                        | STORE_GLOBAL
+                        | DELETE_FAST
+                        | crate::target::opcodes::STORE_NAME
+                        | crate::target::opcodes::STORE_ATTR
+                        | crate::target::opcodes::STORE_SUBSCR
+                        | crate::target::opcodes::STORE_SLICE
+                        | crate::target::opcodes::DELETE_GLOBAL
+                        | crate::target::opcodes::DELETE_NAME
+                        | crate::target::opcodes::DELETE_ATTR
+                        | crate::target::opcodes::DELETE_SUBSCR
+                        | crate::target::opcodes::CALL
+                        | crate::target::opcodes::CALL_KW
+                        | crate::target::opcodes::CALL_FUNCTION_EX
+                );
+                if ends_scope(side.opcode) {
+                    if !matches!(side.opcode, RETURN_VALUE | RAISE_VARARGS)
+                        || !matches!(items.next(), Some(Item::Label(label)) if *label == target)
+                    {
+                        return None;
+                    }
+                    break;
+                }
+            }
+            if falls_through {
+                has_fallthrough_guard = true;
+                allows_shared_target &= ordinary_guard_depths
+                    && matches!(items.as_slice().first(), Some(Item::Instruction(first)) if stable_location(first));
+            }
+            if shared_target || falls_through {
+                has_shared_target = true;
+                let mut has_stable_location = false;
+                for item in items.as_slice() {
+                    let Item::Instruction(next) = item else {
+                        break;
+                    };
+                    // These locations survive the graph rewrites preceding exit duplication.
+                    // An unlocated shared exit can otherwise be copied into its predecessors.
+                    has_stable_location |= stable_location(next);
+                    allows_shared_target &= !next.no_location_policy.is_artificial_eval_break();
+                    if !matches!(next.operand(), Operand::Value(_)) || ends_scope(next.opcode) {
+                        break;
+                    }
+                }
+                shared_targets_eligible &= allows_shared_target && has_stable_location;
+            }
+            guards += 1;
+            continue;
+        }
+        if !matches!(instruction.operand(), Operand::Value(_)) || instruction.opcode == NOT_TAKEN {
+            return None;
+        }
+        if ends_scope(instruction.opcode) {
+            if !matches!(instruction.opcode, RETURN_VALUE | RAISE_VARARGS) {
+                return None;
+            }
+            ended_scope = true;
+        }
+    }
+    if has_shared_target && shared_targets_eligible {
+        let mut copy = false;
+        for item in all_items {
+            let Item::Instruction(instruction) = item else {
+                continue;
+            };
+            if instruction.opcode == NOP {
+                continue;
+            }
+            // A copy used by a walrus keeps its intervening store. Other value-preserving
+            // copies can expose COPY/TO_BOOL conditions that the graph threads through joins.
+            if copy && !matches!(instruction.opcode, STORE_FAST | POP_TOP) {
+                shared_targets_eligible = false;
+                break;
+            }
+            copy = instruction.opcode == COPY && instruction.operand() == Operand::Value(1);
+        }
+    }
+    (guards > 0 && ended_scope).then_some(
+        eligible
+            && shared_targets_eligible
+            && !(has_unpack && may_have_nops)
+            && !(has_fallthrough_guard && has_generator_opcode),
+    )
+}
+
 impl Assembler {
     /// Creates an emitter whose stack analysis and final layout use the selected target.
     pub(crate) fn with_python_version(python_version: crate::PythonVersion) -> Self {
@@ -671,6 +888,32 @@ impl Assembler {
             && assertion_constant_indices(items, &mut []).unwrap_or(false)
     }
 
+    /// Recognizes terminal fallthroughs and simple short-circuit guards sharing a continuation.
+    pub(in crate::assembler) fn has_only_linear_terminal_guards(&self) -> bool {
+        let UnoptimizedCode::Linear(items) = &self.code else {
+            return false;
+        };
+        self.has_terminal_guard_metadata()
+            && terminal_guard_constant_indices(items, &mut []).unwrap_or(false)
+    }
+
+    fn has_terminal_guard_metadata(&self) -> bool {
+        let provenance = &self.exception_owner_provenance;
+        self.python_version == crate::PythonVersion::Py314
+            && self.next_label != 0
+            && self.exception_regions.is_empty()
+            && self.preserved_block_boundaries.is_empty()
+            && self.borrow_unreachable_blocks.is_empty()
+            && self.borrow_omitted_for_backedges.is_empty()
+            && self.folded_loop_exit_anchors.is_empty()
+            && !self.has_synthesized_percent_target_locations
+            && !self.has_next_location
+            && provenance.omitted_nop_tail.is_none()
+            && provenance.noop_finally_locations.is_empty()
+            && provenance.with_context_locations.is_empty()
+            && provenance.copied_finally_iterator_returns.is_empty()
+    }
+
     /// Recognizes a constant return with no CFG or instruction-policy metadata to replay.
     pub(in crate::assembler) fn has_only_linear_constant_return(&self) -> bool {
         let UnoptimizedCode::Linear(items) = &self.code else {
@@ -762,27 +1005,40 @@ impl Assembler {
         let [
             Item::Instruction(resume),
             middle @ ..,
-            Item::Instruction(ret),
+            Item::Instruction(terminal),
         ] = items
         else {
             return false;
         };
-        let mut ordinary_return =
-            Instruction::new(ret.opcode, ret.operand(), ret.location, Some(0));
-        if ret.location == SourceLocation::NONE && ret.no_location_policy.allows_block_inlining() {
+        let mut ordinary_terminal = Instruction::new(
+            terminal.opcode,
+            terminal.operand(),
+            terminal.location,
+            Some(0),
+        );
+        if terminal.opcode == RETURN_VALUE
+            && terminal.location == SourceLocation::NONE
+            && terminal.no_location_policy.allows_block_inlining()
+        {
             // A class footer permits copying onto predecessor edges, which do not exist here.
-            ordinary_return.no_location_policy.allow_block_inlining();
+            ordinary_terminal.no_location_policy.allow_block_inlining();
         }
-        if middle.is_empty()
+        if (middle.is_empty()
+            && !matches!(
+                (terminal.opcode, terminal.operand()),
+                (RAISE_VARARGS, Operand::Value(0))
+            ))
             || resume.opcode != RESUME
             || resume.operand() != Operand::Value(ResumeLocation::AT_FUNC_START.argument())
             || resume.depth_after() != Some(0)
             || *resume
                 != Instruction::new(resume.opcode, resume.operand(), resume.location, Some(0))
-            || ret.opcode != RETURN_VALUE
-            || ret.operand() != Operand::Value(0)
-            || ret.depth_after() != Some(0)
-            || *ret != ordinary_return
+            || !matches!(
+                (terminal.opcode, terminal.operand()),
+                (RETURN_VALUE, Operand::Value(0)) | (RAISE_VARARGS, Operand::Value(0..=2))
+            )
+            || terminal.depth_after() != Some(0)
+            || *terminal != ordinary_terminal
         {
             return false;
         }
@@ -15959,6 +16215,11 @@ impl Assembler {
                 assertion_constant_indices(self.linear_items(), &mut used)
         {
             self.has_proven_linear_assertion_side_exits = linear_eligible;
+            return used;
+        }
+        if self.has_terminal_guard_metadata()
+            && terminal_guard_constant_indices(self.linear_items(), &mut used).is_some()
+        {
             return used;
         }
 

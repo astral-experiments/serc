@@ -395,6 +395,9 @@ impl OptimizationPipeline {
 
     /// Removes copy/pop pairs before local analysis and superinstruction fusion.
     pub(in crate::assembler) fn remove_redundant_copy_pop_pairs(&mut self) -> Option<u32> {
+        if !self.graph.features().has_copy_top() {
+            return None;
+        }
         let mut redundant = Vec::new();
         let mut vacated_slots = Vec::new();
         for block in self.graph.order().iter().copied() {
@@ -610,7 +613,9 @@ impl OptimizationPipeline {
                 Item::Label(_) => None,
             })
             .collect::<Vec<_>>();
-        if let Some(constants) = constants {
+        if graph.features().has_identity_comparison()
+            && let Some(constants) = constants
+        {
             for block in graph.order().to_vec() {
                 remove_none_comparison_boolean_conversions(graph.iter_items_mut(block), constants);
             }
@@ -686,7 +691,7 @@ impl OptimizationPipeline {
         }
         let mut changed = false;
 
-        if has_forward_conditional && features.has_boolean_conversion() {
+        if has_forward_conditional && features.has_boolean_conversion() && features.has_copy_top() {
             let mut positions = graph.item_positions();
             let mut conditional_targets =
                 vec![None; usize::try_from(self.next_label).expect("label count fits in usize")];
