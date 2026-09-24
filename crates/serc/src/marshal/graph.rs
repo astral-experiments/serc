@@ -7,6 +7,7 @@ use smallvec::SmallVec;
 
 use crate::code_object::{
     CodeInterningSummary, CodeObject, CompilationInterningEvent, Constant, MetadataId,
+    MetadataName as Name,
 };
 use crate::target::{is_preinterned_string_for, small_int_bounds_for};
 use crate::{CompileError, InitialInternState, PythonVersion};
@@ -14,7 +15,8 @@ use crate::{CompileError, InitialInternState, PythonVersion};
 use super::key::{
     FrozenSetMembers, HashedObjectKey, ObjectKey, code_bytes_key, code_key, constant_key,
     constants_tuple_key, frozen_set_members_in_wire_order, frozen_set_members_with_properties,
-    is_cached_character, local_kinds_key, locals_tuple_key, should_intern, strings_tuple_key,
+    is_cached_character, local_kinds_key, locals_tuple_key, names_tuple_key, should_intern,
+    strings_tuple_key,
 };
 use super::plan::{MarshalVisitor, ObjectId, ReferenceMode, traverse_code};
 
@@ -733,7 +735,7 @@ fn collect_metadata_tuple_keys<'a>(
     if let Some(properties) = code.marshal_provenance.metadata_tuple_properties {
         if !properties.names.automatically_interned {
             keys.insert(HashedObjectKey::with_hash(
-                strings_tuple_key(&code.names),
+                names_tuple_key(&code.names),
                 properties.names.hash,
             ));
         }
@@ -742,7 +744,7 @@ fn collect_metadata_tuple_keys<'a>(
         }
     } else {
         if code.names.iter().any(|value| !should_intern(value)) {
-            keys.insert(strings_tuple_key(&code.names).into());
+            keys.insert(names_tuple_key(&code.names).into());
         }
         if code.locals.iter().any(|value| !should_intern(value)) {
             keys.insert(locals_tuple_key(code).into());
@@ -1827,7 +1829,7 @@ fn collect_identifier_strings<'a>(
         code.names
             .iter()
             .chain(&code.locals)
-            .map(String::as_str)
+            .map(Name::as_str)
             .filter(|value| should_intern(value) && !generated_mangled_strings.contains(*value)),
     );
     if should_intern(&code.name) && !generated_mangled_strings.contains(&code.name) {
@@ -1884,7 +1886,7 @@ impl CodeTupleOrigins {
     ) -> Self {
         // assemble.c merges names, constants, then locals before _PyCode_New interns them.
         let names = *tuple_origins
-            .entry(summary.names.iter().map(String::as_str).collect())
+            .entry(summary.names.iter().map(Name::as_str).collect())
             .or_insert(false);
         if let Some(constants) = &summary.constants_tuple {
             tuple_origins
@@ -1892,7 +1894,7 @@ impl CodeTupleOrigins {
                 .or_insert(true);
         }
         let locals = *tuple_origins
-            .entry(summary.locals.iter().map(String::as_str).collect())
+            .entry(summary.locals.iter().map(Name::as_str).collect())
             .or_insert(false);
         Self { names, locals }
     }
@@ -1994,7 +1996,7 @@ fn intern_explicit_constants<'a>(
 }
 
 fn intern_metadata_tuple<'a>(
-    values: &'a [String],
+    values: &'a [Name],
     constant_origin: bool,
     interned_strings: &mut InternedStrings<'a, '_>,
     interned_constant_strings: &mut FxHashSet<&'a str>,
@@ -2081,7 +2083,11 @@ fn intern_code_summary<'a>(
     // Discarded code may release these mortal owners. In partial states, this
     // invalidates initial absence without establishing retained presence.
     if interned_strings.python_version >= PythonVersion::Py313 {
-        for value in [&summary.filename, &summary.name, &summary.qualified_name] {
+        for value in [
+            summary.filename.as_ref(),
+            summary.name.as_str(),
+            summary.qualified_name.as_str(),
+        ] {
             if interned_strings.initial.has_unknown_entries() {
                 if interned_strings.tracks_origin(value) {
                     interned_strings.possibly_added.insert(value);
@@ -2227,13 +2233,16 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
                 .record_cached_value(OccurrenceKind::Constants, CachedObject::EmptyTuple);
         }
         let key = constants_tuple_key(values);
-        if values
-            .iter()
-            .any(|value| matches!(value, Constant::Code(_)))
+        if matches!(&key, ObjectKey::ConstantTuple(_))
+            && values
+                .iter()
+                .any(|value| matches!(value, Constant::Code(_)))
         {
             self.graph
                 .record_unique_value(OccurrenceKind::Constants, key)
         } else {
+            // The key has already scanned every member of an all-string tuple. It cannot own
+            // code, and equal literal and metadata tuples must share the same value lookup.
             self.graph.record_keyed(OccurrenceKind::Constants, key)
         }
     }
@@ -2246,11 +2255,11 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
         } else if let Some(properties) = code.marshal_provenance.metadata_tuple_properties {
             self.graph.record_hashed(
                 OccurrenceKind::Strings,
-                HashedObjectKey::with_hash(strings_tuple_key(&code.names), properties.names.hash),
+                HashedObjectKey::with_hash(names_tuple_key(&code.names), properties.names.hash),
             )
         } else {
             self.graph
-                .record_keyed(OccurrenceKind::Strings, strings_tuple_key(&code.names))
+                .record_keyed(OccurrenceKind::Strings, names_tuple_key(&code.names))
         }
     }
 

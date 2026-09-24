@@ -1,5 +1,6 @@
 use crate::code_object::{
     CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance, MetadataId,
+    MetadataName as Name,
 };
 
 use super::encode_code;
@@ -7,7 +8,7 @@ use super::graph::{ObjectGraph, OccurrenceKind};
 use super::key::{
     HashedObjectKey, ObjectKey, code_bytes_key, code_key, constant_key, constant_sort_key,
     constants_tuple_key, local_kinds_key, locals_tuple_key, metadata_tuple_properties,
-    slice_member_uses_identity, strings_tuple_key,
+    names_tuple_key, slice_member_uses_identity, strings_tuple_key,
 };
 use super::plan::{MarshalVisitor, ObjectId, ReferenceMode, traverse_code};
 
@@ -23,7 +24,7 @@ fn code_object(constants: Vec<Constant>) -> CodeObject {
         names: Vec::new(),
         locals: Vec::new(),
         local_kinds: Vec::new(),
-        filename: "module.py".to_string(),
+        filename: "module.py".into(),
         name: "<module>".to_string(),
         qualified_name: "<module>".to_string(),
         first_line_number: 1,
@@ -159,8 +160,8 @@ fn uses_cpython_reference_cache_boundaries() {
 
 #[test]
 fn precomputed_metadata_hashes_match_borrowed_tuples_from_either_source() {
-    let names = ["value", "méthode", ".0", "é"].map(str::to_owned);
-    let locals = ["ascii_name", "A09", "_"].map(str::to_owned);
+    let names = ["value", "méthode", ".0", "é"].map(Name::new);
+    let locals = ["ascii_name", "A09", "_"].map(Name::new);
     let properties = metadata_tuple_properties(&names, &locals);
     assert!(!properties.names.automatically_interned);
     assert!(properties.locals.automatically_interned);
@@ -172,11 +173,10 @@ fn precomputed_metadata_hashes_match_borrowed_tuples_from_either_source() {
     ] {
         let constants = values
             .iter()
-            .cloned()
-            .map(Constant::String)
+            .map(|value| Constant::String(value.to_string()))
             .collect::<Vec<_>>();
-        let hinted = HashedObjectKey::with_hash(strings_tuple_key(values), properties.hash);
-        assert_eq!(hinted, HashedObjectKey::from(strings_tuple_key(values)));
+        let hinted = HashedObjectKey::with_hash(names_tuple_key(values), properties.hash);
+        assert_eq!(hinted, HashedObjectKey::from(names_tuple_key(values)));
         assert_eq!(
             hinted,
             HashedObjectKey::from(constants_tuple_key(&constants))
@@ -293,7 +293,7 @@ fn cached_scalar_graph_routes_constants_metadata_and_structural_bytes() {
         Constant::String("é".to_string()),
     ]);
     code.constants.resize(32, Constant::None);
-    code.names.push("é".to_string());
+    code.names.push("é".into());
     code.marshal_provenance
         .metadata_ids
         .names
@@ -340,7 +340,7 @@ fn tracks_interned_strings_from_constants_and_metadata() {
     code.marshal_provenance
         .explicitly_interned_strings
         .insert("méthode".to_string());
-    code.names.push("metadata name with spaces".to_string());
+    code.names.push("metadata name with spaces".into());
     code.marshal_provenance
         .metadata_ids
         .names
@@ -548,8 +548,8 @@ class Namespace:
 #[test]
 fn dense_metadata_ids_preserve_nested_and_constant_string_identity() {
     let mut nested = code_object(vec![Constant::String("shared_before".to_string())]);
-    nested.names = vec!["shared_after".to_string(), "nested_only".to_string()];
-    nested.locals = vec!["shared_local".to_string()];
+    nested.names = vec!["shared_after".into(), "nested_only".into()];
+    nested.locals = vec!["shared_local".into()];
     nested.local_kinds = vec![1];
     nested.name = "shared_before".to_string();
     nested.qualified_name = "shared_after".to_string();
@@ -567,8 +567,8 @@ fn dense_metadata_ids_preserve_nested_and_constant_string_identity() {
         Constant::String("shared_after".to_string()),
         Constant::String("shared_local".to_string()),
     ]);
-    hinted.names = vec!["shared_before".to_string(), "shared_after".to_string()];
-    hinted.locals = vec!["shared_local".to_string()];
+    hinted.names = vec!["shared_before".into(), "shared_after".into()];
+    hinted.locals = vec!["shared_local".into()];
     hinted.local_kinds = vec![1];
     hinted.name = "shared_after".to_string();
     hinted.qualified_name = "shared_before".to_string();
@@ -610,7 +610,7 @@ fn dense_metadata_ids_preserve_nested_and_constant_string_identity() {
 #[should_panic(expected = "metadata ID tuple length")]
 fn rejects_mismatched_metadata_id_lengths() {
     let mut code = code_object(Vec::new());
-    code.names.push("untracked".to_string());
+    code.names.push("untracked".into());
     ObjectGraph::for_code(&code);
 }
 
@@ -619,7 +619,7 @@ fn rejects_mismatched_metadata_id_lengths() {
 #[should_panic(expected = "metadata ID must identify one string")]
 fn rejects_colliding_metadata_ids() {
     let mut code = code_object(Vec::new());
-    code.names = vec!["first".to_string(), "second".to_string()];
+    code.names = vec!["first".into(), "second".into()];
     code.marshal_provenance.metadata_ids.names =
         vec![MetadataId::from_u32(0), MetadataId::from_u32(0)];
     ObjectGraph::for_code(&code);
@@ -637,8 +637,8 @@ fn keeps_identity_and_value_keys_separate() {
     second.local_kinds.push(1);
     assert_ne!(local_kinds_key(&first), local_kinds_key(&second));
 
-    first.locals.push("value".to_string());
-    second.locals.push("value".to_string());
+    first.locals.push("value".into());
+    second.locals.push("value".into());
     assert_eq!(locals_tuple_key(&first), locals_tuple_key(&second));
     second.marshal_provenance.locals_identity = LocalsIdentity::Fresh;
     assert_ne!(locals_tuple_key(&first), locals_tuple_key(&second));
@@ -654,7 +654,7 @@ fn bypasses_value_lookup_for_structurally_unique_objects() {
         step: Box::new(Constant::None),
     }]);
     inner.bytecode.push(0);
-    inner.locals.push("value".to_string());
+    inner.locals.push("value".into());
     inner
         .marshal_provenance
         .metadata_ids
@@ -673,15 +673,19 @@ fn bypasses_value_lookup_for_structurally_unique_objects() {
 
 #[test]
 fn borrowed_string_tuple_keys_compare_across_sources() {
+    let long = "metadata_identifier_that_does_not_fit_in_inline_name_storage";
     let constants = [
         Constant::String("alpha".to_string()),
         Constant::String("beta".to_string()),
+        Constant::String(long.to_string()),
     ];
-    let strings = ["alpha".to_string(), "beta".to_string()];
-    let keys = [0..1, 0..2, 1..2].map(|range| {
+    let strings = ["alpha".to_string(), "beta".to_string(), long.to_string()];
+    let names = ["alpha", "beta", long].map(Name::new);
+    let keys = [0..1, 0..2, 1..2, 2..3].map(|range| {
         [
             constants_tuple_key(&constants[range.clone()]),
-            strings_tuple_key(&strings[range]),
+            strings_tuple_key(&strings[range.clone()]),
+            names_tuple_key(&names[range]),
         ]
     });
     for (left_index, left_keys) in keys.iter().enumerate() {
@@ -696,7 +700,63 @@ fn borrowed_string_tuple_keys_compare_across_sources() {
         let mut graph = ObjectGraph::default();
         assert!(graph.record(left_keys[0].clone()));
         assert!(!graph.record(left_keys[1].clone()));
+        assert!(!graph.record(left_keys[2].clone()));
     }
+}
+
+#[test]
+fn short_and_long_compiler_names_keep_marshaled_metadata_identity() {
+    fn assert_send_and_sync<T: Send + Sync>() {}
+
+    assert_send_and_sync::<crate::CompiledModule>();
+    let long_local = "local_identifier_that_does_not_fit_in_inline_name_storage";
+    let long_global = "global_identifier_that_does_not_fit_in_inline_name_storage";
+    let source = format!(
+        "def example(short, {long_local}):\n    return short, {long_local}, global_short, {long_global}\n"
+    );
+    let module = crate::compile(&source, "metadata.py").unwrap();
+    let expected = module.marshal();
+    let mut fallback = module.code;
+    let child = fallback
+        .constants
+        .iter_mut()
+        .find_map(|constant| match constant {
+            Constant::Code(child) => Some(child),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(child.locals, ["short", long_local]);
+    assert_eq!(child.names, ["global_short", long_global]);
+    assert_eq!(
+        format!("{:?}", child.locals),
+        format!("{:?}", ["short", long_local])
+    );
+    child.marshal_provenance.metadata_tuple_properties = None;
+    fallback.marshal_provenance.metadata_tuple_properties = None;
+    assert_eq!(encode_code(&fallback), expected);
+}
+
+#[test]
+fn graph_shares_long_string_tuples_with_literal_and_metadata_occurrences() {
+    let strings: Vec<_> = (0..32).map(|index| format!("name_{index}")).collect();
+    let constants: Vec<_> = strings.iter().cloned().map(Constant::String).collect();
+    let mut code = code_object(vec![
+        Constant::Tuple(constants.clone()),
+        Constant::Tuple(constants),
+        Constant::Code(Box::new(code_object(Vec::new()))),
+    ]);
+    code.marshal_provenance.metadata_ids.domain_len = 34;
+    code.marshal_provenance.metadata_ids.names = (2..34).map(MetadataId::from_u32).collect();
+    code.names = strings.into_iter().map(Name::from).collect();
+
+    let graph = ObjectGraph::for_code(&code);
+    let Constant::Tuple(first) = &code.constants[0] else {
+        unreachable!();
+    };
+    assert!(graph.is_shared(&constants_tuple_key(first), false));
+    assert!(graph.is_shared(&names_tuple_key(&code.names), false));
+    assert!(!graph.is_shared(&constants_tuple_key(&code.constants), false));
+    assert!(!encode_code(&code).is_empty());
 }
 
 #[test]
@@ -871,7 +931,7 @@ fn python_312_filename_remains_distinct_from_an_equal_interned_constant() {
     use crate::{InitialInternState, PythonVersion};
 
     let mut code = code_object(vec![Constant::String("filename".to_string())]);
-    code.filename = "filename".to_string();
+    code.filename = "filename".into();
     let state = InitialInternState::default();
     let old = encode_code_with_options(&code, PythonVersion::Py312, &state);
     let new = encode_code_with_options(&code, PythonVersion::Py313, &state);
@@ -1511,7 +1571,7 @@ fn partial_intern_state_preserves_dominated_origins_across_later_promotions() {
             children.push(child);
         }
         let mut promoter = code_object(Vec::new());
-        promoter.names.push(unknown.to_string());
+        promoter.names.push(unknown.into());
         promoter
             .marshal_provenance
             .explicitly_interned_strings
@@ -1629,7 +1689,7 @@ fn partial_intern_state_keeps_earlier_unknown_origins_from_discarded_code() {
         Constant::Tuple(vec![frozen.clone()]),
         Constant::Tuple(vec![Constant::None, frozen]),
     ]);
-    code.names.push(marker.to_string());
+    code.names.push(marker.into());
     code.marshal_provenance
         .generated_mangled_strings
         .insert(marker.to_string());
@@ -1671,7 +1731,7 @@ fn partial_intern_state_does_not_retain_discarded_mortal_metadata() {
         .push(Constant::Tuple(vec![code.constants[0].clone()]));
     code.marshal_provenance.assembly_order = Some(1);
     let mut discarded = code_object(Vec::new());
-    discarded.filename = marker.to_string();
+    discarded.filename = marker.into();
     code.marshal_provenance.interning_events = vec![
         CompilationInterningEvent::CodeAssembly(CodeInterningSummary::from_code(&discarded)),
         CompilationInterningEvent::CodeAssembly(CodeInterningSummary::from_code(&code)),
@@ -1708,7 +1768,7 @@ fn partial_intern_state_respects_metadata_tuple_origins_and_generated_names() {
         .push(Constant::Tuple(vec![code.constants[0].clone()]));
     code.marshal_provenance.assembly_order = Some(2);
     let mut prior = code_object(Vec::new());
-    prior.names.push(marker.to_string());
+    prior.names.push(marker.into());
     code.marshal_provenance.interning_events = vec![
         CompilationInterningEvent::CachedTuple(vec![marker.to_string()]),
         CompilationInterningEvent::CodeAssembly(CodeInterningSummary::from_code(&prior)),
@@ -1822,7 +1882,7 @@ fn partial_absence_is_invalidated_by_discarded_mortal_metadata() {
         code.marshal_provenance.assembly_order = Some(1);
         let mut discarded = code_object(Vec::new());
         match field {
-            "filename" => discarded.filename = marker.to_string(),
+            "filename" => discarded.filename = marker.into(),
             "name" => discarded.name = marker.to_string(),
             _ => discarded.qualified_name = marker.to_string(),
         }
@@ -1852,7 +1912,7 @@ fn partial_absence_is_invalidated_by_discarded_mortal_metadata() {
 
         // A later immortal metadata phase can resolve possible membership,
         // provided no earlier ordinary query has already made the origin unknown.
-        code.names.push(marker.to_string());
+        code.names.push(marker.into());
         code.marshal_provenance
             .metadata_ids
             .names
@@ -1902,7 +1962,7 @@ fn partial_absence_does_not_resolve_early_generated_name_origins() {
     let mut code = code_object(vec![frozen.clone(), frozen]);
     code.marshal_provenance.assembly_order = Some(1);
     let mut generated = code_object(Vec::new());
-    generated.names.push(marker.to_string());
+    generated.names.push(marker.into());
     generated
         .marshal_provenance
         .explicitly_interned_strings
@@ -2019,7 +2079,7 @@ fn metadata_tuple_aliases_intern_only_the_shared_constant_slots() {
     use super::writer::encode_code_with_options;
     use crate::{InitialInternState, PythonVersion};
     let mut child = code_object(vec![Constant::None]);
-    child.names = vec!["café".to_string()];
+    child.names = vec!["café".into()];
     child.marshal_provenance.metadata_ids.names = vec![MetadataId::from_u32(0)];
     let code = code_object(vec![
         Constant::String("café".to_string()),
@@ -2132,7 +2192,7 @@ fn metadata_tuple_aliases_do_not_intern_equal_frozenset_members() {
     let mut code = code_object(vec![Constant::FrozenSet(vec![Constant::String(
         "café".to_string(),
     )])]);
-    code.names = vec!["café".to_string()];
+    code.names = vec!["café".into()];
     code.marshal_provenance.metadata_ids.names = vec![MetadataId::from_u32(0)];
     for version in [PythonVersion::Py314, PythonVersion::Py315] {
         let bytes = encode_code_with_options(&code, version, &InitialInternState::default());

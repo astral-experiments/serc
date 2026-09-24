@@ -65,7 +65,7 @@ enum Scope {
 #[derive(Debug)]
 pub(crate) struct Compiler<'source> {
     context: Rc<CompilationContext<'source>>,
-    cached_source_line: Cell<Option<CachedSourceLine>>,
+    cached_source_lines: Cell<[Option<CachedSourceLine>; 2]>,
     unit: CodeUnit,
     output: OutputState,
     symbols: SymbolState,

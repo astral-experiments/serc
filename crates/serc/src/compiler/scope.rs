@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hasher;
 use std::rc::Rc;
@@ -8,11 +9,13 @@ use ruff_index::{IndexVec, newtype_index};
 use ruff_python_ast::name::Name;
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
 use ruff_python_ast::{Expr, ExprContext, Pattern, Stmt, StmtClassDef, StmtFunctionDef, TypeParam};
+use ruff_text_size::{Ranged, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 use crate::target::code_flags::{CO_FUTURE_ANNOTATIONS, CO_FUTURE_BARRY_AS_BDFL};
 use crate::{CompileError, PythonVersion};
 
+use super::source::SourceAnalysis;
 use super::symbol::mangle_name;
 use super::{Compiler, SHADOWED_SUPER_SENTINEL, Scope};
 
@@ -92,50 +95,44 @@ impl Compiler<'_> {
     ) -> Result<(ScopeId, LoweringFunctionPlan), CompileError> {
         let scope_id = self.function_scope_id(definition)?;
         let arena = self.scope_arena();
-        let mut plan = arena
+        let source_plan = arena
             .function(scope_id)
-            .ok_or_else(|| CompileError::Internal("function scope has no plan".to_string()))?
-            .clone();
-        let required = plan.required.iter().copied().collect::<Vec<_>>();
-        for name in required {
-            let captures_name = match &self.unit.scope {
-                Scope::Class { free_indices, .. } => {
-                    arena.names.get("__class__") == Some(name) || free_indices.contains_key(&name)
-                }
-                Scope::Module | Scope::Function { .. } => self.can_provide_closure_id(name),
-            };
-            if captures_name {
-                plan.insert_freevar(&arena.names, name);
-            } else {
-                plan.mark_global(name);
+            .ok_or_else(|| CompileError::Internal("function scope has no plan".to_string()))?;
+        let mut plan = source_plan.clone();
+        plan.resolve_required(&arena.names, |name| match &self.unit.scope {
+            Scope::Class { free_indices, .. } => {
+                arena.names.get("__class__") == Some(name) || free_indices.contains_key(&name)
             }
-        }
-        for name in plan
-            .annotation_references
-            .iter()
-            .copied()
-            .filter(|_| arena.deferred_annotations || definition.type_params.is_some())
-            .collect::<Vec<_>>()
-        {
-            let captures_name = match &self.unit.scope {
-                // Method annotation thunks are created by the class body and can capture the
-                // class body's free variables, but not arbitrary class-local bindings.
-                Scope::Class { free_indices, .. } => {
-                    free_indices.contains_key(&name)
-                        || arena.names.get("__class__") == Some(name)
-                            && self.is_cell_id(name)
-                            && (arena
-                                .class(self.unit.scope_id)
-                                .is_some_and(|plan| !plan.bound_names.contains(&name))
-                                || function_annotation_expressions(definition).any(|annotation| {
-                                    annotation_nested_required_names(annotation)
-                                        .contains("__class__")
-                                }))
+            Scope::Module | Scope::Function { .. } => self.can_provide_closure_id(name),
+        });
+        if arena.deferred_annotations || definition.type_params.is_some() {
+            #[expect(
+                clippy::iter_over_hash_type,
+                reason = "Annotation captures are inserted in lexical order."
+            )]
+            for &name in &source_plan.annotation_references {
+                let captures_name = match &self.unit.scope {
+                    // Method annotation thunks are created by the class body and can capture the
+                    // class body's free variables, but not arbitrary class-local bindings.
+                    Scope::Class { free_indices, .. } => {
+                        free_indices.contains_key(&name)
+                            || arena.names.get("__class__") == Some(name)
+                                && self.is_cell_id(name)
+                                && (arena
+                                    .class(self.unit.scope_id)
+                                    .is_some_and(|plan| !plan.bound_names.contains(&name))
+                                    || function_annotation_expressions(definition).any(
+                                        |annotation| {
+                                            annotation_nested_required_names(annotation)
+                                                .contains("__class__")
+                                        },
+                                    ))
+                    }
+                    Scope::Module | Scope::Function { .. } => self.can_provide_closure_id(name),
+                };
+                if captures_name {
+                    plan.insert_annotation_freevar(&arena.names, name);
                 }
-                Scope::Module | Scope::Function { .. } => self.can_provide_closure_id(name),
-            };
-            if captures_name {
-                plan.insert_annotation_freevar(&arena.names, name);
             }
         }
         let mut plan = plan.into_lowering_plan();
@@ -227,8 +224,92 @@ const SCOPE_SEED_NAMES: [&str; 26] = [
 #[derive(Debug, Default)]
 pub(super) struct NameInterner {
     seed_names: &'static [&'static str],
-    names: Vec<String>,
+    names: Vec<Name>,
     reverse: HashTable<NameId>,
+    short_names: ShortNameCache,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ShortNameKey {
+    packed: u64,
+    length: u8,
+}
+
+impl ShortNameKey {
+    #[inline]
+    fn new(name: &str) -> Option<Self> {
+        let bytes = name.as_bytes();
+        let length = bytes.len();
+        let packed = match length {
+            1..=3 => {
+                u64::from(bytes[0])
+                    | (u64::from(bytes[length / 2]) << 8)
+                    | (u64::from(bytes[length - 1]) << 16)
+            }
+            4..=8 => {
+                u64::from(u32::from_ne_bytes(bytes[..4].try_into().unwrap()))
+                    | (u64::from(u32::from_ne_bytes(bytes[length - 4..].try_into().unwrap())) << 32)
+            }
+            _ => return None,
+        };
+        Some(Self {
+            packed,
+            length: u8::try_from(length).unwrap(),
+        })
+    }
+
+    #[inline]
+    fn slot(self) -> usize {
+        let mixed = (self.packed ^ u64::from(self.length).wrapping_mul(0x517c_c1b7_2722_0a95))
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        usize::try_from(mixed >> (64 - 7)).unwrap()
+    }
+}
+
+/// Remembers exact short spellings without hashing or probing the full interner again.
+#[derive(Debug)]
+struct ShortNameCache(Box<[Cell<ShortNameEntry>; 128]>);
+
+#[derive(Clone, Copy, Debug)]
+struct ShortNameEntry {
+    packed: u64,
+    id: Option<NameId>,
+    length: u8,
+}
+
+impl Default for ShortNameCache {
+    fn default() -> Self {
+        Self(Box::new(
+            [const {
+                Cell::new(ShortNameEntry {
+                    packed: 0,
+                    id: None,
+                    length: 0,
+                })
+            }; 128],
+        ))
+    }
+}
+
+impl ShortNameCache {
+    #[inline]
+    fn get(&self, key: ShortNameKey) -> Option<NameId> {
+        let entry = self.0[key.slot()].get();
+        if entry.packed == key.packed && entry.length == key.length {
+            entry.id
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn insert(&self, key: ShortNameKey, id: NameId) {
+        self.0[key.slot()].set(ShortNameEntry {
+            packed: key.packed,
+            id: Some(id),
+            length: key.length,
+        });
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -328,33 +409,40 @@ impl NameInterner {
     }
 
     fn seed_id(name: &str) -> Option<NameId> {
-        let index = match name {
-            SHADOWED_SUPER_SENTINEL => 0,
-            "" => 1,
-            ".0" => 2,
-            ".defaults" => 3,
-            ".format" => 4,
-            ".generic_base" => 5,
-            ".kwdefaults" => 6,
-            ".type_params" => 7,
-            "__class__" => 8,
-            "__classdict__" => 9,
-            "__classcell__" => 10,
-            "__classdictcell__" => 11,
-            "__conditional_annotations__" => 12,
-            "__annotate__" => 13,
-            "__annotate_func__" => 14,
-            "__annotations__" => 15,
-            "__doc__" => 16,
-            "__firstlineno__" => 17,
-            "__module__" => 18,
-            "__name__" => 19,
-            "__qualname__" => 20,
-            "__static_attributes__" => 21,
-            "__type_params__" => 22,
-            "format" => 23,
-            "join" => 24,
-            "super" => 25,
+        let bytes = name.as_bytes();
+        let index = match bytes.first() {
+            None => 1,
+            Some(b'\0') if name == SHADOWED_SUPER_SENTINEL => 0,
+            Some(b'.') => match name {
+                ".0" => 2,
+                ".defaults" => 3,
+                ".format" => 4,
+                ".generic_base" => 5,
+                ".kwdefaults" => 6,
+                ".type_params" => 7,
+                _ => return None,
+            },
+            Some(b'_') if bytes.get(1) == Some(&b'_') => match name {
+                "__class__" => 8,
+                "__classdict__" => 9,
+                "__classcell__" => 10,
+                "__classdictcell__" => 11,
+                "__conditional_annotations__" => 12,
+                "__annotate__" => 13,
+                "__annotate_func__" => 14,
+                "__annotations__" => 15,
+                "__doc__" => 16,
+                "__firstlineno__" => 17,
+                "__module__" => 18,
+                "__name__" => 19,
+                "__qualname__" => 20,
+                "__static_attributes__" => 21,
+                "__type_params__" => 22,
+                _ => return None,
+            },
+            Some(b'f') if name == "format" => 23,
+            Some(b'j') if name == "join" => 24,
+            Some(b's') if name == "super" => 25,
             _ => return None,
         };
         Some(NameId::from_usize(index))
@@ -364,38 +452,56 @@ impl NameInterner {
         if let Some(id) = self.get(name) {
             return id;
         }
-        self.insert(name.to_owned())
+        self.insert(Name::new(name))
     }
 
     fn intern_owned(&mut self, name: String) -> NameId {
         if let Some(id) = self.get(&name) {
             return id;
         }
-        self.insert(name)
+        self.insert(Name::from(name))
     }
 
     /// Stores dynamic spellings once; seed IDs resolve from the static table.
-    fn insert(&mut self, name: String) -> NameId {
+    fn insert(&mut self, name: Name) -> NameId {
         let seed_count = self.seed_names.len();
         let id = NameId::from_usize(seed_count + self.names.len());
         self.reverse.insert_unique(Self::hash(&name), id, |id| {
             Self::hash(&self.names[id.index() - seed_count])
         });
+        if let Some(key) = ShortNameKey::new(&name) {
+            self.short_names.insert(key, id);
+        }
         self.names.push(name);
         id
     }
 
     pub(super) fn get(&self, name: &str) -> Option<NameId> {
-        if !self.reverse.is_empty()
-            && let Some(id) = self.reverse.find(Self::hash(name), |id| {
+        let short = ShortNameKey::new(name);
+        if let Some(id) = short.and_then(|key| self.short_names.get(key)) {
+            return Some(id);
+        }
+        if !self.seed_names.is_empty()
+            && let Some(id) = Self::seed_id(name)
+        {
+            if let Some(key) = short {
+                self.short_names.insert(key, id);
+            }
+            return Some(id);
+        }
+        if self.reverse.is_empty() {
+            return None;
+        }
+        let id = self
+            .reverse
+            .find(Self::hash(name), |id| {
                 self.names[id.index() - self.seed_names.len()] == name
             })
-        {
-            return Some(*id);
+            .copied();
+        if let (Some(key), Some(id)) = (short, id) {
+            self.short_names.insert(key, id);
         }
-        (!self.seed_names.is_empty())
-            .then(|| Self::seed_id(name))
-            .flatten()
+        id
     }
 
     fn hash(name: &str) -> u64 {
@@ -500,13 +606,20 @@ impl LoweringFunctionPlan {
         required_names: impl IntoIterator<Item = NameId>,
         annotation_references: impl IntoIterator<Item = NameId>,
     ) {
+        let mut child_names = required_names
+            .into_iter()
+            .chain(annotation_references)
+            .peekable();
+        if child_names.peek().is_none() {
+            return;
+        }
         let local_names: FxHashSet<_> = self
             .locals
             .iter()
             .copied()
             .chain(self.local_aliases.iter().map(|(alias, _)| *alias))
             .collect();
-        for name in required_names.into_iter().chain(annotation_references) {
+        for name in child_names {
             if local_names.contains(&name) {
                 self.cellvars.insert(name);
             } else if !self.globals.contains(&name) {
@@ -538,13 +651,20 @@ impl FunctionPlan {
         required_names: impl IntoIterator<Item = NameId>,
         annotation_references: impl IntoIterator<Item = NameId>,
     ) {
+        let mut child_names = required_names
+            .into_iter()
+            .chain(annotation_references)
+            .peekable();
+        if child_names.peek().is_none() {
+            return;
+        }
         let local_names: FxHashSet<_> = self
             .locals
             .iter()
             .copied()
             .chain(self.local_aliases.iter().map(|(alias, _)| *alias))
             .collect();
-        for name in required_names.into_iter().chain(annotation_references) {
+        for name in child_names {
             if local_names.contains(&name) && !self.comprehension_shadowed_targets.contains(&name) {
                 self.cellvars.insert(name);
             } else if !self.globals.contains(&name) {
@@ -1018,18 +1138,48 @@ impl FunctionPlan {
         names.insert_lexical(&mut self.annotation_freevars, name);
     }
 
-    pub(super) fn mark_global(&mut self, name: NameId) {
+    fn resolve_required(&mut self, names: &NameInterner, mut captures: impl FnMut(NameId) -> bool) {
+        if self.required.is_empty() {
+            return;
+        }
+
+        // Most required names resolve to globals. Reuse their cloned table and only allocate
+        // replacement requirements for captures and locals that cannot be marked global.
+        let mut global_candidates = std::mem::take(&mut self.required);
+        global_candidates.retain(|&name| {
+            if captures(name) {
+                self.insert_freevar(names, name);
+            } else if self.prepare_to_mark_global(name) {
+                return true;
+            }
+            self.required.insert(name);
+            false
+        });
+        if self.globals.is_empty() {
+            self.globals = global_candidates;
+        } else {
+            self.globals.extend(global_candidates);
+        }
+    }
+
+    fn prepare_to_mark_global(&mut self, name: NameId) -> bool {
         self.annotation_freevars
             .retain(|candidate| *candidate != name);
         if (self.locals.contains(&name)
             || self.local_aliases.iter().any(|(alias, _)| *alias == name))
             && !self.comprehension_shadowed_targets.contains(&name)
         {
-            return;
+            return false;
         }
         self.freevars.retain(|candidate| *candidate != name);
-        self.globals.insert(name);
-        self.required.remove(&name);
+        true
+    }
+
+    pub(super) fn mark_global(&mut self, name: NameId) {
+        if self.prepare_to_mark_global(name) {
+            self.globals.insert(name);
+            self.required.remove(&name);
+        }
     }
 
     pub(super) fn into_lowering_plan(self) -> LoweringFunctionPlan {
@@ -1415,7 +1565,7 @@ pub(super) struct ModulePlan {
     pub(super) comprehension_cell_names: NameSet,
     pub(super) has_annotations: bool,
     pub(super) has_simple_annotations: bool,
-    pub(super) has_yield_expressions: bool,
+    yield_offsets: Vec<TextSize>,
 }
 
 #[derive(Debug, Default)]
@@ -1425,10 +1575,27 @@ struct ModulePlanBuilder {
     comprehension_cell_names: FxHashSet<String>,
     has_annotations: bool,
     has_simple_annotations: bool,
-    has_yield_expressions: bool,
+    yield_offsets: Vec<TextSize>,
 }
 
 impl ModulePlan {
+    /// Statement ranges include nested definition decorators and headers. Nested bodies can produce
+    /// false positives; the scope-aware walk remains authoritative.
+    pub(super) fn may_contain_yield(&self, body: &[Stmt]) -> bool {
+        if self.yield_offsets.is_empty() {
+            return false;
+        }
+        let (Some(first), Some(last)) = (body.first(), body.last()) else {
+            return false;
+        };
+        let start = first.start();
+        let end = last.end();
+        let index = self.yield_offsets.partition_point(|offset| *offset < start);
+        self.yield_offsets
+            .get(index)
+            .is_some_and(|offset| *offset < end)
+    }
+
     fn build(
         names: &NameInterner,
         future_flags: u32,
@@ -1454,6 +1621,9 @@ impl ModulePlan {
                     .expect("module analysis should intern the shadowed-super sentinel"),
             );
         }
+        // The AST visitor follows evaluation order for some expressions, not source order.
+        facts.yield_offsets.sort_unstable();
+        facts.yield_offsets.dedup();
         Self {
             future_flags,
             module_globals: facts.module_globals.drain().map(&name_id).collect(),
@@ -1474,7 +1644,7 @@ impl ModulePlan {
                 .collect(),
             has_annotations: facts.has_annotations,
             has_simple_annotations: facts.has_simple_annotations,
-            has_yield_expressions: facts.has_yield_expressions,
+            yield_offsets: facts.yield_offsets,
         }
     }
 }
@@ -1508,13 +1678,27 @@ impl ScopeArena {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn analyze(body: &[Stmt]) -> Self {
         Self::analyze_with_python_version(body, PythonVersion::Py314)
     }
 
+    #[cfg(test)]
     pub(super) fn analyze_with_python_version(
         body: &[Stmt],
         python_version: PythonVersion,
+    ) -> Self {
+        Self::analyze_with_source(
+            body,
+            python_version,
+            &mut SourceAnalysis::new(python_version, 0),
+        )
+    }
+
+    pub(super) fn analyze_with_source<'ast>(
+        body: &'ast [Stmt],
+        python_version: PythonVersion,
+        source: &mut SourceAnalysis<'ast>,
     ) -> Self {
         let future_flags = future_feature_flags(body);
         let future_annotations = future_flags & CO_FUTURE_ANNOTATIONS != 0;
@@ -1531,7 +1715,12 @@ impl ScopeArena {
         // and then finishing plans in reverse preserves lexical child order and closure
         // requirements without walking the statement tree a second time.
         let (facts, definitions, requires_module_bindings) =
-            ModuleNameCollector::collect(&mut arena.names, body, eager_annotations);
+            ModuleNameCollector::collect_with_source(
+                &mut arena.names,
+                body,
+                eager_annotations,
+                source,
+            );
         let mut bindings = LocalCollector {
             eager_function_annotations: eager_annotations,
             eager_statement_annotations: eager_annotations,
@@ -1882,6 +2071,7 @@ enum ScopeDefinition<'ast> {
 
 struct ModuleNameCollector<'a, 'ast> {
     names: &'a mut NameInterner,
+    source: &'a mut SourceAnalysis<'ast>,
     private_name: Option<String>,
     facts: ModulePlanBuilder,
     nested_scope_depth: usize,
@@ -1961,13 +2151,29 @@ impl FlatFunctionInputs {
 }
 
 impl<'a, 'ast> ModuleNameCollector<'a, 'ast> {
+    #[cfg(test)]
     fn collect(
         names: &'a mut NameInterner,
         body: &'ast [Stmt],
         eager_annotations: bool,
     ) -> (ModulePlanBuilder, Vec<ScopeBuildInput<'ast>>, bool) {
+        ModuleNameCollector::collect_with_source(
+            names,
+            body,
+            eager_annotations,
+            &mut SourceAnalysis::new(PythonVersion::Py314, 0),
+        )
+    }
+
+    fn collect_with_source(
+        names: &'a mut NameInterner,
+        body: &'ast [Stmt],
+        eager_annotations: bool,
+        source: &'a mut SourceAnalysis<'ast>,
+    ) -> (ModulePlanBuilder, Vec<ScopeBuildInput<'ast>>, bool) {
         let mut collector = Self {
             names,
+            source,
             private_name: None,
             facts: ModulePlanBuilder::default(),
             nested_scope_depth: 0,
@@ -2011,13 +2217,14 @@ impl<'a, 'ast> ModuleNameCollector<'a, 'ast> {
         }
     }
 
-    fn record_flat_name(&mut self, name: &ruff_python_ast::ExprName) {
+    fn record_flat_name(&mut self, name: &ruff_python_ast::ExprName) -> NameId {
         let spelling = name.id.as_str();
         let id = self.intern(spelling);
         if spelling == "super" {
             self.mark_flat_complex();
         }
         self.record_flat(id, name.ctx != ExprContext::Load);
+        id
     }
 
     fn mark_flat_complex(&mut self) {
@@ -2049,21 +2256,33 @@ impl<'a, 'ast> ModuleNameCollector<'a, 'ast> {
 
 impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
     fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        self.source.observe_stmt(statement);
         let at_module_scope = self.nested_scope_depth == 0;
         if matches!(
             statement,
-            Stmt::AugAssign(_)
-                | Stmt::AnnAssign(_)
-                | Stmt::Try(_)
+            Stmt::AnnAssign(_)
                 | Stmt::Match(_)
                 | Stmt::Global(_)
                 | Stmt::Nonlocal(_)
                 | Stmt::TypeAlias(_)
                 | Stmt::ClassDef(_)
-        ) {
+        ) || matches!(statement, Stmt::Try(statement) if !statement.orelse.is_empty() || !statement.finalbody.is_empty())
+        {
             self.mark_flat_complex();
         }
         match statement {
+            Stmt::AugAssign(assignment)
+                if self
+                    .flat_function
+                    .as_ref()
+                    .is_some_and(|flat| !flat.complex) =>
+            {
+                // Unlike ordinary assignment, the target is evaluated before the value. Ruff's
+                // generic visitor visits them in the reverse order, which would reorder locals.
+                self.visit_expr(&assignment.target);
+                self.visit_expr(&assignment.value);
+                return;
+            }
             Stmt::FunctionDef(definition) => {
                 self.mark_flat_complex();
                 self.intern(definition.name.as_str());
@@ -2167,6 +2386,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                 // A generic class header executes in its own annotation scope, whose
                 // private-name context is the class being defined. Decorators still
                 // belong to the enclosing scope.
+                let outer_source_class = self.source.enter_class_header(definition);
                 let outer_private_name = self.private_name.clone();
                 if definition.type_params.is_some() {
                     self.private_name = Some(definition.name.as_str().to_string());
@@ -2192,7 +2412,9 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                 }
                 self.in_module_header = outer_header;
                 self.private_name = Some(definition.name.as_str().to_string());
+                self.source.enter_class_body(definition);
                 self.collect_suite(&definition.body);
+                self.source.leave_class(outer_source_class);
                 self.private_name = outer_private_name;
                 self.nested_scope_depth -= 1;
                 self.current_scope = parent;
@@ -2270,6 +2492,33 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                         self.intern(name.as_str());
                     }
                 }
+                if self
+                    .flat_function
+                    .as_ref()
+                    .is_some_and(|flat| !flat.complex)
+                {
+                    // With no else or copied finally, runtime local order follows Ruff's body and
+                    // handler traversal. Exception aliases bind after their handler's type.
+                    self.visit_body(&statement.body);
+                    for handler in &statement.handlers {
+                        self.source.observe_except_handler(handler);
+                        if let Some(handler) = handler.as_except_handler() {
+                            if let Some(exception_type) = &handler.type_ {
+                                self.visit_expr(exception_type);
+                            }
+                            if let Some(name) = &handler.name {
+                                let spelling = name.as_str();
+                                if spelling == "super" {
+                                    self.mark_flat_complex();
+                                }
+                                let id = self.intern(spelling);
+                                self.record_flat(id, true);
+                            }
+                            self.visit_body(&handler.body);
+                        }
+                    }
+                    return;
+                }
             }
             _ => {}
         }
@@ -2279,13 +2528,16 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
     fn visit_expr(&mut self, expression: &'ast Expr) {
         match expression {
             Expr::Name(name) => {
-                self.record_flat_name(name);
+                let id = self.record_flat_name(name);
+                self.source.observe_name_with_id(name, id);
                 return;
             }
             Expr::Attribute(attribute) => {
-                self.intern(attribute.attr.as_str());
+                let id = self.intern(attribute.attr.as_str());
+                self.source.observe_attribute_with_id(attribute, id);
                 if let Expr::Name(name) = attribute.value.as_ref() {
-                    self.record_flat_name(name);
+                    let id = self.record_flat_name(name);
+                    self.source.observe_name_with_id(name, id);
                 } else {
                     self.visit_expr(&attribute.value);
                 }
@@ -2298,11 +2550,12 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
             | Expr::NoneLiteral(_)
             | Expr::EllipsisLiteral(_)
             | Expr::IpyEscapeCommand(_) => return,
-            _ => {}
+            _ => self.source.observe_expr(expression),
         }
 
-        self.facts.has_yield_expressions |=
-            matches!(expression, Expr::Yield(_) | Expr::YieldFrom(_));
+        if matches!(expression, Expr::Yield(_) | Expr::YieldFrom(_)) {
+            self.facts.yield_offsets.push(expression.start());
+        }
         self.requires_module_bindings |= (self.nested_scope_depth == 0 || self.in_module_header)
             && matches!(
                 expression,
@@ -2392,6 +2645,7 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
     }
 
     fn visit_pattern(&mut self, pattern: &'ast Pattern) {
+        self.source.observe_pattern(pattern);
         let name = match pattern {
             Pattern::MatchAs(pattern) => pattern.name.as_ref(),
             Pattern::MatchStar(pattern) => pattern.name.as_ref(),
@@ -2402,6 +2656,41 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
             self.intern(name.as_str());
         }
         walk_pattern(self, pattern);
+    }
+
+    fn visit_parameters(&mut self, parameters: &'ast ruff_python_ast::Parameters) {
+        self.source.observe_parameters(parameters);
+        ruff_python_ast::visitor::walk_parameters(self, parameters);
+    }
+
+    fn visit_parameter(&mut self, parameter: &'ast ruff_python_ast::Parameter) {
+        self.source.observe_parameter(parameter);
+        ruff_python_ast::visitor::walk_parameter(self, parameter);
+    }
+
+    fn visit_except_handler(&mut self, handler: &'ast ruff_python_ast::ExceptHandler) {
+        self.source.observe_except_handler(handler);
+        ruff_python_ast::visitor::walk_except_handler(self, handler);
+    }
+
+    fn visit_type_param(&mut self, parameter: &'ast TypeParam) {
+        self.source.observe_type_param(parameter);
+        ruff_python_ast::visitor::walk_type_param(self, parameter);
+    }
+
+    fn visit_keyword(&mut self, keyword: &'ast ruff_python_ast::Keyword) {
+        self.source.observe_keyword(keyword);
+        ruff_python_ast::visitor::walk_keyword(self, keyword);
+    }
+
+    fn visit_alias(&mut self, alias: &'ast ruff_python_ast::Alias) {
+        self.source.observe_alias(alias);
+        ruff_python_ast::visitor::walk_alias(self, alias);
+    }
+
+    fn visit_pattern_keyword(&mut self, keyword: &'ast ruff_python_ast::PatternKeyword) {
+        self.source.observe_pattern_keyword(keyword);
+        ruff_python_ast::visitor::walk_pattern_keyword(self, keyword);
     }
 }
 
@@ -5707,16 +5996,308 @@ pub(super) fn collect_simple_annotations<'a>(
 #[cfg(test)]
 mod tests {
 
+    use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
+    use ruff_python_ast::{Expr, Stmt, StmtFunctionDef};
     use ruff_python_parser::parse_module;
+    use ruff_text_size::{Ranged, TextSize};
     use rustc_hash::{FxHashMap, FxHashSet};
 
     use crate::PythonVersion;
 
+    use super::super::statement::function_body_contains_yield;
     use super::{
-        FlatFunctionInputs, LocalCollector, ModuleNameCollector, NameId, NameInterner,
-        SCOPE_SEED_NAMES, ScopeArena, ScopeDefinition, ScopeId, definitely_evaluated_references,
-        has_annotations,
+        FlatFunctionInputs, FunctionPlan, LocalCollector, ModuleNameCollector, NameId,
+        NameInterner, SCOPE_SEED_NAMES, ScopeArena, ScopeDefinition, ScopeId,
+        definitely_evaluated_references, has_annotations,
     };
+
+    #[test]
+    fn indexed_yields_match_the_exact_scope_walk_for_all_target_versions() {
+        #[derive(Default)]
+        struct Nodes<'ast> {
+            functions: Vec<&'ast StmtFunctionDef>,
+            yield_offsets: Vec<TextSize>,
+        }
+
+        impl<'ast> Visitor<'ast> for Nodes<'ast> {
+            fn visit_stmt(&mut self, statement: &'ast Stmt) {
+                if let Stmt::FunctionDef(function) = statement {
+                    self.functions.push(function);
+                }
+                walk_stmt(self, statement);
+            }
+
+            fn visit_expr(&mut self, expression: &'ast Expr) {
+                if matches!(expression, Expr::Yield(_) | Expr::YieldFrom(_)) {
+                    self.yield_offsets.push(expression.start());
+                }
+                walk_expr(self, expression);
+            }
+        }
+
+        let source = r"
+def plain(value):
+    return value
+
+def nested_only():
+    def nested_generator():
+        yield 1
+    return nested_generator
+
+async def async_plain():
+    await call()
+
+def header_only():
+    @(yield decorator)
+    def child_header(value=(yield default)):
+        pass
+
+def annotated_only():
+    def child_annotation(value: (yield annotation)):
+        pass
+
+def lambda_only():
+    return lambda: (yield nested)
+
+def lambda_defaults():
+    return lambda value=(yield default): value
+
+def comprehension_nested():
+    return [(lambda: (yield item))() for item in source]
+
+def comprehension_input():
+    return [item for item in (yield values)]
+
+def class_only():
+    class Body:
+        def class_generator(self):
+            yield from items
+
+def class_header():
+    @(yield decorator)
+    class Header((yield base)):
+        pass
+
+def out_of_order():
+    (yield items)[(yield key)] = (yield value)
+
+async def async_generator():
+    yield 1
+
+def trailing():
+    pass
+";
+        let parsed = parse_module(source).unwrap();
+        let mut nodes = Nodes::default();
+        nodes.visit_body(parsed.suite());
+        assert!(
+            nodes.yield_offsets.windows(2).any(|pair| pair[0] > pair[1]),
+            "the independent walker should exercise evaluation-order offsets"
+        );
+        nodes.yield_offsets.sort_unstable();
+        nodes.yield_offsets.dedup();
+
+        let expected = FxHashMap::from_iter([
+            ("plain", (false, false, false)),
+            ("nested_only", (true, false, false)),
+            ("nested_generator", (true, true, true)),
+            ("async_plain", (false, false, false)),
+            ("header_only", (true, true, true)),
+            ("child_header", (false, false, false)),
+            ("annotated_only", (true, false, true)),
+            ("child_annotation", (false, false, false)),
+            ("lambda_only", (true, false, false)),
+            ("lambda_defaults", (true, true, true)),
+            ("comprehension_nested", (true, false, false)),
+            ("comprehension_input", (true, true, true)),
+            ("class_only", (true, false, false)),
+            ("class_generator", (true, true, true)),
+            ("class_header", (true, true, true)),
+            ("out_of_order", (true, true, true)),
+            ("async_generator", (true, true, true)),
+            ("trailing", (false, false, false)),
+        ]);
+        assert_eq!(nodes.functions.len(), expected.len());
+
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let scopes = ScopeArena::analyze_with_python_version(parsed.suite(), version);
+            let plan = scopes.module();
+            assert_eq!(plan.yield_offsets, nodes.yield_offsets, "{version:?}");
+            assert!(!plan.may_contain_yield(&[]), "{version:?}");
+            for function in &nodes.functions {
+                let name = function.name.as_str();
+                let (indexed, deferred, eager) = expected[name];
+                assert_eq!(plan.may_contain_yield(&function.body), indexed, "{name}");
+                for eager_annotations in [false, true] {
+                    let exact = function_body_contains_yield(&function.body, eager_annotations);
+                    let guarded = plan.may_contain_yield(&function.body)
+                        && function_body_contains_yield(&function.body, eager_annotations);
+                    assert_eq!(exact, if eager_annotations { eager } else { deferred });
+                    assert_eq!(guarded, exact, "{version:?}: {name}");
+                }
+            }
+
+            let plain = parse_module("def only():\n    return 1\n").unwrap();
+            let plain_scope = ScopeArena::analyze_with_python_version(plain.suite(), version);
+            assert!(plain_scope.module().yield_offsets.is_empty());
+            assert!(!plain_scope.module().may_contain_yield(plain.suite()));
+        }
+    }
+
+    #[test]
+    fn resolved_requirements_reuse_globals_without_losing_captures_or_protected_locals() {
+        let mut names = NameInterner::seeded();
+        let [
+            capture_z,
+            capture_a,
+            local,
+            alias,
+            shadow_local,
+            shadow_alias,
+            global,
+            already_global,
+            explicit_only,
+            untouched,
+        ] = [
+            "z_capture",
+            "a_capture",
+            "local",
+            "alias",
+            "shadow_local",
+            "shadow_alias",
+            "global",
+            "already_global",
+            "explicit_only",
+            "untouched",
+        ]
+        .map(|name| names.intern(name));
+
+        for explicit in [false, true] {
+            for capture_conflicts in [false, true] {
+                let mut plan = FunctionPlan {
+                    locals: vec![local, shadow_local],
+                    local_aliases: vec![(alias, local), (shadow_alias, shadow_local)],
+                    comprehension_shadowed_targets: FxHashSet::from_iter([
+                        shadow_local,
+                        shadow_alias,
+                    ]),
+                    required: FxHashSet::from_iter([
+                        capture_z,
+                        capture_a,
+                        local,
+                        alias,
+                        shadow_local,
+                        shadow_alias,
+                        global,
+                        already_global,
+                    ]),
+                    globals: if explicit {
+                        FxHashSet::from_iter([already_global, explicit_only])
+                    } else {
+                        FxHashSet::default()
+                    },
+                    ..FunctionPlan::default()
+                };
+                for name in [
+                    capture_z,
+                    local,
+                    alias,
+                    shadow_local,
+                    shadow_alias,
+                    global,
+                    already_global,
+                    explicit_only,
+                    untouched,
+                ] {
+                    plan.insert_freevar(&names, name);
+                    plan.insert_annotation_freevar(&names, name);
+                }
+                plan.insert_annotation_freevar(&names, capture_a);
+                let mut captures = FxHashSet::from_iter([capture_a, capture_z]);
+                if capture_conflicts {
+                    captures.extend([local, shadow_alias, global]);
+                }
+                let mut reference = plan.clone();
+                for name in reference.required.iter().copied().collect::<Vec<_>>() {
+                    if captures.contains(&name) {
+                        reference.insert_freevar(&names, name);
+                    } else {
+                        reference.mark_global(name);
+                    }
+                }
+                plan.resolve_required(&names, |name| captures.contains(&name));
+
+                assert_eq!(plan.required, reference.required);
+                assert_eq!(plan.globals, reference.globals);
+                assert_eq!(plan.freevars, reference.freevars);
+                assert_eq!(plan.annotation_freevars, reference.annotation_freevars);
+
+                if !capture_conflicts {
+                    assert_eq!(
+                        plan.required,
+                        FxHashSet::from_iter([capture_a, capture_z, local, alias])
+                    );
+                    assert!(plan.globals.is_superset(&FxHashSet::from_iter([
+                        shadow_local,
+                        shadow_alias,
+                        global,
+                        already_global,
+                    ])));
+                    assert_eq!(plan.globals.contains(&explicit_only), explicit);
+                    assert_eq!(
+                        plan.annotation_freevars,
+                        [capture_a, explicit_only, untouched, capture_z]
+                    );
+                    assert_eq!(
+                        plan.freevars,
+                        [capture_a, alias, explicit_only, local, untouched, capture_z]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_child_requirements_preserve_plans_and_annotation_only_inputs_are_absorbed() {
+        let mut names = NameInterner::seeded();
+        let [local, alias, shadow, global, free, existing] =
+            ["local", "alias", "shadow", "global", "free", "existing"]
+                .map(|name| names.intern(name));
+        let mut full = FunctionPlan {
+            locals: vec![local, shadow],
+            local_aliases: vec![(alias, local)],
+            globals: FxHashSet::from_iter([global]),
+            required: FxHashSet::from_iter([existing]),
+            comprehension_shadowed_targets: FxHashSet::from_iter([shadow]),
+            ..FunctionPlan::default()
+        };
+        let mut lowering = full.clone().into_lowering_plan();
+        full.absorb_child_requirements([], []);
+        lowering.absorb_child_requirements([], []);
+        assert!(full.cellvars.is_empty());
+        assert!(lowering.cellvars.is_empty());
+        assert_eq!(full.required, FxHashSet::from_iter([existing]));
+        assert_eq!(lowering.required, full.required);
+
+        let annotations = [local, alias, shadow, global, free];
+        full.absorb_child_requirements([], annotations);
+        lowering.absorb_child_requirements([], annotations);
+        assert_eq!(full.cellvars, FxHashSet::from_iter([local, alias]));
+        assert_eq!(
+            full.required,
+            FxHashSet::from_iter([existing, free, shadow])
+        );
+        assert_eq!(
+            lowering.cellvars,
+            FxHashSet::from_iter([local, alias, shadow])
+        );
+        assert_eq!(lowering.required, FxHashSet::from_iter([existing, free]));
+    }
 
     #[test]
     fn eager_annotations_use_parent_locals_except_in_generic_scopes() {
@@ -6037,6 +6618,120 @@ mod tests {
     }
 
     #[test]
+    fn seed_candidates_keep_exact_ids_with_dynamic_and_unseeded_interners() {
+        let mut seeded = NameInterner::seeded();
+        let mut unseeded = NameInterner::default();
+        let dynamic = [
+            "ordinary",
+            ".unknown",
+            "\0unknown",
+            "__unknown__",
+            "_single",
+            "former",
+            "joins",
+            "supers",
+            "formatting",
+            "__class_",
+        ];
+        for (index, spelling) in dynamic.into_iter().enumerate() {
+            assert_eq!(
+                seeded.intern(spelling),
+                NameId::from_usize(SCOPE_SEED_NAMES.len() + index),
+            );
+        }
+        for (index, spelling) in SCOPE_SEED_NAMES.into_iter().enumerate() {
+            let id = NameId::from_usize(index);
+            assert_eq!(seeded.get(spelling), Some(id));
+            assert_eq!(seeded.intern(spelling), id);
+            assert_eq!(seeded.intern_owned(spelling.to_owned()), id);
+            assert_eq!(unseeded.get(spelling), None);
+            assert_eq!(unseeded.intern(spelling), id);
+            assert_eq!(unseeded.get(spelling), Some(id));
+        }
+        for (index, spelling) in dynamic.into_iter().enumerate() {
+            let id = NameId::from_usize(SCOPE_SEED_NAMES.len() + index);
+            assert_eq!(seeded.get(spelling), Some(id));
+            assert_eq!(seeded.resolve(id), spelling);
+        }
+    }
+
+    #[test]
+    fn short_name_cache_preserves_lengths_unicode_and_direct_map_collisions() {
+        use super::ShortNameKey;
+
+        let mut names = NameInterner::default();
+        let spellings = [
+            "x",
+            "x\0",
+            "x\0\0",
+            "abcd",
+            "abcd\0",
+            "abcde\0",
+            "abcdef\0",
+            "abcdefg\0",
+            "abcdefghx",
+            "名",
+            "名é",
+            "😀x",
+        ];
+        for (index, spelling) in spellings.iter().enumerate() {
+            assert_eq!(names.get(spelling), None);
+            assert_eq!(names.intern(spelling), NameId::from_usize(index));
+        }
+        for (index, spelling) in spellings.iter().enumerate().rev() {
+            let id = NameId::from_usize(index);
+            assert_eq!(names.get(spelling), Some(id));
+            assert_eq!(names.intern_owned((*spelling).to_owned()), id);
+            assert_eq!(names.resolve(id), *spelling);
+        }
+
+        let mut slots = vec![None; 128];
+        let (first, second) = (0..=128)
+            .find_map(|index| {
+                let spelling = format!("v{index}");
+                let slot = ShortNameKey::new(&spelling).unwrap().slot();
+                slots[slot]
+                    .replace(spelling.clone())
+                    .map(|earlier| (earlier, spelling))
+            })
+            .expect("129 spellings must share at least one of 128 slots");
+        let first_id = names.intern(&first);
+        let second_id = names.intern(&second);
+        for _ in 0..4 {
+            assert_eq!(names.get(&first), Some(first_id));
+            assert_eq!(names.get(&second), Some(second_id));
+        }
+        assert_ne!(first_id, second_id);
+    }
+
+    #[test]
+    fn cached_short_seed_ids_survive_collisions_with_dynamic_names() {
+        use super::ShortNameKey;
+
+        let mut names = NameInterner::seeded();
+        let seed = "super";
+        let seed_id = names.get(seed).unwrap();
+        let seed_key = ShortNameKey::new(seed).unwrap();
+        assert_eq!(names.short_names.get(seed_key), Some(seed_id));
+
+        let colliding = (0..1000)
+            .map(|index| format!("v{index}"))
+            .find(|spelling| ShortNameKey::new(spelling).unwrap().slot() == seed_key.slot())
+            .expect("a dynamic name should share the seed's cache slot");
+        let dynamic_id = names.intern(&colliding);
+        assert_ne!(seed_id, dynamic_id);
+        for _ in 0..4 {
+            assert_eq!(names.get(seed), Some(seed_id));
+            assert_eq!(names.get(&colliding), Some(dynamic_id));
+        }
+
+        let mut unseeded = NameInterner::default();
+        assert_eq!(unseeded.get(seed), None);
+        assert_eq!(unseeded.intern(&colliding), NameId::from_usize(0));
+        assert_eq!(unseeded.intern(seed), NameId::from_usize(1));
+    }
+
+    #[test]
     fn name_interner_preserves_ids_through_growth_and_repeated_lookup() {
         let mut names = NameInterner::seeded();
         for index in 0..2048 {
@@ -6147,6 +6842,140 @@ mod tests {
             [(NameId::from_u32(2), true), (NameId::from_u32(1), true)]
         );
         assert!(inputs.name_positions.is_none());
+    }
+
+    #[test]
+    fn flat_augmented_assignments_match_full_scope_analysis() {
+        let source = "def simple():\n    early += late\n    late = 1\n    item[index] += operand\n    object.field += early\n    object = item = index = 1\nclass Example:\n    def method(self):\n        __slot += _Example__slot\n        _Example__slot = 1\n        self.__field += self[index]\n";
+        let parsed = parse_module(source).unwrap();
+        let fast = ScopeArena::analyze(parsed.suite());
+        let mut full = ScopeArena {
+            names: NameInterner::seeded(),
+            ..ScopeArena::default()
+        };
+        let (_, mut definitions, _) =
+            ModuleNameCollector::collect(&mut full.names, parsed.suite(), false);
+        for input in &mut definitions {
+            if let ScopeDefinition::Function(_, flat, _) = &mut input.definition {
+                assert!(flat.take().is_some());
+            }
+        }
+        full.build_scopes(definitions, false);
+
+        for (scope, expected_locals, expected_required) in [
+            (
+                ScopeId::from_usize(1),
+                ["early", "late", "item", "index", "object"].as_slice(),
+                ["operand"].as_slice(),
+            ),
+            (
+                ScopeId::from_usize(3),
+                ["self", "_Example__slot"].as_slice(),
+                ["index"].as_slice(),
+            ),
+        ] {
+            let fast_plan = fast.function(scope).unwrap();
+            let full_plan = full.function(scope).unwrap();
+            assert_eq!(fast_plan.locals, full_plan.locals);
+            assert_eq!(fast_plan.required, full_plan.required);
+            assert_eq!(fast_plan.local_aliases, full_plan.local_aliases);
+            assert_eq!(
+                fast_plan
+                    .locals
+                    .iter()
+                    .map(|name| fast.names.resolve(*name))
+                    .collect::<Vec<_>>(),
+                expected_locals,
+            );
+            assert_eq!(
+                fast_plan.required,
+                expected_required
+                    .iter()
+                    .map(|name| fast.names.get(name).unwrap())
+                    .collect(),
+            );
+        }
+        let method = fast.function(ScopeId::from_usize(3)).unwrap();
+        assert_eq!(
+            method.local_aliases,
+            [(
+                fast.names.get("__slot").unwrap(),
+                fast.names.get("_Example__slot").unwrap(),
+            )],
+        );
+    }
+
+    #[test]
+    fn flat_exception_handlers_match_full_scope_analysis() {
+        let source = "def handling():\n    try:\n        body = first\n        helper()\n    except (FirstError, SecondError) as first:\n        handler = first\n    except ThirdError as second:\n        later = second\n    except:\n        final = fallback\n    return body, first, handler, second, later, final\ndef star():\n    try:\n        passed = start\n    except* StarError as failure:\n        recovered = failure\n    return passed, recovered\ndef with_else():\n    try:\n        body()\n    except Error as failure:\n        handler()\n    else:\n        fallback()\ndef with_finally():\n    try:\n        body()\n    finally:\n        cleanup()\ndef shadows_super():\n    try:\n        body()\n    except Error as super:\n        pass\n";
+        let parsed = parse_module(source).unwrap();
+        let fast = ScopeArena::analyze(parsed.suite());
+        let mut full = ScopeArena {
+            names: NameInterner::seeded(),
+            ..ScopeArena::default()
+        };
+        let (_, mut definitions, _) =
+            ModuleNameCollector::collect(&mut full.names, parsed.suite(), false);
+        let flat = definitions
+            .iter_mut()
+            .map(|input| {
+                let ScopeDefinition::Function(definition, flat, _) = &mut input.definition else {
+                    panic!("expected only functions");
+                };
+                (definition.name.as_str(), flat.take().is_some())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            flat,
+            [
+                ("handling", true),
+                ("star", true),
+                ("with_else", false),
+                ("with_finally", false),
+                ("shadows_super", false),
+            ],
+        );
+        full.build_scopes(definitions, false);
+
+        for (scope, expected_locals, expected_required) in [
+            (
+                ScopeId::from_usize(1),
+                ["first", "body", "handler", "second", "later", "final"].as_slice(),
+                [
+                    "helper",
+                    "FirstError",
+                    "SecondError",
+                    "ThirdError",
+                    "fallback",
+                ]
+                .as_slice(),
+            ),
+            (
+                ScopeId::from_usize(2),
+                ["passed", "failure", "recovered"].as_slice(),
+                ["start", "StarError"].as_slice(),
+            ),
+        ] {
+            let fast_plan = fast.function(scope).unwrap();
+            let full_plan = full.function(scope).unwrap();
+            assert_eq!(fast_plan.locals, full_plan.locals);
+            assert_eq!(fast_plan.required, full_plan.required);
+            assert_eq!(
+                fast_plan
+                    .locals
+                    .iter()
+                    .map(|name| fast.names.resolve(*name))
+                    .collect::<Vec<_>>(),
+                expected_locals,
+            );
+            assert_eq!(
+                fast_plan.required,
+                expected_required
+                    .iter()
+                    .map(|name| fast.names.get(name).unwrap())
+                    .collect(),
+            );
+        }
     }
 
     #[test]

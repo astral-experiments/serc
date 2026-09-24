@@ -1,11 +1,94 @@
+use std::borrow::Cow;
+use std::fmt;
+use std::ops::Deref;
 use std::sync::Arc;
 
 use ruff_index::newtype_index;
+use ruff_python_ast::name::Name;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::CompileError;
 use crate::target::code_flags::{CO_VARARGS, CO_VARKEYWORDS};
 use crate::target::local_kinds::CO_FAST_LOCAL;
+
+/// An immutable metadata spelling that keeps short names inline.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub(crate) struct MetadataName(Name);
+
+impl MetadataName {
+    #[inline]
+    pub(crate) fn new(value: &str) -> Self {
+        Self(Name::new(value))
+    }
+
+    #[inline]
+    pub(crate) const fn new_static(value: &'static str) -> Self {
+        Self(Name::new_static(value))
+    }
+
+    #[inline]
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl Deref for MetadataName {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Debug for MetadataName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_str(), formatter)
+    }
+}
+
+impl fmt::Display for MetadataName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self.as_str(), formatter)
+    }
+}
+
+impl From<&str> for MetadataName {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for MetadataName {
+    fn from(value: String) -> Self {
+        Self(Name::from(value))
+    }
+}
+
+impl From<Cow<'_, str>> for MetadataName {
+    fn from(value: Cow<'_, str>) -> Self {
+        Self(Name::from(value))
+    }
+}
+
+impl PartialEq<str> for MetadataName {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for MetadataName {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<String> for MetadataName {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum LocalsIdentity {
@@ -50,12 +133,12 @@ pub(crate) enum CompilationInterningEvent {
 /// The string effects of one assembled code object, without retaining its bytecode or children.
 #[derive(Clone, Debug)]
 pub(crate) struct CodeInterningSummary {
-    pub(crate) names: Vec<String>,
-    pub(crate) locals: Vec<String>,
+    pub(crate) names: Vec<MetadataName>,
+    pub(crate) locals: Vec<MetadataName>,
     pub(crate) constant_strings: Vec<String>,
     pub(crate) explicitly_interned_strings: FxHashSet<String>,
     pub(crate) constants_tuple: Option<Vec<String>>,
-    pub(crate) filename: String,
+    pub(crate) filename: Arc<str>,
     pub(crate) name: String,
     pub(crate) qualified_name: String,
 }
@@ -100,7 +183,7 @@ impl CodeInterningSummary {
                     _ => None,
                 })
                 .collect(),
-            filename: code.filename.clone(),
+            filename: Arc::clone(&code.filename),
             name: code.name.clone(),
             qualified_name: code.qualified_name.clone(),
         }
@@ -402,10 +485,11 @@ pub(crate) struct CodeObject {
     pub(crate) flags: u32,
     pub(crate) bytecode: Vec<u8>,
     pub(crate) constants: Vec<Constant>,
-    pub(crate) names: Vec<String>,
-    pub(crate) locals: Vec<String>,
+    pub(crate) names: Vec<MetadataName>,
+    pub(crate) locals: Vec<MetadataName>,
     pub(crate) local_kinds: Vec<u8>,
-    pub(crate) filename: String,
+    /// The caller's immutable filename, shared by all scopes in the compilation.
+    pub(crate) filename: Arc<str>,
     pub(crate) name: String,
     pub(crate) qualified_name: String,
     pub(crate) first_line_number: u32,
@@ -515,7 +599,7 @@ mod tests {
             names: Vec::new(),
             locals: Vec::new(),
             local_kinds: Vec::new(),
-            filename: "module.py".to_string(),
+            filename: "module.py".into(),
             name: "<module>".to_string(),
             qualified_name: "<module>".to_string(),
             first_line_number: 1,
@@ -628,7 +712,7 @@ mod tests {
     #[test]
     fn rejects_mismatched_locals_metadata() {
         let mut code = code_object();
-        code.locals.push("value".to_string());
+        code.locals.push("value".into());
 
         assert_eq!(
             code.validate().unwrap_err(),
@@ -656,7 +740,7 @@ mod tests {
     fn rejects_parameters_without_local_slots() {
         let mut code = code_object();
         code.arg_count = 1;
-        code.locals.push("captured".to_string());
+        code.locals.push("captured".into());
         code.local_kinds.push(CO_FAST_FREE);
 
         assert_eq!(
