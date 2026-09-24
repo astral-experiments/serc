@@ -33,3 +33,64 @@ fn matches_cpython_nested_tail_while_breaks() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_traced_break_into_an_outer_iterator_backedge() {
+    for (definition, footer, wrapper, close) in [
+        ("def", "    yield items\n", "", ""),
+        ("async def", "    await finish()\n", "", ""),
+        (
+            "def",
+            "",
+            "    try:\n",
+            "    except ValueError:\n        recover()\n",
+        ),
+        ("def", "", "    with manager():\n", ""),
+        ("def", "", "", ""),
+    ] {
+        for tail in ["", "else:\n    finish()\n"] {
+            let body = format!(
+                "for value in items:\n    while ready():\n        break\n    else:\n        clean()\n{tail}",
+            );
+            let source = format!(
+                "{definition} f(items):\n{wrapper}{}{close}{footer}",
+                if wrapper.is_empty() {
+                    common::indent(&body)
+                } else {
+                    common::indent(&common::indent(&body))
+                },
+            );
+            common::assert_matches_cpython_marshal(&source, "traced_nested_while_break.py");
+        }
+    }
+
+    common::assert_executes(
+        r"import sys
+
+def f(items):
+    for value in items:
+        while more:
+            break
+        else:
+            clean()
+    yield items
+
+more = True
+lines = []
+def trace(frame, event, arg):
+    if frame.f_code.co_name == 'f' and event == 'line':
+        lines.append(frame.f_lineno)
+    return trace
+
+def clean():
+    raise AssertionError('unexecuted loop else')
+
+sys.settrace(trace)
+try:
+    list(f([1, 2]))
+finally:
+    sys.settrace(None)
+print(lines)",
+        "[4, 5, 6, 4, 5, 6, 4, 9]\n",
+    );
+}
