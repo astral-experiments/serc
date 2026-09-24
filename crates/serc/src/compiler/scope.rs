@@ -564,6 +564,7 @@ pub(super) struct ScopeBodyFacts {
     pub(super) references: FxHashSet<String>,
     outside_inlined_comprehension_references: FxHashSet<String>,
     outside_inlined_comprehension_requirements: FxHashSet<String>,
+    class_inlined_comprehension_references: FxHashSet<String>,
     explicit_dunder_class_reference: bool,
     pub(super) nested_lambda_requirements: BTreeSet<String>,
     pub(super) nested_generator_requirements: BTreeSet<String>,
@@ -1258,6 +1259,7 @@ impl ClassPlan {
             globals,
             nonlocals,
             references,
+            class_inlined_comprehension_references,
             explicit_dunder_class_reference,
             nested_lambda_requirements,
             nested_generator_requirements,
@@ -1287,11 +1289,13 @@ impl ClassPlan {
 
         // Symbol analysis compares the canonical spelling of private aliases before
         // deciding whether a direct class reference can escape to an enclosing scope.
+        // Comprehension iteration targets do not bind the class namespace.
         let private_name = (!deferred_annotations).then_some(definition.name.as_str());
         let bound_names = private_name.map(|_| {
             locals
                 .seen
                 .iter()
+                .filter(|name| locals.non_comprehension_bindings.contains(*name))
                 .map(|name| mangle_name(name.as_str(), private_name))
                 .collect::<FxHashSet<_>>()
         });
@@ -1311,7 +1315,7 @@ impl ClassPlan {
         });
         let is_bound = |name: &str| {
             bound_names.as_ref().map_or_else(
-                || locals.seen.contains(name),
+                || locals.seen.contains(name) && locals.non_comprehension_bindings.contains(name),
                 |names| names.contains(mangle_name(name, private_name).as_ref()),
             )
         };
@@ -1364,8 +1368,11 @@ impl ClassPlan {
         let body_requires_dunder_class =
             body_explicitly_references_dunder_class && required.contains("__class__");
 
+        // Inlined comprehension bodies retain function-style lookup: class bindings and
+        // global declarations do not prevent them from capturing enclosing function locals.
+        required.extend(class_inlined_comprehension_references);
         required.extend(nested_lambda_requirements.iter().cloned());
-        required.extend(nested_generator_requirements);
+        required.extend(nested_generator_requirements.iter().cloned());
         required.extend(
             method_requirements
                 .iter()
@@ -1408,6 +1415,7 @@ impl ClassPlan {
         // Separate comprehensions skip class bindings when capturing enclosing locals.
         let needs_class_closure = child_needs_class_closure
             || nested_lambda_requirements.contains("__class__")
+            || nested_generator_requirements.contains("__class__")
             || nested_annotation_class_closure
             || annotation_requires_class
             || comprehension_needs_class;
@@ -4139,6 +4147,22 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
     }
 
     fn insert_reference(&mut self, name: &'ast str) {
+        if self.class_scope && self.inlined_comprehension_depth > 0 {
+            let canonical = mangle_name(name, self.private_name.as_deref());
+            // An inlined body cannot itself request an enclosing `__class__` cell. It
+            // can still use one requested by an independent direct class-body reference.
+            if name != "__class__"
+                && !self
+                    .class_comprehension_targets
+                    .iter()
+                    .any(|target| mangle_name(target, self.private_name.as_deref()) == canonical)
+            {
+                self.facts
+                    .class_inlined_comprehension_references
+                    .insert(name.to_string());
+            }
+            return;
+        }
         self.references.insert(name);
         if self.inlined_comprehension_depth == 0
             && let Some(references) = &mut self.outside_inlined_comprehension_references
@@ -4406,6 +4430,7 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
                 for generator in generators {
                     collect_target_names(&generator.target, &mut self.class_comprehension_targets);
                 }
+                self.inlined_comprehension_depth += 1;
                 for (index, generator) in generators.iter().enumerate() {
                     if index > 0 {
                         self.visit_expr(&generator.iter);
@@ -4419,6 +4444,7 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
                     self.visit_expr(key);
                 }
                 self.visit_expr(value);
+                self.inlined_comprehension_depth -= 1;
                 self.class_comprehension_targets.truncate(outer_targets);
                 return;
             }
