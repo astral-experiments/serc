@@ -47,6 +47,63 @@ fn matches_cpython_locations_on_copied_iterator_break_exits() {
 }
 
 #[test]
+fn matches_cpython_terminal_handler_iterator_break_cleanup() {
+    for handler in ["except Error:", "except Error as error:", "except:"] {
+        for iteration in ["async for item in items", "for item in items"] {
+            for body in [
+                "break",
+                "if flag:\n    break",
+                "if flag:\n    break\nif other:\n    break",
+                "if flag:\n    work(item)\nelse:\n    break",
+            ] {
+                let source = format!(
+                    "async def f(items, flag, other):\n    try:\n        work(flag)\n    {handler}\n        {iteration}:\n            {}\n",
+                    body.replace('\n', "\n            "),
+                );
+                common::assert_matches_cpython_marshal(&source, "handler_iterator_break.py");
+            }
+        }
+    }
+}
+
+#[test]
+fn matches_cpython_terminal_handler_nested_async_iterator_break_cleanup() {
+    for handler in ["except Error:", "except Error as error:", "except:"] {
+        for body in [
+            "with manager:\n    break",
+            "async with manager:\n    break",
+            "try:\n    break\nfinally:\n    work(item)",
+            "yield item\nbreak",
+            "yield item\nif flag:\n    break",
+        ] {
+            let source = format!(
+                "async def f(items, flag, manager):\n    try:\n        work(flag)\n    {handler}\n        async for item in items:\n            {}\n",
+                body.replace('\n', "\n            "),
+            );
+            common::assert_matches_cpython_marshal(&source, "handler_nested_iterator_break.py");
+        }
+    }
+}
+
+#[test]
+fn matches_cpython_handler_iterator_break_cleanup_with_a_successor() {
+    for handler in ["except Error:", "except Error as error:"] {
+        for suffix in [
+            "        work(items)\n",
+            "        pass\n",
+            "        return\n",
+            "        yield None\n",
+            "        raise\n",
+        ] {
+            let source = format!(
+                "async def f(items, flag):\n    try:\n        work(flag)\n    {handler}\n        async for item in items:\n            break\n{suffix}",
+            );
+            common::assert_matches_cpython_marshal(&source, "handler_iterator_break_successor.py");
+        }
+    }
+}
+
+#[test]
 fn preserves_async_iterator_break_locations_through_finally() {
     for iteration in ["source()", "items"] {
         for body in [
