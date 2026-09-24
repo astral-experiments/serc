@@ -5642,6 +5642,8 @@ pub(super) fn comprehension_cell_names_in_private_context(
     let mut required = BTreeSet::new();
     for (index, generator) in generators.iter().enumerate() {
         collect_target_names(&generator.target, &mut targets);
+        collect_nested_comprehension_target_names(&generator.target, &mut targets);
+        required.extend(nested_required(&generator.target));
         if index > 0 {
             collect_nested_comprehension_target_names(&generator.iter, &mut targets);
             required.extend(nested_required(&generator.iter));
@@ -5878,6 +5880,7 @@ pub(super) fn generator_cellvars(generator: &ruff_python_ast::ExprGenerator) -> 
     let mut nested_requirements = nested_expression_required_names(&generator.elt);
     for (index, comprehension) in generator.generators.iter().enumerate() {
         extend_local_names(&comprehension.target, &mut local_names);
+        nested_requirements.extend(nested_expression_required_names(&comprehension.target));
         if index > 0 {
             extend_local_names(&comprehension.iter, &mut local_names);
             nested_requirements.extend(nested_expression_required_names(&comprehension.iter));

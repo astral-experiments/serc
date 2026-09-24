@@ -21,7 +21,7 @@ use code_object::{CodeFilename, CodeObject};
 use compiler::Compiler;
 pub use config::{CompileOptions, ParsePythonVersionError, PythonVersion};
 pub use initial_intern_state::InitialInternState;
-use ruff_text_size::TextRange;
+use ruff_text_size::{TextRange, TextSize};
 pub use source::{SourceDecodeError, decode_source};
 
 /// The exact CPython implementation targeted by this compiler backend.
@@ -246,6 +246,14 @@ pub fn compile_with_options(
     validate_filename(filename)?;
     if source.contains('\0') {
         return Err(CompileError::Decode(SourceDecodeError::NullByte));
+    }
+    if source.starts_with('\u{feff}') {
+        // Only byte source can use a leading BOM as an encoding signature. Ruff accepts
+        // it in UTF-8 text as well, so reject it before parsing already decoded source.
+        return Err(CompileError::invalid_syntax(
+            "invalid non-printable character U+FEFF",
+            TextRange::new(TextSize::new(0), TextSize::new(3)),
+        ));
     }
     let source = source::normalize_source(source);
     compile_normalized(&source, filename.into(), options)

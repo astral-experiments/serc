@@ -51,6 +51,49 @@ fn matches_cpython_complex_power_infinite_phase() {
 }
 
 #[test]
+fn matches_cpython_nonfinite_complex_power_folding() {
+    for base in [
+        "1e309j",
+        "-1e309j",
+        "(1e309+0j)",
+        "(-1e309-0j)",
+        "(1e309+1e309j)",
+        "(1e309j-1e309j)",
+    ] {
+        for exponent in [
+            "-1", "-1.0", "(-1+0j)", "(-1-0j)", "-2", "0", "1", "2", "1j",
+        ] {
+            let source = format!("def power():\n    return ({base}) ** ({exponent})\n");
+            common::assert_matches_cpython_marshal(&source, "nonfinite_complex_power.py");
+        }
+    }
+}
+
+#[test]
+fn executes_nonfinite_complex_powers_with_cpython_signs() {
+    common::assert_executes(
+        r"
+import math
+
+def signs(value):
+    return math.copysign(1, value.real), math.copysign(1, value.imag)
+
+def dynamic(base, exponent):
+    return base ** exponent
+
+for base, exponent, folded in [
+    (1e309j, -1, 1e309j ** -1),
+    (-1e309j, -1.0, (-1e309j) ** -1.0),
+    (1e309j, -1+0j, 1e309j ** (-1+0j)),
+    (1e309j-1e309j, 1j, (1e309j-1e309j) ** 1j),
+]:
+    print(signs(folded) == signs(dynamic(base, exponent)))
+",
+        "True\nTrue\nTrue\nTrue\n",
+    );
+}
+
+#[test]
 fn executes_complex_powers_and_preserves_errors() {
     common::assert_executes(
         r"

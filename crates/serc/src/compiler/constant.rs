@@ -2055,7 +2055,7 @@ pub(super) fn fold_constant_with_literals(
                     if matches!(left, Constant::Complex { .. })
                         || matches!(right, Constant::Complex { .. }) =>
                 {
-                    fold_complex_power(&left, &right)
+                    fold_complex_power(&left, &right, python_version)
                 }
                 (Constant::String(mut left), Operator::Add, Constant::String(right)) => {
                     left.push_str(&right);
@@ -2328,6 +2328,16 @@ fn constant_as_float(constant: &Constant) -> Option<f64> {
     reason = "CPython checks real exponents for exact binary64 integrality"
 )]
 fn fold_float_power(base: f64, exponent: f64) -> Option<Constant> {
+    // float_pow returns the selected NaN operand directly, preserving its sign and payload.
+    if exponent == 0.0 {
+        return Some(Constant::Float(1.0));
+    }
+    if base.is_nan() {
+        return Some(Constant::Float(base));
+    }
+    if exponent.is_nan() {
+        return Some(Constant::Float(if base == 1.0 { 1.0 } else { exponent }));
+    }
     if base.is_finite() && exponent.is_finite() && base < 0.0 && exponent != exponent.floor() {
         // float_pow delegates negative fractional powers to complex_pow. Follow
         // _Py_c_pow with positive imaginary zeros for both real operands.
@@ -2926,9 +2936,8 @@ fn fold_literal_subscript(
     let Expr::Slice(slice) = index else {
         unreachable!();
     };
-    if slice.step.is_some() && constant_slice(slice).is_none() {
-        return None;
-    }
+    // CPython constructs constant slices before folding their bound expressions.
+    constant_slice(slice)?;
 
     match value {
         Constant::String(value) => {
@@ -3100,6 +3109,68 @@ fn complex_product(left: (f64, f64), right: (f64, f64)) -> (f64, f64) {
     )
 }
 
+/// Recover infinities as modern CPython's `_Py_c_prod` does during integer powers.
+fn complex_power_product(
+    (mut a, mut b): (f64, f64),
+    (mut c, mut d): (f64, f64),
+    python_version: PythonVersion,
+) -> (f64, f64) {
+    let (ac, bd, ad, bc) = (a * c, b * d, a * d, b * c);
+    let result = (ac - bd, ad + bc);
+    if python_version <= PythonVersion::Py313 || !result.0.is_nan() || !result.1.is_nan() {
+        return result;
+    }
+
+    let zero_nan = |value: f64| {
+        if value.is_nan() {
+            0.0_f64.copysign(value)
+        } else {
+            value
+        }
+    };
+    let boxed = |value: f64| f64::from(value.is_infinite()).copysign(value);
+    let mut recalculate = false;
+    if a.is_infinite() || b.is_infinite() {
+        (a, b, c, d) = (boxed(a), boxed(b), zero_nan(c), zero_nan(d));
+        recalculate = true;
+    }
+    if c.is_infinite() || d.is_infinite() {
+        (a, b, c, d) = (zero_nan(a), zero_nan(b), boxed(c), boxed(d));
+        recalculate = true;
+    }
+    if !recalculate && [ac, bd, ad, bc].into_iter().any(f64::is_infinite) {
+        (a, b, c, d) = (zero_nan(a), zero_nan(b), zero_nan(c), zero_nan(d));
+        recalculate = true;
+    }
+    if recalculate {
+        (
+            f64::INFINITY * (a * c - b * d),
+            f64::INFINITY * (a * d + b * c),
+        )
+    } else {
+        result
+    }
+}
+
+/// Recover signed zeros as modern CPython's `_Py_c_quot` does for a reciprocal.
+fn complex_power_reciprocal(
+    divisor: (f64, f64),
+    python_version: PythonVersion,
+) -> Option<(f64, f64)> {
+    let result = complex_quotient((1.0, 0.0), divisor, false)?;
+    if python_version >= PythonVersion::Py314
+        && result.0.is_nan()
+        && result.1.is_nan()
+        && (divisor.0.is_infinite() || divisor.1.is_infinite())
+    {
+        let x = f64::from(divisor.0.is_infinite()).copysign(divisor.0);
+        let y = f64::from(divisor.1.is_infinite()).copysign(divisor.1);
+        Some((0.0 * (x + 0.0 * y), 0.0 * (0.0 * x - y)))
+    } else {
+        Some(result)
+    }
+}
+
 fn complex_quotient(left: (f64, f64), right: (f64, f64), contract: bool) -> Option<(f64, f64)> {
     let abs_real = right.0.abs();
     let abs_imag = right.1.abs();
@@ -3228,7 +3299,11 @@ fn fold_complex_division(
     clippy::float_cmp,
     reason = "CPython checks complex exponents for exact binary64 integrality"
 )]
-fn fold_complex_power(base: &Constant, exponent: &Constant) -> Option<Constant> {
+fn fold_complex_power(
+    base: &Constant,
+    exponent: &Constant,
+    python_version: PythonVersion,
+) -> Option<Constant> {
     let base = constant_complex_parts(base)?;
     let (exponent_real, exponent_imag) = constant_complex_parts(exponent)?;
     if exponent_imag != 0.0 || exponent_real != exponent_real.floor() || exponent_real.abs() > 100.0
@@ -3257,8 +3332,20 @@ fn fold_complex_power(base: &Constant, exponent: &Constant) -> Option<Constant> 
         if phase.is_infinite() && !cfg!(target_os = "macos") {
             return None;
         }
-        let real = magnitude * phase.cos();
-        let imag = magnitude * phase.sin();
+        let component = |value: f64| {
+            // The pinned Linux x86-64 build keeps the libm result in the destination
+            // of the final multiplication, which preserves its NaN when both are NaN.
+            if cfg!(all(target_os = "linux", target_arch = "x86_64"))
+                && magnitude.is_nan()
+                && value.is_nan()
+            {
+                value
+            } else {
+                magnitude * value
+            }
+        };
+        let real = component(phase.cos());
+        let imag = component(phase.sin());
         return (!real.is_infinite() && !imag.is_infinite())
             .then_some(Constant::Complex { real, imag });
     }
@@ -3273,15 +3360,15 @@ fn fold_complex_power(base: &Constant, exponent: &Constant) -> Option<Constant> 
     let mut mask = 1_u64;
     while mask > 0 && magnitude >= mask {
         if magnitude & mask != 0 {
-            result = complex_product(result, power);
+            result = complex_power_product(result, power, python_version);
         }
         mask <<= 1;
-        power = complex_product(power, power);
+        power = complex_power_product(power, power, python_version);
     }
     if exponent < 0 {
-        result = complex_quotient((1.0, 0.0), result, false)?;
+        result = complex_power_reciprocal(result, python_version)?;
     }
-    (result.0.is_finite() && result.1.is_finite()).then_some(Constant::Complex {
+    (!result.0.is_infinite() && !result.1.is_infinite()).then_some(Constant::Complex {
         real: result.0,
         imag: result.1,
     })

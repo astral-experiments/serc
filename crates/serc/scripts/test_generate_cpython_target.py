@@ -95,6 +95,44 @@ class ReadInputsTest(unittest.TestCase):
             self.assertEqual(git(checkout, "status", "--short"), f" M {dirty_input}")
 
 
+class NumericAuthorityTest(unittest.TestCase):
+    def test_checks_root_and_nested_compiler_modules(self) -> None:
+        cases = (
+            ("const LOAD_CONST: u8 = 82;\n", "duplicates numeric opcode LOAD_CONST"),
+            ("emit(BINARY_OP, 0);\n", "duplicates a numeric target operand"),
+            ("Opcode::new(82);\n", "constructs Opcode outside the target module"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = [root / "src/compiler.rs", root / "src/compiler/expression.rs"]
+            for path in paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("")
+            with (
+                mock.patch.object(generator, "CRATE_ROOT", root),
+                mock.patch.object(
+                    generator,
+                    "parse_opcodes_from_generated_names",
+                    return_value={"LOAD_CONST"},
+                ),
+            ):
+                generator.check_numeric_authority()
+                for path in paths:
+                    for source, message in cases:
+                        with self.subTest(path=path.relative_to(root), source=source):
+                            path.write_text(source)
+                            try:
+                                with self.assertRaisesRegex(
+                                    ValueError, message
+                                ) as raised:
+                                    generator.check_numeric_authority()
+                                self.assertIn(
+                                    str(path.relative_to(root)), str(raised.exception)
+                                )
+                            finally:
+                                path.write_text("")
+
+
 class RenderPreinternedLookupTest(unittest.TestCase):
     def test_escapes_rust_string_literals(self) -> None:
         self.assertEqual(

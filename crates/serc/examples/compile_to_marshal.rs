@@ -5,14 +5,14 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use serc::compile;
+use serc::compile_bytes;
 
 fn main() -> ExitCode {
     let Some(path) = env::args_os().nth(1).map(PathBuf::from) else {
         eprintln!("usage: compile_to_marshal PATH");
         return ExitCode::from(2);
     };
-    let source = match fs_err::read_to_string(&path) {
+    let source = match fs_err::read(&path) {
         Ok(source) => source,
         Err(error) => {
             eprintln!("{}: {error}", path.display());
@@ -20,7 +20,7 @@ fn main() -> ExitCode {
         }
     };
     let filename = path.to_string_lossy();
-    let module = match compile(&source, &filename) {
+    let module = match compile_bytes(&source, &filename) {
         Ok(module) => module,
         Err(error) => {
             eprintln!("{}: {error}", path.display());
