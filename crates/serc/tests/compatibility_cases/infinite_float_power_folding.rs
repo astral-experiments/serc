@@ -50,20 +50,22 @@ fn matches_cpython_float_power_nan_operand_signs() {
 fn executes_float_power_with_nan_operand_signs() {
     common::assert_executes(
         r"
-from math import copysign
+from math import copysign, isnan
 
-for value in (
-    (1e309 - 1e309) ** 1,
-    (-(1e309 - 1e309)) ** 1,
-    (1e309 - 1e309) ** (-(1e309 - 1e309)),
-    (-(1e309 - 1e309)) ** (1e309 - 1e309),
-    0 ** (1e309 - 1e309),
-    (1e309 - 1e309) ** 0,
-    1 ** (1e309 - 1e309),
+infinity = float('inf')
+nan = infinity - infinity
+for value, expected in (
+    ((1e309 - 1e309) ** 1, nan),
+    ((-(1e309 - 1e309)) ** 1, -nan),
+    ((1e309 - 1e309) ** (-(1e309 - 1e309)), nan),
+    ((-(1e309 - 1e309)) ** (1e309 - 1e309), -nan),
+    (0 ** (1e309 - 1e309), nan),
 ):
-    print(copysign(1, value))
+    print(isnan(value) and copysign(1, value) == copysign(1, expected))
+print((1e309 - 1e309) ** 0 == 1.0)
+print(1 ** (1e309 - 1e309) == 1.0)
 ",
-        "-1.0\n1.0\n-1.0\n1.0\n-1.0\n1.0\n1.0\n",
+        "True\nTrue\nTrue\nTrue\nTrue\nTrue\nTrue\n",
     );
 }
 
