@@ -231,3 +231,31 @@ fn matches_cpython_pending_return_through_conditional_finalizer_break() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_named_handler_return_overridden_inside_iterator() {
+    for (filename, source) in [
+        (
+            "iterator_named_handler_local_return_overridden.py",
+            "def f(work, items):\n    for item in items:\n        try:\n            work()\n        except Exception as error:\n            return work\n        finally:\n            return items\n",
+        ),
+        (
+            "iterator_named_handler_constant_return_overridden.py",
+            "def f(work, items):\n    for item in items:\n        try:\n            work()\n        except Exception as error:\n            return 1\n        finally:\n            return items\n",
+        ),
+        (
+            "iterator_named_handler_bare_return_overridden.py",
+            "def f(work, items):\n    for item in items:\n        try:\n            work()\n        except Exception as error:\n            return\n        finally:\n            return items\n",
+        ),
+        (
+            "iterator_named_handler_call_return_overridden.py",
+            "def f(work, items):\n    for item in items:\n        try:\n            work()\n        except Exception as error:\n            return work(error)\n        finally:\n            return items\n",
+        ),
+        (
+            "iterator_named_handler_exception_return_overridden.py",
+            "def f(work, items):\n    for item in items:\n        try:\n            work()\n        except Exception as error:\n            return error\n        finally:\n            return items\n",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
