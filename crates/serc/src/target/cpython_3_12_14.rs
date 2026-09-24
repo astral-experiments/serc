@@ -3954,8 +3954,9 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
 ];
 
 pub(crate) fn is_preinterned_string(value: &str) -> bool {
-    is_preinterned_static_string(value)
-        || (cfg!(target_os = "linux") && STARTUP_INTERNED_STRINGS.binary_search(&value).is_ok())
+    static STARTUP: std::sync::LazyLock<rustc_hash::FxHashSet<&'static str>> =
+        std::sync::LazyLock::new(|| STARTUP_INTERNED_STRINGS.iter().copied().collect());
+    is_preinterned_static_string(value) || (cfg!(target_os = "linux") && STARTUP.contains(value))
 }
 
 fn is_preinterned_static_string(value: &str) -> bool {
