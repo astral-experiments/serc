@@ -2866,9 +2866,8 @@ fn fold_literal_subscript(
     let Expr::Slice(slice) = index else {
         unreachable!();
     };
-    if slice.step.is_some() && constant_slice(slice).is_none() {
-        return None;
-    }
+    // CPython constructs constant slices before folding their bound expressions.
+    constant_slice(slice)?;
 
     match value {
         Constant::String(value) => {
