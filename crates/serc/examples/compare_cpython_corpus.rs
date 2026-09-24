@@ -876,6 +876,9 @@ fn compile_input(
 fn capture_compiler(compile: impl FnOnce() -> Result<Vec<u8>, CompileError>) -> CompilerOutcome {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(compile)) {
         Ok(Ok(marshal)) => CompilerOutcome::Compiled(marshal),
+        Ok(Err(error @ CompileError::InvalidFilename)) => {
+            CompilerOutcome::Rejected(error.to_string())
+        }
         Ok(Err(CompileError::Unsupported(message))) => CompilerOutcome::Unsupported(message),
         Ok(Err(CompileError::Parse(error))) => CompilerOutcome::Rejected(error.to_string()),
         Ok(Err(

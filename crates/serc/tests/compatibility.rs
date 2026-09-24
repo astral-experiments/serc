@@ -151,6 +151,111 @@ def continuing_assignment(first, second):
     }
 
     #[test]
+    fn rejects_null_characters_in_filenames_before_reading_source() {
+        use serc::{
+            CompileOptions, InitialInternState, PythonVersion, SourceDecodeError,
+            compile_bytes_with_intern_state, compile_bytes_with_options, compile_with_intern_state,
+            compile_with_options,
+        };
+
+        let expected = CompileError::InvalidFilename;
+        assert_eq!(expected.to_string(), "embedded null character");
+        assert_eq!(expected.range(), None);
+        assert!(expected.source().is_none());
+
+        let initial_intern_state = InitialInternState::default();
+        let text_sources = ["pass", "if =", "\0"];
+        let byte_sources: &[&[u8]] =
+            &[b"pass", b"if =", b"\0", b"\xff", b"# coding: unknown\npass"];
+        for filename in ["\0", "\0prefix", "in\0side", "suffix\0"] {
+            for source in text_sources {
+                assert_eq!(compile(source, filename).unwrap_err(), expected);
+                assert_eq!(compile_to_pyc(source, filename, 0).unwrap_err(), expected);
+                assert_eq!(
+                    compile_with_intern_state(source, filename, &initial_intern_state).unwrap_err(),
+                    expected
+                );
+            }
+            for &source in byte_sources {
+                assert_eq!(compile_bytes(source, filename).unwrap_err(), expected);
+                assert_eq!(
+                    compile_bytes_to_pyc(source, filename, 0).unwrap_err(),
+                    expected
+                );
+                assert_eq!(
+                    compile_bytes_with_intern_state(source, filename, &initial_intern_state)
+                        .unwrap_err(),
+                    expected
+                );
+            }
+            for python_version in [
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ] {
+                let options = CompileOptions {
+                    python_version,
+                    ..CompileOptions::default()
+                };
+                for source in text_sources {
+                    assert_eq!(
+                        compile_with_options(source, filename, &options).unwrap_err(),
+                        expected
+                    );
+                }
+                for &source in byte_sources {
+                    assert_eq!(
+                        compile_bytes_with_options(source, filename, &options).unwrap_err(),
+                        expected
+                    );
+                }
+            }
+        }
+
+        for filename in [
+            "",
+            "plain.py",
+            "literal\\0.py",
+            "near␀nul.py",
+            "folder\nname.py",
+        ] {
+            assert_matches_cpython_marshal("pass", filename);
+            assert_matches_cpython_marshal_bytes(b"pass", filename);
+        }
+        assert!(matches!(
+            compile("if =", "normal.py"),
+            Err(CompileError::Parse(_))
+        ));
+        assert_eq!(
+            compile_bytes(b"\0", "normal.py").unwrap_err(),
+            CompileError::Decode(SourceDecodeError::NullByte)
+        );
+
+        let oracle = super::common::python_3145_command()
+            .args([
+                "-c",
+                r##"
+for filename in ["\0", "\0prefix", "in\0side", "suffix\0"]:
+    for source in ["pass", "if =", "\0", b"pass", b"if =", b"\0", b"\xff", b"# coding: unknown\npass"]:
+        try:
+            compile(source, filename, "exec")
+        except ValueError as error:
+            assert str(error) == "embedded null character", str(error)
+        else:
+            raise AssertionError((filename, source))
+"##,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            oracle.status.success(),
+            "{}",
+            String::from_utf8_lossy(&oracle.stderr)
+        );
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_supported_source_encodings() {
         let cases: [(&str, &[u8]); 9] = [
             ("latin_1.py", b"# coding: latin-1\nvalue = '\xe9'\n"),
