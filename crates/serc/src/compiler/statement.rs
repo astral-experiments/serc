@@ -24721,7 +24721,9 @@ impl<'source> Compiler<'source> {
                         || (matches!(self.unit.scope, Scope::Function { .. })
                             && matches!(self.control.loops.contexts.as_slice(), [iterator]
                                 if iterator.iterator_cleanup == IteratorCleanup::Sync)
-                            && supports_loop_break_terminating_finally_returns(statement)))))
+                            && (supports_loop_break_terminating_finally_returns(statement)
+                                || (self.context.python_version >= crate::PythonVersion::Py314
+                                    && supports_handler_terminating_finally_returns(statement)))))))
         {
             return self.with_control_override(
                 |control| &mut control.finally.copies_terminating_finally_returns,
@@ -33226,6 +33228,42 @@ fn supports_direct_terminating_finally_returns(statement: &ruff_python_ast::Stmt
                     && !expression_suspends_current_scope(value)
             })
         })
+}
+
+/// Copies a named handler's pending return before an enclosing iterator is discarded.
+fn supports_handler_terminating_finally_returns(statement: &ruff_python_ast::StmtTry) -> bool {
+    let [Stmt::Expr(body)] = statement.body.as_slice() else {
+        return false;
+    };
+    let [handler] = statement.handlers.as_slice() else {
+        return false;
+    };
+    let Some(handler) = handler.as_except_handler() else {
+        return false;
+    };
+    let [Stmt::Return(pending)] = handler.body.as_slice() else {
+        return false;
+    };
+    let [Stmt::Return(finalizer)] = statement.finalbody.as_slice() else {
+        return false;
+    };
+    !statement.is_star
+        && statement.orelse.is_empty()
+        && handler.name.is_some()
+        && handler
+            .type_
+            .as_deref()
+            .is_some_and(|value| matches!(value, Expr::Name(_)))
+        && matches!(body.value.as_ref(), Expr::Call(_))
+        && !expression_contains_inline_branch(&body.value)
+        && !expression_suspends_current_scope(&body.value)
+        && pending.value.as_deref().is_none_or(|value| {
+            !expression_contains_inline_branch(value) && !expression_suspends_current_scope(value)
+        })
+        && finalizer
+            .value
+            .as_deref()
+            .is_some_and(|value| matches!(value, Expr::Name(_)))
 }
 
 /// Keeps a pending return live until a finalizer's conditional break or return.
