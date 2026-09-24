@@ -26,10 +26,10 @@ resources. Ruff's dependencies, lockfile, and clean submodule must all match rev
 
 | CPython | Byte-identical accepted | CPython-rejected | Matched rejections | Serc accepted | Compiler failures |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 3.12.14 | 2,174 | 277 | 264 | 11 | 2 |
-| 3.13.15 | 2,193 | 258 | 251 | 5 | 2 |
-| 3.14.5 | 2,230 | 221 | 214 | 5 | 2 |
-| 3.15.0rc2 | 2,249 | 202 | 196 | 4 | 2 |
+| 3.12.14 | 2,174 | 277 | 266 | 9 | 2 |
+| 3.13.15 | 2,193 | 258 | 253 | 3 | 2 |
+| 3.14.5 | 2,230 | 221 | 216 | 3 | 2 |
+| 3.15.0rc2 | 2,249 | 202 | 198 | 2 | 2 |
 
 The last three columns partition CPython-rejected inputs and expose existing rejection
 discrepancies. All other failure categories must be zero. Every accepted input must match
