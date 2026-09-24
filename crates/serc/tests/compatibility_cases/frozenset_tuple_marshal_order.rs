@@ -26,6 +26,42 @@ fn matches_cpython_frozenset_tuple_marshal_order() {
 }
 
 #[test]
+fn matches_cpython_frozenset_scalar_explicit_intern_marshal_order() {
+    for (class, parameter) in [
+        ("公", "š"),
+        ("š", "公"),
+        ("name", "公"),
+        ("公", "é"),
+        ("𐐀", "Ω"),
+    ] {
+        for members in [
+            format!("'{parameter}', '{class}'"),
+            format!("'{class}', '{parameter}'"),
+            format!("'{parameter}', '{class}', 'Ӝ', 'plain', 'with-hyphen'"),
+        ] {
+            for prefix in [String::new(), format!("before = '{parameter}'\n")] {
+                let source = format!(
+                    "{prefix}class {class}:\n    def _thing(self, {parameter}):\n        return {parameter} in {{{members}}}\n"
+                );
+                common::assert_matches_cpython_marshal(
+                    &source,
+                    "frozenset_scalar_explicit_intern_order.py",
+                );
+            }
+        }
+    }
+    for source in [
+        "class 公:\n    def contains(self, value):\n        return value in {'š', '公'}\n",
+        "def contains(value):\n    return value in {'š', '公'}\n",
+    ] {
+        common::assert_matches_cpython_marshal(
+            source,
+            "frozenset_scalar_explicit_intern_controls.py",
+        );
+    }
+}
+
+#[test]
 fn matches_cpython_frozenset_startup_string_identity() {
     for member in ["error", "missing", "other", "timestamp", "u7", "unknown"] {
         let source = format!(
