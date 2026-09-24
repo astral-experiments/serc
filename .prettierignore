@@ -1,0 +1,10 @@
+# Local build output and vendored sources.
+/.venv/
+/target/
+/vendor/
+
+# Generated corpus data and CPython fixtures.
+/corpora/mypy-primer.lock.json
+/corpora/results/
+/crates/serc/scripts/target_metadata/*.json
+/crates/serc/tests/compatibility_cases/fixtures/
