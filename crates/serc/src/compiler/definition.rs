@@ -1500,10 +1500,7 @@ impl Compiler<'_> {
         let mut references = ReferenceCollector::default();
         references.visit_expr(expression);
         let can_see_class_scope = matches!(self.unit.scope, Scope::Class { .. })
-            || self
-                .symbols
-                .free_names
-                .contains(&self.required_name_id("__classdict__"));
+            || self.unit.annotation_classdict_index.is_some();
         let mut local_names = if self.has_deferred_annotations() {
             vec![".format".to_string()]
         } else {
@@ -1741,10 +1738,7 @@ impl Compiler<'_> {
         }
         let can_see_class_scope = self.unit.flags & CO_FUTURE_ANNOTATIONS == 0
             && (matches!(self.unit.scope, Scope::Class { .. })
-                || self
-                    .symbols
-                    .free_names
-                    .contains(&self.required_name_id("__classdict__")));
+                || self.unit.annotation_classdict_index.is_some());
         if can_see_class_scope {
             let classdict = self.required_name_id("__classdict__");
             self.insert_lexical_name(&mut freevars, classdict);

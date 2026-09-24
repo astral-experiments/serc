@@ -145,3 +145,90 @@ fn class_bound_type_parameters_preserve_nested_annotation_captures() {
         "True\nTrue\nTrue\n",
     );
 }
+
+#[test]
+fn explicit_synthetic_class_names_keep_enclosing_and_nested_cells_separate() {
+    for name in ["__classdict__", "__conditional_annotations__"] {
+        for body in [
+            format!("value = {name}"),
+            format!("def method(self): return {name}"),
+            format!("value = {name}\n        def method(self): return {name}"),
+            format!("method = lambda: {name}"),
+            format!("value = ({name} for _ in (1,))"),
+            format!("def method(self):\n            type Alias = {name}\n            return Alias"),
+            format!("class Inner:\n            value = {name}"),
+        ] {
+            for enclosing in [false, true] {
+                let source = if enclosing {
+                    format!(
+                        "def outer():\n    {name} = 42\n    class C:\n        {body}\n    return C\n"
+                    )
+                } else {
+                    format!("class C:\n    {}\n", body.replace("\n    ", "\n"))
+                };
+                common::assert_matches_cpython_marshal(
+                    &source,
+                    "explicit_synthetic_class_cells.py",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn explicit_synthetic_class_names_execute_in_their_native_scopes() {
+    let source = r"
+def outer():
+    __classdict__ = 'dictionary from outer'
+    __conditional_annotations__ = 'conditional from outer'
+    class C:
+        dictionary = __classdict__
+        conditional = __conditional_annotations__
+        def dictionary_from_method(self):
+            return __classdict__
+        def conditional_from_method(self):
+            return __conditional_annotations__
+        def alias(self):
+            type Alias = __classdict__
+            return Alias.__value__
+    return C
+C = outer()
+print(C.dictionary, C.conditional)
+print(C().dictionary_from_method()['dictionary'])
+print(C().conditional_from_method())
+print(C().alias()['conditional'])
+";
+    common::assert_matches_cpython_marshal(source, "execute_explicit_synthetic_class_cells.py");
+    common::assert_executes(
+        source,
+        "dictionary from outer conditional from outer\ndictionary from outer\nset()\nconditional from outer\n",
+    );
+}
+
+#[test]
+fn compiler_generated_class_stores_follow_enclosing_free_classifications() {
+    for name in [
+        "__module__",
+        "__qualname__",
+        "__firstlineno__",
+        "__doc__",
+        "__static_attributes__",
+        "__classdictcell__",
+        "__annotations__",
+    ] {
+        for setup in ["", "        'Class docstring'\n", "        field: int\n"] {
+            let source = format!(
+                "def outer():\n    {name} = 'enclosing'\n    class C:\n{setup}        observed = {name}\n    return C, {name}\n"
+            );
+            common::assert_matches_cpython_marshal(&source, "generated_class_closure_store.py");
+            if name == "__annotations__" {
+                common::assert_matches_cpython_marshal(
+                    &format!("from __future__ import annotations\n{source}"),
+                    "generated_postponed_class_annotation_mapping.py",
+                );
+            }
+        }
+    }
+    let source = "def outer():\n    __firstlineno__ = 42\n    class C:\n        observed = __firstlineno__\n    return C, __firstlineno__\nC, cell = outer()\nprint(C.observed, cell, '__firstlineno__' in vars(C))\n";
+    common::assert_executes(source, "3 3 False\n");
+}
