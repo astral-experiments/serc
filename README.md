@@ -2,9 +2,11 @@
 
 An experimental CPython bytecode compiler, written in Rust.
 
-> [!WARNING] Serc is experimental. All code changes, PR summaries, and
-> additional documentation were authored entirely by GPT-6 Astra in Codex. Use
-> at your own risk.
+> [!WARNING]
+>
+> Serc is experimental. All code changes, PR summaries, and additional
+> documentation were authored entirely by GPT-6 Astra in Codex. Use at your own
+> risk.
 
 ## Highlights
 
@@ -24,7 +26,7 @@ Python code, including [Django](https://github.com/django/django),
 | NumPy 2.4.6 (505 files) | 1.194 s ± 0.023 s |           1.739 s ± 0.060 s |   1.46× |
 
 However, Serc is also experimental, and so may emit incorrect bytecode in some
-cases.
+cases!
 
 ## Installation
 
