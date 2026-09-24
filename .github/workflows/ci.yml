@@ -255,6 +255,9 @@ jobs:
       CARGO_TERM_COLOR: always
       RUSTUP_MAX_RETRIES: 10
     steps:
+      - name: Enable long paths for Ruff's Git checkout
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false

@@ -62,6 +62,9 @@ jobs:
           - { target: i686-pc-windows-msvc, runner: windows-2025, python-arch: x86 }
           - { target: aarch64-pc-windows-msvc, runner: windows-11-arm, python-arch: arm64 }
     steps:
+      - name: Enable long paths for Ruff's Git checkout
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -95,8 +98,8 @@ jobs:
           - { target: x86_64-unknown-linux-gnu, manylinux: "2_17", test: true }
           - { target: i686-unknown-linux-gnu, manylinux: "2_17" }
           - { target: aarch64-unknown-linux-gnu, manylinux: "2_28" }
-          - { target: armv7-unknown-linux-gnueabihf, manylinux: "2_17" }
-          - { target: powerpc64le-unknown-linux-gnu, manylinux: "2_17" }
+          - { target: armv7-unknown-linux-gnueabihf, manylinux: "2_17", zig: true }
+          - { target: powerpc64le-unknown-linux-gnu, manylinux: "2_17", zig: true }
           - { target: s390x-unknown-linux-gnu, manylinux: "2_17" }
           - { target: riscv64gc-unknown-linux-gnu, manylinux: "2_31" }
           - { target: x86_64-unknown-linux-musl, manylinux: musllinux_1_1 }
@@ -119,7 +122,14 @@ jobs:
           sccache: false
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
+          # The old cross GCC images cannot compile mimalloc's date-time warning flag.
+          zig: ${{ matrix.zig || false }}
           args: --release --locked --out dist --compatibility pypi
+          before-script-linux: |
+            if [[ "${{ matrix.target }}" == "s390x-unknown-linux-gnu" ]]; then
+              # psm uses long-displacement instructions; match Rust's z10 baseline.
+              export CFLAGS_s390x_unknown_linux_gnu="-march=z10"
+            fi
       - name: Test installed wheel
         if: matrix.test
         run: python scripts/test-release-wheel.py dist
