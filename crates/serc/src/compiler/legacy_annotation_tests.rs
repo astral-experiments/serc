@@ -27,6 +27,96 @@ fn child<'a>(code: &'a CodeObject, name: &str) -> &'a CodeObject {
 }
 
 #[test]
+fn legacy_ast_folds_boolean_inversion_inside_literal_subscripts() {
+    for version in [PythonVersion::Py312, PythonVersion::Py313] {
+        for (expression, expected) in [
+            (r#""abc"[~False]"#, "'c'"),
+            (r#""abc"[~True]"#, "'b'"),
+            (r#"b"abc"[~False]"#, "99"),
+            ("(10, 20, 30)[~False]", "30"),
+            ("(10, 20, 30)[-~False]", "20"),
+            (r#""abc"[~(True & False)]"#, "'c'"),
+            (r#""abc"[(1, ~False)[1]]"#, "'c'"),
+        ] {
+            assert_folded_expression(version, expression, expected);
+        }
+    }
+    for version in [PythonVersion::Py314, PythonVersion::Py315] {
+        let actual = compile(r#"result = "abc"[~False]"#, version);
+        let folded = compile("result = 'c'", version);
+        assert_ne!(actual.bytecode, folded.bytecode, "{version:?}");
+    }
+}
+
+#[test]
+fn legacy_ast_folds_logical_not_after_folding_its_operand() {
+    for version in [PythonVersion::Py312, PythonVersion::Py313] {
+        for (expression, expected) in [
+            ("not (1 + 2)", "False"),
+            ("not (-1)", "False"),
+            ("not ~0", "False"),
+            ("not +True", "False"),
+            ("not ~False", "False"),
+            ("not (~False + 1)", "True"),
+            ("not not ~True", "True"),
+            (r#"not "abc"[~False]"#, "False"),
+            ("not (True,)[~False]", "False"),
+        ] {
+            assert_folded_expression(version, expression, expected);
+        }
+    }
+    for version in [PythonVersion::Py314, PythonVersion::Py315] {
+        for (expression, expected) in [("not (1 + 2)", "False"), ("not ~False", "False")] {
+            let actual = compile(&format!("result = {expression}"), version);
+            let folded = compile(&format!("result = {expected}"), version);
+            assert_ne!(
+                actual.bytecode, folded.bytecode,
+                "{version:?}: {expression}"
+            );
+        }
+    }
+}
+
+fn assert_folded_expression(version: PythonVersion, expression: &str, expected: &str) {
+    let options = [
+        (
+            format!("result = {expression}"),
+            format!("result = {expected}"),
+            false,
+        ),
+        (
+            format!("def f():\n    return {expression}"),
+            format!("def f():\n    return {expected}"),
+            true,
+        ),
+    ];
+    for (actual, expected, function) in options {
+        let actual = compile(&actual, version);
+        let expected = compile(&expected, version);
+        let (actual, expected) = if function {
+            (child(&actual, "f"), child(&expected, "f"))
+        } else {
+            (&actual, &expected)
+        };
+        assert_eq!(
+            actual.bytecode, expected.bytecode,
+            "{version:?}: {expression}"
+        );
+        assert_eq!(actual.constants.len(), expected.constants.len());
+        assert!(
+            actual
+                .constants
+                .iter()
+                .zip(&expected.constants)
+                .all(|(actual, expected)| {
+                    super::constant::python_constant_values_equal(actual, expected)
+                }),
+            "{version:?}: {expression}"
+        );
+    }
+}
+
+#[test]
 fn legacy_class_comprehensions_reserve_nested_free_captures() {
     for version in [PythonVersion::Py312, PythonVersion::Py313] {
         for (source, expected) in [
