@@ -17,13 +17,31 @@ use crate::{CompileError, PythonVersion};
 use super::statement::suite_contains_yield_in_function_scope;
 use super::symbol::mangle_name;
 
+#[cfg(test)]
+mod declaration_tests;
+mod declarations;
+
 /// Validate AST-based syntax restrictions using Ruff's shared checker.
 pub(crate) fn validate(
     source: &str,
     body: &[Stmt],
     python_version: PythonVersion,
 ) -> Result<(), CompileError> {
-    validate_with_statement_pruning::<true>(source, body, python_version)
+    validate_with_statement_pruning::<true>(source, body, python_version)?;
+    validate_declarations(source, body, python_version)
+}
+
+fn validate_declarations(
+    source: &str,
+    body: &[Stmt],
+    python_version: PythonVersion,
+) -> Result<(), CompileError> {
+    // Keywords cannot be escaped or normalized into their ASCII spellings. Avoid walking modules
+    // without a possible declaration; strings and comments merely cause a harmless extra walk.
+    if source.contains("global") || source.contains("nonlocal") {
+        declarations::validate(body, python_version)?;
+    }
+    Ok(())
 }
 
 fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
@@ -62,7 +80,8 @@ fn validate_without_statement_pruning(
     body: &[Stmt],
     python_version: PythonVersion,
 ) -> Result<(), CompileError> {
-    validate_with_statement_pruning::<false>(source, body, python_version)
+    validate_with_statement_pruning::<false>(source, body, python_version)?;
+    validate_declarations(source, body, python_version)
 }
 
 #[derive(Clone, Copy)]
@@ -755,6 +774,14 @@ impl<const PRUNE_STATEMENTS: bool> SemanticSyntaxContext for Validator<'_, '_, P
 
     fn report_semantic_error(&self, error: SemanticSyntaxError) {
         use SemanticSyntaxErrorKind as Kind;
+        // The declaration pass checks complete symbol histories and places errors on the full
+        // CPython statement, including parameters and module-level nonlocals.
+        if matches!(
+            error.kind,
+            Kind::GlobalParameter(_) | Kind::NonlocalDeclarationAtModuleLevel
+        ) {
+            return;
+        }
         if let Kind::InvalidExpression(kind, _) = &error.kind
             && self.escapes_annotation_scope(error.range, kind)
         {
