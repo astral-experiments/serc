@@ -3,8 +3,8 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 
-use ruff_python_ast::visitor::{Visitor, walk_expr, walk_parameters, walk_stmt};
-use ruff_python_ast::{self as ast, Expr, Stmt};
+use ruff_python_ast::visitor::{Visitor, walk_expr, walk_parameters, walk_pattern, walk_stmt};
+use ruff_python_ast::{self as ast, Expr, Pattern, Stmt};
 use ruff_python_parser::semantic_errors::{
     AwaitOutsideAsyncFunctionKind, InvalidExpressionKind, LazyImportContext, SemanticSyntaxChecker,
     SemanticSyntaxContext, SemanticSyntaxError, SemanticSyntaxErrorKind,
@@ -27,8 +27,7 @@ pub(crate) fn validate(
     body: &[Stmt],
     python_version: PythonVersion,
 ) -> Result<(), CompileError> {
-    validate_with_statement_pruning::<true>(source, body, python_version)?;
-    validate_declarations(source, body, python_version)
+    validate_with_statement_pruning::<true>(source, body, python_version)
 }
 
 fn validate_declarations(
@@ -53,6 +52,8 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         checker: SemanticSyntaxChecker::new(),
         checker_prefix: CheckerPrefix::Initial,
         error: RefCell::new(None),
+        pending_pattern: None,
+        lowering_pattern_error: false,
         source,
         body,
         python_version: match python_version {
@@ -71,7 +72,16 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         scopes: vec![Scope::new(ScopeKind::Module)],
     };
     validator.visit_body(body);
-    validator.error.into_inner().map_or(Ok(()), Err)
+    let lowering_pattern_error = validator.lowering_pattern_error;
+    let result = validator.error.into_inner().map_or(Ok(()), Err);
+    // CPython resolves declarations in the symbol table before lowering match patterns. Other
+    // errors from the shared checker retain their existing precedence over declarations.
+    if lowering_pattern_error {
+        validate_declarations(source, body, python_version)?;
+        return result;
+    }
+    result?;
+    validate_declarations(source, body, python_version)
 }
 
 #[cfg(test)]
@@ -80,8 +90,7 @@ fn validate_without_statement_pruning(
     body: &[Stmt],
     python_version: PythonVersion,
 ) -> Result<(), CompileError> {
-    validate_with_statement_pruning::<false>(source, body, python_version)?;
-    validate_declarations(source, body, python_version)
+    validate_with_statement_pruning::<false>(source, body, python_version)
 }
 
 #[derive(Clone, Copy)]
@@ -128,6 +137,8 @@ struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool> {
     checker: SemanticSyntaxChecker,
     checker_prefix: CheckerPrefix,
     error: RefCell<Option<CompileError>>,
+    pending_pattern: Option<PendingPattern<'ast>>,
+    lowering_pattern_error: bool,
     source: &'source str,
     body: &'ast [Stmt],
     python_version: ast::PythonVersion,
@@ -135,6 +146,153 @@ struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool> {
     private_name: Option<&'ast str>,
     mangled_names: Option<FxHashSet<&'ast str>>,
     scopes: Vec<Scope<'ast>>,
+}
+
+struct PendingPattern<'ast> {
+    statement: &'ast ast::StmtMatch,
+    pattern: ast::IrrefutablePattern,
+}
+
+impl PendingPattern<'_> {
+    /// Preserve pattern errors CPython checks before reaching the irrefutable token.
+    fn prefers(&self, error: &SemanticSyntaxError) -> bool {
+        use SemanticSyntaxErrorKind as Kind;
+        match &error.kind {
+            // Binding a reserved name is rejected by the symbol table before any pattern lowering.
+            Kind::WriteToDebug(_) => true,
+            Kind::IrrefutableCasePattern(_) => false,
+            Kind::MultipleCaseAssignment(_) => error.range.start() < self.pattern.range.start(),
+            Kind::MultipleStarredNamesInSequencePattern
+            | Kind::DuplicateMatchKey(_)
+            | Kind::DuplicateMatchClassAttribute(_) => {
+                error.range.start() < self.pattern.range.start()
+                    || self.statement.cases.iter().any(|case| {
+                        pattern_preflight_contains(&case.pattern, self.pattern.range, error)
+                    })
+            }
+            Kind::DifferentMatchPatternBindings => {
+                if !error.range.contains_range(self.pattern.range) {
+                    return error.range.end() <= self.pattern.range.start();
+                }
+                self.statement.cases.iter().any(|case| {
+                    let Some(pattern) = find_or_pattern(&case.pattern, error.range) else {
+                        return false;
+                    };
+                    let Some((first, rest)) = pattern.patterns.split_first() else {
+                        return false;
+                    };
+                    let first_names = pattern_capture_names(first);
+                    rest.iter()
+                        .find(|arm| pattern_capture_names(arm) != first_names)
+                        .is_some_and(|arm| arm.range().end() <= self.pattern.range.start())
+                })
+            }
+            _ => true,
+        }
+    }
+}
+
+fn pattern_preflight_contains(
+    root: &Pattern,
+    candidate: TextRange,
+    error: &SemanticSyntaxError,
+) -> bool {
+    struct Finder<'a> {
+        candidate: TextRange,
+        error: &'a SemanticSyntaxError,
+        found: bool,
+    }
+    impl<'ast> Visitor<'ast> for Finder<'_> {
+        fn visit_pattern(&mut self, pattern: &'ast Pattern) {
+            use SemanticSyntaxErrorKind as Kind;
+
+            if self.found || !pattern.range().contains_range(self.candidate) {
+                return;
+            }
+            self.found = match (pattern, &self.error.kind) {
+                (Pattern::MatchSequence(pattern), Kind::MultipleStarredNamesInSequencePattern) => {
+                    pattern
+                        .patterns
+                        .iter()
+                        .filter(|pattern| pattern.is_match_star())
+                        .skip(1)
+                        .any(|pattern| pattern.range() == self.error.range)
+                }
+                (Pattern::MatchMapping(pattern), Kind::DuplicateMatchKey(_)) => pattern
+                    .keys
+                    .iter()
+                    .any(|key| key.range() == self.error.range),
+                (Pattern::MatchClass(pattern), Kind::DuplicateMatchClassAttribute(_)) => pattern
+                    .arguments
+                    .keywords
+                    .iter()
+                    .any(|keyword| keyword.attr.range == self.error.range),
+                _ => false,
+            };
+            if !self.found {
+                walk_pattern(self, pattern);
+            }
+        }
+    }
+    let mut finder = Finder {
+        candidate,
+        error,
+        found: false,
+    };
+    finder.visit_pattern(root);
+    finder.found
+}
+
+fn find_or_pattern(root: &Pattern, range: TextRange) -> Option<&ast::PatternMatchOr> {
+    struct Finder<'ast> {
+        range: TextRange,
+        found: Option<&'ast ast::PatternMatchOr>,
+    }
+    impl<'ast> Visitor<'ast> for Finder<'ast> {
+        fn visit_pattern(&mut self, pattern: &'ast Pattern) {
+            if self.found.is_some() || !pattern.range().contains_range(self.range) {
+                return;
+            }
+            if let Pattern::MatchOr(pattern) = pattern
+                && pattern.range == self.range
+            {
+                self.found = Some(pattern);
+            } else {
+                walk_pattern(self, pattern);
+            }
+        }
+    }
+    let mut finder = Finder { range, found: None };
+    finder.visit_pattern(root);
+    finder.found
+}
+
+fn pattern_capture_names(pattern: &Pattern) -> FxHashSet<&str> {
+    #[derive(Default)]
+    struct CaptureNames<'ast>(FxHashSet<&'ast str>);
+    impl<'ast> Visitor<'ast> for CaptureNames<'ast> {
+        fn visit_pattern(&mut self, pattern: &'ast Pattern) {
+            if let Pattern::MatchOr(pattern) = pattern {
+                if let Some(first) = pattern.patterns.first() {
+                    self.visit_pattern(first);
+                }
+                return;
+            }
+            let name = match pattern {
+                Pattern::MatchAs(pattern) => pattern.name.as_ref(),
+                Pattern::MatchStar(pattern) => pattern.name.as_ref(),
+                Pattern::MatchMapping(pattern) => pattern.rest.as_ref(),
+                _ => None,
+            };
+            if let Some(name) = name {
+                self.0.insert(name.as_str());
+            }
+            walk_pattern(self, pattern);
+        }
+    }
+    let mut names = CaptureNames::default();
+    names.visit_pattern(pattern);
+    names.0
 }
 
 impl<'ast, const PRUNE_STATEMENTS: bool> Validator<'_, 'ast, PRUNE_STATEMENTS> {
@@ -157,6 +315,16 @@ impl<'ast, const PRUNE_STATEMENTS: bool> Validator<'_, 'ast, PRUNE_STATEMENTS> {
                 "'break', 'continue' and 'return' cannot appear in an except* block",
                 statement.range(),
             ));
+        }
+    }
+
+    fn defer_pattern_reachability(&mut self, statement: &'ast ast::StmtMatch) {
+        for (index, case) in statement.cases.iter().enumerate() {
+            let allow_irrefutable = case.guard.is_some() || index + 1 == statement.cases.len();
+            if let Some(pattern) = unreachable_pattern(&case.pattern, allow_irrefutable) {
+                self.pending_pattern = Some(PendingPattern { statement, pattern });
+                return;
+            }
         }
     }
 
@@ -386,6 +554,54 @@ impl<'ast, const PRUNE_STATEMENTS: bool> Validator<'_, 'ast, PRUNE_STATEMENTS> {
     }
 }
 
+/// Follow CPython's pattern walk: structural subpatterns can match anything, but only the final
+/// arm of an OR pattern may do so, and only when its enclosing pattern permits it.
+fn unreachable_pattern(
+    pattern: &Pattern,
+    allow_irrefutable: bool,
+) -> Option<ast::IrrefutablePattern> {
+    match pattern {
+        Pattern::MatchAs(as_pattern) => match &as_pattern.pattern {
+            Some(pattern) => unreachable_pattern(pattern, allow_irrefutable),
+            None if !allow_irrefutable => pattern.irrefutable_pattern(),
+            None => None,
+        },
+        Pattern::MatchOr(pattern) => {
+            pattern
+                .patterns
+                .iter()
+                .enumerate()
+                .find_map(|(index, arm)| {
+                    unreachable_pattern(
+                        arm,
+                        allow_irrefutable && index + 1 == pattern.patterns.len(),
+                    )
+                })
+        }
+        Pattern::MatchSequence(pattern) => pattern
+            .patterns
+            .iter()
+            .find_map(|pattern| unreachable_pattern(pattern, true)),
+        Pattern::MatchMapping(pattern) => pattern
+            .patterns
+            .iter()
+            .find_map(|pattern| unreachable_pattern(pattern, true)),
+        Pattern::MatchClass(pattern) => pattern
+            .arguments
+            .patterns
+            .iter()
+            .chain(
+                pattern
+                    .arguments
+                    .keywords
+                    .iter()
+                    .map(|keyword| &keyword.pattern),
+            )
+            .find_map(|pattern| unreachable_pattern(pattern, true)),
+        Pattern::MatchValue(_) | Pattern::MatchSingleton(_) | Pattern::MatchStar(_) => None,
+    }
+}
+
 impl<'ast, const PRUNE_STATEMENTS: bool> Visitor<'ast> for Validator<'_, 'ast, PRUNE_STATEMENTS> {
     fn visit_stmt(&mut self, statement: &'ast Stmt) {
         if self.error.borrow().is_some() {
@@ -417,6 +633,11 @@ impl<'ast, const PRUNE_STATEMENTS: bool> Visitor<'ast> for Validator<'_, 'ast, P
             self.reject_except_star_transfer(statement);
             return;
         }
+        // Ruff checks reachability across whole cases but does not reject unreachable arms of an
+        // OR pattern. Walk both boundaries in CPython's order before checking binding differences.
+        if let Stmt::Match(statement) = statement {
+            self.defer_pattern_reachability(statement);
+        }
         // Relative imports of a module named __future__ are ordinary imports. The shared
         // checker identifies directives by their module spelling, so hide that spelling here.
         if self.statement_needs_checker(statement) {
@@ -432,6 +653,24 @@ impl<'ast, const PRUNE_STATEMENTS: bool> Visitor<'ast> for Validator<'_, 'ast, P
             } else {
                 self.with_checker(|checker, context| checker.visit_stmt(statement, context));
             }
+        }
+        if let Some(pending) = self.pending_pattern.take() {
+            if self.error.borrow().is_none() {
+                self.lowering_pattern_error = true;
+                let message = match pending.pattern.kind {
+                    ast::IrrefutablePatternKind::Name(name) => {
+                        format!("name capture '{name}' makes remaining patterns unreachable")
+                    }
+                    ast::IrrefutablePatternKind::Wildcard => {
+                        "wildcard makes remaining patterns unreachable".to_owned()
+                    }
+                };
+                *self.error.borrow_mut() = Some(CompileError::InvalidPattern {
+                    message,
+                    range: pending.pattern.range,
+                });
+            }
+            return;
         }
         match statement {
             Stmt::FunctionDef(function) => {
@@ -782,13 +1021,22 @@ impl<const PRUNE_STATEMENTS: bool> SemanticSyntaxContext for Validator<'_, '_, P
         ) {
             return;
         }
+        if let Some(pending) = &self.pending_pattern
+            && !pending.prefers(&error)
+        {
+            return;
+        }
         if let Kind::InvalidExpression(kind, _) = &error.kind
             && self.escapes_annotation_scope(error.range, kind)
         {
             return;
         }
         let mut reported = self.error.borrow_mut();
-        if reported.is_some() {
+        if reported.is_some()
+            && !(self.pending_pattern.is_some()
+                && matches!(error.kind, Kind::WriteToDebug(_))
+                && !matches!(*reported, Some(CompileError::InvalidSyntax { .. })))
+        {
             return;
         }
         // Preserve the existing public diagnostics for checks previously performed in lowering.
