@@ -2421,6 +2421,7 @@ impl OptimizationPipeline {
             .unwrap_or(0);
         let mut unsafe_high_locals = vec![true; local_count.saturating_sub(64)];
         let order = self.graph.order().to_vec();
+        let mut has_checked_load = false;
         for block in order {
             unsafe_high_locals.fill(true);
             for instruction in self.graph.instructions_mut(block) {
@@ -2430,7 +2431,11 @@ impl OptimizationPipeline {
                     &mut unsafe_locals,
                     &mut unsafe_high_locals,
                 );
+                has_checked_load |= instruction.opcode == LOAD_FAST_CHECK;
             }
+        }
+        if has_checked_load {
+            self.graph.record_checked_fast_load();
         }
     }
 
@@ -2511,7 +2516,7 @@ impl OptimizationPipeline {
         parameter_count: usize,
         nop_donors: &LocalNopDonors,
     ) {
-        self.add_checks_for_uninitialized_loads_in_arrays(
+        self.add_checks_for_uninitialized_loads_in_arrays::<true>(
             local_count,
             parameter_count,
             None,
@@ -2526,7 +2531,7 @@ impl OptimizationPipeline {
         parameter_count: usize,
         original_arrays: &FxHashMap<BasicBlockId, usize>,
     ) {
-        self.add_checks_for_uninitialized_loads_in_arrays(
+        self.add_checks_for_uninitialized_loads_in_arrays::<false>(
             local_count,
             parameter_count,
             Some(original_arrays),
@@ -2534,7 +2539,72 @@ impl OptimizationPipeline {
         );
     }
 
-    fn add_checks_for_uninitialized_loads_in_arrays(
+    /// Proves that the full dataflow cannot change a local load in any physical block.
+    fn local_loads_are_known_initialized(
+        &self,
+        local_count: usize,
+        parameter_count: usize,
+    ) -> bool {
+        if self.python_version != crate::PythonVersion::Py314
+            || local_count > 64
+            || self.graph.features().has_checked_fast_load()
+        {
+            return false;
+        }
+        let parameter_count = parameter_count.min(local_count);
+        let parameters = !u64::MAX
+            .checked_shl(u32::try_from(parameter_count).unwrap())
+            .unwrap_or(0);
+        for (_, block) in self.graph.iter() {
+            let mut initialized = parameters;
+            for item in block.items() {
+                let Item::Instruction(instruction) = item else {
+                    continue;
+                };
+                let opcode = instruction.opcode;
+                if !matches!(
+                    opcode,
+                    LOAD_FAST | LOAD_FAST_CHECK | STORE_FAST | DELETE_FAST | LOAD_FAST_AND_CLEAR
+                ) {
+                    continue;
+                }
+                if opcode == LOAD_FAST_CHECK
+                    || (opcode == STORE_FAST && instruction.local_policy.may_store_null())
+                {
+                    return false;
+                }
+                let Operand::Value(local) = instruction.operand() else {
+                    continue;
+                };
+                let Ok(local) = usize::try_from(local) else {
+                    continue;
+                };
+                if local >= local_count {
+                    continue;
+                }
+                let bit = 1_u64 << local;
+                if matches!(opcode, DELETE_FAST | LOAD_FAST_AND_CLEAR) {
+                    // A parameter must remain initialized on every normal and exception edge.
+                    if local < parameter_count {
+                        return false;
+                    }
+                    initialized &= !bit;
+                } else if !instruction.local_policy.is_post_analysis_closure_load()
+                    && !instruction.local_policy.is_known_initialized_load()
+                {
+                    if opcode == STORE_FAST {
+                        initialized |= bit;
+                    } else if initialized & bit == 0 {
+                        // Nonparameters are admitted only after an ordinary store in this block.
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn add_checks_for_uninitialized_loads_in_arrays<const PROVE_INITIALIZED: bool>(
         &mut self,
         local_count: usize,
         parameter_count: usize,
@@ -2551,18 +2621,20 @@ impl OptimizationPipeline {
         if !graph.features().has_fast_load() {
             return;
         }
-        let order = graph.order().to_vec();
+        let order = graph.order();
         if order.is_empty() {
             return;
         }
-        if self.exception_regions.is_empty()
+        let single_jump_free_block = (self.exception_regions.is_empty()
             && order.len() == 1
-            && block_jump_target(graph[order[0]].items()).is_none()
-        {
+            && block_jump_target(graph[order[0]].items()).is_none())
+        .then_some(order[0]);
+        if let Some(block) = single_jump_free_block {
             let graph = &mut self.graph;
             let mut unsafe_locals = vec![true; local_count];
             unsafe_locals[..parameter_count.min(local_count).min(64)].fill(false);
-            for instruction in graph.instructions_mut(order[0]) {
+            let mut created_check = false;
+            for instruction in graph.instructions_mut(block) {
                 if instruction.local_policy.is_post_analysis_closure_load()
                     || instruction.local_policy.is_known_initialized_load()
                 {
@@ -2591,14 +2663,24 @@ impl OptimizationPipeline {
                     LOAD_FAST => {
                         if unsafe_locals[local] {
                             instruction.opcode = LOAD_FAST_CHECK;
+                            created_check = true;
                         }
                         unsafe_locals[local] = false;
                     }
                     _ => {}
                 }
             }
+            if created_check {
+                graph.record_checked_fast_load();
+            }
             return;
         }
+        if PROVE_INITIALIZED && self.local_loads_are_known_initialized(local_count, parameter_count)
+        {
+            return;
+        }
+        let graph = &self.graph;
+        let order = graph.order().to_vec();
         let block_slot_count = order
             .iter()
             .map(|block| block.index())
@@ -2830,6 +2912,7 @@ impl OptimizationPipeline {
         }
 
         let graph = &mut self.graph;
+        let mut created_check = false;
         for block in order {
             for (offset, item) in graph.iter_items_mut(block).enumerate() {
                 let ItemMut::Instruction(instruction) = item else {
@@ -2842,10 +2925,14 @@ impl OptimizationPipeline {
                     }
                     LOAD_FAST if needs_check[index] => {
                         instruction.opcode = LOAD_FAST_CHECK;
+                        created_check = true;
                     }
                     _ => {}
                 }
             }
+        }
+        if created_check {
+            graph.record_checked_fast_load();
         }
     }
 
@@ -2855,7 +2942,7 @@ impl OptimizationPipeline {
     /// that local as initialized for subsequent instructions on the same path.
     pub(in crate::assembler) fn remove_redundant_checked_loads(&mut self) -> bool {
         let graph = &mut self.graph;
-        if !graph.features().has_fast_load() {
+        if !graph.features().has_checked_fast_load() {
             return false;
         }
         let checked_blocks = graph
@@ -3348,6 +3435,28 @@ impl OptimizationPipeline {
 
     /// Admits retained direct NOP edges using separately verified original arrays.
     pub(in crate::assembler) fn optimize_load_fast_with_retained_entries(
+        python_version: crate::PythonVersion,
+        items: &mut [Item],
+        exception_regions: &[ExceptionRegion],
+        entries: BorrowEntryLabels<'_>,
+        preserved_block_boundaries: &FxHashSet<Label>,
+        borrow_block_aliases: &FxHashSet<Label>,
+        assertion_side_exits: bool,
+        retained_finally_entries: &FxHashMap<Label, Label>,
+    ) {
+        Self::optimize_load_fast_with_retained_entries_inner::<true>(
+            python_version,
+            items,
+            exception_regions,
+            entries,
+            preserved_block_boundaries,
+            borrow_block_aliases,
+            assertion_side_exits,
+            retained_finally_entries,
+        );
+    }
+
+    fn optimize_load_fast_with_retained_entries_inner<const DIRECT: bool>(
         python_version: crate::PythonVersion,
         items: &mut [Item],
         exception_regions: &[ExceptionRegion],
@@ -4073,10 +4182,13 @@ impl OptimizationPipeline {
         };
 
         let mut stack = ReferenceStack::default();
+        let mut candidates = SmallVec::<[usize; 16]>::new();
         let mut unsafe_loads = Vec::new();
         for (block, range) in blocks.into_iter().enumerate() {
-            let mut has_borrow_candidate = false;
-            for item in &mut items[range.clone()] {
+            candidates.clear();
+            let mut has_local_mutation = false;
+            let mut requires_stack_analysis = false;
+            for (offset, item) in items[range.clone()].iter_mut().enumerate() {
                 let Item::Instruction(instruction) = item else {
                     continue;
                 };
@@ -4084,15 +4196,58 @@ impl OptimizationPipeline {
                 {
                     instruction.opcode = LOAD_FAST_BORROW;
                 } else if matches!(instruction.opcode, LOAD_FAST | LOAD_FAST_LOAD_FAST) {
-                    has_borrow_candidate = true;
+                    candidates.push(offset);
+                    requires_stack_analysis |= instruction.local_policy.strict_owned_load()
+                        || instruction.local_policy.force_owned_load();
                 }
+                has_local_mutation |= matches!(
+                    instruction.opcode,
+                    DELETE_FAST
+                        | LOAD_FAST_AND_CLEAR
+                        | STORE_FAST
+                        | STORE_FAST_LOAD_FAST
+                        | STORE_FAST_STORE_FAST
+                );
             }
             if reachable
                 .as_ref()
                 .is_some_and(|reachable| !reachable[block])
-                || !has_borrow_candidate
+                || candidates.is_empty()
             {
                 continue;
+            }
+            if DIRECT
+                && python_version == crate::PythonVersion::Py314
+                && !has_local_mutation
+                && !requires_stack_analysis
+            {
+                let last = items[range.clone()]
+                    .iter()
+                    .rev()
+                    .find_map(|item| match item {
+                        Item::Instruction(instruction) => Some(instruction),
+                        Item::Label(_) => None,
+                    })
+                    .expect("a borrow block with candidates should contain an instruction");
+                let consumes_stack = (!matches!(last.operand(), Operand::Value(_))
+                    || ends_scope(last.opcode))
+                    && last.depth_after() == Some(0);
+                // No local can invalidate a candidate, and an empty outgoing stack proves
+                // every produced reference was consumed in this reachable block.
+                if consumes_stack {
+                    for offset in &candidates {
+                        let Item::Instruction(instruction) = &mut items[range.start + offset]
+                        else {
+                            unreachable!("borrow candidates should remain instructions");
+                        };
+                        instruction.opcode = match instruction.opcode {
+                            LOAD_FAST => LOAD_FAST_BORROW,
+                            LOAD_FAST_LOAD_FAST => LOAD_FAST_BORROW_LOAD_FAST_BORROW,
+                            _ => unreachable!("borrow candidates should remain local loads"),
+                        };
+                    }
+                    continue;
+                }
             }
             let mut cumulative_effect = 0_i64;
             let mut start_depth = None;
@@ -4246,12 +4401,12 @@ impl OptimizationPipeline {
                     unsafe_loads[producer] = true;
                 }
             }
-            for (offset, unsafe_load) in unsafe_loads.iter().copied().enumerate() {
-                if unsafe_load {
+            for offset in &candidates {
+                if unsafe_loads[*offset] {
                     continue;
                 }
                 let Item::Instruction(instruction) = items[range.start + offset] else {
-                    continue;
+                    unreachable!("borrow candidates should remain instructions");
                 };
                 let local_policy = instruction.local_policy;
                 if local_policy.strict_owned_load() {
@@ -4272,7 +4427,7 @@ impl OptimizationPipeline {
                     LOAD_FAST_LOAD_FAST => {
                         instruction.opcode = LOAD_FAST_BORROW_LOAD_FAST_BORROW;
                     }
-                    _ => {}
+                    _ => unreachable!("borrow candidates should remain local loads"),
                 }
             }
         }
@@ -4294,17 +4449,19 @@ impl OptimizationPipeline {
         }
     }
 
-    pub(in crate::assembler) fn fuse_superinstructions(&mut self) {
+    pub(in crate::assembler) fn fuse_superinstructions(&mut self) -> bool {
         let features = self.graph.features();
         if !features.has_fast_load() && !features.has_store_fast() {
-            return;
+            return false;
         }
 
         let graph = &mut self.graph;
         let order = graph.order().to_vec();
+        let mut changed = false;
         for block in order {
-            graph.fuse_adjacent_instructions(block, fuse_pair);
+            changed |= graph.fuse_adjacent_instructions(block, fuse_pair);
         }
+        changed
     }
 }
 
@@ -4329,6 +4486,539 @@ mod tests {
             SourceLocation::NONE,
             None,
         ))
+    }
+
+    fn borrow_instruction(opcode: crate::target::Opcode, operand: Operand, depth: u32) -> Item {
+        Item::Instruction(Instruction::new(
+            opcode,
+            operand,
+            SourceLocation::NONE,
+            Some(depth),
+        ))
+    }
+
+    fn owned_borrow_instruction(force: bool, strict: bool) -> Item {
+        let mut instruction =
+            Instruction::new(LOAD_FAST, Operand::Value(0), SourceLocation::NONE, Some(1));
+        instruction.local_policy = crate::assembler::ir::LocalPolicy::for_load(force, strict);
+        Item::Instruction(instruction)
+    }
+
+    fn general_borrow<const DIRECT: bool>(items: &mut [Item], unreachable: &FxHashSet<Label>) {
+        super::OptimizationPipeline::optimize_load_fast_with_retained_entries_inner::<DIRECT>(
+            crate::PythonVersion::Py314,
+            items,
+            &[],
+            super::BorrowEntryLabels {
+                unreachable,
+                loop_exits: &FxHashMap::default(),
+                finally_entries: &FxHashMap::default(),
+                finally_jump_sources: &FxHashMap::default(),
+                jump_entries: &FxHashSet::default(),
+                original_boundaries: &FxHashSet::default(),
+                pre_copy_jump_entries: &FxHashMap::default(),
+                authored_finally_break_entries: &FxHashMap::default(),
+            },
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+            false,
+            &FxHashMap::default(),
+        );
+    }
+
+    fn borrow_opcodes(items: &[Item]) -> Vec<crate::target::Opcode> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction)
+                    if matches!(
+                        instruction.opcode,
+                        LOAD_FAST
+                            | LOAD_FAST_BORROW
+                            | super::LOAD_FAST_LOAD_FAST
+                            | super::LOAD_FAST_BORROW_LOAD_FAST_BORROW
+                    ) =>
+                {
+                    Some(instruction.opcode)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn check_initialized_locals(
+        items: &[Item],
+        regions: &[super::ExceptionRegion],
+        local_count: usize,
+        parameter_count: usize,
+        eligible: bool,
+        expected_loads: &[crate::target::Opcode],
+    ) {
+        let make_pipeline = || {
+            let mut assembler = crate::assembler::Assembler::from_linear_items(items.to_vec());
+            assembler.next_label = items
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Label(label) => Some(label.as_u32() + 1),
+                    Item::Instruction(_) => None,
+                })
+                .max()
+                .unwrap_or(0);
+            assembler.exception_regions = regions.to_vec();
+            assembler.into_optimization_pipeline()
+        };
+        let mut direct = make_pipeline();
+        let mut generic = make_pipeline();
+        assert_eq!(
+            direct.local_loads_are_known_initialized(local_count, parameter_count),
+            eligible,
+        );
+        direct.add_checks_for_uninitialized_loads_in_arrays::<true>(
+            local_count,
+            parameter_count,
+            None,
+            Some(&FxHashSet::default()),
+        );
+        generic.add_checks_for_uninitialized_loads_in_arrays::<false>(
+            local_count,
+            parameter_count,
+            None,
+            Some(&FxHashSet::default()),
+        );
+        assert_eq!(direct.graph.copy_items(), generic.graph.copy_items());
+        assert_eq!(
+            direct.graph.features().has_checked_fast_load(),
+            generic.graph.features().has_checked_fast_load(),
+        );
+        let loads = direct
+            .graph
+            .iter_items()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction)
+                    if matches!(instruction.opcode, LOAD_FAST | super::LOAD_FAST_CHECK) =>
+                {
+                    Some(instruction.opcode)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(loads, expected_loads);
+    }
+
+    #[test]
+    fn local_initialization_proof_matches_branch_loop_alias_and_invalidation_dataflow() {
+        use crate::target::opcodes::{
+            DELETE_FAST, LOAD_FAST_AND_CLEAR, LOAD_FAST_CHECK, STORE_FAST,
+        };
+
+        let first = Label::from_u32(0);
+        let alias = Label::from_u32(1);
+        let exit = Label::from_u32(2);
+        let value = Operand::Value;
+        check_initialized_locals(
+            &[
+                Item::Label(first),
+                Item::Label(alias),
+                instruction(LOAD_FAST, value(0)),
+                instruction(POP_JUMP_IF_TRUE, Operand::Forward(exit)),
+                instruction(STORE_FAST, value(1)),
+                instruction(LOAD_FAST_AND_CLEAR, value(1)),
+                instruction(STORE_FAST, value(1)),
+                instruction(LOAD_FAST, value(1)),
+                instruction(JUMP_BACKWARD_NO_INTERRUPT, Operand::Backward(alias)),
+                Item::Label(exit),
+                instruction(STORE_FAST, value(1)),
+                instruction(LOAD_FAST, value(1)),
+                instruction(RETURN_VALUE, value(0)),
+            ],
+            &[],
+            2,
+            1,
+            true,
+            &[LOAD_FAST, LOAD_FAST, LOAD_FAST],
+        );
+        check_initialized_locals(
+            &[
+                instruction(LOAD_FAST, value(63)),
+                instruction(POP_JUMP_IF_TRUE, Operand::Forward(exit)),
+                instruction(LOAD_FAST, value(0)),
+                Item::Label(exit),
+                instruction(LOAD_FAST, value(63)),
+            ],
+            &[],
+            64,
+            64,
+            true,
+            &[LOAD_FAST, LOAD_FAST, LOAD_FAST],
+        );
+        check_initialized_locals(
+            &[
+                instruction(STORE_FAST, value(1)),
+                instruction(JUMP_FORWARD, Operand::Forward(exit)),
+                Item::Label(exit),
+                instruction(LOAD_FAST, value(1)),
+            ],
+            &[],
+            2,
+            1,
+            false,
+            &[LOAD_FAST],
+        );
+        check_initialized_locals(
+            &[
+                Item::Label(first),
+                instruction(LOAD_FAST, value(0)),
+                instruction(DELETE_FAST, value(0)),
+                instruction(JUMP_BACKWARD_NO_INTERRUPT, Operand::Backward(first)),
+            ],
+            &[],
+            1,
+            1,
+            false,
+            &[LOAD_FAST_CHECK],
+        );
+        check_initialized_locals(
+            &[
+                instruction(LOAD_CONST, value(0)),
+                instruction(POP_JUMP_IF_TRUE, Operand::Forward(exit)),
+                instruction(STORE_FAST, value(1)),
+                instruction(LOAD_FAST, value(2)),
+                Item::Label(exit),
+                instruction(STORE_FAST, value(2)),
+                instruction(LOAD_FAST, value(1)),
+            ],
+            &[],
+            3,
+            1,
+            false,
+            &[LOAD_FAST_CHECK, LOAD_FAST_CHECK],
+        );
+        check_initialized_locals(
+            &[
+                instruction(LOAD_FAST, value(0)),
+                instruction(JUMP_FORWARD, Operand::Forward(exit)),
+                Item::Label(exit),
+                instruction(STORE_FAST, value(1)),
+                instruction(LOAD_FAST_AND_CLEAR, value(1)),
+                instruction(LOAD_FAST, value(1)),
+            ],
+            &[],
+            2,
+            1,
+            false,
+            &[LOAD_FAST, LOAD_FAST_CHECK],
+        );
+        for local in [0, 1] {
+            let mut nullable =
+                Instruction::new(STORE_FAST, value(local), SourceLocation::NONE, None);
+            nullable
+                .local_policy
+                .mark_maybe_null_comprehension_restore();
+            check_initialized_locals(
+                &[
+                    instruction(LOAD_FAST, value(0)),
+                    instruction(JUMP_FORWARD, Operand::Forward(exit)),
+                    Item::Label(exit),
+                    Item::Instruction(nullable),
+                    instruction(STORE_FAST, value(local)),
+                    instruction(LOAD_FAST, value(local)),
+                ],
+                &[],
+                2,
+                1,
+                false,
+                &[LOAD_FAST, LOAD_FAST],
+            );
+        }
+    }
+
+    #[test]
+    fn local_initialization_proof_matches_protected_unreachable_and_checked_graphs() {
+        use crate::target::opcodes::{LOAD_FAST_CHECK, STORE_FAST};
+
+        let start = Label::from_u32(0);
+        let end = Label::from_u32(1);
+        let handler = Label::from_u32(2);
+        let value = Operand::Value;
+        let region = super::ExceptionRegion {
+            is_scope_fallback: false,
+            priority: super::ExceptionRegionPriority::OriginalRange(start, end),
+            start,
+            end,
+            target: handler,
+            depth: 0,
+            preserve_lasti: false,
+        };
+        for handler_stores_first in [false, true] {
+            let mut items = vec![
+                Item::Label(start),
+                instruction(LOAD_FAST, value(0)),
+                instruction(STORE_FAST, value(1)),
+                instruction(LOAD_FAST, value(1)),
+                Item::Label(end),
+                instruction(RETURN_VALUE, value(0)),
+                Item::Label(handler),
+            ];
+            if handler_stores_first {
+                items.push(instruction(STORE_FAST, value(1)));
+            }
+            items.extend([
+                instruction(LOAD_FAST, value(1)),
+                instruction(RETURN_VALUE, value(0)),
+            ]);
+            check_initialized_locals(
+                &items,
+                &[region],
+                2,
+                1,
+                handler_stores_first,
+                &[
+                    LOAD_FAST,
+                    LOAD_FAST,
+                    if handler_stores_first {
+                        LOAD_FAST
+                    } else {
+                        LOAD_FAST_CHECK
+                    },
+                ],
+            );
+        }
+        for unreachable_stores_first in [false, true] {
+            let mut items = vec![
+                instruction(LOAD_FAST, value(0)),
+                instruction(RETURN_VALUE, value(0)),
+                Item::Label(end),
+            ];
+            if unreachable_stores_first {
+                items.push(instruction(STORE_FAST, value(1)));
+            }
+            items.extend([
+                instruction(LOAD_FAST, value(1)),
+                instruction(RETURN_VALUE, value(0)),
+            ]);
+            check_initialized_locals(
+                &items,
+                &[],
+                2,
+                1,
+                unreachable_stores_first,
+                &[LOAD_FAST, LOAD_FAST],
+            );
+        }
+        for (index, flagged, expected) in [
+            (0, false, LOAD_FAST),
+            (1, false, LOAD_FAST_CHECK),
+            (8, true, LOAD_FAST),
+        ] {
+            let mut checked =
+                Instruction::new(LOAD_FAST_CHECK, value(index), SourceLocation::NONE, None);
+            if flagged {
+                checked.local_policy.mark_post_analysis_closure_load();
+            }
+            check_initialized_locals(
+                &[
+                    instruction(LOAD_FAST, value(0)),
+                    instruction(JUMP_FORWARD, Operand::Forward(end)),
+                    Item::Label(end),
+                    Item::Instruction(checked),
+                ],
+                &[],
+                2,
+                1,
+                false,
+                &[LOAD_FAST, expected],
+            );
+        }
+        for post_analysis in [false, true] {
+            let mut flagged = Instruction::new(LOAD_FAST, value(1), SourceLocation::NONE, None);
+            if post_analysis {
+                flagged.local_policy.mark_post_analysis_closure_load();
+            } else {
+                flagged.local_policy.mark_known_initialized_load();
+            }
+            check_initialized_locals(
+                &[
+                    instruction(LOAD_FAST, value(0)),
+                    instruction(JUMP_FORWARD, Operand::Forward(end)),
+                    Item::Label(end),
+                    Item::Instruction(flagged),
+                ],
+                &[],
+                2,
+                1,
+                true,
+                &[LOAD_FAST, LOAD_FAST],
+            );
+        }
+        check_initialized_locals(
+            &[
+                instruction(STORE_FAST, value(63)),
+                instruction(STORE_FAST, value(64)),
+                instruction(JUMP_FORWARD, Operand::Forward(end)),
+                Item::Label(end),
+                instruction(LOAD_FAST, value(63)),
+                instruction(LOAD_FAST, value(64)),
+            ],
+            &[],
+            65,
+            0,
+            false,
+            &[LOAD_FAST, LOAD_FAST_CHECK],
+        );
+    }
+
+    #[test]
+    fn general_direct_borrow_matches_stack_analysis_and_owned_policies() {
+        use crate::target::opcodes::{BUILD_TUPLE, DELETE_FAST, LOAD_FAST_LOAD_FAST, STORE_FAST};
+
+        let target = Label::from_u32(0);
+        for (name, items, expected) in [
+            (
+                "single and fused loads consumed on return",
+                vec![
+                    borrow_instruction(LOAD_FAST, Operand::Value(0), 1),
+                    borrow_instruction(LOAD_FAST_LOAD_FAST, Operand::Value(0x12), 3),
+                    borrow_instruction(POP_TOP, Operand::Value(0), 2),
+                    borrow_instruction(POP_TOP, Operand::Value(0), 1),
+                    borrow_instruction(RETURN_VALUE, Operand::Value(0), 0),
+                ],
+                vec![LOAD_FAST_BORROW, super::LOAD_FAST_BORROW_LOAD_FAST_BORROW],
+            ),
+            (
+                "conditional and both return arms",
+                vec![
+                    borrow_instruction(LOAD_FAST, Operand::Value(0), 1),
+                    borrow_instruction(POP_JUMP_IF_TRUE, Operand::Forward(target), 0),
+                    borrow_instruction(LOAD_FAST, Operand::Value(1), 1),
+                    borrow_instruction(RETURN_VALUE, Operand::Value(0), 0),
+                    Item::Label(target),
+                    borrow_instruction(LOAD_FAST, Operand::Value(2), 1),
+                    borrow_instruction(RETURN_VALUE, Operand::Value(0), 0),
+                ],
+                vec![LOAD_FAST_BORROW; 3],
+            ),
+            (
+                "strict owned return",
+                vec![
+                    owned_borrow_instruction(false, true),
+                    borrow_instruction(RETURN_VALUE, Operand::Value(0), 0),
+                ],
+                vec![LOAD_FAST],
+            ),
+            (
+                "forced owned indirectly consumed",
+                vec![
+                    owned_borrow_instruction(true, false),
+                    borrow_instruction(LOAD_CONST, Operand::Value(0), 2),
+                    borrow_instruction(BUILD_TUPLE, Operand::Value(2), 1),
+                    borrow_instruction(RETURN_VALUE, Operand::Value(0), 0),
+                ],
+                vec![LOAD_FAST],
+            ),
+            (
+                "forced owned directly returned",
+                vec![
+                    owned_borrow_instruction(true, false),
+                    borrow_instruction(RETURN_VALUE, Operand::Value(0), 0),
+                ],
+                vec![LOAD_FAST_BORROW],
+            ),
+            (
+                "supporting local deleted",
+                vec![
+                    borrow_instruction(LOAD_FAST, Operand::Value(0), 1),
+                    borrow_instruction(DELETE_FAST, Operand::Value(0), 1),
+                    borrow_instruction(RETURN_VALUE, Operand::Value(0), 0),
+                ],
+                vec![LOAD_FAST],
+            ),
+            (
+                "owned reference stored in another local",
+                vec![
+                    borrow_instruction(LOAD_FAST, Operand::Value(0), 1),
+                    borrow_instruction(STORE_FAST, Operand::Value(1), 0),
+                    borrow_instruction(LOAD_FAST, Operand::Value(1), 1),
+                    borrow_instruction(RETURN_VALUE, Operand::Value(0), 0),
+                ],
+                vec![LOAD_FAST, LOAD_FAST_BORROW],
+            ),
+            (
+                "reference crosses a jump with a nonempty stack",
+                vec![
+                    borrow_instruction(LOAD_FAST, Operand::Value(0), 1),
+                    borrow_instruction(JUMP_FORWARD, Operand::Forward(target), 1),
+                    Item::Label(target),
+                    borrow_instruction(RETURN_VALUE, Operand::Value(0), 0),
+                ],
+                vec![LOAD_FAST],
+            ),
+            (
+                "terminal has no recorded stack depth",
+                vec![
+                    borrow_instruction(LOAD_FAST, Operand::Value(0), 1),
+                    instruction(RETURN_VALUE, Operand::Value(0)),
+                ],
+                vec![LOAD_FAST_BORROW],
+            ),
+        ] {
+            let mut direct = items.clone();
+            let mut generic = items;
+            general_borrow::<true>(&mut direct, &FxHashSet::default());
+            general_borrow::<false>(&mut generic, &FxHashSet::default());
+            assert_eq!(direct, generic, "{name}");
+            assert_eq!(borrow_opcodes(&direct), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn general_direct_borrow_preserves_backward_and_forced_unreachable_entries() {
+        let backward_target = Label::from_u32(0);
+        let dead = Label::from_u32(1);
+        let entry = Label::from_u32(2);
+        let mut forced =
+            Instruction::new(LOAD_FAST, Operand::Value(3), SourceLocation::NONE, Some(1));
+        forced.local_policy.mark_force_borrowed_load();
+        let items = vec![
+            borrow_instruction(JUMP_FORWARD, Operand::Forward(entry), 0),
+            Item::Label(backward_target),
+            borrow_instruction(LOAD_FAST, Operand::Value(0), 1),
+            borrow_instruction(RETURN_VALUE, Operand::Value(0), 0),
+            Item::Label(dead),
+            borrow_instruction(LOAD_FAST, Operand::Value(2), 1),
+            borrow_instruction(POP_TOP, Operand::Value(0), 0),
+            Item::Instruction(forced),
+            borrow_instruction(RETURN_VALUE, Operand::Value(0), 0),
+            Item::Label(entry),
+            borrow_instruction(LOAD_FAST, Operand::Value(1), 1),
+            borrow_instruction(POP_TOP, Operand::Value(0), 0),
+            borrow_instruction(
+                JUMP_BACKWARD_NO_INTERRUPT,
+                Operand::Backward(backward_target),
+                0,
+            ),
+        ];
+        for blocked in [false, true] {
+            let unreachable = if blocked {
+                [backward_target, dead].into_iter().collect()
+            } else {
+                [dead].into_iter().collect()
+            };
+            let mut direct = items.clone();
+            let mut generic = items.clone();
+            general_borrow::<true>(&mut direct, &unreachable);
+            general_borrow::<false>(&mut generic, &unreachable);
+            assert_eq!(direct, generic, "blocked: {blocked}");
+            assert_eq!(
+                borrow_opcodes(&direct),
+                [
+                    if blocked { LOAD_FAST } else { LOAD_FAST_BORROW },
+                    LOAD_FAST,
+                    LOAD_FAST_BORROW,
+                    LOAD_FAST_BORROW,
+                ],
+                "blocked: {blocked}",
+            );
+        }
     }
 
     #[test]

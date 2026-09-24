@@ -1,7 +1,7 @@
 use ruff_index::newtype_index;
 
 use crate::PythonVersion;
-use crate::code_object::{CodeObject, Constant, MetadataId};
+use crate::code_object::{CodeObject, Constant, MetadataId, MetadataName as Name};
 
 use super::key::{
     FrozenSetMembers, frozen_set_members_in_wire_order, slice_member_uses_identity_for,
@@ -121,7 +121,7 @@ where
 /// Compiler-owned IDs follow the same order and length as the metadata tuple.
 #[inline]
 fn traverse_metadata_strings<'a, V>(
-    values: &'a [String],
+    values: &'a [Name],
     metadata_ids: Option<&[MetadataId]>,
     visitor: &mut V,
 ) where

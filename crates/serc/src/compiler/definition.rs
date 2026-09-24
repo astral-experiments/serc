@@ -546,7 +546,10 @@ impl Compiler<'_> {
         } else {
             0
         }) | (self.unit.flags & SUPPORTED_FUTURE_FLAGS);
-        let contains_yield = self.context.module_plan().has_yield_expressions
+        let contains_yield = self
+            .context
+            .module_plan()
+            .may_contain_yield(&definition.body)
             && function_body_contains_yield(
                 &definition.body,
                 !self.has_deferred_annotations() && self.unit.flags & CO_FUTURE_ANNOTATIONS == 0,

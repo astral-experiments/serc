@@ -23,8 +23,17 @@ pub(crate) fn validate(
     body: &[Stmt],
     python_version: PythonVersion,
 ) -> Result<(), CompileError> {
-    let mut validator = Validator {
+    validate_with_statement_pruning::<true>(source, body, python_version)
+}
+
+fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
+    source: &str,
+    body: &[Stmt],
+    python_version: PythonVersion,
+) -> Result<(), CompileError> {
+    let mut validator = Validator::<PRUNE_STATEMENTS> {
         checker: SemanticSyntaxChecker::new(),
+        checker_prefix: CheckerPrefix::Initial,
         error: RefCell::new(None),
         source,
         body,
@@ -45,6 +54,22 @@ pub(crate) fn validate(
     };
     validator.visit_body(body);
     validator.error.into_inner().map_or(Ok(()), Err)
+}
+
+#[cfg(test)]
+fn validate_without_statement_pruning(
+    source: &str,
+    body: &[Stmt],
+    python_version: PythonVersion,
+) -> Result<(), CompileError> {
+    validate_with_statement_pruning::<false>(source, body, python_version)
+}
+
+#[derive(Clone, Copy)]
+enum CheckerPrefix {
+    Initial,
+    Open,
+    Closed,
 }
 
 #[derive(Clone, Copy)]
@@ -80,8 +105,9 @@ impl<'ast> Scope<'ast> {
     }
 }
 
-struct Validator<'source, 'ast> {
+struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool> {
     checker: SemanticSyntaxChecker,
+    checker_prefix: CheckerPrefix,
     error: RefCell<Option<CompileError>>,
     source: &'source str,
     body: &'ast [Stmt],
@@ -92,7 +118,7 @@ struct Validator<'source, 'ast> {
     scopes: Vec<Scope<'ast>>,
 }
 
-impl<'ast> Validator<'_, 'ast> {
+impl<'ast, const PRUNE_STATEMENTS: bool> Validator<'_, 'ast, PRUNE_STATEMENTS> {
     fn scope(&self) -> &Scope<'ast> {
         self.scopes
             .last()
@@ -178,7 +204,25 @@ impl<'ast> Validator<'_, 'ast> {
     }
 
     fn validate_private_parameters(&self, parameters: &'ast ast::Parameters) {
-        if self.private_name.is_none() || self.error.borrow().is_some() {
+        let Some(private_name) = self.private_name else {
+            return;
+        };
+        // This check only reports differently spelled parameters that mangling makes equal.
+        // Ruff already checks duplicate spellings, including when none of them can be mangled.
+        if self.error.borrow().is_some()
+            || parameters.len() < 2
+            || private_name.trim_start_matches('_').is_empty()
+            || !parameters.iter().any(|parameter| {
+                let spelling = parameter.name().as_str();
+                spelling.starts_with("__")
+                    && !spelling.ends_with("__")
+                    && !spelling.contains('.')
+                    && self
+                        .mangled_names
+                        .as_ref()
+                        .is_none_or(|names| names.contains(spelling))
+            })
+        {
             return;
         }
         let mut seen = FxHashMap::default();
@@ -222,6 +266,77 @@ impl<'ast> Validator<'_, 'ast> {
         self.checker = checker;
     }
 
+    fn statement_needs_checker(&mut self, statement: &Stmt) -> bool {
+        if !PRUNE_STATEMENTS {
+            return true;
+        }
+
+        // Ruff updates its docstring and future-import boundaries on statement entry. Keep every
+        // call until both are closed; after that its remaining statement state never changes.
+        if !matches!(self.checker_prefix, CheckerPrefix::Closed) {
+            let keeps_open = match statement {
+                Stmt::Expr(statement) => {
+                    matches!(self.checker_prefix, CheckerPrefix::Initial)
+                        && statement.value.is_string_literal_expr()
+                }
+                Stmt::ImportFrom(import) => {
+                    import.level == 0
+                        && !import.is_lazy
+                        && import.module.as_deref() == Some("__future__")
+                }
+                _ => false,
+            };
+            self.checker_prefix = if keeps_open {
+                CheckerPrefix::Open
+            } else {
+                CheckerPrefix::Closed
+            };
+            return true;
+        }
+
+        // The pinned checker reports errors only for these statement kinds. Parent checks for
+        // starred expressions apply to direct children; other child errors are still visited.
+        match statement {
+            Stmt::FunctionDef(_)
+            | Stmt::ClassDef(_)
+            | Stmt::TypeAlias(_)
+            | Stmt::AnnAssign(_)
+            | Stmt::Match(_)
+            | Stmt::Try(_)
+            | Stmt::Import(_)
+            | Stmt::ImportFrom(_)
+            | Stmt::Global(_)
+            | Stmt::Nonlocal(_) => true,
+            Stmt::Assign(statement) => {
+                statement.value.is_starred_expr()
+                    || matches!(statement.targets.as_slice(), [Expr::Starred(_)])
+            }
+            Stmt::Return(statement) => {
+                !self.in_function_scope()
+                    || statement
+                        .value
+                        .as_deref()
+                        .is_some_and(Expr::is_starred_expr)
+            }
+            Stmt::For(statement) => {
+                statement.is_async
+                    || statement.target.is_starred_expr()
+                    || statement.iter.is_starred_expr()
+            }
+            Stmt::With(statement) => statement.is_async,
+            Stmt::Break(_) | Stmt::Continue(_) => !self.in_loop_context(),
+            Stmt::Delete(_)
+            | Stmt::AugAssign(_)
+            | Stmt::While(_)
+            | Stmt::If(_)
+            | Stmt::Raise(_)
+            | Stmt::Assert(_)
+            | Stmt::Expr(_)
+            | Stmt::Pass(_)
+            | Stmt::IpyEscapeCommand(_) => false,
+        }
+    }
+
     fn comprehension(
         &mut self,
         generators: &'ast [ast::Comprehension],
@@ -252,7 +367,7 @@ impl<'ast> Validator<'_, 'ast> {
     }
 }
 
-impl<'ast> Visitor<'ast> for Validator<'_, 'ast> {
+impl<'ast, const PRUNE_STATEMENTS: bool> Visitor<'ast> for Validator<'_, 'ast, PRUNE_STATEMENTS> {
     fn visit_stmt(&mut self, statement: &'ast Stmt) {
         if self.error.borrow().is_some() {
             return;
@@ -285,17 +400,19 @@ impl<'ast> Visitor<'ast> for Validator<'_, 'ast> {
         }
         // Relative imports of a module named __future__ are ordinary imports. The shared
         // checker identifies directives by their module spelling, so hide that spelling here.
-        if let Stmt::ImportFrom(import) = statement
-            && import.level > 0
-            && import.module.as_deref() == Some("__future__")
-        {
-            let mut import = import.clone();
-            import.module = None;
-            self.with_checker(|checker, context| {
-                checker.visit_stmt(&Stmt::ImportFrom(import), context);
-            });
-        } else {
-            self.with_checker(|checker, context| checker.visit_stmt(statement, context));
+        if self.statement_needs_checker(statement) {
+            if let Stmt::ImportFrom(import) = statement
+                && import.level > 0
+                && import.module.as_deref() == Some("__future__")
+            {
+                let mut import = import.clone();
+                import.module = None;
+                self.with_checker(|checker, context| {
+                    checker.visit_stmt(&Stmt::ImportFrom(import), context);
+                });
+            } else {
+                self.with_checker(|checker, context| checker.visit_stmt(statement, context));
+            }
         }
         match statement {
             Stmt::FunctionDef(function) => {
@@ -410,10 +527,76 @@ impl<'ast> Visitor<'ast> for Validator<'_, 'ast> {
     }
 
     fn visit_expr(&mut self, expression: &'ast Expr) {
+        // This adapter does not supply declarations to Ruff's global-order check. A bare name
+        // therefore only needs checking when it assigns to or deletes `__debug__`. Ordinary
+        // literals and attribute wrappers cannot report errors or update validation state.
+        match expression {
+            Expr::Name(name)
+                if name.id.as_str() != "__debug__"
+                    || !(name.ctx.is_store() || name.ctx.is_del()) =>
+            {
+                return;
+            }
+            Expr::StringLiteral(_)
+            | Expr::BytesLiteral(_)
+            | Expr::NumberLiteral(_)
+            | Expr::BooleanLiteral(_)
+            | Expr::NoneLiteral(_)
+            | Expr::EllipsisLiteral(_) => return,
+            Expr::Attribute(attribute) => {
+                let mut base = attribute.value.as_ref();
+                while let Expr::Attribute(attribute) = base {
+                    base = attribute.value.as_ref();
+                }
+                self.visit_expr(base);
+                return;
+            }
+            _ => {}
+        }
         if self.error.borrow().is_some() {
             return;
         }
-        self.with_checker(|checker, context| checker.visit_expr(expression, context));
+        let check_expression = match expression {
+            // These are the only remaining variants checked by the pinned Ruff visitor. Its
+            // tuple/list check applies only to assignment targets; a lambda without parameters
+            // has no identifiers or duplicates to check. All other expressions still recurse.
+            Expr::Name(_)
+            | Expr::ListComp(_)
+            | Expr::SetComp(_)
+            | Expr::DictComp(_)
+            | Expr::Generator(_)
+            | Expr::Yield(_)
+            | Expr::YieldFrom(_)
+            | Expr::Await(_) => true,
+            Expr::Tuple(tuple) => tuple.ctx.is_store(),
+            Expr::List(list) => list.ctx.is_store(),
+            Expr::Lambda(lambda) => lambda.parameters.is_some(),
+            Expr::BoolOp(_)
+            | Expr::Named(_)
+            | Expr::BinOp(_)
+            | Expr::UnaryOp(_)
+            | Expr::If(_)
+            | Expr::Dict(_)
+            | Expr::Set(_)
+            | Expr::Compare(_)
+            | Expr::Call(_)
+            | Expr::StringLiteral(_)
+            | Expr::BytesLiteral(_)
+            | Expr::NumberLiteral(_)
+            | Expr::BooleanLiteral(_)
+            | Expr::NoneLiteral(_)
+            | Expr::EllipsisLiteral(_)
+            | Expr::FString(_)
+            | Expr::TString(_)
+            | Expr::Attribute(_)
+            | Expr::Subscript(_)
+            | Expr::Starred(_)
+            | Expr::Slice(_)
+            | Expr::IpyEscapeCommand(_) => false,
+        };
+        if check_expression {
+            self.with_checker(|checker, context| checker.visit_expr(expression, context));
+        }
         match expression {
             Expr::Lambda(lambda) => {
                 if let Some(parameters) = &lambda.parameters {
@@ -464,7 +647,7 @@ impl<'ast> Visitor<'ast> for Validator<'_, 'ast> {
     }
 }
 
-impl SemanticSyntaxContext for Validator<'_, '_> {
+impl<const PRUNE_STATEMENTS: bool> SemanticSyntaxContext for Validator<'_, '_, PRUNE_STATEMENTS> {
     fn future_annotations_or_stub(&self) -> bool {
         self.future_annotations
     }
@@ -627,7 +810,7 @@ impl SemanticSyntaxContext for Validator<'_, '_> {
 mod tests {
     use ruff_python_parser::parse_module;
 
-    use super::validate;
+    use super::{validate, validate_without_statement_pruning};
     use crate::{CompileError, PythonVersion};
 
     const TARGETS: [PythonVersion; 4] = [
@@ -636,6 +819,215 @@ mod tests {
         PythonVersion::Py314,
         PythonVersion::Py315,
     ];
+
+    #[test]
+    fn leaf_expressions_keep_debug_and_interpolated_expression_checks() {
+        let valid = "ordinary = 1\ntext = 'left' 'right'\nraw = b'left' b'right'\nvalues = (ordinary, True, False, None, ..., 1.2, 3j, __debug__)\ndel ordinary\n";
+        let parsed = parse_module(valid).unwrap();
+        for python_version in TARGETS {
+            validate(valid, &parsed.syntax().body, python_version).unwrap();
+        }
+
+        for (source, message) in [
+            ("__debug__ = 1", "__debug__"),
+            ("del __debug__", "__debug__"),
+            ("(ordinary, __debug__) = (1, 2)", "__debug__"),
+            ("value = f'{(__debug__ := 1)}'", "__debug__"),
+            ("value = f'{(yield ordinary)}'", "yield"),
+        ] {
+            let parsed = parse_module(source).unwrap();
+            for python_version in TARGETS {
+                let error = validate(source, &parsed.syntax().body, python_version).unwrap_err();
+                assert!(
+                    error.to_string().contains(message),
+                    "{python_version:?}: {source}: {error}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn skipped_expression_wrappers_still_check_descendants_and_assignment_targets() {
+        let valid = "left, right = (), ()\nvalues = (*left, *right), [*left, *right]\ndel (left, right)\nempty = lambda: __debug__\n";
+        let parsed = parse_module(valid).unwrap();
+        for python_version in TARGETS {
+            validate(valid, &parsed.syntax().body, python_version).unwrap();
+        }
+
+        for (source, message) in [
+            ("value = consume((yield item))", "yield"),
+            ("value = (yield item).attribute", "yield"),
+            ("value = not (other or 1 + (yield item))", "yield"),
+            ("value = values[0:(yield item)]", "yield"),
+            ("value = {'key': {item, (yield item)}}", "yield"),
+            (
+                "value = (bound := (yield item)) if flag else other",
+                "yield",
+            ),
+            ("value = [(yield item) == other]", "yield"),
+            ("value = consume((await item))", "await"),
+            ("(*left, *right) = values", "starred"),
+            ("[*left, *right] = values", "starred"),
+            (
+                "value = consume([item for item in (bound := values)])",
+                "assignment expression",
+            ),
+        ] {
+            let parsed = parse_module(source).unwrap();
+            for python_version in TARGETS {
+                let error = validate(source, &parsed.syntax().body, python_version).unwrap_err();
+                assert!(
+                    error.to_string().to_ascii_lowercase().contains(message),
+                    "{python_version:?}: {source}: {error}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn attribute_chains_keep_the_first_error_at_the_terminal_expression() {
+        let valid = "normal.first.second.third = 1\ndel normal.first.second.third\nvalue = __debug__.first.second.third\nvalue = (lambda: 1).first.second.third\n";
+        let parsed = parse_module(valid).unwrap();
+        for python_version in TARGETS {
+            validate(valid, &parsed.syntax().body, python_version).unwrap();
+        }
+
+        for (source, message, expected) in [
+            (
+                "value = ((yield first).a.b.c, (await second).d.e.f)",
+                "'yield' outside function",
+                "yield first",
+            ),
+            (
+                "value = ((await first).a.b.c, (yield second).d.e.f)",
+                "'await' outside function",
+                "await first",
+            ),
+            (
+                "value = ((__debug__ := first).a.b.c, (yield second).d.e.f)",
+                "cannot assign to `__debug__`",
+                "__debug__",
+            ),
+            (
+                "value = ((yield first).a.b.c, (__debug__ := second).d.e.f)",
+                "'yield' outside function",
+                "yield first",
+            ),
+        ] {
+            let parsed = parse_module(source).unwrap();
+            for python_version in TARGETS {
+                let error = validate(source, &parsed.syntax().body, python_version).unwrap_err();
+                let CompileError::InvalidSyntax {
+                    message: actual,
+                    range,
+                } = error
+                else {
+                    panic!("unexpected error for {source}: {error}");
+                };
+                assert_eq!(actual, message, "{python_version:?}: {source}");
+                assert_eq!(
+                    &source[usize::from(range.start())..usize::from(range.end())],
+                    expected,
+                    "{python_version:?}: {source}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pruned_statement_checks_match_the_standalone_checker_for_every_target() {
+        for source in [
+            "",
+            "'module docstring'\nfrom __future__ import annotations\nfrom __future__ import division\nvalue = 1",
+            "from __future__ import annotations\nfrom __future__ import division\nvalue = 1",
+            "'first string'\n'second string'\nfrom __future__ import annotations",
+            "from __future__ import annotations\n'not a docstring'\nfrom __future__ import division",
+            "from .__future__ import annotations\nfrom __future__ import division",
+            "'doc'\nfrom .__future__ import annotations\nfrom __future__ import division",
+            "pass\nfrom __future__ import annotations",
+            "if flag:\n 'nested string'\n from __future__ import annotations",
+            "def ordinary():\n 'function docstring'\n from __future__ import annotations",
+            "class Ordinary:\n 'class docstring'\n from __future__ import annotations",
+            "lazy from __future__ import annotations\nfrom __future__ import division",
+            "value = 0\nordinary = other\nordinary += 1\ndel ordinary\nassert True\nif flag: pass\nwhile False: pass",
+            "value = 0\nordinary = (yield first)\n(__debug__ := second)",
+            "value = 0\n__debug__ = other\n(yield second)",
+            "value = 0\n*ordinary = other\n(yield second)",
+            "value = 0\nordinary = *other\n(yield second)",
+            "value = 0\n(*left, *right) = other\n(yield second)",
+            "value = 0\nordinary += (yield first)\n(__debug__ := second)",
+            "value = 0\ndel __debug__\n(yield second)",
+            "value = 0\nassert (yield first)\n(__debug__ := second)",
+            "value = 0\nif (yield first): pass\n(__debug__ := second)",
+            "value = 0\nwhile (yield first): pass\n(__debug__ := second)",
+            "value = 0\nraise (yield first)\n(__debug__ := second)",
+            "value = 0\nwith context as __debug__: pass\n(yield second)",
+            "value = 0\nasync with context: pass\n(yield second)",
+            "value = 0\nfor __debug__ in other: pass\n(yield second)",
+            "value = 0\nfor *ordinary in other: pass\n(yield second)",
+            "value = 0\nfor ordinary in *other: pass\n(yield second)",
+            "value = 0\nasync for ordinary in other: pass\n(yield second)",
+            "value = 0\nreturn (yield first)\n(__debug__ := second)",
+            "value = 0\nbreak\n(__debug__ := second)",
+            "value = 0\ncontinue\n(__debug__ := second)",
+            "def ordinary():\n for name in values:\n  if name: continue\n  break\n with context: pass\n return 1",
+            "def ordinary():\n return *values\n (__debug__ := second)",
+            "def ordinary():\n return (__debug__ := first)\n (__debug__ := second)",
+            "def ordinary():\n while flag:\n  pass\n else:\n  break",
+            "def ordinary():\n try: pass\n except* Error:\n  for value in values: break\n  return (__debug__ := first)",
+            "async def ordinary():\n yield 1\n return (await first)",
+            "def ordinary(value):\n pass\n global value\n (__debug__ := second)",
+            "value = 0\ntry: pass\nexcept Error as __debug__: pass\n(yield second)",
+        ] {
+            let parsed = parse_module(source).unwrap_or_else(|error| panic!("{source}: {error}"));
+            for python_version in TARGETS {
+                let pruned = validate(source, &parsed.syntax().body, python_version);
+                let reference = validate_without_statement_pruning(
+                    source,
+                    &parsed.syntax().body,
+                    python_version,
+                );
+                assert_eq!(
+                    format!("{pruned:?}"),
+                    format!("{reference:?}"),
+                    "{python_version:?}: {source}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_mangling_parameters_keep_ordinary_duplicate_checks() {
+        for source in [
+            "class C:\n def f(__private): pass",
+            "class C:\n def f(__dunder__, _C__dunder__, ordinary): pass",
+            "class C:\n value = lambda __dunder__, _C__dunder__: None",
+            "class ___:\n def f(__private, ____private, ordinary): pass",
+            "class C[T]((lambda __private, _C__private: object)(0, 0)): pass",
+        ] {
+            let parsed = parse_module(source).unwrap();
+            for python_version in TARGETS {
+                validate(source, &parsed.syntax().body, python_version)
+                    .unwrap_or_else(|error| panic!("{python_version:?}: {source}: {error}"));
+            }
+        }
+
+        for source in [
+            "class C:\n def f(ordinary, ordinary): pass",
+            "class C:\n value = lambda ordinary, ordinary: None",
+            "class C:\n def f(__dunder__, __dunder__): pass",
+            "class ___:\n def f(__private, __private): pass",
+        ] {
+            let parsed = parse_module(source).unwrap();
+            for python_version in TARGETS {
+                let error = validate(source, &parsed.syntax().body, python_version).unwrap_err();
+                assert!(
+                    error.to_string().to_ascii_lowercase().contains("duplicate"),
+                    "{python_version:?}: {source}: {error}",
+                );
+            }
+        }
+    }
 
     #[test]
     fn private_parameter_aliases_are_rejected_in_their_lexical_class() {

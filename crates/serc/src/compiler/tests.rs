@@ -33,6 +33,66 @@ fn optional_compiler_ids_remain_four_bytes() {
 }
 
 #[test]
+fn compiled_modules_share_their_filename_and_remain_send_sync() {
+    use std::sync::Arc;
+
+    use crate::code_object::{CodeInterningSummary, CompilationInterningEvent};
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    fn child<'a>(code: &'a CodeObject, name: &str) -> &'a CodeObject {
+        code.constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(child) if child.name == name => Some(child.as_ref()),
+                _ => None,
+            })
+            .expect("nested code should exist")
+    }
+
+    assert_send_sync::<crate::CompiledModule>();
+    let source = "class Holder:\n    def method(self):\n        self.__hidden = 1\n        def nested():\n            return 1\n        return nested\n";
+    let filename = "directory/nested/filename_é.py";
+    for python_version in [
+        crate::PythonVersion::Py312,
+        crate::PythonVersion::Py313,
+        crate::PythonVersion::Py314,
+        crate::PythonVersion::Py315,
+    ] {
+        let module = crate::compile_with_options(
+            source,
+            filename,
+            &crate::CompileOptions {
+                python_version,
+                ..crate::CompileOptions::default()
+            },
+        )
+        .unwrap();
+        let root = &module.code;
+        let class = child(root, "Holder");
+        let method = child(class, "method");
+        let nested = child(method, "nested");
+        assert_eq!(root.filename.as_ref(), filename);
+        for code in [class, method, nested] {
+            assert!(Arc::ptr_eq(&root.filename, &code.filename));
+        }
+        let clone = module.clone();
+        assert!(Arc::ptr_eq(&root.filename, &clone.code.filename));
+        let summary = CodeInterningSummary::from_code(nested);
+        assert!(Arc::ptr_eq(&root.filename, &summary.filename));
+
+        let mut summaries = 0;
+        for event in &root.marshal_provenance.interning_events {
+            if let CompilationInterningEvent::CodeAssembly(summary) = event {
+                assert!(Arc::ptr_eq(&root.filename, &summary.filename));
+                summaries += 1;
+            }
+        }
+        assert!(summaries >= 4, "{python_version:?}: {summaries}");
+    }
+}
+
+#[test]
 fn generator_nested_comprehension_captures_keep_scope_roles_for_all_targets() {
     use crate::target::local_kinds::{CO_FAST_CELL, CO_FAST_FREE, CO_FAST_LOCAL};
 
@@ -239,7 +299,7 @@ fn compiler_stack_effect_validation_rejects_stale_lowering_metadata() {
 fn module_compiler<'source>(
     source: &'source str,
     parsed: &'source Parsed<ModModule>,
-) -> Compiler<'source> {
+) -> Box<Compiler<'source>> {
     Compiler::module("example.py", source, parsed.tokens(), parsed.suite())
 }
 
@@ -1716,6 +1776,31 @@ fn source_locations_pair_utf8_columns_crlf_boundaries_and_eof() {
 }
 
 #[test]
+fn source_positions_visit_adjacent_lines_in_both_directions_and_fall_back_for_jumps() {
+    let source = "a = 1\r\nb = 2\n\n# comment\nc = 3\r\nd = 4\n";
+    let parsed = parse_module(source).unwrap();
+    let compiler = module_compiler(source, &parsed);
+    let expected = ruff_source_file::LineIndex::from_source_text(source);
+    let lines = expected.line_starts();
+    for line in [0, 1, 2, 3, 4, 5, 6, 5, 4, 3, 2, 1, 0, 5, 2, 6, 0] {
+        let start = lines[line];
+        let end = lines
+            .get(line + 1)
+            .map_or(source.len(), |next| usize::from(*next) - 1);
+        for offset in [usize::from(start), end] {
+            let offset = u32::try_from(offset).unwrap();
+            assert_eq!(
+                compiler.source_position(offset),
+                (
+                    i32::try_from(line + 1).unwrap(),
+                    i32::try_from(offset - u32::from(start)).unwrap()
+                ),
+            );
+        }
+    }
+}
+
+#[test]
 fn source_positions_use_utf8_byte_columns() {
     let source = "α = 1\nβγ = 2\n";
     let parsed = parse_module(source).unwrap();
@@ -1727,6 +1812,31 @@ fn source_positions_use_utf8_byte_columns() {
     assert_eq!(compiler.source_position(9), (2, 2));
     assert_eq!(compiler.source_position(11), (2, 4));
     assert_eq!(compiler.line_number(11), 2);
+}
+
+#[test]
+fn source_locations_preserve_multiline_endpoints_when_revisited() {
+    let source = "α\nβγ\nδ\n";
+    let parsed = parse_module(source).unwrap();
+    let compiler = module_compiler(source, &parsed);
+    let range = |start, end| TextRange::new(TextSize::new(start), TextSize::new(end));
+
+    for _ in 0..2 {
+        assert_eq!(
+            compiler.source_location(range(0, 7)),
+            SourceLocation::new(1, 2, 0, 4),
+        );
+        assert_eq!(
+            compiler.source_location(range(0, 2)),
+            SourceLocation::new(1, 1, 0, 2),
+        );
+        assert_eq!(
+            compiler.source_location(range(5, 11)),
+            SourceLocation::new(2, 4, 2, 0),
+        );
+        assert_eq!(compiler.source_position(8), (3, 0));
+        assert_eq!(compiler.source_position(u32::MAX), (4, 0));
+    }
 }
 
 #[test]
