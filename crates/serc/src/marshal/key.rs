@@ -460,7 +460,7 @@ pub(super) fn constant_key(value: &Constant) -> ObjectKey<'_> {
 }
 
 pub(super) type ConstantSortKey = SmallVec<[u8; 16]>;
-pub(super) type FrozenSetMembers<'a> = SmallVec<[(ConstantSortKey, &'a Constant); 4]>;
+pub(super) type FrozenSetMembers<'a> = SmallVec<[&'a Constant; 4]>;
 
 pub(super) fn constant_sort_key(value: &Constant) -> ConstantSortKey {
     constant_sort_key_with_properties(value, PythonVersion::Py314, &|value| {
@@ -669,7 +669,7 @@ fn constant_sort_key_with_properties<'a>(
                         .to_le_bytes(),
                 );
                 for (_, value) in
-                    frozen_set_members_with_properties(values, python_version, properties)
+                    sorted_frozen_set_members_with_properties(values, python_version, properties)
                 {
                     append(output, value, true, python_version, properties, references);
                 }
@@ -699,12 +699,12 @@ fn constant_sort_key_with_properties<'a>(
 }
 
 pub(super) fn frozen_set_members_in_wire_order(values: &[Constant]) -> FrozenSetMembers<'_> {
-    let mut members = FrozenSetMembers::new();
+    let mut members = SmallVec::<[(ConstantSortKey, &Constant); 4]>::new();
     for value in values {
         members.push((constant_sort_key(value), value));
     }
     members.sort_by(|(left, _), (right, _)| left.cmp(right));
-    members
+    members.into_iter().map(|(_, value)| value).collect()
 }
 
 pub(super) fn frozen_set_members_with_properties<'a>(
@@ -712,7 +712,18 @@ pub(super) fn frozen_set_members_with_properties<'a>(
     python_version: PythonVersion,
     properties: &impl Fn(&'a Constant) -> (bool, bool),
 ) -> FrozenSetMembers<'a> {
-    let mut members = FrozenSetMembers::new();
+    sorted_frozen_set_members_with_properties(values, python_version, properties)
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect()
+}
+
+fn sorted_frozen_set_members_with_properties<'a>(
+    values: &'a [Constant],
+    python_version: PythonVersion,
+    properties: &impl Fn(&'a Constant) -> (bool, bool),
+) -> SmallVec<[(ConstantSortKey, &'a Constant); 4]> {
+    let mut members = SmallVec::<[(ConstantSortKey, &Constant); 4]>::new();
     for value in values {
         members.push((
             constant_sort_key_with_properties(value, python_version, properties),
