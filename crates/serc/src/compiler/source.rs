@@ -1257,6 +1257,18 @@ impl Compiler<'_> {
                 }
                 None
             }
+            Expr::UnaryOp(unary)
+                if !self.has_deferred_annotations()
+                    && unary.op == ruff_python_ast::UnaryOp::Not
+                    && matches!(
+                        unary.operand.as_ref(),
+                        Expr::UnaryOp(_) | Expr::BinOp(_) | Expr::Subscript(_)
+                    ) =>
+            {
+                // The legacy AST optimizer applies `not` after recursively folding its operand.
+                self.source_aware_fold_constant(&unary.operand)
+                    .map(|constant| Constant::Bool(!constant.is_truthy()))
+            }
 
             Expr::StringLiteral(string) => Some(self.string_literal_constant(string)),
             Expr::FString(fstring) => {

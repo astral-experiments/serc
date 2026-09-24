@@ -2891,12 +2891,18 @@ fn fold_literal_subscript(
     let value =
         fold_constant_with_literals(value, python_version, literal, boolean_sequence_repetition)?;
     if !matches!(index, Expr::Slice(_)) {
-        let index = match fold_constant_with_literals(
-            index,
-            PythonVersion::Py314,
-            &literal_constant,
-            boolean_sequence_repetition,
-        )? {
+        let index = if python_version <= PythonVersion::Py313 {
+            // The legacy AST optimizer sees source-aware folds such as `~True` in indices.
+            fold_constant_with_literals(index, python_version, literal, boolean_sequence_repetition)
+        } else {
+            fold_constant_with_literals(
+                index,
+                PythonVersion::Py314,
+                &literal_constant,
+                boolean_sequence_repetition,
+            )
+        };
+        let index = match index? {
             Constant::Bool(value) => i128::from(u8::from(value)),
             Constant::Int(value) => i128::from(value),
             Constant::SignedInt(value) => i128::from(value),
