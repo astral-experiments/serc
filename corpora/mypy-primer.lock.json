@@ -282,8 +282,8 @@
       ]
     },
     {
-      "id": "github.com--astroserc--xarray-dataclasses",
-      "url": "https://github.com/astroserc/xarray-dataclasses",
+      "id": "github.com--astropenguin--xarray-dataclasses",
+      "url": "https://github.com/astropenguin/xarray-dataclasses",
       "revision": "605e15f3d081fdc7ff2a51abdd09596db946a96d",
       "logical_projects": [
         "xarray-dataclasses"
