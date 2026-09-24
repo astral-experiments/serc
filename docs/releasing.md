@@ -1,7 +1,9 @@
 # Releasing Serc
 
-Serc uses the same Maturin packaging, GitHub release environments, and trusted
-publishing pattern as uv. The Python package contains the native `serc` executable
+Serc uses uv's Maturin packaging and trusted publishing pattern. Releases are
+manually dispatched from `main` and publish after successful build checks, with
+no separate environment approval. The GitHub repository can remain private.
+The Python package contains the native `serc` executable
 and supports both `serc` and `python -m serc`. Cargo publishes the `serc` library and
 the `serc-cli` package (`cargo install serc-cli`).
 
@@ -20,15 +22,13 @@ the `serc-cli` package (`cargo install serc-cli`).
    Serc does not need a registry token. A successful dry run makes no changes.
 3. Add Serc to the release policies in
    [`astral-sh/github-policies`](https://github.com/astral-sh/github-policies/blob/main/releases/README.md):
-   `environments/release-gate.json`, the custom-app entry in
-   `environments/release.json`, and `rulesets/tags-require-release.json`. Grant
-   `astral-sh/full-time` repository access and install the existing
-   `release-environment-gate` GitHub App for Serc before applying the policies.
-   `release-gate` requires approval from `astral-sh/full-time`, prevents self-review,
-   and disallows administrator bypass. The custom App protects `release` after
-   human approval of `release-gate`. Both environments permit only `main`.
-   Both required reviewers and custom deployment protection rules require GitHub
-   Enterprise for a private repository, or making the repository public.
+   the Serc entry in `environments/release.json` and
+   `rulesets/tags-require-release.json`. The `release` environment permits only
+   `main`, with no required reviewers or custom deployment protection rules. Keep
+   this environment name because the registry trusted publishers are bound to it.
+   Serc does not use a `release-gate` environment or require the
+   `release-environment-gate` App. This is an explicit exception to uv's separate
+   approval step while Serc remains private.
 4. Grant the existing `astral-automations-bot` GitHub App access to Serc. The broker
    reads `.github/secure-token-service.json` from Serc's `main` branch; the checked-in
    policy permits only `release-prepare.yml`, dispatched on `main` in the
@@ -40,7 +40,7 @@ the `serc-cli` package (`cargo install serc-cli`).
    values. No new broker deployment or App private key is needed. This token allows
    the release PR to trigger ordinary CI.
 5. Set the repository Actions variable `SERC_RELEASES_ENABLED` to `true` after
-   registry registration and environment protection are complete. It starts as
+   registry registration and the `main` environment restriction are complete. It starts as
    `false`; build-only dry runs work while publishing is disabled.
 
 The trusted publisher uses the calling workflow filename (`release.yml`), even
@@ -59,8 +59,11 @@ publishing. The same preparation is available locally through `scripts/release.s
 Run the **Release** workflow on `main` with `tag=dry-run` to build and check all
 wheels, the source distribution, and Cargo packages without publishing. Inspect
 the artifacts and successful checks, then run it with the package version as the
-tag (for example, `0.1.0`) and approve the `release-gate` deployment. This publishes
-the verified Python artifacts and both crates, then creates the GitHub release.
+tag (for example, `0.1.0`). Once its build and package checks succeed, the workflow
+publishes the verified Python artifacts and both crates, then creates the GitHub
+release without another approval. Published packages, including the source
+distribution and crate sources, are public even when the GitHub repository is
+private.
 
 The crates publisher skips versions already on crates.io, allowing an interrupted
 release to resume. PyPI's publisher likewise checks existing files when retrying.
