@@ -17,6 +17,7 @@ workspace = true
 [dependencies]
 clap = { workspace = true }
 fs-err = { workspace = true }
+libmimalloc-sys = { workspace = true }
 mimalloc = { workspace = true }
 serc = { path = "../serc" }
 rayon = { workspace = true }
