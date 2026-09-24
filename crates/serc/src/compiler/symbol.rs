@@ -1586,9 +1586,9 @@ impl Compiler<'_> {
                         return;
                     }
                     Expr::Compare(comparison) if self.legacy_compiler.is_some() => {
-                        self.visit_expr(&comparison.left);
-                        for (index, comparator) in comparison.comparators.iter().enumerate() {
-                            if index + 1 == comparison.comparators.len()
+                        self.visit_expr(comparison.first_operand());
+                        for (index, comparator) in comparison.comparators().iter().enumerate() {
+                            if index + 1 == comparison.comparators().len()
                                 && matches!(
                                     comparison.ops[index],
                                     ruff_python_ast::CmpOp::In | ruff_python_ast::CmpOp::NotIn
@@ -1746,14 +1746,18 @@ impl Compiler<'_> {
                     _ => {}
                 }
                 let comprehension = match expression {
-                    Expr::ListComp(comprehension) => {
-                        Some((&comprehension.generators, None, comprehension.elt.as_ref()))
-                    }
-                    Expr::SetComp(comprehension) => {
-                        Some((&comprehension.generators, None, comprehension.elt.as_ref()))
-                    }
+                    Expr::ListComp(comprehension) => Some((
+                        &comprehension.generators[..],
+                        None,
+                        comprehension.elt.as_ref(),
+                    )),
+                    Expr::SetComp(comprehension) => Some((
+                        &comprehension.generators[..],
+                        None,
+                        comprehension.elt.as_ref(),
+                    )),
                     Expr::DictComp(comprehension) => Some((
-                        &comprehension.generators,
+                        &comprehension.generators[..],
                         comprehension.key.as_deref(),
                         comprehension.value.as_ref(),
                     )),

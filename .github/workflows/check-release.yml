@@ -1,0 +1,31 @@
+name: Check release
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/*release*.yml'
+      - '.github/workflows/*publish*.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**/Cargo.toml'
+      - 'pyproject.toml'
+      - 'python/**'
+      - 'scripts/*release*'
+      - 'scripts/publish-crates.py'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: check-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wheels:
+    uses: ./.github/workflows/build-release-binaries.yml
+    permissions:
+      contents: read
+  crates:
+    uses: ./.github/workflows/check-publish.yml
+    permissions:
+      contents: read

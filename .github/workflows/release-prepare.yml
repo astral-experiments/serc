@@ -1,0 +1,73 @@
+name: Prepare release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The version to set (overrides detection)
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: prepare-release
+  cancel-in-progress: false
+
+jobs:
+  prepare-release:
+    if: github.repository == 'astral-sh/serc' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: automations
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.12.13"
+          checksum: "745765a3b6e360ad76743599ae5c42e9278c7edf8bbff9fc76d05bf2623a04dd"
+          enable-cache: false
+      - name: Get automation token
+        id: token
+        uses: open-security-tools/ost-simple-sts@9e012247e07c39080fb6a832dbfbcfeacebc19c4
+        with:
+          exchange-url: ${{ secrets.STS_API_URL }}/exchange
+          audience: ${{ secrets.STS_API_URL }}
+          repository: astral-sh/serc
+          permissions: |
+            contents: write
+            pull_requests: write
+      - name: Configure Git
+        run: |
+          git config user.name "astral-automations-bot[bot]"
+          git config user.email "305554984+astral-automations-bot[bot]@users.noreply.github.com"
+      - name: Prepare version and changelog
+        run: |
+          if [[ -n "$INPUT_VERSION" ]]; then
+            ./scripts/release.sh --version "$INPUT_VERSION"
+          else
+            ./scripts/release.sh
+          fi
+        env:
+          GITHUB_TOKEN: ${{ steps.token.outputs.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+      - name: Create or update pull request
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          ASSIGNEE: ${{ github.triggering_actor }}
+        run: |
+          gh auth setup-git
+          branch="$(git branch --show-current)"
+          previous="$(git ls-remote origin "refs/heads/$branch" | cut -f1)"
+          git push --force-with-lease="refs/heads/$branch:$previous" origin HEAD:"$branch"
+          pull_request="$(gh pr list --base main --head "$branch" --state open --json url --jq '.[0].url')"
+          if [[ -n "$pull_request" ]]; then
+            gh pr edit "$pull_request" --add-assignee "$ASSIGNEE"
+          else
+            gh pr create --base main --head "$branch" --assignee "$ASSIGNEE" --fill-first
+          fi

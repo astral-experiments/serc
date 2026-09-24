@@ -1,0 +1,157 @@
+name: Build release binaries
+
+on:
+  workflow_call:
+    outputs:
+      distributions:
+        description: Artifact ID containing all verified release distributions
+        value: ${{ jobs.collect.outputs.distributions }}
+
+permissions:
+  contents: read
+
+env:
+  ACTIONS_CACHE_MODE: none
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  sdist:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Build source distribution
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          maturin-version: v1.14.1
+          sccache: false
+          command: sdist
+          args: --out dist
+      - name: Install from the source distribution
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/serc-sdist"
+          "$RUNNER_TEMP/serc-sdist/bin/python" -m pip install dist/serc-*.tar.gz
+          "$RUNNER_TEMP/serc-sdist/bin/serc" --version
+          "$RUNNER_TEMP/serc-sdist/bin/python" -m serc --help
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: serc-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  native-wheels:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-apple-darwin, runner: macos-15-intel, python-arch: x64 }
+          - { target: aarch64-apple-darwin, runner: macos-15, python-arch: arm64 }
+          - { target: x86_64-pc-windows-msvc, runner: windows-2025, python-arch: x64 }
+          - { target: i686-pc-windows-msvc, runner: windows-2025, python-arch: x86 }
+          - { target: aarch64-pc-windows-msvc, runner: windows-11-arm, python-arch: arm64 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+          architecture: ${{ matrix.python-arch }}
+      - name: Build wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          maturin-version: v1.14.1
+          sccache: false
+          target: ${{ matrix.target }}
+          args: --release --locked --out dist --compatibility pypi
+      - name: Test installed wheel
+        run: python scripts/test-release-wheel.py dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: serc-wheels-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  linux-wheels:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, manylinux: "2_17", test: true }
+          - { target: i686-unknown-linux-gnu, manylinux: "2_17" }
+          - { target: aarch64-unknown-linux-gnu, manylinux: "2_28" }
+          - { target: armv7-unknown-linux-gnueabihf, manylinux: "2_17" }
+          - { target: powerpc64le-unknown-linux-gnu, manylinux: "2_17" }
+          - { target: s390x-unknown-linux-gnu, manylinux: "2_17" }
+          - { target: riscv64gc-unknown-linux-gnu, manylinux: "2_31" }
+          - { target: x86_64-unknown-linux-musl, manylinux: musllinux_1_1 }
+          - { target: i686-unknown-linux-musl, manylinux: musllinux_1_1 }
+          - { target: aarch64-unknown-linux-musl, manylinux: musllinux_1_1 }
+          - { target: armv7-unknown-linux-musleabihf, manylinux: musllinux_1_1 }
+          - { target: arm-unknown-linux-musleabihf, manylinux: auto }
+          - { target: riscv64gc-unknown-linux-musl, manylinux: musllinux_1_1 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Build portable wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          maturin-version: v1.14.1
+          sccache: false
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist --compatibility pypi
+      - name: Test installed wheel
+        if: matrix.test
+        run: python scripts/test-release-wheel.py dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: serc-wheels-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  collect:
+    needs: [sdist, native-wheels, linux-wheels]
+    runs-on: ubuntu-24.04
+    outputs:
+      distributions: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: serc-wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: serc-sdist
+          path: dist
+      - name: Check distribution contents
+        run: python3 scripts/check-release-distributions.py dist --expected-wheels 18
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        id: upload
+        with:
+          name: serc-distributions
+          path: dist/*
+          if-no-files-found: error

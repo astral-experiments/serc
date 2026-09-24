@@ -337,18 +337,18 @@ fn opcode_locations_preserve_multiline_attribute_and_call_ranges() {
 
     assert_eq!(
         compiler.call_opcode_location(same_line),
-        compiler.source_location(same_line.range)
+        compiler.source_location(same_line.range())
     );
     assert_eq!(
         compiler.call_opcode_location(split_method),
         compiler.source_location(TextRange::new(
             split_method_attribute.attr.range().start(),
-            split_method.range.end(),
+            split_method.range().end(),
         ))
     );
     assert_eq!(
         compiler.call_opcode_location(split_import),
-        compiler.source_location(split_import.range)
+        compiler.source_location(split_import.range())
     );
     assert_eq!(
         compiler.attribute_opcode_location(split_attribute),

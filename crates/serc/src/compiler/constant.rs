@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
 use ruff_python_ast::{
-    BoolOp, Expr, ExprBinOp, ExprContext, ExprStringLiteral, FStringPart,
+    BoolOp, Expr, ExprBinOp, ExprContext, ExprStringLiteral, FStringPartRef,
     InterpolatedStringElement, Number, Operator, Stmt, UnaryOp,
 };
 use ruff_text_size::Ranged;
@@ -1833,8 +1833,8 @@ pub(super) fn fold_constant_with_literals(
             let mut value = String::new();
             for part in &fstring.value {
                 match part {
-                    FStringPart::Literal(literal) => value.push_str(&literal.value),
-                    FStringPart::FString(fstring) => {
+                    FStringPartRef::Literal(literal) => value.push_str(&literal.value),
+                    FStringPartRef::FString(fstring) => {
                         for element in &fstring.elements {
                             let InterpolatedStringElement::Literal(literal) = element else {
                                 return None;
@@ -3917,9 +3917,9 @@ fn first_constant(
                         }
                     }
                     Expr::Compare(comparison) => {
-                        self.visit_expr(&comparison.left);
-                        for (index, comparator) in comparison.comparators.iter().enumerate() {
-                            if index + 1 == comparison.comparators.len()
+                        self.visit_expr(comparison.first_operand());
+                        for (index, comparator) in comparison.comparators().iter().enumerate() {
+                            if index + 1 == comparison.comparators().len()
                                 && matches!(
                                     comparison.ops[index],
                                     ruff_python_ast::CmpOp::In | ruff_python_ast::CmpOp::NotIn
@@ -3941,14 +3941,18 @@ fn first_constant(
             }
             if self.compiler.context.python_version <= PythonVersion::Py313 {
                 let comprehension = match expression {
-                    Expr::ListComp(comprehension) => {
-                        Some((&comprehension.generators, None, comprehension.elt.as_ref()))
-                    }
-                    Expr::SetComp(comprehension) => {
-                        Some((&comprehension.generators, None, comprehension.elt.as_ref()))
-                    }
+                    Expr::ListComp(comprehension) => Some((
+                        &comprehension.generators[..],
+                        None,
+                        comprehension.elt.as_ref(),
+                    )),
+                    Expr::SetComp(comprehension) => Some((
+                        &comprehension.generators[..],
+                        None,
+                        comprehension.elt.as_ref(),
+                    )),
                     Expr::DictComp(comprehension) => Some((
-                        &comprehension.generators,
+                        &comprehension.generators[..],
                         comprehension.key.as_deref(),
                         comprehension.value.as_ref(),
                     )),
