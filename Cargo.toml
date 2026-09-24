@@ -18,13 +18,13 @@ encoding_rs = "0.8.35"
 hashbrown = { version = "0.17.1", default-features = false }
 libmimalloc-sys = { version = "0.1.49", default-features = false }
 mimalloc = { version = "0.1.52", default-features = false }
-ruff_index = { version = "=0.0.14", git = "https://github.com/astral-sh/ruff", rev = "62914c4b9b79a9e5004374a9c482ad2ed69290e1" }
-ruff_python_ast = { version = "=0.0.14", git = "https://github.com/astral-sh/ruff", rev = "62914c4b9b79a9e5004374a9c482ad2ed69290e1" }
-ruff_python_codegen = { version = "=0.0.14", git = "https://github.com/astral-sh/ruff", rev = "62914c4b9b79a9e5004374a9c482ad2ed69290e1" }
-ruff_python_literal = { version = "=0.0.14", git = "https://github.com/astral-sh/ruff", rev = "62914c4b9b79a9e5004374a9c482ad2ed69290e1" }
-ruff_python_parser = { version = "=0.0.14", git = "https://github.com/astral-sh/ruff", rev = "62914c4b9b79a9e5004374a9c482ad2ed69290e1" }
-ruff_source_file = { version = "=0.0.14", git = "https://github.com/astral-sh/ruff", rev = "62914c4b9b79a9e5004374a9c482ad2ed69290e1" }
-ruff_text_size = { version = "=0.0.14", git = "https://github.com/astral-sh/ruff", rev = "62914c4b9b79a9e5004374a9c482ad2ed69290e1" }
+ruff_index = "0.0.15"
+ruff_python_ast = "0.0.15"
+ruff_python_codegen = "0.0.15"
+ruff_python_literal = "0.0.15"
+ruff_python_parser = "0.0.15"
+ruff_source_file = "0.0.15"
+ruff_text_size = "0.0.15"
 rustc-hash = "2.0.0"
 smallvec = "1.15.2"
 

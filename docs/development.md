@@ -18,8 +18,9 @@ checked against its exact release and bytecode magic number. CI also checks
 generated target metadata. The Python style gate requires exactly Ruff 0.16.8;
 install it with `python3 -m pip install ruff==0.16.8`.
 
-`./scripts/check-ruff-pin` verifies that the Cargo manifest, lockfile, submodule
-gitlink, and initialized, clean Ruff submodule all use the same revision.
+`./scripts/check-ruff-pin` uses `cargo metadata --locked` to verify that the
+Ruff crates.io dependencies resolve to one release and that their published
+source revisions match the initialized, clean corpus submodule.
 
 ## Profile-guided release build
 

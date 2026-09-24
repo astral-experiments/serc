@@ -23,8 +23,9 @@ git submodule update --init vendor/ruff
 ```
 
 The baseline covers 2,470 `.py` fixtures from Ruff's parser, linter, formatter,
-and ty semantic resources. Ruff's dependencies, lockfile, and clean submodule
-must all match revision `62914c4b9b79a9e5004374a9c482ad2ed69290e1`.
+and ty semantic resources. Ruff's crates.io dependencies use release `0.0.15`;
+their published source revisions and the clean submodule must all match
+`0be08a206f9c3180afd3e93bcc792ed5cb1f4db1`.
 
 | CPython   | Byte-identical accepted | CPython-rejected | Matched rejections | Serc accepted | Compiler failures |
 | --------- | ----------------------: | ---------------: | -----------------: | ------------: | ----------------: |
