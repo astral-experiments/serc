@@ -1241,6 +1241,24 @@ def parent():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_empty_string_slice_bounds() {
+        for source in [
+            "subject['':]\n",
+            "subject[:'']\n",
+            "subject[::'']\n",
+            "subject['':'':'']\n",
+            "subject['':'%']\n",
+            "subject['':'fine':'é']\nsubject['x':'': 'Ā']\n",
+            "before = ('', '-')\nsubject['':'-']\n",
+            "subject['':'-']\nafter = ('', '-')\n",
+            "before = ''\nsubject['':]\nsubject[:'']\nsubject[::'']\nafter = ''\n",
+            "def first(subject):\n    return subject['':]\ndef second(subject):\n    return '', subject[:'']\n",
+        ] {
+            assert_matches_cpython_marshal(source, "empty_string_slice.py");
+        }
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_origin_sensitive_frozenset_identity() {
         let source = r#"def membership_first(kind):
     if kind in {None, "sort"}:
