@@ -1572,6 +1572,22 @@ fn compile_matches_cpython_cache_paths_and_pyc() {
 fn compile_matches_cpython_for_non_utf8_paths() {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
+    use std::path::Path;
+
+    fn fixture_created(result: std::io::Result<()>, path: &Path) -> bool {
+        // Darwin's EILSEQ is 92: APFS may refuse non-UTF-8 names, while Unix APIs can still
+        // represent them. Other errors and filesystems that accept the fixtures must run the test.
+        const DARWIN_EILSEQ: i32 = 92;
+        match result {
+            Ok(()) => true,
+            Err(error)
+                if cfg!(target_os = "macos") && error.raw_os_error() == Some(DARWIN_EILSEQ) =>
+            {
+                false
+            }
+            Err(error) => panic!("failed to create {path:?}: {error}"),
+        }
+    }
 
     fn oracle(version: serc::PythonVersion) -> Command {
         match version {
@@ -1592,7 +1608,9 @@ fn compile_matches_cpython_for_non_utf8_paths() {
     let nested = directory
         .path()
         .join(OsString::from_vec(b"dir_\xf0\x9f\x90\xa7_\xfe".to_vec()));
-    fs_err::create_dir(&nested).unwrap();
+    if !fixture_created(std::fs::create_dir(&nested), &nested) {
+        return;
+    }
 
     let stems = [
         b"caf\xc3\xa9_\xff_mid_\xe2\x82".as_slice(),
@@ -1628,7 +1646,9 @@ sys.stdout.buffer.write(source.encode())
             .output()
             .unwrap();
         assert!(source.status.success(), "{source_path:?}: {source:?}");
-        fs_err::write(&source_path, source.stdout).unwrap();
+        if !fixture_created(std::fs::write(&source_path, source.stdout), &source_path) {
+            return;
+        }
         std::fs::File::options()
             .write(true)
             .open(&source_path)

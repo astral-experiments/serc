@@ -320,6 +320,106 @@ for filename in ["\0", "\0prefix", "in\0side", "suffix\0"]:
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn matches_cpython_marshal_for_in_memory_unix_path_filenames() {
+        use std::ffi::OsStr;
+        use std::io::Write as _;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::path::Path;
+        use std::process::{Command, Stdio};
+
+        use serc::{CompileOptions, PythonVersion, compile_bytes_with_path_and_options};
+
+        let source = b"def outer():\n    def inner():\n        return 42\n    return inner\n";
+        let filenames: &[&[u8]] = &[
+            b"plain.py",
+            b"nested/path.py",
+            b"caf\xc3\xa9.py",
+            b"cafe\xcc\x81.py",
+            b"replacement-\xef\xbf\xbd.py",
+            b"invalid-\xff.py",
+            b"continuation-\x80\xbf.py",
+            b"truncated-\xe2\x82.py",
+            b"surrogate-\xed\xa0\x80.py",
+            b"mixed-\xc3\xa9-\xff-\xf0\x9f\x90\xa7.py",
+        ];
+        let oracle_script = r"
+import importlib.util, marshal, os, sys, types
+assert sys.implementation.name == 'cpython'
+assert sys.version.split()[0] == sys.argv[2]
+assert importlib.util.MAGIC_NUMBER.hex() == sys.argv[3]
+filename = os.fsdecode(bytes.fromhex(sys.argv[1]))
+code = compile(sys.stdin.buffer.read(), filename, 'exec', dont_inherit=True, optimize=0)
+def assert_filenames(code):
+    assert code.co_filename is filename
+    for constant in code.co_consts:
+        if isinstance(constant, types.CodeType):
+            assert_filenames(constant)
+assert_filenames(code)
+sys.stdout.buffer.write(marshal.dumps(code))
+";
+
+        for (python_version, variable, default) in [
+            (
+                PythonVersion::Py312,
+                "SERC_TEST_PYTHON_312",
+                "python3.12",
+            ),
+            (
+                PythonVersion::Py313,
+                "SERC_TEST_PYTHON_313",
+                "python3.13",
+            ),
+            (PythonVersion::Py314, "SERC_TEST_PYTHON", "python3.14"),
+            (
+                PythonVersion::Py315,
+                "SERC_TEST_PYTHON_315",
+                "python3.15",
+            ),
+        ] {
+            let executable = std::env::var_os(variable).unwrap_or_else(|| default.into());
+            let target = python_version.target();
+            let options = CompileOptions {
+                python_version,
+                ..CompileOptions::default()
+            };
+            for &filename in filenames {
+                let mut hex = String::new();
+                for byte in filename {
+                    write!(hex, "{byte:02x}").unwrap();
+                }
+                let mut oracle = Command::new(&executable)
+                    .args(["-B", "-I", "-S", "-X", "utf8", "-c", oracle_script])
+                    .args([
+                        &hex,
+                        target.tag.strip_prefix('v').unwrap(),
+                        &target.magic_hex(),
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap_or_else(|error| panic!("could not start {executable:?}: {error}"));
+                oracle.stdin.take().unwrap().write_all(source).unwrap();
+                let expected = oracle.wait_with_output().unwrap();
+                assert!(
+                    expected.status.success(),
+                    "{python_version}, {hex}: {}",
+                    String::from_utf8_lossy(&expected.stderr),
+                );
+                let actual = compile_bytes_with_path_and_options(
+                    source,
+                    Path::new(OsStr::from_bytes(filename)),
+                    &options,
+                )
+                .unwrap()
+                .marshal();
+                assert_eq!(actual, expected.stdout, "{python_version}, {hex}");
+            }
+        }
+    }
+
     #[test]
     fn matches_cpython_marshal_for_supported_source_encodings() {
         let cases: [(&str, &[u8]); 9] = [
