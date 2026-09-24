@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "serc"
 version = "0.1.0"
-description = "A Rust compiler from Python source to CPython bytecode"
+description = "An experimental CPython bytecode compiler, written in Rust."
 authors = [{ name = "Astral Software Inc.", email = "hey@astral.sh" }]
 requires-python = ">=3.8"
 license = "MIT OR Apache-2.0"

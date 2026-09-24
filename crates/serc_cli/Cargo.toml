@@ -1,7 +1,7 @@
 [package]
 name = "serc-cli"
 version = "0.1.0"
-description = "Command-line interface for the Serc Python bytecode compiler"
+description = "An experimental CPython bytecode compiler, written in Rust."
 default-run = "serc"
 edition = { workspace = true }
 rust-version = { workspace = true }
