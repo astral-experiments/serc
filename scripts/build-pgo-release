@@ -332,8 +332,8 @@ def main():
         # Use the comparator's default roots; keep expectations in sync with
         # check-cpython-compatibility (3.14).
         outcomes = {
-            "matched-rejection": 214,
-            "rejection-mismatch": 5,
+            "matched-rejection": 216,
+            "rejection-mismatch": 3,
             "byte-mismatch": 0,
             "unsupported": 0,
             "parse-mismatch": 0,
