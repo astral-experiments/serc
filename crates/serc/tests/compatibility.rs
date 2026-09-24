@@ -194,13 +194,21 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_bom_and_newlines_before_compiling() {
+    fn normalizes_byte_source_bom_and_text_source_newlines_before_compiling() {
         let source =
             "\u{feff}def greet(name):\r\n    message = f\"héllo, {name}\"\r    return message\r\n";
         let normalized = "def greet(name):\n    message = f\"héllo, {name}\"\n    return message\n";
 
         assert_eq!(
-            compile(source, "greet.py").unwrap().marshal(),
+            compile_bytes(source.as_bytes(), "greet.py")
+                .unwrap()
+                .marshal(),
+            compile(normalized, "greet.py").unwrap().marshal()
+        );
+        assert_eq!(
+            compile(source.trim_start_matches('\u{feff}'), "greet.py")
+                .unwrap()
+                .marshal(),
             compile(normalized, "greet.py").unwrap().marshal()
         );
     }
