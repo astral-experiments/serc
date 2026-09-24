@@ -29,6 +29,45 @@ fn matches_cpython_float_power_overflow_and_nan_controls() {
 }
 
 #[test]
+fn matches_cpython_float_power_nan_operand_signs() {
+    let nans = ["1e309 - 1e309", "-(1e309 - 1e309)"];
+    let reals = ["0", "-0.0", "1", "1.0", "-1.0", "2.0", "1e309"];
+    for nan in nans {
+        for real in reals {
+            for (base, exponent) in [(nan, real), (real, nan)] {
+                let source = format!("def power():\n    return ({base}) ** ({exponent})\n");
+                common::assert_matches_cpython_marshal(&source, "float_power_nan_sign.py");
+            }
+        }
+        for other_nan in nans {
+            let source = format!("def power():\n    return ({nan}) ** ({other_nan})\n");
+            common::assert_matches_cpython_marshal(&source, "float_power_nan_sign.py");
+        }
+    }
+}
+
+#[test]
+fn executes_float_power_with_nan_operand_signs() {
+    common::assert_executes(
+        r"
+from math import copysign
+
+for value in (
+    (1e309 - 1e309) ** 1,
+    (-(1e309 - 1e309)) ** 1,
+    (1e309 - 1e309) ** (-(1e309 - 1e309)),
+    (-(1e309 - 1e309)) ** (1e309 - 1e309),
+    0 ** (1e309 - 1e309),
+    (1e309 - 1e309) ** 0,
+    1 ** (1e309 - 1e309),
+):
+    print(copysign(1, value))
+",
+        "-1.0\n1.0\n-1.0\n1.0\n-1.0\n1.0\n1.0\n",
+    );
+}
+
+#[test]
 fn executes_infinite_float_powers_and_preserves_errors() {
     common::assert_executes(
         r"
