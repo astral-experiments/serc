@@ -109,6 +109,62 @@ def continuing_assignment(first, second):
     }
 
     #[test]
+    fn distinguishes_a_byte_order_mark_in_text_and_byte_source() {
+        use serc::{
+            CompileOptions, InitialInternState, PythonVersion, compile_bytes_with_options,
+            compile_with_intern_state, compile_with_options,
+        };
+
+        let text = "\u{feff}value = 1\r\n";
+        let expected_message = "invalid non-printable character U+FEFF";
+        let assert_rejected = |error: CompileError| {
+            assert!(error.to_string().contains(expected_message), "{error}");
+            assert_eq!(error.range().unwrap().start().to_u32(), 0);
+            assert_eq!(error.range().unwrap().end().to_u32(), 3);
+        };
+        assert_rejected(compile(text, "bom.py").unwrap_err());
+        assert_rejected(compile_to_pyc(text, "bom.py", 0).unwrap_err());
+        assert_rejected(
+            compile_with_intern_state(text, "bom.py", &InitialInternState::default()).unwrap_err(),
+        );
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let options = CompileOptions {
+                python_version,
+                ..CompileOptions::default()
+            };
+            assert_rejected(compile_with_options(text, "bom.py", &options).unwrap_err());
+            assert_eq!(
+                compile_bytes_with_options(text.as_bytes(), "bom.py", &options)
+                    .unwrap()
+                    .marshal(),
+                compile_with_options("value = 1\n", "bom.py", &options)
+                    .unwrap()
+                    .marshal(),
+            );
+        }
+
+        let output = super::common::python_3145_command()
+            .args([
+                "-c",
+                "try:\n compile(chr(0xfeff) + 'value = 1\\n', 'bom.py', 'exec')\nexcept SyntaxError as error:\n print(error.msg, error.lineno, error.offset)\nelse:\n raise AssertionError('accepted text BOM')",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            format!("{expected_message} 1 1"),
+        );
+        assert_matches_cpython_marshal_bytes(text.as_bytes(), "bom.py");
+        assert_matches_cpython_marshal("# \u{feff}\nvalue = '\u{feff}'\n", "literal_bom.py");
+    }
+
+    #[test]
     fn rejects_null_characters_in_text_source() {
         use serc::{
             CompileOptions, InitialInternState, PythonVersion, SourceDecodeError,
@@ -180,13 +236,21 @@ def continuing_assignment(first, second):
     }
 
     #[test]
-    fn normalizes_bom_and_newlines_before_compiling() {
+    fn normalizes_byte_source_bom_and_text_source_newlines_before_compiling() {
         let source =
             "\u{feff}def greet(name):\r\n    message = f\"héllo, {name}\"\r    return message\r\n";
         let normalized = "def greet(name):\n    message = f\"héllo, {name}\"\n    return message\n";
 
         assert_eq!(
-            compile(source, "greet.py").unwrap().marshal(),
+            compile_bytes(source.as_bytes(), "greet.py")
+                .unwrap()
+                .marshal(),
+            compile(normalized, "greet.py").unwrap().marshal()
+        );
+        assert_eq!(
+            compile(source.trim_start_matches('\u{feff}'), "greet.py")
+                .unwrap()
+                .marshal(),
             compile(normalized, "greet.py").unwrap().marshal()
         );
     }
