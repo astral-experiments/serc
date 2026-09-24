@@ -2,7 +2,6 @@ use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use ruff_python_ast::token::{TokenKind, Tokens};
 use ruff_python_ast::visitor::transformer::{Transformer, walk_expr as transform_expr};
@@ -19,7 +18,9 @@ use ruff_text_size::{Ranged, TextLen, TextRange, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::assembler::SourceLocation;
-use crate::code_object::{CodeInterningSummary, CodeObject, CompilationInterningEvent, Constant};
+use crate::code_object::{
+    CodeFilename, CodeInterningSummary, CodeObject, CompilationInterningEvent, Constant,
+};
 
 use super::constant::{
     constant_slice_with_literals, explicit_surrogate_string, fold_constant,
@@ -122,7 +123,7 @@ impl ConstantOrigins {
 #[derive(Debug)]
 pub(super) struct CompilationContext<'source> {
     pub(super) python_version: crate::PythonVersion,
-    pub(super) filename: Arc<str>,
+    pub(super) filename: CodeFilename,
     pub(super) source: &'source str,
     pub(super) tokens: &'source Tokens,
     line_index: LineIndex,
@@ -163,11 +164,17 @@ impl<'source> CompilationContext<'source> {
         tokens: &'source Tokens,
         body: &'source Suite,
     ) -> Self {
-        Self::with_python_version(filename, source, tokens, body, crate::PythonVersion::Py314)
+        Self::with_python_version(
+            filename.into(),
+            source,
+            tokens,
+            body,
+            crate::PythonVersion::Py314,
+        )
     }
 
     pub(super) fn with_python_version(
-        filename: &str,
+        filename: CodeFilename,
         source: &'source str,
         tokens: &'source Tokens,
         body: &'source Suite,
@@ -210,7 +217,7 @@ impl<'source> CompilationContext<'source> {
             .then(RefCell::default);
         Self {
             python_version,
-            filename: Arc::from(filename),
+            filename,
             source,
             tokens,
             line_index: LineIndex::from_source_text(source),
@@ -520,8 +527,8 @@ impl<'source> CompilationContext<'source> {
         if !origins.tracks(value) {
             return None;
         }
-        let metadata_already_interned =
-            value == self.filename.as_ref() || origins.interned_qualified_names.contains(value);
+        let metadata_already_interned = self.filename.as_utf8() == Some(value)
+            || origins.interned_qualified_names.contains(value);
         match origins.strings.entry(value.to_string()) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 // A dotted import interns its complete spelling while parsing. In 3.13,
@@ -2290,7 +2297,7 @@ mod tests {
             assert_eq!(can_fold_bytes(&statement.value), possible_bytes, "{source}");
             for version in [Py313, Py314, Py315] {
                 let context = CompilationContext::with_python_version(
-                    "bytes.py",
+                    "bytes.py".into(),
                     source,
                     parsed.tokens(),
                     parsed.suite(),

@@ -1,4 +1,4 @@
-use crate::code_object::{CodeObject, Constant, MetadataId};
+use crate::code_object::{CodeFilename, CodeObject, Constant, MetadataId};
 use crate::{InitialInternState, PythonVersion};
 
 use super::graph::{ObjectGraph, ObjectReference, Occurrence, OccurrenceCursor, OccurrenceKind};
@@ -274,11 +274,23 @@ impl Writer<'_, '_, '_> {
         value: &[u8],
         reference_mode: ReferenceMode,
     ) {
-        let Some(flag) = self.begin_object(object, reference_mode) else {
+        let object = self.graph.object_for_writing(object);
+        let interned = object.is_interned();
+        let reference_mode = if interned {
+            ReferenceMode::Forced
+        } else {
+            reference_mode
+        };
+        let reference = object.reference_for_write(reference_mode, &mut self.reference_count);
+        let Some(flag) = self.write_reference(reference) else {
             return;
         };
         self.byte_and_long(
-            TYPE_UNICODE | flag,
+            (if interned {
+                TYPE_INTERNED
+            } else {
+                TYPE_UNICODE
+            }) | flag,
             value
                 .len()
                 .try_into()
@@ -544,13 +556,21 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
         self.string_with_object(object, value, ReferenceMode::IfShared);
     }
 
-    fn code_filename(&mut self, code: &'code CodeObject, metadata_id: Option<MetadataId>) {
-        if self.graph.python_version() == PythonVersion::Py312 {
+    fn code_filename(&mut self, code: &'code CodeObject, _metadata_id: Option<MetadataId>) {
+        let reference_mode = if self.graph.python_version() == PythonVersion::Py312 {
             // The compile caller retains its filename alongside the code object.
-            let object = self.next_object(OccurrenceKind::MetadataString);
-            self.string_with_object(object, &code.filename, ReferenceMode::Forced);
+            ReferenceMode::Forced
         } else {
-            self.metadata_string(&code.filename, metadata_id);
+            ReferenceMode::IfShared
+        };
+        let object = self.next_object(OccurrenceKind::MetadataString);
+        match &code.filename {
+            CodeFilename::Utf8(filename) => {
+                self.string_with_object(object, filename, reference_mode);
+            }
+            CodeFilename::Surrogate(filename) => {
+                self.surrogate_string_with_object(object, filename, reference_mode);
+            }
         }
     }
 
