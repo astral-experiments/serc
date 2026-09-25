@@ -7,12 +7,74 @@ file records its exact target, source or capture provenance, hashes, entry
 counts, and filtering rules. Other process states can be supplied through
 `InitialInternState`.
 
-| Target            | Commit                                     |                        Supplemental strings |
-| ----------------- | ------------------------------------------ | ------------------------------------------: |
-| CPython 3.12.14   | `2abcf904b8dac8c999d2b3aac76681abb333798a` |                                       2,956 |
-| CPython 3.13.15   | `4061bc4c35f7c26f25264666d4ba083b93d2f6f9` |                                       2,648 |
-| CPython 3.14.5    | `5607950ef232dad16d75c0cf53101d9649d89115` | 1,045 (source-derived bootstrap supplement) |
-| CPython 3.15.0rc2 | `435c9e5a798c99653e3ab64ce29baed0e4f3dfee` |                                       2,790 |
+| Target            | Commit                                     |                Supplemental strings |
+| ----------------- | ------------------------------------------ | ----------------------------------: |
+| CPython 3.12.14   | `2abcf904b8dac8c999d2b3aac76681abb333798a` |                               2,956 |
+| CPython 3.13.15   | `4061bc4c35f7c26f25264666d4ba083b93d2f6f9` |                               2,648 |
+| CPython 3.14.5    | `5607950ef232dad16d75c0cf53101d9649d89115` | 2,617 (captured startup supplement) |
+| CPython 3.15.0rc2 | `435c9e5a798c99653e3ab64ce29baed0e4f3dfee` |                               2,790 |
+
+## Python 3.14 canonical startup profile
+
+`cpython_3_14_5_startup.json` models the pinned CPython 3.14.5 Linux x86-64
+native build with the GIL enabled, `-I -S -X utf8`, and the neutral
+`marshal`/`sys` oracle recorded in the fixture. Its executable, installed
+runtime, headers, bootstrap script, environment, and empty source are bound by
+SHA-256. This is the declared default bootstrap, not automatic detection of any
+host interpreter or a claim about every Linux build. Different callers supply an
+explicit `InitialInternState`. The Rust host architecture does not identify the
+caller's interpreter; the reference remains the same across Linux hosts.
+
+The complete capture contains 1,034 static entries, 2,021 immortal dynamic
+entries, and 655 mortal dynamic entries. Every mortal entry has an independently
+retained owner: the audit follows strong references from interpreter roots and
+checks the actual canonical pointer, not merely an equal string. The fixture
+records each owner path, the exact layout and audit hashes, and the verified
+count. Roots include module and builtin-type dictionaries, AST and generic-type
+state, the suspended oracle frame, and the `posix` module's cached
+`struct_rusage` name. Weak references, borrowed stack references, and temporary
+capture references are not accepted as owners.
+
+The default assumes this bootstrap remains unchanged throughout compilation; it
+does not model arbitrary caller mutations, import hooks, or warning callbacks.
+Absolute installation filenames are omitted and belong in explicit runtime
+profiles. After subtracting generated static and compiler-initialized strings
+and cached single characters, 2,617 strings supplement the default Linux lookup.
+This covers native startup families such as `_io`, `posix`, `_codecs`,
+`_signal`, `_thread`, `_weakref`, `sys`, and `time`, including builtin and
+extension type descriptors. The independently source-derived bootstrap
+supplement below remains an additional provenance check.
+
+### Reviewing retained ownership
+
+The offline audit is implemented by
+[`audit_startup_owners.py`](../audit_startup_owners.py). Its layout generator,
+[`generate_startup_owner_layout.py`](../generate_startup_owner_layout.py),
+checks the exact committed CPython declarations and admitted installed headers
+before compiling a standalone offset helper. The helper does not link
+`libpython`.
+[`cpython_3_14_5_startup_ownership.json`](cpython_3_14_5_startup_ownership.json)
+records the source declarations, ownership finalizers, layout hash, and
+generator hash used for the fixture.
+
+Given the saved artifacts from a verified capture, repeat the offline proof:
+
+```sh
+python3 -I -B crates/serc/scripts/generate_startup_owner_layout.py --capture-dir /path/to/capture --cpython /path/to/cpython-3.14.5 --headers /path/to/installed/include/python3.14
+python3 -I -B crates/serc/scripts/audit_startup_owners.py --capture-dir /path/to/capture --python /path/to/captured/python3.14
+```
+
+The capture directory supplies `header-provenance.json` (installed and exact-tag
+header hashes), `layout.json` (intern-table layouts), `capture-receipt.json`
+(unchanged runtime and successful observation), and `neutral.metadata.json`
+(executable, snapshot, memory, and output hashes plus the stopped interpreter
+address). `neutral.canonical.json` records the sorted string codepoints and
+intern states; `neutral.addresses.json` maps canonical object addresses to those
+records. `neutral.memory/segments.json` lists sorted address ranges, filenames,
+and SHA-256 hashes for their saved bytes. The audit verifies these hashes,
+follows only strong object edges, and writes `retained-owner-audit.json` with a
+named canonical owner for every mortal entry. These saved-memory inputs are
+local audit artifacts and are not needed by ordinary target generation.
 
 ## Source-derived Python 3.14 bootstrap supplement
 

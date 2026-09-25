@@ -26,6 +26,7 @@
 // Python/codecs.c: sha256:94cc13df09177cf4b50b9d7f289df2a20e70cbe2a7bc5c07b9d48feb7bcf53dd
 // Programs/_freeze_module.c: sha256:ddb95051b0993e421f70e80163d94827ec0889f172132fcd096dfd753f2992b4
 // scripts/target_metadata/cpython_3_14_5_bootstrap.json: sha256:3a55396a7cd0f658d221fa67528ff3390b29db386dac856640ef90b17ef9ad8a
+// scripts/target_metadata/cpython_3_14_5_startup.json: sha256:1c0a3051c44c5307327db0f331d259e65a7e648da1cb5b30a0b2f8d9ca059f02
 
 use super::Opcode;
 
@@ -2115,7 +2116,7 @@ pub(crate) static BOOTSTRAP_INTERNED_STRINGS: &[&str] = &[
     "zlib_codec",
 ];
 
-// Include Linux bootstrap strings in the same exact prefix lookup.
+// Use the canonical isolated Linux profile regardless of the Rust host architecture.
 #[cfg(target_os = "linux")]
 #[rustfmt::skip]
 static LINUX_PREINTERNED_STRINGS: &[&str] = &[
@@ -2123,67 +2124,197 @@ static LINUX_PREINTERNED_STRINGS: &[&str] = &[
     ".type_params", "037", "1026", "1125", "1140", "1250", "1251", "1252", "1253", "1254", "1255",
     "1256", "1257", "1258", "1e309", "273", "424", "437", "500", "646", "775", "850", "852", "855",
     "857", "858", "860", "861", "862", "863", "864", "865", "866", "869", "874", "8859", "932",
-    "936", "949", "950", "<NULL>", "<dictcomp>", "<frozen importlib._bootstrap>",
-    "<frozen importlib._bootstrap_external>", "<genexpr>", "<lambda>", "<listcomp>", "<module>",
-    "<setcomp>", "<string>", "<unknown>", "AppleFrameworkLoader",
-    "AppleFrameworkLoader.create_module", "AttributeError", "BYTECODE_SUFFIXES", "BuiltinImporter",
+    "936", "949", "950", "<NULL>", "<dictcomp>", "<frozen codecs>", "<frozen getpath>",
+    "<frozen importlib._bootstrap>", "<frozen importlib._bootstrap_external>", "<frozen zipimport>",
+    "<genexpr>", "<lambda>", "<listcomp>", "<module>", "<setcomp>", "<string>", "<unknown>",
+    "ABI_THREAD", "AppleFrameworkLoader", "AppleFrameworkLoader.create_module", "ArithmeticError",
+    "AssertionError", "AttributeError", "BOM", "BOM32_BE", "BOM32_LE", "BOM64_BE", "BOM64_LE",
+    "BOM_BE", "BOM_LE", "BOM_UTF16", "BOM_UTF16_BE", "BOM_UTF16_LE", "BOM_UTF32", "BOM_UTF32_BE",
+    "BOM_UTF32_LE", "BOM_UTF8", "BRANCH", "BRANCH_LEFT", "BRANCH_RIGHT", "BUILDDIR_TXT",
+    "BUILDSTDLIB_LANDMARKS", "BUILD_LANDMARK", "BYTECODE_SUFFIXES", "BaseException",
+    "BaseExceptionGroup", "BlockingIOError", "BrokenPipeError", "BufferError",
+    "BufferedIncrementalDecoder", "BufferedIncrementalDecoder.__init__",
+    "BufferedIncrementalDecoder._buffer_decode", "BufferedIncrementalDecoder.decode",
+    "BufferedIncrementalDecoder.getstate", "BufferedIncrementalDecoder.reset",
+    "BufferedIncrementalDecoder.setstate", "BufferedIncrementalEncoder",
+    "BufferedIncrementalEncoder.__init__", "BufferedIncrementalEncoder._buffer_encode",
+    "BufferedIncrementalEncoder.encode", "BufferedIncrementalEncoder.getstate",
+    "BufferedIncrementalEncoder.reset", "BufferedIncrementalEncoder.setstate", "BufferedRWPair",
+    "BufferedRandom", "BufferedReader", "BufferedWriter", "BuiltinImporter",
     "BuiltinImporter.create_module", "BuiltinImporter.exec_module", "BuiltinImporter.find_spec",
     "BuiltinImporter.get_code", "BuiltinImporter.get_source", "BuiltinImporter.is_package",
-    "BytesIO", "CANCELLED", "CodecInfo", "CodecRegistryError", "DEBUG_BUILD",
-    "DEBUG_BYTECODE_SUFFIXES", "DeprecationWarning", "EOFError", "EXTENSION_SUFFIXES", "Exception",
+    "BytesIO", "BytesWarning", "CALL", "CANCELLED", "CLD_CONTINUED", "CLD_DUMPED", "CLD_EXITED",
+    "CLD_KILLED", "CLD_STOPPED", "CLD_TRAPPED", "CLOCK_BOOTTIME", "CLOCK_MONOTONIC",
+    "CLOCK_MONOTONIC_RAW", "CLOCK_PROCESS_CPUTIME_ID", "CLOCK_REALTIME", "CLOCK_THREAD_CPUTIME_ID",
+    "CLONE_FILES", "CLONE_FS", "CLONE_NEWIPC", "CLONE_NEWNET", "CLONE_NEWNS", "CLONE_NEWPID",
+    "CLONE_NEWUSER", "CLONE_NEWUTS", "CLONE_SIGHAND", "CLONE_SYSVSEM", "CLONE_THREAD", "CLONE_VM",
+    "COVERAGE_ID", "CS_GNU_LIBC_VERSION", "CS_GNU_LIBPTHREAD_VERSION", "CS_LFS64_CFLAGS",
+    "CS_LFS64_LDFLAGS", "CS_LFS64_LIBS", "CS_LFS64_LINTFLAGS", "CS_LFS_CFLAGS", "CS_LFS_LDFLAGS",
+    "CS_LFS_LIBS", "CS_LFS_LINTFLAGS", "CS_PATH", "CS_XBS5_ILP32_OFF32_CFLAGS",
+    "CS_XBS5_ILP32_OFF32_LDFLAGS", "CS_XBS5_ILP32_OFF32_LIBS", "CS_XBS5_ILP32_OFF32_LINTFLAGS",
+    "CS_XBS5_ILP32_OFFBIG_CFLAGS", "CS_XBS5_ILP32_OFFBIG_LDFLAGS", "CS_XBS5_ILP32_OFFBIG_LIBS",
+    "CS_XBS5_ILP32_OFFBIG_LINTFLAGS", "CS_XBS5_LP64_OFF64_CFLAGS", "CS_XBS5_LP64_OFF64_LDFLAGS",
+    "CS_XBS5_LP64_OFF64_LIBS", "CS_XBS5_LP64_OFF64_LINTFLAGS", "CS_XBS5_LPBIG_OFFBIG_CFLAGS",
+    "CS_XBS5_LPBIG_OFFBIG_LDFLAGS", "CS_XBS5_LPBIG_OFFBIG_LIBS", "CS_XBS5_LPBIG_OFFBIG_LINTFLAGS",
+    "C_RAISE", "C_RETURN", "CallableProxyType", "ChildProcessError", "CloseKey", "Codec",
+    "Codec.decode", "Codec.encode", "CodecInfo", "CodecInfo.__getnewargs__", "CodecInfo.__new__",
+    "CodecInfo.__repr__", "CodecRegistryError", "ConnectionAbortedError", "ConnectionError",
+    "ConnectionRefusedError", "ConnectionResetError", "DEBUGGER_ID", "DEBUG_BUILD",
+    "DEBUG_BYTECODE_SUFFIXES", "DEFAULT_BUFFER_SIZE", "DEFAULT_PROGRAM_NAME", "DELIM", "DISABLE",
+    "DeprecationWarning", "DirEntry", "EFD_CLOEXEC", "EFD_NONBLOCK", "EFD_SEMAPHORE",
+    "END_CENTRAL_DIR_LOCATOR_SIZE_64", "END_CENTRAL_DIR_SIZE", "END_CENTRAL_DIR_SIZE_64",
+    "ENV_PATH", "ENV_PYTHONEXECUTABLE", "ENV_PYTHONHOME", "ENV_PYTHONPATH",
+    "ENV___PYVENV_LAUNCHER__", "EOFError", "EXCEPTION_HANDLED", "EXEC_PREFIX", "EXE_SUFFIX",
+    "EXTENSION_SUFFIXES", "EX_CANTCREAT", "EX_CONFIG", "EX_DATAERR", "EX_IOERR", "EX_NOHOST",
+    "EX_NOINPUT", "EX_NOPERM", "EX_NOUSER", "EX_OK", "EX_OSERR", "EX_OSFILE", "EX_PROTOCOL",
+    "EX_SOFTWARE", "EX_TEMPFAIL", "EX_UNAVAILABLE", "EX_USAGE", "Ellipsis", "EncodedFile",
+    "EncodingWarning", "EnumKey", "EnvironmentError", "Exception", "ExceptionGroup",
     "ExtensionFileLoader", "ExtensionFileLoader.__eq__", "ExtensionFileLoader.__hash__",
     "ExtensionFileLoader.__init__", "ExtensionFileLoader.create_module",
     "ExtensionFileLoader.exec_module", "ExtensionFileLoader.get_code",
     "ExtensionFileLoader.get_filename", "ExtensionFileLoader.get_source",
     "ExtensionFileLoader.is_package", "ExtensionFileLoader.is_package.<locals>.<genexpr>",
-    "FINISHED", "False", "FileExistsError", "FileFinder", "FileFinder.__init__",
-    "FileFinder.__init__.<locals>.<genexpr>", "FileFinder.__repr__", "FileFinder._fill_cache",
-    "FileFinder._get_spec", "FileFinder.find_spec", "FileFinder.invalidate_caches",
-    "FileFinder.path_hook", "FileFinder.path_hook.<locals>.path_hook_for_FileFinder", "FileIO",
-    "FileLoader", "FileLoader.__eq__", "FileLoader.__hash__", "FileLoader.__init__",
-    "FileLoader.get_data", "FileLoader.get_filename", "FileLoader.get_resource_reader",
-    "FileLoader.load_module", "FileNotFoundError", "FileReader", "FrozenImporter",
+    "FINISHED", "F_LOCK", "F_OK", "F_TEST", "F_TLOCK", "F_ULOCK", "False", "FileExistsError",
+    "FileFinder", "FileFinder.__init__", "FileFinder.__init__.<locals>.<genexpr>",
+    "FileFinder.__repr__", "FileFinder._fill_cache", "FileFinder._get_spec", "FileFinder.find_spec",
+    "FileFinder.invalidate_caches", "FileFinder.path_hook",
+    "FileFinder.path_hook.<locals>.path_hook_for_FileFinder", "FileIO", "FileLoader",
+    "FileLoader.__eq__", "FileLoader.__hash__", "FileLoader.__init__", "FileLoader.get_data",
+    "FileLoader.get_filename", "FileLoader.get_resource_reader", "FileLoader.load_module",
+    "FileNotFoundError", "FileReader", "FloatingPointError", "FrozenImporter",
     "FrozenImporter._fix_up_module", "FrozenImporter._resolve_filename",
     "FrozenImporter.create_module", "FrozenImporter.exec_module", "FrozenImporter.find_spec",
     "FrozenImporter.get_code", "FrozenImporter.get_source", "FrozenImporter.is_package",
-    "FrozenImporter.load_module", "HKEY_CURRENT_USER", "HKEY_LOCAL_MACHINE", "ImportError",
-    "ImportWarning", "IncrementalNewlineDecoder", "IndexError", "JSONDecodeError", "KeyError",
-    "KeyedRef", "LookupError", "MAGIC_NUMBER", "MetadataPathFinder", "ModuleNotFoundError",
-    "ModuleSpec", "ModuleSpec.__eq__", "ModuleSpec.__init__", "ModuleSpec.__repr__",
-    "ModuleSpec.cached", "ModuleSpec.has_location", "ModuleSpec.parent", "NamespaceLoader",
-    "NamespaceLoader.__init__", "NamespaceLoader.create_module", "NamespaceLoader.exec_module",
-    "NamespaceLoader.get_code", "NamespaceLoader.get_resource_reader", "NamespaceLoader.get_source",
-    "NamespaceLoader.is_package", "NamespaceLoader.load_module", "NamespaceReader",
+    "FrozenImporter.load_module", "FutureWarning", "GeneratorExit", "HKEY_CURRENT_USER",
+    "HKEY_LOCAL_MACHINE", "INSTRUCTION", "IOError", "ITIMER_PROF", "ITIMER_REAL", "ITIMER_VIRTUAL",
+    "ImportError", "ImportWarning", "IncrementalDecoder", "IncrementalDecoder.__init__",
+    "IncrementalDecoder.decode", "IncrementalDecoder.getstate", "IncrementalDecoder.reset",
+    "IncrementalDecoder.setstate", "IncrementalEncoder", "IncrementalEncoder.__init__",
+    "IncrementalEncoder.encode", "IncrementalEncoder.getstate", "IncrementalEncoder.reset",
+    "IncrementalEncoder.setstate", "IncrementalNewlineDecoder", "IndentationError", "IndexError",
+    "InterruptedError", "IsADirectoryError", "ItimerError", "JSONDecodeError", "JUMP", "KeyError",
+    "KeyboardInterrupt", "KeyedRef", "LINE", "Lib", "LockType", "LookupError", "MAGIC_NUMBER",
+    "MAX_COMMENT_LEN", "MAX_UINT32", "MISSING", "MemoryError", "MetadataPathFinder",
+    "ModuleNotFoundError", "ModuleSpec", "ModuleSpec.__eq__", "ModuleSpec.__init__",
+    "ModuleSpec.__repr__", "ModuleSpec.cached", "ModuleSpec.has_location", "ModuleSpec.parent",
+    "NGROUPS_MAX", "NO_EVENTS", "NSIG", "NameError", "NamespaceLoader", "NamespaceLoader.__init__",
+    "NamespaceLoader.create_module", "NamespaceLoader.exec_module", "NamespaceLoader.get_code",
+    "NamespaceLoader.get_resource_reader", "NamespaceLoader.get_source",
+    "NamespaceLoader.is_package", "NamespaceLoader.load_module", "NamespaceReader", "None",
     "NotADirectoryError", "NotImplemented", "NotImplementedError", "OPTIMIZED_BYTECODE_SUFFIXES",
-    "OSError", "O_CREAT", "O_EXCL", "O_WRONLY", "OpenKey", "OverflowError", "PENDING",
-    "PYTHONCASEOK", "PathFinder", "PathFinder._get_spec", "PathFinder._path_hooks",
+    "OPTIMIZER_ID", "OSError", "O_ACCMODE", "O_APPEND", "O_ASYNC", "O_CLOEXEC", "O_CREAT",
+    "O_DIRECT", "O_DIRECTORY", "O_DSYNC", "O_EXCL", "O_FSYNC", "O_LARGEFILE", "O_NDELAY",
+    "O_NOATIME", "O_NOCTTY", "O_NOFOLLOW", "O_NONBLOCK", "O_PATH", "O_RDONLY", "O_RDWR", "O_RSYNC",
+    "O_SYNC", "O_TMPFILE", "O_TRUNC", "O_WRONLY", "OpenKey", "OpenKeyEx", "OverflowError",
+    "PC_ALLOC_SIZE_MIN", "PC_ASYNC_IO", "PC_CHOWN_RESTRICTED", "PC_FILESIZEBITS", "PC_LINK_MAX",
+    "PC_MAX_CANON", "PC_MAX_INPUT", "PC_NAME_MAX", "PC_NO_TRUNC", "PC_PATH_MAX", "PC_PIPE_BUF",
+    "PC_PRIO_IO", "PC_REC_INCR_XFER_SIZE", "PC_REC_MAX_XFER_SIZE", "PC_REC_MIN_XFER_SIZE",
+    "PC_REC_XFER_ALIGN", "PC_SOCK_MAXBUF", "PC_SYMLINK_MAX", "PC_SYNC_IO", "PC_VDISABLE", "PENDING",
+    "PLATLIBDIR", "PLATSTDLIB_LANDMARK", "POSIX_FADV_DONTNEED", "POSIX_FADV_NOREUSE",
+    "POSIX_FADV_NORMAL", "POSIX_FADV_RANDOM", "POSIX_FADV_SEQUENTIAL", "POSIX_FADV_WILLNEED",
+    "POSIX_SPAWN_CLOSE", "POSIX_SPAWN_DUP2", "POSIX_SPAWN_OPEN", "PREFIX", "PRIO_PGRP",
+    "PRIO_PROCESS", "PRIO_USER", "PROFILER_ID", "PYDEBUGEXT", "PYTHONCASEOK", "PYTHONPATH",
+    "PYWINVER", "PY_RESUME", "PY_RETURN", "PY_START", "PY_THROW", "PY_UNWIND", "PY_YIELD", "P_ALL",
+    "P_PGID", "P_PID", "PathFinder", "PathFinder._get_spec", "PathFinder._path_hooks",
     "PathFinder._path_importer_cache", "PathFinder.find_distributions", "PathFinder.find_spec",
-    "PathFinder.invalidate_caches", "PermissionError", "Py_Repr", "QueryValue", "REGISTRY_KEY",
-    "REGISTRY_KEY_DEBUG", "RLock", "RuntimeError", "SOURCE_SUFFIXES", "SourceFileLoader",
-    "SourceFileLoader._cache_bytecode", "SourceFileLoader.path_stats", "SourceFileLoader.set_data",
-    "SourceLoader", "SourceLoader._cache_bytecode", "SourceLoader.get_code",
-    "SourceLoader.get_source", "SourceLoader.path_mtime", "SourceLoader.path_stats",
-    "SourceLoader.set_data", "SourceLoader.source_to_code", "SourcelessFileLoader",
-    "SourcelessFileLoader.get_code", "SourcelessFileLoader.get_source", "SystemError",
-    "TextIOWrapper", "True", "TypeError", "ValueError", "WarningMessage", "WindowsRegistryFinder",
+    "PathFinder.invalidate_caches", "PendingDeprecationWarning", "PermissionError",
+    "ProcessLookupError", "ProxyType", "Py_Repr", "PythonFinalizationError", "QueryValue", "RAISE",
+    "REGISTRY_KEY", "REGISTRY_KEY_DEBUG", "RERAISE", "RLock", "RTLD_DEEPBIND", "RTLD_GLOBAL",
+    "RTLD_LAZY", "RTLD_LOCAL", "RTLD_NODELETE", "RTLD_NOLOAD", "RTLD_NOW", "R_OK", "Reader",
+    "RecursionError", "ReferenceError", "ReferenceType", "ResourceWarning", "RuntimeError",
+    "RuntimeWarning", "SCHED_BATCH", "SCHED_DEADLINE", "SCHED_FIFO", "SCHED_IDLE", "SCHED_NORMAL",
+    "SCHED_OTHER", "SCHED_RESET_ON_FORK", "SCHED_RR", "SC_2_CHAR_TERM", "SC_2_C_BIND", "SC_2_C_DEV",
+    "SC_2_C_VERSION", "SC_2_FORT_DEV", "SC_2_FORT_RUN", "SC_2_LOCALEDEF", "SC_2_SW_DEV", "SC_2_UPE",
+    "SC_2_VERSION", "SC_AIO_LISTIO_MAX", "SC_AIO_MAX", "SC_AIO_PRIO_DELTA_MAX", "SC_ARG_MAX",
+    "SC_ASYNCHRONOUS_IO", "SC_ATEXIT_MAX", "SC_AVPHYS_PAGES", "SC_BC_BASE_MAX", "SC_BC_DIM_MAX",
+    "SC_BC_SCALE_MAX", "SC_BC_STRING_MAX", "SC_CHARCLASS_NAME_MAX", "SC_CHAR_BIT", "SC_CHAR_MAX",
+    "SC_CHAR_MIN", "SC_CHILD_MAX", "SC_CLK_TCK", "SC_COLL_WEIGHTS_MAX", "SC_DELAYTIMER_MAX",
+    "SC_EQUIV_CLASS_MAX", "SC_EXPR_NEST_MAX", "SC_FSYNC", "SC_GETGR_R_SIZE_MAX",
+    "SC_GETPW_R_SIZE_MAX", "SC_INT_MAX", "SC_INT_MIN", "SC_IOV_MAX", "SC_JOB_CONTROL",
+    "SC_LINE_MAX", "SC_LOGIN_NAME_MAX", "SC_LONG_BIT", "SC_MAPPED_FILES", "SC_MB_LEN_MAX",
+    "SC_MEMLOCK", "SC_MEMLOCK_RANGE", "SC_MEMORY_PROTECTION", "SC_MESSAGE_PASSING",
+    "SC_MQ_OPEN_MAX", "SC_MQ_PRIO_MAX", "SC_NGROUPS_MAX", "SC_NL_ARGMAX", "SC_NL_LANGMAX",
+    "SC_NL_MSGMAX", "SC_NL_NMAX", "SC_NL_SETMAX", "SC_NL_TEXTMAX", "SC_NPROCESSORS_CONF",
+    "SC_NPROCESSORS_ONLN", "SC_NZERO", "SC_OPEN_MAX", "SC_PAGESIZE", "SC_PAGE_SIZE", "SC_PASS_MAX",
+    "SC_PHYS_PAGES", "SC_PII", "SC_PII_INTERNET", "SC_PII_INTERNET_DGRAM", "SC_PII_INTERNET_STREAM",
+    "SC_PII_OSI", "SC_PII_OSI_CLTS", "SC_PII_OSI_COTS", "SC_PII_OSI_M", "SC_PII_SOCKET",
+    "SC_PII_XTI", "SC_POLL", "SC_PRIORITIZED_IO", "SC_PRIORITY_SCHEDULING", "SC_REALTIME_SIGNALS",
+    "SC_RE_DUP_MAX", "SC_RTSIG_MAX", "SC_SAVED_IDS", "SC_SCHAR_MAX", "SC_SCHAR_MIN", "SC_SELECT",
+    "SC_SEMAPHORES", "SC_SEM_NSEMS_MAX", "SC_SEM_VALUE_MAX", "SC_SHARED_MEMORY_OBJECTS",
+    "SC_SHRT_MAX", "SC_SHRT_MIN", "SC_SIGQUEUE_MAX", "SC_SSIZE_MAX", "SC_STREAM_MAX",
+    "SC_SYNCHRONIZED_IO", "SC_THREADS", "SC_THREAD_ATTR_STACKADDR", "SC_THREAD_ATTR_STACKSIZE",
+    "SC_THREAD_DESTRUCTOR_ITERATIONS", "SC_THREAD_KEYS_MAX", "SC_THREAD_PRIORITY_SCHEDULING",
+    "SC_THREAD_PRIO_INHERIT", "SC_THREAD_PRIO_PROTECT", "SC_THREAD_PROCESS_SHARED",
+    "SC_THREAD_SAFE_FUNCTIONS", "SC_THREAD_STACK_MIN", "SC_THREAD_THREADS_MAX", "SC_TIMERS",
+    "SC_TIMER_MAX", "SC_TTY_NAME_MAX", "SC_TZNAME_MAX", "SC_T_IOV_MAX", "SC_UCHAR_MAX",
+    "SC_UINT_MAX", "SC_UIO_MAXIOV", "SC_ULONG_MAX", "SC_USHRT_MAX", "SC_VERSION", "SC_WORD_BIT",
+    "SC_XBS5_ILP32_OFF32", "SC_XBS5_ILP32_OFFBIG", "SC_XBS5_LP64_OFF64", "SC_XBS5_LPBIG_OFFBIG",
+    "SC_XOPEN_CRYPT", "SC_XOPEN_ENH_I18N", "SC_XOPEN_LEGACY", "SC_XOPEN_REALTIME",
+    "SC_XOPEN_REALTIME_THREADS", "SC_XOPEN_SHM", "SC_XOPEN_UNIX", "SC_XOPEN_VERSION",
+    "SC_XOPEN_XCU_VERSION", "SC_XOPEN_XPG2", "SC_XOPEN_XPG3", "SC_XOPEN_XPG4", "SEEK_DATA",
+    "SEEK_HOLE", "SEP", "SIGABRT", "SIGALRM", "SIGBUS", "SIGCHLD", "SIGCLD", "SIGCONT", "SIGFPE",
+    "SIGHUP", "SIGILL", "SIGINT", "SIGIO", "SIGIOT", "SIGKILL", "SIGPIPE", "SIGPOLL", "SIGPROF",
+    "SIGPWR", "SIGQUIT", "SIGRTMAX", "SIGRTMIN", "SIGSEGV", "SIGSTKFLT", "SIGSTOP", "SIGSYS",
+    "SIGTERM", "SIGTRAP", "SIGTSTP", "SIGTTIN", "SIGTTOU", "SIGURG", "SIGUSR1", "SIGUSR2",
+    "SIGVTALRM", "SIGWINCH", "SIGXCPU", "SIGXFSZ", "SIG_BLOCK", "SIG_DFL", "SIG_IGN", "SIG_SETMASK",
+    "SIG_UNBLOCK", "SOURCE_SUFFIXES", "SPLICE_F_MORE", "SPLICE_F_MOVE", "SPLICE_F_NONBLOCK",
+    "STDLIB_LANDMARKS", "STDLIB_SUBDIR", "STOP_ITERATION", "STRING_END_ARCHIVE",
+    "STRING_END_LOCATOR_64", "STRING_END_ZIP_64", "ST_APPEND", "ST_MANDLOCK", "ST_NOATIME",
+    "ST_NODEV", "ST_NODIRATIME", "ST_NOEXEC", "ST_NOSUID", "ST_RDONLY", "ST_RELATIME",
+    "ST_SYNCHRONOUS", "ST_WRITE", "SourceFileLoader", "SourceFileLoader._cache_bytecode",
+    "SourceFileLoader.path_stats", "SourceFileLoader.set_data", "SourceLoader",
+    "SourceLoader._cache_bytecode", "SourceLoader.get_code", "SourceLoader.get_source",
+    "SourceLoader.path_mtime", "SourceLoader.path_stats", "SourceLoader.set_data",
+    "SourceLoader.source_to_code", "SourcelessFileLoader", "SourcelessFileLoader.get_code",
+    "SourcelessFileLoader.get_source", "StopAsyncIteration", "StopIteration", "StreamReader",
+    "StreamReader.__enter__", "StreamReader.__exit__", "StreamReader.__getattr__",
+    "StreamReader.__init__", "StreamReader.__iter__", "StreamReader.__next__",
+    "StreamReader.__reduce_ex__", "StreamReader.decode", "StreamReader.read",
+    "StreamReader.readline", "StreamReader.readlines", "StreamReader.reset", "StreamReader.seek",
+    "StreamReaderWriter", "StreamReaderWriter.__enter__", "StreamReaderWriter.__exit__",
+    "StreamReaderWriter.__getattr__", "StreamReaderWriter.__init__", "StreamReaderWriter.__iter__",
+    "StreamReaderWriter.__next__", "StreamReaderWriter.__reduce_ex__", "StreamReaderWriter.read",
+    "StreamReaderWriter.readline", "StreamReaderWriter.readlines", "StreamReaderWriter.reset",
+    "StreamReaderWriter.seek", "StreamReaderWriter.write", "StreamReaderWriter.writelines",
+    "StreamRecoder", "StreamRecoder.__enter__", "StreamRecoder.__exit__",
+    "StreamRecoder.__getattr__", "StreamRecoder.__init__", "StreamRecoder.__iter__",
+    "StreamRecoder.__next__", "StreamRecoder.__reduce_ex__", "StreamRecoder.read",
+    "StreamRecoder.readline", "StreamRecoder.readlines", "StreamRecoder.reset",
+    "StreamRecoder.seek", "StreamRecoder.write", "StreamRecoder.writelines", "StreamWriter",
+    "StreamWriter.__enter__", "StreamWriter.__exit__", "StreamWriter.__getattr__",
+    "StreamWriter.__init__", "StreamWriter.__reduce_ex__", "StreamWriter.reset",
+    "StreamWriter.seek", "StreamWriter.write", "StreamWriter.writelines", "StringIO", "SyntaxError",
+    "SyntaxWarning", "SystemError", "SystemExit", "TFD_CLOEXEC", "TFD_NONBLOCK",
+    "TFD_TIMER_ABSTIME", "TIMEOUT_MAX", "TMP_MAX", "TabError", "TextIOWrapper", "TimeoutError",
+    "True", "TypeError", "UnboundLocalError", "UnicodeDecodeError", "UnicodeEncodeError",
+    "UnicodeError", "UnicodeTranslateError", "UnicodeWarning", "UnsupportedOperation",
+    "UserWarning", "VENV_LANDMARK", "VERSION_MAJOR", "VERSION_MINOR", "VPATH", "ValueError",
+    "WCONTINUED", "WCOREDUMP", "WEXITED", "WEXITSTATUS", "WIFCONTINUED", "WIFEXITED", "WIFSIGNALED",
+    "WIFSTOPPED", "WINREG_KEY", "WITH_NEXT_FRAMEWORK", "WNOHANG", "WNOWAIT", "WSTOPPED", "WSTOPSIG",
+    "WTERMSIG", "WUNTRACED", "W_OK", "Warning", "WarningMessage", "WindowsRegistryFinder",
     "WindowsRegistryFinder._open_registry", "WindowsRegistryFinder._search_registry",
-    "WindowsRegistryFinder.find_spec", "_BlockingOnManager", "_BlockingOnManager.__enter__",
-    "_BlockingOnManager.__exit__", "_BlockingOnManager.__init__", "_CASE_INSENSITIVE_PLATFORMS",
-    "_CASE_INSENSITIVE_PLATFORMS_BYTES_KEY", "_CASE_INSENSITIVE_PLATFORMS_STR_KEY",
-    "_DeadlockError", "_DummyModuleLock", "_DummyModuleLock.__init__", "_DummyModuleLock.__repr__",
-    "_DummyModuleLock.acquire", "_DummyModuleLock.release", "_ERR_MSG_PREFIX", "_ImportLockContext",
-    "_ImportLockContext.__enter__", "_ImportLockContext.__exit__", "_KeyedRef", "_List",
-    "_LoaderBasics", "_LoaderBasics.create_module", "_LoaderBasics.exec_module",
-    "_LoaderBasics.is_package", "_LoaderBasics.load_module", "_MAXCACHE", "_MS_WINDOWS",
-    "_ModuleLock", "_ModuleLock.__init__", "_ModuleLock.__repr__", "_ModuleLock.acquire",
-    "_ModuleLock.has_deadlock", "_ModuleLock.locked", "_ModuleLock.release", "_ModuleLockManager",
-    "_ModuleLockManager.__enter__", "_ModuleLockManager.__exit__", "_ModuleLockManager.__init__",
-    "_NEEDS_LOADING", "_NamespaceLoader", "_NamespacePath", "_NamespacePath.__contains__",
-    "_NamespacePath.__getitem__", "_NamespacePath.__init__", "_NamespacePath.__iter__",
-    "_NamespacePath.__len__", "_NamespacePath.__repr__", "_NamespacePath.__setitem__",
+    "WindowsRegistryFinder.find_spec", "Writer", "XATTR_CREATE", "XATTR_REPLACE", "XATTR_SIZE_MAX",
+    "X_OK", "ZIP64_EXTRA_TAG", "ZIP_LANDMARK", "ZeroDivisionError", "ZipImportError", "ZipReader",
+    "_BlockingOnManager", "_BlockingOnManager.__enter__", "_BlockingOnManager.__exit__",
+    "_BlockingOnManager.__init__", "_BufferedIOBase", "_BytesIOBuffer",
+    "_CASE_INSENSITIVE_PLATFORMS", "_CASE_INSENSITIVE_PLATFORMS_BYTES_KEY",
+    "_CASE_INSENSITIVE_PLATFORMS_STR_KEY", "_CHUNK_SIZE", "_DEPRECATED_MSG", "_DeadlockError",
+    "_DummyModuleLock", "_DummyModuleLock.__init__", "_DummyModuleLock.__repr__",
+    "_DummyModuleLock.acquire", "_DummyModuleLock.release", "_ERR_MSG_PREFIX", "_ExceptHookArgs",
+    "_IOBase", "_ImportLockContext", "_ImportLockContext.__enter__", "_ImportLockContext.__exit__",
+    "_IncompleteInputError", "_KeyedRef", "_List", "_LoaderBasics", "_LoaderBasics.create_module",
+    "_LoaderBasics.exec_module", "_LoaderBasics.is_package", "_LoaderBasics.load_module",
+    "_MAXCACHE", "_MS_WINDOWS", "_ModuleLock", "_ModuleLock.__init__", "_ModuleLock.__repr__",
+    "_ModuleLock.acquire", "_ModuleLock.has_deadlock", "_ModuleLock.locked", "_ModuleLock.release",
+    "_ModuleLockManager", "_ModuleLockManager.__enter__", "_ModuleLockManager.__exit__",
+    "_ModuleLockManager.__init__", "_NAME_MAXLEN", "_NEEDS_LOADING", "_NamespaceLoader",
+    "_NamespacePath", "_NamespacePath.__contains__", "_NamespacePath.__getitem__",
+    "_NamespacePath.__init__", "_NamespacePath.__iter__", "_NamespacePath.__len__",
+    "_NamespacePath.__repr__", "_NamespacePath.__setitem__",
     "_NamespacePath._find_parent_path_names", "_NamespacePath._get_parent_path",
     "_NamespacePath._recalculate", "_NamespacePath.append", "_OPT", "_ORIGIN", "_POPULATE",
-    "_PYCACHE", "_SEP", "_WeakValueDictionary", "_WeakValueDictionary.__init__",
+    "_PYCACHE", "_RawIOBase", "_SEP", "_STRUCT_TM_ITEMS", "_TextIOBase", "_ThreadHandle",
+    "_WeakValueDictionary", "_WeakValueDictionary.__init__",
     "_WeakValueDictionary.__init__.<locals>.KeyedRef",
     "_WeakValueDictionary.__init__.<locals>.KeyedRef.__init__",
     "_WeakValueDictionary.__init__.<locals>.KeyedRef.__new__",
@@ -2191,236 +2322,398 @@ static LINUX_PREINTERNED_STRINGS: &[&str] = &[
     "_WeakValueDictionary._commit_removals", "_WeakValueDictionary.clear",
     "_WeakValueDictionary.get", "_WeakValueDictionary.setdefault", "_WindowsConsoleIO",
     "__IOBase_closed", "__abc_tpflags__", "__abs__", "__abstractmethods__", "__add__", "__aenter__",
-    "__aexit__", "__aiter__", "__all__", "__and__", "__anext__", "__annotate__",
+    "__aexit__", "__aiter__", "__all__", "__alloc__", "__and__", "__anext__", "__annotate__",
     "__annotate_func__", "__annotations__", "__annotations_cache__", "__args__", "__await__",
-    "__bases__", "__bool__", "__buffer__", "__build_class__", "__builtins__", "__bytes__",
-    "__cached__", "__call__", "__cantrace__", "__ceil__", "__class__", "__class_getitem__",
-    "__classcell__", "__classdict__", "__classdictcell__", "__code__", "__complex__",
-    "__conditional_annotations__", "__contains__", "__ctypes_from_outparam__", "__del__",
-    "__delattr__", "__delete__", "__delitem__", "__dict__", "__dictoffset__", "__dir__",
-    "__divmod__", "__doc__", "__enter__", "__eq__", "__exit__", "__file__", "__firstlineno__",
-    "__float__", "__floor__", "__floordiv__", "__format__", "__fspath__", "__ge__", "__get__",
-    "__getattr__", "__getattribute__", "__getinitargs__", "__getitem__", "__getnewargs__",
-    "__getnewargs_ex__", "__getstate__", "__gt__", "__hash__", "__iadd__", "__iand__",
-    "__ifloordiv__", "__ilshift__", "__imatmul__", "__imod__", "__import__", "__imul__",
-    "__index__", "__init__", "__init_subclass__", "__instancecheck__", "__int__", "__invert__",
-    "__ior__", "__ipow__", "__irshift__", "__isabstractmethod__", "__isub__", "__iter__",
-    "__itruediv__", "__ixor__", "__le__", "__len__", "__length_hint__", "__lltrace__", "__loader__",
+    "__base__", "__bases__", "__basicsize__", "__bool__", "__bound__", "__breakpointhook__",
+    "__buffer__", "__build_class__", "__builtins__", "__bytes__", "__cached__", "__call__",
+    "__callback__", "__cantrace__", "__cause__", "__ceil__", "__class__", "__class_getitem__",
+    "__classcell__", "__classdict__", "__classdictcell__", "__closure__", "__code__", "__complex__",
+    "__conditional_annotations__", "__constraints__", "__contains__", "__context__",
+    "__contravariant__", "__covariant__", "__ctypes_from_outparam__", "__debug__", "__default__",
+    "__defaults__", "__del__", "__delattr__", "__delete__", "__delitem__", "__dict__",
+    "__dictoffset__", "__dir__", "__displayhook__", "__divmod__", "__doc__", "__enter__", "__eq__",
+    "__excepthook__", "__exit__", "__file__", "__firstlineno__", "__flags__", "__float__",
+    "__floor__", "__floordiv__", "__format__", "__fspath__", "__func__", "__ge__", "__get__",
+    "__getattr__", "__getattribute__", "__getformat__", "__getinitargs__", "__getitem__",
+    "__getnewargs__", "__getnewargs_ex__", "__getstate__", "__globals__", "__gt__", "__hash__",
+    "__iadd__", "__iand__", "__ifloordiv__", "__ilshift__", "__imatmul__", "__imod__", "__import__",
+    "__imul__", "__index__", "__infer_variance__", "__init__", "__init_subclass__",
+    "__instancecheck__", "__int__", "__invert__", "__ior__", "__ipow__", "__irshift__",
+    "__isabstractmethod__", "__isub__", "__itemsize__", "__iter__", "__itruediv__", "__ixor__",
+    "__kwdefaults__", "__le__", "__len__", "__length_hint__", "__lltrace__", "__loader__",
     "__lshift__", "__lt__", "__main__", "__match_args__", "__matmul__", "__missing__", "__mod__",
-    "__module__", "__mro_entries__", "__mul__", "__name__", "__ne__", "__neg__", "__new__",
-    "__newobj__", "__newobj_ex__", "__next__", "__notes__", "__or__", "__orig_class__",
-    "__origin__", "__origname__", "__package__", "__parameters__", "__path__", "__pos__", "__pow__",
-    "__prepare__", "__pycache__", "__qualname__", "__radd__", "__rand__", "__rdivmod__",
-    "__reduce__", "__reduce_ex__", "__release_buffer__", "__repr__", "__reversed__",
-    "__rfloordiv__", "__rlshift__", "__rmatmul__", "__rmod__", "__rmul__", "__ror__", "__round__",
-    "__rpow__", "__rrshift__", "__rshift__", "__rsub__", "__rtruediv__", "__rxor__", "__set__",
-    "__set_name__", "__setattr__", "__setitem__", "__setstate__", "__sizeof__", "__slotnames__",
-    "__slots__", "__spec__", "__static_attributes__", "__str__", "__sub__", "__subclasscheck__",
-    "__subclasshook__", "__truediv__", "__trunc__", "__type_params__",
-    "__typing_is_unpacked_typevartuple__", "__typing_prepare_subst__", "__typing_subst__",
-    "__typing_unpacked_tuple_args__", "__warningregistry__", "__weaklistoffset__", "__weakref__",
-    "__xor__", "_abc_impl", "_abstract_", "_active", "_aliases", "_anonymous_", "_argtypes_",
-    "_as_parameter_", "_asyncio_future_blocking", "_bless_my_loader", "_blksize", "_blocking_on",
-    "_bootstrap", "_bootstrap_external", "_bootstrap_module", "_builtin_from_name", "_cache",
+    "__module__", "__mro__", "__mro_entries__", "__mul__", "__name__", "__ne__", "__neg__",
+    "__new__", "__newobj__", "__newobj_ex__", "__next__", "__notes__", "__objclass__", "__or__",
+    "__orig_class__", "__origin__", "__origname__", "__package__", "__parameters__", "__path__",
+    "__pos__", "__pow__", "__prepare__", "__pycache__", "__qualname__", "__radd__", "__rand__",
+    "__rdivmod__", "__reduce__", "__reduce_ex__", "__release_buffer__", "__replace__", "__repr__",
+    "__reversed__", "__rfloordiv__", "__rlshift__", "__rmatmul__", "__rmod__", "__rmul__",
+    "__ror__", "__round__", "__rpow__", "__rrshift__", "__rshift__", "__rsub__", "__rtruediv__",
+    "__rxor__", "__self__", "__self_class__", "__set__", "__set_name__", "__setattr__",
+    "__setitem__", "__setstate__", "__sizeof__", "__slotnames__", "__slots__", "__spec__",
+    "__static_attributes__", "__stderr__", "__stdin__", "__stdout__", "__str__", "__sub__",
+    "__subclasscheck__", "__subclasses__", "__subclasshook__", "__suppress_context__",
+    "__text_signature__", "__thisclass__", "__traceback__", "__truediv__", "__trunc__",
+    "__type_params__", "__typing_is_unpacked_typevartuple__", "__typing_prepare_subst__",
+    "__typing_subst__", "__typing_unpacked_tuple_args__", "__unpacked__", "__unraisablehook__",
+    "__value__", "__warningregistry__", "__weaklistoffset__", "__weakref__", "__weakrefoffset__",
+    "__wrapped__", "__xor__", "_abc_impl", "_abstract_", "_acquire_lock", "_acquire_restore",
+    "_active", "_aliases", "_all_events", "_anonymous_", "_argtypes_", "_as_parameter_",
+    "_asyncio_future_blocking", "_at_fork_reinit", "_base_executable", "_baserepl",
+    "_bless_my_loader", "_blksize", "_blocking_on", "_bootstrap", "_bootstrap_external",
+    "_bootstrap_module", "_buffer_decode", "_buffer_encode", "_builtin_from_name", "_cache",
     "_cache_bytecode", "_cached", "_calc___package__", "_calc_mode", "_call_with_frames_removed",
-    "_check_name", "_check_name.<locals>._check_name_wrapper", "_check_name.<locals>._wrap",
-    "_check_name_wrapper", "_check_retval_", "_classify_pyc", "_code_to_hash_pyc",
-    "_code_to_timestamp_pyc", "_code_type", "_commit_removals", "_compile_bytecode",
-    "_dealloc_warn", "_epoch", "_exec", "_feature_version", "_field_types", "_fields_",
-    "_fill_cache", "_filters", "_finalizing", "_find_and_load", "_find_and_load_unlocked",
+    "_checkClosed", "_checkReadable", "_checkSeekable", "_checkWritable", "_check_name",
+    "_check_name.<locals>._check_name_wrapper", "_check_name.<locals>._wrap", "_check_name_wrapper",
+    "_check_retval_", "_classify_pyc", "_clear_internal_caches", "_clear_type_cache",
+    "_clear_type_descriptors", "_co_code_adaptive", "_code_to_hash_pyc", "_code_to_timestamp_pyc",
+    "_code_type", "_codecs", "_commit_removals", "_compile_bytecode", "_compile_source",
+    "_config_init", "_count", "_create_environ", "_current_exceptions", "_current_frames",
+    "_dealloc_warn", "_debugmallocstats", "_defaultaction", "_deprecated", "_dump_tracelets",
+    "_empty_charbuffer", "_epoch", "_eq_mtime", "_excepthook", "_exec", "_exit", "_false",
+    "_feature_version", "_field_types", "_fields_", "_fill_cache", "_filters",
+    "_filters_mutated_lock_held", "_finalizing", "_find_and_load", "_find_and_load_unlocked",
     "_find_parent_path_names", "_find_spec", "_fix_co_filename", "_fix_up_module", "_flags_",
-    "_frozen_importlib_external", "_gcd_import", "_get_cached", "_get_module_lock",
-    "_get_module_lock.<locals>.cb", "_get_parent_path", "_get_sourcefile", "_get_spec",
-    "_get_supported_file_loaders", "_handle_fromlist", "_has_deadlocked", "_imp", "_imp_module",
-    "_import_tail", "_init_module_attrs", "_initializing", "_install",
-    "_install_external_importers", "_internal_use", "_io", "_is_text_encoding", "_isatty_open_only",
-    "_iterating", "_last_epoch", "_last_parent_path", "_length_", "_limbo", "_load",
-    "_load_backward_compatible", "_load_module_shim", "_load_unlocked", "_loaders", "_lock",
-    "_lock_unlock_module", "_loop", "_make_relax_case", "_make_relax_case.<locals>._relax_case",
-    "_mode", "_module_locks", "_module_repr", "_module_repr_from_spec", "_name",
-    "_needs_com_addref_", "_new_module", "_object_name", "_only_immortal", "_open_registry",
-    "_optimize", "_os", "_pack_uint32", "_path", "_path_abspath", "_path_cache", "_path_finder",
-    "_path_hooks", "_path_importer_cache", "_path_is_mode_type", "_path_isabs", "_path_isdir",
-    "_path_isfile", "_path_join", "_path_mtime", "_path_split", "_path_split.<locals>.<genexpr>",
-    "_path_splitroot", "_path_stat", "_pathseps_with_colon", "_pending_removals", "_recalculate",
-    "_relax_case", "_relaxed_path_cache", "_remove_dead_weakref", "_requires_builtin",
-    "_requires_builtin.<locals>._requires_builtin_wrapper", "_requires_builtin_wrapper",
-    "_requires_frozen", "_requires_frozen.<locals>._requires_frozen_wrapper",
-    "_requires_frozen_wrapper", "_resolve_filename", "_resolve_name", "_restype_", "_sanity_check",
-    "_search_registry", "_set_bootstrap_module", "_set_fileattr", "_setup", "_showwarnmsg",
-    "_shutdown", "_slotnames", "_spec_from_module", "_stdlib_dir", "_strptime",
+    "_framework", "_from_flags", "_frozen_importlib", "_frozen_importlib_external",
+    "_frozen_module_names", "_gcd_import", "_get_cached", "_get_cpu_count_config", "_get_data",
+    "_get_decompress_func", "_get_files", "_get_main_thread_ident", "_get_module_code",
+    "_get_module_info", "_get_module_lock", "_get_module_lock.<locals>.cb", "_get_module_path",
+    "_get_mtime_and_size_of_source", "_get_name", "_get_parent_path", "_get_pyc_source",
+    "_get_sourcefile", "_get_spec", "_get_supported_file_loaders", "_getframe",
+    "_getframemodulename", "_getline_from_code", "_getlines_from_code", "_git", "_handle_fromlist",
+    "_has_deadlocked", "_have_functions", "_imp", "_imp_module", "_import_tail", "_importing_zlib",
+    "_init_main", "_init_module_attrs", "_initializing", "_inputhook", "_install",
+    "_install_external_importers", "_install_importlib", "_interactive_cache", "_internal_use",
+    "_io", "_is_dir", "_is_gil_enabled", "_is_immortal", "_is_inputhook_installed", "_is_interned",
+    "_is_main_interpreter", "_is_owned", "_is_python_build", "_is_text_encoding",
+    "_isatty_open_only", "_iterating", "_jit", "_last_epoch", "_last_parent_path", "_length_",
+    "_limbo", "_load", "_load_backward_compatible", "_load_module_shim", "_load_unlocked",
+    "_loaders", "_local", "_lock", "_lock_unlock_module", "_loop", "_make_key",
+    "_make_lazycache_entry", "_make_lazycache_entry.<locals>.get_lines", "_make_relax_case",
+    "_make_relax_case.<locals>._relax_case", "_make_thread_handle", "_metadata", "_mode",
+    "_module_locks", "_module_repr", "_module_repr_from_spec", "_module_type", "_multiarch",
+    "_name", "_needs_com_addref_", "_new_module", "_normalize_line_endings", "_object_name",
+    "_onceregistry", "_only_immortal", "_open_registry", "_optimize", "_os",
+    "_override_frozen_modules_for_tests", "_override_multi_interp_extensions_check", "_pack_uint32",
+    "_parse_dostime", "_path", "_path_abspath", "_path_cache", "_path_finder", "_path_hooks",
+    "_path_importer_cache", "_path_is_mode_type", "_path_isabs", "_path_isdir", "_path_isfile",
+    "_path_join", "_path_mtime", "_path_normpath", "_path_split", "_path_split.<locals>.<genexpr>",
+    "_path_splitroot", "_path_splitroot_ex", "_path_stat", "_pathseps_with_colon",
+    "_pending_removals", "_read_directory", "_recalculate", "_recursion_count", "_register_code",
+    "_relax_case", "_relaxed_path_cache", "_release_lock", "_release_save", "_remove_dead_weakref",
+    "_requires_builtin", "_requires_builtin.<locals>._requires_builtin_wrapper",
+    "_requires_builtin_wrapper", "_requires_frozen",
+    "_requires_frozen.<locals>._requires_frozen_wrapper", "_requires_frozen_wrapper",
+    "_resolve_filename", "_resolve_name", "_restype_", "_sanity_check", "_search_registry",
+    "_set_bootstrap_module", "_set_done", "_set_fileattr", "_setprofileallthreads",
+    "_settraceallthreads", "_setup", "_showwarnmsg", "_shutdown", "_slotnames",
+    "_source_unavailable", "_spec_from_module", "_stdlib_dir", "_strptime",
     "_strptime_datetime_date", "_strptime_datetime_datetime", "_strptime_datetime_time", "_thread",
-    "_type_", "_uninitialized_submodules", "_unknown", "_unpack_uint16", "_unpack_uint32",
-    "_unpack_uint64", "_validate_hash_pyc", "_validate_timestamp_pyc", "_verbose_message",
-    "_warn_unawaited_coroutine", "_warnings", "_weakref", "_win_cp_codecs", "_wrap",
-    "_write_atomic", "_xoptions", "abs_tol", "access", "aclose", "acquire", "acquire_lock", "add",
-    "add_done_callback", "after_in_child", "after_in_parent", "aggregate_class", "alias",
-    "aliased_encoding", "aliases", "align", "all", "all_threads", "allocate_lock", "allow_code",
-    "almost_filename", "always", "ansi", "ansi_x3_4_1968", "any", "append", "arabic", "arg",
-    "argdefs", "args", "arguments", "argv", "as_integer_ratio", "ascii", "asend", "asmo_708", "ast",
-    "athrow", "attribute", "authorizer_callback", "autocommit", "backtick", "base", "base64",
-    "base64_codec", "base_64", "base_filename", "base_path", "before", "big", "big5", "big5_hkscs",
-    "big5_tw", "big5hkscs", "binary_form", "bit_offset", "bit_size", "bits", "block", "blocked_on",
-    "blocking_on", "bool", "bound", "buffer", "buffer_callback", "buffer_size", "buffering",
-    "buffers", "bufsize", "builtin_module", "builtin_module_names", "builtin_name", "builtins",
-    "bundle_path", "byte_offset", "byte_size", "bytearray", "bytecode", "bytecode_path",
-    "byteorder", "bytes", "bytes_data", "bytes_per_sep", "bz2", "bz2_codec", "c_call",
-    "c_exception", "c_parameter_type", "c_return", "cache", "cache_from_source", "cache_module",
-    "cache_path", "cache_tag", "cached", "cached_datetime_module", "cached_statements", "cadata",
-    "cafile", "call", "call_exception_handler", "call_soon", "callable", "callback", "cancel",
-    "candidate_blocking_on", "candidate_ids", "capath", "casefold", "category", "cb", "cb_type",
-    "certfile", "chars", "check_hash_based_pycs", "check_same_thread", "check_source", "checked",
-    "child", "chinese", "classmethod", "clear", "close", "closed", "closefd", "closure",
-    "co_argcount", "co_cellvars", "co_code", "co_consts", "co_exceptiontable", "co_filename",
-    "co_firstlineno", "co_flags", "co_freevars", "co_kwonlyargcount", "co_linetable", "co_name",
-    "co_names", "co_nlocals", "co_posonlyargcount", "co_qualname", "co_stacksize", "co_varnames",
-    "code", "code_object", "code_page_encode", "codecaliases", "codecs", "col_offset", "command",
-    "comment_factory", "compile", "compile_mode", "consts", "contents", "context", "contravariant",
-    "conversion", "cookie", "copy", "copyreg", "coro", "count", "covariant", "cp", "cp037",
-    "cp1026", "cp1051", "cp1125", "cp1140", "cp1250", "cp1251", "cp1252", "cp1253", "cp1254",
-    "cp1255", "cp1256", "cp1257", "cp1258", "cp1361", "cp154", "cp273", "cp367", "cp424", "cp437",
+    "_type_", "_uninitialized_submodules", "_unknown", "_unmarshal_code", "_unpack_uint16",
+    "_unpack_uint32", "_unpack_uint64", "_unregister_error", "_validate_hash_pyc",
+    "_validate_timestamp_pyc", "_varname_from_oparg", "_verbose_message",
+    "_warn_unawaited_coroutine", "_warnings", "_warnings_context", "_weakref", "_win_cp_codecs",
+    "_wrap", "_write_atomic", "_xoptions", "_zip_directory_cache", "_zip_searchorder", "abiflags",
+    "abort", "abs", "abs_tol", "abspath", "access", "aclose", "acquire", "acquire_lock",
+    "activate_stack_trampoline", "add", "add_done_callback", "add_nested", "add_note",
+    "addaudithook", "addop", "after_in_child", "after_in_parent", "ag_await", "ag_code", "ag_frame",
+    "ag_running", "ag_suspended", "aggregate_class", "aiter", "alarm", "algorithm", "alias",
+    "aliased_encoding", "aliases", "align", "all", "all_threads", "allocate", "allocate_lock",
+    "allow_code", "almost_filename", "alt_path_sep", "altzone", "always", "anext", "ansi",
+    "ansi_x3_4_1968", "any", "api_version", "append", "arabic", "arc_offset", "archive", "arg",
+    "argdefs", "args", "arguments", "argv", "as_integer_ratio", "ascii", "ascii_decode",
+    "ascii_encode", "asctime", "asend", "asmo_708", "ast", "astimezone", "athrow", "attribute",
+    "audit", "authorizer_callback", "autocommit", "backslashreplace", "backslashreplace_errors",
+    "backtick", "base", "base64", "base64_codec", "base_64", "base_exe", "base_exec_prefix",
+    "base_executable", "base_filename", "base_path", "base_prefix", "basename", "before", "big",
+    "big5", "big5_hkscs", "big5_tw", "big5hkscs", "bin", "binary_form", "bit_count", "bit_length",
+    "bit_offset", "bit_size", "bits", "bits_per_digit", "block", "blocked_on", "blocking_on",
+    "bool", "bound", "breakpoint", "breakpointhook", "buffer", "buffer_callback", "buffer_size",
+    "buffered_stdio", "buffering", "buffers", "bufsize", "build_prefix", "build_stdlib_prefix",
+    "builtin_module", "builtin_module_names", "builtin_name", "builtins", "bundle_path",
+    "byte_offset", "byte_size", "bytearray", "bytebuffer", "bytecode", "bytecode_path", "byteorder",
+    "bytes", "bytes_data", "bytes_per_sep", "bytes_warning", "bytesdecoded", "bytesencoded", "bz2",
+    "bz2_codec", "c_call", "c_contiguous", "c_exception", "c_parameter_type", "c_return", "cache",
+    "cache_from_source", "cache_module", "cache_path", "cache_tag", "cached",
+    "cached_datetime_module", "cached_statements", "cadata", "cafile", "call",
+    "call_exception_handler", "call_soon", "call_tracing", "callable", "callback", "cancel",
+    "candidate", "candidate_blocking_on", "candidate_ids", "capath", "capitalize", "casefold",
+    "cast", "category", "cb", "cb_type", "cell_contents", "center", "central_directory_position",
+    "central_directory_size", "certfile", "characters_written", "charbuffer", "charbuffertype",
+    "charmap_build", "charmap_decode", "charmap_encode", "chars", "chdir", "check_hash_based_pycs",
+    "check_hash_pycs_mode", "check_same_thread", "check_source", "checkcache", "checked", "child",
+    "children", "children_system", "children_user", "chinese", "chmod", "chown", "chr", "chroot",
+    "classmethod", "clear", "clear_tool_id", "clearcache", "clock_getres", "clock_gettime",
+    "clock_gettime_ns", "clock_settime", "clock_settime_ns", "close", "closed", "closefd",
+    "closerange", "closure", "co_argcount", "co_branches", "co_cellvars", "co_code", "co_consts",
+    "co_exceptiontable", "co_filename", "co_firstlineno", "co_flags", "co_freevars",
+    "co_kwonlyargcount", "co_lines", "co_linetable", "co_lnotab", "co_name", "co_names",
+    "co_nlocals", "co_positions", "co_posonlyargcount", "co_qualname", "co_stacksize",
+    "co_varnames", "code", "code_debug_ranges", "code_id", "code_object", "code_page_encode",
+    "codecaliases", "codecs", "col_offset", "columns", "combine", "command", "comment_factory",
+    "comment_size", "compile", "compile_mode", "complex", "compress", "config", "configure_c_stdio",
+    "confstr", "confstr_names", "conjugate", "const", "consts", "consumed", "contents", "context",
+    "context_aware_warnings", "contiguous", "contravariant", "conversion", "cookie", "copy",
+    "copyreg", "copyright", "coro", "count", "covariant", "cp", "cp037", "cp1026", "cp1051",
+    "cp1125", "cp1140", "cp1250", "cp1251", "cp1252", "cp1253", "cp1254", "cp1255", "cp1256",
+    "cp1257", "cp1258", "cp1361", "cp154", "cp273", "cp367", "cp424", "cp437", "cp437_table",
     "cp500", "cp65001", "cp775", "cp819", "cp850", "cp852", "cp855", "cp857", "cp858", "cp860",
     "cp861", "cp862", "cp863", "cp864", "cp865", "cp866", "cp866u", "cp869", "cp874", "cp932",
-    "cp936", "cp949", "cp950", "cp_gr", "cp_is", "cpathname", "create_builtin", "create_dynamic",
-    "create_module", "create_win32_code_page_codec", "csHPRoman8", "csascii", "csbig5", "cseuckr",
-    "csibm037", "csibm1026", "csibm273", "csibm424", "csibm500", "csibm855", "csibm857", "csibm858",
-    "csibm860", "csibm861", "csibm863", "csibm864", "csibm865", "csibm866", "csibm869",
-    "csiso2022jp", "csiso2022kr", "csiso58gb231280", "csisolatin1", "csisolatin2", "csisolatin3",
-    "csisolatin4", "csisolatin5", "csisolatin6", "csisolatinarabic", "csisolatincyrillic",
-    "csisolatingreek", "csisolatinhebrew", "cskoi8r", "cspc775baltic", "cspc850multilingual",
-    "cspc862latinhebrew", "cspc8codepage437", "cspcp852", "csptcp154", "csshiftjis", "cut_off",
-    "cwd", "cygwin", "cyrillic", "cyrillic_asian", "d_parameter_type", "darwin", "data", "database",
-    "day", "dbcs", "debug", "debug_override", "decode", "decode_source", "decoder", "default",
-    "defaultaction", "delete", "depth", "desired_access", "detect_encoding", "detect_types",
-    "deterministic", "device", "dict", "dictcomp", "difference_update", "digest", "digest_size",
-    "digestmod", "dir_fd", "dirname", "discard", "dispatch_table", "displayhook", "dklen", "doc",
-    "done", "dont_inherit", "dont_write_bytecode", "dot", "dot_count", "dst", "dst_dir_fd", "dumps",
-    "eager_start", "ebcdic_cp_be", "ebcdic_cp_ca", "ebcdic_cp_ch", "ebcdic_cp_he", "ebcdic_cp_nl",
-    "ebcdic_cp_us", "ebcdic_cp_wt", "ecma_114", "ecma_118", "edges", "effective_ids",
-    "element_factory", "elot_928", "encode", "encoding", "end", "end_col_offset", "end_lineno",
-    "end_offset", "endpos", "endswith", "entry", "entrypoint", "env", "environ", "errors", "euc_cn",
+    "cp936", "cp949", "cp950", "cp_gr", "cp_is", "cpathname", "cpu_count", "cr_await", "cr_code",
+    "cr_frame", "cr_origin", "cr_running", "cr_suspended", "crc", "create_builtin",
+    "create_dynamic", "create_module", "create_win32_code_page_codec", "csHPRoman8", "csascii",
+    "csbig5", "cseuckr", "csibm037", "csibm1026", "csibm273", "csibm424", "csibm500", "csibm855",
+    "csibm857", "csibm858", "csibm860", "csibm861", "csibm863", "csibm864", "csibm865", "csibm866",
+    "csibm869", "csiso2022jp", "csiso2022kr", "csiso58gb231280", "csisolatin1", "csisolatin2",
+    "csisolatin3", "csisolatin4", "csisolatin5", "csisolatin6", "csisolatinarabic",
+    "csisolatincyrillic", "csisolatingreek", "csisolatinhebrew", "cskoi8r", "cspc775baltic",
+    "cspc850multilingual", "cspc862latinhebrew", "cspc8codepage437", "cspcp852", "csptcp154",
+    "csshiftjis", "ctermid", "ctime", "cut_off", "cutoff", "cwd", "cygwin", "cyrillic",
+    "cyrillic_asian", "d_parameter_type", "daemon_threads_allowed", "darwin", "data",
+    "data_encoding", "data_info", "data_size", "database", "datapath", "date", "day", "daylight",
+    "days", "dbcs", "deactivate_stack_trampoline", "debug", "debug_override", "decode",
+    "decode_source", "decodedbytes", "decoder", "decoding_map", "decompress", "default",
+    "default_int_handler", "default_max_str_digits", "defaultaction", "delattr", "delete",
+    "deleter", "denominator", "depth", "derive", "desired_access", "detach", "detect_encoding",
+    "detect_types", "deterministic", "dev_mode", "device", "device_encoding", "dict", "dictcomp",
+    "difference", "difference_update", "dig", "digest", "digest_size", "digestmod", "dir", "dir_fd",
+    "dirname", "dirpath", "discard", "dispatch_table", "displayhook", "divmod", "dklen", "dll",
+    "doc", "done", "dont_inherit", "dont_write_bytecode", "dot", "dot_count", "dst", "dst_dir_fd",
+    "dump", "dump_refs", "dump_refs_file", "dumps", "dup", "dup2", "eager_start", "ebcdic_cp_be",
+    "ebcdic_cp_ca", "ebcdic_cp_ch", "ebcdic_cp_he", "ebcdic_cp_nl", "ebcdic_cp_us", "ebcdic_cp_wt",
+    "ecma_114", "ecma_118", "edges", "effective_ids", "elapsed", "element_factory", "elot_928",
+    "encode", "encoder", "encoding", "encodings", "end", "end_col_offset", "end_lineno",
+    "end_offset", "endpos", "endswith", "entry", "entrypoint", "enumerate", "env", "environ",
+    "epsilon", "err_msg", "errno", "error", "errors", "escape_decode", "escape_encode", "euc_cn",
     "euc_jis2004", "euc_jis_2004", "euc_jisx0213", "euc_jp", "euc_kr", "euccn", "eucgb2312_cn",
-    "eucjis2004", "eucjisx0213", "eucjp", "euckr", "event", "eventmask", "exc_details",
-    "exc_traceback", "exc_type", "exc_value", "excepthook", "exception", "exec", "exec_builtin",
-    "exec_dynamic", "exec_module", "executable", "existing_file_name", "exp", "expression",
-    "extend", "extension", "extension_loaders", "extension_suffixes", "extra_tokens", "facility",
-    "factory", "false", "family", "fanout", "fd", "fd2", "fdel", "fget", "fields", "file",
-    "file_actions", "file_name", "filename", "filename_base", "fileno", "filepath", "fillvalue",
-    "filter", "filters", "final", "find_class", "find_distributions", "find_frozen", "find_spec",
-    "finder", "fix_imports", "flags", "flush", "fn", "fold", "follow_symlinks", "format",
-    "format_spec", "found_in_pycache_prefix", "frame_buffer", "framework_binary", "from_bytes",
-    "from_name", "from_param", "fromlist", "fromtimestamp", "fromutc", "frozen", "fset", "fspath",
-    "full_path", "fullname", "func", "future", "fxn", "gb18030", "gb18030_2000", "gb2312",
-    "gb2312_1980", "gb2312_80", "gbk", "generation", "genexpr", "get", "get_code", "get_data",
-    "get_debug", "get_event_loop", "get_filename", "get_frozen_object", "get_ident", "get_loop",
-    "get_resource_reader", "get_source", "getaliases", "getattr", "getcwd", "getregentry",
-    "getstate", "gid", "globals", "globals_", "greek", "greek8", "groupindex", "groups", "handle",
-    "handle_seq", "has_deadlock", "has_location", "hasattr", "hash", "hash_based", "hash_name",
-    "head", "header", "headers", "hebrew", "hex", "hex_codec", "hi", "hkey", "hkscs", "hook",
-    "hour", "hp_roman8", "hz", "hz_gb", "hz_gb_2312", "hzgb", "ibm037", "ibm039", "ibm1026",
-    "ibm1051", "ibm1125", "ibm1140", "ibm273", "ibm367", "ibm424", "ibm437", "ibm500", "ibm775",
-    "ibm819", "ibm850", "ibm852", "ibm855", "ibm857", "ibm858", "ibm860", "ibm861", "ibm862",
-    "ibm863", "ibm864", "ibm865", "ibm866", "ibm869", "id", "ident", "identity_hint", "ignore",
-    "ignore_environment", "imag", "implementation", "import_", "importlib", "importlib.metadata",
-    "importlib.readers", "in_fd", "incoming", "index", "indexgroup", "inf", "infer_variance",
-    "info", "inherit_handle", "inheritable", "init_filename", "initial", "initial_bytes",
-    "initial_owner", "initial_state", "initial_value", "initval", "inner_size", "input", "insert",
-    "insert_comments", "insert_pis", "instructions", "int", "intern", "intersection", "interval",
-    "invalidate_caches", "io", "ios", "is_builtin", "is_compress", "is_frozen", "is_frozen_package",
-    "is_namespace", "is_package", "is_raw", "is_reload", "is_running", "is_struct", "isalnum",
-    "isascii", "isatty", "isinstance", "iso2022_jp", "iso2022_jp_1", "iso2022_jp_2",
-    "iso2022_jp_2004", "iso2022_jp_3", "iso2022_jp_ext", "iso2022_kr", "iso2022jp", "iso2022jp_1",
-    "iso2022jp_2", "iso2022jp_2004", "iso2022jp_3", "iso2022jp_ext", "iso2022kr", "iso646_us",
-    "iso8859", "iso8859_1", "iso8859_10", "iso8859_11", "iso8859_13", "iso8859_14", "iso8859_15",
-    "iso8859_16", "iso8859_2", "iso8859_3", "iso8859_4", "iso8859_5", "iso8859_6", "iso8859_7",
-    "iso8859_8", "iso8859_9", "iso_2022_jp", "iso_2022_jp_1", "iso_2022_jp_2", "iso_2022_jp_2004",
-    "iso_2022_jp_3", "iso_2022_jp_ext", "iso_2022_kr", "iso_8859_1", "iso_8859_10",
-    "iso_8859_10_1992", "iso_8859_11", "iso_8859_11_2001", "iso_8859_13", "iso_8859_14",
-    "iso_8859_14_1998", "iso_8859_15", "iso_8859_16", "iso_8859_16_2001", "iso_8859_1_1987",
-    "iso_8859_2", "iso_8859_2_1987", "iso_8859_3", "iso_8859_3_1988", "iso_8859_4",
-    "iso_8859_4_1988", "iso_8859_5", "iso_8859_5_1988", "iso_8859_6", "iso_8859_6_1987",
-    "iso_8859_7", "iso_8859_7_1987", "iso_8859_8", "iso_8859_8_1988", "iso_8859_8_e",
-    "iso_8859_8_i", "iso_8859_9", "iso_8859_9_1989", "iso_celtic", "iso_ir_100", "iso_ir_101",
-    "iso_ir_109", "iso_ir_110", "iso_ir_126", "iso_ir_127", "iso_ir_138", "iso_ir_144",
-    "iso_ir_148", "iso_ir_157", "iso_ir_166", "iso_ir_199", "iso_ir_226", "iso_ir_58", "iso_ir_6",
-    "isoformat", "isolation_level", "ispkg", "istext", "item", "items", "iter", "iterable",
-    "iterations", "jisx0213", "johab", "join", "json.decoder", "jump", "keepends", "key", "keyfile",
-    "keys", "kind", "koi8_r", "korean", "ks_c_5601", "ks_c_5601_1987", "ks_x_1001", "ksc5601",
-    "ksx1001", "kw", "kw1", "kw2", "kwargs", "kwdefaults", "kwds", "kz1048", "kz_1048", "l1", "l10",
-    "l2", "l3", "l4", "l5", "l6", "l7", "l8", "l9", "label", "lambda", "last", "last_exc",
+    "eucjis2004", "eucjisx0213", "eucjp", "euckr", "eval", "evaluate_bound", "evaluate_constraints",
+    "evaluate_default", "evaluate_value", "event", "eventfd", "eventfd_read", "eventfd_write",
+    "eventmask", "events", "ex", "exc_details", "exc_info", "exc_traceback", "exc_type",
+    "exc_value", "excepthook", "exception", "exceptions", "exe", "exec", "exec_builtin",
+    "exec_dynamic", "exec_module", "exec_prefix", "executable", "executable_dir", "execv", "execve",
+    "existing_file_name", "exit", "exit_thread", "exp", "expandtabs", "expression", "extend",
+    "extension", "extension_loaders", "extension_suffixes", "extra_data", "extra_data_len",
+    "extra_size", "extra_tokens", "f_back", "f_bavail", "f_bfree", "f_blocks", "f_bsize",
+    "f_builtins", "f_code", "f_contiguous", "f_favail", "f_ffree", "f_files", "f_flag", "f_frsize",
+    "f_fsid", "f_generator", "f_globals", "f_lasti", "f_lineno", "f_locals", "f_namemax", "f_trace",
+    "f_trace_lines", "f_trace_opcodes", "facility", "factory", "false", "family", "fanout",
+    "faulthandler", "fchdir", "fchmod", "fchown", "fd", "fd2", "fdatasync", "fdel", "fget",
+    "fields", "file", "file_actions", "file_encoding", "file_info", "file_name", "file_offset",
+    "file_size", "filename", "filename2", "filename_base", "filenames", "fileno", "filepath",
+    "files", "filesystem_encoding", "filesystem_errors", "fillvalue", "filter", "filters", "final",
+    "finalizer", "find", "find_class", "find_distributions", "find_frozen", "find_spec", "finder",
+    "firstiter", "firstline", "fix_imports", "flags", "float", "float_info", "float_repr_style",
+    "flush", "fn", "fold", "follow_symlinks", "fork", "forkpty", "format", "format_map",
+    "format_spec", "found_in_pycache_prefix", "fp", "fpathconf", "frame_buffer", "framework_binary",
+    "free_tool_id", "from_bytes", "from_name", "from_number", "from_param", "fromhex",
+    "fromisocalendar", "fromisoformat", "fromkeys", "fromlist", "fromordinal", "fromtimestamp",
+    "fromutc", "frozen", "frozenset", "fset", "fspath", "fstat", "fstatvfs", "fsync", "ftruncate",
+    "full_path", "fullname", "fullpath", "func", "future", "fxn", "gb18030", "gb18030_2000",
+    "gb2312", "gb2312_1980", "gb2312_80", "gbk", "generation", "genexpr", "get",
+    "get_asyncgen_hooks", "get_blocking", "get_clock_info", "get_code",
+    "get_coroutine_origin_tracking_depth", "get_data", "get_debug", "get_event_loop", "get_events",
+    "get_filename", "get_frozen_object", "get_ident", "get_inheritable", "get_instructions",
+    "get_int_max_str_digits", "get_jit_code", "get_lines", "get_local_events", "get_loop",
+    "get_native_id", "get_nested", "get_oparg", "get_opcode", "get_resource_reader", "get_source",
+    "get_terminal_size", "get_tool", "getaliases", "getallocatedblocks", "getattr", "getbuffer",
+    "getcwd", "getcwdb", "getdecoder", "getdefaultencoding", "getdlopenflags", "getegid",
+    "getencoder", "geteuid", "getfilesystemencodeerrors", "getfilesystemencoding", "getgid",
+    "getgrouplist", "getgroups", "getincrementaldecoder", "getincrementalencoder", "getitimer",
+    "getline", "getlines", "getloadavg", "getlogin", "getpgid", "getpgrp", "getpid", "getppid",
+    "getpriority", "getprofile", "getreader", "getrecursionlimit", "getrefcount", "getregentry",
+    "getresgid", "getresuid", "getsid", "getsignal", "getsizeof", "getstate", "getswitchinterval",
+    "getter", "gettrace", "getuid", "getunicodeinternedsize", "getvalue", "getweakrefcount",
+    "getweakrefs", "getwriter", "getxattr", "gi_code", "gi_frame", "gi_running", "gi_suspended",
+    "gi_yieldfrom", "gid", "gil", "globals", "globals_", "gmtime", "grantpt", "greek", "greek8",
+    "groupindex", "groups", "had_delim", "had_equ", "handle", "handle_seq", "has_deadlock",
+    "has_default", "has_location", "hasattr", "hash", "hash_based", "hash_bits", "hash_info",
+    "hash_name", "hash_randomization", "hash_seed", "hassuffix", "head", "header",
+    "header_position", "header_size", "headers", "hebrew", "hex", "hex_codec", "hexversion", "hi",
+    "hk", "hkey", "hkscs", "home", "home_was_set", "hook", "hour", "hp_roman8", "hz", "hz_gb",
+    "hz_gb_2312", "hzgb", "ibm037", "ibm039", "ibm1026", "ibm1051", "ibm1125", "ibm1140", "ibm273",
+    "ibm367", "ibm424", "ibm437", "ibm500", "ibm775", "ibm819", "ibm850", "ibm852", "ibm855",
+    "ibm857", "ibm858", "ibm860", "ibm861", "ibm862", "ibm863", "ibm864", "ibm865", "ibm866",
+    "ibm869", "id", "ident", "identity_hint", "ignore", "ignore_environment", "ignore_errors",
+    "imag", "implementation", "import_", "import_error", "import_time", "importlib",
+    "importlib.metadata", "importlib.readers", "in_fd", "incoming", "incrementaldecoder",
+    "incrementalencoder", "index", "indexgroup", "indices", "inf", "infer_variance", "info",
+    "inherit_handle", "inheritable", "init_filename", "init_frozen", "initgroups", "initial",
+    "initial_bytes", "initial_owner", "initial_state", "initial_value", "initval", "inner_size",
+    "inode", "input", "insert", "insert_comments", "insert_pis", "inspect",
+    "install_signal_handlers", "instructions", "int", "int_info", "int_max_str_digits",
+    "interactive", "intern", "interpolations", "interrupt_main", "intersection",
+    "intersection_update", "interval", "invalidate_caches", "io", "ios", "is_active",
+    "is_available", "is_builtin", "is_compress", "is_dir", "is_done", "is_enabled", "is_file",
+    "is_finalizing", "is_frozen", "is_frozen_package", "is_integer", "is_junction", "is_namespace",
+    "is_package", "is_raw", "is_reload", "is_remote_debug_enabled", "is_running",
+    "is_stack_trampoline_active", "is_struct", "is_symlink", "is_valid", "isabs", "isalnum",
+    "isalpha", "isascii", "isatty", "isbytecode", "isdecimal", "isdigit", "isdir", "isdisjoint",
+    "isfile", "isidentifier", "isinstance", "islower", "isnumeric", "iso2022_jp", "iso2022_jp_1",
+    "iso2022_jp_2", "iso2022_jp_2004", "iso2022_jp_3", "iso2022_jp_ext", "iso2022_kr", "iso2022jp",
+    "iso2022jp_1", "iso2022jp_2", "iso2022jp_2004", "iso2022jp_3", "iso2022jp_ext", "iso2022kr",
+    "iso646_us", "iso8859", "iso8859_1", "iso8859_10", "iso8859_11", "iso8859_13", "iso8859_14",
+    "iso8859_15", "iso8859_16", "iso8859_2", "iso8859_3", "iso8859_4", "iso8859_5", "iso8859_6",
+    "iso8859_7", "iso8859_8", "iso8859_9", "iso_2022_jp", "iso_2022_jp_1", "iso_2022_jp_2",
+    "iso_2022_jp_2004", "iso_2022_jp_3", "iso_2022_jp_ext", "iso_2022_kr", "iso_8859_1",
+    "iso_8859_10", "iso_8859_10_1992", "iso_8859_11", "iso_8859_11_2001", "iso_8859_13",
+    "iso_8859_14", "iso_8859_14_1998", "iso_8859_15", "iso_8859_16", "iso_8859_16_2001",
+    "iso_8859_1_1987", "iso_8859_2", "iso_8859_2_1987", "iso_8859_3", "iso_8859_3_1988",
+    "iso_8859_4", "iso_8859_4_1988", "iso_8859_5", "iso_8859_5_1988", "iso_8859_6",
+    "iso_8859_6_1987", "iso_8859_7", "iso_8859_7_1987", "iso_8859_8", "iso_8859_8_1988",
+    "iso_8859_8_e", "iso_8859_8_i", "iso_8859_9", "iso_8859_9_1989", "iso_celtic", "iso_ir_100",
+    "iso_ir_101", "iso_ir_109", "iso_ir_110", "iso_ir_126", "iso_ir_127", "iso_ir_138",
+    "iso_ir_144", "iso_ir_148", "iso_ir_157", "iso_ir_166", "iso_ir_199", "iso_ir_226", "iso_ir_58",
+    "iso_ir_6", "isocalendar", "isoformat", "isolated", "isolation_level", "isoweekday",
+    "ispackage", "ispkg", "isprintable", "isspace", "issubclass", "issubset", "issuperset",
+    "istext", "istitle", "isupper", "isxfile", "item", "items", "itemsize", "iter", "iterable",
+    "iterations", "iterator", "iterdecode", "iterencode", "jisx0213", "johab", "join", "joinpath",
+    "json.decoder", "jump", "keepends", "key", "keyfile", "keys", "kill", "killpg", "kind",
+    "koi8_r", "korean", "ks_c_5601", "ks_c_5601_1987", "ks_x_1001", "ksc5601", "ksx1001", "kw",
+    "kw1", "kw2", "kwargs", "kwdefaults", "kwds", "kz1048", "kz_1048", "l1", "l10", "l2", "l3",
+    "l4", "l5", "l6", "l7", "l8", "l9", "label", "lambda", "landmarks", "last", "last_exc",
     "last_node", "last_traceback", "last_type", "last_value", "latin", "latin1", "latin10",
     "latin2", "latin3", "latin4", "latin5", "latin6", "latin7", "latin8", "latin9", "latin_1",
-    "leaf_size", "len", "length", "level", "limit", "line", "line_buffering", "lineno", "list",
-    "list index out of range", "listcomp", "listdir", "little", "lo", "load_module", "loader",
+    "latin_1_decode", "latin_1_encode", "lazy_entry", "lazycache", "lchown", "leaf_size", "len",
+    "length", "level", "library", "library_dir", "limit", "line", "line0withend", "line0withoutend",
+    "line_buffering", "linebuffer", "lineno", "lines", "link", "list", "list index out of range",
+    "listcomp", "listdir", "listxattr", "little", "ljust", "lo", "load", "load_module", "loader",
     "loader_class", "loader_details", "loader_state", "loaders", "loads", "locale", "locals",
-    "location", "lock", "locked", "logoption", "loop", "lower_suffix_contents", "lstrip",
-    "mac_centeuro", "mac_cyrillic", "mac_greek", "mac_iceland", "mac_latin2", "mac_roman",
-    "mac_turkish", "maccentraleurope", "maccyrillic", "macgreek", "maciceland", "macintosh",
-    "maclatin2", "macroman", "macturkish", "magic", "manual_reset", "map", "mapping", "marshal",
-    "match", "max", "max_length", "maxdigits", "maxevents", "maxlen", "maxmem", "maxsplit",
-    "maxvalue", "mbcs", "me", "memLevel", "memlimit", "memoryview", "message", "meta_path",
-    "metaclass", "metadata", "method", "microsecond", "milliseconds", "minute", "missing", "mkdir",
-    "mod", "mode", "modname", "modnames", "module", "module_from_spec", "module_globals",
-    "module_type", "modules", "month", "mro", "ms1361", "ms874", "ms932", "ms936", "ms949", "ms950",
-    "ms_kanji", "msg", "mskanji", "mtime", "mutex", "mycmp", "n_arg", "n_fields",
-    "n_sequence_fields", "n_unnamed_fields", "name", "name_from", "namespace_path",
-    "namespace_separator", "namespaces", "narg", "ndigits", "nested", "never", "new",
-    "new_file_name", "new_limit", "new_name", "new_root", "newline", "newline_decoder", "newlines",
-    "next", "nlocals", "node_depth", "node_offset", "norm_encoding", "normalize_encoding", "ns",
-    "nstype", "nt", "null", "number", "ob", "obj", "object", "offset", "offset_dst", "offset_src",
-    "old", "on_type_read", "onceregistry", "only_active_thread", "only_keys", "oparg", "opcode",
-    "open", "open_code", "opener", "operation", "opt_level", "optimization", "optimize", "options",
-    "order", "origin", "origname", "other", "out_fd", "outgoing", "outpath", "overlapped",
-    "override", "owner", "package", "pages", "parameter", "parent", "parent_module",
-    "parent_module_name", "parent_path", "parent_spec", "part", "partition", "password", "path",
-    "path_attr_name", "path_finder", "path_hook", "path_hook_for_FileFinder", "path_hooks",
-    "path_importer_cache", "path_mtime", "path_parts", "path_sep", "path_sep_tuple",
-    "path_separators", "path_stats", "path_tmp", "pathname", "pattern", "peek", "persistent_id",
-    "persistent_load", "person", "pi_factory", "pid", "pkgdir", "platform", "policy", "pop",
-    "portions", "pos", "pos1", "pos2", "posix", "print", "print_file_and_line", "priority",
-    "progress", "progress_handler", "progress_routine", "property", "proto", "protocol", "ps1",
-    "ps2", "pt154", "ptcp154", "punct", "py", "pyc_magic_number_token", "pycache",
-    "pycache_filename", "pycache_prefix", "query", "quopri", "quopri_codec", "quoted_printable",
-    "quotedprintable", "quotetabs", "r8", "raw", "read", "read1", "readable", "readall", "readinto",
-    "readinto1", "readline", "readonly", "real", "recursive", "reducer_override", "ref", "register",
-    "registry", "registry_key", "rel_tol", "release", "release_lock", "relfile", "reload", "remove",
-    "removeprefix", "repl", "replace", "reserved", "reset", "resetids", "return", "reverse",
-    "reversed", "rfind", "rk1048", "roman8", "root", "rot13", "rot_13", "rpartition", "rsplit",
-    "rstrip", "ruscii", "s_jis", "s_jis_2004", "s_jisx0213", "salt", "sched_priority", "scheduler",
-    "script", "search", "search_function", "second", "security_attributes", "seek", "seekable",
-    "seen_ids", "selectors", "self", "self_module", "self_weakref", "send", "sep", "sequence",
-    "server_hostname", "server_side", "session", "set", "set_data", "setattr", "setcomp",
-    "setdefault", "setpgroup", "setsid", "setsigdef", "setsigmask", "setstate", "setter", "shape",
+    "localtime", "location", "lock", "lock_held", "locked", "locked_lock", "lockf", "login_tty",
+    "logoption", "lookup", "lookup_error", "loop", "lower_suffix_contents", "lseek", "lstat",
+    "lstrip", "mac_centeuro", "mac_cyrillic", "mac_greek", "mac_iceland", "mac_latin2", "mac_roman",
+    "mac_turkish", "maccentraleurope", "maccyrillic", "macgreek", "machine", "maciceland",
+    "macintosh", "maclatin2", "macroman", "macturkish", "magic", "major", "make_encoding_map",
+    "make_identity_dict", "makedev", "malloc_stats", "mant_dig", "manual_reset", "map", "mapping",
+    "marshal", "match", "max", "max_10_exp", "max_comment_plus_dirs_size", "max_comment_start",
+    "max_exp", "max_length", "maxdigits", "maxevents", "maxlen", "maxmem", "maxsize", "maxsplit",
+    "maxunicode", "maxvalue", "mbcs", "me", "memLevel", "memlimit", "memoryview", "message",
+    "meta_path", "metaclass", "metadata", "method", "mi", "micro", "microsecond", "microseconds",
+    "milliseconds", "min", "min_10_exp", "min_exp", "minor", "minute", "missing", "mkdir", "mkfifo",
+    "mknod", "mktime", "mod", "mode", "modname", "modnames", "modpath", "module",
+    "module_from_spec", "module_globals", "module_info", "module_search_paths",
+    "module_search_paths_set", "module_type", "modules", "modulus", "monitoring", "monotonic",
+    "monotonic_ns", "month", "move_to_end", "mro", "ms1361", "ms874", "ms932", "ms936", "ms949",
+    "ms950", "ms_kanji", "msg", "mskanji", "mtime", "mutex", "mycmp", "n_arg", "n_fields",
+    "n_sequence_fields", "n_unnamed_fields", "name", "name_from", "name_size", "namereplace",
+    "namereplace_errors", "namespace_path", "namespace_separator", "namespaces", "nan", "narg",
+    "nbytes", "ndigits", "ndim", "nested", "never", "new", "new_file_name", "new_label",
+    "new_limit", "new_name", "new_root", "newchars", "newdata", "newline", "newline_decoder",
+    "newlines", "next", "nice", "nlocals", "no_site", "no_user_site", "node_depth", "node_offset",
+    "nodename", "norm_encoding", "normalize_encoding", "now", "ns", "nstype", "nt", "null",
+    "num_entries", "num_extra_values", "number", "numerator", "ob", "obj", "object", "oct",
+    "offset", "offset_dst", "offset_src", "old", "old_value", "on_type_read", "onceregistry",
+    "only_active_thread", "only_keys", "oparg", "opcode", "open", "open_code", "opener", "openpty",
+    "operation", "opt_level", "optimization", "optimization_level", "optimize", "options", "ord",
+    "order", "orig_argv", "origin", "origname", "os", "os_name", "other", "out_fd", "outgoing",
+    "outpath", "output", "overlapped", "override", "owner", "package", "pages", "parameter",
+    "parent", "parent_module", "parent_module_name", "parent_path", "parent_spec", "parse_argv",
+    "parser_debug", "part", "partition", "password", "path", "path_attr_name", "path_finder",
+    "path_hook", "path_hook_for_FileFinder", "path_hooks", "path_importer_cache", "path_mtime",
+    "path_parts", "path_sep", "path_sep_tuple", "path_separators", "path_stats", "path_tmp",
+    "pathconf", "pathconf_names", "pathconfig_warnings", "pathname", "pattern", "pause", "peek",
+    "perf_counter", "perf_counter_ns", "perf_profiling", "persistent_id", "persistent_load",
+    "person", "pi_factory", "pid", "pipe", "pipe2", "pkgdir", "platform", "platlibdir",
+    "platstdlib_dir", "policy", "pop", "popitem", "portions", "pos", "pos1", "pos2", "pos64",
+    "posix", "posix_fadvise", "posix_fallocate", "posix_openpt", "posix_spawn", "posix_spawnp",
+    "pow", "pread", "preadv", "prefix", "print", "print_file_and_line", "priority", "process_time",
+    "process_time_ns", "program_name", "progress", "progress_handler", "progress_routine",
+    "property", "proto", "protocol", "proxy", "ps1", "ps2", "pt154", "ptcp154", "pth", "pth_dir",
+    "pthread_getcpuclockid", "pthread_kill", "pthread_sigmask", "ptsname", "punct", "putenv",
+    "pwrite", "pwritev", "py", "py_setpath", "pyc_magic_number_token", "pycache",
+    "pycache_filename", "pycache_prefix", "python", "pythonpath", "pythonpath_env",
+    "pythonpath_was_set", "pyvenvcfg", "query", "quiet", "quopri", "quopri_codec",
+    "quoted_printable", "quotedprintable", "quotetabs", "r8", "radix", "raise_signal", "range",
+    "raw", "raw_data", "raw_unicode_escape_decode", "raw_unicode_escape_encode", "read", "read1",
+    "readable", "readall", "readbuffer_encode", "reader", "readinto", "readinto1", "readline",
+    "readlines", "readlink", "readonly", "readsize", "readv", "real", "real_executable",
+    "real_executable_dir", "realpath", "reason", "reconfigure", "recursive", "reducer_override",
+    "ref", "register", "register_at_fork", "register_callback", "register_error", "registry",
+    "registry_key", "rel_tol", "release", "release_lock", "releaselevel", "relfile", "reload",
+    "remote_debug", "remote_exec", "remove", "removeprefix", "removesuffix", "removexattr",
+    "rename", "repl", "replace", "replace_errors", "repr", "reserved", "reset", "resetids",
+    "resize", "resolution", "restart_events", "result", "return", "reverse", "reversed", "rfind",
+    "rindex", "rjust", "rk1048", "rmdir", "rng", "roman8", "root", "rot13", "rot_13", "round",
+    "rounds", "rpartition", "rsplit", "rstrip", "run", "run_command", "run_filename", "run_module",
+    "ruscii", "s_jis", "s_jis_2004", "s_jisx0213", "safe_path", "salt", "scandir",
+    "sched_get_priority_max", "sched_get_priority_min", "sched_getaffinity", "sched_getparam",
+    "sched_getscheduler", "sched_param", "sched_priority", "sched_rr_get_interval",
+    "sched_setaffinity", "sched_setparam", "sched_setscheduler", "sched_yield", "scheduler",
+    "script", "search", "search_function", "search_up", "search_up.<locals>.<genexpr>", "second",
+    "seconds", "security_attributes", "seed_bits", "seek", "seekable", "seen_ids", "selectors",
+    "self", "self_module", "self_weakref", "send", "sendfile", "sep", "sequence", "serial",
+    "server_hostname", "server_side", "session", "set", "set_asyncgen_hooks", "set_blocking",
+    "set_coroutine_origin_tracking_depth", "set_data", "set_events", "set_inheritable",
+    "set_int_max_str_digits", "set_local_events", "set_name", "set_wakeup_fd", "setattr", "setcomp",
+    "setdefault", "setdlopenflags", "setegid", "seteuid", "setgid", "setgroups", "setitimer",
+    "setns", "setpgid", "setpgroup", "setpgrp", "setpriority", "setprofile", "setrecursionlimit",
+    "setregid", "setresgid", "setresuid", "setreuid", "setsid", "setsigdef", "setsigmask",
+    "setstate", "setswitchinterval", "setter", "settrace", "setuid", "setxattr", "shape",
     "shift_jis", "shift_jis_2004", "shift_jisx0213", "shiftjis", "shiftjis2004", "shiftjisx0213",
-    "show_cmd", "signed", "size", "sizehint", "sjis", "sjis_2004", "sjisx0213",
-    "skip_file_prefixes", "sleep", "smsl", "sock", "sort", "sorted", "source", "source_bytes",
-    "source_bytes_readline", "source_from_cache", "source_hash", "source_mtime", "source_path",
-    "source_size", "source_to_code", "source_traceback", "spam", "spec", "spec_from_file_location",
-    "spec_from_loader", "spec_loader", "split", "src", "src_dir_fd", "st", "st_mode", "st_mtime",
-    "st_size", "stacklevel", "start", "startswith", "stat", "stat_info", "state", "statement",
-    "staticmethod", "status", "stderr", "stdin", "stdout", "step", "steps", "store_name",
-    "strategy", "strftime", "strict", "strict_mode", "string", "strip", "stripped_path",
-    "strk1048_2002", "sub_key", "subcalls", "submodule_search_locations", "suffix", "suffixes",
-    "super", "supported_loaders", "symmetric_difference_update", "sys", "sys_module", "sys_version",
-    "tabsize", "tag", "tail", "tail_module", "tail_name", "target", "target_id",
-    "target_is_directory", "task", "tb_frame", "tb_lasti", "tb_lineno", "tb_next", "tell",
-    "template", "term", "text", "thai", "thread_id", "threading", "throw", "tid", "timeout",
-    "timer", "times", "timetuple", "timeunit", "tis620", "tis_620", "tis_620_0", "tis_620_2529_0",
-    "tis_620_2529_1", "to_bytes", "tokenize", "top", "trace_callback", "traceback", "trailers",
-    "translate", "true", "truncate", "tuple", "tvos", "twice", "txt", "type", "type_params", "tz",
-    "tzinfo", "tzname", "u16", "u32", "u7", "u8", "u_jis", "uhc", "uid", "ujis",
-    "unicode_1_1_utf_7", "unicodebigunmarked", "unicodelittleunmarked", "unlink", "unraisablehook",
-    "update", "uri", "us", "us_ascii", "usedforsecurity", "utf", "utf-8", "utf16", "utf32", "utf7",
-    "utf8", "utf8_ucs2", "utf8_ucs4", "utf_16", "utf_16_be", "utf_16_le", "utf_16be", "utf_16le",
-    "utf_32", "utf_32_be", "utf_32_le", "utf_32be", "utf_32le", "utf_7", "utf_8", "uu", "uu_codec",
-    "value", "values", "vars", "verbose", "verbosity", "version", "version_info", "volume",
-    "wait_all", "waiters", "wakeup", "warn", "warn_on_full_buffer", "warnings", "warnoptions",
-    "watchos", "wb", "wbits", "week", "weekday", "where", "which", "who", "win", "win32",
-    "win32_code_page_search_function", "windows_1250", "windows_1251", "windows_1252",
-    "windows_1253", "windows_1254", "windows_1255", "windows_1256", "windows_1257", "windows_1258",
-    "windows_31j", "windows_874", "winreg", "withdata", "wr", "writable", "write", "write_through",
-    "x_mac_japanese", "x_mac_korean", "x_mac_simp_chinese", "x_mac_trad_chinese", "year", "zdict",
-    "zip", "zlib", "zlib_codec", "zstd_dict", "{{", "}}",
+    "show_cmd", "show_ref_count", "si_band", "si_code", "si_errno", "si_pid", "si_signo",
+    "si_status", "si_uid", "siginterrupt", "signal", "signed", "sigpending", "sigtimedwait",
+    "sigwait", "sigwaitinfo", "site_import", "size", "sizehint", "sizeof_digit", "sjis",
+    "sjis_2004", "sjisx0213", "skip_file_prefixes", "skip_source_first_line", "sleep", "smsl",
+    "sock", "sort", "sorted", "source", "source_bytes", "source_bytes_readline",
+    "source_from_cache", "source_hash", "source_mtime", "source_path", "source_size",
+    "source_to_code", "source_traceback", "spam", "spec", "spec_from_file_location",
+    "spec_from_loader", "spec_loader", "splice", "split", "splitlines", "sr", "src", "src_dir_fd",
+    "srw", "st", "st_atime", "st_atime_ns", "st_blksize", "st_blocks", "st_ctime", "st_ctime_ns",
+    "st_dev", "st_gid", "st_ino", "st_mode", "st_mtime", "st_mtime_ns", "st_nlink", "st_rdev",
+    "st_size", "st_uid", "stack", "stack_size", "stacklevel", "start", "start_joinable_thread",
+    "start_new", "start_new_thread", "start_offset", "startswith", "stat", "stat_info",
+    "stat_result", "state", "statement", "staticmethod", "status", "statvfs", "statvfs_result",
+    "stderr", "stdin", "stdio_encoding", "stdio_errors", "stdlib_dir",
+    "stdlib_dir_was_set_in_config", "stdlib_module_names", "stdout", "step", "steps", "stop",
+    "store_name", "str_digits_check_threshold", "strategy", "stream", "streamreader",
+    "streamwriter", "strerror", "strftime", "strict", "strict_errors", "strict_mode", "strides",
+    "string", "strings", "strip", "stripped_path", "strk1048_2002", "strptime", "strsignal",
+    "struct", "struct_rusage", "struct_siginfo", "struct_time", "sub_key", "subcalls", "subgroup",
+    "submodule_search_locations", "suboffsets", "suffix", "suffixes", "sum", "super",
+    "supported_loaders", "supports_isolated_interpreters", "surrogateescape", "surrogatepass",
+    "swapcase", "symbols", "symlink", "symmetric_difference", "symmetric_difference_update", "sync",
+    "sys", "sys_module", "sys_path_0", "sys_version", "sysconf", "sysconf_names", "sysname",
+    "system", "t1", "t2", "tabsize", "tag", "tail", "tail_module", "tail_name", "target",
+    "target_id", "target_is_directory", "task", "tb", "tb_frame", "tb_lasti", "tb_lineno",
+    "tb_next", "tcgetpgrp", "tcsetpgrp", "tell", "template", "term", "terminal_size", "text",
+    "text_encoding", "thai", "thread", "thread_id", "thread_info", "thread_inherit_context",
+    "thread_time", "thread_time_ns", "threading", "throw", "tid", "time", "time_ns", "timeout",
+    "timer", "timerfd_create", "timerfd_gettime", "timerfd_gettime_ns", "timerfd_settime",
+    "timerfd_settime_ns", "times", "times_result", "timestamp", "timetuple", "timetz", "timeunit",
+    "timezone", "tis620", "tis_620", "tis_620_0", "tis_620_2529_0", "tis_620_2529_1", "title",
+    "tm_gmtoff", "tm_hour", "tm_isdst", "tm_mday", "tm_min", "tm_mon", "tm_sec", "tm_wday",
+    "tm_yday", "tm_year", "tm_zone", "to_bytes", "tobytes", "toc_entry", "today", "tokenize",
+    "tolist", "toordinal", "top", "toreadonly", "total_seconds", "trace_callback", "traceback",
+    "tracemalloc", "trailers", "translate", "true", "truncate", "ttyname", "tuple", "tvos", "twice",
+    "txt", "type", "type_params", "tz", "tzinfo", "tzname", "tzset", "u16", "u32", "u7", "u8",
+    "u_jis", "uhc", "uid", "ujis", "umask", "uname", "uname_result", "uncompressed_size",
+    "unicode_1_1_utf_7", "unicode_escape_decode", "unicode_escape_encode", "unicodebigunmarked",
+    "unicodelittleunmarked", "union", "unknown", "unlink", "unlockpt", "unpack_from",
+    "unraisablehook", "unregister", "unsetenv", "unshare", "update", "updatecache", "urandom",
+    "uri", "us", "us_ascii", "use_environment", "use_frozen_modules", "use_hash_seed", "use_label",
+    "use_tool_id", "usedforsecurity", "user", "user_site_directory", "utc", "utcfromtimestamp",
+    "utcnow", "utcoffset", "utctimetuple", "utf", "utf-8", "utf16", "utf32", "utf7", "utf8",
+    "utf8_mode", "utf8_ucs2", "utf8_ucs4", "utf_16", "utf_16_be", "utf_16_be_decode",
+    "utf_16_be_encode", "utf_16_decode", "utf_16_encode", "utf_16_ex_decode", "utf_16_le",
+    "utf_16_le_decode", "utf_16_le_encode", "utf_16be", "utf_16le", "utf_32", "utf_32_be",
+    "utf_32_be_decode", "utf_32_be_encode", "utf_32_decode", "utf_32_encode", "utf_32_ex_decode",
+    "utf_32_le", "utf_32_le_decode", "utf_32_le_encode", "utf_32be", "utf_32le", "utf_7",
+    "utf_7_decode", "utf_7_encode", "utf_8", "utf_8_decode", "utf_8_encode", "utime", "uu",
+    "uu_codec", "valid_signals", "value", "values", "var", "varnames", "vars", "venv_prefix",
+    "venv_prefix2", "verbose", "verbosity", "version", "version_info", "volume", "wait", "wait3",
+    "wait4", "wait_all", "waiters", "waitid", "waitid_result", "waitpid", "waitstatus_to_exitcode",
+    "wakeup", "warn", "warn_default_encoding", "warn_explicit", "warn_on_full_buffer", "warnings",
+    "warnoptions", "watchos", "wb", "wbits", "week", "weekday", "whence", "where", "which", "who",
+    "why", "width", "win", "win32", "win32_code_page_search_function", "windows_1250",
+    "windows_1251", "windows_1252", "windows_1253", "windows_1254", "windows_1255", "windows_1256",
+    "windows_1257", "windows_1258", "windows_31j", "windows_874", "winreg", "with_traceback",
+    "withdata", "wr", "writable", "write", "write_bytecode", "write_through", "writelines",
+    "writer", "writev", "x_mac_japanese", "x_mac_korean", "x_mac_simp_chinese",
+    "x_mac_trad_chinese", "xmlcharrefreplace", "xmlcharrefreplace_errors", "xoptions", "year",
+    "zdict", "zfill", "zip", "zipimporter", "zipimporter.__init__", "zipimporter.__repr__",
+    "zipimporter._get_files", "zipimporter.find_spec", "zipimporter.get_code",
+    "zipimporter.get_data", "zipimporter.get_filename", "zipimporter.get_resource_reader",
+    "zipimporter.get_source", "zipimporter.invalidate_caches", "zipimporter.is_package",
+    "zipimporter.load_module", "zlib", "zlib_codec", "zstd_dict", "{{", "}}",
 ];
 
 #[cfg(target_os = "linux")]
@@ -2459,308 +2752,383 @@ pub(crate) fn is_preinterned_string(value: &str) -> bool {
         0x3935 => (47, 48),
         0x3c4e => (48, 49),
         0x3c64 => (49, 50),
-        0x3c66 => (50, 52),
-        0x3c67 => (52, 53),
-        0x3c6c => (53, 55),
-        0x3c6d => (55, 56),
-        0x3c73 => (56, 58),
-        0x3c75 => (58, 59),
-        0x4170 => (59, 61),
-        0x4174 => (61, 62),
-        0x4259 => (62, 63),
-        0x4275 => (63, 70),
-        0x4279 => (70, 71),
-        0x4341 => (71, 72),
-        0x436f => (72, 74),
-        0x4445 => (74, 76),
-        0x4465 => (76, 77),
-        0x454f => (77, 78),
-        0x4558 => (78, 79),
-        0x4578 => (79, 91),
-        0x4649 => (91, 92),
-        0x4661 => (92, 93),
-        0x4669 => (93, 115),
-        0x4672 => (115, 125),
-        0x484b => (125, 127),
-        0x496d => (127, 129),
-        0x496e => (129, 131),
-        0x4a53 => (131, 132),
-        0x4b65 => (132, 134),
-        0x4c6f => (134, 135),
-        0x4d41 => (135, 136),
-        0x4d49 => return value == "MISSING",
-        0x4d65 => (136, 137),
-        0x4d6f => (137, 145),
-        0x4e61 => (145, 155),
-        0x4e6f => {
-            if value == "None" {
-                return true;
-            }
-            (155, 158)
-        }
-        0x4f50 => (158, 159),
-        0x4f53 => (159, 160),
-        0x4f5f => (160, 163),
-        0x4f70 => (163, 164),
-        0x4f76 => (164, 165),
-        0x5045 => (165, 166),
-        0x5059 => (166, 167),
-        0x5061 => (167, 174),
-        0x5065 => (174, 175),
-        0x5079 => (175, 176),
-        0x5175 => (176, 177),
-        0x5245 => (177, 179),
-        0x524c => (179, 180),
-        0x5275 => (180, 181),
-        0x534f => (181, 182),
-        0x536f => (182, 197),
-        0x5379 => (197, 198),
-        0x5465 => (198, 199),
-        0x5472 => (199, 200),
-        0x5479 => (200, 201),
-        0x5661 => (201, 202),
-        0x5761 => (202, 203),
-        0x5769 => (203, 207),
-        0x5f42 => (207, 211),
-        0x5f43 => (211, 214),
-        0x5f44 => (214, 220),
-        0x5f45 => (220, 221),
-        0x5f49 => (221, 224),
-        0x5f4b => (224, 225),
-        0x5f4c => (225, 231),
-        0x5f4d => (231, 244),
-        0x5f4e => (244, 258),
-        0x5f4f => (258, 260),
-        0x5f50 => (260, 262),
-        0x5f53 => (262, 263),
-        0x5f57 => (263, 274),
-        0x5f5f => (274, 444),
+        0x3c66 => (50, 55),
+        0x3c67 => (55, 56),
+        0x3c6c => (56, 58),
+        0x3c6d => (58, 59),
+        0x3c73 => (59, 61),
+        0x3c75 => (61, 62),
+        0x4142 => (62, 63),
+        0x4170 => (63, 65),
+        0x4172 => (65, 66),
+        0x4173 => (66, 67),
+        0x4174 => (67, 68),
+        0x424f => (68, 82),
+        0x4252 => (82, 85),
+        0x4255 => (85, 88),
+        0x4259 => (88, 89),
+        0x4261 => (89, 91),
+        0x426c => (91, 92),
+        0x4272 => (92, 93),
+        0x4275 => (93, 119),
+        0x4279 => (119, 121),
+        0x4341 => (121, 123),
+        0x434c => (123, 147),
+        0x434f => (147, 148),
+        0x4353 => (148, 175),
+        0x435f => (175, 177),
+        0x4361 => (177, 178),
+        0x4368 => (178, 179),
+        0x436c => (179, 180),
+        0x436f => (180, 192),
+        0x4445 => (192, 198),
+        0x4449 => (198, 199),
+        0x4465 => (199, 200),
+        0x4469 => (200, 201),
+        0x4546 => (201, 204),
+        0x454e => (204, 212),
+        0x454f => (212, 213),
+        0x4558 => (213, 233),
+        0x456c => (233, 234),
+        0x456e => (234, 238),
+        0x4578 => (238, 251),
+        0x4649 => (251, 252),
+        0x465f => (252, 257),
+        0x4661 => (257, 258),
+        0x4669 => (258, 280),
+        0x466c => (280, 281),
+        0x4672 => (281, 291),
+        0x4675 => (291, 292),
+        0x4765 => (292, 293),
+        0x484b => (293, 295),
+        0x494e => (295, 296),
+        0x494f => (296, 297),
+        0x4954 => (297, 300),
+        0x496d => (300, 302),
+        0x496e => (302, 318),
+        0x4973 => (318, 319),
+        0x4974 => (319, 320),
+        0x4a53 => (320, 321),
+        0x4a55 => (321, 322),
+        0x4b65 => (322, 325),
+        0x4c49 => (325, 326),
+        0x4c69 => (326, 327),
+        0x4c6f => (327, 329),
+        0x4d41 => (329, 332),
+        0x4d49 => (332, 333),
+        0x4d65 => (333, 335),
+        0x4d6f => (335, 343),
+        0x4e47 => (343, 344),
+        0x4e4f => (344, 345),
+        0x4e53 => (345, 346),
+        0x4e61 => (346, 357),
+        0x4e6f => (357, 361),
+        0x4f50 => (361, 363),
+        0x4f53 => (363, 364),
+        0x4f5f => (364, 388),
+        0x4f70 => (388, 390),
+        0x4f76 => (390, 391),
+        0x5043 => (391, 411),
+        0x5045 => (411, 412),
+        0x504c => (412, 414),
+        0x504f => (414, 423),
+        0x5052 => (423, 428),
+        0x5059 => (428, 438),
+        0x505f => (438, 441),
+        0x5061 => (441, 448),
+        0x5065 => (448, 450),
+        0x5072 => (450, 452),
+        0x5079 => (452, 454),
+        0x5175 => (454, 455),
+        0x5241 => (455, 456),
+        0x5245 => (456, 459),
+        0x524c => (459, 460),
+        0x5254 => (460, 467),
+        0x525f => (467, 468),
+        0x5265 => (468, 473),
+        0x5275 => (473, 475),
+        0x5343 => (475, 617),
+        0x5345 => (617, 620),
+        0x5349 => (620, 661),
+        0x534f => (661, 662),
+        0x5350 => (662, 665),
+        0x5354 => (665, 682),
+        0x536f => (682, 697),
+        0x5374 => (697, 754),
+        0x5379 => (754, 758),
+        0x5446 => (758, 761),
+        0x5449 => (761, 762),
+        0x544d => (762, 763),
+        0x5461 => (763, 764),
+        0x5465 => (764, 765),
+        0x5469 => (765, 766),
+        0x5472 => (766, 767),
+        0x5479 => (767, 768),
+        0x556e => (768, 775),
+        0x5573 => (775, 776),
+        0x5645 => (776, 779),
+        0x5650 => (779, 780),
+        0x5661 => (780, 781),
+        0x5743 => (781, 783),
+        0x5745 => (783, 785),
+        0x5749 => (785, 791),
+        0x574e => (791, 793),
+        0x5753 => (793, 795),
+        0x5754 => (795, 796),
+        0x5755 => (796, 797),
+        0x575f => (797, 798),
+        0x5761 => (798, 800),
+        0x5769 => (800, 804),
+        0x5772 => (804, 805),
+        0x5841 => (805, 808),
+        0x585f => (808, 809),
+        0x5a49 => (809, 811),
+        0x5a65 => (811, 812),
+        0x5a69 => (812, 814),
+        0x5f42 => (814, 820),
+        0x5f43 => (820, 824),
+        0x5f44 => (824, 831),
+        0x5f45 => (831, 833),
+        0x5f49 => (833, 838),
+        0x5f4b => (838, 839),
+        0x5f4c => (839, 845),
+        0x5f4d => (845, 858),
+        0x5f4e => (858, 873),
+        0x5f4f => (873, 875),
+        0x5f50 => (875, 877),
+        0x5f52 => (877, 878),
+        0x5f53 => (878, 880),
+        0x5f54 => (880, 882),
+        0x5f57 => (882, 893),
+        0x5f5f => (893, 1105),
         0x5f61 => {
             if value == "_attributes" {
                 return true;
             }
-            (444, 452)
+            (1105, 1117)
         }
-        0x5f62 => (452, 459),
-        0x5f63 => (459, 476),
-        0x5f64 => (476, 477),
-        0x5f65 => (477, 479),
+        0x5f62 => (1117, 1128),
+        0x5f63 => (1128, 1160),
+        0x5f64 => (1160, 1165),
+        0x5f65 => (1165, 1171),
         0x5f66 => {
             if value == "_fields" {
                 return true;
             }
-            (479, 493)
+            (1171, 1191)
         }
-        0x5f67 => (493, 501),
-        0x5f68 => (501, 503),
-        0x5f69 => (503, 515),
-        0x5f6c => (515, 527),
-        0x5f6d => (527, 533),
-        0x5f6e => (533, 536),
-        0x5f6f => (536, 541),
-        0x5f70 => (541, 560),
-        0x5f72 => (560, 573),
-        0x5f73 => (573, 587),
-        0x5f74 => (587, 589),
-        0x5f75 => (589, 594),
-        0x5f76 => (594, 597),
-        0x5f77 => (597, 603),
-        0x5f78 => (603, 604),
-        0x6162 => (604, 605),
-        0x6163 => (605, 609),
-        0x6164 => (609, 611),
-        0x6166 => (611, 613),
-        0x6167 => (613, 614),
-        0x616c => (614, 624),
+        0x5f67 => (1191, 1215),
+        0x5f68 => (1215, 1218),
+        0x5f69 => (1218, 1243),
+        0x5f6a => (1243, 1244),
+        0x5f6c => (1244, 1257),
+        0x5f6d => (1257, 1270),
+        0x5f6e => (1270, 1274),
+        0x5f6f => (1274, 1282),
+        0x5f70 => (1282, 1304),
+        0x5f72 => (1304, 1322),
+        0x5f73 => (1322, 1340),
+        0x5f74 => (1340, 1342),
+        0x5f75 => (1342, 1349),
+        0x5f76 => (1349, 1353),
+        0x5f77 => (1353, 1360),
+        0x5f78 => (1360, 1361),
+        0x5f7a => (1361, 1363),
+        0x6162 => (1363, 1368),
+        0x6163 => (1368, 1373),
+        0x6164 => (1373, 1379),
+        0x6166 => (1379, 1381),
+        0x6167 => (1381, 1387),
+        0x6169 => (1387, 1388),
+        0x616c => (1388, 1403),
         0x616e => {
             if value == "annotation" {
                 return true;
             }
-            (624, 627)
+            (1403, 1407)
         }
-        0x6170 => (627, 628),
+        0x6170 => (1407, 1409),
         0x6172 => {
             if value == "argtypes" {
                 return true;
             }
-            (628, 634)
+            (1409, 1417)
         }
         0x6173 => {
             if value == "asname" {
                 return true;
             }
-            (634, 639)
+            (1417, 1426)
         }
         0x6174 => {
             if value == "attr" {
                 return true;
             }
-            (639, 641)
+            (1426, 1428)
         }
-        0x6175 => (641, 643),
+        0x6175 => (1428, 1431),
         0x6261 => {
             if value == "bases" {
                 return true;
             }
-            (643, 650)
+            (1431, 1445)
         }
-        0x6265 => (650, 651),
-        0x6269 => (651, 660),
-        0x626c => (660, 663),
+        0x6265 => (1445, 1446),
+        0x6269 => (1446, 1459),
+        0x626c => (1459, 1462),
         0x626f => {
             if value == "body" {
                 return true;
             }
-            (663, 665)
+            (1462, 1464)
         }
-        0x6275 => (665, 676),
-        0x6279 => (676, 685),
-        0x627a => (685, 687),
-        0x635f => (687, 691),
+        0x6272 => (1464, 1466),
+        0x6275 => (1466, 1480),
+        0x6279 => (1480, 1493),
+        0x627a => (1493, 1495),
+        0x635f => (1495, 1500),
         0x6361 => {
-            if value == "candidate" || value == "cases" || value == "cause" {
+            if value == "cases" || value == "cause" {
                 return true;
             }
-            (691, 712)
+            (1500, 1525)
         }
-        0x6362 => (712, 714),
-        0x6365 => (714, 715),
-        0x6368 => (715, 722),
+        0x6362 => (1525, 1527),
+        0x6365 => (1527, 1532),
+        0x6368 => (1532, 1555),
         0x636c => {
             if value == "cls" {
                 return true;
             }
-            (722, 728)
+            (1555, 1569)
         }
         0x636f => {
             if value == "comparators" || value == "context_expr" {
                 return true;
             }
-            (728, 767)
+            (1569, 1629)
         }
-        0x6370 => (767, 814),
-        0x6372 => (814, 818),
-        0x6373 => (818, 858),
-        0x6374 => return value == "ctx",
-        0x6375 => (858, 859),
-        0x6377 => (859, 860),
-        0x6379 => (860, 863),
-        0x645f => (863, 864),
-        0x6461 => {
-            if value == "date" {
+        0x6370 => (1629, 1678),
+        0x6372 => (1678, 1689),
+        0x6373 => (1689, 1729),
+        0x6374 => {
+            if value == "ctx" {
                 return true;
             }
-            (864, 868)
+            (1729, 1731)
         }
-        0x6462 => (868, 869),
+        0x6375 => (1731, 1733),
+        0x6377 => (1733, 1734),
+        0x6379 => (1734, 1737),
+        0x645f => (1737, 1738),
+        0x6461 => (1738, 1750),
+        0x6462 => (1750, 1751),
         0x6465 => {
             if value == "decorator_list" || value == "default_value" || value == "defaults" {
                 return true;
             }
-            (869, 883)
+            (1751, 1778)
         }
-        0x6469 => (883, 894),
-        0x646b => (894, 895),
-        0x646f => (895, 901),
-        0x6473 => (901, 903),
-        0x6475 => (903, 904),
-        0x6561 => (904, 905),
-        0x6562 => (905, 912),
-        0x6563 => (912, 914),
-        0x6564 => (914, 915),
-        0x6566 => (915, 916),
+        0x6469 => (1778, 1794),
+        0x646b => (1794, 1795),
+        0x646c => (1795, 1796),
+        0x646f => (1796, 1802),
+        0x6473 => (1802, 1804),
+        0x6475 => (1804, 1810),
+        0x6561 => (1810, 1811),
+        0x6562 => (1811, 1818),
+        0x6563 => (1818, 1820),
+        0x6564 => (1820, 1821),
+        0x6566 => (1821, 1822),
         0x656c => {
             if value == "elt" || value == "elts" {
                 return true;
             }
-            (916, 918)
+            (1822, 1825)
         }
-        0x656e => (918, 930),
-        0x6572 => {
-            if value == "error" {
-                return true;
-            }
-            (930, 931)
-        }
-        0x6575 => (931, 943),
-        0x6576 => {
-            if value == "eval" {
-                return true;
-            }
-            (943, 945)
-        }
+        0x656e => (1825, 1840),
+        0x6570 => (1840, 1841),
+        0x6572 => (1841, 1845),
+        0x6573 => (1845, 1847),
+        0x6575 => (1847, 1859),
+        0x6576 => (1859, 1870),
         0x6578 => {
             if value == "exc" {
                 return true;
             }
-            (945, 964)
+            (1870, 1903)
         }
-        0x6661 => (964, 969),
-        0x6664 => (969, 972),
-        0x6667 => (972, 973),
+        0x665f => (1903, 1926),
+        0x6661 => (1926, 1932),
+        0x6663 => (1932, 1935),
+        0x6664 => (1935, 1939),
+        0x6667 => (1939, 1940),
         0x6669 => {
             if value == "finalbody" {
                 return true;
             }
-            (973, 991)
+            (1940, 1971)
         }
-        0x666c => (991, 993),
-        0x666e => (993, 994),
-        0x666f => (994, 999),
-        0x6672 => (999, 1008),
-        0x6673 => (1008, 1010),
-        0x6675 => (1010, 1014),
-        0x6678 => (1014, 1015),
-        0x6762 => (1015, 1021),
+        0x666c => (1971, 1976),
+        0x666e => (1976, 1977),
+        0x666f => (1977, 1985),
+        0x6670 => (1985, 1987),
+        0x6672 => (1987, 2004),
+        0x6673 => (2004, 2009),
+        0x6674 => (2009, 2010),
+        0x6675 => (2010, 2015),
+        0x6678 => (2015, 2016),
+        0x6762 => (2016, 2022),
         0x6765 => {
             if value == "generators" {
                 return true;
             }
-            (1021, 1039)
+            (2022, 2102)
         }
-        0x6769 => (1039, 1040),
-        0x676c => (1040, 1042),
-        0x6772 => (1042, 1046),
+        0x6769 => (2102, 2109),
+        0x676c => (2109, 2111),
+        0x676d => (2111, 2112),
+        0x6772 => (2112, 2117),
         0x6775 => return value == "guard",
         0x6861 => {
             if value == "handlers" {
                 return true;
             }
-            (1046, 1054)
+            (2117, 2133)
         }
-        0x6865 => (1054, 1060),
-        0x6869 => (1060, 1061),
-        0x686b => (1061, 1063),
-        0x686f => (1063, 1065),
-        0x6870 => (1065, 1066),
-        0x687a => (1066, 1070),
-        0x6962 => (1070, 1096),
-        0x6964 => (1096, 1099),
+        0x6865 => (2133, 2142),
+        0x6869 => (2142, 2143),
+        0x686b => (2143, 2146),
+        0x686f => (2146, 2150),
+        0x6870 => (2150, 2151),
+        0x687a => (2151, 2155),
+        0x6962 => (2155, 2181),
+        0x6964 => (2181, 2184),
         0x6966 => return value == "ifs",
-        0x6967 => (1099, 1101),
-        0x696d => (1101, 1107),
-        0x696e => (1107, 1134),
-        0x696f => (1134, 1136),
+        0x6967 => (2184, 2187),
+        0x696d => (2187, 2195),
+        0x696e => (2195, 2236),
+        0x696f => (2236, 2238),
         0x6973 => {
             if value == "is_async" {
                 return true;
             }
-            (1136, 1238)
+            (2238, 2376)
         }
-        0x6974 => (1238, 1243),
-        0x6a69 => (1243, 1244),
-        0x6a6f => (1244, 1246),
-        0x6a73 => (1246, 1247),
-        0x6a75 => (1247, 1248),
+        0x6974 => (2376, 2385),
+        0x6a69 => (2385, 2386),
+        0x6a6f => (2386, 2389),
+        0x6a73 => (2389, 2390),
+        0x6a75 => (2390, 2391),
         0x6b65 => {
             if value == "keywords" {
                 return true;
             }
-            (1248, 1252)
+            (2391, 2395)
         }
-        0x6b69 => (1252, 1253),
-        0x6b6f => (1253, 1255),
-        0x6b73 => (1255, 1260),
+        0x6b69 => (2395, 2398),
+        0x6b6f => (2398, 2400),
+        0x6b73 => (2400, 2405),
         0x6b77 => {
             if value == "kw_defaults"
                 || value == "kwarg"
@@ -2770,275 +3138,245 @@ pub(crate) fn is_preinterned_string(value: &str) -> bool {
             {
                 return true;
             }
-            (1260, 1266)
+            (2405, 2411)
         }
-        0x6b7a => (1266, 1268),
-        0x6c31 => (1268, 1270),
-        0x6c32 => (1270, 1271),
-        0x6c33 => (1271, 1272),
-        0x6c34 => (1272, 1273),
-        0x6c35 => (1273, 1274),
-        0x6c36 => (1274, 1275),
-        0x6c37 => (1275, 1276),
-        0x6c38 => (1276, 1277),
-        0x6c39 => (1277, 1278),
-        0x6c61 => (1278, 1298),
+        0x6b7a => (2411, 2413),
+        0x6c31 => (2413, 2415),
+        0x6c32 => (2415, 2416),
+        0x6c33 => (2416, 2417),
+        0x6c34 => (2417, 2418),
+        0x6c35 => (2418, 2419),
+        0x6c36 => (2419, 2420),
+        0x6c37 => (2420, 2421),
+        0x6c38 => (2421, 2422),
+        0x6c39 => (2422, 2423),
+        0x6c61 => (2423, 2448),
+        0x6c63 => (2448, 2449),
         0x6c65 => {
             if value == "left" {
                 return true;
             }
-            (1298, 1302)
+            (2449, 2453)
         }
-        0x6c69 => {
-            if value == "link" {
-                return true;
-            }
-            (1302, 1311)
-        }
+        0x6c69 => (2453, 2470),
+        0x6c6a => (2470, 2471),
         0x6c6f => {
             if value == "lower" {
                 return true;
             }
-            (1311, 1327)
+            (2471, 2495)
         }
-        0x6c73 => (1327, 1328),
-        0x6d61 => (1328, 1357),
-        0x6d62 => (1357, 1358),
-        0x6d65 => (1358, 1367),
-        0x6d69 => {
-            if value == "min" {
-                return true;
-            }
-            (1367, 1371)
-        }
-        0x6d6b => (1371, 1372),
-        0x6d6f => (1372, 1382),
-        0x6d72 => (1382, 1383),
-        0x6d73 => (1383, 1392),
-        0x6d74 => (1392, 1393),
-        0x6d75 => (1393, 1394),
-        0x6d79 => (1394, 1395),
-        0x6e5f => (1395, 1399),
+        0x6c73 => (2495, 2498),
+        0x6d61 => (2498, 2540),
+        0x6d62 => (2540, 2541),
+        0x6d65 => (2541, 2550),
+        0x6d69 => (2550, 2561),
+        0x6d6b => (2561, 2565),
+        0x6d6f => (2565, 2584),
+        0x6d72 => (2584, 2585),
+        0x6d73 => (2585, 2594),
+        0x6d74 => (2594, 2595),
+        0x6d75 => (2595, 2596),
+        0x6d79 => (2596, 2597),
+        0x6e5f => (2597, 2601),
         0x6e61 => {
-            if value == "names" || value == "nan" {
+            if value == "names" {
                 return true;
             }
-            (1399, 1405)
+            (2601, 2611)
         }
-        0x6e64 => (1405, 1406),
-        0x6e65 => (1406, 1417),
-        0x6e6c => (1417, 1418),
-        0x6e6f => (1418, 1422),
-        0x6e73 => (1422, 1424),
-        0x6e74 => (1424, 1425),
-        0x6e75 => (1425, 1427),
-        0x6f62 => (1427, 1430),
-        0x6f66 => (1430, 1433),
-        0x6f6c => {
-            if value == "old_value" {
-                return true;
-            }
-            (1433, 1434)
-        }
-        0x6f6e => (1434, 1438),
+        0x6e62 => (2611, 2612),
+        0x6e64 => (2612, 2614),
+        0x6e65 => (2614, 2628),
+        0x6e69 => (2628, 2629),
+        0x6e6c => (2629, 2630),
+        0x6e6f => (2630, 2638),
+        0x6e73 => (2638, 2640),
+        0x6e74 => (2640, 2641),
+        0x6e75 => (2641, 2646),
+        0x6f62 => (2646, 2649),
+        0x6f63 => (2649, 2650),
+        0x6f66 => (2650, 2653),
+        0x6f6c => (2653, 2655),
+        0x6f6e => (2655, 2659),
         0x6f70 => {
             if value == "op" || value == "operand" || value == "ops" || value == "optional_vars" {
                 return true;
             }
-            (1438, 1448)
+            (2659, 2671)
         }
         0x6f72 => {
             if value == "orelse" {
                 return true;
             }
-            (1448, 1451)
+            (2671, 2676)
         }
-        0x6f74 => (1451, 1452),
-        0x6f75 => {
-            if value == "output" {
-                return true;
-            }
-            (1452, 1455)
-        }
-        0x6f76 => (1455, 1457),
-        0x6f77 => (1457, 1458),
+        0x6f73 => (2676, 2678),
+        0x6f74 => (2678, 2679),
+        0x6f75 => (2679, 2683),
+        0x6f76 => (2683, 2685),
+        0x6f77 => (2685, 2686),
         0x7061 => {
-            if value == "patterns" || (cfg!(unix) && value == "pause") {
+            if value == "patterns" {
                 return true;
             }
-            (1458, 1485)
+            (2686, 2719)
         }
-        0x7065 => (1485, 1489),
-        0x7069 => (1489, 1491),
-        0x706b => (1491, 1492),
-        0x706c => (1492, 1493),
+        0x7065 => (2719, 2726),
+        0x7069 => (2726, 2730),
+        0x706b => (2730, 2731),
+        0x706c => (2731, 2734),
         0x706f => {
             if value == "posonlyargs" {
                 return true;
             }
-            (1493, 1500)
+            (2734, 2749)
         }
-        0x7072 => (1500, 1509),
-        0x7073 => (1509, 1511),
-        0x7074 => (1511, 1513),
-        0x7075 => (1513, 1514),
-        0x7079 => {
-            if value == "python" {
-                return true;
-            }
-            (1514, 1519)
-        }
-        0x7175 => {
-            if value == "quiet" {
-                return true;
-            }
-            (1519, 1525)
-        }
-        0x7238 => (1525, 1526),
-        0x7261 => (1526, 1527),
+        0x7072 => (2749, 2765),
+        0x7073 => (2765, 2767),
+        0x7074 => (2767, 2775),
+        0x7075 => (2775, 2777),
+        0x7077 => (2777, 2779),
+        0x7079 => (2779, 2790),
+        0x7175 => (2790, 2797),
+        0x7238 => (2797, 2798),
+        0x7261 => (2798, 2805),
         0x7265 => {
             if value == "rest" || value == "returns" {
                 return true;
             }
-            (1527, 1557)
+            (2805, 2861)
         }
-        0x7266 => (1557, 1558),
-        0x7269 => return value == "right",
-        0x726b => (1558, 1559),
-        0x726f => (1559, 1563),
-        0x7270 => (1563, 1564),
-        0x7273 => (1564, 1566),
-        0x7275 => {
-            if value == "run" {
+        0x7266 => (2861, 2862),
+        0x7269 => {
+            if value == "right" {
                 return true;
             }
-            (1566, 1567)
+            (2862, 2863)
         }
-        0x735f => (1567, 1570),
-        0x7361 => (1570, 1571),
-        0x7363 => (1571, 1574),
-        0x7365 => (1574, 1602),
-        0x7368 => (1602, 1610),
+        0x726a => (2863, 2864),
+        0x726b => (2864, 2865),
+        0x726d => (2865, 2866),
+        0x726e => (2866, 2867),
+        0x726f => (2867, 2873),
+        0x7270 => (2873, 2874),
+        0x7273 => (2874, 2876),
+        0x7275 => (2876, 2881),
+        0x735f => (2881, 2884),
+        0x7361 => (2884, 2886),
+        0x7363 => (2886, 2901),
+        0x7365 => (2901, 2964),
+        0x7368 => (2964, 2973),
         0x7369 => {
             if value == "simple" {
                 return true;
             }
-            (1610, 1613)
+            (2973, 2991)
         }
-        0x736a => (1613, 1616),
-        0x736b => (1616, 1617),
+        0x736a => (2991, 2994),
+        0x736b => (2994, 2996),
         0x736c => {
             if value == "slice" {
                 return true;
             }
-            (1617, 1618)
+            (2996, 2997)
         }
-        0x736d => (1618, 1619),
-        0x736f => (1619, 1632),
-        0x7370 => (1632, 1638),
-        0x7372 => (1638, 1640),
+        0x736d => (2997, 2998),
+        0x736f => (2998, 3011),
+        0x7370 => (3011, 3019),
+        0x7372 => (3019, 3023),
         0x7374 => {
             if value == "str" {
                 return true;
             }
-            (1640, 1667)
+            (3023, 3092)
         }
         0x7375 => {
-            if value == "subject" || value == "sum" {
+            if value == "subject" {
                 return true;
             }
-            (1667, 1674)
+            (3092, 3105)
         }
-        0x7379 => {
-            if value == "system" {
-                return true;
-            }
-            (1674, 1678)
-        }
+        0x7377 => (3105, 3106),
+        0x7379 => (3106, 3119),
+        0x7431 => (3119, 3120),
+        0x7432 => (3120, 3121),
         0x7461 => {
             if value == "targets" {
                 return true;
             }
-            (1678, 1687)
+            (3121, 3130)
         }
-        0x7462 => (1687, 1691),
+        0x7462 => (3130, 3135),
+        0x7463 => (3135, 3137),
         0x7465 => {
             if value == "test" {
                 return true;
             }
-            (1691, 1695)
+            (3137, 3143)
         }
-        0x7468 => (1695, 1699),
-        0x7469 => {
-            if value == "timestamp" {
-                return true;
-            }
-            (1699, 1710)
-        }
-        0x746f => (1710, 1713),
-        0x7472 => (1713, 1719),
-        0x7475 => (1719, 1720),
-        0x7476 => (1720, 1721),
-        0x7477 => (1721, 1722),
-        0x7478 => (1722, 1723),
+        0x7468 => (3143, 3152),
+        0x7469 => (3152, 3175),
+        0x746d => (3175, 3186),
+        0x746f => (3186, 3196),
+        0x7472 => (3196, 3203),
+        0x7474 => (3203, 3204),
+        0x7475 => (3204, 3205),
+        0x7476 => (3205, 3206),
+        0x7477 => (3206, 3207),
+        0x7478 => (3207, 3208),
         0x7479 => {
             if value == "type_comment" || value == "type_ignores" {
                 return true;
             }
-            (1723, 1725)
+            (3208, 3210)
         }
-        0x747a => (1725, 1728),
-        0x7531 => (1728, 1729),
-        0x7533 => (1729, 1730),
-        0x7537 => (1730, 1731),
-        0x7538 => (1731, 1732),
-        0x755f => (1732, 1733),
-        0x7568 => (1733, 1734),
-        0x7569 => (1734, 1735),
-        0x756a => (1735, 1736),
-        0x756e => {
-            if value == "unknown" {
-                return true;
-            }
-            (1736, 1741)
-        }
+        0x747a => (3210, 3214),
+        0x7531 => (3214, 3215),
+        0x7533 => (3215, 3216),
+        0x7537 => (3216, 3217),
+        0x7538 => (3217, 3218),
+        0x755f => (3218, 3219),
+        0x7568 => (3219, 3220),
+        0x7569 => (3220, 3221),
+        0x756a => (3221, 3222),
+        0x756d => (3222, 3223),
+        0x756e => (3223, 3240),
         0x7570 => {
             if value == "upper" {
                 return true;
             }
-            (1741, 1742)
+            (3240, 3242)
         }
-        0x7572 => (1742, 1743),
-        0x7573 => {
-            if value == "user" {
-                return true;
-            }
-            (1743, 1746)
-        }
-        0x7574 => (1746, 1766),
-        0x7575 => (1766, 1768),
+        0x7572 => (3242, 3244),
+        0x7573 => (3244, 3254),
+        0x7574 => (3254, 3299),
+        0x7575 => (3299, 3301),
         0x7661 => {
-            if value == "var" || value == "vararg" {
+            if value == "vararg" {
                 return true;
             }
-            (1768, 1771)
+            (3301, 3307)
         }
-        0x7665 => (1771, 1775),
-        0x766f => (1775, 1776),
-        0x7761 => (1776, 1784),
-        0x7762 => (1784, 1786),
-        0x7765 => (1786, 1788),
-        0x7768 => (1788, 1791),
-        0x7769 => (1791, 1807),
-        0x7772 => (1807, 1811),
-        0x785f => (1811, 1815),
-        0x7965 => (1815, 1816),
-        0x7a64 => (1816, 1817),
-        0x7a69 => (1817, 1818),
-        0x7a6c => (1818, 1820),
-        0x7a73 => (1820, 1821),
-        0x7b7b => (1821, 1822),
-        0x7d7d => (1822, 1823),
+        0x7665 => (3307, 3313),
+        0x766f => (3313, 3314),
+        0x7761 => (3314, 3331),
+        0x7762 => (3331, 3333),
+        0x7765 => (3333, 3335),
+        0x7768 => (3335, 3340),
+        0x7769 => (3340, 3358),
+        0x7772 => (3358, 3366),
+        0x785f => (3366, 3370),
+        0x786d => (3370, 3372),
+        0x786f => (3372, 3373),
+        0x7965 => (3373, 3374),
+        0x7a64 => (3374, 3375),
+        0x7a66 => (3375, 3376),
+        0x7a69 => (3376, 3390),
+        0x7a6c => (3390, 3392),
+        0x7a73 => (3392, 3393),
+        0x7b7b => (3393, 3394),
+        0x7d7d => (3394, 3395),
         _ => return false,
     };
     LINUX_PREINTERNED_STRINGS[start..end]

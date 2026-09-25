@@ -150,6 +150,8 @@ UNIX_STARTUP_INTERNED_STRINGS = ("pause",)
 CRATE_ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = CRATE_ROOT / "src" / "target" / "cpython_3_14_5.rs"
 MARSHAL_OUTPUT = CRATE_ROOT / "src" / "marshal" / "v5.rs"
+STARTUP_314_INPUT = "scripts/target_metadata/cpython_3_14_5_startup.json"
+STARTUP_314_SHA256 = "1c0a3051c44c5307327db0f331d259e65a7e648da1cb5b30a0b2f8d9ca059f02"
 STARTUP_315_INPUT = "scripts/target_metadata/cpython_3_15_0rc2_startup.json"
 STARTUP_315_SHA256 = "bec0bd2dedbe3b38ca68e446c67abf0f8d0f4793b551d9c7036acb0517765d63"
 LEGACY_STARTUP_INPUTS = {
@@ -204,6 +206,8 @@ def read_bootstrap_strings(sources: dict[str, str]) -> tuple[str, ...]:
 
 
 def startup_input() -> tuple[str, str]:
+    if TARGET_MINOR == "3.14":
+        return STARTUP_314_INPUT, STARTUP_314_SHA256
     if TARGET_MINOR == "3.15":
         return STARTUP_315_INPUT, STARTUP_315_SHA256
     if TARGET_MINOR not in LEGACY_STARTUP_INPUTS:
@@ -229,6 +233,49 @@ def read_startup_strings() -> tuple[str, ...]:
         raise ValueError("startup profile strings are not unique, sorted and complete")
     if any(not isinstance(value, str) or value.startswith("/") for value in values):
         raise ValueError("startup profile contains an environment-specific path")
+    if TARGET_MINOR == "3.14":
+        retention = profile["retention"]
+        owners = retention["mortal_owners"]
+        mortal = retention["mortal_dynamic_entries"]
+        if (
+            profile["platform"] != "linux"
+            or profile["architecture"] != "x86_64"
+            or not profile["gil_enabled"]
+            or not profile["isolated"]
+            or profile["site_enabled"]
+            or retention["proved_mortal_entries"] != mortal
+            or len(owners) != mortal
+            or list(owners) != sorted(owners)
+            or any(not isinstance(owner, str) or not owner for owner in owners.values())
+            or retention["static_entries"]
+            + retention["immortal_dynamic_entries"]
+            + mortal
+            != profile["canonical_snapshot_entries"]
+        ):
+            raise ValueError(
+                "Python 3.14 startup profile has incomplete retained ownership"
+            )
+        provenance_path = (
+            CRATE_ROOT / "scripts/target_metadata/cpython_3_14_5_startup_ownership.json"
+        )
+        provenance_data = provenance_path.read_bytes()
+        provenance = json.loads(provenance_data)
+        auditor = (CRATE_ROOT / "scripts/audit_startup_owners.py").read_bytes()
+        layout_generator = (
+            CRATE_ROOT / "scripts/generate_startup_owner_layout.py"
+        ).read_bytes()
+        if (
+            hashlib.sha256(provenance_data).hexdigest()
+            != retention["owner_layout_provenance_sha256"]
+            or provenance["source_commit"] != TARGET_COMMIT
+            or provenance["layout_sha256"] != retention["owner_layout_sha256"]
+            or hashlib.sha256(layout_generator).hexdigest()
+            != provenance["generator_sha256"]
+            or hashlib.sha256(auditor).hexdigest() != retention["audit_script_sha256"]
+        ):
+            raise ValueError(
+                "Python 3.14 startup ownership provenance checksum mismatch"
+            )
     return tuple(values)
 
 
@@ -984,6 +1031,7 @@ def render(sources: dict[str, str]) -> str:
         lines.append(f"// {relative}: sha256:{digest}")
     if TARGET_MINOR == "3.14":
         lines.append(f"// {BOOTSTRAP_314_INPUT}: sha256:{BOOTSTRAP_314_SHA256}")
+        lines.append(f"// {STARTUP_314_INPUT}: sha256:{STARTUP_314_SHA256}")
     elif TARGET_MINOR == "3.15":
         lines.append(f"// {STARTUP_315_INPUT}: sha256:{STARTUP_315_SHA256}")
     lines.extend(
@@ -1103,13 +1151,15 @@ def render(sources: dict[str, str]) -> str:
             f"    {rust_string_literal(value)}," for value in bootstrap_strings
         )
         linux_preinterned_strings = sorted(
-            set(preinterned_strings) | set(bootstrap_strings)
+            set(preinterned_strings)
+            | set(bootstrap_strings)
+            | set(read_startup_strings())
         )
         lines.extend(
             [
                 "];",
                 "",
-                "// Include Linux bootstrap strings in the same exact prefix lookup.",
+                "// Use the canonical isolated Linux profile regardless of the Rust host architecture.",
                 '#[cfg(target_os = "linux")]',
                 "#[rustfmt::skip]",
                 "static LINUX_PREINTERNED_STRINGS: &[&str] = &[",

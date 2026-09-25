@@ -74,6 +74,37 @@ fn matches_cpython_frozenset_startup_string_identity() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn matches_cpython_frozenset_native_startup_string_identity() {
+    // Repeated equal frozensets expose whether a string had a retained canonical
+    // owner before compilation. Cover native modules and their type descriptors.
+    for member in [
+        "getvalue",
+        "getbuffer",
+        "_CHUNK_SIZE",
+        "is_file",
+        "O_RDONLY",
+        "struct_rusage",
+        "ascii_decode",
+        "_unregister_error",
+        "__getformat__",
+        "get_native_id",
+        "_remove_dead_weakref",
+        "get_clock_info",
+        "get_int_max_str_digits",
+        "SIG_DFL",
+        "evaluate_bound",
+    ] {
+        let source = format!(
+            "def first(value):\n    return value in {{'{member}', 'novel_marker'}}, 1\n\
+             def second(value):\n    'second docstring'\n    \
+                 return value in {{'{member}', 'novel_marker'}}, 2\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "startup_interned_names.py");
+    }
+}
+
+#[test]
 fn matches_cpython_frozenset_annotation_string_origins() {
     for future in ["", "from __future__ import annotations\n"] {
         for before_method in [false, true] {

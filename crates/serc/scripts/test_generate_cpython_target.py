@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
 import subprocess
 import tempfile
 import unittest
@@ -296,6 +298,42 @@ class TargetSelectionTest(unittest.TestCase):
             self.assertRaisesRegex(ValueError, "does not match"),
         ):
             generator.read_startup_strings()
+
+    def test_314_startup_fixture_has_complete_retained_ownership(self) -> None:
+        generator.select_target_version("3.14")
+        strings = generator.read_startup_strings()
+        self.assertEqual(len(strings), 2617)
+        self.assertIn("struct_rusage", strings)
+        path = generator.CRATE_ROOT / generator.STARTUP_314_INPUT
+        original = json.loads(path.read_text())
+        for mutation in [
+            "missing_owner",
+            "missing_proof",
+            "wrong_count",
+            "wrong_build",
+        ]:
+            with self.subTest(mutation=mutation):
+                profile = json.loads(json.dumps(original))
+                retention = profile["retention"]
+                if mutation == "missing_owner":
+                    retention["mortal_owners"].pop("struct_rusage")
+                elif mutation == "missing_proof":
+                    retention["proved_mortal_entries"] -= 1
+                elif mutation == "wrong_count":
+                    retention["immortal_dynamic_entries"] += 1
+                else:
+                    profile["gil_enabled"] = False
+                data = json.dumps(profile).encode()
+                with (
+                    mock.patch.object(Path, "read_bytes", return_value=data),
+                    mock.patch.object(
+                        generator,
+                        "STARTUP_314_SHA256",
+                        hashlib.sha256(data).hexdigest(),
+                    ),
+                    self.assertRaisesRegex(ValueError, "incomplete retained ownership"),
+                ):
+                    generator.read_startup_strings()
 
     def test_opcode_boundary_comes_from_pinned_source(self) -> None:
         source = """
