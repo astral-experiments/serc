@@ -18,3 +18,13 @@ fn matches_cpython_non_final_match_failure_backedges() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_or_pattern_before_pass_loop_tail() {
+    for guard in ["", " if True", " if predicate(value)"] {
+        let source = format!(
+            "def f(value, flag):\n    while flag:\n        match value:\n            case 1 | 2{guard}:\n                pass\n        pass\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "or_before_pass_loop_tail.py");
+    }
+}

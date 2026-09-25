@@ -14593,6 +14593,15 @@ impl<'source> Compiler<'source> {
             self.set_branch_end_location(body, body_start);
         }
         let backedge = self.emit_jump_backward_instruction(JUMP_BACKWARD, restart)?;
+        if self.context.python_version >= crate::PythonVersion::Py314
+            && matches!(body, [.., Stmt::Match(statement), Stmt::Pass(_)]
+            if statement.cases.len() == 1
+                && matches!(statement.cases[0].pattern, Pattern::MatchOr(_)))
+        {
+            // The trailing Pass still occupies its original slot when CPython
+            // threads the match failure, so both paths share this loop backedge.
+            self.assembler.prevent_jump_threading_target(backedge);
+        }
         if inline_try_tail {
             self.assembler
                 .prepare_no_location_block_for_inlining(backedge);
