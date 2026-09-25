@@ -1,6 +1,32 @@
 use crate::common;
 
 #[test]
+fn preserves_coroutine_owner_after_guarded_empty_recovery() {
+    for scope in ["def", "async def"] {
+        for guard in ["x", "x or y"] {
+            for name in ["", " as inner"] {
+                for outer in ["pass", "raise"] {
+                    for tail in [
+                        "    return use(x)\n",
+                        "    work(x)\n    return use(y)\n",
+                        "    try:\n        pass\n    finally:\n        try:\n            pass\n        except E:\n            pass\n",
+                        "    try:\n        pass\n    finally:\n        cleanup(x)\n",
+                    ] {
+                        let source = format!(
+                            "{scope} f(x, y):\n    try:\n        if {guard}:\n            try:\n                pass\n            except E{name}:\n                pass\n    except E:\n        {outer}\n{tail}"
+                        );
+                        common::assert_matches_cpython_marshal(
+                            &source,
+                            "coroutine_guarded_empty_recovery_owner.py",
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn empty_try_nop_owner_target() {
     let source = r#"def copy_one(row, base_dest, *, overwrite=False, verbose=False):
     src_uri = normalize_uri((row.get("path") or "").strip())

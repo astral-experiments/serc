@@ -20494,22 +20494,51 @@ impl<'source> Compiler<'source> {
                     .finally
                     .active_pass_finally_locations
                     .is_empty();
+            // The normal jump leaves the enclosing try but stays inside the
+            // coroutine's StopIteration handler. Its range exclusion must not
+            // discard the synthetic outer owner as well.
+            let coroutine_nested_pass_exit = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    == CO_COROUTINE
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .len()
+                    == 1
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && !self.control.exceptions.prevent_try_exit_inlining
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.loops.contexts.is_empty()
+                && body_noop_location.is_some()
+                && !statement.is_star
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty()
+                && matches!(statement.body.as_slice(), [Stmt::Pass(_)])
+                && matches!(statement.handlers.as_slice(), [handler]
+                if handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.is_some()
+                        && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+                }));
             // When every handler exits, an empty body leading directly to its own finally
             // retains its unowned POP_BLOCK marker. Other shared or enclosing-region exits
             // retain the normal jump's exception owner.
             // Legacy passes retain the original empty-body exit jump's owner
             // until actual copying replaces it with the owner's donor record.
-            let exception_policy = if exclude_nested_normal_exit
-                || (body_noop_location.is_some()
-                    && self.context.python_version >= crate::PythonVersion::Py314
-                    && statement.orelse.is_empty()
-                    && !self
-                        .control
-                        .exceptions
-                        .active_exception_region_exclusions
-                        .is_empty()
-                    && (self.control.finally.active_finally_try_bodies == 0
-                        || (handlers_terminate && !statement.finalbody.is_empty())))
+            let exception_policy = if !coroutine_nested_pass_exit
+                && (exclude_nested_normal_exit
+                    || (body_noop_location.is_some()
+                        && self.context.python_version >= crate::PythonVersion::Py314
+                        && statement.orelse.is_empty()
+                        && !self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .is_empty()
+                        && (self.control.finally.active_finally_try_bodies == 0
+                            || (handlers_terminate && !statement.finalbody.is_empty()))))
             {
                 ExceptionPolicy::EXCLUDE_ALWAYS
             } else {
