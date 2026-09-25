@@ -23707,10 +23707,14 @@ impl<'source> Compiler<'source> {
                         || handler_ends_with_named_conditional_cleanup
                         || handler_ends_with_nonterminal_with
                         || handler_cleanup_from_original_join)
-                        && handler.name.is_some()
+                        && (handler.name.is_some()
+                            || (handler_cleanup_from_original_join
+                                && matches!(handler.body.as_slice(), [Stmt::With(manager)]
+                                    if !manager.is_async && suite_terminates(&manager.body))))
                     {
-                        // An original join leaves the alias cleanup unlocated. Its implicit
-                        // return remains eligible for copying onto unconditional predecessors.
+                        // An original join leaves the cleanup eligible for copying onto
+                        // unconditional predecessors. A terminating manager can also reach
+                        // this join when it suppresses the exception from its body.
                         self.assembler.allow_last_no_location_block_inlining();
                         if handler_cleanup_from_original_join {
                             self.assembler.allow_last_unconditional_block_inlining();
