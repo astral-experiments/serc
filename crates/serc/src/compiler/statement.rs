@@ -4400,10 +4400,29 @@ impl<'source> Compiler<'source> {
                     return Ok(());
                 }
                 self.mark_definitely_evaluated_locals(&expression.value);
+                // A constant prefix can fold a Boolean cleanup to its final
+                // operand before the copied return is emitted. Its discard has
+                // the same location as that operand's ordinary expression statement.
+                let folded_boolean_value =
+                    if self.control.finally.copies_terminating_finally_returns
+                        && let Expr::BoolOp(boolean) = expression.value.as_ref()
+                        && let Some((last, leading)) = boolean.values.split_last()
+                        && !leading.is_empty()
+                        && leading.iter().all(|value| {
+                            matches!(value, Expr::BooleanLiteral(literal)
+                            if literal.value == (boolean.op == BoolOp::And))
+                        })
+                        && !expression_contains_inline_branch(last)
+                    {
+                        Some(last)
+                    } else {
+                        None
+                    };
                 let preserve_no_location = matches!(
                     expression.value.as_ref(),
                     Expr::BoolOp(_) | Expr::If(_)
-                ) || matches!(expression.value.as_ref(), Expr::Compare(compare) if compare.ops.len() > 1);
+                ) && folded_boolean_value.is_none()
+                    || matches!(expression.value.as_ref(), Expr::Compare(compare) if compare.ops.len() > 1);
                 let optimized_generator_call = matches!(
                     expression.value.as_ref(),
                     Expr::Call(call) if optimized_generator_callable_for_target(call, self.context.python_version).is_some()
@@ -4418,12 +4437,13 @@ impl<'source> Compiler<'source> {
                 } else if preserve_no_location || optimized_generator_call {
                     self.assembler.set_location(SourceLocation::NONE);
                 } else {
-                    if matches!(expression.value.as_ref(), Expr::BinOp(binary) if optimized_percent_format(binary, |literal| self.string_literal_constant(literal)).is_some())
+                    let discarded_value = folded_boolean_value.unwrap_or(expression.value.as_ref());
+                    if matches!(discarded_value, Expr::BinOp(binary) if optimized_percent_format(binary, |literal| self.string_literal_constant(literal)).is_some())
                         && let Some(location) = self.assembler.last_instruction_location()
                     {
                         self.assembler.set_location(location);
                     } else {
-                        let discard_location = match expression.value.as_ref() {
+                        let discard_location = match discarded_value {
                             Expr::Named(named) => self.source_location(named.target.range()),
                             Expr::Attribute(attribute) => self.attribute_opcode_location(attribute),
                             Expr::Call(call) => self.call_opcode_location(call),
@@ -25237,35 +25257,40 @@ impl<'source> Compiler<'source> {
     ) -> Result<(), CompileError> {
         let finally = &self.control.finally;
         if !finally.copies_terminating_finally_returns
-            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
-            && self.control.withs.active_with_exits.is_empty()
-            && self.control.withs.active_with_region_exclusions.is_empty()
-            && self.control.exceptions.active_exception_handlers.is_empty()
-            && self.control.exceptions.active_exception_group_handlers == 0
-            && self.control.exceptions.active_try_marker_slots.is_empty()
-            && self
-                .control
-                .exceptions
-                .active_exception_region_exclusions
-                .is_empty()
-            && finally.is_inactive_for_return_unwind()
-            && ((self.context.python_version <= crate::PythonVersion::Py313
-                && self.control.loops.contexts.is_empty()
-                && supports_nested_terminating_finally_returns(statement))
-                || (self.unit.flags & CO_COROUTINE == 0
-                    && self.control.loops.contexts.iter().all(|context| {
-                        context.iterator_cleanup != IteratorCleanup::Async
-                            && context.with_depth == 0
-                            && context.finally_end_depth == 0
-                            && context.exception_region_depth == 0
-                    })
-                    && (supports_direct_terminating_finally_returns(statement)
-                        || (matches!(self.unit.scope, Scope::Function { .. })
-                            && matches!(self.control.loops.contexts.as_slice(), [iterator]
+            && (supports_direct_terminating_finally_returns(statement)
+                || (self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.withs.active_with_region_exclusions.is_empty()
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.exceptions.active_try_marker_slots.is_empty()
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty()
+                    && finally.is_inactive_for_return_unwind()
+                    && ((self.context.python_version <= crate::PythonVersion::Py313
+                        && self.control.loops.contexts.is_empty()
+                        && supports_nested_terminating_finally_returns(statement))
+                        || (self.unit.flags & CO_COROUTINE == 0
+                            && self.control.loops.contexts.iter().all(|context| {
+                                context.iterator_cleanup != IteratorCleanup::Async
+                                    && context.with_depth == 0
+                                    && context.finally_end_depth == 0
+                                    && context.exception_region_depth == 0
+                            })
+                            && (supports_direct_terminating_finally_returns(statement)
+                                || (matches!(self.unit.scope, Scope::Function { .. })
+                                    && matches!(self.control.loops.contexts.as_slice(), [iterator]
                                 if iterator.iterator_cleanup == IteratorCleanup::Sync)
-                            && (supports_loop_break_terminating_finally_returns(statement)
-                                || (self.context.python_version >= crate::PythonVersion::Py314
-                                    && supports_handler_terminating_finally_returns(statement)))))))
+                                    && (supports_loop_break_terminating_finally_returns(
+                                        statement,
+                                    ) || (self.context.python_version
+                                        >= crate::PythonVersion::Py314
+                                        && supports_handler_terminating_finally_returns(
+                                            statement,
+                                        )))))))))
         {
             return self.with_control_override(
                 |control| &mut control.finally.copies_terminating_finally_returns,
@@ -33902,31 +33927,16 @@ fn finalizer_tail_has_matching_linear_copies(body: &[Stmt]) -> bool {
         })
 }
 
-/// A direct finalizer return unwinds the pending value before enclosing iterators.
-/// Both expressions stay in one block, with no newly entered cleanup scope.
+/// Copy pending returns through a finalizer that ends with its own return.
 fn supports_direct_terminating_finally_returns(statement: &ruff_python_ast::StmtTry) -> bool {
-    let [Stmt::Return(body)] = statement.body.as_slice() else {
-        return false;
-    };
-    let Some((Stmt::Return(finalizer), prefix)) = statement.finalbody.split_last() else {
-        return false;
-    };
-    if !prefix.iter().all(|statement| {
-        matches!(statement, Stmt::Expr(expression)
-            if !expression_contains_inline_branch(&expression.value)
-                && !expression_suspends_current_scope(&expression.value))
-    }) {
-        return false;
-    }
-    !statement.is_star
-        && statement.handlers.is_empty()
-        && statement.orelse.is_empty()
-        && [body, finalizer].iter().all(|statement| {
-            statement.value.as_deref().is_none_or(|value| {
-                !expression_contains_inline_branch(value)
-                    && !expression_suspends_current_scope(value)
-            })
-        })
+    matches!(statement.finalbody.last(), Some(Stmt::Return(_)))
+        && (suite_contains_return(&statement.body)
+            || suite_contains_return(&statement.orelse)
+            || statement.handlers.iter().any(|handler| {
+                handler
+                    .as_except_handler()
+                    .is_some_and(|handler| suite_contains_return(&handler.body))
+            }))
 }
 
 /// Copies a named handler's pending return before an enclosing iterator is discarded.

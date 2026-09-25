@@ -74,6 +74,213 @@ except ValueError:
     }
 
     #[test]
+    fn terminating_finally_keeps_pending_return_through_branches_and_assignments() {
+        let source = r#"
+class Tracked:
+    def __del__(self):
+        print("destroyed")
+
+def pending():
+    return Tracked()
+
+def cleanup(raises):
+    print("cleanup")
+    if raises:
+        raise ValueError()
+
+def guarded(flag, raises):
+    try:
+        return pending()
+    finally:
+        flag and cleanup(raises)
+        return 42
+
+def folded(raises):
+    try:
+        return pending()
+    finally:
+        True and cleanup(raises)
+        return 42
+
+def conditional(flag, raises):
+    try:
+        return pending()
+    finally:
+        if flag:
+            cleanup(raises)
+        else:
+            print("skipped")
+        return 42
+
+def assigned(raises):
+    try:
+        return pending()
+    finally:
+        result = cleanup(raises)
+        return 42
+
+print(guarded(False, False))
+print(guarded(True, False))
+try:
+    guarded(True, True)
+except ValueError:
+    print("caught")
+print(folded(False))
+try:
+    folded(True)
+except ValueError:
+    print("caught")
+print(conditional(False, False))
+print(conditional(True, False))
+try:
+    conditional(True, True)
+except ValueError:
+    print("caught")
+print(assigned(False))
+try:
+    assigned(True)
+except ValueError:
+    print("caught")
+"#;
+        assert_matches_cpython_marshal(source, "branching_finally_return.py");
+        assert_executes(
+            source,
+            "destroyed\n42\ncleanup\ndestroyed\n42\ncleanup\ndestroyed\ncaught\n\
+             cleanup\ndestroyed\n42\ncleanup\ndestroyed\ncaught\n\
+             skipped\ndestroyed\n42\ncleanup\ndestroyed\n42\ncleanup\ndestroyed\ncaught\n\
+             cleanup\ndestroyed\n42\ncleanup\ndestroyed\ncaught\n",
+        );
+    }
+
+    #[test]
+    fn pending_returns_survive_manager_cleanup_and_suspension() {
+        let source = r#"
+events = []
+class Held:
+    count = 0
+    def __init__(self):
+        Held.count += 1
+        events.append("create")
+    def __del__(self):
+        Held.count -= 1
+        events.append("destroy")
+
+class Guard:
+    def __enter__(self):
+        events.append(f"enter:{Held.count}")
+    def __exit__(self, *args):
+        events.append(f"exit:{Held.count}")
+
+class Suspension:
+    def __await__(self):
+        yield None
+
+def generator(flag):
+    try:
+        if flag:
+            return Held()
+        return Held()
+    finally:
+        with Guard():
+            yield None
+        return 42
+
+async def coroutine(flag):
+    try:
+        if flag:
+            return Held()
+        return Held()
+    finally:
+        with Guard():
+            await Suspension()
+        return 42
+
+for factory in (generator, coroutine):
+    for flag in (False, True):
+        for raises in (False, True):
+            events.clear()
+            pending = factory(flag)
+            pending.send(None)
+            print("live", Held.count)
+            try:
+                if raises:
+                    pending.throw(ValueError())
+                else:
+                    pending.send(None)
+            except StopIteration as stop:
+                print("returned", stop.value)
+            except ValueError:
+                print("raised")
+            print(events)
+"#;
+        assert_matches_cpython_marshal(source, "suspending_finally_return.py");
+        assert_executes(
+            source,
+            &"live 1\nreturned 42\n['create', 'enter:1', 'exit:1', 'destroy']\n\
+              live 1\nraised\n['create', 'enter:1', 'exit:1', 'destroy']\n"
+                .repeat(4),
+        );
+    }
+
+    #[test]
+    fn pending_returns_survive_handler_and_else_finalizers() {
+        let source = r#"
+class Held:
+    count = 0
+    def __init__(self):
+        Held.count += 1
+        print("create")
+    def __del__(self):
+        Held.count -= 1
+        print("destroy")
+
+def replace(path):
+    try:
+        if path == 0:
+            return Held()
+        if path == 1:
+            raise ValueError()
+    except ValueError as error:
+        return Held()
+    else:
+        return Held()
+    finally:
+        print("live", Held.count)
+        return 42
+
+def replace_group():
+    try:
+        return Held()
+    except* ValueError:
+        pass
+    finally:
+        print("live", Held.count)
+        return 42
+
+for path in range(3):
+    print(replace(path))
+print(replace_group())
+"#;
+        assert_matches_cpython_marshal(source, "handler_finally_return.py");
+        assert_executes(source, &"create\nlive 1\ndestroy\n42\n".repeat(4));
+    }
+
+    #[test]
+    fn folded_percent_format_cleanup_preserves_discard_positions() {
+        for expression in [
+            "True and ('%s' % (value,))",
+            "False or ('%s' % (value,))",
+            "True and ('%r' % (value,))",
+            "True and ('x:%s' % (value,))",
+        ] {
+            let source = format!(
+                "def f(value, pending):\n    try:\n        return pending()\n    finally:\n        {expression}\n        return 42\n"
+            );
+            assert_matches_cpython_marshal(&source, "folded_percent_finally.py");
+        }
+    }
+
+    #[test]
     fn exposes_the_pinned_cpython_source_identity() {
         assert_eq!(CPYTHON_TARGET.tag, "v3.14.5");
         assert_eq!(
