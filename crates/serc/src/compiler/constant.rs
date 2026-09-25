@@ -4261,7 +4261,7 @@ pub(super) fn is_literal_constant(expression: &Expr) -> bool {
             | Expr::BytesLiteral(_)
     )
 }
-fn big_integer_digits(token: &str) -> Vec<u16> {
+pub(super) fn big_integer_digits(token: &str) -> Vec<u16> {
     let token: String = token
         .chars()
         .filter(|character| *character != '_')
