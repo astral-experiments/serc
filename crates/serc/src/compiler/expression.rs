@@ -52,11 +52,12 @@ use super::scope::{
     comprehension_cell_names, comprehension_cell_names_in_private_context,
     comprehension_name_bindings, comprehension_name_bindings_with_mangler,
     comprehension_scope_facts, comprehension_temporary_names, generator_cellvars,
-    generator_external_names, generator_has_private_spelling_collisions,
-    generator_private_local_aliases, generator_required_names,
-    generator_required_names_with_mangler, global_comprehension_temporary_names,
-    global_comprehension_walrus_names, inlined_comprehension_cell_names_in_expression,
-    legacy_class_comprehension_names, parameter_default_expressions,
+    generator_cellvars_with_mangler, generator_external_names,
+    generator_has_private_spelling_collisions, generator_private_local_aliases,
+    generator_required_names, generator_required_names_with_mangler,
+    global_comprehension_temporary_names, global_comprehension_walrus_names,
+    inlined_comprehension_cell_names_in_expression, legacy_class_comprehension_names,
+    parameter_default_expressions,
 };
 use super::source::{
     debug_text_range, first_expression_instruction_range, fstring_literal_range,
@@ -4749,7 +4750,15 @@ impl Compiler<'_> {
         }
         let is_async = generator_is_async(generator);
 
-        let mut generator_cellvars = generator_cellvars(generator);
+        let private_spelling_collisions = self.unit.private_name.is_some()
+            && generator_has_private_spelling_collisions(generator, &|name| {
+                self.mangled_name(name)
+            });
+        let mut generator_cellvars = if private_spelling_collisions {
+            generator_cellvars_with_mangler(generator, &|name| self.mangled_name(name))
+        } else {
+            generator_cellvars(generator)
+        };
         let mut generator_locals = Vec::new();
         for comprehension in &generator.generators {
             collect_target_names(&comprehension.target, &mut generator_locals);
@@ -4831,10 +4840,6 @@ impl Compiler<'_> {
         // entries for the function's separately ordered cell slots.
         locals.extend(generator_cellvars.iter().cloned());
 
-        let private_spelling_collisions = self.unit.private_name.is_some()
-            && generator_has_private_spelling_collisions(generator, &|name| {
-                self.mangled_name(name)
-            });
         if private_spelling_collisions {
             // Distinct source spellings can denote one mangled name. Until generator
             // slot planning supports aliases, preserve its previous allocation path.
@@ -4942,6 +4947,14 @@ impl Compiler<'_> {
                 globals.insert(name);
             }
         }
+        let cell_sort_names = if private_spelling_collisions {
+            locals
+                .iter()
+                .map(|name| (self.required_name_id(name), self.mangled_name(name)))
+                .collect()
+        } else {
+            FxHashMap::default()
+        };
         let locals = self.name_ids(locals);
         let globals = self.name_id_set(globals);
         let generator_cellvars = self.name_id_set(generator_cellvars);
@@ -4950,6 +4963,7 @@ impl Compiler<'_> {
         let generator_range = self.generator_expression_range(generator);
         let plan = LoweringFunctionPlan {
             locals,
+            cell_sort_names,
             local_aliases: local_aliases
                 .iter()
                 .map(|(alias, original)| {
