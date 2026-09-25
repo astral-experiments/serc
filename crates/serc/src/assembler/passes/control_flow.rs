@@ -522,7 +522,10 @@ impl OptimizationPipeline {
                     {
                         discarded_admissions.push(index);
                     }
-                    if let Some(depth) = instruction.depth_after() {
+                    if instruction.depth_after().is_some() {
+                        // CLEANUP_THROW consumes the incoming exception before its
+                        // recorded depth, so its peak is one higher than that depth.
+                        let depth = instruction.maximum_stack_depth();
                         removed_max_depth =
                             Some(removed_max_depth.map_or(depth, |max: u32| max.max(depth)));
                     }
