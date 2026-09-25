@@ -217,3 +217,32 @@ fn matches_cpython_original_manager_pop_blocks_after_finally() {
         "manager_pop_simple_control.py",
     );
 }
+
+#[test]
+fn nested_manager_reraise_matches_cpython_handler_cleanup() {
+    for (scope, suspension) in [
+        ("def", ""),
+        ("def", "    yield value\n"),
+        ("async def", ""),
+        ("async def", "    await before()\n"),
+    ] {
+        for outer in ["except Error as error:", "except Error:"] {
+            for inner in ["except Error:", "except Error as inner:"] {
+                for outer_body in ["return run()", "run()"] {
+                    for inner_body in ["return retry()", "retry()"] {
+                        for manager_body in ["raise", "raise Error", "work()\nraise"] {
+                            let manager_body = manager_body.replace('\n', "\n                ");
+                            let source = format!(
+                                "{scope} f():\n{suspension}    try:\n        {outer_body}\n    {outer}\n        try:\n            {inner_body}\n        {inner}\n            with context():\n                {manager_body}\n"
+                            );
+                            common::assert_matches_cpython_marshal(
+                                &source,
+                                "nested_manager_reraise.py",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
