@@ -22,6 +22,9 @@ module_quotes: Annotated[str, "contains 'single' and \"double\" quotes"]
 module_unicode: Annotated[str, u"one" " two"]
 module_upper_unicode: Annotated[str, U"one" " two"]
 module_late_unicode: Annotated[str, "one" u" two"]
+module_simple_union: u"one" " two" | (None | Resource.Type)
+module_right_union: A | (B | "forward")
+module_string_attribute: "forward".Type | None
 
 
 class Resource:

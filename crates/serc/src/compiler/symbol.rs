@@ -1519,6 +1519,10 @@ impl Compiler<'_> {
             }
 
             fn visit_expr(&mut self, expression: &'ast Expr) {
+                if crate::stack_growth_required() {
+                    return crate::grow_stack(|| self.visit_expr(expression));
+                }
+
                 if let Some(constant) = self.legacy_collection_constant(expression, false) {
                     self.record_interpolated_constant(constant);
                     return;
@@ -1978,6 +1982,10 @@ impl Compiler<'_> {
 
         impl<'ast> Visitor<'ast> for Collector {
             fn visit_expr(&mut self, expression: &'ast Expr) {
+                if crate::stack_growth_required() {
+                    return crate::grow_stack(|| self.visit_expr(expression));
+                }
+
                 match expression {
                     Expr::Name(name)
                         if name.ctx == ExprContext::Load && name.id.as_str() == "__debug__" => {}
@@ -2076,6 +2084,10 @@ impl Compiler<'_> {
 
         impl<'ast> Visitor<'ast> for Collector<'_> {
             fn visit_expr(&mut self, expression: &'ast Expr) {
+                if crate::stack_growth_required() {
+                    return crate::grow_stack(|| self.visit_expr(expression));
+                }
+
                 if let Expr::FString(fstring) = expression
                     && let Some(source) = self.legacy_fstring_source
                 {
@@ -2756,6 +2768,10 @@ pub(super) fn has_untracked_discarded_collection(body: &[Stmt]) -> bool {
     struct RuntimeCollection(bool);
     impl<'ast> Visitor<'ast> for RuntimeCollection {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             let elements = match expression {
                 Expr::Tuple(tuple) => Some(tuple.elts.as_slice()),
                 Expr::List(list) => Some(list.elts.as_slice()),

@@ -2219,10 +2219,18 @@ impl Compiler<'_> {
         expression: &Expr,
         continuation: Option<(BoolOp, SourceLocation)>,
     ) -> Result<(), CompileError> {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| {
+                self.compile_expression_with_boolean_continuation(expression, continuation)
+            });
+        }
+
         if self.context.python_version <= PythonVersion::Py313
-            && let Some(comparison) = legacy_folded_not_comparison(expression)
+            && let Some(result) = with_legacy_folded_not_comparison(expression, |comparison| {
+                self.compile_expression_with_boolean_continuation(comparison, continuation)
+            })
         {
-            return self.compile_expression_with_boolean_continuation(&comparison, continuation);
+            return result;
         }
         let previous = self.assembler.location();
         self.assembler
@@ -5595,6 +5603,18 @@ impl Compiler<'_> {
         include_protected_region_exclusion: bool,
         negated: bool,
     ) -> Result<(), CompileError> {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| {
+                self.compile_filter_condition(
+                    condition,
+                    element_location,
+                    (accepted, restart),
+                    include_comprehension_cleanup,
+                    include_protected_region_exclusion,
+                    negated,
+                )
+            });
+        }
         // CPython's codegen_jump_if preserves branch lowering through every nested NOT
         // and Boolean operand; evaluating a nested operand as a value leaves extra copies.
         if let Expr::UnaryOp(unary) = condition
@@ -6011,6 +6031,18 @@ impl Compiler<'_> {
         include_with_region_exclusion: bool,
         include_protected_region_exclusion: bool,
     ) -> Result<(), CompileError> {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| {
+                self.compile_comprehension_filter(
+                    condition,
+                    element_location,
+                    accepted,
+                    restart,
+                    include_with_region_exclusion,
+                    include_protected_region_exclusion,
+                )
+            });
+        }
         if self.context.python_version <= PythonVersion::Py313 {
             return self.compile_jump_if(condition, false, restart);
         }
@@ -7534,6 +7566,9 @@ impl Compiler<'_> {
         return_location: SourceLocation,
     ) -> Result<(), CompileError> {
         fn has_only_runtime_tail_conditions(expression: &Expr) -> bool {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| has_only_runtime_tail_conditions(expression));
+            }
             let Expr::If(conditional) = expression else {
                 return true;
             };
@@ -7573,6 +7608,16 @@ impl Compiler<'_> {
         final_fallthrough: bool,
         defer_return: bool,
     ) -> Result<(), CompileError> {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| {
+                self.compile_tail_return_expression_inner(
+                    expression,
+                    return_location,
+                    final_fallthrough,
+                    defer_return,
+                )
+            });
+        }
         let Expr::If(conditional) = expression else {
             self.compile_with_strict_owned_loads(
                 final_fallthrough && matches!(expression, Expr::Name(_)),
@@ -8729,10 +8774,15 @@ impl Compiler<'_> {
         jump_on: bool,
         label: Label,
     ) -> Result<(), CompileError> {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.compile_jump_if(expression, jump_on, label));
+        }
         if self.context.python_version <= PythonVersion::Py313
-            && let Some(comparison) = legacy_folded_not_comparison(expression)
+            && let Some(result) = with_legacy_folded_not_comparison(expression, |comparison| {
+                self.compile_jump_if(comparison, jump_on, label)
+            })
         {
-            return self.compile_jump_if(&comparison, jump_on, label);
+            return result;
         }
         let legacy_constant = self.context.python_version <= PythonVersion::Py313
             && self.return_value_is_constant(expression);
@@ -9467,12 +9517,19 @@ impl CollectionKind {
     }
 }
 
-/// Mirrors the legacy AST optimizer, including the inner comparison's source range.
-fn legacy_folded_not_comparison(expression: &Expr) -> Option<Expr> {
+/// Compile the legacy folded comparison while its recursive clone and drop share a stack.
+fn with_legacy_folded_not_comparison<T>(
+    expression: &Expr,
+    callback: impl FnOnce(&Expr) -> T,
+) -> Option<T> {
     let (comparison, operator) = legacy_not_comparison(expression)?;
-    let mut comparison = comparison.clone();
-    comparison.ops[0] = operator;
-    Some(Expr::Compare(comparison))
+    let mut depth = crate::stack::ExpressionDepth::default();
+    depth.visit_expr(expression);
+    Some(crate::stack::with_depth(depth.maximum(), || {
+        let mut comparison = comparison.clone();
+        comparison.ops[0] = operator;
+        callback(&Expr::Compare(comparison))
+    }))
 }
 
 /// Identify the single comparison and operator left by legacy `not` folding.
@@ -9519,6 +9576,10 @@ fn expression_contains_yield_with_defaults(expression: &Expr, visit_defaults: bo
 
     impl<'ast> Visitor<'ast> for Collector {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             if let Expr::Lambda(lambda) = expression {
                 if self.visit_defaults
                     && let Some(parameters) = lambda.parameters.as_deref()
@@ -9593,6 +9654,10 @@ fn expression_contains_inlined_comprehension(expression: &Expr) -> bool {
 
     impl<'ast> Visitor<'ast> for Collector {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             if self.found || matches!(expression, Expr::Lambda(_) | Expr::Generator(_)) {
                 return;
             }
@@ -9661,6 +9726,10 @@ pub(super) fn expression_suspends_current_scope(expression: &Expr) -> bool {
 
     impl<'ast> Visitor<'ast> for Collector {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             if self.found {
                 return;
             }
@@ -9791,6 +9860,9 @@ pub(super) fn early_condition_truthiness(expression: &Expr) -> Option<bool> {
 // Returns the leaf that reaches a nested conditional expression's join by fallthrough.
 // A short-circuit leaf has multiple predecessors, so CPython keeps the join source-less.
 fn conditional_expression_fallthrough(expression: &ExprIf) -> Option<&Expr> {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| conditional_expression_fallthrough(expression));
+    }
     let branch = if early_condition_truthiness(&expression.test) == Some(true) {
         expression.body.as_ref()
     } else {

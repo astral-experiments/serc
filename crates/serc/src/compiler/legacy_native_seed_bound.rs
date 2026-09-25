@@ -366,6 +366,9 @@ impl<'ast> Counter<'ast> {
     }
 
     fn condition(&mut self, expression: &Expr) -> Option<()> {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.condition(expression));
+        }
         match expression {
             Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => self.condition(&unary.operand)?,
             Expr::BoolOp(boolean) => {
@@ -446,6 +449,9 @@ impl<'ast> Counter<'ast> {
     }
 
     fn expression(&mut self, expression: &Expr) -> Option<()> {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.expression(expression));
+        }
         match expression {
             Expr::Name(_)
             | Expr::NumberLiteral(_)

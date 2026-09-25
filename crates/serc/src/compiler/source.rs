@@ -639,6 +639,9 @@ fn has_double_underscore(name: &str) -> bool {
 
 /// Whether folding can carry a bytes literal to a result, possibly through tuple indexing.
 fn can_fold_bytes(expression: &Expr) -> bool {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| can_fold_bytes(expression));
+    }
     match expression {
         Expr::BytesLiteral(_) => true,
         Expr::BinOp(binary) if matches!(binary.op, Operator::Add | Operator::Mult) => {
@@ -1003,6 +1006,10 @@ impl<'ast> Visitor<'ast> for SourceAnalysis<'ast> {
     }
 
     fn visit_expr(&mut self, expression: &'ast Expr) {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.visit_expr(expression));
+        }
+
         self.observe_expr(expression);
         match expression {
             Expr::Name(_)
@@ -1270,6 +1277,10 @@ impl Compiler<'_> {
 
         impl<'a> Visitor<'a> for RequiresRuntimeConstruction {
             fn visit_expr(&mut self, expression: &'a Expr) {
+                if crate::stack_growth_required() {
+                    return crate::grow_stack(|| self.visit_expr(expression));
+                }
+
                 let requires_runtime = if self.python_version <= crate::PythonVersion::Py313 {
                     // The AST optimizer leaves slices and joined strings at runtime.
                     matches!(expression, Expr::Slice(_) | Expr::FString(_))
@@ -1768,6 +1779,12 @@ pub(super) fn first_expression_instruction_range(
     expression: &Expr,
     python_version: crate::PythonVersion,
 ) -> ruff_text_size::TextRange {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| {
+            first_expression_instruction_range(expression, python_version)
+        });
+    }
+
     if matches!(
         expression,
         Expr::BinOp(_) | Expr::Name(_) | Expr::UnaryOp(_) | Expr::Tuple(_)
@@ -1818,6 +1835,132 @@ fn last_discarded_annotation_slice_range(expression: &Expr) -> ruff_text_size::T
     }
 }
 pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
+    if let Some(annotation) = unparse_simple_annotation(expression, source) {
+        return annotation;
+    }
+    let mut depth = crate::stack::ExpressionDepth::default();
+    depth.visit_expr(expression);
+    crate::stack::with_depth(depth.maximum(), || {
+        unparse_annotation_inner(expression, source)
+    })
+}
+
+/// Render common expressions without cloning or recursively unparsing the AST.
+fn unparse_simple_annotation(expression: &Expr, source: &str) -> Option<String> {
+    enum Part<'a> {
+        Expression(&'a Expr, u8),
+        Text(&'a str),
+    }
+
+    // These precedence values match Ruff's AST unparser.
+    const SUBSCRIPT: u8 = 13;
+    const COMMA: u8 = 21;
+    const MAX: u8 = 63;
+
+    if !crate::stack::is_simple_annotation(expression) {
+        return None;
+    }
+    let mut pending = vec![Part::Expression(expression, 0)];
+    let mut result = String::new();
+    while let Some(part) = pending.pop() {
+        match part {
+            Part::Text(text) => result.push_str(text),
+            Part::Expression(Expr::Name(name), _) => result.push_str(name.id.as_str()),
+            Part::Expression(Expr::NoneLiteral(_), _) => result.push_str("None"),
+            Part::Expression(Expr::BooleanLiteral(boolean), _) => {
+                result.push_str(if boolean.value { "True" } else { "False" });
+            }
+            Part::Expression(Expr::EllipsisLiteral(_), _) => result.push_str("..."),
+            Part::Expression(literal @ (Expr::NumberLiteral(_) | Expr::StringLiteral(_)), _) => {
+                // The existing leaf renderer preserves source-dependent string escapes
+                // and integer spellings without traversing the surrounding deep tree.
+                result.push_str(&unparse_annotation_inner(literal, source));
+            }
+            Part::Expression(expression @ Expr::Attribute(attribute), _) => {
+                if matches!(
+                    attribute.value.as_ref(),
+                    Expr::NumberLiteral(ruff_python_ast::ExprNumberLiteral {
+                        value: ruff_python_ast::Number::Int(_),
+                        ..
+                    })
+                ) {
+                    result.push_str(&unparse_annotation_inner(expression, source));
+                } else {
+                    pending.push(Part::Text(attribute.attr.as_str()));
+                    pending.push(Part::Text("."));
+                    pending.push(Part::Expression(&attribute.value, MAX));
+                }
+            }
+            Part::Expression(Expr::Subscript(subscript), _) => {
+                pending.push(Part::Text("]"));
+                pending.push(Part::Expression(&subscript.slice, SUBSCRIPT));
+                pending.push(Part::Text("["));
+                pending.push(Part::Expression(&subscript.value, MAX));
+            }
+            Part::Expression(Expr::Call(call), _) => {
+                pending.push(Part::Text(")"));
+                for (index, argument) in call.arguments.args.iter().enumerate().rev() {
+                    pending.push(Part::Expression(argument, COMMA));
+                    if index > 0 {
+                        pending.push(Part::Text(", "));
+                    }
+                }
+                pending.push(Part::Text("("));
+                pending.push(Part::Expression(&call.func, MAX));
+            }
+            Part::Expression(Expr::BinOp(binary), level) => {
+                let (operator, precedence) = match binary.op {
+                    Operator::BitOr => (" | ", 39),
+                    Operator::BitXor => (" ^ ", 41),
+                    Operator::BitAnd => (" & ", 43),
+                    Operator::LShift => (" << ", 45),
+                    Operator::RShift => (" >> ", 45),
+                    Operator::Add => (" + ", 47),
+                    Operator::Sub => (" - ", 47),
+                    Operator::Mult => (" * ", 49),
+                    Operator::MatMult => (" @ ", 49),
+                    Operator::Div => (" / ", 49),
+                    Operator::Mod => (" % ", 49),
+                    Operator::FloorDiv => (" // ", 49),
+                    Operator::Pow => (" ** ", 55),
+                };
+                let right_associative = binary.op == Operator::Pow;
+                let group = level > precedence;
+                if group {
+                    result.push('(');
+                    pending.push(Part::Text(")"));
+                }
+                pending.push(Part::Expression(
+                    &binary.right,
+                    precedence + u8::from(!right_associative),
+                ));
+                pending.push(Part::Text(operator));
+                pending.push(Part::Expression(
+                    &binary.left,
+                    precedence + u8::from(right_associative),
+                ));
+            }
+            Part::Expression(Expr::UnaryOp(unary), level) => {
+                let (operator, precedence) = match unary.op {
+                    ruff_python_ast::UnaryOp::Not => ("not ", 35),
+                    ruff_python_ast::UnaryOp::Invert => ("~", 53),
+                    ruff_python_ast::UnaryOp::UAdd => ("+", 53),
+                    ruff_python_ast::UnaryOp::USub => ("-", 53),
+                };
+                if level > precedence {
+                    result.push('(');
+                    pending.push(Part::Text(")"));
+                }
+                pending.push(Part::Expression(&unary.operand, precedence));
+                pending.push(Part::Text(operator));
+            }
+            Part::Expression(_, _) => unreachable!("simple annotation was checked above"),
+        }
+    }
+    Some(result)
+}
+
+fn unparse_annotation_inner(expression: &Expr, source: &str) -> String {
     #[derive(Default)]
     struct AnnotationStrings<'ast> {
         needs_normalization: bool,
@@ -1831,6 +1974,10 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
 
     impl<'ast> Visitor<'ast> for AnnotationStrings<'ast> {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             match expression {
                 Expr::StringLiteral(string) => {
                     self.needs_normalization = true;
@@ -1885,6 +2032,10 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
 
     impl Transformer for AnnotationStringNormalizer<'_> {
         fn visit_expr(&self, expression: &mut Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             if let Expr::StringLiteral(string) = expression {
                 let mut literal = string
                     .value
@@ -2207,6 +2358,9 @@ fn annotation_integer_to_decimal(token: &str) -> String {
 
 /// These expressions cannot contain any of the constructs corrected after Ruff generates them.
 fn annotation_needs_no_unparse_corrections(expression: &Expr) -> bool {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| annotation_needs_no_unparse_corrections(expression));
+    }
     match expression {
         Expr::Name(_) | Expr::NoneLiteral(_) => true,
         Expr::Attribute(attribute) => annotation_needs_no_unparse_corrections(&attribute.value),

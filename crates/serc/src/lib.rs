@@ -12,6 +12,7 @@ mod delimiter_nesting;
 mod initial_intern_state;
 mod marshal;
 mod source;
+mod stack;
 mod target;
 
 use std::error::Error;
@@ -369,11 +370,90 @@ fn validate_filename(filename: &str) -> Result<(), CompileError> {
     Ok(())
 }
 
+const STACK_SEGMENT_SIZE: usize = 2 * 1024 * 1024;
+const STACK_RED_ZONE: usize = 256 * 1024;
+
+thread_local! {
+    static STACK_REENTRY_BYPASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Check before recursive AST operations so they can grow on the current thread.
+#[inline]
+fn stack_growth_required() -> bool {
+    stack_growth_required_for(stacker::remaining_stack())
+}
+
+#[inline]
+fn stack_growth_required_for(remaining: Option<usize>) -> bool {
+    let bypass = STACK_REENTRY_BYPASS.with(|bypass| bypass.replace(false));
+    if remaining.is_some_and(|remaining| remaining >= STACK_RED_ZONE) {
+        return false;
+    }
+    !bypass
+}
+
+/// Reenter a guarded operation after growing its stack. Some platforms cannot
+/// switch stacks or report the new bounds; allow that reentry to run once
+/// rather than repeatedly invoking stack growth without making progress.
+fn grow_stack<T>(callback: impl FnOnce() -> T) -> T {
+    stacker::grow(STACK_SEGMENT_SIZE, || {
+        if stacker::remaining_stack().is_some_and(|remaining| remaining >= STACK_RED_ZONE) {
+            callback()
+        } else {
+            with_stack_reentry_bypass(callback)
+        }
+    })
+}
+
+fn with_stack_reentry_bypass<T>(callback: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            STACK_REENTRY_BYPASS.with(|bypass| bypass.set(self.0));
+        }
+    }
+    let previous = STACK_REENTRY_BYPASS.with(|bypass| bypass.replace(true));
+    let _restore = Restore(previous);
+    callback()
+}
+
+/// Owns the parser output while allowing deeply nested expressions to be dropped safely.
+struct ParsedModule(Option<ruff_python_parser::Parsed<ruff_python_ast::ModModule>>);
+
+impl Drop for ParsedModule {
+    fn drop(&mut self) {
+        use ruff_python_ast::visitor::transformer::{Transformer, walk_expr};
+
+        struct ClearExpressions;
+
+        impl Transformer for ClearExpressions {
+            fn visit_expr(&self, expression: &mut ruff_python_ast::Expr) {
+                stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT_SIZE, || {
+                    walk_expr(self, expression);
+                    // Its children have already been cleared, so replacing the node does not
+                    // recursively drop a potentially unbounded expression tree.
+                    *expression = ruff_python_ast::Expr::NoneLiteral(
+                        ruff_python_ast::ExprNoneLiteral::default(),
+                    );
+                });
+            }
+        }
+
+        if let Some(parsed) = self.0.take() {
+            let mut suite = parsed.into_suite();
+            ClearExpressions.visit_body(&mut suite);
+        }
+    }
+}
+
 fn compile_normalized(
     source: &str,
     filename: CodeFilename,
     options: &CompileOptions,
 ) -> Result<CompiledModule, CompileError> {
+    if stack_growth_required() {
+        return grow_stack(|| compile_normalized(source, filename, options));
+    }
     options
         .native_build_profile
         .validate(options.python_version)?;
@@ -386,10 +466,14 @@ fn compile_normalized(
     let parse_options = ruff_python_parser::ParseOptions::from(ruff_python_parser::Mode::Module)
         .with_target_version(target_version);
     delimiter_nesting::validate(source, &parse_options, options.python_version)?;
-    let parsed = ruff_python_parser::parse(source, parse_options)
-        .map_err(CompileError::Parse)?
+    let parsed = ruff_python_parser::parse_unchecked(source, parse_options)
         .try_into_module()
         .ok_or_else(|| CompileError::Internal("parser did not return a module".to_string()))?;
+    let parsed = ParsedModule(Some(parsed));
+    let parsed = parsed.0.as_ref().expect("parsed module is present");
+    if let Some(error) = parsed.errors().first() {
+        return Err(CompileError::Parse(error.clone()));
+    }
     if let Some(error) = parsed.unsupported_syntax_errors().first() {
         return Err(CompileError::invalid_syntax(error.to_string(), error.range));
     }

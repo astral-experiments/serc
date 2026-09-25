@@ -425,6 +425,10 @@ impl<'a> Visitor<'a> for Validator<'a> {
     }
 
     fn visit_expr(&mut self, expression: &'a Expr) {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.visit_expr(expression));
+        }
+
         match expression {
             Expr::Name(name) => {
                 let usage = if name.ctx.is_load() {
