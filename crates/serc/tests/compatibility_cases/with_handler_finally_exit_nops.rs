@@ -128,3 +128,18 @@ fn matches_cpython_nested_manager_in_coroutine_finally() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_nested_manager_in_async_generator_finally() {
+    for inner in ["log()", "await log()"] {
+        for after in ["", "    finish()\n"] {
+            let source = format!(
+                "async def f():\n    yield value\n    with context():\n        try:\n            action()\n        finally:\n            if first and second:\n                with suppress(Exception):\n                    {inner}\n{after}"
+            );
+            common::assert_matches_cpython_marshal(
+                &source,
+                "nested_manager_async_generator_finally.py",
+            );
+        }
+    }
+}
