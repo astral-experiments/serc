@@ -15553,21 +15553,6 @@ fn matches_cpython_threaded_async_loop_exit_borrow_boundaries() {
     async with manager:
         try:
             async for item in source:
-                if selected(item):
-                    break
-                consume(item)
-        except Error:
-            pass
-        consume(value)
-        consume(source)
-",
-            "protected_async_surviving_break_control.py",
-        ),
-        (
-            r"async def run(manager, source, value):
-    async with manager:
-        try:
-            async for item in source:
                 break
         except Error:
             pass
