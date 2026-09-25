@@ -148,6 +148,9 @@ pub(super) struct CodeUnit {
     pub(super) mangled_names: Option<FxHashSet<String>>,
     pub(super) free_names_are_final: bool,
     pub(super) pending_private_type_parameters: FxHashSet<NameId>,
+    /// Plans use declaration-time generic-header symbol identities, while
+    /// instructions look up names with the completed mangling restriction.
+    pub(super) header_symbol_names_are_final: bool,
     pub(super) arg_count: u32,
     positional_only_arg_count: u32,
     keyword_only_arg_count: u32,
@@ -246,6 +249,10 @@ impl<'source> Compiler<'source> {
         self.unit
             .mangled_names
             .clone_from(&parent.unit.mangled_names);
+        self.unit
+            .pending_private_type_parameters
+            .clone_from(&parent.unit.pending_private_type_parameters);
+        self.unit.header_symbol_names_are_final = parent.unit.header_symbol_names_are_final;
         self.symbols
             .imported_scope_names
             .clone_from(&parent.symbols.imported_scope_names);
@@ -346,29 +353,52 @@ impl<'source> Compiler<'source> {
         )
         .unwrap_or(usize::MAX);
         let names = &context.scopes.names;
-        let mut locals: Vec<_> = plan
-            .locals
-            .iter()
-            .enumerate()
-            .filter(|(index, name)| {
-                *index < parameter_count
-                    || !plan.cellvars.contains(*name)
-                    || plan.inlined_comprehension_cellvars.contains(*name)
-            })
-            .map(|(_, name)| *name)
-            .collect();
+        let header_storage = plan.header_local_storage.as_ref();
+        let mut locals: Vec<_> = if let Some(storage) = header_storage {
+            let mut seen = FxHashSet::default();
+            if storage.fast_locals.iter().any(|name| !seen.insert(*name))
+                || storage
+                    .fast_locals
+                    .get(..parameter_count)
+                    .is_none_or(|parameters| Some(parameters) != plan.locals.get(..parameter_count))
+                || storage.cellvars.iter().any(|name| !seen.contains(name))
+            {
+                return Err(CompileError::Internal(
+                    "invalid generic-header fast-local storage layout".to_string(),
+                ));
+            }
+            storage.fast_locals.clone()
+        } else {
+            plan.locals
+                .iter()
+                .enumerate()
+                .filter(|(index, name)| {
+                    *index < parameter_count
+                        || !plan.cellvars.contains(*name)
+                        || plan.inlined_comprehension_cellvars.contains(*name)
+                })
+                .map(|(_, name)| *name)
+                .collect()
+        };
         let fast_local_count = locals.len();
-        let mut cell_only_locals: Vec<_> = plan
-            .locals
-            .iter()
-            .enumerate()
-            .filter(|(index, name)| {
-                *index >= parameter_count
-                    && plan.cellvars.contains(*name)
-                    && !plan.inlined_comprehension_cellvars.contains(*name)
-            })
-            .map(|(_, name)| *name)
-            .collect();
+        let mut cell_only_locals: Vec<_> = if header_storage.is_some() {
+            plan.cellvars
+                .iter()
+                .filter(|name| !locals.contains(name))
+                .copied()
+                .collect()
+        } else {
+            plan.locals
+                .iter()
+                .enumerate()
+                .filter(|(index, name)| {
+                    *index >= parameter_count
+                        && plan.cellvars.contains(*name)
+                        && !plan.inlined_comprehension_cellvars.contains(*name)
+                })
+                .map(|(_, name)| *name)
+                .collect()
+        };
         cell_only_locals.sort_by(|left, right| {
             let spelling = |name| {
                 plan.cell_sort_names
@@ -384,6 +414,34 @@ impl<'source> Compiler<'source> {
             .map(|(index, name)| Ok((*name, to_u32(index, "local variable count")?)))
             .collect::<Result<FxHashMap<_, _>, CompileError>>()?;
         let mut temporary_indices = FxHashMap::default();
+        if let Some(storage) = header_storage {
+            for &(symbol, physical) in &storage.comprehension_slots {
+                let index = indices.get(&physical).copied().ok_or_else(|| {
+                    CompileError::Internal(format!(
+                        "missing generic-header comprehension storage `{}`",
+                        names.resolve(physical)
+                    ))
+                })?;
+                if usize::try_from(index).unwrap() >= fast_local_count {
+                    return Err(CompileError::Internal(format!(
+                        "generic-header comprehension storage `{}` is not a fast local",
+                        names.resolve(physical)
+                    )));
+                }
+                temporary_indices.insert(symbol, index);
+                temporary_indices.insert(physical, index);
+            }
+            // CPython adds mangled save/restore slots to its metadata tables
+            // without adding the corresponding name to the symbol table. Keep
+            // these slots unavailable to ordinary name and closure lookup.
+            let declared_names: FxHashSet<_> = plan
+                .locals
+                .iter()
+                .chain(plan.cellvars.iter())
+                .copied()
+                .collect();
+            indices.retain(|name, _| declared_names.contains(name));
+        }
         for &(alias, original) in &plan.local_aliases {
             let index = indices[&original];
             indices.insert(alias, index);
@@ -404,12 +462,16 @@ impl<'source> Compiler<'source> {
 
         let aliases: Option<Rc<[(NameId, NameId)]>> =
             (!plan.local_aliases.is_empty()).then(|| plan.local_aliases.clone().into());
-        let cell_names = plan
+        let scope_cell_names = plan
             .cellvars
             .iter()
             .copied()
             .collect::<NameSet>()
             .with_aliases(aliases.as_ref());
+        let mut cell_names = scope_cell_names.clone();
+        if let Some(storage) = header_storage {
+            cell_names.extend(storage.cellvars.iter().copied());
+        }
         let global_names = plan.globals.iter().copied().collect();
         let initialized_locals = locals
             .iter()
@@ -437,7 +499,7 @@ impl<'source> Compiler<'source> {
             scope: Scope::Function {
                 indices,
                 free_indices,
-                cells: cell_names,
+                cells: scope_cell_names,
                 globals: global_names,
             },
             scope_id,
@@ -1265,8 +1327,10 @@ impl<'source> Compiler<'source> {
             .enumerate()
             .map(|(index, name_id)| {
                 let spelling = self.resolve_name(*name_id);
-                if self.unit.free_names_are_final
+                if (self.unit.free_names_are_final
                     && index >= self.symbols.locals.len() - self.symbols.free_names.len()
+                    || self.unit.header_symbol_names_are_final)
+                    && !(self.unit.annotation_thunk && spelling == ".format")
                 {
                     return (MetadataName::new(spelling), MetadataId::from(*name_id));
                 }
@@ -1506,6 +1570,7 @@ impl CodeUnit {
             mangled_names: None,
             free_names_are_final: false,
             pending_private_type_parameters: FxHashSet::default(),
+            header_symbol_names_are_final: false,
             arg_count: spec.arg_count,
             positional_only_arg_count: spec.positional_only_arg_count,
             keyword_only_arg_count: spec.keyword_only_arg_count,

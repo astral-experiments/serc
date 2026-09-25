@@ -27,9 +27,10 @@ use crate::{CompileError, PythonVersion};
 use super::constant::folded_constant_owner_slots;
 use super::scope::{
     LoweringFunctionPlan, NameId, ReferenceCollector, annotation_nested_required_names,
-    collect_conditional_simple_annotations, collect_simple_annotations, expression_required_names,
+    annotation_nested_required_names_with_mangler, collect_conditional_simple_annotations,
+    collect_simple_annotations, expression_required_names, expression_required_names_with_mangler,
     expression_requirements_outside_comprehensions, function_annotation_expressions,
-    inlined_comprehension_cell_names_in_expression,
+    header_expression_storage, inlined_comprehension_cell_names_in_expression,
     inlined_comprehension_local_names_in_expression, nested_expression_required_names,
 };
 use super::source::unparse_annotation;
@@ -93,30 +94,45 @@ impl Compiler<'_> {
         type_params: &ruff_python_ast::TypeParams,
         private_class: Option<&str>,
     ) -> BTreeSet<String> {
-        let private_type_names = private_class
-            .map(|_| {
-                type_params
-                    .iter()
-                    .map(|parameter| parameter.name().as_str())
-                    .collect::<FxHashSet<_>>()
-            })
-            .unwrap_or_default();
-        let shadows = |name| {
-            if let Some(private_class) = private_class {
-                let source_name = self.resolve_name(name);
-                let name = if private_type_names.contains(source_name) {
-                    self.required_name_id(&super::symbol::mangle_name(
-                        source_name,
-                        Some(private_class),
-                    ))
-                } else {
-                    name
+        if let Some(private_class) = private_class {
+            let mut declared = FxHashSet::default();
+            let mut required = BTreeSet::new();
+            for parameter in type_params {
+                declared.insert(parameter.name().as_str());
+                let mangle = |name: &str| {
+                    if declared.contains(name) {
+                        super::symbol::mangle_name(name, Some(private_class)).into_owned()
+                    } else {
+                        name.to_owned()
+                    }
                 };
-                self.class_scope_shadows_unmangled_annotation_name(name)
-            } else {
-                self.class_scope_shadows_annotation_name(name)
+                let mut collect = |expression: &Expr| {
+                    let nested = annotation_nested_required_names_with_mangler(expression, &mangle)
+                        .into_iter()
+                        .map(|name| mangle(&name))
+                        .collect::<FxHashSet<_>>();
+                    for name in expression_required_names_with_mangler(expression, &mangle) {
+                        let name = mangle(&name);
+                        let shadows = self.class_scope_shadows_unmangled_annotation_name(
+                            self.required_name_id(&name),
+                        );
+                        if !shadows || nested.contains(&name) {
+                            required.insert(name);
+                        }
+                    }
+                };
+                if let TypeParam::TypeVar(parameter) = parameter
+                    && let Some(bound) = parameter.bound.as_deref()
+                {
+                    collect(bound);
+                }
+                if let Some(default) = parameter.default() {
+                    collect(default);
+                }
             }
-        };
+            return required;
+        }
+        let shadows = |name| self.class_scope_shadows_annotation_name(name);
         let mut required = BTreeSet::new();
         for parameter in type_params {
             if let TypeParam::TypeVar(parameter) = parameter
@@ -675,7 +691,7 @@ impl Compiler<'_> {
     ) -> Result<(), CompileError> {
         let indices = closure_names
             .iter()
-            .map(|name| self.closure_index_id(*name))
+            .map(|name| self.child_closure_index(*name))
             .collect::<Result<Vec<_>, _>>()?;
         self.emit_function_with_closure_indices(code, &indices)
     }
@@ -837,29 +853,47 @@ impl Compiler<'_> {
             self.type_parameter_scope_requirements(type_params, Some(definition.name.as_str()));
         let mut type_parameter_cell_requirements = type_parameter_requirements.clone();
         let mut wrapper_requirements = type_parameter_requirements;
+        let header_mangle = |name: &str| {
+            if type_params
+                .iter()
+                .any(|parameter| parameter.name().as_str() == name)
+            {
+                super::symbol::mangle_name(name, Some(definition.name.as_str())).into_owned()
+            } else {
+                name.to_owned()
+            }
+        };
         let mut header_references = ReferenceCollector::default();
         if let Some(arguments) = definition.arguments.as_deref() {
+            let mut collect = |expression: &Expr| {
+                header_references.visit_expr(expression);
+                let nested =
+                    annotation_nested_required_names_with_mangler(expression, &header_mangle)
+                        .into_iter()
+                        .map(|name| header_mangle(&name))
+                        .collect::<BTreeSet<_>>();
+                wrapper_requirements.extend(
+                    expression_required_names_with_mangler(expression, &header_mangle)
+                        .into_iter()
+                        .map(|name| header_mangle(&name))
+                        .filter(|name| {
+                            !self.class_scope_shadows_unmangled_annotation_name(
+                                self.required_name_id(name),
+                            ) || nested.contains(name)
+                        }),
+                );
+                type_parameter_cell_requirements.extend(nested);
+            };
             for argument in &arguments.args {
-                header_references.visit_expr(argument);
-                wrapper_requirements
-                    .extend(self.class_visible_annotation_requirements(argument, true));
-                type_parameter_cell_requirements.extend(nested_expression_required_names(argument));
+                collect(argument);
             }
             for keyword in &arguments.keywords {
-                header_references.visit_expr(&keyword.value);
-                wrapper_requirements
-                    .extend(self.class_visible_annotation_requirements(&keyword.value, true));
-                type_parameter_cell_requirements
-                    .extend(nested_expression_required_names(&keyword.value));
+                collect(&keyword.value);
             }
         }
         let type_parameter_cell_requirements = self.name_id_set(type_parameter_cell_requirements);
         let wrapper_requirements = self.name_id_set(wrapper_requirements);
-        let mut cellvars: FxHashSet<_> = type_names
-            .intersection(required_names)
-            .chain(type_names.intersection(&type_parameter_cell_requirements))
-            .copied()
-            .collect();
+        let mut cellvars: FxHashSet<_> = type_names.intersection(required_names).copied().collect();
         let emitted_type_name = |name| {
             self.required_name_id(&super::symbol::mangle_name(
                 self.resolve_name(name),
@@ -871,10 +905,22 @@ impl Compiler<'_> {
             .copied()
             .map(emitted_type_name)
             .collect::<FxHashSet<_>>();
+        let local_aliases = type_names
+            .iter()
+            .copied()
+            .filter_map(|name| {
+                let emitted = emitted_type_name(name);
+                (emitted != name).then_some((emitted, name))
+            })
+            .collect::<Vec<_>>();
+        cellvars.extend(
+            type_names.iter().copied().filter(|name| {
+                type_parameter_cell_requirements.contains(&emitted_type_name(*name))
+            }),
+        );
         cellvars.extend(type_names.iter().copied().filter(|name| {
-            class_plan
-                .unmangled_required
-                .contains(&emitted_type_name(*name))
+            let emitted = emitted_type_name(*name);
+            required_names.contains(&emitted) || class_plan.unmangled_required.contains(&emitted)
         }));
         cellvars.insert(self.required_name_id(".type_params"));
         let mut captures = Vec::new();
@@ -883,7 +929,7 @@ impl Compiler<'_> {
             reason = "Capture records are sorted by emitted identity before closure emission."
         )]
         for &name in required_names {
-            if type_names.contains(&name) {
+            if type_names.contains(&name) || emitted_type_names.contains(&name) {
                 continue;
             }
             let enclosing = class_plan
@@ -899,7 +945,7 @@ impl Compiler<'_> {
         }
         for &name in wrapper_requirements
             .iter()
-            .filter(|name| !type_names.contains(*name))
+            .filter(|name| !emitted_type_names.contains(*name))
             .chain(class_plan.unmangled_required.iter())
         {
             if !emitted_type_names.contains(&name)
@@ -923,12 +969,17 @@ impl Compiler<'_> {
         let globals = header_references
             .references
             .iter()
-            .map(|name| self.required_name_id(name))
+            .map(|name| self.required_name_id(&header_mangle(name)))
             .filter(|name| !type_names.contains(name))
-            .filter(|name| self.class_scope_shadows_unmangled_annotation_name(*name))
+            .filter(|name| !emitted_type_names.contains(name))
+            .filter(|name| {
+                !freevars.contains(name)
+                    || self.class_scope_shadows_unmangled_annotation_name(*name)
+            })
             .collect();
         let plan = LoweringFunctionPlan {
             locals,
+            local_aliases,
             globals,
             cellvars,
             freevars,
@@ -1007,8 +1058,14 @@ impl Compiler<'_> {
             false,
         ));
         wrapper.store_name(".type_params")?;
-        wrapper
-            .compile_plain_class_definition(definition, DefinitionDecorators::AlreadyCompiled)?;
+        // Header argument scopes see the completed type-parameter restriction.
+        // Their plans use the already-canonical symbol names, while the wrapper
+        // retains its existing metadata identities.
+        wrapper.unit.header_symbol_names_are_final = true;
+        let class_result = wrapper
+            .compile_plain_class_definition(definition, DefinitionDecorators::AlreadyCompiled);
+        wrapper.unit.header_symbol_names_are_final = false;
+        class_result?;
         wrapper.emit(RETURN_VALUE, 0, -1)?;
         let wrapper = wrapper.finish_inner(false)?;
 
@@ -1499,6 +1556,15 @@ impl Compiler<'_> {
     ) -> Result<(), CompileError> {
         let mut references = ReferenceCollector::default();
         references.visit_expr(expression);
+        let generic_class_header =
+            self.unit.mangled_names.is_some() && self.unit.generic_target_qualified_name.is_some();
+        let symbol_name = |name: &str| {
+            if generic_class_header {
+                self.symbol_analysis_name(name)
+            } else {
+                name.to_owned()
+            }
+        };
         let can_see_class_scope = matches!(self.unit.scope, Scope::Class { .. })
             || self.unit.annotation_classdict_index.is_some();
         let mut local_names = if self.has_deferred_annotations() {
@@ -1516,38 +1582,98 @@ impl Compiler<'_> {
         };
         let mut seen = FxHashSet::default();
         local_names.retain(|name| seen.insert(name.clone()));
-        let locals = self.name_ids(&local_names);
-        let required_names = self.name_ids(expression_required_names(expression));
-        let nested_requirements = self.name_id_set(annotation_nested_required_names(expression));
-        let outside_requirements =
-            self.name_id_set(expression_requirements_outside_comprehensions(expression));
+        let mut locals = self.name_ids(local_names.iter().map(|name| symbol_name(name)));
+        if generic_class_header {
+            let mut seen = FxHashSet::default();
+            locals.retain(|name| seen.insert(*name));
+        }
+        let required = if generic_class_header {
+            expression_required_names_with_mangler(expression, &symbol_name)
+        } else {
+            expression_required_names(expression)
+        };
+        let required_names = self.name_ids(required.iter().map(|name| symbol_name(name)));
+        let nested_names = if generic_class_header {
+            annotation_nested_required_names_with_mangler(expression, &symbol_name)
+        } else {
+            annotation_nested_required_names(expression)
+        };
+        let nested_requirements =
+            self.name_id_set(nested_names.iter().map(|name| symbol_name(name)));
+        let outside_requirements = self.name_id_set(
+            expression_requirements_outside_comprehensions(expression)
+                .iter()
+                .map(|name| symbol_name(name)),
+        );
         let mut freevars: Vec<_> = required_names
             .iter()
             .filter(|name| !locals.contains(name) || outside_requirements.contains(name))
-            .filter(|name| !self.unit.pending_private_type_parameters.contains(*name))
-            .filter(|name| self.is_type_parameter_id(**name) || self.can_provide_closure_id(**name))
             .filter(|name| {
-                !self.class_scope_shadows_annotation_name(**name)
-                    || nested_requirements.contains(*name)
+                if generic_class_header {
+                    self.physical_closure_index(**name).ok().flatten().is_some()
+                } else {
+                    !self.unit.pending_private_type_parameters.contains(*name)
+                        && (self.is_type_parameter_id(**name)
+                            || self.can_provide_closure_id(**name))
+                }
+            })
+            .filter(|name| {
+                !(if generic_class_header {
+                    self.class_scope_shadows_unmangled_annotation_name(**name)
+                } else {
+                    self.class_scope_shadows_annotation_name(**name)
+                }) || nested_requirements.contains(*name)
             })
             .copied()
             .collect();
+        if generic_class_header {
+            freevars.sort_unstable_by(|left, right| {
+                self.resolve_name(*left).cmp(self.resolve_name(*right))
+            });
+            freevars.dedup();
+        }
         if can_see_class_scope {
             let classdict = self.required_name_id("__classdict__");
             self.insert_lexical_name(&mut freevars, classdict);
         }
-        freevars.sort_unstable_by_key(|name| self.mangled_name(self.resolve_name(*name)));
+        if !generic_class_header {
+            freevars.sort_unstable_by_key(|name| self.mangled_name(self.resolve_name(*name)));
+        }
         let freevar_set: FxHashSet<_> = freevars.iter().copied().collect();
         let globals = references
             .references
             .iter()
-            .map(|name| self.required_name_id(name))
+            .map(|name| self.required_name_id(&symbol_name(name)))
             .filter(|name| {
-                !freevar_set.contains(name) || self.class_scope_shadows_annotation_name(*name)
+                !freevar_set.contains(name)
+                    || if generic_class_header {
+                        self.class_scope_shadows_unmangled_annotation_name(*name)
+                    } else {
+                        self.class_scope_shadows_annotation_name(*name)
+                    }
             })
             .collect();
-        let cellvars = self.name_id_set(inlined_cellvars);
+        let cellvars = self.name_id_set(inlined_cellvars.iter().map(|name| symbol_name(name)));
+        let header_local_storage = (generic_class_header
+            && !can_see_class_scope
+            && !self.unit.pending_private_type_parameters.is_empty())
+        .then(|| {
+            let prefix = if self.has_deferred_annotations() {
+                vec![self.required_name_id(".format")]
+            } else {
+                Vec::new()
+            };
+            header_expression_storage(
+                &ruff_python_ast::Parameters::default(),
+                expression,
+                &symbol_name,
+                &|name| self.mangled_name(name),
+                &self.context.scopes.names,
+                &prefix,
+            )
+        });
         let plan = LoweringFunctionPlan {
+            header_local_storage,
             locals,
             globals,
             freevars,
@@ -1594,6 +1720,10 @@ impl Compiler<'_> {
             (if nested { CO_NESTED } else { 0 }) | (self.unit.flags & SUPPORTED_FUTURE_FLAGS),
         )?;
         child.inherit_lexical_context(self);
+        if generic_class_header {
+            child.unit.header_symbol_names_are_final = true;
+            child.unit.free_names_are_final = true;
+        }
         // Before 3.14, type alias values use ordinary function scopes, so
         // definitions within them include the alias and `<locals>`.
         if !type_alias || self.has_deferred_annotations() {
@@ -1636,7 +1766,22 @@ impl Compiler<'_> {
             flags |= FunctionAttribute::DEFAULTS.argument();
         }
         if !closure_names.is_empty() {
-            self.emit_closure_tuple(&closure_names)?;
+            if generic_class_header {
+                let indices = closure_names
+                    .iter()
+                    .map(|name| {
+                        self.physical_closure_index(*name)?.ok_or_else(|| {
+                            CompileError::Internal(format!(
+                                "missing header closure variable `{}`",
+                                self.resolve_name(*name)
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.emit_closure_indices(&indices)?;
+            } else {
+                self.emit_closure_tuple(&closure_names)?;
+            }
         }
         let code = self.add_constant(Constant::Code(Box::new(child)))?;
         self.emit(LOAD_CONST, code, 1)?;
