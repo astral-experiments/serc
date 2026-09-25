@@ -1786,6 +1786,7 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
     #[derive(Default)]
     struct AnnotationStrings<'ast> {
         needs_normalization: bool,
+        strings: Vec<&'ast ruff_python_ast::ExprStringLiteral>,
         fstrings: Vec<&'ast ruff_python_ast::ExprFString>,
         integer_attribute_values: Vec<&'ast ruff_python_ast::ExprNumberLiteral>,
         unpacked_keywords: Vec<&'ast ruff_python_ast::Keyword>,
@@ -1795,7 +1796,10 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
     impl<'ast> Visitor<'ast> for AnnotationStrings<'ast> {
         fn visit_expr(&mut self, expression: &'ast Expr) {
             match expression {
-                Expr::StringLiteral(_) => self.needs_normalization = true,
+                Expr::StringLiteral(string) => {
+                    self.needs_normalization = true;
+                    self.strings.push(string);
+                }
                 Expr::FString(string) => {
                     self.needs_normalization = true;
                     self.fstrings.push(string);
@@ -1893,15 +1897,7 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
     }
 
     if let Expr::StringLiteral(string) = expression {
-        let mut annotation = python_string_repr(string.value.to_str());
-        if string.value.is_unicode()
-            && string.value.iter().next().is_some_and(|literal| {
-                source.as_bytes().get(usize::from(literal.range.start())) == Some(&b'u')
-            })
-        {
-            annotation.insert(0, 'u');
-        }
-        return annotation;
+        return annotation_string_literal_repr(string, source).0;
     }
 
     if let Expr::FString(string) = expression {
@@ -1948,6 +1944,21 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
             )
         })
         .collect::<Vec<_>>();
+    replacements.extend(
+        generated_strings
+            .strings
+            .iter()
+            .zip(original_strings.strings)
+            .filter(|(_, original)| original.value.to_str().contains('\u{fffd}'))
+            .filter_map(|(generated, original)| {
+                let (repr, has_surrogates) = annotation_string_literal_repr(original, source);
+                if has_surrogates {
+                    Some((std::ops::Range::<usize>::from(generated.range), repr))
+                } else {
+                    None
+                }
+            }),
+    );
     replacements.extend(
         generated_strings
             .templates
@@ -2144,18 +2155,30 @@ fn annotation_needs_no_unparse_corrections(expression: &Expr) -> bool {
 
 /// CPython builds a complete `JoinedStr` body before applying string repr to it.
 fn unparse_annotation_fstring(string: &ruff_python_ast::ExprFString, source: &str) -> String {
-    let mut body = String::new();
+    let mut body = AnnotationStringBody::default();
     for part in &string.value {
         match part {
             FStringPartRef::Literal(literal) => {
-                append_annotation_string_literal(&mut body, &literal.value);
+                body.push_literal(
+                    &literal.value,
+                    source,
+                    literal.range,
+                    literal.flags.prefix().is_raw(),
+                    true,
+                );
             }
             FStringPartRef::FString(part) => {
-                append_annotation_interpolations(&mut body, &part.elements, source, None);
+                append_annotation_interpolations(
+                    &mut body,
+                    &part.elements,
+                    source,
+                    None,
+                    part.flags.prefix().is_raw(),
+                );
             }
         }
     }
-    format!("f{}", python_string_repr(&body))
+    format!("f{}", body.repr())
 }
 
 /// Template interpolations retain their authored text, including grouping parentheses.
@@ -2164,39 +2187,34 @@ fn unparse_annotation_tstring(string: &ruff_python_ast::ExprTString, source: &st
         &source[std::ops::Range::<usize>::from(string.range)],
         ruff_python_parser::ParseOptions::from(ruff_python_parser::Mode::ParenthesizedExpression),
     );
-    let mut body = String::new();
+    let mut body = AnnotationStringBody::default();
     for part in &string.value {
         append_annotation_interpolations(
             &mut body,
             &part.elements,
             source,
             Some((parsed.tokens(), string.start())),
+            part.flags.prefix().is_raw(),
         );
     }
-    format!("t{}", python_string_repr(&body))
-}
-
-fn append_annotation_string_literal(body: &mut String, value: &str) {
-    body.push_str(&value.replace('{', "{{").replace('}', "}}"));
+    format!("t{}", body.repr())
 }
 
 fn append_annotation_interpolations(
-    body: &mut String,
+    body: &mut AnnotationStringBody,
     elements: &[InterpolatedStringElement],
     source: &str,
     template_tokens: Option<(&Tokens, TextSize)>,
+    is_raw: bool,
 ) {
     for element in elements {
         match element {
             InterpolatedStringElement::Literal(literal) => {
-                append_annotation_string_literal(body, &literal.value);
+                body.push_literal(&literal.value, source, literal.range, is_raw, true);
             }
             InterpolatedStringElement::Interpolation(interpolation) => {
                 if let Some(debug_text) = &interpolation.debug_text {
-                    append_annotation_string_literal(
-                        body,
-                        &annotation_interpolation_text(debug_text.as_str()),
-                    );
+                    body.push_braced(&annotation_interpolation_text(debug_text.as_str()));
                 }
                 let value = if let Some((tokens, offset)) = template_tokens {
                     let end = if interpolation.conversion.is_none() {
@@ -2250,7 +2268,7 @@ fn append_annotation_interpolations(
                 if let Some(spec) = &interpolation.format_spec {
                     body.push(':');
                     // CPython represents template format specs with FormattedValue nodes.
-                    append_annotation_interpolations(body, &spec.elements, source, None);
+                    append_annotation_interpolations(body, &spec.elements, source, None, is_raw);
                 }
                 body.push('}');
             }
@@ -2309,6 +2327,125 @@ fn annotation_interpolation_text(value: &str) -> String {
         }
     }
     result
+}
+
+/// Keeps source-only surrogate identities until Python's string repr is emitted.
+#[derive(Default)]
+struct AnnotationStringBody {
+    value: String,
+    surrogates: Vec<(usize, u16)>,
+}
+
+impl AnnotationStringBody {
+    fn push(&mut self, character: char) {
+        self.value.push(character);
+    }
+
+    fn push_str(&mut self, value: &str) {
+        self.value.push_str(value);
+    }
+
+    fn push_braced(&mut self, value: &str) {
+        for character in value.chars() {
+            self.push(character);
+            if matches!(character, '{' | '}') {
+                self.push(character);
+            }
+        }
+    }
+
+    fn push_literal(
+        &mut self,
+        value: &str,
+        source: &str,
+        range: TextRange,
+        is_raw: bool,
+        escape_braces: bool,
+    ) {
+        let restored = (!is_raw && value.contains('\u{fffd}'))
+            .then(|| {
+                explicit_surrogate_string(value, &source[std::ops::Range::<usize>::from(range)])
+            })
+            .flatten();
+        // Ruff's replacement character and a surrogate-pass UTF-8 sequence are both
+        // three bytes, so their offsets in the restored and decoded values agree.
+        for (offset, character) in value.char_indices() {
+            if character == '\u{fffd}'
+                && let Some([0xed, second @ 0xa0..=0xbf, third @ 0x80..=0xbf]) = restored
+                    .as_deref()
+                    .and_then(|bytes| bytes.get(offset..offset + 3))
+            {
+                let surrogate = 0xd000 | (u16::from(second & 0x3f) << 6) | u16::from(third & 0x3f);
+                self.surrogates.push((self.value.len(), surrogate));
+            }
+            self.push(character);
+            if escape_braces && matches!(character, '{' | '}') {
+                self.push(character);
+            }
+        }
+    }
+
+    fn repr(&self) -> String {
+        let repr = python_string_repr(&self.value);
+        if self.surrogates.is_empty() {
+            return repr;
+        }
+        // U+FFFD is printable in Python repr, so its occurrences remain in order
+        // after quote selection and escaping. Replace only source surrogate entries.
+        let mut surrogates = self.surrogates.iter().copied().peekable();
+        let mut replacements = self
+            .value
+            .char_indices()
+            .filter(|(_, character)| *character == '\u{fffd}')
+            .map(|(offset, _)| {
+                if surrogates.peek().is_some_and(|(index, _)| *index == offset) {
+                    surrogates.next().map(|(_, surrogate)| surrogate)
+                } else {
+                    None
+                }
+            });
+        let mut output = String::with_capacity(repr.len());
+        for character in repr.chars() {
+            if character == '\u{fffd}'
+                && let Some(Some(surrogate)) = replacements.next()
+            {
+                use std::fmt::Write;
+                write!(output, "\\u{surrogate:04x}").expect("writing to a string succeeds");
+            } else {
+                output.push(character);
+            }
+        }
+        output
+    }
+}
+
+fn annotation_string_literal_repr(
+    string: &ruff_python_ast::ExprStringLiteral,
+    source: &str,
+) -> (String, bool) {
+    let (mut repr, has_surrogates) = if string.value.to_str().contains('\u{fffd}') {
+        let mut body = AnnotationStringBody::default();
+        for literal in &string.value {
+            body.push_literal(
+                literal.as_str(),
+                source,
+                literal.range,
+                literal.flags.prefix().is_raw(),
+                false,
+            );
+        }
+        (body.repr(), !body.surrogates.is_empty())
+    } else {
+        (python_string_repr(string.value.to_str()), false)
+    };
+    if string.value.is_unicode()
+        && string.value.iter().next().is_some_and(|literal| {
+            source.as_bytes().get(usize::from(literal.range.start())) == Some(&b'u')
+        })
+    {
+        repr.insert(0, 'u');
+    }
+    (repr, has_surrogates)
 }
 
 fn python_string_repr(value: &str) -> String {
