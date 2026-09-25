@@ -4902,6 +4902,22 @@ struct VariableSpellings {
     names: BTreeSet<String>,
 }
 
+pub(super) fn generator_has_private_spelling_collisions(
+    generator: &ruff_python_ast::ExprGenerator,
+    mangle: &impl Fn(&str) -> String,
+) -> bool {
+    let mut spellings = VariableSpellings::default();
+    spellings.visit_expr(&generator.elt);
+    for comprehension in &generator.generators {
+        spellings.visit_expr(&comprehension.target);
+        spellings.visit_expr(&comprehension.iter);
+        for condition in &comprehension.ifs {
+            spellings.visit_expr(condition);
+        }
+    }
+    !colliding_private_spellings(&spellings.names, mangle).is_empty()
+}
+
 impl<'ast> Visitor<'ast> for VariableSpellings {
     fn visit_expr(&mut self, expression: &'ast Expr) {
         if let Expr::Name(name) = expression {
@@ -5786,6 +5802,106 @@ pub(super) fn collect_nested_comprehension_target_names(
 
     Collector { names }.visit_expr(expression);
 }
+
+/// Collect generator fast-local uses and inlined comprehension saves in evaluation order.
+pub(super) fn collect_generator_slot_names(
+    expression: &Expr,
+    generator_locals: &FxHashSet<String>,
+    generator_cellvars: &FxHashSet<String>,
+    names: &mut Vec<String>,
+) {
+    struct Collector<'a> {
+        generator_locals: &'a FxHashSet<String>,
+        generator_cellvars: &'a FxHashSet<String>,
+        names: &'a mut Vec<String>,
+    }
+
+    impl<'ast> Visitor<'ast> for Collector<'_> {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            let (generators, key, value) = match expression {
+                Expr::ListComp(comprehension) => (
+                    &comprehension.generators[..],
+                    None,
+                    comprehension.elt.as_ref(),
+                ),
+                Expr::SetComp(comprehension) => (
+                    &comprehension.generators[..],
+                    None,
+                    comprehension.elt.as_ref(),
+                ),
+                Expr::DictComp(comprehension) => (
+                    &comprehension.generators[..],
+                    comprehension.key.as_deref(),
+                    comprehension.value.as_ref(),
+                ),
+                Expr::Generator(generator) => {
+                    if let Some(first) = generator.generators.first() {
+                        self.visit_expr(&first.iter);
+                    }
+                    return;
+                }
+                Expr::Lambda(lambda) => {
+                    visit_lambda_defaults(self, lambda);
+                    return;
+                }
+                Expr::Name(name) => {
+                    let name = name.id.as_str();
+                    if self.generator_locals.contains(name)
+                        && !self.generator_cellvars.contains(name)
+                    {
+                        self.names.push(name.to_owned());
+                    }
+                    return;
+                }
+                _ => {
+                    walk_expr(self, expression);
+                    return;
+                }
+            };
+            if let Some(first) = generators.first() {
+                self.visit_expr(&first.iter);
+            }
+            let temporary_names = comprehension_temporary_names(generators, key, value);
+            let mut direct_targets = Vec::new();
+            for generator in generators {
+                collect_target_names(&generator.target, &mut direct_targets);
+            }
+            let deferred_outer_names = comprehension_name_bindings(generators, key, value)
+                .into_iter()
+                .filter(|(name, bound)| !bound && !direct_targets.contains(name))
+                .map(|(name, _)| name)
+                .collect::<FxHashSet<_>>();
+            // An inlined child can shadow a name that its parent reads from an
+            // enclosing scope. The child owns that save, after the parent's saves.
+            self.names.extend(
+                temporary_names
+                    .into_iter()
+                    .filter(|name| !deferred_outer_names.contains(name)),
+            );
+            for (index, generator) in generators.iter().enumerate() {
+                if index > 0 {
+                    self.visit_expr(&generator.iter);
+                }
+                self.visit_expr(&generator.target);
+                for condition in &generator.ifs {
+                    self.visit_expr(condition);
+                }
+            }
+            if let Some(key) = key {
+                self.visit_expr(key);
+            }
+            self.visit_expr(value);
+        }
+    }
+
+    Collector {
+        generator_locals,
+        generator_cellvars,
+        names,
+    }
+    .visit_expr(expression);
+}
+
 pub(super) fn collect_self_iterated_nested_comprehension_targets(
     expression: &Expr,
     names: &mut Vec<String>,
