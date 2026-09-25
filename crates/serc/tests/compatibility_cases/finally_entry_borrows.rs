@@ -1,6 +1,30 @@
 use crate::common;
 
 #[test]
+fn matches_cpython_borrows_after_guarded_pass_recovery() {
+    for guard in ["x", "x and y", "x or y", "x is None"] {
+        for body in ["pass", "work(y)"] {
+            for name in ["", " as error"] {
+                for recovery in ["pass", "work(x)"] {
+                    for tail in [
+                        "    return use(x)\n",
+                        "    try:\n        pass\n    finally:\n        data = [x, 1 if y is None else 2]\n        try:\n            consume(data)\n        except E:\n            pass\n",
+                    ] {
+                        let source = format!(
+                            "def f(x, y):\n    try:\n        if {guard}:\n            try:\n                {body}\n            except E{name}:\n                {recovery}\n    except E:\n        pass\n{tail}"
+                        );
+                        common::assert_matches_cpython_marshal(
+                            &source,
+                            "guarded_pass_recovery_borrows.py",
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn matches_cpython_borrows_in_structured_finally_bodies() {
     for prefix in ["", "async "] {
         for body in ["use(value)", "for item in values:\n            use(item)"] {
