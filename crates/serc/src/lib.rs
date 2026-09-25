@@ -9,6 +9,7 @@ mod code_object;
 mod compiler;
 mod config;
 mod delimiter_nesting;
+mod indentation;
 mod initial_intern_state;
 mod marshal;
 mod source;
@@ -498,6 +499,7 @@ fn compile_normalized(
     if let Some(error) = parsed.errors().first() {
         return Err(CompileError::Parse(error.clone()));
     }
+    indentation::validate(parsed.tokens())?;
     if let Some(error) = parsed.unsupported_syntax_errors().first() {
         return Err(CompileError::invalid_syntax(error.to_string(), error.range));
     }
