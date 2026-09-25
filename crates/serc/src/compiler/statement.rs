@@ -21013,10 +21013,8 @@ impl<'source> Compiler<'source> {
                 && statement.orelse.is_empty()
                 && statement.finalbody.is_empty()
                 && matches!(self.unit.scope, Scope::Function { .. })
-                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                 && suite_has_linear_borrow_fallthrough(&statement.body)
-                && self.control.loops.contexts.is_empty()
-                && self.control.withs.active_with_exits.is_empty()
                 && self.control.exceptions.active_exception_handlers.is_empty()
                 && self
                     .control
@@ -34951,8 +34949,9 @@ fn guarded_recovery_has_populated_handler_suffix(body: &[Stmt]) -> bool {
     })
 }
 
-// A final no-else None guard keeps the named handler cleanup live through its
-// false edge. Normally completing nested recoveries cannot orphan that entry.
+// A final no-else runtime guard keeps the named handler cleanup live through its
+// false edge, including inside a loop or context manager. Normally completing
+// nested recoveries cannot orphan that entry.
 fn handlers_have_live_guarded_recovery_cleanup(statement: &ruff_python_ast::StmtTry) -> bool {
     fn completed_work(statement: &Stmt) -> bool {
         suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
@@ -35011,9 +35010,7 @@ fn handlers_have_live_guarded_recovery_cleanup(statement: &ruff_python_ast::Stmt
             return false;
         };
         if !guard.elif_else_clauses.is_empty()
-            || !matches!(guard.test.as_ref(), Expr::Compare(comparison)
-                if matches!(comparison.first_operand(), Expr::Name(_))
-                    && is_specialized_none_condition(&guard.test))
+            || !condition_has_linear_runtime_leaves(&guard.test)
             || !matches!(guard.body.last(), Some(Stmt::Try(_)))
             || !normal_recovery_suite(&handler.body)
         {

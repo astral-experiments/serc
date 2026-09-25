@@ -589,3 +589,26 @@ fn compacts_assertion_pop_before_matching_normal_exit() {
         common::assert_matches_cpython_marshal(&source, "sync_assertion_pop_compaction.py");
     }
 }
+
+#[test]
+fn preserves_borrows_after_guarded_nested_handler_cleanup() {
+    for scope in ["def", "async def"] {
+        for guard in ["x", "not x", "x is None", "x == y"] {
+            for inner_name in ["", " as inner"] {
+                for (wrapper, indent) in [
+                    ("", "    "),
+                    ("    with manager():\n", "        "),
+                    ("    for item in x:\n", "        "),
+                ] {
+                    let source = format!(
+                        "{scope} f(x, y):\n{wrapper}{indent}try:\n{indent}    work(x)\n{indent}except E as error:\n{indent}    if {guard}:\n{indent}        try:\n{indent}            work(y)\n{indent}        except E{inner_name}:\n{indent}            work(x)\n{indent}return use(x)\n"
+                    );
+                    common::assert_matches_cpython_marshal(
+                        &source,
+                        "guarded_nested_handler_borrows.py",
+                    );
+                }
+            }
+        }
+    }
+}
