@@ -4958,7 +4958,8 @@ impl Compiler<'_> {
         let locals = self.name_ids(locals);
         let globals = self.name_id_set(globals);
         let generator_cellvars = self.name_id_set(generator_cellvars);
-        let freevars = self.name_ids(freevars);
+        let mut freevars = self.name_ids(freevars);
+        let free_aliases = self.coalesce_private_freevars(&mut freevars);
         let closure_names = freevars.clone();
         let generator_range = self.generator_expression_range(generator);
         let plan = LoweringFunctionPlan {
@@ -4977,6 +4978,7 @@ impl Compiler<'_> {
             cellvars: generator_cellvars,
             inlined_comprehension_cellvars: self.name_id_set(inlined_cellvars),
             freevars,
+            free_aliases,
             ..LoweringFunctionPlan::default()
         };
         let inlined_comprehension_parent = !self
