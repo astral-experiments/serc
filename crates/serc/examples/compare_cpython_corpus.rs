@@ -1337,6 +1337,24 @@ mod tests {
         );
     }
 
+    // Diagnostic for https://github.com/astral-sh/serc/issues/746.
+    #[test]
+    #[ignore = "issue #746: the oracle caller's intern state is not modeled by default"]
+    fn comparator_accounts_for_oracle_caller_intern_state() {
+        let python = std::env::var("SERC_TEST_PYTHON").unwrap_or_else(|_| "python3.14".to_string());
+        verify_python(&python, PythonVersion::Py314).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("caller_state.py");
+        fs::write(
+            &path,
+            "def first(value):\n    return value in {'full', 'novel_marker'}, 1\n\ndef second(value):\n    'second docstring'\n    return value in {'full', 'novel_marker'}, 2\n",
+        )
+        .unwrap();
+
+        let outcome = super::compare(&path, &python, true, &CompileOptions::default(), None, None);
+        assert_eq!(outcome.kind, OutcomeKind::Exact, "{}", outcome.detail);
+    }
+
     #[test]
     fn oracle_distinguishes_compilation_rejections_and_io_failures() {
         let python = std::env::var("SERC_TEST_PYTHON").unwrap_or_else(|_| "python3.14".to_string());
