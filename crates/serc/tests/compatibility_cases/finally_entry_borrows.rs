@@ -1,6 +1,31 @@
 use crate::common;
 
 #[test]
+fn coroutine_guarded_pass_recovery_preserves_owned_finalizer_loads() {
+    for guard in ["x and y", "x and y and z"] {
+        for inner in ["except E:", "except E as error:"] {
+            for outer in ["except F:", "except F as error:"] {
+                for body in ["pass", "work(y)"] {
+                    for cleanup in [
+                        "use(x)",
+                        "data = [x, y]\n        use(data)",
+                        "data = [x, 1 if y else 2]\n        use(data)",
+                    ] {
+                        let source = format!(
+                            "async def f(x, y, z):\n    try:\n        if {guard}:\n            try:\n                pass\n            {inner}\n                pass\n    {outer}\n        pass\n    try:\n        {body}\n    finally:\n        {cleanup}\n"
+                        );
+                        common::assert_matches_cpython_marshal(
+                            &source,
+                            "coroutine_guarded_pass_recovery_finally.py",
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn matches_cpython_borrows_after_guarded_pass_recovery() {
     for guard in ["x", "x and y", "x or y", "x is None"] {
         for body in ["pass", "work(y)"] {
