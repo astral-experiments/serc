@@ -293,6 +293,33 @@ fn compile_rejects_unsupported_python_version() {
 }
 
 #[test]
+fn terminal_generator_assignments_match_cpython_315_marshal() {
+    for callable in ["tuple", "all", "any", "list", "set"] {
+        let source = format!("result = {callable}(x for x in values) if flag else ()\n");
+        let native = common::python_315_command()
+            .args([
+                "-c",
+                "import marshal, sys; code = compile(sys.argv[1], 'generator_assignment.py', 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))",
+                &source,
+            ])
+            .output()
+            .unwrap();
+        assert!(native.status.success(), "{callable}: {native:?}");
+        let actual = serc::compile_with_options(
+            &source,
+            "generator_assignment.py",
+            &serc::CompileOptions {
+                python_version: serc::PythonVersion::Py315,
+                ..serc::CompileOptions::default()
+            },
+        )
+        .unwrap()
+        .marshal();
+        assert_eq!(actual, native.stdout, "{callable}");
+    }
+}
+
+#[test]
 fn unary_plus_patterns_match_cpython_315_marshal() {
     for pattern in [
         "+1",
