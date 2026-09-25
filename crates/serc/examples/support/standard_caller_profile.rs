@@ -38,6 +38,59 @@ const REVIEWED_PROOFS: &[ReviewedProof] = &[
     },
 ];
 
+// Scoped absence needs its own independent admission. Positive profiles remain
+// partial, and their hashes do not authorize a companion supplied by a caller.
+const REVIEWED_SCOPED_ABSENCE: &[ReviewedScopedAbsence] = &[
+    ReviewedScopedAbsence {
+        initial_profile_sha256: "41b6c006a0fcdf27ef6c09728a0ffdc55e20514d7bba4aed8df27b677f78376e",
+        path: "cpython_3_13_15_caller_dotted.json",
+        sha256: "009d9506e87ebd44b4c421f38125290777766467f8e2ae89405b70316f7d004c",
+    },
+    ReviewedScopedAbsence {
+        initial_profile_sha256: "5a7e6ca0176ab8e07bae6bde1d54226439462b6e82493e110f4863ce2bbf45e0",
+        path: "cpython_3_14_5_caller_dotted.json",
+        sha256: "680d91a73f17138904c5a2117988a53d30ca8dab90e76b42519d904257c9d015",
+    },
+    ReviewedScopedAbsence {
+        initial_profile_sha256: "3580dff92980e02edea1334fd6fa7815bc2c7924ec79466a4389815a5e149a0a",
+        path: "cpython_3_15_0rc2_caller_dotted.json",
+        sha256: "c40c8a59dbbae777283de24aab1cb4fd6582b07b42fab51a66a2c67675ed84f3",
+    },
+];
+
+struct ReviewedScopedAbsence {
+    initial_profile_sha256: &'static str,
+    path: &'static str,
+    sha256: &'static str,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopedAbsence {
+    schema_version: u32,
+    kind: String,
+    target: Target,
+    initial_profile_sha256: String,
+    runtime_admission_sha256: String,
+    oracle_sha256: String,
+    compiler_executable_sha256: String,
+    generator_sha256: String,
+    lexical_helper_sha256: String,
+    source_inputs: BTreeMap<String, String>,
+    domain: String,
+    phase: String,
+    scope_complete: bool,
+    possible_names: Vec<String>,
+    coverage: ScopedCoverage,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopedCoverage {
+    recipes: Vec<Value>,
+    unresolved: Vec<Value>,
+}
+
 struct ReviewedProof {
     sha256: &'static str,
     semantics: StateSemantics,
@@ -232,6 +285,8 @@ pub(super) fn load(
             admission["preparer_sha256"].as_str() == Some(&preparer_hash),
             "runtime admission does not bind the reviewed preparer",
         )?;
+        let scoped_absence =
+            load_scoped_absence(directory, &proof_hash, &proof, &artifact.sha256, &admission)?;
         match prepare_runtime(python, &preparer, &admission_path, &admission) {
             Ok(qualified) => {
                 let mut retained = proof.state.retained_strings.clone();
@@ -248,12 +303,31 @@ pub(super) fn load(
                 }
                 let retained_entries = retained.len();
                 let (state, description) = match proof.state.semantics {
-                    StateSemantics::GuaranteedRetainedPartial => (
-                        InitialInternState::from_partial(retained),
-                        format!(
-                            "{retained_entries} guaranteed retained entries; every unproved entry unknown"
-                        ),
-                    ),
+                    StateSemantics::GuaranteedRetainedPartial => {
+                        if let Some(possible) = scoped_absence {
+                            let possible_entries = possible.len();
+                            (
+                                InitialInternState::from_partial_with_absence(
+                                    retained,
+                                    move |target, value| {
+                                        target == version
+                                            && ascii_dotted_name(value)
+                                            && !possible.contains(value)
+                                    },
+                                ),
+                                format!(
+                                    "{retained_entries} guaranteed retained entries; initial dotted-name absence scoped around {possible_entries} possible entries"
+                                ),
+                            )
+                        } else {
+                            (
+                                InitialInternState::from_partial(retained),
+                                format!(
+                                    "{retained_entries} guaranteed retained entries; every unproved entry unknown"
+                                ),
+                            )
+                        }
+                    }
                     StateSemantics::RetainedWithAbsence => {
                         let possible: BTreeSet<_> =
                             proof.state.possible_ascii_words.into_iter().collect();
@@ -287,6 +361,141 @@ pub(super) fn load(
         "no reviewed runtime admission matched: {}",
         errors.join("; ")
     ))
+}
+
+/// Load an independently pinned complement within one closed initial-state domain.
+fn load_scoped_absence(
+    directory: &Path,
+    profile_hash: &str,
+    profile: &SourceProof,
+    runtime_hash: &str,
+    runtime: &Value,
+) -> Result<Option<BTreeSet<String>>, String> {
+    let Some(admission) = REVIEWED_SCOPED_ABSENCE
+        .iter()
+        .find(|entry| entry.initial_profile_sha256 == profile_hash)
+    else {
+        return Ok(None);
+    };
+    let bytes = fs_err::read(directory.join(relative_path(admission.path)?))
+        .map_err(|error| error.to_string())?;
+    require(
+        digest(&bytes) == admission.sha256,
+        "scoped absence artifact differs from independent admission",
+    )?;
+    let proof: ScopedAbsence = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let scripts = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts");
+    let generator_hash = digest(
+        &fs_err::read(scripts.join("generate_cpython_caller_dotted.py"))
+            .map_err(|error| error.to_string())?,
+    );
+    let helper_hash = digest(
+        &fs_err::read(scripts.join("caller_dotted_metadata.py"))
+            .map_err(|error| error.to_string())?,
+    );
+    proof.validate(
+        profile_hash,
+        profile,
+        runtime_hash,
+        runtime,
+        &generator_hash,
+        &helper_hash,
+    )?;
+    Ok(Some(proof.possible_names.into_iter().collect()))
+}
+
+impl ScopedAbsence {
+    /// Check the phase, domain, source and selected-runtime bindings independently.
+    fn validate(
+        &self,
+        profile_hash: &str,
+        profile: &SourceProof,
+        runtime_hash: &str,
+        runtime: &Value,
+        generator_hash: &str,
+        helper_hash: &str,
+    ) -> Result<(), String> {
+        require(
+            self.schema_version == 1
+                && self.kind == "standard-caller-scoped-absence"
+                && self.domain == "ascii-dotted-identifiers-and-locals"
+                && self.phase == "before-target-source-decoding"
+                && self.scope_complete
+                && profile.state.semantics == StateSemantics::GuaranteedRetainedPartial,
+            "unsupported scoped absence contract",
+        )?;
+        require(
+            self.initial_profile_sha256 == profile_hash
+                && self.target == profile.target
+                && self.runtime_admission_sha256 == runtime_hash
+                && self.oracle_sha256 == profile.oracle.script_sha256,
+            "scoped absence profile, target, runtime or oracle binding differs",
+        )?;
+        require(
+            self.generator_sha256 == generator_hash
+                && self.lexical_helper_sha256 == helper_hash
+                && valid_hash(generator_hash)
+                && valid_hash(helper_hash)
+                && !self.source_inputs.is_empty()
+                && self.source_inputs.iter().all(|(path, hash)| {
+                    valid_hash(hash)
+                        && relative_path(path.strip_prefix("runtime:").unwrap_or(path)).is_ok()
+                }),
+            "scoped absence source or generator provenance differs",
+        )?;
+        let executable = runtime["executable"]
+            .as_str()
+            .ok_or("runtime executable missing")?;
+        require(
+            valid_hash(&self.compiler_executable_sha256)
+                && runtime["files"]
+                    .as_array()
+                    .ok_or("runtime file manifest missing")?
+                    .iter()
+                    .any(|file| {
+                        file["path"].as_str() == Some(executable)
+                            && file["sha256"].as_str() == Some(&self.compiler_executable_sha256)
+                    }),
+            "scoped absence generator compiler has no admitted runtime binding",
+        )?;
+        require(
+            !self.coverage.recipes.is_empty() && self.coverage.unresolved.is_empty(),
+            "scoped absence has unresolved closure obligations",
+        )?;
+        require(
+            self.possible_names.windows(2).all(|pair| pair[0] < pair[1])
+                && self
+                    .possible_names
+                    .iter()
+                    .all(|value| ascii_dotted_name(value)),
+            "scoped absence candidates must be sorted unique names in the declared domain",
+        )?;
+        require(
+            profile
+                .state
+                .retained_strings
+                .iter()
+                .filter(|value| ascii_dotted_name(value))
+                .all(|value| self.possible_names.binary_search(value).is_ok()),
+            "scoped absence candidates omit a guaranteed retained name",
+        )
+    }
+}
+
+/// Match only the source-audited ASCII domain, never general Unicode identifiers.
+fn ascii_dotted_name(value: &str) -> bool {
+    fn identifier(value: &str) -> bool {
+        value.as_bytes().split_first().is_some_and(|(first, rest)| {
+            (first.is_ascii_alphabetic() || *first == b'_')
+                && rest
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        })
+    }
+    let mut parts = value.split('.');
+    identifier(parts.next().unwrap_or_default())
+        && parts.clone().next().is_some()
+        && parts.all(|part| part == "<locals>" || identifier(part))
 }
 
 fn prepare_runtime(
@@ -619,6 +828,139 @@ mod tests {
         .err()
         .expect("unreviewed proof must fail before interpreter invocation");
         assert!(error.contains("has not been independently admitted"));
+    }
+
+    #[test]
+    fn dotted_absence_domain_excludes_unproved_string_shapes() {
+        for name in [
+            "Owner.member",
+            "function.<locals>.Owner",
+            "_x.Y2",
+            "a.<locals>",
+        ] {
+            assert!(ascii_dotted_name(name), "{name}");
+        }
+        for name in [
+            "",
+            "single",
+            ".member",
+            "Owner.",
+            "a..b",
+            "1a.b",
+            "a.2b",
+            "a.<lambda>",
+            "<locals>.a",
+            "Owner.é",
+            "path/name.py",
+            "a.b\n",
+        ] {
+            assert!(!ascii_dotted_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn reviewed_scoped_companions_bind_the_unchanged_partial_profiles() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/target_metadata");
+        for stem in ["3_12_14", "3_13_15", "3_14_5", "3_15_0rc2"] {
+            let bytes =
+                fs_err::read(directory.join(format!("cpython_{stem}_caller.json"))).unwrap();
+            let profile: SourceProof = serde_json::from_slice(&bytes).unwrap();
+            let runtime_artifact = &profile.runtime_admissions[0];
+            let runtime_bytes = fs_err::read(directory.join(&runtime_artifact.path)).unwrap();
+            assert_eq!(digest(&runtime_bytes), runtime_artifact.sha256);
+            let runtime: Value = serde_json::from_slice(&runtime_bytes).unwrap();
+            let possible = load_scoped_absence(
+                &directory,
+                &digest(&bytes),
+                &profile,
+                &runtime_artifact.sha256,
+                &runtime,
+            )
+            .unwrap();
+            assert_eq!(possible.is_some(), stem != "3_12_14");
+        }
+    }
+
+    #[test]
+    fn scoped_absence_requires_all_runtime_source_and_domain_bindings() {
+        use serde_json::json;
+        let profile_bytes =
+            include_bytes!("../../scripts/target_metadata/cpython_3_14_5_caller.json");
+        let profile: SourceProof = serde_json::from_slice(profile_bytes).unwrap();
+        let profile_value: Value = serde_json::from_slice(profile_bytes).unwrap();
+        let runtime_bytes = include_bytes!(
+            "../../scripts/target_metadata/cpython_3_14_5_caller_runtime_linux_x86_64.json"
+        );
+        let runtime: Value = serde_json::from_slice(runtime_bytes).unwrap();
+        let compiler = runtime["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == runtime["executable"])
+            .unwrap()["sha256"]
+            .clone();
+        let generator_hash = "1".repeat(64);
+        let helper_hash = "2".repeat(64);
+        let possible: Vec<_> = profile
+            .state
+            .retained_strings
+            .iter()
+            .filter(|name| ascii_dotted_name(name))
+            .collect();
+        let artifact = json!({
+            "schema_version": 1,
+            "kind": "standard-caller-scoped-absence",
+            "target": profile_value["target"],
+            "initial_profile_sha256": digest(profile_bytes),
+            "runtime_admission_sha256": digest(runtime_bytes),
+            "oracle_sha256": profile.oracle.script_sha256,
+            "compiler_executable_sha256": compiler,
+            "generator_sha256": generator_hash,
+            "lexical_helper_sha256": helper_hash,
+            "source_inputs": {"Python/compile.c": "3".repeat(64)},
+            "domain": "ascii-dotted-identifiers-and-locals",
+            "phase": "before-target-source-decoding",
+            "scope_complete": true,
+            "possible_names": possible,
+            "coverage": {"recipes": [{"kind": "test-only-domain-closure"}], "unresolved": []},
+        });
+        let validate = |value: Value| {
+            serde_json::from_value::<ScopedAbsence>(value)
+                .unwrap()
+                .validate(
+                    &digest(profile_bytes),
+                    &profile,
+                    &digest(runtime_bytes),
+                    &runtime,
+                    &generator_hash,
+                    &helper_hash,
+                )
+        };
+        validate(artifact.clone()).unwrap();
+        for (field, replacement) in [
+            ("initial_profile_sha256", json!("0".repeat(64))),
+            ("runtime_admission_sha256", json!("0".repeat(64))),
+            ("oracle_sha256", json!("0".repeat(64))),
+            ("compiler_executable_sha256", json!("0".repeat(64))),
+            ("generator_sha256", json!("0".repeat(64))),
+            ("lexical_helper_sha256", json!("0".repeat(64))),
+            ("source_inputs", json!({})),
+            ("phase", json!("after-target-compilation")),
+            ("scope_complete", json!(false)),
+            ("domain", json!("all-strings")),
+            ("possible_names", json!(["Owner.é"])),
+            (
+                "coverage",
+                json!({"recipes": [{}], "unresolved": ["missing-root"]}),
+            ),
+        ] {
+            let mut changed = artifact.clone();
+            changed[field] = replacement;
+            assert!(validate(changed).is_err(), "{field}");
+        }
+        let mut changed = artifact;
+        changed["target"]["commit"] = json!("unqualified-source");
+        assert!(validate(changed).is_err());
     }
 
     /// Exercise provenance binding without executing an interpreter or admitting a fixture.

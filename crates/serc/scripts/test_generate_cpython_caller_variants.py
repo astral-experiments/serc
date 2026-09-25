@@ -1,4 +1,5 @@
 """Compile-only tests for version-specific positive membership guarantees."""
+from __future__ import annotations
 
 import unittest
 
