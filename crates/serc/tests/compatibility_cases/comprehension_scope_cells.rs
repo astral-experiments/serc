@@ -1,6 +1,16 @@
 use crate::common;
 use crate::common::indent;
 
+#[test]
+#[ignore = "Serc reserves the captured generator target before its sibling locals"]
+fn generator_inline_cell_slot_order_matches_cpython() {
+    let source = r"g = (locals() for x, y in [(1, 2)] if [lambda: x for x in [1]])
+print(list(next(g)))
+";
+    common::assert_executes(source, "['.0', 'y', 'x']\n");
+    common::assert_matches_cpython_marshal(source, "generator_inline_cell_slot_order.py");
+}
+
 fn comprehension(kind: &str, element: &str, target: &str) -> String {
     match kind {
         "list" => format!("[{element} for {target} in values]"),
