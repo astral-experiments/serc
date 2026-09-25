@@ -209,9 +209,27 @@ impl Compiler<'_> {
             .expect("active temporary should have an index")
     }
 
+    /// A saved descendant target does not turn an unrelated global use into a local.
+    pub(super) fn active_temporary_binds_name(&self, name: NameId) -> bool {
+        if !self.symbols.active_temporaries.contains(name) {
+            return false;
+        }
+        if self.control.generators.generator_expression
+            && matches!(&self.unit.scope, Scope::Function { globals, .. } if globals.contains(name))
+        {
+            return self
+                .control
+                .comprehensions
+                .active_comprehension_local_names
+                .iter()
+                .any(|locals| locals.contains(name));
+        }
+        true
+    }
+
     pub(super) fn load_name(&mut self, name: &str) -> Result<(), CompileError> {
         let name_id = self.required_name_id(name);
-        if self.symbols.active_temporaries.contains(name_id) {
+        if self.active_temporary_binds_name(name_id) {
             let index = self.active_temporary_index(name_id);
             return self.emit(
                 if self.symbols.cell_names.contains(name_id)
@@ -389,7 +407,7 @@ impl Compiler<'_> {
             NameMutation::Store => (STORE_GLOBAL, STORE_NAME, STORE_DEREF, STORE_FAST, -1),
             NameMutation::Delete => (DELETE_GLOBAL, DELETE_NAME, DELETE_DEREF, DELETE_FAST, 0),
         };
-        if self.symbols.active_temporaries.contains(name_id) {
+        if self.active_temporary_binds_name(name_id) {
             let index = self.active_temporary_index(name_id);
             return self.emit(
                 if self.symbols.cell_names.contains(name_id)
@@ -558,6 +576,12 @@ impl Compiler<'_> {
     }
 
     pub(super) fn can_provide_closure_id(&self, name: NameId) -> bool {
+        if self.control.generators.generator_expression
+            && matches!(&self.unit.scope, Scope::Function { globals, .. } if globals.contains(name))
+            && !self.active_temporary_binds_name(name)
+        {
+            return false;
+        }
         match &self.unit.scope {
             Scope::Module => {
                 // Module cells belong to active inlined comprehensions, not module bindings.

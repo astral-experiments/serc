@@ -50,9 +50,12 @@ use super::scope::{
     collect_generator_slot_names, collect_nested_comprehension_target_names,
     collect_self_iterated_nested_comprehension_targets, collect_target_names,
     comprehension_cell_names, comprehension_cell_names_in_private_context,
-    comprehension_name_bindings, comprehension_scope_facts, comprehension_temporary_names,
-    generator_cellvars, generator_has_private_spelling_collisions, generator_required_names,
-    global_comprehension_temporary_names, inlined_comprehension_cell_names_in_expression,
+    comprehension_name_bindings, comprehension_name_bindings_with_mangler,
+    comprehension_scope_facts, comprehension_temporary_names, generator_cellvars,
+    generator_external_names, generator_has_private_spelling_collisions,
+    generator_private_local_aliases, generator_required_names,
+    generator_required_names_with_mangler, global_comprehension_temporary_names,
+    global_comprehension_walrus_names, inlined_comprehension_cell_names_in_expression,
     legacy_class_comprehension_names, parameter_default_expressions,
 };
 use super::source::{
@@ -3739,7 +3742,7 @@ impl Compiler<'_> {
         {
             return Ok(SpecializedLowering::NotApplicable);
         }
-        if self.symbols.active_temporaries.contains(name_id) {
+        if self.active_temporary_binds_name(name_id) {
             return Ok(SpecializedLowering::NotApplicable);
         }
         let is_global = match &self.unit.scope {
@@ -4143,6 +4146,19 @@ impl Compiler<'_> {
             }
             _ => None,
         };
+        let global_walrus_names = if self.control.generators.generator_expression
+            && let Scope::Function { globals, .. } = &self.unit.scope
+        {
+            global_comprehension_walrus_names(
+                generators,
+                key,
+                value,
+                |name| globals.contains(self.required_name_id(name)),
+                self.unit.private_name.as_deref(),
+            )
+        } else {
+            FxHashSet::default()
+        };
         if let Some(global_saves) = global_saves {
             // Save explicit-global walrus slots in symbol order without changing their accesses.
             // Only iteration targets belong in active_temporary_names above.
@@ -4164,13 +4180,25 @@ impl Compiler<'_> {
         let deferred_external_targets = if nested_temporary_names.is_empty() {
             FxHashSet::default()
         } else {
-            comprehension_name_bindings(generators, key, value)
+            let bindings = if self.control.generators.generator_expression
+                && self.unit.private_name.is_some()
+            {
+                comprehension_name_bindings_with_mangler(generators, key, value, &|name| {
+                    self.mangled_name(name)
+                })
+            } else {
+                comprehension_name_bindings(generators, key, value)
+            };
+            bindings
                 .into_iter()
                 .filter(|(name, bound)| {
                     if *bound || !nested_temporary_names.contains(name.as_str()) {
                         return false;
                     }
                     let name_id = self.required_name_id(name);
+                    if global_walrus_names.contains(&self.mangled_name(name)) {
+                        return false;
+                    }
                     match &self.unit.scope {
                         Scope::Function { free_indices, .. }
                             if free_indices.contains_key(&name_id) =>
@@ -4225,7 +4253,10 @@ impl Compiler<'_> {
             let index = self.ensure_temporary(name)?;
             temporary_indices.push(index);
             self.emit(LOAD_FAST_AND_CLEAR, index, 1)?;
-            if comprehension_cell_ids.contains(self.required_name_id(name)) && self.is_cell(name) {
+            if comprehension_cell_ids.contains(self.required_name_id(name))
+                && !global_walrus_names.contains(&self.mangled_name(name))
+                && self.is_cell(name)
+            {
                 let cell_index = comprehension_free_cell_indices
                     .get(&self.required_name_id(name))
                     .copied()
@@ -4248,10 +4279,13 @@ impl Compiler<'_> {
                 0,
             )?;
         }
-        let local_names: NameSet = local_names
+        let mut local_names: NameSet = local_names
             .iter()
             .map(|name| self.required_name_id(name))
             .collect();
+        if self.control.generators.generator_expression {
+            local_names = local_names.with_aliases_from(&self.symbols.cell_names);
+        }
         let direct_temporary_ids = local_names.iter_unordered().collect::<Vec<_>>();
         let active_temporary_ids: Vec<_> = active_temporary_names
             .iter()
@@ -4715,12 +4749,29 @@ impl Compiler<'_> {
         }
         let is_async = generator_is_async(generator);
 
-        let generator_cellvars = generator_cellvars(generator);
+        let mut generator_cellvars = generator_cellvars(generator);
         let mut generator_locals = Vec::new();
         for comprehension in &generator.generators {
             collect_target_names(&comprehension.target, &mut generator_locals);
         }
         let generator_locals = generator_locals.into_iter().collect::<FxHashSet<_>>();
+        let generator_local_names = generator_locals
+            .iter()
+            .map(|name| self.mangled_name(name))
+            .collect::<FxHashSet<_>>();
+        let (external_names, external_closures, captured_targets) =
+            generator_external_names(generator, &|name| self.mangled_name(name));
+        let external_closures = external_closures
+            .iter()
+            .map(|name| self.mangled_name(name))
+            .collect::<FxHashSet<_>>();
+        generator_cellvars.retain(|name| {
+            let canonical = self.mangled_name(name);
+            !external_closures.contains(&canonical)
+                || generator_local_names.contains(&canonical)
+                || captured_targets.contains(&canonical)
+                || self.generator_has_enclosing_binding(name)
+        });
 
         // Inlined comprehensions need a fast slot for every target they save, even
         // when the enclosing generator accesses the same name through a cell.
@@ -4780,9 +4831,11 @@ impl Compiler<'_> {
         // entries for the function's separately ordered cell slots.
         locals.extend(generator_cellvars.iter().cloned());
 
-        if self.unit.private_name.is_some()
-            && generator_has_private_spelling_collisions(generator, &|name| self.mangled_name(name))
-        {
+        let private_spelling_collisions = self.unit.private_name.is_some()
+            && generator_has_private_spelling_collisions(generator, &|name| {
+                self.mangled_name(name)
+            });
+        if private_spelling_collisions {
             // Distinct source spellings can denote one mangled name. Until generator
             // slot planning supports aliases, preserve its previous allocation path.
             locals = vec![".0".to_string()];
@@ -4814,13 +4867,78 @@ impl Compiler<'_> {
         }
         let mut seen = FxHashSet::default();
         locals.retain(|name| seen.insert(name.clone()));
-        let required_names = generator_required_names(generator);
+        let local_aliases = if private_spelling_collisions {
+            generator_private_local_aliases(generator, &mut locals, &|name| self.mangled_name(name))
+        } else {
+            Vec::new()
+        };
+        let original_name = |name: &str| {
+            local_aliases
+                .iter()
+                .find_map(|(alias, original)| (name == alias).then_some(original.clone()))
+                .unwrap_or_else(|| name.to_owned())
+        };
+        generator_cellvars = generator_cellvars
+            .iter()
+            .map(|name| original_name(name))
+            .collect();
+        inlined_cellvars = inlined_cellvars
+            .iter()
+            .map(|name| original_name(name))
+            .collect();
+        if private_spelling_collisions {
+            // An inlined target saves an existing generator cell through its fast
+            // slot even when the two uses spell the private name differently.
+            let mut inlined_targets = Vec::new();
+            collect_nested_comprehension_target_names(&generator.elt, &mut inlined_targets);
+            for (index, comprehension) in generator.generators.iter().enumerate() {
+                collect_nested_comprehension_target_names(
+                    &comprehension.target,
+                    &mut inlined_targets,
+                );
+                if index > 0 {
+                    collect_nested_comprehension_target_names(
+                        &comprehension.iter,
+                        &mut inlined_targets,
+                    );
+                }
+                for condition in &comprehension.ifs {
+                    collect_nested_comprehension_target_names(condition, &mut inlined_targets);
+                }
+            }
+            inlined_cellvars.extend(
+                inlined_targets
+                    .iter()
+                    .map(|name| original_name(name))
+                    .filter(|name| generator_cellvars.contains(name)),
+            );
+        }
+        let required_names = if private_spelling_collisions {
+            generator_required_names_with_mangler(generator, &|name| self.mangled_name(name))
+        } else {
+            generator_required_names(generator)
+        };
         let mut globals = FxHashSet::default();
         let mut freevars = BTreeSet::new();
         for name in required_names {
             if self.can_provide_closure(&name) {
                 freevars.insert(name);
             } else {
+                globals.insert(name);
+            }
+        }
+        // A child's target may be saved by an enclosing comprehension even when a
+        // different child or lambda uses the same spelling as a global. Keep that
+        // global classification separate from the temporary save order.
+        let temporary_names = locals
+            .iter()
+            .map(|name| self.mangled_name(name))
+            .filter(|name| !generator_local_names.contains(name))
+            .collect::<FxHashSet<_>>();
+        for name in external_names.into_iter().collect::<BTreeSet<_>>() {
+            if temporary_names.contains(&self.mangled_name(&name))
+                && !self.generator_has_enclosing_binding(&name)
+            {
                 globals.insert(name);
             }
         }
@@ -4832,6 +4950,15 @@ impl Compiler<'_> {
         let generator_range = self.generator_expression_range(generator);
         let plan = LoweringFunctionPlan {
             locals,
+            local_aliases: local_aliases
+                .iter()
+                .map(|(alias, original)| {
+                    (
+                        self.required_name_id(alias),
+                        self.required_name_id(original),
+                    )
+                })
+                .collect(),
             globals,
             cellvars: generator_cellvars,
             inlined_comprehension_cellvars: self.name_id_set(inlined_cellvars),
