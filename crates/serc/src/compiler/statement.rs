@@ -18732,9 +18732,36 @@ impl<'source> Compiler<'source> {
                     handler.name.is_none() && handler_ends_in_runtime_while_break(&handler.body)
                 })
             });
+        // Multiple false edges and the pass-only protected body meet at the
+        // original POP_BLOCK. Its removal leaves an empty borrow entry even
+        // though the nested recovery's cold handler still has work.
+        let guarded_pass_recovery_exit = !statement.is_star
+            && statement.orelse.is_empty()
+            && statement.finalbody.is_empty()
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && matches!(statement.body.as_slice(), [Stmt::If(guard)]
+            if guard.elif_else_clauses.is_empty()
+                && condition_jump_target_count(&guard.test, false) > 1
+                && matches!(guard.body.as_slice(), [Stmt::Try(recovery)]
+                    if !recovery.is_star
+                        && recovery.orelse.is_empty()
+                        && recovery.finalbody.is_empty()
+                        && matches!(recovery.body.as_slice(), [Stmt::Pass(_)])
+                        && !recovery.handlers.is_empty()
+                        && recovery.handlers.iter().all(|handler| {
+                            handler.as_except_handler().is_some_and(|handler| {
+                                handler.type_.is_some()
+                                    && (matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+                                        || suite_has_linear_borrow_fallthrough(&handler.body))
+                            })
+                        })));
         let normal_exit_starts_in_empty_block = borrow_exit_has_successor
             && (suite_ends_in_empty_try_exit_block(normal_exit_suite, loop_tail.is_some())
                 || handler_contains_terminal_nested_try
+                || guarded_pass_recovery_exit
                 || (handler_contains_nested_handler_cold_join
                     && (borrow_exit_has_source_successor
                         || statement.handlers.iter().any(|handler| {
