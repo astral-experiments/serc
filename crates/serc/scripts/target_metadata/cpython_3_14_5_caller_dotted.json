@@ -8,11 +8,11 @@
     "commit": "5607950ef232dad16d75c0cf53101d9649d89115",
     "magic_hex": "2b0e0d0a"
   },
-  "initial_profile_sha256": "5a7e6ca0176ab8e07bae6bde1d54226439462b6e82493e110f4863ce2bbf45e0",
-  "runtime_admission_sha256": "a5f5312cc24c3329ef130339538c5ae2ad63fd878bf4743940a692637b6d1e68",
+  "initial_profile_sha256": "8c20397f2f49ca525354027544385195d716c4675dc04361d3d52b04d03e3fd9",
+  "runtime_admission_sha256": "62a85764ccd2264a6777f950f57d4fd62ae6fbeccee304b1a3639cd36499dd37",
   "oracle_sha256": "6812e016e7e871700001ad9f8f832c5998d553bc33c84afb1745dbd664a965fb",
   "compiler_executable_sha256": "c27397da5541f67655be462e128ca3d3eb6e0a8eb0d39036896c9042529f4304",
-  "generator_sha256": "8e5ab2c617b59b22ffb3aa5fc386732149132c08b33dd35c8b34911dfc164bad",
+  "generator_sha256": "dc36dacca1206ad79c4fd2cc370ff7b2af99da3730376ee9eb16df50ea82648e",
   "lexical_helper_sha256": "b523f42a12cfe5578c10b32a3d0b640a3e68ae07e1de15cd1fb36f85ba7469c5",
   "source_inputs": {
     "Include/Python.h": "e39aad93d70c3ea1a63b77ec5795ff59a5c177745aedace6f83bbf4275a20d9f",
@@ -669,7 +669,7 @@
     "Python/uniqueid.c": "9e8f7b6fc62aa7e3d27dc96f36c1c3d6773e7c127a298adf1c4404b0e9df4f87",
     "Tools/build/freeze_modules.py": "7802f3f7d2e5d46225b9acf8a9b7ec6ab63f25df4b9d0c61a1e1fa5c89879c07",
     "runtime:include/python3.14/pyconfig.h": "630328163fe5a6c6ffdc5279ccb38f1b27f0de9598f424f4a591c9832ab070fe",
-    "runtime:lib/python3.14/_sysconfigdata__linux_x86_64-linux-gnu.py": "4b2eec266bbacd0d3126375d23b11dfdfbf4fdb6737c67a50d8f12ac5cb4f31c",
+    "runtime:lib/python3.14/_sysconfigdata__linux_x86_64-linux-gnu.py": "221996cad6077a3cb848c9f3dca97ba7d01e983b368b79ec2073fb37161f2f1b",
     "runtime:lib/python3.14/config-3.14-x86_64-linux-gnu/Makefile": "1e9d1d17de3e475c30f179e3dc8d1dbcae31d4062c820400cd0068c64f5c85a8",
     "runtime:lib/python3.14/config-3.14-x86_64-linux-gnu/config.c": "1116a18df3e92369f1563d1c3a9ae226c2bec23a5cc9af1274f5fbeb49436800"
   },
@@ -11403,22 +11403,30 @@
           {
             "path": "include/python3.14/pyconfig.h",
             "sha256": "630328163fe5a6c6ffdc5279ccb38f1b27f0de9598f424f4a591c9832ab070fe",
-            "bound_by_runtime_manifest": false
+            "bound_by_runtime_manifest": false,
+            "prefix_relocation": null
           },
           {
             "path": "lib/python3.14/config-3.14-x86_64-linux-gnu/config.c",
             "sha256": "1116a18df3e92369f1563d1c3a9ae226c2bec23a5cc9af1274f5fbeb49436800",
-            "bound_by_runtime_manifest": true
+            "bound_by_runtime_manifest": true,
+            "prefix_relocation": null
           },
           {
             "path": "lib/python3.14/config-3.14-x86_64-linux-gnu/Makefile",
             "sha256": "1e9d1d17de3e475c30f179e3dc8d1dbcae31d4062c820400cd0068c64f5c85a8",
-            "bound_by_runtime_manifest": true
+            "bound_by_runtime_manifest": true,
+            "prefix_relocation": null
           },
           {
             "path": "lib/python3.14/_sysconfigdata__linux_x86_64-linux-gnu.py",
-            "sha256": "4b2eec266bbacd0d3126375d23b11dfdfbf4fdb6737c67a50d8f12ac5cb4f31c",
-            "bound_by_runtime_manifest": true
+            "sha256": "221996cad6077a3cb848c9f3dca97ba7d01e983b368b79ec2073fb37161f2f1b",
+            "bound_by_runtime_manifest": true,
+            "prefix_relocation": {
+              "kind": "uv-sysconfig-prefix-v1",
+              "occurrences": 29,
+              "uv_source_commit": "635500036e1705961315e86447f0fab0a8ddb309"
+            }
           }
         ],
         "missing": []
@@ -11426,12 +11434,13 @@
       {
         "kind": "generator-dependencies",
         "sha256": {
-          "generate_cpython_caller.py": "1734e621ac257a6a28732ba73190c4e0d45c551e6879eda57d48b0c02ff86c8f",
+          "generate_cpython_caller.py": "1388289d4eb2040a87fbbee73c33f4a297966584937f5656e2d8d51789c2db4a",
           "generate_cpython_bootstrap.py": "f7d5739e538c3833d95d4a4a5b3e65a3122ba3af49d1c37477ca59ca7ac2517e",
           "caller_source_owners.py": "d2c227c77b06cb8bdf458e8dc59fcc912db9291b4cddf63fb0b3e8eed6c53c56",
-          "generate_cpython_caller_variants.py": "3f11425ced647a5a7516d600e630b2bfcd63cd027637315c249df102a9cd0c9f",
+          "generate_cpython_caller_variants.py": "86ae6ccaf4d082a7b009440cb4c86d7c1781b79bf3f6f89550d789f09613e5e7",
           "generate_cpython_target.py": "9a49a8b2f1cf9a3338913c1498bc745aad6570217eeec7a1a259fbc03f1dd68e",
-          "caller_dotted_proof.md": "b2d7b5c70b5015b76d69d22c6c3e48e55db8a34a5c972ee05a7555fec2b43057"
+          "prepare_cpython_caller.py": "013666935cdbc1952d7260af798a41e18e81be75f1bf1065b17f3c1557846d5d",
+          "caller_dotted_proof.md": "04a62be200580e772a736bf65a1eb3f06b2ca7ea17f5b1e45731f0aadfe6126d"
         }
       },
       {

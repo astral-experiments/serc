@@ -17,22 +17,22 @@ use super::initial_intern_profile::LoadedProfile;
 // A proof document cannot authorize itself by setting `closure_complete`.
 const REVIEWED_PROOFS: &[ReviewedProof] = &[
     ReviewedProof {
-        sha256: "5a7e6ca0176ab8e07bae6bde1d54226439462b6e82493e110f4863ce2bbf45e0",
+        sha256: "8c20397f2f49ca525354027544385195d716c4675dc04361d3d52b04d03e3fd9",
         semantics: StateSemantics::GuaranteedRetainedPartial,
         startup_provenance: StartupProvenance::CapturedNativeOwners,
     },
     ReviewedProof {
-        sha256: "7d8c772f0b50ca61110d74ad22214e4eca9c5d751ee28047007975dacd8af50e",
+        sha256: "b3a6cb00447301fe7f20e9e656b8b391c561102835b4734a12ba19107b755720",
         semantics: StateSemantics::GuaranteedRetainedPartial,
         startup_provenance: StartupProvenance::SourceDerived,
     },
     ReviewedProof {
-        sha256: "41b6c006a0fcdf27ef6c09728a0ffdc55e20514d7bba4aed8df27b677f78376e",
+        sha256: "47c5b083c5439134a462e9451685365d5b91d35826ae733737e9de65c058ed1e",
         semantics: StateSemantics::GuaranteedRetainedPartial,
         startup_provenance: StartupProvenance::SourceDerived,
     },
     ReviewedProof {
-        sha256: "3580dff92980e02edea1334fd6fa7815bc2c7924ec79466a4389815a5e149a0a",
+        sha256: "7e96c1f8dea2cdb06805eea76eff8ffd53099c9a208b94cb6d988e8ec6d225d5",
         semantics: StateSemantics::GuaranteedRetainedPartial,
         startup_provenance: StartupProvenance::SourceDerived,
     },
@@ -42,19 +42,19 @@ const REVIEWED_PROOFS: &[ReviewedProof] = &[
 // partial, and their hashes do not authorize a companion supplied by a caller.
 const REVIEWED_SCOPED_ABSENCE: &[ReviewedScopedAbsence] = &[
     ReviewedScopedAbsence {
-        initial_profile_sha256: "41b6c006a0fcdf27ef6c09728a0ffdc55e20514d7bba4aed8df27b677f78376e",
+        initial_profile_sha256: "47c5b083c5439134a462e9451685365d5b91d35826ae733737e9de65c058ed1e",
         path: "cpython_3_13_15_caller_dotted.json",
-        sha256: "009d9506e87ebd44b4c421f38125290777766467f8e2ae89405b70316f7d004c",
+        sha256: "9f9834e1f17682ca43c3b241c4d8a682d7b4ce464c4f9c002d44d59669603663",
     },
     ReviewedScopedAbsence {
-        initial_profile_sha256: "5a7e6ca0176ab8e07bae6bde1d54226439462b6e82493e110f4863ce2bbf45e0",
+        initial_profile_sha256: "8c20397f2f49ca525354027544385195d716c4675dc04361d3d52b04d03e3fd9",
         path: "cpython_3_14_5_caller_dotted.json",
-        sha256: "680d91a73f17138904c5a2117988a53d30ca8dab90e76b42519d904257c9d015",
+        sha256: "f4901d30c138cefdd2cda7f078410503ad17d4f045775db49a04758911c5ce29",
     },
     ReviewedScopedAbsence {
-        initial_profile_sha256: "3580dff92980e02edea1334fd6fa7815bc2c7924ec79466a4389815a5e149a0a",
+        initial_profile_sha256: "7e96c1f8dea2cdb06805eea76eff8ffd53099c9a208b94cb6d988e8ec6d225d5",
         path: "cpython_3_15_0rc2_caller_dotted.json",
-        sha256: "c40c8a59dbbae777283de24aab1cb4fd6582b07b42fab51a66a2c67675ed84f3",
+        sha256: "7fc530a09a859ed29d5e0f13168c000788f671ba9c4893c24a90eec82ac67777",
     },
 ];
 

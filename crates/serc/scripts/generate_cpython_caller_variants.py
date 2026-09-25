@@ -25,6 +25,9 @@ from types import CodeType
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import generate_cpython_target as target
 
+sys.path.insert(0, str(target.CRATE_ROOT.parents[1] / "scripts"))
+import prepare_cpython_caller as runtime_preparer
+
 ORACLE_SHA256 = "6812e016e7e871700001ad9f8f832c5998d553bc33c84afb1745dbd664a965fb"
 WORD = re.compile(r"[A-Za-z0-9_]*\Z")
 BASE_FROZEN = (
@@ -99,7 +102,12 @@ def digest(data: bytes) -> str:
 
 def verify_generation_runtime(admission: dict) -> str:
     """Bind this compiler process to a qualified immutable runtime, once."""
-    prefix = Path(sys.prefix).resolve()
+    if (
+        digest(Path(runtime_preparer.__file__).read_bytes())
+        != admission["preparer_sha256"]
+    ):
+        raise ValueError("runtime admission does not bind the shared verifier")
+    prefix = Path(sys.prefix)
     executable = prefix / admission["executable"]
     if (
         not sys.flags.isolated
@@ -125,25 +133,11 @@ def verify_generation_runtime(admission: dict) -> str:
     admitted_library_paths = set()
     executable_hash = None
     for entry in admission["files"]:
-        path = prefix / entry["path"]
-        if (
-            not path.is_file()
-            or not path.resolve().is_relative_to(prefix)
-            or path.stat().st_size != entry["size"]
-            or stat.S_IMODE(path.stat().st_mode) & 0o222
-        ):
+        path = runtime_preparer.validate_file(prefix, entry)
+        if stat.S_IMODE(path.stat().st_mode) & 0o222:
             raise ValueError("generation runtime file identity changed")
-        if entry["symlink_target"] is None:
-            if path.is_symlink():
-                raise ValueError("unexpected runtime symlink")
-        elif not path.is_symlink() or os.readlink(path) != entry["symlink_target"]:
-            raise ValueError("generation runtime symlink changed")
-        with path.open("rb") as stream:
-            fingerprint = hashlib.file_digest(stream, "sha256").hexdigest()
-        if fingerprint != entry["sha256"]:
-            raise ValueError("generation runtime file content changed")
         if entry["path"] == admission["executable"]:
-            executable_hash = fingerprint
+            executable_hash = entry["sha256"]
         if path.name.startswith("libpython") and ".so" in path.name:
             admitted_library_paths.add(path.resolve())
     # Dynamic CI launchers contain little compiler code themselves. Verify the
