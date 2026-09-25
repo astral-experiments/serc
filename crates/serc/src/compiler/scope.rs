@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hasher;
+use std::marker::PhantomData;
 use std::rc::Rc;
 
 use hashbrown::HashTable;
@@ -22,6 +23,25 @@ use super::{Compiler, SHADOWED_SUPER_SENTINEL, Scope};
 impl Compiler<'_> {
     pub(super) fn scope_arena(&self) -> &ScopeArena {
         &self.context.scopes
+    }
+
+    /// Whether a generator's enclosing lexical scopes bind a name before the module.
+    pub(super) fn generator_has_enclosing_binding(&self, name: &str) -> bool {
+        if self.can_provide_closure(name) {
+            return true;
+        }
+        let arena = self.scope_arena();
+        let name_id = arena
+            .names
+            .get(&self.mangled_name(name))
+            .unwrap_or_else(|| self.required_name_id(name));
+        // Lambda scopes are synthesized during lowering and do not have their own arena node.
+        if self.unit.qualified_name.ends_with("<lambda>")
+            && matches!(&self.unit.scope, Scope::Function { indices, .. } if indices.contains_key(&name_id))
+        {
+            return true;
+        }
+        arena.function_or_enclosing_binds(self.unit.scope_id, name_id)
     }
 
     /// Synthetic class-visible annotation scopes retain their enclosing class's scope ID.
@@ -2182,6 +2202,30 @@ impl ScopeArena {
             parent = node.parent;
         }
         false
+    }
+
+    fn function_or_enclosing_binds(&self, id: ScopeId, name: NameId) -> bool {
+        match &self.nodes[id].plan {
+            ScopePlan::Module => return false,
+            ScopePlan::Function(plan) => {
+                if plan.globals.contains(&name) {
+                    return false;
+                }
+                if plan.lexical_bindings.contains(&name)
+                    || plan.type_parameter_names.contains(&name)
+                {
+                    return true;
+                }
+            }
+            ScopePlan::Class(plan) => {
+                if self.names.resolve(name) == "__class__"
+                    || plan.type_parameter_names.contains(&name)
+                {
+                    return true;
+                }
+            }
+        }
+        self.enclosing_function_binds(id, name)
     }
 
     pub(super) fn function(&self, id: ScopeId) -> Option<&FunctionPlan> {
@@ -4477,7 +4521,7 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
                 let Expr::Generator(generator) = expression else {
                     unreachable!()
                 };
-                generator_required_names(generator)
+                generator_parent_requirements(generator)
             });
             self.facts.nested_generator_requirements.extend(
                 required
@@ -4497,7 +4541,7 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
                 let Expr::Generator(generator) = expression else {
                     unreachable!()
                 };
-                generator_required_names(generator)
+                generator_parent_requirements(generator)
             });
             if self.inlined_comprehension_depth == 0 {
                 self.facts
@@ -4737,6 +4781,35 @@ pub(super) struct LambdaScopeAnalysis {
     pub(super) required: BTreeSet<String>,
 }
 
+/// Reuse raw lexical requirements within one borrowed expression tree.
+///
+/// Keys identify nodes in that tree; a fresh cache is used for normalized clones
+/// and for each independent analysis, so neither pointer reuse nor private-name
+/// contexts can mix results.
+#[derive(Default)]
+struct ExpressionScopeCache<'ast> {
+    lambda_requirements: FxHashMap<*const ruff_python_ast::ExprLambda, BTreeSet<String>>,
+    generator_requirements: FxHashMap<*const ruff_python_ast::ExprGenerator, BTreeSet<String>>,
+    generator_parent_requirements:
+        FxHashMap<*const ruff_python_ast::ExprGenerator, BTreeSet<String>>,
+    nodes: PhantomData<&'ast Expr>,
+}
+
+fn lambda_required_names_with_cache<'ast>(
+    lambda: &'ast ruff_python_ast::ExprLambda,
+    cache: &mut ExpressionScopeCache<'ast>,
+) -> BTreeSet<String> {
+    let key = std::ptr::from_ref(lambda);
+    if let Some(required) = cache.lambda_requirements.get(&key) {
+        return required.clone();
+    }
+    let empty_parameters = ruff_python_ast::Parameters::default();
+    let parameters = lambda.parameters.as_deref().unwrap_or(&empty_parameters);
+    let required = expression_scope_facts(parameters, &lambda.body, cache).required;
+    cache.lambda_requirements.insert(key, required.clone());
+    required
+}
+
 pub(super) fn analyze_lambda_scope(lambda: &ruff_python_ast::ExprLambda) -> LambdaScopeAnalysis {
     let empty_parameters = ruff_python_ast::Parameters::default();
     let parameters = lambda.parameters.as_deref().unwrap_or(&empty_parameters);
@@ -4936,46 +5009,20 @@ fn analyze_expression_scope(
     parameters: &ruff_python_ast::Parameters,
     body: &Expr,
 ) -> LambdaScopeAnalysis {
-    let mut locals = LocalCollector::default();
-    for parameter in parameters_in_locals_order(parameters) {
-        locals.insert(parameter.name.as_str());
-    }
-    let parameter_names = locals.names.iter().cloned().collect::<FxHashSet<_>>();
-    locals.collect_expression(body);
+    analyze_expression_scope_with_cache(parameters, body, &mut ExpressionScopeCache::default())
+}
 
-    let mut references = ReferenceCollector {
-        skip_generator_bodies: true,
-        ..ReferenceCollector::default()
-    };
-    references.visit_expr(body);
-    let nested_requirements = nested_expression_required_names(body);
-    let local_names = locals.names.iter().cloned().collect::<FxHashSet<_>>();
-    let mut outside_references = ReferenceCollector {
-        skip_generator_bodies: true,
-        skip_inlined_comprehension_bodies: true,
-        ..ReferenceCollector::default()
-    };
-    // A comprehension's first iterable can read an outer binding with its target's spelling.
-    // Lambda defaults are evaluated here too; nested lambda bodies retain their own captures.
-    if !locals.comprehension_targets.is_empty() {
-        outside_references.visit_expr(body);
-    }
-    let cellvars: FxHashSet<_> = nested_requirements
-        .iter()
-        .filter(|name| local_names.contains(name.as_str()))
-        .cloned()
-        .collect();
-    let required = references
-        .references
-        .iter()
-        .chain(&nested_requirements)
-        .filter(|name| {
-            !local_names.contains(name.as_str())
-                || (outside_references.references.contains(name.as_str())
-                    && !locals.non_comprehension_bindings.contains(name.as_str()))
-        })
-        .cloned()
-        .collect();
+fn analyze_expression_scope_with_cache<'ast>(
+    parameters: &ruff_python_ast::Parameters,
+    body: &'ast Expr,
+    cache: &mut ExpressionScopeCache<'ast>,
+) -> LambdaScopeAnalysis {
+    let ExpressionScopeFacts {
+        mut locals,
+        parameter_names,
+        cellvars,
+        required,
+    } = expression_scope_facts(parameters, body, cache);
     let mut inlined_comprehension_cellvars = inlined_comprehension_cell_names_in_expression(body);
     let comprehension_fast_cellvars = locals
         .comprehension_iteration_targets
@@ -5006,6 +5053,67 @@ fn analyze_expression_scope(
         locals: locals.names.into_iter().map(String::from).collect(),
         cellvars,
         inlined_comprehension_cellvars,
+        required,
+    }
+}
+
+struct ExpressionScopeFacts {
+    locals: LocalCollector,
+    parameter_names: FxHashSet<Name>,
+    cellvars: FxHashSet<String>,
+    required: BTreeSet<String>,
+}
+
+/// Collect requirements without planning inlined-comprehension cell slots.
+fn expression_scope_facts<'ast>(
+    parameters: &ruff_python_ast::Parameters,
+    body: &'ast Expr,
+    cache: &mut ExpressionScopeCache<'ast>,
+) -> ExpressionScopeFacts {
+    let mut locals = LocalCollector::default();
+    for parameter in parameters_in_locals_order(parameters) {
+        locals.insert(parameter.name.as_str());
+    }
+    let parameter_names = locals.names.iter().cloned().collect::<FxHashSet<_>>();
+    locals.collect_expression(body);
+
+    let mut references = ReferenceCollector {
+        skip_generator_bodies: true,
+        ..ReferenceCollector::default()
+    };
+    references.visit_expr(body);
+    let nested_requirements = nested_expression_required_names_with_cache(body, cache);
+    let local_names = locals.names.iter().cloned().collect::<FxHashSet<_>>();
+    let mut outside_references = ReferenceCollector {
+        skip_generator_bodies: true,
+        skip_inlined_comprehension_bodies: true,
+        ..ReferenceCollector::default()
+    };
+    // A comprehension's first iterable can read an outer binding with its target's spelling.
+    // Lambda defaults are evaluated here too; nested lambda bodies retain their own captures.
+    if !locals.comprehension_targets.is_empty() {
+        outside_references.visit_expr(body);
+    }
+    let cellvars: FxHashSet<_> = nested_requirements
+        .iter()
+        .filter(|name| local_names.contains(name.as_str()))
+        .cloned()
+        .collect();
+    let required = references
+        .references
+        .iter()
+        .chain(&nested_requirements)
+        .filter(|name| {
+            !local_names.contains(name.as_str())
+                || (outside_references.references.contains(name.as_str())
+                    && !locals.non_comprehension_bindings.contains(name.as_str()))
+        })
+        .cloned()
+        .collect();
+    ExpressionScopeFacts {
+        locals,
+        parameter_names,
+        cellvars,
         required,
     }
 }
@@ -5157,12 +5265,19 @@ pub(super) fn annotation_nested_required_names(expression: &Expr) -> BTreeSet<St
 }
 
 pub(super) fn nested_expression_required_names(expression: &Expr) -> BTreeSet<String> {
-    #[derive(Default)]
-    struct Collector {
+    nested_expression_required_names_with_cache(expression, &mut ExpressionScopeCache::default())
+}
+
+fn nested_expression_required_names_with_cache<'ast>(
+    expression: &'ast Expr,
+    cache: &mut ExpressionScopeCache<'ast>,
+) -> BTreeSet<String> {
+    struct Collector<'cache, 'ast> {
         required: BTreeSet<String>,
+        cache: &'cache mut ExpressionScopeCache<'ast>,
     }
 
-    impl<'ast> Visitor<'ast> for Collector {
+    impl<'ast> Visitor<'ast> for Collector<'_, 'ast> {
         fn visit_expr(&mut self, expression: &'ast Expr) {
             if let Expr::Generator(generator) = expression {
                 // The first iterable executes in the enclosing scope and can create its
@@ -5170,19 +5285,26 @@ pub(super) fn nested_expression_required_names(expression: &Expr) -> BTreeSet<St
                 if let Some(first) = generator.generators.first() {
                     self.visit_expr(&first.iter);
                 }
-                self.required.extend(generator_required_names(generator));
+                self.required
+                    .extend(generator_parent_requirements_with_cache(
+                        generator, self.cache,
+                    ));
                 return;
             }
             if let Expr::Lambda(lambda) = expression {
                 visit_lambda_defaults(self, lambda);
-                self.required.extend(analyze_lambda_scope(lambda).required);
+                self.required
+                    .extend(lambda_required_names_with_cache(lambda, self.cache));
                 return;
             }
             walk_expr(self, expression);
         }
     }
 
-    let mut collector = Collector::default();
+    let mut collector = Collector {
+        required: BTreeSet::new(),
+        cache,
+    };
     collector.visit_expr(expression);
     collector.required
 }
@@ -5322,6 +5444,34 @@ pub(super) fn global_comprehension_temporary_names(
     is_global: impl Fn(&str) -> bool,
     private_name: Option<&str>,
 ) -> Option<Vec<String>> {
+    let walrus_targets =
+        global_comprehension_walrus_names(generators, key, value, is_global, private_name);
+    if walrus_targets.is_empty() {
+        return None;
+    }
+    Some(
+        comprehension_symbol_names(
+            generators,
+            key,
+            value,
+            false,
+            Some(&walrus_targets),
+            private_name,
+        )
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect(),
+    )
+}
+
+/// Identify global assignment-expression names whose symbols are saved by this comprehension.
+pub(super) fn global_comprehension_walrus_names(
+    generators: &[ruff_python_ast::Comprehension],
+    key: Option<&Expr>,
+    value: &Expr,
+    is_global: impl Fn(&str) -> bool,
+    private_name: Option<&str>,
+) -> FxHashSet<String> {
     let mut walrus_targets = Vec::new();
     if let Some(key) = key {
         collect_named_expression_target_names(key, &mut walrus_targets);
@@ -5333,12 +5483,12 @@ pub(super) fn global_comprehension_temporary_names(
         }
     }
     if walrus_targets.is_empty() {
-        return None;
+        return FxHashSet::default();
     }
     let facts = comprehension_scope_facts(generators, key, value);
     // A child copies its flags only for an absent outer symbol. Preserve an
     // existing outer read unless this comprehension itself also binds the name.
-    let walrus_targets = walrus_targets
+    walrus_targets
         .into_iter()
         .filter(|name| is_global(name))
         .filter(|name| {
@@ -5359,23 +5509,7 @@ pub(super) fn global_comprehension_temporary_names(
             Some(private_name) => mangle_name(&name, Some(private_name)).into_owned(),
             None => name,
         })
-        .collect::<FxHashSet<_>>();
-    if walrus_targets.is_empty() {
-        return None;
-    }
-    Some(
-        comprehension_symbol_names(
-            generators,
-            key,
-            value,
-            false,
-            Some(&walrus_targets),
-            private_name,
-        )
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect(),
-    )
+        .collect()
 }
 
 /// Return legacy class save candidates; `true` entries require an enclosing free binding.
@@ -5596,20 +5730,45 @@ pub(super) fn comprehension_name_bindings(
     key: Option<&Expr>,
     value: &Expr,
 ) -> BTreeMap<String, bool> {
-    #[derive(Default)]
-    struct Collector {
+    comprehension_name_bindings_with_parent_requirements(
+        generators,
+        key,
+        value,
+        false,
+        &mut ExpressionScopeCache::default(),
+    )
+}
+
+fn comprehension_name_bindings_with_parent_requirements<'ast>(
+    generators: &'ast [ruff_python_ast::Comprehension],
+    key: Option<&'ast Expr>,
+    value: &'ast Expr,
+    include_generator_parent_requirements: bool,
+    cache: &mut ExpressionScopeCache<'ast>,
+) -> BTreeMap<String, bool> {
+    struct Collector<'cache, 'ast> {
         symbols: BTreeMap<String, bool>,
         children: Vec<BTreeMap<String, bool>>,
         closure_references: BTreeSet<String>,
+        include_generator_parent_requirements: bool,
+        cache: &'cache mut ExpressionScopeCache<'ast>,
     }
 
-    impl Collector {
+    impl<'ast> Collector<'_, 'ast> {
         fn comprehension(
-            generators: &[ruff_python_ast::Comprehension],
-            key: Option<&Expr>,
-            value: &Expr,
+            generators: &'ast [ruff_python_ast::Comprehension],
+            key: Option<&'ast Expr>,
+            value: &'ast Expr,
+            include_generator_parent_requirements: bool,
+            cache: &mut ExpressionScopeCache<'ast>,
         ) -> BTreeMap<String, bool> {
-            let mut collector = Self::default();
+            let mut collector = Collector {
+                include_generator_parent_requirements,
+                symbols: BTreeMap::new(),
+                children: Vec::new(),
+                closure_references: BTreeSet::new(),
+                cache,
+            };
             for generator in generators {
                 let mut targets = Vec::new();
                 collect_target_names(&generator.target, &mut targets);
@@ -5642,7 +5801,7 @@ pub(super) fn comprehension_name_bindings(
         }
     }
 
-    impl<'ast> Visitor<'ast> for Collector {
+    impl<'ast> Visitor<'ast> for Collector<'_, 'ast> {
         fn visit_expr(&mut self, expression: &'ast Expr) {
             let (generators, key, value) = match expression {
                 Expr::ListComp(comprehension) => (
@@ -5664,14 +5823,18 @@ pub(super) fn comprehension_name_bindings(
                     if let Some(first) = generator.generators.first() {
                         self.visit_expr(&first.iter);
                     }
-                    self.closure_references
-                        .extend(generator_required_names(generator));
+                    let required = if self.include_generator_parent_requirements {
+                        generator_parent_requirements_with_cache(generator, self.cache)
+                    } else {
+                        generator_required_names_with_cache(generator, self.cache)
+                    };
+                    self.closure_references.extend(required);
                     return;
                 }
                 Expr::Lambda(lambda) => {
                     visit_lambda_defaults(self, lambda);
                     self.closure_references
-                        .extend(analyze_lambda_scope(lambda).required);
+                        .extend(lambda_required_names_with_cache(lambda, self.cache));
                     return;
                 }
                 Expr::Dict(dictionary) => {
@@ -5707,12 +5870,24 @@ pub(super) fn comprehension_name_bindings(
             if let Some(first) = generators.first() {
                 self.visit_expr(&first.iter);
             }
-            self.children
-                .push(Self::comprehension(generators, key, value));
+            let child = Self::comprehension(
+                generators,
+                key,
+                value,
+                self.include_generator_parent_requirements,
+                self.cache,
+            );
+            self.children.push(child);
         }
     }
 
-    Collector::comprehension(generators, key, value)
+    Collector::comprehension(
+        generators,
+        key,
+        value,
+        include_generator_parent_requirements,
+        cache,
+    )
 }
 
 /// Compare alias identities before child admission, retaining raw escaping names.
@@ -5760,6 +5935,56 @@ fn comprehension_bindings_in_private_context(
     let bindings = collect(&normalized);
     // Reuse the existing own/first-child precedence, including its exclusion of
     // the first iterable. Only symbol identity changes before that traversal.
+    raw.into_keys()
+        .filter_map(|name| bindings.get(&normalize(&name)).map(|bound| (name, *bound)))
+        .collect()
+}
+
+/// Preserve comprehension binding precedence when private spellings share a name.
+pub(super) fn comprehension_name_bindings_with_mangler(
+    generators: &[ruff_python_ast::Comprehension],
+    key: Option<&Expr>,
+    value: &Expr,
+    mangle: &impl Fn(&str) -> String,
+) -> BTreeMap<String, bool> {
+    let raw = comprehension_name_bindings(generators, key, value);
+    let mut spellings = VariableSpellings::default();
+    for generator in generators {
+        spellings.visit_expr(&generator.target);
+        spellings.visit_expr(&generator.iter);
+        for condition in &generator.ifs {
+            spellings.visit_expr(condition);
+        }
+    }
+    if let Some(key) = key {
+        spellings.visit_expr(key);
+    }
+    spellings.visit_expr(value);
+    let aliases = colliding_private_spellings(&spellings.names, mangle);
+    if aliases.is_empty() {
+        return raw;
+    }
+    let normalize = |name: &str| {
+        aliases
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_owned())
+    };
+    let transformer = PrivateVariableNormalizer { mangle: &normalize };
+    let mut generators = generators.to_vec();
+    let mut key = key.cloned();
+    let mut value = value.clone();
+    for generator in &mut generators {
+        ruff_python_ast::visitor::transformer::Transformer::visit_comprehension(
+            &transformer,
+            generator,
+        );
+    }
+    if let Some(key) = &mut key {
+        ruff_python_ast::visitor::transformer::Transformer::visit_expr(&transformer, key);
+    }
+    ruff_python_ast::visitor::transformer::Transformer::visit_expr(&transformer, &mut value);
+    let bindings = comprehension_name_bindings(&generators, key.as_ref(), &value);
     raw.into_keys()
         .filter_map(|name| bindings.get(&normalize(&name)).map(|bound| (name, *bound)))
         .collect()
@@ -6102,24 +6327,340 @@ pub(super) fn generator_named_targets(
     collector.names
 }
 
+/// Names used outside the inlined comprehension targets that shadow them.
+pub(super) fn generator_external_names(
+    generator: &ruff_python_ast::ExprGenerator,
+    mangle: &impl Fn(&str) -> String,
+) -> (FxHashSet<String>, FxHashSet<String>, FxHashSet<String>) {
+    generator_external_names_with_cache(generator, mangle, &mut ExpressionScopeCache::default())
+}
+
+fn generator_external_names_with_cache<'ast>(
+    generator: &'ast ruff_python_ast::ExprGenerator,
+    mangle: &impl Fn(&str) -> String,
+    cache: &mut ExpressionScopeCache<'ast>,
+) -> (FxHashSet<String>, FxHashSet<String>, FxHashSet<String>) {
+    struct Collector<'a, 'cache, 'ast, M> {
+        names: FxHashSet<String>,
+        closure_names: FxHashSet<String>,
+        captured_targets: FxHashSet<String>,
+        targets: Vec<FxHashSet<String>>,
+        mangle: &'a M,
+        cache: &'cache mut ExpressionScopeCache<'ast>,
+    }
+
+    impl<M: Fn(&str) -> String> Collector<'_, '_, '_, M> {
+        fn insert(&mut self, name: &str) {
+            let canonical = (self.mangle)(name);
+            if !self
+                .targets
+                .iter()
+                .any(|targets| targets.contains(&canonical))
+            {
+                self.names.insert(name.to_owned());
+            }
+        }
+
+        fn insert_closure(&mut self, name: &str) {
+            let canonical = (self.mangle)(name);
+            if self
+                .targets
+                .iter()
+                .any(|targets| targets.contains(&canonical))
+            {
+                self.captured_targets.insert(canonical);
+            } else {
+                self.names.insert(name.to_owned());
+                self.closure_names.insert(name.to_owned());
+            }
+        }
+    }
+
+    impl<'ast, M: Fn(&str) -> String> Visitor<'ast> for Collector<'_, '_, 'ast, M> {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            let (generators, key, value) = match expression {
+                Expr::ListComp(comprehension) => (
+                    &comprehension.generators[..],
+                    None,
+                    comprehension.elt.as_ref(),
+                ),
+                Expr::SetComp(comprehension) => (
+                    &comprehension.generators[..],
+                    None,
+                    comprehension.elt.as_ref(),
+                ),
+                Expr::DictComp(comprehension) => (
+                    &comprehension.generators[..],
+                    comprehension.key.as_deref(),
+                    comprehension.value.as_ref(),
+                ),
+                Expr::Lambda(lambda) => {
+                    visit_lambda_defaults(self, lambda);
+                    for name in lambda_required_names_with_cache(lambda, self.cache) {
+                        self.insert_closure(&name);
+                    }
+                    return;
+                }
+                Expr::Generator(generator) => {
+                    if let Some(first) = generator.generators.first() {
+                        self.visit_expr(&first.iter);
+                    }
+                    let mut own_targets = Vec::new();
+                    for comprehension in &generator.generators {
+                        collect_target_names(&comprehension.target, &mut own_targets);
+                    }
+                    let own_targets = own_targets
+                        .iter()
+                        .map(|name| (self.mangle)(name))
+                        .collect::<FxHashSet<_>>();
+                    let (names, _, _) =
+                        generator_external_names_with_cache(generator, self.mangle, self.cache);
+                    for name in names.into_iter().collect::<BTreeSet<_>>() {
+                        if !own_targets.contains(&(self.mangle)(&name)) {
+                            self.insert_closure(&name);
+                        }
+                    }
+                    return;
+                }
+                Expr::Named(named) => {
+                    if let Expr::Name(name) = named.target.as_ref() {
+                        self.insert(name.id.as_str());
+                    }
+                    self.visit_expr(&named.value);
+                    return;
+                }
+                Expr::Name(name) if name.ctx == ExprContext::Load => {
+                    self.insert(name.id.as_str());
+                    if name.id.as_str() == "super" {
+                        self.insert("__class__");
+                    }
+                    return;
+                }
+                _ => {
+                    walk_expr(self, expression);
+                    return;
+                }
+            };
+
+            if let Some(first) = generators.first() {
+                self.visit_expr(&first.iter);
+            }
+            let mut targets = Vec::new();
+            for generator in generators {
+                collect_target_names(&generator.target, &mut targets);
+            }
+            self.targets
+                .push(targets.iter().map(|name| (self.mangle)(name)).collect());
+            for (index, generator) in generators.iter().enumerate() {
+                self.visit_expr(&generator.target);
+                if index > 0 {
+                    self.visit_expr(&generator.iter);
+                }
+                for condition in &generator.ifs {
+                    self.visit_expr(condition);
+                }
+            }
+            if let Some(key) = key {
+                self.visit_expr(key);
+            }
+            self.visit_expr(value);
+            self.targets.pop();
+        }
+    }
+
+    let mut collector = Collector {
+        names: FxHashSet::default(),
+        closure_names: FxHashSet::default(),
+        captured_targets: FxHashSet::default(),
+        targets: Vec::new(),
+        mangle,
+        cache,
+    };
+    for (index, comprehension) in generator.generators.iter().enumerate() {
+        collector.visit_expr(&comprehension.target);
+        if index > 0 {
+            collector.visit_expr(&comprehension.iter);
+        }
+        for condition in &comprehension.ifs {
+            collector.visit_expr(condition);
+        }
+    }
+    collector.visit_expr(&generator.elt);
+    (
+        collector.names,
+        collector.closure_names,
+        collector.captured_targets,
+    )
+}
+
+/// Include lexical child captures when promoting cells in the enclosing scope.
+fn generator_parent_requirements(generator: &ruff_python_ast::ExprGenerator) -> BTreeSet<String> {
+    generator_parent_requirements_with_cache(generator, &mut ExpressionScopeCache::default())
+}
+
+fn generator_parent_requirements_with_cache<'ast>(
+    generator: &'ast ruff_python_ast::ExprGenerator,
+    cache: &mut ExpressionScopeCache<'ast>,
+) -> BTreeSet<String> {
+    let key = std::ptr::from_ref(generator);
+    if let Some(required) = cache.generator_parent_requirements.get(&key) {
+        return required.clone();
+    }
+    let mut required = generator_required_names_with_cache(generator, cache);
+    let mut generator_targets = Vec::new();
+    for comprehension in &generator.generators {
+        collect_target_names(&comprehension.target, &mut generator_targets);
+    }
+    let (_, closure_names, captured_targets) =
+        generator_external_names_with_cache(generator, &str::to_owned, cache);
+    required.extend(
+        closure_names
+            .into_iter()
+            .filter(|name| captured_targets.contains(name) && !generator_targets.contains(name)),
+    );
+    cache
+        .generator_parent_requirements
+        .insert(key, required.clone());
+    required
+}
+
+/// Resolve colliding private spellings before deciding which generator names escape.
+pub(super) fn generator_required_names_with_mangler(
+    generator: &ruff_python_ast::ExprGenerator,
+    mangle: &impl Fn(&str) -> String,
+) -> BTreeSet<String> {
+    let expression = Expr::Generator(generator.clone());
+    contextual_expression_requirements(&expression, mangle, |expression| {
+        let Expr::Generator(generator) = expression else {
+            unreachable!();
+        };
+        generator_required_names(generator)
+    })
+}
+
+/// Give private spellings of a generator local the same physical slot.
+pub(super) fn generator_private_local_aliases(
+    generator: &ruff_python_ast::ExprGenerator,
+    locals: &mut Vec<String>,
+    mangle: &impl Fn(&str) -> String,
+) -> Vec<(String, String)> {
+    let mut representatives = FxHashMap::default();
+    locals.retain(|name| {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            representatives.entry(mangle(name))
+        {
+            entry.insert(name.clone());
+            true
+        } else {
+            false
+        }
+    });
+    let mut spellings = VariableSpellings::default();
+    spellings.visit_expr(&Expr::Generator(generator.clone()));
+    spellings
+        .names
+        .into_iter()
+        .filter_map(|name| {
+            let original = representatives.get(&mangle(&name))?;
+            (name != *original).then_some((name, original.clone()))
+        })
+        .collect()
+}
+
 pub(super) fn generator_required_names(
     generator: &ruff_python_ast::ExprGenerator,
 ) -> BTreeSet<String> {
-    fn collect_requirements(
-        expression: &Expr,
+    generator_required_names_with_cache(generator, &mut ExpressionScopeCache::default())
+}
+
+fn generator_required_names_with_cache<'ast>(
+    generator: &'ast ruff_python_ast::ExprGenerator,
+    cache: &mut ExpressionScopeCache<'ast>,
+) -> BTreeSet<String> {
+    struct InlineExternalReferences<'cache, 'ast> {
+        names: FxHashSet<String>,
+        nested: BTreeSet<String>,
+        cache: &'cache mut ExpressionScopeCache<'ast>,
+    }
+
+    impl<'ast> Visitor<'ast> for InlineExternalReferences<'_, 'ast> {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            let (generators, key, value) = match expression {
+                Expr::ListComp(comprehension) => (
+                    &comprehension.generators[..],
+                    None,
+                    comprehension.elt.as_ref(),
+                ),
+                Expr::SetComp(comprehension) => (
+                    &comprehension.generators[..],
+                    None,
+                    comprehension.elt.as_ref(),
+                ),
+                Expr::DictComp(comprehension) => (
+                    &comprehension.generators[..],
+                    comprehension.key.as_deref(),
+                    comprehension.value.as_ref(),
+                ),
+                Expr::Lambda(lambda) => {
+                    visit_lambda_defaults(self, lambda);
+                    self.nested
+                        .extend(lambda_required_names_with_cache(lambda, self.cache));
+                    return;
+                }
+                Expr::Generator(generator) => {
+                    if let Some(first) = generator.generators.first() {
+                        self.visit_expr(&first.iter);
+                    }
+                    self.nested.extend(generator_parent_requirements_with_cache(
+                        generator, self.cache,
+                    ));
+                    return;
+                }
+                _ => {
+                    walk_expr(self, expression);
+                    return;
+                }
+            };
+            if let Some(first) = generators.first() {
+                self.visit_expr(&first.iter);
+            }
+            let external = comprehension_name_bindings_with_parent_requirements(
+                generators, key, value, true, self.cache,
+            )
+            .into_iter()
+            .filter_map(|(name, bound)| (!bound).then_some(name));
+            self.names.extend(external);
+        }
+    }
+
+    fn collect_requirements<'ast>(
+        expression: &'ast Expr,
         local_names: &mut FxHashSet<String>,
         references: &mut ReferenceCollector,
         outside_references: &mut ReferenceCollector,
         nested_requirements: &mut BTreeSet<String>,
+        cache: &mut ExpressionScopeCache<'ast>,
     ) {
         let mut names = Vec::new();
         collect_nested_comprehension_target_names(expression, &mut names);
         local_names.extend(names);
         references.visit_expr(expression);
         outside_references.visit_expr(expression);
-        nested_requirements.extend(nested_expression_required_names(expression));
+        let mut inlined = InlineExternalReferences {
+            names: FxHashSet::default(),
+            nested: BTreeSet::new(),
+            cache,
+        };
+        inlined.visit_expr(expression);
+        nested_requirements.extend(inlined.names.iter().cloned());
+        nested_requirements.extend(inlined.nested);
+        outside_references.references.extend(inlined.names);
     }
 
+    let key = std::ptr::from_ref(generator);
+    if let Some(required) = cache.generator_requirements.get(&key) {
+        return required.clone();
+    }
     let mut local_names = FxHashSet::default();
     for comprehension in &generator.generators {
         let mut names = Vec::new();
@@ -6144,6 +6685,7 @@ pub(super) fn generator_required_names(
         &mut references,
         &mut outside_references,
         &mut nested_requirements,
+        cache,
     );
     for (index, comprehension) in generator.generators.iter().enumerate() {
         collect_requirements(
@@ -6152,6 +6694,7 @@ pub(super) fn generator_required_names(
             &mut references,
             &mut outside_references,
             &mut nested_requirements,
+            cache,
         );
         // The outermost iterable is evaluated by the enclosing scope and passed
         // to the generator as its implicit `.0` argument.
@@ -6162,6 +6705,7 @@ pub(super) fn generator_required_names(
                 &mut references,
                 &mut outside_references,
                 &mut nested_requirements,
+                cache,
             );
         }
         for condition in &comprehension.ifs {
@@ -6171,6 +6715,7 @@ pub(super) fn generator_required_names(
                 &mut references,
                 &mut outside_references,
                 &mut nested_requirements,
+                cache,
             );
         }
     }
@@ -6180,7 +6725,7 @@ pub(super) fn generator_required_names(
     references.references.extend(nested_requirements);
     // Inlined targets need temporary local slots without hiding reads in the generator body
     // or in the comprehension's first iterable.
-    references
+    let required: BTreeSet<_> = references
         .references
         .into_iter()
         .filter(|name| {
@@ -6188,7 +6733,9 @@ pub(super) fn generator_required_names(
                 || (outside_references.references.contains(name)
                     && !generator_targets.contains(name))
         })
-        .collect()
+        .collect();
+    cache.generator_requirements.insert(key, required.clone());
+    required
 }
 
 pub(super) fn generator_cellvars(generator: &ruff_python_ast::ExprGenerator) -> FxHashSet<String> {

@@ -146,6 +146,7 @@ mod generator_break_constant_compatibility;
 mod generator_break_return_regions;
 mod generator_call_name_condition_owner_compatibility;
 mod generator_dispatch_region_slots;
+mod generator_external_shadow;
 mod generator_handler_finally_nop_owner_compatibility;
 mod generator_iterator_negated_name_ifexp_owner_compatibility;
 mod generator_lambda_walrus_scope;
