@@ -8,6 +8,7 @@ mod assembler;
 mod code_object;
 mod compiler;
 mod config;
+mod decimal_literals;
 mod delimiter_nesting;
 mod initial_intern_state;
 mod marshal;
@@ -498,6 +499,7 @@ fn compile_normalized(
     if let Some(error) = parsed.errors().first() {
         return Err(CompileError::Parse(error.clone()));
     }
+    decimal_literals::validate(source, parsed.tokens())?;
     if let Some(error) = parsed.unsupported_syntax_errors().first() {
         return Err(CompileError::invalid_syntax(error.to_string(), error.range));
     }
