@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+case "${1:-}" in
+    3.12)
+        expected_exact=2190
+        expected_rejected=280
+        expected_matched_rejection=269
+        expected_rejection_mismatch=9
+        expected_compiler_failure=2
+        ;;
+    3.13)
+        expected_exact=2209
+        expected_rejected=261
+        expected_matched_rejection=256
+        expected_rejection_mismatch=3
+        expected_compiler_failure=2
+        ;;
+    3.14)
+        expected_exact=2246
+        expected_rejected=224
+        expected_matched_rejection=219
+        expected_rejection_mismatch=3
+        expected_compiler_failure=2
+        ;;
+    3.15)
+        expected_exact=2266
+        expected_rejected=204
+        expected_matched_rejection=200
+        expected_rejection_mismatch=2
+        expected_compiler_failure=2
+        ;;
+    *)
+        echo "error: unsupported Python target '${1:-}'; expected 3.12, 3.13, 3.14, or 3.15" >&2
+        exit 2
+        ;;
+esac
+
+printf '%s\n' \
+    --expected-files 2470 \
+    --expected-exact "$expected_exact" \
+    --expected-cpython-rejected "$expected_rejected" \
+    --expected-outcome "matched-rejection=$expected_matched_rejection" \
+    --expected-outcome "rejection-mismatch=$expected_rejection_mismatch" \
+    --expected-outcome byte-mismatch=0 \
+    --expected-outcome unsupported=0 \
+    --expected-outcome parse-mismatch=0 \
+    --expected-outcome "compiler-failure=$expected_compiler_failure" \
+    --expected-outcome non-utf8=0 \
+    --expected-outcome oracle-failure=0 \
+    --require-all

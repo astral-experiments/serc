@@ -325,23 +325,10 @@ def main():
             output / "generate-target",
             f"-Cprofile-generate={raw}",
         )
-        # Use the comparator's default roots; keep expectations in sync with
-        # check-cpython-compatibility (3.14).
-        outcomes = {
-            "matched-rejection": 219,
-            "rejection-mismatch": 3,
-            "byte-mismatch": 0,
-            "unsupported": 0,
-            "parse-mismatch": 0,
-            "compiler-failure": 2,
-            "non-utf8": 0,
-            "oracle-failure": 0,
-        }
-        expectations = [
-            arg
-            for kind, count in outcomes.items()
-            for arg in ("--expected-outcome", f"{kind}={count}")
-        ]
+        # Use the comparator's default roots.
+        expectations = run(
+            [repo / "scripts/ruff-corpus-expectations", "3.14"]
+        ).splitlines()
         run(
             [
                 training,
@@ -349,14 +336,7 @@ def main():
                 args.python,
                 "--python-version",
                 "3.14",
-                "--expected-files",
-                "2470",
-                "--expected-exact",
-                "2246",
-                "--expected-cpython-rejected",
-                "224",
                 *expectations,
-                "--require-all",
             ],
             {
                 "RAYON_NUM_THREADS": "1",
