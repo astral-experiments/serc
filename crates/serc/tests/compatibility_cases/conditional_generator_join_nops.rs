@@ -115,3 +115,25 @@ fn matches_cpython_bookkeeping_boundary_for_try_star_named_pass() {
 ";
     common::assert_matches_cpython_marshal(source, "try_star_named_pass.py");
 }
+
+#[test]
+fn matches_cpython_terminal_assignment_with_tuple_generator_join() {
+    let cases = [
+        r"result = (
+    tuple(f(x) for x in g())
+    if cond == value
+    else ()
+)
+",
+        "result = tuple(x for x in values) if flag else ()\n",
+        "result = all(x for x in values) if flag else ()\n",
+        "result = any(x for x in values) if flag else ()\n",
+        "def f(flag, values):\n    result = tuple(x for x in values) if flag else ()\n",
+        "result = () if flag else tuple(x for x in values)\n",
+        "result = tuple(x for x in values) if flag else ()\nconsume(result)\n",
+        "target.result = tuple(x for x in values) if flag else ()\n",
+    ];
+    for source in cases {
+        common::assert_matches_cpython_marshal(source, "terminal_tuple_generator_assignment.py");
+    }
+}

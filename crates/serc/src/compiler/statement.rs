@@ -3903,7 +3903,13 @@ impl<'source> Compiler<'source> {
         // apply that threshold. Keep the direct forms specialized to preserve nested-conditional
         // behavior and the load fusion before a simple attribute store.
         match assignment.targets.as_slice() {
-            [Expr::Name(_)] => true,
+            [Expr::Name(_)] => {
+                // Optimized generator calls have a fallback path. Keep their
+                // join until the assembler copies the store.
+                !matches!(assignment.value.as_ref(), Expr::If(expression)
+                    if matches!(expression.body.as_ref(), Expr::Call(call)
+                        if optimized_generator_callable_for_target(call, self.context.python_version).is_some()))
+            }
             [Expr::Attribute(attribute)] => {
                 // Keep an optimized tuple call's original join until the assembler
                 // copies the attribute-store exit and accounts for its jump slot.
