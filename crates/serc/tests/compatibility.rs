@@ -15964,3 +15964,85 @@ for i in range(1):
     common::assert_executes(source, "caught\n");
     common::assert_matches_cpython_marshal(source, "finally_break_nested_cleanup_error.py");
 }
+
+#[test]
+fn nested_finally_continues_preserve_stack_and_exception_state() {
+    let source = r"def f(items):
+    for item in items:
+        try:
+            pass
+        finally:
+            try:
+                continue
+            finally:
+                continue
+";
+    common::assert_matches_cpython_marshal(source, "nested_finally_continues.py");
+}
+
+#[test]
+fn nested_finally_continues_restore_exception_state_after_suspension() {
+    for (function, suspension, driver) in [
+        ("def", "pass", "target()"),
+        ("def", "yield item", "list(target())"),
+        (
+            "async def",
+            "await asyncio.sleep(0)",
+            "asyncio.run(target())",
+        ),
+        (
+            "async def",
+            "yield item",
+            "async def collect():\n    async for _ in target():\n        pass\nasyncio.run(collect())",
+        ),
+    ] {
+        let source = format!(
+            r"import asyncio
+import sys
+
+events = []
+def observe(where):
+    error = sys.exception()
+    events.append((where, None if error is None else (type(error).__name__, error.args)))
+
+class Manager:
+    def __enter__(self):
+        observe('enter')
+    def __exit__(self, *exc):
+        observe('exit')
+        raise LookupError('manager')
+
+{function} target():
+    for item in [1, 2]:
+        try:
+            with Manager():
+                try:
+                    raise ValueError(item)
+                finally:
+                    try:
+                        observe('before')
+                        continue
+                    finally:
+                        {suspension}
+                        observe('during')
+                        continue
+        except LookupError:
+            observe('caught')
+
+{driver}
+print(events)
+"
+        );
+        common::assert_matches_cpython_marshal(&source, "nested_finally_continue_state.py");
+        common::assert_executes(
+            &source,
+            concat!(
+                "[('enter', None), ('before', ('ValueError', (1,))), ",
+                "('during', ('ValueError', (1,))), ('exit', None), ",
+                "('caught', ('LookupError', ('manager',))), ('enter', None), ",
+                "('before', ('ValueError', (2,))), ('during', ('ValueError', (2,))), ",
+                "('exit', None), ('caught', ('LookupError', ('manager',)))]\n",
+            ),
+        );
+    }
+}
