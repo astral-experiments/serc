@@ -353,7 +353,9 @@ def read_inputs(checkout: Path) -> dict[str, str]:
 
 
 def parse_preinterned_strings(source: str) -> list[str]:
-    strings = set(re.findall(r"STRUCT_FOR_ID\(([A-Za-z_][A-Za-z0-9_]*)\)", source))
+    strings = set(
+        re.findall(r"(?m)^[ \t]*STRUCT_FOR_ID\(([A-Za-z_][A-Za-z0-9_]*)\)", source)
+    )
     literal_tokens = re.findall(
         r'STRUCT_FOR_STR\([^,]+,\s*("(?:\\.|[^"\\])*")\)',
         source,

@@ -1756,6 +1756,18 @@ def empty_string_second():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_macro_parameter_as_constant() {
+        let source = r"def first(value):
+    return value in {'NAME', 'novel_marker'}, 1
+
+def second(value):
+    'second docstring'
+    return value in {'NAME', 'novel_marker'}, 2
+";
+        assert_matches_cpython_marshal(source, "macro_parameter.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_startup_interned_frozenset_members() {
         let source = r#"def startup_first(value):
     if value in {None, "500", "ascii", "darwin", "kwargs", "l1", "l2", "update", "win32"}:

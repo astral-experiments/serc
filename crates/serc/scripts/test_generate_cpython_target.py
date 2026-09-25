@@ -47,6 +47,8 @@ class ReadInputsTest(unittest.TestCase):
 
     def test_parses_preinterned_strings(self) -> None:
         source = """
+        #define STRUCT_FOR_ID(NAME) \\
+            STRUCT_FOR_ASCII_STR(#NAME) _py_ ## NAME;
         STRUCT_FOR_STR(anon_module, "<module>")
         STRUCT_FOR_STR(empty, "")
         STRUCT_FOR_ID(sort)
@@ -56,6 +58,12 @@ class ReadInputsTest(unittest.TestCase):
         self.assertEqual(
             generator.parse_preinterned_strings(source),
             ["", "<module>", "alpha", "sort"],
+        )
+        self.assertEqual(
+            generator.parse_preinterned_strings(
+                source + "\n        STRUCT_FOR_ID(NAME)\n"
+            ),
+            ["", "<module>", "NAME", "alpha", "sort"],
         )
 
     def test_reads_pinned_commit_instead_of_dirty_worktree(self) -> None:
