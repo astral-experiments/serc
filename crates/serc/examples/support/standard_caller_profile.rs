@@ -15,11 +15,28 @@ use super::initial_intern_profile::LoadedProfile;
 
 // Only independently reviewed complete source proofs may supply an absence rule.
 // A proof document cannot authorize itself by setting `closure_complete`.
-const REVIEWED_PROOFS: &[ReviewedProof] = &[ReviewedProof {
-    sha256: "5a7e6ca0176ab8e07bae6bde1d54226439462b6e82493e110f4863ce2bbf45e0",
-    semantics: StateSemantics::GuaranteedRetainedPartial,
-    startup_provenance: StartupProvenance::CapturedNativeOwners,
-}];
+const REVIEWED_PROOFS: &[ReviewedProof] = &[
+    ReviewedProof {
+        sha256: "5a7e6ca0176ab8e07bae6bde1d54226439462b6e82493e110f4863ce2bbf45e0",
+        semantics: StateSemantics::GuaranteedRetainedPartial,
+        startup_provenance: StartupProvenance::CapturedNativeOwners,
+    },
+    ReviewedProof {
+        sha256: "7d8c772f0b50ca61110d74ad22214e4eca9c5d751ee28047007975dacd8af50e",
+        semantics: StateSemantics::GuaranteedRetainedPartial,
+        startup_provenance: StartupProvenance::SourceDerived,
+    },
+    ReviewedProof {
+        sha256: "41b6c006a0fcdf27ef6c09728a0ffdc55e20514d7bba4aed8df27b677f78376e",
+        semantics: StateSemantics::GuaranteedRetainedPartial,
+        startup_provenance: StartupProvenance::SourceDerived,
+    },
+    ReviewedProof {
+        sha256: "3580dff92980e02edea1334fd6fa7815bc2c7924ec79466a4389815a5e149a0a",
+        semantics: StateSemantics::GuaranteedRetainedPartial,
+        startup_provenance: StartupProvenance::SourceDerived,
+    },
+];
 
 struct ReviewedProof {
     sha256: &'static str,
