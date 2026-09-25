@@ -47,6 +47,14 @@ use ir::{
     NormalizedExceptionOwner, Operand, OperandPatch, OptimizationPipeline, UnoptimizedCode,
 };
 
+/// Yields the contiguous trailing labels in reverse emission order.
+fn trailing_labels(items: &[Item]) -> impl Iterator<Item = Label> + '_ {
+    items.iter().rev().map_while(|item| match item {
+        Item::Label(label) => Some(*label),
+        Item::Instruction(_) => None,
+    })
+}
+
 /// Binds a delegated try's normal jump while its finally target is being emitted.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NameReturnBorrowExit {
@@ -1270,14 +1278,7 @@ impl Assembler {
             .iter()
             .rposition(|item| matches!(item, Item::Instruction(_)))
             .expect("the loop-tail discard exists");
-        let labels = items[..index]
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(&items[..index]).collect::<Vec<_>>();
         self.original_unlocated_discard_targets.extend(labels);
     }
 
@@ -1594,15 +1595,7 @@ impl Assembler {
 
     /// Whether a source NOP reaches this join by fallthrough or a compacted cleanup jump.
     pub(crate) fn current_join_has_located_compacted_predecessor(&self) -> bool {
-        let labels = self
-            .linear_items()
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(self.linear_items()).collect::<Vec<_>>();
         if let Some(Item::Instruction(instruction)) = self
             .linear_items()
             .get(self.linear_items().len().saturating_sub(labels.len() + 1))
@@ -1679,14 +1672,7 @@ impl Assembler {
         {
             return false;
         }
-        let labels = before
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(before).collect::<Vec<_>>();
         let head = before.len() - labels.len();
         if self.join_labels_have_authored_location(&labels)
             || !labels.iter().any(|label| {
@@ -1767,14 +1753,7 @@ impl Assembler {
     /// Hidden authored NOPs and handler entries also prevent treating the join as unlocated.
     pub(crate) fn at_original_unconditional_join(&self) -> bool {
         let items = self.linear_items();
-        let labels = items
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
         let Some(Item::Instruction(previous)) =
             items.get(items.len().saturating_sub(labels.len() + 1))
         else {
@@ -1807,14 +1786,7 @@ impl Assembler {
     /// the artificial handler cleanup before that cleanup is copied onto break edges.
     pub(crate) fn at_original_authored_break_join(&self) -> bool {
         let items = self.linear_items();
-        let labels = items
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
         if labels.is_empty()
             || self.join_labels_have_authored_location(&labels)
             || labels.iter().any(|label| {
@@ -1870,14 +1842,7 @@ impl Assembler {
         // singleton certificate's metadata admission unchanged.
         let exact_records = matches!(conditions.peek(), Some((_, Some(_))));
         let items = self.linear_items();
-        let labels = items
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
         if labels.len() != 2
             || !self.exception_regions.is_empty()
             || self.join_labels_have_authored_location(&labels)
@@ -1998,14 +1963,7 @@ impl Assembler {
     /// Removing the break first would merge those two original cleanup predecessors.
     pub(crate) fn defer_original_while_break_cleanup_edges(&mut self) -> bool {
         let items = self.linear_items();
-        let labels = items
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
         if labels.is_empty()
             || self.join_labels_have_authored_location(&labels)
             || labels.iter().any(|label| {
@@ -2106,14 +2064,7 @@ impl Assembler {
         allow_recorded_none_guard: bool,
     ) -> bool {
         let items = self.linear_items();
-        let labels = items
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
         if self.join_labels_have_authored_location(&labels)
             || labels.iter().any(|label| {
                 self.folded_away_condition_targets.contains(label)
@@ -2207,14 +2158,7 @@ impl Assembler {
         raise_location: SourceLocation,
     ) -> bool {
         let items = self.linear_items();
-        let labels = items
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
         if labels.is_empty()
             || self.join_labels_have_authored_location(&labels)
             || labels.iter().any(|label| {
@@ -2405,14 +2349,7 @@ impl Assembler {
     pub(crate) fn original_match_failure_location(&self) -> Option<SourceLocation> {
         let end = self.original_match_join?;
         let items = self.linear_items();
-        let labels = items
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
         if !labels.contains(&end) || self.join_labels_have_authored_location(&labels) {
             return None;
         }
@@ -2425,14 +2362,7 @@ impl Assembler {
         // share the cleanup; neither donates the last failure POP's location.
         if previous.opcode == POP_TOP {
             let pop_index = items.len().checked_sub(labels.len() + 1)?;
-            let pop_labels = items[..pop_index]
-                .iter()
-                .rev()
-                .map_while(|item| match item {
-                    Item::Label(label) => Some(*label),
-                    Item::Instruction(_) => None,
-                })
-                .collect::<Vec<_>>();
+            let pop_labels = trailing_labels(&items[..pop_index]).collect::<Vec<_>>();
             let Item::Instruction(before_pop) =
                 items.get(pop_index.checked_sub(pop_labels.len() + 1)?)?
             else {
@@ -2515,14 +2445,7 @@ impl Assembler {
     /// certify this predecessor. A jump predecessor must use later CFG propagation.
     pub(crate) fn original_fallthrough_join_location(&self) -> Option<SourceLocation> {
         let items = self.linear_items();
-        let labels = items
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
         if !labels.iter().any(|label| {
             self.exception_owner_provenance.source_boundaries.contains(label)
                 && self.exception_owner_provenance.block_boundaries.contains(label)
@@ -2577,14 +2500,7 @@ impl Assembler {
         {
             return;
         }
-        let labels = items[..marker_item]
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(&items[..marker_item]).collect::<Vec<_>>();
         let Some(entry) = labels.iter().copied().find(|label| {
             self.exception_owner_provenance
                 .source_boundaries
@@ -2721,14 +2637,7 @@ impl Assembler {
     /// Certifies the single original false edge after a direct returning arm.
     pub(crate) fn original_return_guard_has_false_donor(&self, location: SourceLocation) -> bool {
         let items = self.linear_items();
-        let labels = items
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
         if labels.is_empty()
             || self.join_labels_have_authored_location(&labels)
             || labels.iter().any(|label| {
@@ -2793,23 +2702,15 @@ impl Assembler {
         {
             return;
         }
-        let Some(entry) = items[..index]
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .find(|label| {
-                self.exception_owner_provenance
-                    .source_boundaries
+        let Some(entry) = trailing_labels(&items[..index]).find(|label| {
+            self.exception_owner_provenance
+                .source_boundaries
+                .contains(label)
+                && self
+                    .exception_owner_provenance
+                    .block_boundaries
                     .contains(label)
-                    && self
-                        .exception_owner_provenance
-                        .block_boundaries
-                        .contains(label)
-            })
-        else {
+        }) else {
             return;
         };
         self.exception_owner_provenance
@@ -2849,14 +2750,7 @@ impl Assembler {
 
     fn original_shared_conditional_join(&self, allow_recorded_none_guard: bool) -> bool {
         let items = self.linear_items();
-        let labels = items
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
         if labels.is_empty()
             || self.join_labels_have_authored_location(&labels)
             || self.current_join_has_located_compacted_predecessor()
@@ -2969,14 +2863,7 @@ impl Assembler {
         allow_recorded_cleanup: bool,
     ) -> bool {
         let items = self.linear_items();
-        let labels = items
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
         if labels.is_empty()
             || self.join_labels_have_authored_location(&labels)
             || self.current_join_has_located_compacted_predecessor()
@@ -3195,14 +3082,7 @@ impl Assembler {
     /// Whether folded and emitted conditional edges share this original block head.
     pub(crate) fn has_folded_shared_conditional_entry(&self) -> bool {
         let items = self.linear_items();
-        let labels = items
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
         if !labels
             .iter()
             .any(|label| self.folded_away_condition_targets.contains(label))
@@ -3937,14 +3817,7 @@ impl Assembler {
         let instructions = [*swap, *restore, *store];
         // The cold cleanup's end can share the normal entry's original offset.
         // Retain that entire emitted label prefix, including its exact order.
-        let mut entries = items[..items.len() - 3]
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let mut entries = trailing_labels(&items[..items.len() - 3]).collect::<Vec<_>>();
         entries.reverse();
         self.comprehension_assignment_exits
             .insert(exit, (entries, instructions));
@@ -5195,14 +5068,7 @@ impl Assembler {
             return false;
         }
         let items = self.linear_items();
-        let labels = items
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
         let Some(before) = items.len().checked_sub(labels.len() + 1) else {
             return false;
         };
@@ -5355,15 +5221,7 @@ impl Assembler {
 
     /// Retains the original NOP head when statement lowering omits the instruction.
     pub(crate) fn record_omitted_nop_targets(&mut self, location: SourceLocation) {
-        let labels = self
-            .linear_items()
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(self.linear_items()).collect::<Vec<_>>();
         if labels.is_empty()
             && let Some(Item::Instruction(previous)) = self.linear_items().last()
             && location.line >= 0
@@ -5504,15 +5362,7 @@ impl Assembler {
 
     /// Retains the artificial location of normal handler cleanup before propagation.
     pub(crate) fn record_unlocated_cleanup_targets(&mut self) {
-        let labels = self
-            .linear_items()
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(self.linear_items()).collect::<Vec<_>>();
         self.original_unlocated_cleanup_targets.extend(labels);
     }
 
@@ -5576,14 +5426,7 @@ impl Assembler {
         location: SourceLocation,
     ) {
         let items = self.linear_items();
-        let aliases = items
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let aliases = trailing_labels(items).collect::<Vec<_>>();
         if !aliases.contains(&entry) || location.line < 0 {
             return;
         }
@@ -6955,24 +6798,17 @@ impl Assembler {
         {
             return false;
         }
-        let mut entries = aliases
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .filter(|label| {
-                *label != boundary
-                    && self
-                        .exception_owner_provenance
-                        .block_boundaries
-                        .contains(label)
-                    && self
-                        .exception_owner_provenance
-                        .source_boundaries
-                        .contains(label)
-            });
+        let mut entries = trailing_labels(aliases).filter(|label| {
+            *label != boundary
+                && self
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .contains(label)
+                && self
+                    .exception_owner_provenance
+                    .source_boundaries
+                    .contains(label)
+        });
         let (Some(entry), None) = (entries.next(), entries.next()) else {
             return false;
         };
@@ -7365,14 +7201,7 @@ impl Assembler {
         let index = usize::try_from(emitted.instruction().item_index)
             .expect("emitted instruction index should fit in usize");
         let items = &self.linear_items()[..index];
-        let labels = items
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
         if labels.is_empty()
             || labels.iter().any(|label| {
                 self.borrow_block_aliases.contains(label)
@@ -7807,14 +7636,7 @@ impl Assembler {
         let index = usize::try_from(emitted.instruction().item_index)
             .expect("emitted instruction index should fit in usize");
         let items = &self.linear_items()[..index];
-        let labels = items
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
         if labels.is_empty()
             || labels.iter().any(|label| {
                 self.borrow_block_aliases.contains(label)
@@ -8092,14 +7914,7 @@ impl Assembler {
         let index = usize::try_from(emitted.instruction().item_index)
             .expect("emitted instruction index should fit in usize");
         let items = &self.linear_items()[..index];
-        let labels = items
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
         let conditional_predecessors = items
             .iter()
             .filter(|item| {
@@ -8213,14 +8028,7 @@ impl Assembler {
         };
         assert_eq!(instruction.opcode, JUMP_BACKWARD);
         let location = instruction.location;
-        let labels = head
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(head).collect::<Vec<_>>();
         self.conditional_threading_targets
             .extend(labels.into_iter().map(|label| (label, location)));
     }
@@ -10192,14 +10000,7 @@ impl Assembler {
         let Some(unwind) = head.get(unwind_start..) else {
             return;
         };
-        let labels = unwind
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(unwind).collect::<Vec<_>>();
         let mut matching = unwind.iter().filter_map(|item| match item {
             Item::Instruction(instruction)
                 if matches!(
@@ -10326,14 +10127,7 @@ impl Assembler {
         if *last != jump {
             return None;
         }
-        let labels = head
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let labels = trailing_labels(head).collect::<Vec<_>>();
         let unwind = head.get(unwind_start..)?;
         let mut matching = unwind.iter().filter_map(|item| match item {
             Item::Instruction(instruction)
@@ -10606,14 +10400,7 @@ impl Assembler {
         {
             return;
         }
-        let exit_labels = items[..index]
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let exit_labels = trailing_labels(&items[..index]).collect::<Vec<_>>();
         let clean_labels = |labels: &[Label]| {
             !labels.is_empty()
                 && labels.iter().all(|label| {
@@ -13248,14 +13035,7 @@ impl Assembler {
                 && pop.local_policy.hidden_exception_owner_slots() == 0;
             let normal_exit = (manager_try_cleanup && missing_pop_block)
                 .then(|| {
-                    let aliases = items[..pop_index]
-                        .iter()
-                        .rev()
-                        .map_while(|item| match item {
-                            Item::Label(label) => Some(*label),
-                            Item::Instruction(_) => None,
-                        })
-                        .collect::<Vec<_>>();
+                    let aliases = trailing_labels(&items[..pop_index]).collect::<Vec<_>>();
                     let mut exits = self
                         .exception_owner_provenance
                         .normal_try_exits
@@ -13320,14 +13100,7 @@ impl Assembler {
     ) -> Option<(Label, SourceLocation)> {
         let entry = self.original_match_join?;
         let items = self.linear_items();
-        let aliases = items
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let aliases = trailing_labels(items).collect::<Vec<_>>();
         if !aliases.contains(&entry)
             || !aliases.contains(&protected_end)
             || self.join_labels_have_authored_location(&aliases)
@@ -13399,13 +13172,7 @@ impl Assembler {
         {
             return None;
         }
-        let first_aliases = head
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
+        let first_aliases = trailing_labels(head)
             .chain(std::iter::once(*first_label))
             .collect::<Vec<_>>();
         if self.join_labels_have_authored_location(&first_aliases)
@@ -13443,14 +13210,7 @@ impl Assembler {
         removed_slots: u8,
     ) -> bool {
         let items = self.linear_items();
-        let aliases = items
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let aliases = trailing_labels(items).collect::<Vec<_>>();
         if !aliases.contains(&protected_end)
             || self.join_labels_have_authored_location(&aliases)
             || aliases.iter().any(|label| {
@@ -13516,14 +13276,7 @@ impl Assembler {
         break_target: Label,
     ) -> bool {
         let items = self.linear_items();
-        let aliases = items
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let aliases = trailing_labels(items).collect::<Vec<_>>();
         if location.line < 0
             || !aliases.contains(&protected_end)
             || aliases.contains(&break_target)
@@ -13598,14 +13351,7 @@ impl Assembler {
         has_cold_normal_donor: bool,
     ) -> Option<Label> {
         let items = self.linear_items();
-        let aliases = items
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let aliases = trailing_labels(items).collect::<Vec<_>>();
         if !aliases.contains(&protected_end) {
             return None;
         }
@@ -13660,14 +13406,7 @@ impl Assembler {
         protected_end: Label,
     ) -> Option<(Label, SourceLocation)> {
         let items = self.linear_items();
-        let aliases = items
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let aliases = trailing_labels(items).collect::<Vec<_>>();
         if !aliases.contains(&protected_end)
             || self.join_labels_have_authored_location(&aliases)
             || aliases.iter().any(|label| {
@@ -13935,14 +13674,7 @@ impl Assembler {
         } else {
             None
         };
-        let original_nop_targets = items[..index]
-            .iter()
-            .rev()
-            .map_while(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let original_nop_targets = trailing_labels(&items[..index]).collect::<Vec<_>>();
         self.original_nop_targets.extend(original_nop_targets);
         let UnoptimizedCode::Linear(items) = &mut self.code else {
             unreachable!();
