@@ -215,6 +215,8 @@ fn decode_legacy(encoding: SourceEncoding, bytes: &[u8]) -> Option<Cow<'_, str>>
     }
 }
 
+/// Decode with CPython's EUC-JP mappings instead of the web encoding's variants.
+/// Reject web-only extensions and replace the few mappings that differ in CPython.
 fn decode_euc_jp(bytes: &[u8]) -> Option<Cow<'_, str>> {
     let decoded = EUC_JP.decode_without_bom_handling_and_without_replacement(bytes)?;
     let mut has_override = false;
