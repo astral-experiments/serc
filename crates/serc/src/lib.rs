@@ -8,6 +8,7 @@ mod assembler;
 mod code_object;
 mod compiler;
 mod config;
+mod delimiter_nesting;
 mod initial_intern_state;
 mod marshal;
 mod source;
@@ -347,6 +348,7 @@ fn compile_normalized(
     };
     let parse_options = ruff_python_parser::ParseOptions::from(ruff_python_parser::Mode::Module)
         .with_target_version(target_version);
+    delimiter_nesting::validate(source, &parse_options, options.python_version)?;
     let parsed = ruff_python_parser::parse(source, parse_options)
         .map_err(CompileError::Parse)?
         .try_into_module()
