@@ -659,9 +659,21 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
         }
     }
 
-    fn python_312_class_alias_lambda(&self, alias: &ast::StmtTypeAlias) -> Option<TextRange> {
+    /// Reject nested scopes where Python 3.12 annotation scopes can see a class namespace.
+    fn python_312_class_annotation_error(&self, statement: &Stmt) -> Option<CompileError> {
         #[derive(Default)]
-        struct FirstRestriction(Option<Result<TextRange, ()>>);
+        struct FirstRestriction(Option<Result<(&'static str, TextRange), ()>>);
+
+        impl FirstRestriction {
+            fn into_error(self) -> Option<CompileError> {
+                self.0.and_then(Result::ok).map(|(kind, range)| {
+                    CompileError::invalid_syntax(
+                        format!("Cannot use {kind} in annotation scope within class scope"),
+                        range,
+                    )
+                })
+            }
+        }
 
         impl<'ast> Visitor<'ast> for FirstRestriction {
             fn visit_expr(&mut self, expression: &'ast Expr) {
@@ -673,16 +685,17 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
                     return;
                 }
                 match expression {
-                    Expr::Lambda(_) => self.0 = Some(Ok(expression.range())),
-                    // These restrictions take precedence when symbol analysis reaches them first.
-                    Expr::Named(_)
-                    | Expr::Yield(_)
-                    | Expr::YieldFrom(_)
-                    | Expr::Await(_)
-                    | Expr::ListComp(_)
+                    Expr::Lambda(_) => self.0 = Some(Ok(("lambda", expression.range()))),
+                    Expr::ListComp(_)
                     | Expr::SetComp(_)
                     | Expr::DictComp(_)
-                    | Expr::Generator(_) => self.0 = Some(Err(())),
+                    | Expr::Generator(_) => {
+                        self.0 = Some(Ok(("comprehension", expression.range())));
+                    }
+                    // These restrictions take precedence when symbol analysis reaches them first.
+                    Expr::Named(_) | Expr::Yield(_) | Expr::YieldFrom(_) | Expr::Await(_) => {
+                        self.0 = Some(Err(()));
+                    }
                     Expr::Dict(dict) => {
                         // CPython visits every key before any value during symbol analysis.
                         for item in &dict.items {
@@ -699,19 +712,25 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
             }
         }
 
-        if matches!(alias.name.as_ref(), Expr::Name(name) if name.id.as_str() == "__debug__") {
-            return None;
-        }
+        let (parameters, private_name) = match statement {
+            Stmt::TypeAlias(alias) => (alias.type_params.as_deref(), self.private_name),
+            Stmt::ClassDef(class) if class.type_params.is_some() => {
+                (class.type_params.as_deref(), Some(class.name.as_str()))
+            }
+            Stmt::FunctionDef(function) if function.type_params.is_some() => {
+                (function.type_params.as_deref(), self.private_name)
+            }
+            _ => return None,
+        };
         let mut first = FirstRestriction::default();
-        if let Some(parameters) = alias.type_params.as_deref() {
+        if let Some(parameters) = parameters {
             let mut names = FxHashSet::default();
             for parameter in parameters {
                 let name = parameter.name().as_str();
-                if name == "__debug__"
-                    || name == "__classdict__"
-                    || !names.insert(mangle_name(name, self.private_name).into_owned())
+                if name == "__classdict__"
+                    || !names.insert(mangle_name(name, private_name).into_owned())
                 {
-                    return first.0.and_then(Result::ok);
+                    return first.into_error();
                 }
                 if let ast::TypeParam::TypeVar(parameter) = parameter
                     && let Some(bound) = parameter.bound.as_deref()
@@ -723,8 +742,47 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
                 }
             }
         }
-        first.visit_expr(&alias.value);
-        first.0.and_then(Result::ok)
+        match statement {
+            Stmt::TypeAlias(alias) => first.visit_expr(&alias.value),
+            Stmt::ClassDef(class) => {
+                if let Some(arguments) = &class.arguments {
+                    // Symbol analysis visits all positional bases before keyword values.
+                    for argument in &arguments.args {
+                        first.visit_expr(argument);
+                    }
+                    for keyword in &arguments.keywords {
+                        first.visit_expr(&keyword.value);
+                    }
+                }
+            }
+            Stmt::FunctionDef(function) if !self.future_annotations => {
+                // Future annotations create a separate scope without class visibility.
+                let parameters = &function.parameters;
+                for parameter in parameters
+                    .posonlyargs
+                    .iter()
+                    .chain(&parameters.args)
+                    .map(|parameter| &parameter.parameter)
+                    .chain(parameters.vararg.as_deref())
+                    .chain(parameters.kwarg.as_deref())
+                    .chain(
+                        parameters
+                            .kwonlyargs
+                            .iter()
+                            .map(|parameter| &parameter.parameter),
+                    )
+                {
+                    if let Some(annotation) = &parameter.annotation {
+                        first.visit_expr(annotation);
+                    }
+                }
+                if let Some(returns) = &function.returns {
+                    first.visit_expr(returns);
+                }
+            }
+            _ => {}
+        }
+        first.into_error()
     }
 
     fn with_checker(&mut self, visit: impl FnOnce(&mut SemanticSyntaxChecker, &Self)) {
@@ -1068,13 +1126,34 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
         }
         if self.python_version == ast::PythonVersion::PY312
             && matches!(self.scope().kind, ScopeKind::Class)
-            && let Stmt::TypeAlias(alias) = statement
-            && let Some(range) = self.python_312_class_alias_lambda(alias)
+            && let Some(error) = self.python_312_class_annotation_error(statement)
         {
-            *self.error.borrow_mut() = Some(CompileError::invalid_syntax(
-                "Cannot use lambda in annotation scope within class scope",
-                range,
-            ));
+            // Defaults and decorators are checked before entering the annotation scope.
+            // Only revisit these eager expressions when the preflight found a restriction.
+            // Their code-generation errors still follow the annotation's symbol-table error.
+            let previous = std::mem::replace(&mut self.pre_lowering_only, true);
+            match statement {
+                Stmt::FunctionDef(function) => {
+                    for parameter in function.parameters.iter_non_variadic_params() {
+                        if let Some(default) = &parameter.default {
+                            self.visit_expr(default);
+                        }
+                    }
+                    for decorator in &function.decorator_list {
+                        self.visit_decorator(decorator);
+                    }
+                }
+                Stmt::ClassDef(class) => {
+                    for decorator in &class.decorator_list {
+                        self.visit_decorator(decorator);
+                    }
+                }
+                _ => {}
+            }
+            self.pre_lowering_only = previous;
+            if self.error.borrow().is_none() {
+                *self.error.borrow_mut() = Some(error);
+            }
             return;
         }
         // Relative imports of a module named __future__ are ordinary imports. The shared
