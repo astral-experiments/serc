@@ -493,6 +493,23 @@ sys.stdout.buffer.write(marshal.dumps(code))
         assert_matches_cpython_marshal_bytes(&latin9, "latin9_all_bytes.py");
     }
 
+    const SOURCE_CODEC_IDENTITY_BODY: &str = "def first(value):\n    return value in {'encoding_table', 'novel_marker'}, 1\n\ndef second(value):\n    'second docstring'\n    return value in {'encoding_table', 'novel_marker'}, 2\n";
+
+    #[test]
+    fn matches_cpython_marshal_for_utf8_codec_identity_control() {
+        let source = format!("# coding: utf-8\n{SOURCE_CODEC_IDENTITY_BODY}");
+        assert_matches_cpython_marshal_bytes(source.as_bytes(), "source_codec_identity.py");
+    }
+
+    #[test]
+    #[ignore = "issue #778: source codec imports affect interned object identity"]
+    fn matches_cpython_marshal_when_source_codecs_intern_constants() {
+        for encoding in ["cp1251", "iso-8859-15", "koi8-r"] {
+            let source = format!("# coding: {encoding}\n{SOURCE_CODEC_IDENTITY_BODY}");
+            assert_matches_cpython_marshal_bytes(source.as_bytes(), "source_codec_identity.py");
+        }
+    }
+
     #[test]
     fn normalizes_byte_source_bom_and_text_source_newlines_before_compiling() {
         let source =
