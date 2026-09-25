@@ -64,6 +64,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) retained_setup_value_arrays: Vec<RetainedSetupValueArray>,
     // Region re-entry after a return emits no original instruction or unwind slot.
     pub(super) return_region_reentries: FxHashSet<Label>,
+    pub(super) loop_finally_region_boundaries: FxHashSet<Label>,
     // Proven CALL/POP or unique conditional-join donor and its exact disposal array.
     pub(super) copied_finally_iterator_returns: Vec<(SourceLocation, Vec<Item>)>,
     // Fresh authored break array through the first truth marker, with two omitted POPs.
@@ -9295,6 +9296,87 @@ impl LayoutAssembler {
                                                 })
                                     )
                             });
+                        // A value-preserving Boolean introduces COPY and TO_BOOL after
+                        // the original POP_BLOCK has been compacted. When the unchanged
+                        // expansion reaches the adjacent captured POP cell, it inherits
+                        // that cell's NULL owner instead of the enclosing try owner.
+                        let single_pop_boolean_marker = instruction.exception_policy()
+                            == super::ExceptionPolicy::NoneDynamic
+                            && original_value_jump_positions
+                                .values()
+                                .any(|position| *position == instruction_index)
+                            && early_return_nop_slot.is_some_and(|(_, pop, slot, _)| {
+                                indexed_instructions[pop]
+                                    .local_policy
+                                    .hidden_exception_owner_slots()
+                                    == 1
+                                    && instruction_index == slot + 1
+                                    && matches!(
+                                        indexed_instructions.get(pop + 1..instruction_index),
+                                        Some([load, copy, to_bool, condition])
+                                            if matches!(load.opcode,
+                                                crate::target::opcodes::LOAD_FAST
+                                                    | crate::target::opcodes::LOAD_FAST_BORROW)
+                                                && matches!(load.operand(), Operand::Value(_))
+                                                && copy.opcode == crate::target::opcodes::COPY
+                                                && copy.operand() == Operand::Value(1)
+                                                && to_bool.opcode == crate::target::opcodes::TO_BOOL
+                                                && to_bool.operand() == Operand::Value(0)
+                                                && matches!(condition.opcode,
+                                                    crate::target::opcodes::POP_JUMP_IF_FALSE | crate::target::opcodes::POP_JUMP_IF_TRUE)
+                                                && matches!(condition.operand(), Operand::Forward(_))
+                                                && [load, copy, to_bool, condition].iter().all(|record| {
+                                                    record.local_policy.hidden_exception_owner_slots() == 0
+                                                        && record.pre_fold_extra_instructions() == 0
+                                                        && record.exception_policy()
+                                                            == super::ExceptionPolicy::NoneUnchanged
+                                                        && record.no_location_policy.borrow_fallthrough()
+                                                            == super::BorrowFallthrough::Reachable
+                                                        && !record.jump_policy.borrow_empty_block()
+                                                })
+                                    )
+                            });
+                        // A global one-argument call likewise compacts its PUSH_NULL,
+                        // so the condition's appended marker can reuse the captured POP.
+                        // Authenticate the entire unchanged call and condition sequence.
+                        let single_pop_call_marker = instruction.exception_policy()
+                            == super::ExceptionPolicy::NonePresent
+                            && early_return_nop_slot.is_some_and(|(_, pop, slot, _)| {
+                                indexed_instructions[pop]
+                                    .local_policy
+                                    .hidden_exception_owner_slots()
+                                    == 1
+                                    && instruction_index == slot + 1
+                                    && matches!(
+                                        indexed_instructions.get(pop + 1..instruction_index),
+                                        Some([global, arg, call, to_bool, condition])
+                                            if global.opcode == crate::target::opcodes::LOAD_GLOBAL
+                                                && matches!(global.operand(), Operand::Value(value) if value & 1 == 1)
+                                                && matches!(arg.opcode,
+                                                    crate::target::opcodes::LOAD_FAST
+                                                        | crate::target::opcodes::LOAD_FAST_BORROW)
+                                                && matches!(arg.operand(), Operand::Value(_))
+                                                && call.opcode == crate::target::opcodes::CALL
+                                                && call.operand() == Operand::Value(1)
+                                                && to_bool.opcode == crate::target::opcodes::TO_BOOL
+                                                && to_bool.operand() == Operand::Value(0)
+                                                && matches!(condition.opcode,
+                                                    crate::target::opcodes::POP_JUMP_IF_FALSE | crate::target::opcodes::POP_JUMP_IF_TRUE)
+                                                && matches!(condition.operand(), Operand::Forward(_))
+                                                && [global, arg, call, to_bool, condition].iter().all(|record| {
+                                                    record.local_policy.hidden_exception_owner_slots() == 0
+                                                        && record.pre_fold_extra_instructions() == 0
+                                                        && record.exception_policy()
+                                                            == super::ExceptionPolicy::NoneUnchanged
+                                                        && record.no_location_policy.borrow_fallthrough()
+                                                            == super::BorrowFallthrough::Reachable
+                                                        && !record.jump_policy.borrow_empty_block()
+                                                })
+                                                && call.location == instruction.location
+                                                && to_bool.location == instruction.location
+                                                && condition.location == instruction.location
+                                    )
+                            });
                         // Early compaction leaves the authored exit NOP and its adjacent
                         // POP_BLOCK records in their old array cells. The first retains its
                         // try owner; either captured POP is NULL despite a scope fallback.
@@ -9308,10 +9390,14 @@ impl LayoutAssembler {
                                 instruction.exception_policy().owner(),
                                 NormalizedExceptionOwner::Present
                                     | NormalizedExceptionOwner::DynamicCondition
-                            ) || threaded_paired_pop_marker)
+                            ) || threaded_paired_pop_marker
+                                || single_pop_boolean_marker
+                                || single_pop_call_marker)
                             && owners.get(instruction_index).is_none_or(|decision| {
                                 !decision.is_definitive()
-                                    || (threaded_paired_pop_marker
+                                    || ((threaded_paired_pop_marker
+                                        || single_pop_boolean_marker
+                                        || single_pop_call_marker)
                                         && decision.has_owner()
                                         && decision.source_region().is_none()
                                         && !decision.overrides_existing())
@@ -9343,7 +9429,9 @@ impl LayoutAssembler {
                                         POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
                                     ) && previous.local_policy.hidden_exception_owner_slots() == 3
                                 }))
-                                || single_pop_truth_marker)
+                                || single_pop_truth_marker
+                                || single_pop_boolean_marker
+                                || single_pop_call_marker)
                         {
                             let source_region = (instruction_index == slot).then_some(region);
                             owners.insert(

@@ -159,6 +159,7 @@ struct FinallyExitContext<'ast> {
     loop_depth: usize,
     with_depth: usize,
     handler_depth: usize,
+    finally_end_depth: usize,
     try_body_depth: usize,
     exception_region_depth: usize,
     suspension_exception_depth: usize,
@@ -168,6 +169,14 @@ struct FinallyExitContext<'ast> {
     handler: Label,
     depth: u32,
     preserves_conditional_exit_owner: bool,
+}
+
+/// Exception-region boundaries surrounding one exceptional-finally cleanup.
+#[derive(Clone, Copy)]
+struct FinallyEndUnwind {
+    before: Label,
+    pop_except: Label,
+    after: Label,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -223,6 +232,7 @@ struct WithExitContext {
     normal_exit: WithBodyNormalExit,
     terminal_condition_preceded_by_finally: bool,
     exception_region_depth: usize,
+    finally_end_depth: usize,
     normal_finally_depth: usize,
     loop_depth: usize,
     preserves_none_condition_owner: bool,
@@ -238,7 +248,9 @@ enum WithBodyExitNoop {
 }
 
 struct LoopControlUnwind {
-    with_starts: Vec<WithUnwind>,
+    with_unwinds: Vec<WithUnwind>,
+    handler_starts: Vec<Label>,
+    finalizer_tail_location: Option<SourceLocation>,
     // Each start retains exclusions recorded before that lexical unwind point.
     region_starts: Vec<Option<(Label, usize)>>,
 }
@@ -487,6 +499,8 @@ pub(super) struct FinallyState<'ast> {
     // coroutine stop-iteration handler.
     pub(super) active_normal_finally_bodies: usize,
     pub(super) active_finally_end_blocks: usize,
+    // Exception collector owning each active exceptional-finally body, outermost first.
+    finally_end_region_indices: Vec<usize>,
     // An enclosing try's authored successor remains a normal-finally continuation only
     // at the same loop, exceptional-finally, and copied-finally depths.
     normal_finally_continuation_depths: Option<(usize, usize, usize)>,
@@ -4471,12 +4485,29 @@ impl<'source> Compiler<'source> {
                 // A direct break unwinds the same original try records as continue.
                 // Keep the single finally POP even when iterator disposal follows it.
                 let break_pop_blocks = self.continued_finally_pop_blocks(context, true, false);
-                let copied_break_pop_blocks =
-                    if break_pop_blocks == 1 || context.iterator_cleanup == IteratorCleanup::None {
-                        break_pop_blocks
-                    } else {
-                        0
-                    };
+                let nested_copied_finally_pop = self.context.python_version
+                    >= crate::PythonVersion::Py314
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && self.control.finally.active_normal_finally_bodies == 1
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.withs.active_with_exits.is_empty()
+                    && matches!(self.control.finally.active_loop_finally_contexts.as_slice(), [finally]
+                        if finally.loop_depth == self.control.loops.contexts.len()
+                            && finally.with_depth == context.with_depth
+                            && finally.exception_region_depth + 1
+                                == self.control.exceptions.active_exception_region_exclusions.len()
+                            && !matches!(finally.body, [Stmt::Pass(_)]));
+                let copied_break_pop_blocks = if nested_copied_finally_pop {
+                    1
+                } else if break_pop_blocks == 1 || context.iterator_cleanup == IteratorCleanup::None
+                {
+                    break_pop_blocks
+                } else {
+                    0
+                };
                 let copied_break_item = self.assembler.item_count();
                 // Keep the two omitted POP_BLOCKs as provenance only. Iterator
                 // cleanup still follows the copied finalizer's shared exit.
@@ -4625,7 +4656,7 @@ impl<'source> Compiler<'source> {
                                     && self.control.withs.active_with_exits.last().is_some_and(
                                         |manager| {
                                             manager.exception_region_depth
-                                                == self
+                                                <= self
                                                     .control
                                                     .exceptions
                                                     .active_exception_region_exclusions
@@ -4652,7 +4683,6 @@ impl<'source> Compiler<'source> {
                     && self.control.finally.active_loop_finally_contexts.is_empty()
                     && self.control.finally.active_finally_try_bodies == 0
                     && self.control.finally.active_finally_end_blocks == 0
-                    && self.control.finally.active_normal_finally_bodies == 0
                     && self.control.finally.active_copied_finally_bodies == 0
                 {
                     // Only ordinary try bodies lie between this break and its loop;
@@ -4703,8 +4733,17 @@ impl<'source> Compiler<'source> {
                     self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
                     self.assembler.mark_last_as_converted_pop_block();
                 }
-                let finally_end_unwind_start =
-                    self.emit_finally_end_unwind(context.finally_end_depth, false)?;
+                let retained_finally_end_depth = self.loop_retained_finally_end_depth(context);
+                let defer_finally_end = retained_finally_end_depth > context.finally_end_depth;
+                let finally_end_unwind_starts =
+                    self.emit_loop_finally_end_unwind(retained_finally_end_depth)?;
+                let finally_end_unwind_start = finally_end_unwind_starts
+                    .first()
+                    .map(|unwind| unwind.pop_except);
+                let early_unwind_first_region =
+                    (!finally_end_unwind_starts.is_empty()).then(|| {
+                        self.first_finally_end_unwind_region(context, retained_finally_end_depth)
+                    });
                 let mut exclusion_start = if self
                     .control
                     .exceptions
@@ -4720,30 +4759,66 @@ impl<'source> Compiler<'source> {
                     self.assembler.mark(start);
                     Some(start)
                 };
+                let has_copied_finalizer = self
+                    .control
+                    .finally
+                    .active_loop_finally_contexts
+                    .iter()
+                    .any(|finally| finally.loop_depth >= self.control.loops.contexts.len());
                 let finally_unwind_start = self.assembler.item_count();
                 let LoopControlUnwind {
-                    with_starts: with_unwind_starts,
-                    region_starts: region_unwind_starts,
-                } = self.emit_loop_control_finally_unwind(
-                    super::legacy_native_labels::WithAwait::Break(statement.range),
-                    context.with_depth,
-                    None,
-                    (copied_break_pop_blocks > 0)
-                        .then_some((copied_break_item, copied_break_pop_blocks)),
-                    None,
-                    None,
+                    with_unwinds: with_unwind_starts,
+                    handler_starts: handler_unwind_starts,
+                    finalizer_tail_location,
+                    region_starts: mut region_unwind_starts,
+                } = self.with_control_override(
+                    |control| &mut control.finally.active_finally_end_blocks,
+                    retained_finally_end_depth,
+                    |compiler| {
+                        compiler.emit_loop_control_finally_unwind(
+                            super::legacy_native_labels::WithAwait::Break(statement.range),
+                            context.with_depth,
+                            None,
+                            (copied_break_pop_blocks > 0)
+                                .then_some((copied_break_item, copied_break_pop_blocks)),
+                            None,
+                            defer_finally_end.then_some((
+                                context.finally_end_depth,
+                                copied_finally_exclusion_lengths.as_slice(),
+                            )),
+                        )
+                    },
                 )?;
+                self.record_finally_end_unwind_regions(
+                    context,
+                    retained_finally_end_depth,
+                    &finally_end_unwind_starts,
+                    &copied_finally_exclusion_lengths,
+                    &mut region_unwind_starts,
+                    self.control.withs.active_with_exits.len(),
+                    false,
+                );
                 if let Some(origin) = copied_break_handler_origin {
                     self.assembler.record_copied_break_handler_cleanup(origin);
                 }
-                if exclusion_start.is_some()
-                    && finally_end_unwind_start.is_none()
-                    && !with_unwind_starts.is_empty()
+                let needs_outer_region_boundary = exclusion_start.is_some()
+                    && (has_copied_finalizer || !with_unwind_starts.is_empty())
                     && region_unwind_starts[context.exception_region_depth..]
                         .iter()
-                        .any(Option::is_none)
-                {
-                    // Outer tries remain active until the managers inside them finish exiting.
+                        .any(Option::is_none);
+                let copied_finalizer_location = (self.context.python_version
+                    >= crate::PythonVersion::Py314
+                    && has_copied_finalizer
+                    && with_unwind_starts.is_empty()
+                    && handler_unwind_starts.is_empty()
+                    && finalizer_tail_location.is_some()
+                    && (needs_outer_region_boundary
+                        || self.control.finally.active_finally_end_blocks
+                            > context.finally_end_depth))
+                    .then_some(finalizer_tail_location)
+                    .flatten();
+                if needs_outer_region_boundary {
+                    // Outer tries remain active through inner finalizers and manager exits.
                     let start = self.assembler.label();
                     self.assembler.mark(start);
                     exclusion_start = Some(start);
@@ -4751,10 +4826,19 @@ impl<'source> Compiler<'source> {
                 if copied_finally_with_join {
                     self.assembler.set_location(SourceLocation::NONE);
                 }
+                let iterator_location = self.assembler.location();
+                if !copied_finally_with_join && let Some(location) = copied_finalizer_location {
+                    // The coverage boundary must not interrupt the location that
+                    // reaches the loop's artificial iterator discard.
+                    self.assembler.set_location(location);
+                }
                 let copied_finally_try_iterator_entry = (copied_finally_try_iterator_join
                     && self.assembler.at_original_shared_finally_iterator_join())
                 .then(|| self.assembler.item_count());
                 self.emit_iterator_cleanup(context.iterator_cleanup, false)?;
+                if copied_finalizer_location.is_some() {
+                    self.assembler.set_location(iterator_location);
+                }
                 if context.break_policy.returns() {
                     if self.context.python_version == crate::PythonVersion::Py313
                         && self.assembler.instruction_count() == marker_end
@@ -4928,12 +5012,25 @@ impl<'source> Compiler<'source> {
                             .iter_mut()
                             .zip(&copied_finally_exclusion_lengths)
                             .zip(&region_unwind_starts)
+                            .enumerate()
                             .skip(context.exception_region_depth)
                         {
+                            let (index, exclusions) = exclusions;
                             let ((exclusions, length), region_start) = exclusions;
                             let (start, length) =
                                 region_start.unwrap_or((exclusion_start, *length));
-                            exclusions.truncate(length);
+                            if handler_unwind_starts.contains(&start)
+                                || !defer_finally_end
+                                || early_unwind_first_region.is_some_and(|first| index >= first)
+                            {
+                                // A copied finalizer can have already left this region
+                                // before the enclosing exit starts its own cleanup.
+                                // Keep those earlier, disjoint exclusions.
+                                let preceding = exclusions.get(length..).map_or(0, |recent| {
+                                    self.assembler.exclusions_ending_before(recent, start)
+                                });
+                                exclusions.truncate(length + preceding);
+                            }
                             exclusions.push((start, exclusion_end));
                         }
                     }
@@ -5355,20 +5452,19 @@ impl<'source> Compiler<'source> {
                     .flatten();
                 let finally_unwind_start = self.assembler.item_count();
                 let LoopControlUnwind {
-                    with_starts: with_unwind_starts,
+                    with_unwinds: with_unwind_starts,
                     region_starts: region_unwind_starts,
+                    ..
                 } = self.emit_loop_control_finally_unwind(
                     super::legacy_native_labels::WithAwait::Continue(statement.range),
                     context.with_depth,
                     Some(context.continue_label),
                     None,
                     continued_unnamed_handler_origin.or(continued_handler_try_origin),
-                    handler_before_finally_end.then(|| {
-                        (
-                            context.finally_end_depth,
-                            copied_finally_exclusion_lengths[context.exception_region_depth],
-                        )
-                    }),
+                    handler_before_finally_end.then_some((
+                        context.finally_end_depth,
+                        copied_finally_exclusion_lengths.as_slice(),
+                    )),
                 )?;
                 if let Some(origin) = continued_handler_try_origin {
                     self.assembler.record_continued_handler_try_prefix(origin);
@@ -13632,7 +13728,7 @@ impl<'source> Compiler<'source> {
         continue_target: Option<Label>,
         copied_break_item: Option<(usize, usize)>,
         copied_continue_item: Option<usize>,
-        deferred_finally_end: Option<(usize, usize)>,
+        deferred_finally_end: Option<(usize, &[usize])>,
     ) -> Result<LoopControlUnwind, CompileError> {
         let captured_none_prefix = continue_target.is_some()
             && matches!(self.control.finally.active_loop_finally_contexts.as_slice(), [context]
@@ -13677,8 +13773,12 @@ impl<'source> Compiler<'source> {
             .position(|handler| handler.loop_depth >= loop_depth)
             .unwrap_or(handlers.len());
         let initialized_locals = self.symbols.initialized_locals.clone();
+        let finally_end_depth = self.control.finally.active_finally_end_blocks;
+        let finally_exclusion_lengths = deferred_finally_end.map(|(_, lengths)| lengths);
         let mut next_with = self.control.withs.active_with_exits.len();
         let mut with_unwind_starts = Vec::new();
+        let mut handler_unwind_starts = Vec::new();
+        let mut finalizer_tail_location = None;
         let mut region_unwind_starts = vec![
             None;
             self.control
@@ -13694,7 +13794,9 @@ impl<'source> Compiler<'source> {
                     context.loop_context_depth + 1,
                     &mut next_with,
                     &mut with_unwind_starts,
+                    &mut handler_unwind_starts,
                     &mut region_unwind_starts,
+                    finally_exclusion_lengths,
                 )?;
                 let copied_handler_start = if copied_continue_item.is_some() {
                     // No manager or preserved-value unwind precedes this exact handler.
@@ -13714,6 +13816,14 @@ impl<'source> Compiler<'source> {
                     context.with_depth,
                     &mut next_with,
                     &mut with_unwind_starts,
+                    &mut handler_unwind_starts,
+                    &mut region_unwind_starts,
+                    finally_exclusion_lengths,
+                )?;
+                self.emit_loop_finally_end_to(
+                    context.finally_end_depth,
+                    next_with,
+                    finally_exclusion_lengths,
                     &mut region_unwind_starts,
                 )?;
                 if self.context.python_version == crate::PythonVersion::Py312
@@ -13998,7 +14108,9 @@ impl<'source> Compiler<'source> {
                                 && copied_finally_has_guarded_pass_cleanup(context.body)))
                         && matches!(context.body.last(), Some(Stmt::If(tail))
                             if tail.elif_else_clauses.is_empty()
-                                && !suite_contains_loop_break(&tail.body))
+                                && (!suite_contains_loop_break(&tail.body)
+                                    || (matches!(tail.test.as_ref(), Expr::Name(_))
+                                        && matches!(tail.body.as_slice(), [Stmt::Break(_)]))))
                 });
                 // A loop-exit copy has left every protected finalizer inside it,
                 // including terminal finalizers without a registered exit context.
@@ -14058,6 +14170,28 @@ impl<'source> Compiler<'source> {
                         .active_exception_region_exclusions
                         .split_off(context.exception_region_depth)
                 });
+                // The copied body has exited its protected try, but enclosing owners
+                // must remain active until their own cleanup is emitted.
+                let copied_exceptional_finally_start = (context.finally_end_depth
+                    > self
+                        .control
+                        .loops
+                        .contexts
+                        .last()
+                        .expect("loop context exists")
+                        .finally_end_depth)
+                    .then(|| {
+                        let start = self.assembler.label();
+                        self.assembler.mark(start);
+                        let lengths = self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .iter()
+                            .map(Vec::len)
+                            .collect::<Vec<_>>();
+                        (start, lengths)
+                    });
                 let result = self.with_control_override(
                     |control| &mut control.finally.active_overriding_finally_returns,
                     outer_overriding_returns,
@@ -14086,6 +14220,44 @@ impl<'source> Compiler<'source> {
                         )
                     },
                 );
+                // Only a straight-line finalizer can donate a location to the
+                // artificial iterator discard after its exception unwind.
+                let linear_finalizer = match context.body {
+                    [Stmt::Expr(expression)] => {
+                        matches!(expression.value.as_ref(), Expr::Call(_))
+                            && !expression_contains_inline_branch(&expression.value)
+                            && !expression_suspends_current_scope(&expression.value)
+                    }
+                    [Stmt::Assign(assignment)] => {
+                        assignment
+                            .targets
+                            .iter()
+                            .all(|target| matches!(target, Expr::Name(_)))
+                            && !expression_contains_inline_branch(&assignment.value)
+                            && !expression_suspends_current_scope(&assignment.value)
+                    }
+                    _ => false,
+                };
+                finalizer_tail_location = linear_finalizer
+                    .then(|| self.assembler.current_block_last_instruction_location())
+                    .flatten()
+                    .filter(|location| location.line >= 0);
+                if let Some((start, lengths)) = copied_exceptional_finally_start {
+                    let end = self.assembler.label();
+                    self.assembler.mark(end);
+                    for exclusions in self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .iter_mut()
+                        .zip(lengths)
+                        .skip(context.exception_region_depth)
+                    {
+                        let (exclusions, length) = exclusions;
+                        exclusions.truncate(length);
+                        exclusions.push((start, end));
+                    }
+                }
                 if result.is_ok()
                     && let Some(exclusion_count) = retained_try_break_exit
                 {
@@ -14125,7 +14297,9 @@ impl<'source> Compiler<'source> {
                 0,
                 &mut next_with,
                 &mut with_unwind_starts,
+                &mut handler_unwind_starts,
                 &mut region_unwind_starts,
+                finally_exclusion_lengths,
             )?;
             self.emit_loop_control_cleanup_to(
                 origin,
@@ -14133,15 +14307,17 @@ impl<'source> Compiler<'source> {
                 with_depth,
                 &mut next_with,
                 &mut with_unwind_starts,
+                &mut handler_unwind_starts,
                 &mut region_unwind_starts,
+                finally_exclusion_lengths,
             )?;
-            if let Some((from_depth, exclusion_count)) = deferred_finally_end {
-                // Keep the named cleanup and POP_TOP under the outer finalizer.
-                // Its returned boundary retires that owner before POP_EXCEPT.
-                // Set it before fallback would introduce a label ahead of POP_TOP.
-                region_unwind_starts[loop_exception_region_depth] = self
-                    .emit_finally_end_unwind(from_depth, false)?
-                    .map(|start| (start, exclusion_count));
+            if let Some((from_depth, _)) = deferred_finally_end {
+                self.emit_loop_finally_end_to(
+                    from_depth,
+                    next_with,
+                    finally_exclusion_lengths,
+                    &mut region_unwind_starts,
+                )?;
             }
             if handlers.len() > first_handler
                 && region_unwind_starts
@@ -14164,7 +14340,9 @@ impl<'source> Compiler<'source> {
                 }
             }
             Ok(LoopControlUnwind {
-                with_starts: with_unwind_starts,
+                with_unwinds: with_unwind_starts,
+                handler_starts: handler_unwind_starts,
+                finalizer_tail_location,
                 region_starts: region_unwind_starts,
             })
         })();
@@ -14172,6 +14350,7 @@ impl<'source> Compiler<'source> {
         self.control.exceptions.active_exception_handlers = handlers;
         self.control.finally.preserved_return_value_contexts = preserved_values;
         self.control.finally.copied_return_finally_preserved_values = preserved_value_count;
+        self.control.finally.active_finally_end_blocks = finally_end_depth;
         self.control
             .finally
             .active_return_finally_contexts
@@ -14189,7 +14368,9 @@ impl<'source> Compiler<'source> {
         finally_depth: usize,
         next_with: &mut usize,
         with_unwind_starts: &mut Vec<WithUnwind>,
+        handler_unwind_starts: &mut Vec<Label>,
         region_unwind_starts: &mut [Option<(Label, usize)>],
+        finally_exclusion_lengths: Option<&[usize]>,
     ) -> Result<(), CompileError> {
         while let Some(context) = self
             .control
@@ -14206,7 +14387,9 @@ impl<'source> Compiler<'source> {
                 context.managers,
                 next_with,
                 with_unwind_starts,
+                handler_unwind_starts,
                 region_unwind_starts,
+                finally_exclusion_lengths,
             )?;
             self.emit(POP_TOP, 0, -1)?;
             self.control.finally.preserved_return_value_contexts.pop();
@@ -14222,7 +14405,9 @@ impl<'source> Compiler<'source> {
         with_depth: usize,
         next_with: &mut usize,
         with_unwind_starts: &mut Vec<WithUnwind>,
+        handler_unwind_starts: &mut Vec<Label>,
         region_unwind_starts: &mut [Option<(Label, usize)>],
+        finally_exclusion_lengths: Option<&[usize]>,
     ) -> Result<(), CompileError> {
         while self.control.exceptions.active_exception_handlers.len() > handler_depth {
             let handler = *self
@@ -14237,9 +14422,17 @@ impl<'source> Compiler<'source> {
                 next_with,
                 with_unwind_starts,
                 region_unwind_starts,
+                finally_exclusion_lengths,
+            )?;
+            self.emit_loop_finally_end_to(
+                handler.finally_end_depth,
+                *next_with,
+                finally_exclusion_lengths,
+                region_unwind_starts,
             )?;
             let start = self.assembler.label();
             self.assembler.mark(start);
+            handler_unwind_starts.push(start);
             for (index, region_start) in region_unwind_starts
                 .iter_mut()
                 .enumerate()
@@ -14265,6 +14458,7 @@ impl<'source> Compiler<'source> {
             next_with,
             with_unwind_starts,
             region_unwind_starts,
+            finally_exclusion_lengths,
         )
     }
 
@@ -14275,16 +14469,26 @@ impl<'source> Compiler<'source> {
         next_with: &mut usize,
         with_unwind_starts: &mut Vec<WithUnwind>,
         region_unwind_starts: &mut [Option<(Label, usize)>],
+        finally_exclusion_lengths: Option<&[usize]>,
     ) -> Result<(), CompileError> {
-        let starts = self.emit_with_unwind(with_depth, *next_with, false, origin)?;
-        for unwind in &starts {
-            unwind.record_exception_starts_with_checkpoints(
+        for index in (with_depth..*next_with).rev() {
+            let finally_end_depth = self.control.withs.active_with_exits[index].finally_end_depth;
+            self.emit_loop_finally_end_to(
+                finally_end_depth,
+                index + 1,
+                finally_exclusion_lengths,
                 region_unwind_starts,
-                &self.control.exceptions.active_exception_region_exclusions,
-            );
+            )?;
+            let starts = self.emit_with_unwind(index, index + 1, false, origin)?;
+            for unwind in &starts {
+                unwind.record_exception_starts_with_checkpoints(
+                    region_unwind_starts,
+                    &self.control.exceptions.active_exception_region_exclusions,
+                );
+            }
+            with_unwind_starts.extend(starts);
+            *next_with = index;
         }
-        *next_with = with_depth;
-        with_unwind_starts.extend(starts);
         Ok(())
     }
 
@@ -14310,6 +14514,161 @@ impl<'source> Compiler<'source> {
             self.emit(POP_EXCEPT, 0, -1)?;
         }
         Ok(unwind_start)
+    }
+
+    /// Unwind exceptional finalizers entered inside the next lexical cleanup scope.
+    fn emit_loop_finally_end_to(
+        &mut self,
+        target_depth: usize,
+        active_manager_depth: usize,
+        exclusion_lengths: Option<&[usize]>,
+        region_starts: &mut [Option<(Label, usize)>],
+    ) -> Result<(), CompileError> {
+        let Some(exclusion_lengths) = exclusion_lengths else {
+            return Ok(());
+        };
+        let context = *self
+            .control
+            .loops
+            .contexts
+            .last()
+            .expect("loop context exists");
+        let target_depth = target_depth.max(context.finally_end_depth);
+        if target_depth >= self.control.finally.active_finally_end_blocks {
+            return Ok(());
+        }
+        let unwinds = self.emit_loop_finally_end_unwind(target_depth)?;
+        self.record_finally_end_unwind_regions(
+            context,
+            target_depth,
+            &unwinds,
+            exclusion_lengths,
+            region_starts,
+            active_manager_depth,
+            true,
+        );
+        self.control.finally.active_finally_end_blocks = target_depth;
+        Ok(())
+    }
+
+    /// Record separate boundaries so enclosing regions can retire at their own `POP_EXCEPT`.
+    fn emit_loop_finally_end_unwind(
+        &mut self,
+        from_depth: usize,
+    ) -> Result<Vec<FinallyEndUnwind>, CompileError> {
+        let mut unwinds = Vec::new();
+        for _ in from_depth..self.control.finally.active_finally_end_blocks {
+            let before = self.assembler.label();
+            // These coverage-only boundaries add no native POP_BLOCK. The
+            // POP_BLOCK in a FINALLY_END unwind precedes the POP_EXCEPT itself.
+            self.assembler.mark_loop_finally_region_boundary(before);
+            self.emit(POP_TOP, 0, -1)?;
+            if self.context.python_version == crate::PythonVersion::Py312 {
+                self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
+                self.assembler.mark_last_as_converted_pop_block();
+            }
+            let pop_except = self.assembler.label();
+            self.assembler.mark(pop_except);
+            self.emit(POP_EXCEPT, 0, -1)?;
+            let after = self.assembler.label();
+            self.assembler.mark_loop_finally_region_boundary(after);
+            unwinds.push(FinallyEndUnwind {
+                before,
+                pop_except,
+                after,
+            });
+        }
+        Ok(unwinds)
+    }
+
+    /// Retire each exceptional-finally owner at its cleanup boundary, preserving
+    /// enclosing regions through any manager exit that still runs inside them.
+    fn record_finally_end_unwind_regions(
+        &self,
+        context: LoopContext,
+        from_depth: usize,
+        unwinds: &[FinallyEndUnwind],
+        exclusion_lengths: &[usize],
+        region_starts: &mut [Option<(Label, usize)>],
+        active_manager_depth: usize,
+        preserve_existing: bool,
+    ) {
+        if unwinds.is_empty() {
+            return;
+        }
+        let owners = &self.control.finally.finally_end_region_indices
+            [from_depth..self.control.finally.active_finally_end_blocks];
+        let first_region = self.first_finally_end_unwind_region(context, from_depth);
+        for (index, region_start) in region_starts.iter_mut().enumerate().skip(first_region) {
+            if (preserve_existing && region_start.is_some())
+                || (!preserve_existing
+                    && region_start.is_none()
+                    && self
+                        .control
+                        .finally
+                        .active_loop_finally_contexts
+                        .iter()
+                        .filter(|finally| finally.loop_depth >= self.control.loops.contexts.len())
+                        .any(|finally| index < finally.exception_region_depth))
+                || self.control.withs.active_with_exits[context.with_depth..active_manager_depth]
+                    .iter()
+                    .any(|manager| index < manager.exception_region_depth)
+            {
+                // An enclosing region stays active through an inner manager's exit,
+                // even after a nested exceptional finally has popped its handler.
+                continue;
+            }
+            let start = if let Some(owner) = owners.iter().position(|&owner| owner == index) {
+                unwinds[owners.len() - owner - 1].pop_except
+            } else if let Some(owner) = owners.iter().position(|&owner| owner > index) {
+                unwinds[owners.len() - owner - 1].after
+            } else {
+                unwinds[0].before
+            };
+            *region_start = Some((start, exclusion_lengths[index]));
+        }
+    }
+
+    fn first_finally_end_unwind_region(&self, context: LoopContext, from_depth: usize) -> usize {
+        if from_depth > context.finally_end_depth {
+            self.control.finally.finally_end_region_indices[from_depth - 1] + 1
+        } else {
+            context.exception_region_depth
+        }
+    }
+
+    /// Keep exception state that a pending finalizer or manager still needs.
+    fn loop_retained_finally_end_depth(&self, context: LoopContext) -> usize {
+        let manager_depth = self
+            .control
+            .withs
+            .active_with_exits
+            .iter()
+            .skip(context.with_depth)
+            .map(|manager| manager.finally_end_depth)
+            .max()
+            .unwrap_or(context.finally_end_depth)
+            .max(context.finally_end_depth);
+        let handler_depth = self
+            .control
+            .exceptions
+            .active_exception_handlers
+            .iter()
+            .filter(|handler| handler.loop_depth >= self.control.loops.contexts.len())
+            .map(|handler| handler.finally_end_depth)
+            .max()
+            .unwrap_or(context.finally_end_depth);
+        self.control
+            .finally
+            .active_loop_finally_contexts
+            .iter()
+            .filter(|finally| finally.loop_depth >= self.control.loops.contexts.len())
+            .map(|finally| finally.finally_end_depth)
+            .max()
+            .unwrap_or(context.finally_end_depth)
+            .max(manager_depth)
+            .max(handler_depth)
+            .min(self.control.finally.active_finally_end_blocks)
     }
 
     /// Keeps a runtime condition before its copied normal exit from an ordinary try.
@@ -22191,18 +22550,18 @@ impl<'source> Compiler<'source> {
                     .record_exception_owner_continuation(body_start);
             }
             self.assembler.mark(body_start);
-            // Use ordinary handler unwinding while the target loop stays in the current
-            // finalizer context. Leaving a FINALLY_END also needs its cleanup interleaved
-            // with the handlers, so retain the existing path for those transfers.
+            // Use ordinary handler unwinding when this exit must also leave an enclosing
+            // handler or exceptional finally. The direct path only restores this handler.
             let use_enclosing_handler_unwind =
                 self.control.loops.contexts.last().is_some_and(|context| {
-                    context.finally_end_depth == self.control.finally.active_finally_end_blocks
-                }) && self
-                    .control
-                    .exceptions
-                    .active_exception_handlers
-                    .iter()
-                    .any(|handler| handler.loop_depth >= self.control.loops.contexts.len());
+                    context.finally_end_depth < self.control.finally.active_finally_end_blocks
+                        || self
+                            .control
+                            .exceptions
+                            .active_exception_handlers
+                            .iter()
+                            .any(|handler| handler.loop_depth >= self.control.loops.contexts.len())
+                });
             if matches!(handler.body.as_slice(), [Stmt::Continue(_)])
                 && !use_enclosing_handler_unwind
                 && self.control.loops.contexts.last().is_none_or(|context| {
@@ -24807,19 +25166,35 @@ impl<'source> Compiler<'source> {
             self.control.withs.active_with_exits.len(),
             self.control.loops.contexts.len(),
         );
+        let mut finally_end_region_indices =
+            self.control.finally.finally_end_region_indices.clone();
+        finally_end_region_indices.truncate(self.control.finally.active_finally_end_blocks);
+        finally_end_region_indices.push(
+            self.control
+                .exceptions
+                .active_exception_region_exclusions
+                .len()
+                - 1,
+        );
         self.with_control_override(
-            |control| &mut control.finally.exceptional_finally_continuation_depths,
-            Some(continuation_depths),
+            |control| &mut control.finally.finally_end_region_indices,
+            finally_end_region_indices,
             |compiler| {
-                compiler.with_control_counter(
-                    |control| &mut control.finally.active_finally_end_blocks,
+                compiler.with_control_override(
+                    |control| &mut control.finally.exceptional_finally_continuation_depths,
+                    Some(continuation_depths),
                     |compiler| {
-                        // This separate exceptional-finally array can inline its own
-                        // small RERAISE continuation despite an outer protected body.
-                        compiler.with_control_override(
-                            |control| &mut control.exceptions.prevent_try_exit_inlining,
-                            false,
-                            |compiler| compiler.compile_suite(body),
+                        compiler.with_control_counter(
+                            |control| &mut control.finally.active_finally_end_blocks,
+                            |compiler| {
+                                // This separate exceptional-finally array can inline its own
+                                // small RERAISE continuation despite an outer protected body.
+                                compiler.with_control_override(
+                                    |control| &mut control.exceptions.prevent_try_exit_inlining,
+                                    false,
+                                    |compiler| compiler.compile_suite(body),
+                                )
+                            },
                         )
                     },
                 )
@@ -25045,6 +25420,16 @@ impl<'source> Compiler<'source> {
             && statement.orelse.is_empty()
             && matches!(statement.body.as_slice(), [Stmt::Continue(_)])
             && matches!(statement.finalbody.as_slice(), [Stmt::Break(_)])
+            && self.control.loops.contexts.last().is_some_and(|context| {
+                self.control.finally.active_finally_end_blocks == context.finally_end_depth
+                    && self.control.withs.active_with_exits.len() == context.with_depth
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+                        == context.exception_region_depth
+            })
         {
             return self.compile_try_finally_continue_break(statement);
         }
@@ -27296,6 +27681,7 @@ impl<'source> Compiler<'source> {
                 loop_depth: self.control.loops.contexts.len(),
                 with_depth: self.control.withs.active_with_exits.len(),
                 handler_depth: self.control.exceptions.active_exception_handlers.len(),
+                finally_end_depth: self.control.finally.active_finally_end_blocks,
                 try_body_depth: self.control.exceptions.active_try_marker_slots.len(),
                 exception_region_depth: self
                     .control
@@ -29820,6 +30206,7 @@ impl<'source> Compiler<'source> {
                 .exceptions
                 .active_exception_region_exclusions
                 .len(),
+            finally_end_depth: self.control.finally.active_finally_end_blocks,
             normal_finally_depth: self.control.finally.active_normal_finally_bodies,
             loop_depth: self.control.loops.contexts.len(),
             preserves_none_condition_owner: remaining.is_empty()
@@ -30348,6 +30735,7 @@ impl<'source> Compiler<'source> {
                 .exceptions
                 .active_exception_region_exclusions
                 .len(),
+            finally_end_depth: self.control.finally.active_finally_end_blocks,
             normal_finally_depth: self.control.finally.active_normal_finally_bodies,
             loop_depth: self.control.loops.contexts.len(),
             preserves_none_condition_owner: false,

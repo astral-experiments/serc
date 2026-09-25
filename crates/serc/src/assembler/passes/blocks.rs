@@ -4276,6 +4276,38 @@ impl OptimizationPipeline {
         {
             exception_boundary_blocks[block.index()] = true;
         }
+        // Region endpoints can share a basic block after earlier simplification.
+        // Keep their instruction positions as well as their block membership so
+        // a nonempty range inside one block survives exit copying.
+        let mut region_label_offsets = FxHashMap::default();
+        let mut region_instruction_count = 0usize;
+        if !self.exception_regions.is_empty() {
+            for &block in &order {
+                for item in graph[block].items() {
+                    match item {
+                        Item::Label(label) => {
+                            region_label_offsets.insert(*label, region_instruction_count);
+                        }
+                        Item::Instruction(_) => region_instruction_count += 1,
+                    }
+                }
+            }
+        }
+        let empty_regions = self
+            .exception_regions
+            .iter()
+            .map(|region| {
+                let start = region_label_offsets
+                    .get(&region.start)
+                    .copied()
+                    .unwrap_or(0);
+                let end = region_label_offsets
+                    .get(&region.end)
+                    .copied()
+                    .unwrap_or(region_instruction_count);
+                start >= end
+            })
+            .collect::<Vec<_>>();
         let region_memberships = self
             .exception_regions
             .iter()
@@ -5889,6 +5921,12 @@ impl OptimizationPipeline {
             // inner exclusions still divide the successive POP_EXCEPT instructions below.
             copied_exception_regions.extend(self.exception_regions.iter().enumerate().filter_map(
                 |(index, region)| {
+                    // Empty or inverted ranges protect no instructions. In particular,
+                    // a copied start alias must not resurrect such a region across the
+                    // copied cleanup when its original end lies outside the array.
+                    if empty_regions[index] {
+                        return None;
+                    }
                     let start = copied_labels.get(&region.start).copied().or_else(|| {
                         (target_chain_end > target_position
                             && region_memberships[index].contains(&positions[target.index()]))

@@ -226,6 +226,7 @@ impl Assembler {
     }
 
     pub(in crate::assembler) fn into_optimization_pipeline(mut self) -> OptimizationPipeline {
+        self.prune_unused_loop_finally_region_boundaries();
         self.resolve_folded_condition_borrow_entries();
         let (mut graph, initial_reachable) = match self.code {
             UnoptimizedCode::Linear(items) => (
