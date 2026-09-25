@@ -29257,7 +29257,9 @@ impl<'source> Compiler<'source> {
 
         self.assembler
             .set_location(self.source_location(statement.range));
-        self.emit(NOP, 0, 0)?;
+        // The empty protected body and its overridden continue leave line markers
+        // outside every enclosing exception owner in CPython's normalized CFG.
+        self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
         self.assembler.record_exception_setup(empty_protected, true);
         self.assembler.mark(empty_protected);
         self.assembler.add_exception_region(
@@ -29269,7 +29271,7 @@ impl<'source> Compiler<'source> {
         );
         self.assembler
             .set_location(self.source_location(continue_statement.range()));
-        self.emit(NOP, 0, 0)?;
+        self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
         self.assembler
             .set_location(self.source_location(break_statement.range()));
         self.emit_iterator_cleanup(context.iterator_cleanup, false)?;
