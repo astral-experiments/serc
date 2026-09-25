@@ -2,6 +2,51 @@ use crate::common;
 use crate::common::indent as indent_finally_borrow_case;
 
 #[test]
+fn conditional_nested_pass_recovery_reaches_following_loads() {
+    for (scope, call) in [
+        ("def", "operation(item)"),
+        ("async def", "operation(item)"),
+        ("async def", "await operation(item)"),
+    ] {
+        for condition in ["flag", "not flag"] {
+            for arm in ["pass", "work(item)"] {
+                for inner in ["except E:", "except E as error:"] {
+                    for outer in ["except F:", "except F as error:"] {
+                        for tail in ["use(item)", "return item"] {
+                            let source = format!(
+                                "{scope} f(flag, item):\n    try:\n        try:\n            if {condition}:\n                {arm}\n            else:\n                {call}\n        {inner}\n            pass\n    {outer}\n        pass\n    {tail}\n"
+                            );
+                            common::assert_matches_cpython_marshal(
+                                &source,
+                                "conditional_nested_pass_recovery.py",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for prefix in ["", "for item in items:"] {
+        for manager in ["", "with manager():", "async with async_manager():"] {
+            let mut body = String::from(
+                "try:\n    try:\n        if flag:\n            pass\n        else:\n            await operation(item, mode=1 if flag else 2)\n    except E:\n        pass\nexcept F as error:\n    pass\nif flag:\n    await finish(item)\n",
+            );
+            if !prefix.is_empty() {
+                body = format!("{prefix}\n{}", indent_finally_borrow_case(&body));
+            }
+            if !manager.is_empty() {
+                body = format!("{manager}\n{}", indent_finally_borrow_case(&body));
+            }
+            let source = format!(
+                "async def f(flag, item, items):\n{}",
+                indent_finally_borrow_case(&body)
+            );
+            common::assert_matches_cpython_marshal(&source, "managed_nested_pass_recovery.py");
+        }
+    }
+}
+
+#[test]
 fn matches_cpython_completed_handler_for_borrowing() {
     for protected_loop in [false, true] {
         let protected = if protected_loop {
