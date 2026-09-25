@@ -26,6 +26,7 @@ mod class_comprehension_cells;
 mod class_comprehension_free_scope;
 mod class_footer_predecessors;
 mod class_pattern_wildcard_locations;
+mod class_private_global_aliases;
 mod class_static_attribute_ownership;
 mod cleanup_interrupt_checks;
 mod cleanup_throw_stack_depth;

@@ -29,7 +29,7 @@ impl Compiler<'_> {
         self.scope_arena()
             .class(self.unit.scope_id)
             .is_some_and(|plan| {
-                if self.unit.mangled_names.is_some() && !plan.globals.is_empty() {
+                if !plan.globals.is_empty() {
                     let name = self.mangled_name_cow(self.resolve_name(name));
                     plan.canonical_globals
                         .contains(&self.required_name_id(&name))
@@ -1312,13 +1312,11 @@ impl ClassPlan {
                 .map(|name| mangle_name(name.as_str(), private_name))
                 .collect::<FxHashSet<_>>()
         });
-        let global_names = private_name.map(|_| {
-            locals
-                .globals
-                .iter()
-                .map(|name| mangle_name(name, private_name))
-                .collect::<FxHashSet<_>>()
-        });
+        let global_names = locals
+            .globals
+            .iter()
+            .map(|name| mangle_name(name, Some(definition.name.as_str())))
+            .collect::<FxHashSet<_>>();
         let nonlocal_names = private_name.map(|_| {
             locals
                 .nonlocals
@@ -1333,10 +1331,7 @@ impl ClassPlan {
             )
         };
         let is_global = |name: &str| {
-            global_names.as_ref().map_or_else(
-                || locals.globals.contains(name),
-                |names| names.contains(mangle_name(name, private_name).as_ref()),
-            )
+            global_names.contains(mangle_name(name, Some(definition.name.as_str())).as_ref())
         };
         let is_nonlocal = |name: &str| {
             nonlocal_names.as_ref().map_or_else(
@@ -2475,7 +2470,9 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
             Stmt::Global(statement) => {
                 for name in &statement.names {
                     self.intern(name.as_str());
-                    self.facts.module_globals.insert(name.as_str().to_string());
+                    self.facts.module_globals.insert(
+                        mangle_name(name.as_str(), self.private_name.as_deref()).into_owned(),
+                    );
                 }
             }
             Stmt::Nonlocal(statement) => {

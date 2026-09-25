@@ -238,17 +238,13 @@ impl Compiler<'_> {
                     self.emit(LOAD_NAME, index, 1)
                 }
             }
-            Scope::Class {
-                globals,
-                free_indices,
-                ..
-            } => {
+            Scope::Class { free_indices, .. } => {
                 let in_comprehension = !self
                     .control
                     .comprehensions
                     .active_comprehension_local_names
                     .is_empty();
-                if globals.contains(name_id)
+                if self.class_scope_declares_global(name_id)
                     && !(in_comprehension && free_indices.contains_key(&name_id))
                 {
                     let index = self.name_index_with_id(name, name_id)?;
@@ -417,12 +413,11 @@ impl Compiler<'_> {
                 }
             }
             Scope::Class {
-                globals,
                 nonlocals,
                 free_indices,
                 ..
             } => {
-                if globals.contains(name_id) {
+                if self.class_scope_declares_global(name_id) {
                     let index = self.name_index_with_id(name, name_id)?;
                     self.emit(global, index, effect)
                 } else if nonlocals.contains(name_id) {
@@ -729,7 +724,15 @@ impl Compiler<'_> {
         }
         match &self.unit.scope {
             Scope::Module => name.to_string(),
-            Scope::Class { globals, .. } | Scope::Function { globals, .. }
+            Scope::Class { .. }
+                if honor_explicit_global
+                    && self
+                        .name_id(name)
+                        .is_some_and(|name| self.class_scope_declares_global(name)) =>
+            {
+                name.to_string()
+            }
+            Scope::Function { globals, .. }
                 if honor_explicit_global && self.contains_name(globals, name) =>
             {
                 name.to_string()
