@@ -1,3 +1,7 @@
+mod with_unwind;
+
+use with_unwind::WithUnwind;
+
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
 use ruff_python_ast::{BoolOp, CmpOp, Expr, Pattern, Stmt, UnaryOp};
 use ruff_text_size::{Ranged, TextRange};
@@ -222,13 +226,6 @@ struct WithExitContext {
     normal_finally_depth: usize,
     loop_depth: usize,
     preserves_none_condition_owner: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct WithUnwind {
-    index: usize,
-    start: Label,
-    exclusion_count: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1440,32 +1437,6 @@ impl<'source> Compiler<'source> {
     ) -> Result<(T, RegionExclusions), CompileError> {
         let (value, exclusions) = self.with_control_stack(select, Vec::new(), compile)?;
         Ok((value, exclusions))
-    }
-
-    fn with_with_context<T>(
-        &mut self,
-        mut context: WithExitContext,
-        terminal: bool,
-        compile: impl FnOnce(&mut Self) -> Result<T, CompileError>,
-    ) -> Result<T, CompileError> {
-        let previous_depth = self.control.withs.active_with_exits.len();
-        let previous_terminal_withs = self.control.withs.active_terminal_withs;
-        // The `as` target is compiled before the context becomes active and can itself suspend.
-        // Capture the epoch at the same push boundary as the former parallel epoch stack.
-        context.suspension_epoch = self.control.generators.coroutine_suspension_epoch;
-        self.control.withs.active_with_exits.push(context);
-        self.control.withs.active_terminal_withs += usize::from(terminal);
-        let result = compile(self);
-        self.control.withs.active_terminal_withs = previous_terminal_withs;
-        debug_assert!(
-            result.is_err() || self.control.withs.active_with_exits.len() == previous_depth + 1,
-            "with contexts should be balanced"
-        );
-        self.control
-            .withs
-            .active_with_exits
-            .truncate(previous_depth);
-        result
     }
 
     fn with_statement_context<R>(
@@ -4960,14 +4931,9 @@ impl<'source> Compiler<'source> {
                             exclusions.push((start, exclusion_end));
                         }
                     }
-                    for unwind in with_unwind_starts {
-                        let exclusions =
-                            &mut self.control.withs.active_with_region_exclusions[unwind.index];
-                        // Copied cleanup can append narrower exclusions after this manager has
-                        // already exited. The complete unwind exclusion subsumes those ranges.
-                        exclusions.truncate(unwind.exclusion_count);
-                        exclusions.push((unwind.start, exclusion_end));
-                    }
+                    self.control
+                        .withs
+                        .finish_unwinds(with_unwind_starts, exclusion_end);
                 }
                 self.set_depth(unreachable_depth);
             }
@@ -5505,14 +5471,9 @@ impl<'source> Compiler<'source> {
                             exclusions.push((start, exclusion_end));
                         }
                     }
-                    for unwind in with_unwind_starts {
-                        let exclusions =
-                            &mut self.control.withs.active_with_region_exclusions[unwind.index];
-                        // Copied cleanup can append narrower exclusions after this manager has
-                        // already exited. The complete unwind exclusion subsumes those ranges.
-                        exclusions.truncate(unwind.exclusion_count);
-                        exclusions.push((unwind.start, exclusion_end));
-                    }
+                    self.control
+                        .withs
+                        .finish_unwinds(with_unwind_starts, exclusion_end);
                 }
                 self.set_depth(starting_depth);
             }
@@ -7324,11 +7285,7 @@ impl<'source> Compiler<'source> {
                             )?;
                             if let Some(region_starts) = &mut handler_region_unwind_starts {
                                 for unwind in &starts {
-                                    for region_start in
-                                        &mut region_starts[manager.exception_region_depth..]
-                                    {
-                                        region_start.get_or_insert(unwind.start);
-                                    }
+                                    unwind.record_exception_starts(region_starts);
                                 }
                             }
                             with_unwind_starts.extend(starts);
@@ -7389,11 +7346,7 @@ impl<'source> Compiler<'source> {
                             )?;
                             if let Some(region_starts) = &mut handler_region_unwind_starts {
                                 for unwind in &starts {
-                                    for region_start in
-                                        &mut region_starts[context.exception_region_depth..]
-                                    {
-                                        region_start.get_or_insert(unwind.start);
-                                    }
+                                    unwind.record_exception_starts(region_starts);
                                 }
                             }
                             with_unwind_starts.extend(starts);
@@ -8185,11 +8138,7 @@ impl<'source> Compiler<'source> {
                             // Record that boundary before the later iterator cleanup
                             // can fill the same still-empty region-start slots.
                             for unwind in &starts {
-                                let depth = self.control.withs.active_with_exits[unwind.index]
-                                    .exception_region_depth;
-                                for region_start in &mut region_starts[depth..] {
-                                    region_start.get_or_insert(unwind.start);
-                                }
+                                unwind.record_exception_starts(region_starts);
                             }
                         }
                         if interleaved_sync_manager_return {
@@ -8428,11 +8377,7 @@ impl<'source> Compiler<'source> {
                     )?);
                     if let Some(region_starts) = &mut handler_region_unwind_starts {
                         for unwind in &starts {
-                            let depth = self.control.withs.active_with_exits[unwind.index]
-                                .exception_region_depth;
-                            for region_start in &mut region_starts[depth..] {
-                                region_start.get_or_insert(unwind.start);
-                            }
+                            unwind.record_exception_starts(region_starts);
                         }
                         let start = self.assembler.label();
                         self.assembler.mark(start);
@@ -10457,12 +10402,8 @@ impl<'source> Compiler<'source> {
                     if tracks_iterator_region_unwinds
                         && let Some(region_starts) = &mut handler_region_unwind_starts
                     {
-                        let depth =
-                            self.control.withs.active_with_exits[with_index].exception_region_depth;
                         for unwind in &starts {
-                            for region_start in &mut region_starts[depth..] {
-                                region_start.get_or_insert(unwind.start);
-                            }
+                            unwind.record_exception_starts(region_starts);
                         }
                     }
                     remaining_with_starts.extend(starts);
@@ -10550,11 +10491,7 @@ impl<'source> Compiler<'source> {
                 }
                 if let Some(region_starts) = &mut handler_region_unwind_starts {
                     for unwind in &remaining_with_starts {
-                        let depth = self.control.withs.active_with_exits[unwind.index]
-                            .exception_region_depth;
-                        for region_start in &mut region_starts[depth..] {
-                            region_start.get_or_insert(unwind.start);
-                        }
+                        unwind.record_exception_starts(region_starts);
                     }
                 }
                 with_unwind_starts.extend(remaining_with_starts);
@@ -10874,11 +10811,7 @@ impl<'source> Compiler<'source> {
                         let exclusion_start = with_unwind_starts
                             [..with_unwind_before_exception_start]
                             .iter()
-                            .find(|unwind| {
-                                index
-                                    >= self.control.withs.active_with_exits[unwind.index]
-                                        .exception_region_depth
-                            })
+                            .find(|unwind| unwind.exits_exception_region(index))
                             .map_or(exclusion_start, |unwind| unwind.start);
                         let exclusion_start = nested_finally_region_unwind_start
                             .filter(|(cutoff, _)| index >= *cutoff)
@@ -10910,14 +10843,9 @@ impl<'source> Compiler<'source> {
                 if !with_unwind_starts.is_empty() {
                     let unwind_end = self.assembler.label();
                     self.assembler.mark(unwind_end);
-                    for unwind in with_unwind_starts {
-                        let exclusions =
-                            &mut self.control.withs.active_with_region_exclusions[unwind.index];
-                        // Copied cleanup can append narrower exclusions after this manager has
-                        // already exited. The complete unwind exclusion subsumes those ranges.
-                        exclusions.truncate(unwind.exclusion_count);
-                        exclusions.push((unwind.start, unwind_end));
-                    }
+                    self.control
+                        .withs
+                        .finish_unwinds(with_unwind_starts, unwind_end);
                 }
                 self.set_depth(starting_depth);
             }
@@ -13417,58 +13345,6 @@ impl<'source> Compiler<'source> {
                 .is_empty()
     }
 
-    /// Python 3.14 replaced the bound exit callable with a callable/self pair.
-    fn with_exit_stack_slots(&self) -> i32 {
-        if self.context.python_version <= crate::PythonVersion::Py313 {
-            1
-        } else {
-            2
-        }
-    }
-
-    fn emit_with_exit_call(&mut self) -> Result<(), CompileError> {
-        let slots = self.with_exit_stack_slots();
-        self.emit(CALL, (slots + 1).cast_unsigned(), -slots - 2)
-    }
-
-    fn emit_with_unwind(
-        &mut self,
-        from_depth: usize,
-        to_depth: usize,
-        preserve_tos: bool,
-        origin: super::legacy_native_labels::WithAwait,
-    ) -> Result<Vec<WithUnwind>, CompileError> {
-        let mut unwind_starts = Vec::with_capacity(to_depth - from_depth);
-        for index in (from_depth..to_depth).rev() {
-            let context = self.control.withs.active_with_exits[index];
-            let start = self.assembler.label();
-            self.assembler.mark(start);
-            unwind_starts.push(WithUnwind {
-                index,
-                start,
-                exclusion_count: self.control.withs.active_with_region_exclusions[index].len(),
-            });
-            self.assembler.set_location(context.location);
-            if preserve_tos {
-                if self.with_exit_stack_slots() == 2 {
-                    self.emit(SWAP, 3, 0)?;
-                }
-                self.emit(SWAP, 2, 0)?;
-            }
-            let none = self.add_constant(Constant::None)?;
-            self.emit(LOAD_CONST, none, 1)?;
-            self.emit(LOAD_CONST, none, 1)?;
-            self.emit(LOAD_CONST, none, 1)?;
-            self.emit_with_exit_call()?;
-            if context.is_async {
-                let roles = Some(origin.roles(context.source_range));
-                self.compile_awaitable_on_stack_with_native_roles(2, roles)?;
-            }
-            self.emit(POP_TOP, 0, -1)?;
-        }
-        Ok(unwind_starts)
-    }
-
     /// Drop an iterator's target-specific stack slots while preserving a return value.
     fn emit_iterator_cleanup(
         &mut self,
@@ -14396,13 +14272,10 @@ impl<'source> Compiler<'source> {
     ) -> Result<(), CompileError> {
         let starts = self.emit_with_unwind(with_depth, *next_with, false, origin)?;
         for unwind in &starts {
-            let depth = self.control.withs.active_with_exits[unwind.index].exception_region_depth;
-            for (index, region_start) in region_unwind_starts.iter_mut().enumerate().skip(depth) {
-                region_start.get_or_insert((
-                    unwind.start,
-                    self.control.exceptions.active_exception_region_exclusions[index].len(),
-                ));
-            }
+            unwind.record_exception_starts_with_checkpoints(
+                region_unwind_starts,
+                &self.control.exceptions.active_exception_region_exclusions,
+            );
         }
         *next_with = with_depth;
         with_unwind_starts.extend(starts);
