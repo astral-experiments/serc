@@ -20482,7 +20482,8 @@ impl<'source> Compiler<'source> {
                     || (body_noop_location.is_some()
                         && self.context.python_version >= crate::PythonVersion::Py314
                         && (self.control.finally.active_overriding_finally_returns > 0
-                            || ((pass_only_handlers
+                            || (((pass_only_handlers
+                                && self.control.finally.active_finally_try_bodies == 0)
                                 || exception_policy == ExceptionPolicy::EXCLUDE_ALWAYS)
                                 && !self.control.exceptions.prevent_try_exit_inlining))))
             {
