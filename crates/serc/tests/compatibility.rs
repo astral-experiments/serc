@@ -15587,3 +15587,188 @@ fn matches_cpython_exceptional_finally_iterator_depth_boundaries() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn nested_finally_boolean_marker_does_not_catch_trace_exception() {
+    let source = r"import dis
+import sys
+
+def consume(value):
+    pass
+
+def f(flag):
+    for _ in range(2):
+        try:
+            try:
+                consume('body')
+            finally:
+                try:
+                    consume('finally')
+                    break
+                finally:
+                    flag and consume(1)
+        except Exception:
+            consume('except')
+
+def trace(frame, event, arg):
+    if event == 'call' and frame.f_code is f.__code__:
+        frame.f_trace_opcodes = True
+        frame.f_trace_lines = False
+        return trace
+    if event == 'opcode' and frame.f_code is f.__code__:
+        if frame.f_code.co_code[frame.f_lasti] == dis.opmap['NOT_TAKEN']:
+            raise ValueError('trace')
+    return trace
+
+sys.settrace(trace)
+f(False)
+sys.settrace(None)
+try:
+    sys.settrace(trace)
+    f(True)
+except ValueError:
+    print('propagated')
+else:
+    print('swallowed')
+finally:
+    sys.settrace(None)
+";
+    common::assert_executes(source, "propagated\n");
+}
+
+#[test]
+fn nested_finally_call_marker_does_not_catch_trace_exception() {
+    let source = r"import dis
+import sys
+
+def consume(value):
+    return value
+
+def f(flag):
+    for _ in range(2):
+        try:
+            try:
+                consume('body')
+            finally:
+                try:
+                    consume('finally')
+                    consume(flag)
+                    break
+                finally:
+                    if consume(flag):
+                        consume(1)
+        except Exception:
+            consume('except')
+
+def trace(frame, event, arg):
+    if event == 'call' and frame.f_code is f.__code__:
+        frame.f_trace_opcodes = True
+        frame.f_trace_lines = False
+        return trace
+    if event == 'opcode' and frame.f_code is f.__code__:
+        if frame.f_code.co_code[frame.f_lasti] == dis.opmap['NOT_TAKEN']:
+            raise ValueError('trace')
+    return trace
+
+sys.settrace(trace)
+f(False)
+sys.settrace(None)
+try:
+    sys.settrace(trace)
+    f(True)
+except ValueError:
+    print('propagated')
+else:
+    print('swallowed')
+finally:
+    sys.settrace(None)
+";
+    common::assert_executes(source, "propagated\n");
+    let bytecode_source = r"def f(log, flag):
+    for i in range(2):
+        try:
+            try:
+                consume('body')
+            finally:
+                try:
+                    consume('finally')
+                    consume(flag)
+                    break
+                finally:
+                    if consume(flag):
+                        consume(1)
+        except Exception:
+            consume('except')
+    return log
+";
+    common::assert_matches_cpython_marshal(bytecode_source, "nested_finally_call_marker.py");
+}
+
+#[test]
+fn finally_break_keeps_enclosing_handler_for_manager_exit() {
+    let source = r"class Manager:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        raise ValueError('exit failed')
+
+def f(items):
+    for item in items:
+        try:
+            with Manager():
+                try:
+                    raise RuntimeError('work failed')
+                finally:
+                    break
+        except ValueError:
+            print('caught')
+
+f([1])
+";
+    common::assert_executes(source, "caught\n");
+    common::assert_matches_cpython_marshal(source, "finally_break_manager_exit_error.py");
+}
+
+#[test]
+fn finally_break_keeps_enclosing_handler_for_outer_cleanup() {
+    let source = r"def cleanup():
+    print('cleanup')
+    raise ValueError('cleanup failed')
+
+for item in range(1):
+    try:
+        try:
+            try:
+                raise RuntimeError('work failed')
+            finally:
+                break
+        finally:
+            cleanup()
+    except ValueError:
+        print('caught')
+";
+    common::assert_executes(source, "cleanup\ncaught\n");
+    common::assert_matches_cpython_marshal(source, "finally_break_outer_cleanup_error.py");
+}
+
+#[test]
+fn finally_break_keeps_enclosing_handler_for_nested_cleanup() {
+    let source = r"def cleanup():
+    raise ValueError('cleanup failed')
+
+for i in range(1):
+    try:
+        try:
+            pass
+        finally:
+            try:
+                break
+            finally:
+                cleanup()
+    except ValueError:
+        print('caught')
+";
+    common::assert_executes(source, "caught\n");
+    common::assert_matches_cpython_marshal(source, "finally_break_nested_cleanup_error.py");
+}

@@ -3789,6 +3789,26 @@ impl Assembler {
         self.linear_items().len()
     }
 
+    /// Count earlier exclusions that end before the next cleanup boundary.
+    pub(crate) fn exclusions_ending_before(
+        &self,
+        exclusions: &[(Label, Label)],
+        boundary: Label,
+    ) -> usize {
+        if exclusions.is_empty() {
+            return 0;
+        }
+        let items = self.linear_items();
+        let Some(boundary_index) = items.iter().position(|item| *item == Item::Label(boundary))
+        else {
+            return 0;
+        };
+        exclusions
+            .iter()
+            .take_while(|(_, end)| items[..boundary_index].contains(&Item::Label(*end)))
+            .count()
+    }
+
     fn indexed_instruction_at(&self, instruction_offset: usize) -> Option<(usize, &Instruction)> {
         let items = self.linear_items();
         if instruction_offset >= self.instruction_count {
@@ -6115,6 +6135,44 @@ impl Assembler {
         self.exception_owner_provenance
             .return_region_reentries
             .insert(boundary);
+    }
+
+    /// Marks a coverage-only boundary in an exceptional-finally loop unwind.
+    pub(crate) fn mark_loop_finally_region_boundary(&mut self, boundary: Label) {
+        self.mark(boundary);
+        self.exception_owner_provenance
+            .loop_finally_region_boundaries
+            .insert(boundary);
+    }
+
+    /// Drop unused coverage-only labels before they split original basic blocks.
+    fn prune_unused_loop_finally_region_boundaries(&mut self) {
+        let boundaries = &self
+            .exception_owner_provenance
+            .loop_finally_region_boundaries;
+        if boundaries.is_empty() {
+            return;
+        }
+        let UnoptimizedCode::Linear(items) = &mut self.code else {
+            return;
+        };
+        let mut used = self
+            .exception_regions
+            .iter()
+            .flat_map(|region| [region.start, region.end, region.target])
+            .collect::<FxHashSet<_>>();
+        used.extend(self.preserved_block_boundaries.iter().copied());
+        for item in items.iter() {
+            if let Item::Instruction(instruction) = item {
+                match instruction.operand() {
+                    Operand::Forward(label) | Operand::Backward(label) => {
+                        used.insert(label);
+                    }
+                    Operand::Value(_) | Operand::Deferred(_) => {}
+                }
+            }
+        }
+        items.retain(|item| !matches!(item, Item::Label(label) if boundaries.contains(label) && !used.contains(label)));
     }
 
     /// Captures a copied finalizer's donor across only artificial iterator disposal.
@@ -16170,6 +16228,7 @@ impl Assembler {
     }
 
     pub(crate) fn used_constant_indices(&mut self, constant_count: usize) -> Vec<bool> {
+        self.prune_unused_loop_finally_region_boundaries();
         self.resolve_folded_condition_borrow_entries();
         if let UnoptimizedCode::Prepared { graph, reachable } = &self.code {
             return reachable_constant_indices(graph, reachable, constant_count);
