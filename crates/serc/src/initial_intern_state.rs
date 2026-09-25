@@ -11,7 +11,8 @@ use crate::target::is_preinterned_string_for;
 /// CPython can reuse strings interned by its bootstrap or earlier imports when it
 /// assembles code objects. This can affect marshal object sharing even when code
 /// fields compare equal. The default preserves Serc's isolated CPython startup
-/// model. [`Self::new`] supplements that model with existing canonical strings;
+/// model, whose exact native build and bootstrap are recorded in the target
+/// metadata. [`Self::new`] supplements that model with existing canonical strings;
 /// [`Self::from_complete`] uses exactly the supplied entries. [`Self::from_partial`]
 /// leaves every unproved entry unknown and rejects byte-relevant uncertainty.
 /// [`Self::from_partial_with_absence`] also accepts an immutable absence proof.
