@@ -66,17 +66,20 @@ Profiles are generated artifacts, not source-controlled corpus word lists.
 
 A `standard-caller-source-proof` is a separate version 1 document. The
 [source-proof reader](standard_caller_profile.rs) requires an independently
-reviewed artifact hash, the exact target and unchanged oracle, complete source
-coverage, and a matching runtime admission. A document cannot grant itself
-admission by declaring its closure complete.
+reviewed artifact hash and state semantics, the exact target and unchanged
+oracle, proved retained-entry ownership, and a matching runtime admission. A
+document cannot grant itself admission by declaring its proof complete.
 
-The proof distinguishes guaranteed retained strings from all possibly present
-ASCII words. An absent ASCII word is known absent only when the complete source
-closure proves that fact. Other strings remain unknown. Python 3.12 and 3.13 add
-the current filename's retained POSIX components independently for each input;
-Python 3.14 and 3.15 do not apply that earlier pathlib behavior. All standard
-profiles require filenames whose spelling is already canonical for the unchanged
-pathlib oracle.
+A `guaranteed-retained-partial` proof supplies only guaranteed retained strings;
+every unproved entry remains unknown. A separately admitted
+`retained-with-absence` proof also establishes a complete possible-ASCII-word
+closure and can prove that words outside it are absent. Neither the possible
+word inventory nor an incomplete closure can supply absence facts in partial
+mode. Byte-relevant unknown membership always fails validation. Python 3.12 and
+3.13 add the current filename's retained POSIX components independently for each
+input; Python 3.14 and 3.15 do not apply that earlier pathlib behavior. All
+standard profiles require filenames whose spelling is already canonical for the
+unchanged pathlib oracle.
 
 Runtime qualification occurs once per run. The preparer verifies the exact
 interpreter, library, and standard-library files, then creates an owned
