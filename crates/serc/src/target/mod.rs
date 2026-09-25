@@ -64,7 +64,9 @@ pub(crate) const fn is_scope_exit(opcode: Opcode) -> bool {
     cpython_3_14_5::is_scope_exit(opcode) || matches!(opcode, opcodes::RETURN_CONST)
 }
 
-/// An opcode for the selected CPython target.
+/// An instruction identity in the compiler's semantic IR.
+///
+/// Use [`Opcode::code_for`] to obtain its wire opcode for a specific CPython release.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct Opcode {
     code: u8,
