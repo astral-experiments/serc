@@ -14,10 +14,6 @@ def find_serc_bin() -> str:
     serc_exe = "serc" + sysconfig.get_config_var("EXE")
 
     targets = [
-        # The scripts directory for the current Python
-        sysconfig.get_path("scripts"),
-        # The scripts directory for the base prefix
-        sysconfig.get_path("scripts", vars={"base": sys.base_prefix}),
         # Above the package root, e.g., from `pip install --prefix`
         (
             # On Windows, with module path `<prefix>/Lib/site-packages/serc`
@@ -34,6 +30,10 @@ def find_serc_bin() -> str:
         # Adjacent to the package root, e.g., from `pip install --target`
         # with module path `<target>/serc`
         _join(_matching_parents(_module_path(), "serc"), "bin"),
+        # The scripts directory for the current Python
+        sysconfig.get_path("scripts"),
+        # The scripts directory for the base prefix
+        sysconfig.get_path("scripts", vars={"base": sys.base_prefix}),
         # The user scheme scripts directory, e.g., `~/.local/bin`
         sysconfig.get_path("scripts", scheme=_user_scheme()),
     ]

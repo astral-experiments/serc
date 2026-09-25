@@ -40,6 +40,38 @@ def main() -> None:
                     f"Expected argument error exit code 2, got {result.returncode}"
                 )
 
+        # A target installation must use its own executable even when this
+        # Python environment also contains an installed copy of Serc.
+        target = root / "target"
+        subprocess.run(
+            [
+                python,
+                "-m",
+                "pip",
+                "install",
+                "--no-index",
+                "--no-deps",
+                "--target",
+                target,
+                wheels[0],
+            ],
+            cwd=root,
+            check=True,
+        )
+        result = subprocess.run(
+            [python, "-c", "import serc; print(serc.find_serc_bin())"],
+            cwd=root,
+            env={**os.environ, "PYTHONPATH": str(target)},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        expected = target / "bin" / binary.name
+        if Path(result.stdout.strip()).resolve() != expected.resolve():
+            sys.exit(
+                f"Target installation selected {result.stdout.strip()}, not {expected}"
+            )
+
 
 if __name__ == "__main__":
     main()
