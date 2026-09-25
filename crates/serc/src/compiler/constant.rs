@@ -2,10 +2,10 @@ use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::hash::{Hash, Hasher};
 
-use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
+use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
 use ruff_python_ast::{
     BoolOp, Expr, ExprBinOp, ExprContext, ExprStringLiteral, ExprUnaryOp, FStringPartRef,
-    InterpolatedStringElement, Number, Operator, Stmt, UnaryOp,
+    InterpolatedStringElement, Number, Operator, Pattern, Singleton, Stmt, UnaryOp,
 };
 use ruff_text_size::Ranged;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
@@ -3777,12 +3777,13 @@ fn first_constant(
             if self.is_complete() {
                 return;
             }
-            if self.compiler.context.python_version <= PythonVersion::Py313
+            if (self.compiler.context.python_version <= PythonVersion::Py313
+                || self.include_implicit_constants)
                 && matches!(statement, Stmt::Expr(expression)
                     if self.compiler.return_value_is_constant(&expression.value))
             {
-                // A Constant expression statement is discarded by code generation,
-                // before it can reserve the first entry in the legacy constant table.
+                // A discarded constant expression does not reserve the first
+                // code-generation constant when searching a terminal loop body.
                 return;
             }
             if matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
@@ -3967,6 +3968,64 @@ fn first_constant(
                 _ => {}
             }
             walk_stmt(self, statement);
+        }
+
+        fn visit_pattern(&mut self, pattern: &'ast Pattern) {
+            if self.is_complete() {
+                return;
+            }
+            if self.include_implicit_constants
+                && self.compiler.context.python_version >= PythonVersion::Py314
+            {
+                match pattern {
+                    Pattern::MatchSequence(sequence) => {
+                        let starred = sequence
+                            .patterns
+                            .iter()
+                            .any(|pattern| matches!(pattern, Pattern::MatchStar(_)));
+                        if !starred || sequence.patterns.len() > 1 {
+                            let length = sequence.patterns.len() - usize::from(starred);
+                            self.constant =
+                                Some(Constant::Int(u64::try_from(length).unwrap_or(u64::MAX)));
+                            return;
+                        }
+                    }
+                    Pattern::MatchMapping(mapping) if !mapping.keys.is_empty() => {
+                        self.constant = Some(Constant::Int(
+                            u64::try_from(mapping.keys.len()).unwrap_or(u64::MAX),
+                        ));
+                        return;
+                    }
+                    Pattern::MatchMapping(mapping) if mapping.rest.is_some() => {
+                        self.constant = Some(Constant::Tuple(Vec::new()));
+                        return;
+                    }
+                    Pattern::MatchClass(class) => {
+                        self.visit_expr(&class.cls);
+                        if !self.is_complete() {
+                            self.constant = Some(Constant::Tuple(
+                                class
+                                    .arguments
+                                    .keywords
+                                    .iter()
+                                    .map(|keyword| Constant::String(keyword.attr.to_string()))
+                                    .collect(),
+                            ));
+                        }
+                        return;
+                    }
+                    Pattern::MatchSingleton(singleton) => {
+                        self.constant = Some(match singleton.value {
+                            Singleton::None => Constant::None,
+                            Singleton::True => Constant::Bool(true),
+                            Singleton::False => Constant::Bool(false),
+                        });
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            walk_pattern(self, pattern);
         }
 
         fn visit_expr(&mut self, expression: &'ast Expr) {
