@@ -351,6 +351,19 @@ impl crate::assembler::ConstantTable for OutputState {
             seen: &mut [bool],
             order: &mut Vec<u32>,
         ) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| {
+                    append_folded_dependencies(
+                        constant,
+                        pool,
+                        dependencies,
+                        first_deferred,
+                        used,
+                        seen,
+                        order,
+                    );
+                });
+            }
             if let Some((_, operands)) = dependencies
                 .iter()
                 .find(|(result, _)| ConstantEquality::PoolKey.equal(result, constant))
@@ -547,6 +560,10 @@ pub(super) fn can_order_early_boolean_admissions(body: &[Stmt]) -> bool {
         }
 
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             if !self.certified {
                 return;
             }
@@ -594,6 +611,10 @@ fn collect_early_boolean_admissions(expression: &Expr, admissions: &mut Vec<bool
     struct Collector<'a>(&'a mut Vec<bool>);
     impl<'ast> Visitor<'ast> for Collector<'_> {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             walk_expr(self, expression);
             if let Expr::UnaryOp(unary) = expression
                 && unary.op == UnaryOp::Not
@@ -745,6 +766,9 @@ impl Compiler<'_> {
     }
 
     pub(super) fn record_folded_operands(&mut self, expression: &Expr) -> Result<(), CompileError> {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.record_folded_operands(expression));
+        }
         match expression {
             Expr::BinOp(binary) => {
                 self.record_folded_value(&binary.left)?;
@@ -830,6 +854,9 @@ impl OutputState {
             seen: &mut Vec<Constant>,
             collected: &mut Vec<(Constant, Vec<Constant>)>,
         ) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| collect(constant, dependencies, seen, collected));
+            }
             if seen
                 .iter()
                 .any(|value| ConstantEquality::PoolKey.equal(value, constant))
@@ -947,6 +974,9 @@ impl Compiler<'_> {
     }
 
     pub(super) fn record_folded_value(&mut self, expression: &Expr) -> Result<(), CompileError> {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.record_folded_value(expression));
+        }
         let literal = match expression {
             Expr::StringLiteral(string) => Some(self.string_literal_constant(string)),
             _ => literal_constant(expression),
@@ -1252,6 +1282,9 @@ impl Compiler<'_> {
 
 /// Returns whether a binary-expression tree contains only primitive literal leaves.
 fn is_literal_binary_tree(expression: &Expr) -> bool {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| is_literal_binary_tree(expression));
+    }
     match expression {
         Expr::BinOp(binary) => {
             is_literal_binary_tree(&binary.left) && is_literal_binary_tree(&binary.right)
@@ -1282,6 +1315,9 @@ pub(super) fn folded_constant_owner_slots(
     python_version: PythonVersion,
 ) -> usize {
     fn direct(expression: &Expr, python_version: PythonVersion) -> usize {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| direct(expression, python_version));
+        }
         match expression {
             Expr::BinOp(binary) => {
                 2 + direct(&binary.left, python_version) + direct(&binary.right, python_version)
@@ -1922,6 +1958,18 @@ pub(super) fn fold_constant_with_profile(
     literal: &impl Fn(&Expr) -> Option<Constant>,
     boolean_sequence_repetition: bool,
 ) -> Option<Constant> {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| {
+            fold_constant_with_profile(
+                expression,
+                python_version,
+                native_build_profile,
+                literal,
+                boolean_sequence_repetition,
+            )
+        });
+    }
+
     if let Some(constant) = literal(expression) {
         return Some(constant);
     }
@@ -2321,6 +2369,10 @@ fn contains_negative_empty_repetition(expression: &Expr, python_version: PythonV
     }
     impl<'ast> Visitor<'ast> for Finder {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             if self.found {
                 return;
             }
@@ -3603,6 +3655,9 @@ pub(super) fn two_element_slice_optimization(
 }
 
 pub(super) fn first_literal_constant(expression: &Expr) -> Option<Constant> {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| first_literal_constant(expression));
+    }
     if let Some(constant) = literal_constant(expression) {
         return Some(constant);
     }
@@ -4122,6 +4177,10 @@ fn first_constant(
         }
 
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             if self.is_complete() {
                 return;
             }

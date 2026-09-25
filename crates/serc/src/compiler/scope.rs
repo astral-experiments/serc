@@ -2716,6 +2716,10 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
     }
 
     fn visit_expr(&mut self, expression: &'ast Expr) {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.visit_expr(expression));
+        }
+
         match expression {
             Expr::Name(name) => {
                 let id = self.record_flat_name(name);
@@ -3091,6 +3095,10 @@ impl LocalCollector {
 
         impl<'ast> Visitor<'ast> for Collector<'_> {
             fn visit_expr(&mut self, expression: &'ast Expr) {
+                if crate::stack_growth_required() {
+                    return crate::grow_stack(|| self.visit_expr(expression));
+                }
+
                 let (generators, key, value) = match expression {
                     Expr::ListComp(comprehension) => (
                         &comprehension.generators[..],
@@ -3661,6 +3669,10 @@ struct NamedExpressionCollector<'a> {
 
 impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
     fn visit_expr(&mut self, expression: &'ast Expr) {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.visit_expr(expression));
+        }
+
         if let Expr::Lambda(lambda) = expression {
             visit_lambda_defaults(self, lambda);
             return;
@@ -3906,6 +3918,10 @@ struct LocalAnnotationBindings(FxHashSet<String>);
 
 impl<'ast> Visitor<'ast> for LocalAnnotationBindings {
     fn visit_expr(&mut self, expression: &'ast Expr) {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.visit_expr(expression));
+        }
+
         if let Expr::Lambda(lambda) = expression {
             visit_lambda_defaults(self, lambda);
             return;
@@ -4475,6 +4491,10 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
     }
 
     fn visit_expr(&mut self, expression: &'ast Expr) {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.visit_expr(expression));
+        }
+
         if self.collect_function_scope_facts
             && let Expr::Dict(dictionary) = expression
         {
@@ -4695,6 +4715,10 @@ pub(super) struct ReferenceCollector {
 
 impl<'ast> Visitor<'ast> for ReferenceCollector {
     fn visit_expr(&mut self, expression: &'ast Expr) {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.visit_expr(expression));
+        }
+
         if let Expr::Lambda(lambda) = expression {
             visit_lambda_defaults(self, lambda);
             return;
@@ -4743,6 +4767,10 @@ pub(super) fn definitely_evaluated_references(expression: &Expr) -> Option<FxHas
 
     impl<'ast> Visitor<'ast> for Collector<'ast> {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             if self.conditional {
                 return;
             }
@@ -4859,40 +4887,45 @@ fn analyze_expression_scope_with_mangler(
             .cloned()
             .unwrap_or_else(|| name.to_owned())
     };
-    let mut parameters = parameters.clone();
-    let mut body = body.clone();
-    let transformer = PrivateVariableNormalizer { mangle: &normalize };
-    ruff_python_ast::visitor::transformer::Transformer::visit_parameters(
-        &transformer,
-        &mut parameters,
-    );
-    ruff_python_ast::visitor::transformer::Transformer::visit_expr(&transformer, &mut body);
+    let mut depth = crate::stack::ExpressionDepth::default();
+    depth.visit_parameters(parameters);
+    depth.visit_expr(body);
+    crate::stack::with_depth(depth.maximum(), || {
+        let mut parameters = parameters.clone();
+        let mut body = body.clone();
+        let transformer = PrivateVariableNormalizer { mangle: &normalize };
+        ruff_python_ast::visitor::transformer::Transformer::visit_parameters(
+            &transformer,
+            &mut parameters,
+        );
+        ruff_python_ast::visitor::transformer::Transformer::visit_expr(&transformer, &mut body);
 
-    let mut analysis = analyze_expression_scope(&parameters, &body);
-    // Preserve the spellings used by the surrounding scope and original AST.
-    // The normalized result removes false escapes such as lambda __x: _C__x.
-    // Preserve the existing free-variable spelling selection.
-    analysis.required = raw
-        .required
-        .into_iter()
-        .filter(|name| analysis.required.contains(&normalize(name)))
-        .collect();
+        let mut analysis = analyze_expression_scope(&parameters, &body);
+        // Preserve the spellings used by the surrounding scope and original AST.
+        // The normalized result removes false escapes such as lambda __x: _C__x.
+        // Preserve the existing free-variable spelling selection.
+        analysis.required = raw
+            .required
+            .into_iter()
+            .filter(|name| analysis.required.contains(&normalize(name)))
+            .collect();
 
-    let local_names: FxHashSet<_> = analysis.locals.iter().map(String::as_str).collect();
-    let local_aliases = spellings
-        .names
-        .into_iter()
-        .filter_map(|raw| {
-            let canonical = normalize(&raw);
-            (raw != canonical && local_names.contains(canonical.as_str()))
-                .then_some((raw, canonical))
-        })
-        .collect();
+        let local_names: FxHashSet<_> = analysis.locals.iter().map(String::as_str).collect();
+        let local_aliases = spellings
+            .names
+            .into_iter()
+            .filter_map(|raw| {
+                let canonical = normalize(&raw);
+                (raw != canonical && local_names.contains(canonical.as_str()))
+                    .then_some((raw, canonical))
+            })
+            .collect();
 
-    ContextualLambdaScopeAnalysis {
-        analysis,
-        local_aliases,
-    }
+        ContextualLambdaScopeAnalysis {
+            analysis,
+            local_aliases,
+        }
+    })
 }
 
 /// Adapt existing pure requirement collectors without changing recursive APIs.
@@ -4917,15 +4950,19 @@ fn contextual_expression_requirements(
             .cloned()
             .unwrap_or_else(|| name.to_owned())
     };
-    let mut normalized = expression.clone();
-    ruff_python_ast::visitor::transformer::Transformer::visit_expr(
-        &PrivateVariableNormalizer { mangle: &normalize },
-        &mut normalized,
-    );
-    let required = collect(&normalized);
-    raw.into_iter()
-        .filter(|name| required.contains(&normalize(name)))
-        .collect()
+    let mut depth = crate::stack::ExpressionDepth::default();
+    depth.visit_expr(expression);
+    crate::stack::with_depth(depth.maximum(), || {
+        let mut normalized = expression.clone();
+        ruff_python_ast::visitor::transformer::Transformer::visit_expr(
+            &PrivateVariableNormalizer { mangle: &normalize },
+            &mut normalized,
+        );
+        let required = collect(&normalized);
+        raw.into_iter()
+            .filter(|name| required.contains(&normalize(name)))
+            .collect()
+    })
 }
 
 /// Only normalize identities with multiple observed source spellings.
@@ -4955,6 +4992,10 @@ impl<M: Fn(&str) -> String> ruff_python_ast::visitor::transformer::Transformer
     for PrivateVariableNormalizer<'_, M>
 {
     fn visit_expr(&self, expression: &mut Expr) {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.visit_expr(expression));
+        }
+
         if let Expr::Name(name) = expression {
             name.id = Name::new((self.mangle)(name.id.as_str()));
         }
@@ -4993,6 +5034,10 @@ pub(super) fn generator_has_private_spelling_collisions(
 
 impl<'ast> Visitor<'ast> for VariableSpellings {
     fn visit_expr(&mut self, expression: &'ast Expr) {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.visit_expr(expression));
+        }
+
         if let Expr::Name(name) = expression {
             self.names.insert(name.id.to_string());
         }
@@ -5141,6 +5186,10 @@ pub(super) fn annotation_comprehension_requirements(
 
     impl<'ast> Visitor<'ast> for Collector {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             let (generators, key, value) = match expression {
                 Expr::ListComp(comprehension) => (
                     &comprehension.generators[..],
@@ -5200,6 +5249,10 @@ pub(super) fn expression_requirements_outside_comprehensions(
 
     impl<'ast> Visitor<'ast> for Collector {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             let generators = match expression {
                 Expr::ListComp(comprehension) => Some(&comprehension.generators[..]),
                 Expr::SetComp(comprehension) => Some(&comprehension.generators[..]),
@@ -5279,6 +5332,10 @@ fn nested_expression_required_names_with_cache<'ast>(
 
     impl<'ast> Visitor<'ast> for Collector<'_, 'ast> {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             if let Expr::Generator(generator) = expression {
                 // The first iterable executes in the enclosing scope and can create its
                 // own closures, independently of the generator body's requirements.
@@ -5362,6 +5419,10 @@ impl ComprehensionScopeFacts {
 
 impl<'ast> Visitor<'ast> for ComprehensionScopeFacts {
     fn visit_expr(&mut self, expression: &'ast Expr) {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.visit_expr(expression));
+        }
+
         match expression {
             Expr::Name(name) => {
                 self.names.insert(name.id.as_str().to_string());
@@ -5610,6 +5671,10 @@ fn comprehension_symbol_names(
 
     impl<'ast> Visitor<'ast> for Collector<'_> {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             let (generators, key, value) = match expression {
                 Expr::ListComp(comprehension) => (
                     &comprehension.generators[..],
@@ -5803,6 +5868,10 @@ fn comprehension_name_bindings_with_parent_requirements<'ast>(
 
     impl<'ast> Visitor<'ast> for Collector<'_, 'ast> {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             let (generators, key, value) = match expression {
                 Expr::ListComp(comprehension) => (
                     &comprehension.generators[..],
@@ -5927,17 +5996,21 @@ fn comprehension_bindings_in_private_context(
             .cloned()
             .unwrap_or_else(|| name.to_owned())
     };
-    let mut normalized = expression.clone();
-    ruff_python_ast::visitor::transformer::Transformer::visit_expr(
-        &PrivateVariableNormalizer { mangle: &normalize },
-        &mut normalized,
-    );
-    let bindings = collect(&normalized);
-    // Reuse the existing own/first-child precedence, including its exclusion of
-    // the first iterable. Only symbol identity changes before that traversal.
-    raw.into_keys()
-        .filter_map(|name| bindings.get(&normalize(&name)).map(|bound| (name, *bound)))
-        .collect()
+    let mut depth = crate::stack::ExpressionDepth::default();
+    depth.visit_expr(expression);
+    crate::stack::with_depth(depth.maximum(), || {
+        let mut normalized = expression.clone();
+        ruff_python_ast::visitor::transformer::Transformer::visit_expr(
+            &PrivateVariableNormalizer { mangle: &normalize },
+            &mut normalized,
+        );
+        let bindings = collect(&normalized);
+        // Reuse the existing own/first-child precedence, including its exclusion of
+        // the first iterable. Only symbol identity changes before that traversal.
+        raw.into_keys()
+            .filter_map(|name| bindings.get(&normalize(&name)).map(|bound| (name, *bound)))
+            .collect()
+    })
 }
 
 /// Preserve comprehension binding precedence when private spellings share a name.
@@ -5971,23 +6044,33 @@ pub(super) fn comprehension_name_bindings_with_mangler(
             .unwrap_or_else(|| name.to_owned())
     };
     let transformer = PrivateVariableNormalizer { mangle: &normalize };
-    let mut generators = generators.to_vec();
-    let mut key = key.cloned();
-    let mut value = value.clone();
-    for generator in &mut generators {
-        ruff_python_ast::visitor::transformer::Transformer::visit_comprehension(
-            &transformer,
-            generator,
-        );
+    let mut depth = crate::stack::ExpressionDepth::default();
+    for generator in generators {
+        depth.visit_comprehension(generator);
     }
-    if let Some(key) = &mut key {
-        ruff_python_ast::visitor::transformer::Transformer::visit_expr(&transformer, key);
+    if let Some(key) = key {
+        depth.visit_expr(key);
     }
-    ruff_python_ast::visitor::transformer::Transformer::visit_expr(&transformer, &mut value);
-    let bindings = comprehension_name_bindings(&generators, key.as_ref(), &value);
-    raw.into_keys()
-        .filter_map(|name| bindings.get(&normalize(&name)).map(|bound| (name, *bound)))
-        .collect()
+    depth.visit_expr(value);
+    crate::stack::with_depth(depth.maximum(), || {
+        let mut generators = generators.to_vec();
+        let mut key = key.cloned();
+        let mut value = value.clone();
+        for generator in &mut generators {
+            ruff_python_ast::visitor::transformer::Transformer::visit_comprehension(
+                &transformer,
+                generator,
+            );
+        }
+        if let Some(key) = &mut key {
+            ruff_python_ast::visitor::transformer::Transformer::visit_expr(&transformer, key);
+        }
+        ruff_python_ast::visitor::transformer::Transformer::visit_expr(&transformer, &mut value);
+        let bindings = comprehension_name_bindings(&generators, key.as_ref(), &value);
+        raw.into_keys()
+            .filter_map(|name| bindings.get(&normalize(&name)).map(|bound| (name, *bound)))
+            .collect()
+    })
 }
 
 pub(super) fn collect_nested_comprehension_target_names(
@@ -6000,6 +6083,10 @@ pub(super) fn collect_nested_comprehension_target_names(
 
     impl<'ast> Visitor<'ast> for Collector<'_> {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             let generators = match expression {
                 Expr::ListComp(comprehension) => Some(&comprehension.generators[..]),
                 Expr::SetComp(comprehension) => Some(&comprehension.generators[..]),
@@ -6043,6 +6130,10 @@ pub(super) fn collect_generator_slot_names(
 
     impl<'ast> Visitor<'ast> for Collector<'_> {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             let (generators, key, value) = match expression {
                 Expr::ListComp(comprehension) => (
                     &comprehension.generators[..],
@@ -6137,6 +6228,10 @@ pub(super) fn collect_self_iterated_nested_comprehension_targets(
 
     impl<'ast> Visitor<'ast> for Collector<'_> {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             let generators = match expression {
                 Expr::ListComp(comprehension) => Some(&comprehension.generators[..]),
                 Expr::SetComp(comprehension) => Some(&comprehension.generators[..]),
@@ -6234,6 +6329,10 @@ pub(super) fn inlined_comprehension_cell_names_in_expression(
 
     impl<'ast> Visitor<'ast> for Collector {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             match expression {
                 Expr::ListComp(comprehension) => self.names.extend(comprehension_cell_names(
                     &comprehension.generators[..],
@@ -6278,6 +6377,10 @@ pub(super) fn collect_named_expression_target_names(expression: &Expr, names: &m
 
     impl<'ast> Visitor<'ast> for Collector<'_> {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             if let Expr::Named(named) = expression
                 && let Expr::Name(name) = named.target.as_ref()
             {
@@ -6303,6 +6406,10 @@ pub(super) fn generator_named_targets(
 
     impl<'ast> Visitor<'ast> for Collector {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             if let Expr::Lambda(lambda) = expression {
                 visit_lambda_defaults(self, lambda);
                 return;
@@ -6378,6 +6485,10 @@ fn generator_external_names_with_cache<'ast>(
 
     impl<'ast, M: Fn(&str) -> String> Visitor<'ast> for Collector<'_, '_, 'ast, M> {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             let (generators, key, value) = match expression {
                 Expr::ListComp(comprehension) => (
                     &comprehension.generators[..],
@@ -6529,12 +6640,19 @@ pub(super) fn generator_required_names_with_mangler(
     generator: &ruff_python_ast::ExprGenerator,
     mangle: &impl Fn(&str) -> String,
 ) -> BTreeSet<String> {
-    let expression = Expr::Generator(generator.clone());
-    contextual_expression_requirements(&expression, mangle, |expression| {
-        let Expr::Generator(generator) = expression else {
-            unreachable!();
-        };
-        generator_required_names(generator)
+    let mut depth = crate::stack::ExpressionDepth::default();
+    depth.visit_expr(&generator.elt);
+    for comprehension in &generator.generators {
+        depth.visit_comprehension(comprehension);
+    }
+    crate::stack::with_depth(depth.maximum(), || {
+        let expression = Expr::Generator(generator.clone());
+        contextual_expression_requirements(&expression, mangle, |expression| {
+            let Expr::Generator(generator) = expression else {
+                unreachable!();
+            };
+            generator_required_names(generator)
+        })
     })
 }
 
@@ -6556,7 +6674,10 @@ pub(super) fn generator_private_local_aliases(
         }
     });
     let mut spellings = VariableSpellings::default();
-    spellings.visit_expr(&Expr::Generator(generator.clone()));
+    spellings.visit_expr(&generator.elt);
+    for comprehension in &generator.generators {
+        spellings.visit_comprehension(comprehension);
+    }
     spellings
         .names
         .into_iter()
@@ -6585,6 +6706,10 @@ fn generator_required_names_with_cache<'ast>(
 
     impl<'ast> Visitor<'ast> for InlineExternalReferences<'_, 'ast> {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             let (generators, key, value) = match expression {
                 Expr::ListComp(comprehension) => (
                     &comprehension.generators[..],
@@ -6768,32 +6893,39 @@ pub(super) fn generator_cellvars_with_mangler(
     generator: &ruff_python_ast::ExprGenerator,
     mangle: &impl Fn(&str) -> String,
 ) -> FxHashSet<String> {
-    let expression = Expr::Generator(generator.clone());
-    let mut spellings = VariableSpellings::default();
-    spellings.visit_expr(&expression);
-    let aliases = colliding_private_spellings(&spellings.names, mangle);
-    if aliases.is_empty() {
-        return generator_cellvars(generator);
+    let mut depth = crate::stack::ExpressionDepth::default();
+    depth.visit_expr(&generator.elt);
+    for comprehension in &generator.generators {
+        depth.visit_comprehension(comprehension);
     }
-    let normalize = |name: &str| {
-        aliases
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| name.to_owned())
-    };
-    let mut normalized = expression;
-    ruff_python_ast::visitor::transformer::Transformer::visit_expr(
-        &PrivateVariableNormalizer { mangle: &normalize },
-        &mut normalized,
-    );
-    let Expr::Generator(normalized) = normalized else {
-        unreachable!()
-    };
-    let cells = generator_cellvars(&normalized);
-    generator_cellvar_local_names(generator)
-        .into_iter()
-        .filter(|name| cells.contains(&normalize(name)))
-        .collect()
+    crate::stack::with_depth(depth.maximum(), || {
+        let expression = Expr::Generator(generator.clone());
+        let mut spellings = VariableSpellings::default();
+        spellings.visit_expr(&expression);
+        let aliases = colliding_private_spellings(&spellings.names, mangle);
+        if aliases.is_empty() {
+            return generator_cellvars(generator);
+        }
+        let normalize = |name: &str| {
+            aliases
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| name.to_owned())
+        };
+        let mut normalized = expression;
+        ruff_python_ast::visitor::transformer::Transformer::visit_expr(
+            &PrivateVariableNormalizer { mangle: &normalize },
+            &mut normalized,
+        );
+        let Expr::Generator(normalized) = normalized else {
+            unreachable!()
+        };
+        let cells = generator_cellvars(&normalized);
+        generator_cellvar_local_names(generator)
+            .into_iter()
+            .filter(|name| cells.contains(&normalize(name)))
+            .collect()
+    })
 }
 
 pub(super) fn generator_cellvars(generator: &ruff_python_ast::ExprGenerator) -> FxHashSet<String> {
@@ -6949,6 +7081,10 @@ mod tests {
             }
 
             fn visit_expr(&mut self, expression: &'ast Expr) {
+                if crate::stack_growth_required() {
+                    return crate::grow_stack(|| self.visit_expr(expression));
+                }
+
                 if matches!(expression, Expr::Yield(_) | Expr::YieldFrom(_)) {
                     self.yield_offsets.push(expression.start());
                 }

@@ -238,6 +238,67 @@ impl<'ast> Scope<'ast> {
     }
 }
 
+/// Preserve the fields Ruff checks on an ordinary function while replacing
+/// simple annotations with leaves its recursive checker can visit cheaply.
+fn simple_function_checker_view(function: &ast::StmtFunctionDef) -> Option<Stmt> {
+    fn leaf() -> Expr {
+        Expr::NoneLiteral(ast::ExprNoneLiteral::default())
+    }
+    fn parameter(original: &ast::Parameter) -> ast::Parameter {
+        ast::Parameter {
+            range: original.range,
+            node_index: original.node_index.clone(),
+            name: original.name.clone(),
+            annotation: original.annotation.as_ref().map(|_| Box::new(leaf())),
+        }
+    }
+    fn with_default(original: &ast::ParameterWithDefault) -> ast::ParameterWithDefault {
+        ast::ParameterWithDefault {
+            range: original.range,
+            node_index: original.node_index.clone(),
+            parameter: parameter(&original.parameter),
+            default: original.default.as_ref().map(|_| Box::new(leaf())),
+        }
+    }
+
+    if function.is_async
+        || function.type_params.is_some()
+        || !function
+            .parameters
+            .iter()
+            .filter_map(ast::AnyParameterRef::annotation)
+            .all(crate::stack::is_simple_annotation)
+        || !function
+            .returns
+            .as_deref()
+            .is_none_or(crate::stack::is_simple_annotation)
+    {
+        return None;
+    }
+
+    let original = &function.parameters;
+    let parameters = ast::Parameters {
+        range: original.range,
+        node_index: original.node_index.clone(),
+        posonlyargs: original.posonlyargs.iter().map(with_default).collect(),
+        args: original.args.iter().map(with_default).collect(),
+        vararg: original.vararg.as_deref().map(parameter).map(Box::new),
+        kwonlyargs: original.kwonlyargs.iter().map(with_default).collect(),
+        kwarg: original.kwarg.as_deref().map(parameter).map(Box::new),
+    };
+    Some(Stmt::FunctionDef(ast::StmtFunctionDef {
+        node_index: function.node_index.clone(),
+        range: function.range,
+        is_async: false,
+        decorator_list: ast::DecoratorList::new(),
+        name: function.name.clone(),
+        type_params: None,
+        parameters: Box::new(parameters),
+        returns: function.returns.as_ref().map(|_| Box::new(leaf())),
+        body: ast::Suite::new(),
+    }))
+}
+
 struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> {
     pre_lowering_only: bool,
     checker: SemanticSyntaxChecker,
@@ -490,6 +551,10 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
                 }
             }
             fn visit_expr(&mut self, expression: &'ast Expr) {
+                if crate::stack_growth_required() {
+                    return crate::grow_stack(|| self.visit_expr(expression));
+                }
+
                 if self.found || !expression.range().contains_range(self.range) {
                     return;
                 }
@@ -600,6 +665,10 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
 
         impl<'ast> Visitor<'ast> for FirstRestriction {
             fn visit_expr(&mut self, expression: &'ast Expr) {
+                if crate::stack_growth_required() {
+                    return crate::grow_stack(|| self.visit_expr(expression));
+                }
+
                 if self.0.is_some() {
                     return;
                 }
@@ -665,6 +734,41 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
     }
 
     fn check_statement(&mut self, statement: &Stmt) {
+        if let Stmt::AnnAssign(assignment) = statement
+            && matches!(assignment.target.as_ref(), Expr::Name(_))
+            && crate::stack::is_simple_annotation(&assignment.annotation)
+        {
+            // These annotations contain none of the expressions checked by Ruff's
+            // recursive InvalidExpressionVisitor. Preserve the original target and
+            // statement kind so its declaration and future-import checks still run.
+            let statement = Stmt::AnnAssign(ast::StmtAnnAssign {
+                node_index: assignment.node_index.clone(),
+                range: assignment.range,
+                target: assignment.target.clone(),
+                annotation: Box::new(Expr::NoneLiteral(ast::ExprNoneLiteral::default())),
+                value: None,
+                simple: assignment.simple,
+            });
+            self.with_checker(|checker, context| checker.visit_stmt(&statement, context));
+            return;
+        }
+        if let Stmt::TypeAlias(alias) = statement
+            && alias.type_params.is_none()
+            && matches!(alias.name.as_ref(), Expr::Name(_))
+            && crate::stack::is_simple_annotation(&alias.value)
+        {
+            // Nongeneric aliases have no type-parameter checks; their value can
+            // be replaced when it contains no invalid-expression candidates.
+            let statement = Stmt::TypeAlias(ast::StmtTypeAlias {
+                node_index: alias.node_index.clone(),
+                range: alias.range,
+                name: alias.name.clone(),
+                type_params: None,
+                value: Box::new(Expr::NoneLiteral(ast::ExprNoneLiteral::default())),
+            });
+            self.with_checker(|checker, context| checker.visit_stmt(&statement, context));
+            return;
+        }
         // Relative imports of a module named __future__ are ordinary imports. The shared
         // checker identifies directives by their module spelling, so hide that spelling here.
         if let Stmt::ImportFrom(import) = statement
@@ -677,7 +781,57 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
                 checker.visit_stmt(&Stmt::ImportFrom(import), context);
             });
         } else {
-            self.with_checker(|checker, context| checker.visit_stmt(statement, context));
+            // Ruff's semantic checker has a private recursive annotation visitor. Measure
+            // the input it may walk and provide a stack sized for that walk.
+            let mut depth = crate::stack::ExpressionDepth::default();
+            match statement {
+                Stmt::AnnAssign(statement) => depth.visit_expr(&statement.annotation),
+                Stmt::FunctionDef(statement) => {
+                    depth.visit_parameters(&statement.parameters);
+                    if let Some(returns) = &statement.returns {
+                        depth.visit_expr(returns);
+                    }
+                    if let Some(type_params) = &statement.type_params {
+                        depth.visit_type_params(type_params);
+                    }
+                    if statement.is_async {
+                        depth.visit_body(&statement.body);
+                    }
+                }
+                Stmt::ClassDef(statement) => {
+                    if let Some(arguments) = &statement.arguments {
+                        depth.visit_arguments(arguments);
+                    }
+                    if let Some(type_params) = &statement.type_params {
+                        depth.visit_type_params(type_params);
+                    }
+                }
+                Stmt::TypeAlias(statement) => {
+                    depth.visit_expr(&statement.value);
+                    if let Some(type_params) = &statement.type_params {
+                        depth.visit_type_params(type_params);
+                    }
+                }
+                _ => {}
+            }
+            let depth = depth.maximum();
+            if depth >= 1_024
+                && let Stmt::FunctionDef(function) = statement
+                && let Some(view) = simple_function_checker_view(function)
+            {
+                // Ruff's synchronous nongeneric function checks inspect names and
+                // annotations, but not decorators, defaults, or the function body.
+                // The validator still visits every original child after this check.
+                self.with_checker(|checker, context| checker.visit_stmt(&view, context));
+                return;
+            }
+            self.with_checker(|checker, context| {
+                if depth == 0 {
+                    checker.visit_stmt(statement, context);
+                } else {
+                    crate::stack::with_depth(depth, || checker.visit_stmt(statement, context));
+                }
+            });
         }
     }
 
@@ -1089,6 +1243,10 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
     }
 
     fn visit_expr(&mut self, expression: &'ast Expr) {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.visit_expr(expression));
+        }
+
         if FUTURE_ONLY {
             return;
         }
@@ -1160,7 +1318,20 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
             | Expr::IpyEscapeCommand(_) => false,
         };
         if check_expression {
-            self.with_checker(|checker, context| checker.visit_expr(expression, context));
+            if matches!(
+                expression,
+                Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_) | Expr::Generator(_)
+            ) {
+                let mut depth = crate::stack::ExpressionDepth::default();
+                depth.visit_expr(expression);
+                self.with_checker(|checker, context| {
+                    crate::stack::with_depth(depth.maximum(), || {
+                        checker.visit_expr(expression, context);
+                    });
+                });
+            } else {
+                self.with_checker(|checker, context| checker.visit_expr(expression, context));
+            }
         }
         match expression {
             Expr::Lambda(lambda) => {

@@ -16198,6 +16198,17 @@ impl<'source> Compiler<'source> {
         restart: Label,
         non_final_branch: bool,
     ) -> Result<(), CompileError> {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| {
+                self.compile_loop_tail_condition(
+                    expression,
+                    jump_on,
+                    success,
+                    restart,
+                    non_final_branch,
+                )
+            });
+        }
         if let Expr::UnaryOp(unary) = expression
             && unary.op == UnaryOp::Not
         {
@@ -16546,6 +16557,9 @@ impl<'source> Compiler<'source> {
 
     /// Whether CPython has replaced a return value with a Constant AST node before lowering.
     pub(super) fn return_value_is_constant(&self, expression: &Expr) -> bool {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.return_value_is_constant(expression));
+        }
         if is_literal_constant(expression) {
             return true;
         }
@@ -31245,6 +31259,9 @@ impl<'source> Compiler<'source> {
 }
 
 fn condition_starts_with_removed_boolean_operand(expression: &Expr) -> bool {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| condition_starts_with_removed_boolean_operand(expression));
+    }
     match expression {
         Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => {
             condition_starts_with_removed_boolean_operand(&unary.operand)
@@ -31263,6 +31280,9 @@ fn condition_starts_with_removed_boolean_operand(expression: &Expr) -> bool {
 // Mirrors the edges that `compile_jump_if` emits directly to its caller-provided target. The
 // converted with-body `POP_BLOCK` only retains a location when that target has one predecessor.
 pub(super) fn condition_jump_target_count(expression: &Expr, jump_on: bool) -> usize {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| condition_jump_target_count(expression, jump_on));
+    }
     if let Expr::UnaryOp(unary) = expression
         && unary.op == UnaryOp::Not
     {
@@ -31314,6 +31334,11 @@ pub(super) fn condition_jump_target_count(expression: &Expr, jump_on: bool) -> u
 // constant operands whose edges disappear later. A shared POP_BLOCK cannot inherit one
 // operand's location merely because constant folding eventually removes the other edge.
 fn original_condition_has_unique_jump_target(expression: &Expr, jump_on: bool) -> bool {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| {
+            original_condition_has_unique_jump_target(expression, jump_on)
+        });
+    }
     match expression {
         Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => {
             original_condition_has_unique_jump_target(&unary.operand, !jump_on)
@@ -31363,6 +31388,9 @@ fn suite_terminates_before_constant_folding(body: &[Stmt]) -> bool {
 
 // Returns the expression that contributes the sole edge to a condition's target.
 pub(super) fn unique_condition_jump_target(expression: &Expr, jump_on: bool) -> Option<&Expr> {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| unique_condition_jump_target(expression, jump_on));
+    }
     if condition_jump_target_count(expression, jump_on) != 1 {
         return None;
     }
@@ -31564,6 +31592,10 @@ fn expression_contains_eager_suspension(expression: &Expr) -> bool {
 
     impl<'ast> Visitor<'ast> for Detector {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             if self.found || matches!(expression, Expr::Generator(_)) {
                 return;
             }
@@ -31681,6 +31713,10 @@ fn is_simple_iterator_assert_assignment_value(expression: &Expr) -> bool {
 
     impl<'ast> Visitor<'ast> for Detector {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             if self.complex {
                 return;
             }
@@ -31728,6 +31764,10 @@ fn expression_contains_generator(expression: &Expr) -> bool {
 
     impl<'ast> Visitor<'ast> for Detector {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             if self.found || matches!(expression, Expr::Lambda(_)) {
                 return;
             }
@@ -31751,6 +31791,10 @@ fn expression_contains_chained_comparison(expression: &Expr) -> bool {
 
     impl<'ast> Visitor<'ast> for Detector {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             if matches!(expression, Expr::Compare(comparison) if comparison.ops.len() > 1) {
                 self.found = true;
             } else if !self.found {
@@ -33878,6 +33922,10 @@ fn finalizer_tail_has_matching_linear_copies(body: &[Stmt]) -> bool {
 
     impl<'ast> Visitor<'ast> for SuspensionFinder {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             if matches!(
                 expression,
                 Expr::Await(_) | Expr::Yield(_) | Expr::YieldFrom(_)
@@ -34677,6 +34725,10 @@ fn suite_contains_yield_with_scope_options(
         }
 
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             if self.found {
                 return;
             }
@@ -34716,6 +34768,10 @@ fn expression_contains_inline_branch(expression: &Expr) -> bool {
 
     impl<'ast> Visitor<'ast> for InlineBranchDetector {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             if self.found {
                 return;
             }
@@ -34773,6 +34829,10 @@ fn terminal_condition_contains_global_callable(
 
     impl<'ast, F: FnMut(&str) -> bool> Visitor<'ast> for GlobalCallableDetector<F> {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             if self.found {
                 return;
             }
@@ -35093,6 +35153,10 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt]) -> bool {
         }
 
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             if self.found {
                 return;
             }
@@ -36680,6 +36744,10 @@ fn expression_yields_in_current_scope(expression: &Expr) -> bool {
 
     impl<'ast> Visitor<'ast> for Detector {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             if self.found {
                 return;
             }
@@ -36708,6 +36776,9 @@ fn expression_yields_in_current_scope(expression: &Expr) -> bool {
 }
 
 fn condition_has_only_runtime_tests(expression: &Expr) -> bool {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| condition_has_only_runtime_tests(expression));
+    }
     if early_condition_truthiness(expression).is_some() || fold_constant(expression).is_some() {
         return false;
     }
@@ -36724,6 +36795,9 @@ fn condition_has_only_runtime_tests(expression: &Expr) -> bool {
 
 /// Certify short-circuit conditions whose individual runtime tests have no internal branch.
 fn condition_has_linear_runtime_leaves(expression: &Expr) -> bool {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| condition_has_linear_runtime_leaves(expression));
+    }
     match expression {
         Expr::BoolOp(boolean) => boolean
             .values
@@ -37463,6 +37537,10 @@ fn handler_cleanup_has_for_exhaustion_join(body: &[Stmt]) -> bool {
 
     impl<'ast> Visitor<'ast> for SuspensionDetector {
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             self.0 |= expression_suspends_current_scope(expression);
         }
     }
@@ -38526,6 +38604,9 @@ fn suite_has_live_try_before_conditional_break(body: &[Stmt]) -> bool {
 
 /// Certifies runtime condition edges that enter the async break's iterator discard.
 fn condition_reaches_async_break_entry(expression: &Expr) -> bool {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| condition_reaches_async_break_entry(expression));
+    }
     if early_condition_truthiness(expression).is_some() || fold_constant(expression).is_some() {
         return false;
     }
@@ -39122,6 +39203,10 @@ fn shifted_try_none_owner_statements(body: &[Stmt]) -> Vec<TextRange> {
         }
 
         fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
             if self.found
                 || matches!(
                     expression,

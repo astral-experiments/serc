@@ -1126,6 +1126,9 @@ impl<'ast> Builder<'ast> {
     }
 
     fn condition(&mut self, expression: &Expr, jump_on: bool) -> Option<()> {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.condition(expression, jump_on));
+        }
         match expression {
             Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => {
                 self.condition(&unary.operand, !jump_on)?;
@@ -1254,6 +1257,9 @@ impl<'ast> Builder<'ast> {
     }
 
     fn expression(&mut self, expression: &Expr) -> Option<()> {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.expression(expression));
+        }
         match expression {
             Expr::Name(_)
             | Expr::NumberLiteral(_)
@@ -1458,6 +1464,9 @@ impl<'ast> Builder<'ast> {
 }
 
 fn runtime_condition(expression: &Expr) -> bool {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| runtime_condition(expression));
+    }
     match expression {
         Expr::Name(name) => name.id.as_str() != "__debug__",
         Expr::Attribute(_)
