@@ -1,8 +1,9 @@
 //! Validated, explicit process snapshots for the corpus comparator.
 //!
 //! Hashes bind declared artifacts and the local runtime, not an artifact's author.
-//! A snapshot preserves one process's mortal entries; it does not claim that all
-//! fresh processes retain the same entries, or exclude any comparison failures.
+//! A snapshot records one process's entries. Only the authenticated static pool
+//! proves membership across fresh invocations; dynamic observations stay unknown
+//! without a separately reviewed caller contract.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -27,6 +28,12 @@ pub(super) struct LoadedProfile {
     pub(super) state: InitialInternState,
     pub(super) snapshot_sha256: String,
     pub(super) entries: usize,
+    pub(super) retained_entries: usize,
+}
+
+struct ValidatedSnapshot {
+    entries: usize,
+    static_strings: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -177,12 +184,12 @@ pub(super) fn load(
     runtime.validate_mapped_files(&maps)?;
     profile.validate_headers(&headers)?;
     profile.validate_capture(&capture, oracle)?;
-    let strings = validate_snapshot(read_json(&snapshot)?, &capture)?;
-    let entries = strings.len();
+    let snapshot = validate_snapshot(read_json(&snapshot)?, &capture)?;
     Ok(LoadedProfile {
-        state: InitialInternState::new(strings),
+        retained_entries: snapshot.static_strings.len(),
+        state: InitialInternState::from_partial(snapshot.static_strings),
         snapshot_sha256: profile.snapshot.sha256,
-        entries,
+        entries: snapshot.entries,
     })
 }
 
@@ -402,8 +409,12 @@ impl RuntimeInputs {
     }
 }
 
-fn validate_snapshot(entries: Vec<InternEntry>, capture: &Value) -> Result<Vec<String>, String> {
+fn validate_snapshot(
+    entries: Vec<InternEntry>,
+    capture: &Value,
+) -> Result<ValidatedSnapshot, String> {
     let mut seen = BTreeSet::new();
+    let mut static_strings = Vec::new();
     let mut states = BTreeMap::<u8, usize>::new();
     for entry in entries {
         require(
@@ -418,6 +429,12 @@ fn validate_snapshot(entries: Vec<InternEntry>, capture: &Value) -> Result<Vec<S
             .into_iter()
             .map(|point| char::from_u32(point).ok_or("snapshot contains a non-scalar codepoint"))
             .collect::<Result<_, _>>()?;
+        // Static canonical objects belong to this authenticated build. Dynamic
+        // observations, including immortal objects, do not prove membership in
+        // every new caller process or retention under a different input.
+        if matches!(entry.pool, Pool::Static) {
+            static_strings.push(value.clone());
+        }
         require(seen.insert(value), "duplicate interned value")?;
         *states.entry(entry.state).or_default() += 1;
     }
@@ -446,7 +463,10 @@ fn validate_snapshot(entries: Vec<InternEntry>, capture: &Value) -> Result<Vec<S
             "snapshot container count differs from capture",
         )?;
     }
-    Ok(seen.into_iter().collect())
+    Ok(ValidatedSnapshot {
+        entries: seen.len(),
+        static_strings,
+    })
 }
 
 fn read(path: &Path) -> Result<Vec<u8>, String> {
@@ -596,12 +616,32 @@ mod tests {
     }
 
     #[test]
-    fn preserves_full_snapshot_and_rejects_incomplete_or_invalid_entries() {
-        let (entries, capture) = snapshot();
-        let strings =
+    fn captured_dynamic_immortality_does_not_prove_cross_process_membership() {
+        let (mut entries, mut capture) = snapshot();
+        entries.push(json!({"pool":"dynamic", "state":2, "codepoints":[120,121]}));
+        capture["snapshot"]["states"]["2"] = json!(1);
+        capture["snapshot"]["total"] = json!(259);
+        capture["snapshot"]["dynamic_count"] = json!(2);
+        let snapshot =
             validate_snapshot(serde_json::from_value(json!(entries)).unwrap(), &capture).unwrap();
-        assert_eq!(strings.len(), 258);
-        assert!(strings.iter().any(|value| value == "ab"));
+        assert_eq!(snapshot.entries, 259);
+        assert_eq!(snapshot.static_strings.len(), 257);
+        assert!(
+            !snapshot
+                .static_strings
+                .iter()
+                .any(|value| value == "xy" || value == "ab")
+        );
+    }
+
+    #[test]
+    fn validates_full_snapshot_and_rejects_incomplete_or_invalid_entries() {
+        let (entries, capture) = snapshot();
+        let validated =
+            validate_snapshot(serde_json::from_value(json!(entries)).unwrap(), &capture).unwrap();
+        assert_eq!(validated.entries, 258);
+        assert_eq!(validated.static_strings.len(), 257);
+        assert!(!validated.static_strings.iter().any(|value| value == "ab"));
         for change in 0..6 {
             let (mut entries, mut capture) = snapshot();
             match change {

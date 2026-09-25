@@ -1,9 +1,22 @@
 # Explicit initial intern-state profiles
 
-`--initial-intern-state PROFILE.json` supplies one immutable captured intern
-state to comparison and mismatch-dump compilation. It describes one process,
-including mortal strings, which the model assumes remain retained. A run never
-chooses profiles from oracle results or excludes mismatches.
+The comparator requires `--initial-intern-state PROFILE.json` with provenance
+matching its actual oracle. A captured snapshot authenticates one process's
+membership. Its static pool supplies guaranteed retained entries; dynamic
+observations remain unknown unless a separate caller contract proves membership
+and lifetime across inputs. Dynamic immortality within the captured process does
+not establish membership in every fresh invocation.
+
+Byte-relevant unknown membership is reported as `unresolved-intern-state` and
+fails compatibility validation. It is neither a compiler failure nor a matched
+syntax rejection. A run never chooses profiles from comparison results or
+excludes mismatches.
+
+`--diagnostic-assume-startup-intern-state` permits exploratory comparisons using
+the neutral startup model. Output explicitly identifies this unverified
+assumption, and the option cannot be combined with compatibility-gate counts,
+`--require-all`, rejection-parity validation, a caller profile/model, or native
+cache operations.
 
 ## Profile format
 
@@ -32,8 +45,9 @@ counts.
 Capture evidence binds the executable and exact-tag headers, observer/layout,
 oracle arguments and script, source, and snapshot. Preserve the sole-thread
 check, two agreeing complete reads, function-memory comparison, and
-extraction/timing reports. The profile supplements the compiler's startup
-knowledge and source chronology.
+extraction/timing reports. Captured entries do not implicitly supplement the
+compiler's neutral startup model. The effective state is partial, and
+compilation preserves source chronology.
 
 `runtime_inputs` covers every installed prefix file and captured mapped native
 file, recording absolute path, SHA-256, byte size, and symlink target. Directory

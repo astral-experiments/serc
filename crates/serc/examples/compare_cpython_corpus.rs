@@ -48,6 +48,7 @@ enum OutcomeKind {
     Unsupported,
     ParseMismatch,
     CompilerFailure,
+    UnresolvedInternState,
     MatchedRejection,
     RejectionMismatch,
     NonUtf8,
@@ -55,12 +56,13 @@ enum OutcomeKind {
 }
 
 impl OutcomeKind {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::Exact,
         Self::ByteMismatch,
         Self::Unsupported,
         Self::ParseMismatch,
         Self::CompilerFailure,
+        Self::UnresolvedInternState,
         Self::MatchedRejection,
         Self::RejectionMismatch,
         Self::NonUtf8,
@@ -74,6 +76,7 @@ impl OutcomeKind {
             Self::Unsupported => "unsupported",
             Self::ParseMismatch => "parse/decode mismatch",
             Self::CompilerFailure => "compiler failure",
+            Self::UnresolvedInternState => "unresolved intern state",
             Self::MatchedRejection => "matched rejection",
             Self::RejectionMismatch => "rejection mismatch",
             Self::NonUtf8 => "non-UTF-8",
@@ -88,6 +91,7 @@ impl OutcomeKind {
             Self::Unsupported => "unsupported",
             Self::ParseMismatch => "parse-mismatch",
             Self::CompilerFailure => "compiler-failure",
+            Self::UnresolvedInternState => "unresolved-intern-state",
             Self::MatchedRejection => "matched-rejection",
             Self::RejectionMismatch => "rejection-mismatch",
             Self::NonUtf8 => "non-utf8",
@@ -132,6 +136,7 @@ enum OracleOutcome {
 enum CompilerOutcome {
     Compiled(Vec<u8>),
     Unsupported(String),
+    UnresolvedInternState(String),
     Rejected(String),
     Failed(String),
 }
@@ -170,6 +175,9 @@ struct Options {
     source_bytes: bool,
     #[arg(long, value_name = "PROFILE.json")]
     initial_intern_state: Option<PathBuf>,
+    /// Diagnostic only: substitute the compiler's neutral startup model for caller state.
+    #[arg(long, conflicts_with_all = ["initial_intern_state", "caller_intern_model"])]
+    diagnostic_assume_startup_intern_state: bool,
     /// Reproduce a validated caller protocol from an independent pre-path baseline.
     #[arg(long, value_name = "MODEL.json")]
     caller_intern_model: Option<PathBuf>,
@@ -179,6 +187,25 @@ struct Options {
 }
 
 impl Options {
+    fn validate_intern_contract(&self, cache_read: bool, cache_write: bool) -> Result<(), String> {
+        if self.diagnostic_assume_startup_intern_state {
+            if cache_read
+                || cache_write
+                || self.require_all
+                || self.require_rejection_parity
+                || self.expected_files.is_some()
+                || self.expected_exact.is_some()
+                || self.expected_cpython_rejected.is_some()
+                || !self.expected_outcomes.is_empty()
+            {
+                return Err("diagnostic startup assumptions cannot validate a compatibility gate or native cache".to_string());
+            }
+        } else if self.initial_intern_state.is_none() {
+            return Err("comparison requires --initial-intern-state with provenance matching this oracle; use --diagnostic-assume-startup-intern-state only for exploratory comparisons".to_string());
+        }
+        Ok(())
+    }
+
     fn validate_assume_absent(&self, cache_read: bool) -> Result<(), String> {
         if self.caller_intern_assume_absent && !cache_read {
             Err("--caller-intern-assume-absent requires admitted native cache reading".to_string())
@@ -226,6 +253,18 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     let read_config = env::var_os("SERC_NATIVE_CACHE_READ");
+    if let Err(message) = options.validate_intern_contract(
+        read_config.is_some(),
+        env::var_os("SERC_NATIVE_CACHE_WRITE").is_some(),
+    ) {
+        eprintln!("{message}");
+        return ExitCode::from(2);
+    }
+    if options.diagnostic_assume_startup_intern_state {
+        eprintln!(
+            "DIAGNOSTIC ONLY: assuming neutral startup intern state for the pathlib oracle; output equality is conditional on this unverified assumption"
+        );
+    }
     if let Err(message) = options.validate_assume_absent(read_config.is_some()) {
         eprintln!("{message}");
         return ExitCode::from(2);
@@ -269,11 +308,11 @@ fn main() -> ExitCode {
         let role = if options.caller_intern_model.is_some() {
             "Native provenance snapshot"
         } else {
-            "Initial intern-state snapshot"
+            "Partial caller intern-state evidence"
         };
         println!(
-            "{role}: {} ({} entries; captured process state)",
-            profile.snapshot_sha256, profile.entries
+            "{role}: {} ({} observed entries; {} guaranteed retained entries)",
+            profile.snapshot_sha256, profile.entries, profile.retained_entries
         );
     }
     let caller_model = match options
@@ -302,7 +341,12 @@ fn main() -> ExitCode {
     };
     let compile_options = CompileOptions {
         python_version: options.python_version,
-        initial_intern_state: profile.map(|profile| profile.state).unwrap_or_default(),
+        initial_intern_state: if let Some(profile) = profile {
+            profile.state
+        } else {
+            assert!(options.diagnostic_assume_startup_intern_state);
+            serc::InitialInternState::default()
+        },
         ..CompileOptions::default()
     };
     let mut paths = match discover(&options.roots, &options.extensions) {
@@ -492,6 +536,7 @@ fn main() -> ExitCode {
         OutcomeKind::Unsupported,
         OutcomeKind::ParseMismatch,
         OutcomeKind::CompilerFailure,
+        OutcomeKind::UnresolvedInternState,
         OutcomeKind::NonUtf8,
         OutcomeKind::OracleFailure,
     ] {
@@ -504,6 +549,7 @@ fn main() -> ExitCode {
         OutcomeKind::Unsupported,
         OutcomeKind::ParseMismatch,
         OutcomeKind::CompilerFailure,
+        OutcomeKind::UnresolvedInternState,
         OutcomeKind::RejectionMismatch,
         OutcomeKind::OracleFailure,
     ] {
@@ -596,6 +642,12 @@ fn validate_outcome_counts(
     let count = |kind| counts.get(&kind).copied().unwrap_or_default();
     let exact = count(OutcomeKind::Exact);
     let mut failures = Vec::new();
+    let unresolved = count(OutcomeKind::UnresolvedInternState);
+    if unresolved != 0 {
+        failures.push(format!(
+            "{unresolved} files require unresolved caller intern-state evidence"
+        ));
+    }
 
     for (&kind, &expected) in expected_outcomes {
         let actual = count(kind);
@@ -939,6 +991,9 @@ fn capture_compiler(compile: impl FnOnce() -> Result<Vec<u8>, CompileError>) -> 
             | CompileError::InvalidDocstring { message, .. },
         )) => CompilerOutcome::Rejected(message),
         Ok(Err(CompileError::Decode(error))) => CompilerOutcome::Rejected(error.to_string()),
+        Ok(Err(error @ CompileError::UnresolvedInternState { .. })) => {
+            CompilerOutcome::UnresolvedInternState(error.to_string())
+        }
         Ok(Err(CompileError::Internal(message))) => CompilerOutcome::Failed(message),
         Ok(Err(error)) => CompilerOutcome::Failed(error.to_string()),
         Err(payload) => CompilerOutcome::Failed(format!(
@@ -961,6 +1016,9 @@ fn classify_with_mismatch_bytes(
     let oracle_rejected = matches!(&oracle, OracleOutcome::Rejected(_));
     let mut mismatch_bytes = None;
     let (kind, detail) = match (oracle, compiled) {
+        (_, CompilerOutcome::UnresolvedInternState(detail)) => {
+            (OutcomeKind::UnresolvedInternState, detail)
+        }
         (OracleOutcome::Compiled(oracle), CompilerOutcome::Compiled(ours)) => {
             if ours == oracle {
                 (OutcomeKind::Exact, format!("{} bytes", ours.len()))
@@ -1079,6 +1137,69 @@ mod tests {
         .unwrap();
         assert!(diagnostic.validate_assume_absent(false).is_err());
         assert!(diagnostic.validate_assume_absent(true).is_ok());
+    }
+
+    #[test]
+    fn comparison_requires_caller_evidence_and_diagnostics_cannot_gate() {
+        let defaults = Options::try_parse_from(["compare_cpython_corpus"]).unwrap();
+        assert!(defaults.validate_intern_contract(false, false).is_err());
+        let profiled = Options::try_parse_from([
+            "compare_cpython_corpus",
+            "--initial-intern-state",
+            "profile.json",
+        ])
+        .unwrap();
+        assert!(profiled.validate_intern_contract(false, false).is_ok());
+        let diagnostic = Options::try_parse_from([
+            "compare_cpython_corpus",
+            "--diagnostic-assume-startup-intern-state",
+        ])
+        .unwrap();
+        assert!(diagnostic.validate_intern_contract(false, false).is_ok());
+        assert!(diagnostic.validate_intern_contract(true, false).is_err());
+        assert!(diagnostic.validate_intern_contract(false, true).is_err());
+        for gate in ["--require-all", "--require-rejection-parity"] {
+            let options = Options::try_parse_from([
+                "compare_cpython_corpus",
+                "--diagnostic-assume-startup-intern-state",
+                gate,
+            ])
+            .unwrap();
+            assert!(options.validate_intern_contract(false, false).is_err());
+        }
+        assert!(
+            Options::try_parse_from([
+                "compare_cpython_corpus",
+                "--diagnostic-assume-startup-intern-state",
+                "--initial-intern-state",
+                "profile.json",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unresolved_caller_identity_is_never_an_exact_match_or_rejection() {
+        for oracle in [
+            OracleOutcome::Compiled(vec![]),
+            OracleOutcome::Rejected("SyntaxError".into()),
+        ] {
+            let compiled = capture_compiler(|| {
+                Err(serc::CompileError::UnresolvedInternState {
+                    value: "full".into(),
+                })
+            });
+            let outcome = classify(Path::new("module.py"), oracle, compiled);
+            assert_eq!(outcome.kind, OutcomeKind::UnresolvedInternState);
+            assert!(outcome.kind.is_failure());
+            assert!(outcome.detail.contains("full"));
+        }
+    }
+
+    #[test]
+    fn expected_unknown_counts_cannot_turn_missing_context_into_success() {
+        let counts = BTreeMap::from([(OutcomeKind::UnresolvedInternState, 1)]);
+        assert!(!validate_outcome_counts(&counts, 0, 1, 0, &counts, None, false, false).is_empty());
     }
 
     #[test]
