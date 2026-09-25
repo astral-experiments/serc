@@ -39,6 +39,8 @@ for code in walk(root):
         print(code.co_qualname, positions)
 "#;
 
+const PYTHON_3145_IDENTITY_CHECK: &str = "import importlib.util, sys; expected = tuple(map(int, sys.argv[2].split('.'))) + ('final', 0); actual = sys.version_info; magic = importlib.util.MAGIC_NUMBER.hex(); ok = sys.implementation.name == sys.argv[1] and actual == expected and magic == sys.argv[3]; print(f'{sys.implementation.name} {'.'.join(map(str, actual[:3]))} {actual.releaselevel} {actual.serial} magic {magic}', file=sys.stderr); raise SystemExit(not ok)";
+
 static PYTHON_3145: OnceLock<Result<String, String>> = OnceLock::new();
 
 fn python_3145() -> &'static str {
@@ -58,7 +60,7 @@ fn discover_python_3145() -> Result<String, String> {
             "-I",
             "-S",
             "-c",
-            "import importlib.util, sys; expected = tuple(map(int, sys.argv[2].split('.'))); actual = sys.version_info[:3]; magic = importlib.util.MAGIC_NUMBER.hex(); ok = sys.implementation.name == sys.argv[1] and actual == expected and magic == sys.argv[3]; print(f'{sys.implementation.name} {'.'.join(map(str, actual))} magic {magic}', file=sys.stderr); raise SystemExit(not ok)",
+            PYTHON_3145_IDENTITY_CHECK,
             CPYTHON_TARGET.implementation,
             version.as_str(),
             magic.as_str(),
@@ -248,4 +250,30 @@ pub(crate) fn indent(source: &str) -> String {
         result.push('\n');
     }
     result
+}
+
+#[test]
+fn python_3145_identity_rejects_prereleases() {
+    let script = "import collections, sys; Version = collections.namedtuple('Version', 'major minor micro releaselevel serial'); sys.version_info = Version(3, 14, 5, 'candidate', 1); exec(sys.argv.pop(1))";
+    let output = Command::new(python_3145())
+        .args([
+            "-I",
+            "-S",
+            "-c",
+            script,
+            PYTHON_3145_IDENTITY_CHECK,
+            CPYTHON_TARGET.implementation,
+            &CPYTHON_TARGET.version_string(),
+            &CPYTHON_TARGET.magic_hex(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim(),
+        format!(
+            "cpython 3.14.5 candidate 1 magic {}",
+            CPYTHON_TARGET.magic_hex()
+        )
+    );
 }
