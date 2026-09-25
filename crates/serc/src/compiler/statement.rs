@@ -26805,6 +26805,53 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_finally_end_blocks == 0
             && self.control.finally.active_copied_finally_bodies == 0
             && loop_recovery_has_nonempty_finally_route(statement);
+        // A guarded named handler has a populated exit into normal cleanup,
+        // even when the protected body or an earlier handler is only `pass`.
+        let guarded_named_handler_reaches_finally = !statement.is_star
+            && self.context.python_version >= crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+            && statement.orelse.is_empty()
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self.control.exceptions.active_exception_region_exclusions.is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && (matches!(statement.body.as_slice(), [Stmt::Pass(_)])
+                || matches!(statement.body.as_slice(), [Stmt::Expr(work)]
+                    if suite_has_linear_borrow_fallthrough(&statement.body)
+                        && !expression_suspends_current_scope(&work.value)))
+            && statement.handlers.split_last().is_some_and(|(guarded, preceding)| {
+                preceding.len() <= 1 && preceding.iter().all(|plain| plain.as_except_handler().is_some_and(|handler| {
+                    handler.type_.is_some()
+                        && handler.name.is_none()
+                        && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+                })) && guarded.as_except_handler().is_some_and(|handler| {
+                    handler.type_.is_some()
+                        && handler.name.is_some()
+                        && matches!(handler.body.as_slice(), [Stmt::If(guard)]
+                            if condition_has_linear_runtime_leaves(&guard.test)
+                                && !expression_suspends_current_scope(&guard.test)
+                                && guard.elif_else_clauses.is_empty()
+                                && (matches!(guard.body.as_slice(), [Stmt::Raise(raise)]
+                                    if raise.exc.as_deref().is_none_or(|value| matches!(value, Expr::Name(_)))
+                                        && raise.cause.as_deref().is_none_or(|value| matches!(value, Expr::Name(_))))
+                                    || matches!(guard.body.as_slice(), [Stmt::Return(return_)]
+                                        if return_.value.as_deref().is_none_or(|value| matches!(value, Expr::Name(_))))))
+                })})
+            && suite_has_linear_borrow_fallthrough(&statement.finalbody)
+            && (matches!(statement.finalbody.as_slice(), [Stmt::Expr(cleanup)]
+                if !expression_suspends_current_scope(&cleanup.value))
+                || matches!(statement.finalbody.as_slice(), [Stmt::AugAssign(cleanup)]
+                    if !expression_suspends_current_scope(&cleanup.target)
+                        && !expression_suspends_current_scope(&cleanup.value))
+                || matches!(statement.finalbody.as_slice(), [Stmt::Assign(cleanup)]
+                    if cleanup.targets.iter().all(|target| !expression_suspends_current_scope(target))
+                        && !expression_suspends_current_scope(&cleanup.value)));
         let normal_finally_is_borrow_reachable = (simple_fallthrough_handlers_reach_finally
             || compound_fallthrough_handlers_reach_finally
             || runtime_while_handlers_reach_finally)
@@ -26818,6 +26865,7 @@ impl<'source> Compiler<'source> {
             || dispatcher_break_reaches_finally
             || inner_try_break_loop_range.is_some()
             || conditional_handler_reaches_finally
+            || guarded_named_handler_reaches_finally
             || named_iterator_break_reaches_finally
             || iterator_continue_recovery_reaches_finally
             || terminal_if_false_edge_reaches_finally
