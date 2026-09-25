@@ -33,6 +33,14 @@ def generate(
     archive_sha256: str,
 ) -> dict:
     """Bind runtime bytes and exact module sources without observing intern state."""
+    runtime_preparer = variants.runtime_preparer
+    if any(
+        (prefix / relative).is_file()
+        for relative in runtime_preparer.RELOCATABLE_SYSCONFIG
+    ):
+        # Validate the installation spelling before resolving it: a symlink
+        # alias must not silently change which prefix bytes are authenticated.
+        runtime_preparer.prefix_bytes(prefix)
     prefix = prefix.resolve()
     frozen, ordinary = variants.module_maps(checkout, version)
     executable = f"bin/python{version}"
@@ -48,13 +56,32 @@ def generate(
             continue
         if not path.is_file() or not path.resolve().is_relative_to(prefix):
             raise ValueError(f"unsupported runtime entry: {relative}")
+        entry = {
+            "path": relative.as_posix(),
+            "executable": bool(path.stat().st_mode & 0o111),
+            "symlink_target": os.readlink(path) if path.is_symlink() else None,
+        }
+        if entry["path"] in runtime_preparer.RELOCATABLE_SYSCONFIG:
+            entry["prefix_relocation"] = {
+                "kind": "uv-sysconfig-prefix-v1",
+                "occurrences": path.read_bytes().count(
+                    runtime_preparer.prefix_bytes(prefix)
+                ),
+                "uv_source_commit": runtime_preparer.UV_RELOCATION_COMMIT,
+            }
+        size, sha256 = runtime_preparer.file_identity(prefix, entry)
         entries.append(
             {
-                "path": relative.as_posix(),
-                "sha256": digest(path),
-                "size": path.stat().st_size,
-                "executable": bool(path.stat().st_mode & 0o111),
-                "symlink_target": os.readlink(path) if path.is_symlink() else None,
+                "path": entry["path"],
+                "sha256": sha256,
+                "size": size,
+                "executable": entry["executable"],
+                "symlink_target": entry["symlink_target"],
+                **(
+                    {"prefix_relocation": entry["prefix_relocation"]}
+                    if "prefix_relocation" in entry
+                    else {}
+                ),
             }
         )
     entries.sort(key=lambda entry: entry["path"])

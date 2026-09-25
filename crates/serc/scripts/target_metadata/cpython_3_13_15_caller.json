@@ -27,7 +27,7 @@
   "platform": "linux",
   "architecture": "x86_64",
   "gil_enabled": true,
-  "generator_sha256": "3f11425ced647a5a7516d600e630b2bfcd63cd027637315c249df102a9cd0c9f",
+  "generator_sha256": "86ae6ccaf4d082a7b009440cb4c86d7c1781b79bf3f6f89550d789f09613e5e7",
   "input_sha256": {
     "Include/internal/pycore_global_strings.h": "46484946f10cba8b1d282f9e0ea39276add8a30fc4ff81058f242368e36c5013",
     "Lib/_collections_abc.py": "87601195497fde3b7cea03bce396e1b713c17af3d273298d99d3bc0147f745b9",
@@ -80,7 +80,7 @@
     "Python/pythonrun.c": "2f091cc16fc42d1195a04afb547264d3dbae1069ea8ff5486156c8bf547bcf9c",
     "Tools/build/freeze_modules.py": "6e6dfe3eb63050f6128f37ca888be7fb907de9c9613bb208941b954fe295012b"
   },
-  "startup_profile_sha256": "f1e1100939e7720a0d8e7ec468970b4c93e14bbd0d75f4c967b3d0389c3552cd",
+  "startup_profile_sha256": "4485df8166e99edf0083710fec02c865233a579970a441abf219d6a3b32f997b",
   "state": {
     "semantics": "guaranteed-retained-partial",
     "positive_proof_complete": true,
@@ -8382,7 +8382,7 @@
   "runtime_admissions": [
     {
       "path": "cpython_3_13_15_caller_runtime_linux_x86_64.json",
-      "sha256": "a244b184e89f34623244bddfa6ff7a03791eb9487eda850b2b8db83417dfedd6"
+      "sha256": "bd6e6c43c1cc3218956d5ecb5eaf54413399bcf05bf01a3ceeeb123c38d39ecc"
     }
   ],
   "coverage": {
@@ -8608,7 +8608,7 @@
       {
         "kind": "source-derived-initial-state-artifact",
         "path": "cpython_3_13_15_caller_startup.json",
-        "sha256": "f1e1100939e7720a0d8e7ec468970b4c93e14bbd0d75f4c967b3d0389c3552cd"
+        "sha256": "4485df8166e99edf0083710fec02c865233a579970a441abf219d6a3b32f997b"
       }
     ],
     "intern_sinks": [

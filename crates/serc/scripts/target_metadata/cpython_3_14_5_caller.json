@@ -27,7 +27,7 @@
   "platform": "linux",
   "architecture": "x86_64",
   "gil_enabled": true,
-  "generator_sha256": "1734e621ac257a6a28732ba73190c4e0d45c551e6879eda57d48b0c02ff86c8f",
+  "generator_sha256": "1388289d4eb2040a87fbbee73c33f4a297966584937f5656e2d8d51789c2db4a",
   "input_sha256": {
     "Include/Python.h": "e39aad93d70c3ea1a63b77ec5795ff59a5c177745aedace6f83bbf4275a20d9f",
     "Include/abstract.h": "3543d54a3493df2e72f2c607a6ad31ea19cc47f19c862f7a6b4cd1ac578b3873",
@@ -10448,7 +10448,7 @@
   "runtime_admissions": [
     {
       "path": "cpython_3_14_5_caller_runtime_linux_x86_64.json",
-      "sha256": "a5f5312cc24c3329ef130339538c5ae2ad63fd878bf4743940a692637b6d1e68"
+      "sha256": "62a85764ccd2264a6777f950f57d4fd62ae6fbeccee304b1a3639cd36499dd37"
     }
   ],
   "coverage": {
@@ -10693,6 +10693,11 @@
       }
     ],
     "retained_owners": [
+      {
+        "kind": "generation-runtime-admission-verification",
+        "helper": "generate_cpython_caller_variants.py",
+        "helper_sha256": "86ae6ccaf4d082a7b009440cb4c86d7c1781b79bf3f6f89550d789f09613e5e7"
+      },
       {
         "kind": "retained-code-source-analysis",
         "helper": "caller_source_owners.py",

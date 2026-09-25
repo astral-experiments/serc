@@ -10,7 +10,7 @@
     "magic_hex": "520e0d0a"
   },
   "scope": "isolated-fixed-caller-before-compilation",
-  "generator_sha256": "3f11425ced647a5a7516d600e630b2bfcd63cd027637315c249df102a9cd0c9f",
+  "generator_sha256": "86ae6ccaf4d082a7b009440cb4c86d7c1781b79bf3f6f89550d789f09613e5e7",
   "compiler_executable_sha256": "48bd5afdced148bd2f318ca9b35858f31b9355c1ce4fb243bd45505468deb174",
   "input_sha256": {
     "Include/internal/pycore_global_strings.h": "74a169a0576ca03d9ae278ee008db5f2d735501bfdc84e23c3f74fae50e78963",
@@ -51,7 +51,7 @@
   "runtime_admissions": [
     {
       "path": "cpython_3_15_0rc2_caller_runtime_linux_x86_64.json",
-      "sha256": "105ede4e32968da99515ddefebd37c838784d91100ceba87c3c81886dbd455e6"
+      "sha256": "58eca2d151397d464d537f605f949a9ca89a96b237bb3d6549ac07551e160158"
     }
   ],
   "recipes": [

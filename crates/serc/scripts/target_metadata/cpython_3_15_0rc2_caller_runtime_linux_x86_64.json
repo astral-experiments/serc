@@ -549,10 +549,15 @@
     },
     {
       "path": "lib/python3.15/_sysconfigdata__linux_x86_64-linux-gnu.py",
-      "sha256": "5beffcd0e031d52ea54f2c0d7a73683c75cbe790898929dec72d281ae2ff0fad",
-      "size": 64868,
+      "sha256": "d27b097f372d740a6b4c78938bccc418fd4f609ff1575fbcf198dd6fdc65ef2f",
+      "size": 63505,
       "executable": false,
-      "symlink_target": null
+      "symlink_target": null,
+      "prefix_relocation": {
+        "kind": "uv-sysconfig-prefix-v1",
+        "occurrences": 29,
+        "uv_source_commit": "635500036e1705961315e86447f0fab0a8ddb309"
+      }
     },
     {
       "path": "lib/python3.15/_threading_local.py",
@@ -6934,5 +6939,5 @@
       "path": null
     }
   ],
-  "preparer_sha256": "38879d1965e90126b1285b2d1f6fdb729b4349aa72f3acf706a7490b106ada9b"
+  "preparer_sha256": "013666935cdbc1952d7260af798a41e18e81be75f1bf1065b17f3c1557846d5d"
 }

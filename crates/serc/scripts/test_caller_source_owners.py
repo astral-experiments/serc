@@ -1,4 +1,5 @@
 """Compile-only tests; none of the sample modules is executed."""
+
 from __future__ import annotations
 
 import textwrap

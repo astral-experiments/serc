@@ -506,9 +506,14 @@
     {
       "executable": false,
       "path": "lib/python3.14/_sysconfigdata__linux_x86_64-linux-gnu.py",
-      "sha256": "4b2eec266bbacd0d3126375d23b11dfdfbf4fdb6737c67a50d8f12ac5cb4f31c",
-      "size": 50686,
-      "symlink_target": null
+      "sha256": "221996cad6077a3cb848c9f3dca97ba7d01e983b368b79ec2073fb37161f2f1b",
+      "size": 49381,
+      "symlink_target": null,
+      "prefix_relocation": {
+        "kind": "uv-sysconfig-prefix-v1",
+        "occurrences": 29,
+        "uv_source_commit": "635500036e1705961315e86447f0fab0a8ddb309"
+      }
     },
     {
       "executable": false,
@@ -6580,7 +6585,7 @@
     }
   ],
   "platform": "linux",
-  "preparer_sha256": "38879d1965e90126b1285b2d1f6fdb729b4349aa72f3acf706a7490b106ada9b",
+  "preparer_sha256": "013666935cdbc1952d7260af798a41e18e81be75f1bf1065b17f3c1557846d5d",
   "schema_version": 1,
   "source_modules": [
     {

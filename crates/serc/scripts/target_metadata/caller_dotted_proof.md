@@ -21,6 +21,14 @@ Makefile, configuration header and sysconfig data bind build selection.
 Extension registration alone does not execute its initializer; optional modules
 whose initialization is possible are nevertheless included conservatively.
 
+The admitted uv builds rewrite installation-prefix occurrences in the generated
+sysconfig file. Its manifest authenticates the entire normalized byte sequence
+and exact occurrence count, using only the actual canonical prefix. Every other
+byte remains bound. The owned runtime rewrites the authenticated prefix and
+revalidates the same identity. These absolute path substitutions do not add a
+name in the dotted-identifier domain; no configuration key or non-prefix value
+is omitted from authentication.
+
 Full decoded C literals are collected with adjacent-string concatenation. Static
 type-module lookup can intern the prefix preceding the last dot in `tp_name`, so
 every such literal prefix is included. The finite POSIX `MODNAME` type-name

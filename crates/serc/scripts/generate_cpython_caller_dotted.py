@@ -28,18 +28,18 @@ METADATA = Path(__file__).resolve().parent / "target_metadata"
 PROFILE_PINS = {
     "3.13": (
         "3_13_15",
-        "41b6c006a0fcdf27ef6c09728a0ffdc55e20514d7bba4aed8df27b677f78376e",
-        "a244b184e89f34623244bddfa6ff7a03791eb9487eda850b2b8db83417dfedd6",
+        "47c5b083c5439134a462e9451685365d5b91d35826ae733737e9de65c058ed1e",
+        "bd6e6c43c1cc3218956d5ecb5eaf54413399bcf05bf01a3ceeeb123c38d39ecc",
     ),
     "3.14": (
         "3_14_5",
-        "5a7e6ca0176ab8e07bae6bde1d54226439462b6e82493e110f4863ce2bbf45e0",
-        "a5f5312cc24c3329ef130339538c5ae2ad63fd878bf4743940a692637b6d1e68",
+        "8c20397f2f49ca525354027544385195d716c4675dc04361d3d52b04d03e3fd9",
+        "62a85764ccd2264a6777f950f57d4fd62ae6fbeccee304b1a3639cd36499dd37",
     ),
     "3.15": (
         "3_15_0rc2",
-        "3580dff92980e02edea1334fd6fa7815bc2c7924ec79466a4389815a5e149a0a",
-        "105ede4e32968da99515ddefebd37c838784d91100ceba87c3c81886dbd455e6",
+        "7e96c1f8dea2cdb06805eea76eff8ffd53099c9a208b94cb6d988e8ec6d225d5",
+        "58eca2d151397d464d537f605f949a9ca89a96b237bb3d6549ac07551e160158",
     ),
 }
 # Completion requires a separate exact-target source-closure review. Merely
@@ -272,15 +272,27 @@ def generate(source: Path, build_prefix: Path, version: str) -> dict:
             build_missing.append(relative)
             continue
         data = path.read_bytes()
-        fingerprint = digest(data)
         if relative in admitted_files:
-            assert fingerprint == admitted_files[relative]["sha256"]
+            entry = admitted_files[relative]
+            identity_data = variants.runtime_preparer.normalized_content(
+                build_prefix, entry, data
+            )
+            assert (len(identity_data), digest(identity_data)) == (
+                entry["size"],
+                entry["sha256"],
+            )
+        else:
+            identity_data = data
+        fingerprint = digest(identity_data)
         inputs["runtime:" + relative] = fingerprint
         build_inputs.append(
             {
                 "path": relative,
                 "sha256": fingerprint,
                 "bound_by_runtime_manifest": relative in admitted_files,
+                "prefix_relocation": admitted_files.get(relative, {}).get(
+                    "prefix_relocation"
+                ),
             }
         )
         text = data.decode()
@@ -445,6 +457,7 @@ def generate(source: Path, build_prefix: Path, version: str) -> dict:
                         Path(caller.caller_source_owners.__file__),
                         Path(variants.__file__),
                         Path(target.__file__),
+                        Path(variants.runtime_preparer.__file__),
                         METADATA / "caller_dotted_proof.md",
                     ]
                 },

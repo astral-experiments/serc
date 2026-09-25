@@ -40,6 +40,7 @@ from types import CodeType
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import caller_source_owners
 import generate_cpython_bootstrap as bootstrap
+import generate_cpython_caller_variants as variants
 import generate_cpython_target as target
 
 ORACLE_SHA256 = "6812e016e7e871700001ad9f8f832c5998d553bc33c84afb1745dbd664a965fb"
@@ -352,6 +353,22 @@ def generate(
         raise ValueError(
             "source facts require the independently audited exact compiler executable"
         )
+    if not admissions:
+        raise ValueError("caller generation requires a reviewed runtime admission")
+    refs = []
+    for admission in admissions:
+        admission_bytes = admission.read_bytes()
+        admitted = json.loads(admission_bytes)
+        compiler_hash = variants.verify_generation_runtime(admitted)
+        if (
+            admitted["build"]["source_commit"] != target.TARGET_COMMIT
+            or compiler_hash != base["runtime_profile"]["executable_sha256"]
+        ):
+            raise ValueError(
+                "native startup owners require the independently audited exact runtime"
+            )
+        relative = admission.resolve().relative_to(output.parent.resolve())
+        refs.append({"path": str(relative), "sha256": digest(admission_bytes)})
 
     sources: dict[str, str] = {}
     for path in (
@@ -561,20 +578,6 @@ def generate(
     # Keep only the schema-required retained subset in the public artifact.
     possible = {word for word in retained if ASCII_WORD.fullmatch(word)}
 
-    refs = []
-    for admission in admissions:
-        admitted = json.loads(admission.read_bytes())
-        executable = next(
-            entry
-            for entry in admitted["files"]
-            if entry["path"] == admitted["executable"]
-        )
-        if executable["sha256"] != base["runtime_profile"]["executable_sha256"]:
-            raise ValueError(
-                "native startup owners require the independently audited exact executable"
-            )
-        relative = admission.resolve().relative_to(output.parent.resolve())
-        refs.append({"path": str(relative), "sha256": digest(admission.read_bytes())})
     magic = int(
         re.search(
             r"^#define\s+PYC_MAGIC_NUMBER\s+(\d+)$",
@@ -622,6 +625,11 @@ def generate(
         "coverage": {
             "module_loads": modules,
             "retained_owners": [
+                {
+                    "kind": "generation-runtime-admission-verification",
+                    "helper": "generate_cpython_caller_variants.py",
+                    "helper_sha256": digest(Path(variants.__file__).read_bytes()),
+                },
                 {
                     "kind": "retained-code-source-analysis",
                     "helper": "caller_source_owners.py",

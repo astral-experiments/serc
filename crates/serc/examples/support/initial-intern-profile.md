@@ -89,6 +89,16 @@ under the admitted complete environment, preserving its script, arguments,
 compile options, warnings, and raw-byte comparison. The original interpreter
 installation is unchanged, and the temporary copy is removed when the run ends.
 
+The two admitted uv installations relocate `_sysconfigdata` to their
+installation prefix. Only those exact manifest paths may use the tagged prefix
+transform: the full file, normalized size, substitution count, and pinned uv
+transform are authenticated. The prefix comes from the actual canonical
+installation path, never from a field in the file. Qualification rewrites that
+verified prefix for the owned copy and authenticates the result again. Other
+byte changes, prefix aliases, unsupported escaped spellings, or transformations
+of any other file fail qualification; all untagged files retain exact raw-byte
+hashes.
+
 These profiles describe the qualified runtime and environment, not arbitrary
 inherited process settings. They cannot be combined with legacy caller models or
 native output caches. Existing captured-profile and cache invocations retain

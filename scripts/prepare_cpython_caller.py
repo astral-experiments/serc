@@ -28,6 +28,13 @@ print(json.dumps({'executable': sys.executable, 'prefix': sys.prefix,
     'paths': sys.path, 'modules': modules}))
 """
 
+PREFIX_MARKER = b"/__SERC_RUNTIME_PREFIX__"
+UV_RELOCATION_COMMIT = "635500036e1705961315e86447f0fab0a8ddb309"
+RELOCATABLE_SYSCONFIG = frozenset(
+    f"lib/python{version}/_sysconfigdata__linux_x86_64-linux-gnu.py"
+    for version in ("3.14", "3.15")
+)
+
 
 def relative_path(value: str) -> Path:
     """Accept a normalized path that cannot escape an admitted runtime prefix."""
@@ -50,6 +57,52 @@ def sha256(path: Path) -> str:
         return digest.hexdigest()
 
 
+def prefix_bytes(prefix: Path) -> bytes:
+    """Accept only canonical, unescaped prefixes in the reviewed uv transform."""
+    text = str(prefix)
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/_-."
+    if (
+        not prefix.is_absolute()
+        or prefix != prefix.resolve(strict=True)
+        or any(character not in allowed for character in text)
+        or text == "/"
+        or PREFIX_MARKER.decode() in text
+    ):
+        raise ValueError("unsupported sysconfig installation prefix")
+    return text.encode("ascii")
+
+
+def normalized_content(prefix: Path, item: dict, content: bytes) -> bytes:
+    """Authenticate every byte modulo the single reviewed installation prefix."""
+    relocation = item.get("prefix_relocation")
+    if relocation is None:
+        return content
+    if (
+        item["path"] not in RELOCATABLE_SYSCONFIG
+        or item["symlink_target"] is not None
+        or not isinstance(relocation, dict)
+        or set(relocation) != {"kind", "occurrences", "uv_source_commit"}
+        or relocation["kind"] != "uv-sysconfig-prefix-v1"
+        or relocation["uv_source_commit"] != UV_RELOCATION_COMMIT
+        or type(relocation["occurrences"]) is not int
+        or relocation["occurrences"] <= 0
+    ):
+        raise ValueError("unsupported runtime prefix relocation")
+    original = prefix_bytes(prefix)
+    if PREFIX_MARKER in content or content.count(original) != relocation["occurrences"]:
+        raise ValueError("sysconfig prefix occurrences differ from admission")
+    return content.replace(original, PREFIX_MARKER)
+
+
+def file_identity(prefix: Path, item: dict) -> tuple[int, str]:
+    """Return exact raw identity, or full normalized identity for tagged sysconfig."""
+    path = prefix / relative_path(item["path"])
+    if item.get("prefix_relocation") is None:
+        return path.stat().st_size, sha256(path)
+    content = normalized_content(prefix, item, path.read_bytes())
+    return len(content), hashlib.sha256(content).hexdigest()
+
+
 def validate_file(prefix: Path, item: dict) -> Path:
     """Check the exact bytes and link identity of one manifest entry."""
     path = prefix / relative_path(item["path"])
@@ -61,7 +114,7 @@ def validate_file(prefix: Path, item: dict) -> Path:
         raise ValueError(f"runtime link changed: {item['path']}")
     if not path.resolve().is_relative_to(prefix.resolve()):
         raise ValueError(f"runtime file escapes prefix: {item['path']}")
-    if path.stat().st_size != item["size"] or sha256(path) != item["sha256"]:
+    if file_identity(prefix, item) != (item["size"], item["sha256"]):
         raise ValueError(f"runtime content changed: {item['path']}")
     return path
 
@@ -92,6 +145,10 @@ def prepare(admission: dict, supplied: Path, destination: Path) -> dict:
         raise ValueError(
             "caller runtime does not support a system preload configuration"
         )
+    # uv uses an absolute installation spelling, not symlink canonicalization.
+    # Tagged relocation therefore rejects aliases instead of guessing a prefix.
+    if any(item.get("prefix_relocation") for item in admission["files"]):
+        prefix_bytes(supplied)
     supplied = supplied.resolve()
     destination = destination.resolve()
     if supplied == destination or destination.is_relative_to(supplied):
@@ -114,7 +171,15 @@ def prepare(admission: dict, supplied: Path, destination: Path) -> dict:
         target = destination / path
         target.parent.mkdir(parents=True, exist_ok=True)
         if item["symlink_target"] is None:
-            shutil.copyfile(source, target)
+            if item.get("prefix_relocation") is None:
+                shutil.copyfile(source, target)
+            else:
+                # Source authentication above precedes the exact rewrite. The
+                # destination then passes the same full normalized-byte check.
+                content = source.read_bytes().replace(
+                    prefix_bytes(supplied), prefix_bytes(destination)
+                )
+                target.write_bytes(content)
             target.chmod(0o555 if item["executable"] else 0o444)
     # Resolve links only after all canonical files exist in the copy.
     for item in entries:
