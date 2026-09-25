@@ -18,6 +18,27 @@ mod tests {
     use serc_fixtures as fixtures;
 
     #[test]
+    fn nested_constant_condition_matches_cpython_marshal() {
+        for condition in [
+            "False if d else False",
+            "False if d else True",
+            "0 if d else 0",
+            "None if d else None",
+            "False if d else 0",
+            "0 if d else False",
+            "False if d else None",
+            "None if d else False",
+        ] {
+            let source = format!("def f(d):\n    return 1 if ({condition}) else 2\n");
+            assert_matches_cpython_marshal(&source, "nested_constant_condition.py");
+        }
+        assert_executes(
+            "class Probe:\n    def __bool__(self):\n        print('tested')\n        return True\n\ndef f(d):\n    return 1 if (False if d else False) else 2\n\nprint(f(Probe()))\n",
+            "tested\n2\n",
+        );
+    }
+
+    #[test]
     fn terminating_finally_keeps_pending_return_until_cleanup_finishes() {
         let source = r#"
 class Tracked:

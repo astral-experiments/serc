@@ -4225,13 +4225,33 @@ impl OptimizationPipeline {
                 .collect::<FxHashSet<_>>()
         };
         let graph = &mut self.graph;
-        // Unlocated borrow markers always disappear after local analysis. Keep the
-        // barrier in the graph, but exclude it from physical jump adjacency.
-        let is_unlocated_borrow_marker = |instruction: &Instruction| {
+        // A later removed forward jump may acquire and transfer a barrier to the
+        // preceding marker on a retry. Refuse to skip that marker when a forward
+        // jump is its next instruction; labels do not separate these records.
+        let mut maybe_promoted = FxHashSet::default();
+        if finalize_borrow_empty_blocks {
+            let mut follows_forward_jump = false;
+            for block in graph.order().iter().copied().rev() {
+                for (offset, item) in graph[block].items().iter().enumerate().rev() {
+                    if let Item::Instruction(instruction) = item {
+                        if follows_forward_jump {
+                            maybe_promoted.insert(ItemPosition::new(block, offset));
+                        }
+                        follows_forward_jump = instruction.opcode == JUMP_FORWARD;
+                    }
+                }
+            }
+        }
+        // These borrow markers disappear after local analysis if their policy
+        // stays unchanged. Keep them in the graph for borrowing, while excluding
+        // them from physical adjacency when no later jump can change that policy.
+        let is_removable_borrow_marker = |instruction: &Instruction| {
             finalize_borrow_empty_blocks
                 && instruction.opcode == NOP
                 && instruction.jump_policy.borrow_empty_block()
-                && instruction.location.line < 0
+                && (instruction.location.line < 0
+                    || instruction.no_location_policy.borrow_fallthrough()
+                        == BorrowFallthrough::BarrierIfRemoved)
         };
         let mut target = None;
         let mut has_work = false;
@@ -4242,7 +4262,7 @@ impl OptimizationPipeline {
                     break;
                 }
                 Item::Label(_) => {}
-                Item::Instruction(instruction) if is_unlocated_borrow_marker(instruction) => {}
+                Item::Instruction(instruction) if is_removable_borrow_marker(instruction) => {}
                 Item::Instruction(instruction) => {
                     target = None;
                     if instruction.opcode != JUMP_FORWARD {
@@ -4327,6 +4347,8 @@ impl OptimizationPipeline {
                     }
 
                     let mut target_is_next = false;
+                    let mut crossed_located_folded_marker = false;
+                    let mut crossed_other_located_marker = false;
                     let mut crosses_exception_boundary = false;
                     let mut crosses_only_original_match_end = finalize_borrow_empty_blocks
                         && instruction.jump_policy.is_original_match_success()
@@ -4413,7 +4435,24 @@ impl OptimizationPipeline {
                                     }
                                 }
                                 Item::Instruction(removed) => {
-                                    if is_unlocated_borrow_marker(removed) {
+                                    if is_removable_borrow_marker(removed)
+                                        && !(removed.location.line >= 0
+                                            && removed.jump_policy.always_retains_nop()
+                                            && maybe_promoted.contains(&ItemPosition::new(
+                                                next_block,
+                                                next_offset,
+                                            )))
+                                    {
+                                        if removed.location.line >= 0 {
+                                            if removed.location.line == instruction.location.line
+                                                && removed.no_location_policy.borrow_fallthrough()
+                                                    == BorrowFallthrough::BarrierIfRemoved
+                                            {
+                                                crossed_located_folded_marker = true;
+                                            } else {
+                                                crossed_other_located_marker = true;
+                                            }
+                                        }
                                         continue;
                                     }
                                     let position = ItemPosition::new(next_block, next_offset);
@@ -4821,6 +4860,24 @@ impl OptimizationPipeline {
                         let instruction = graph.instruction_mut(position).unwrap();
                         instruction.opcode = NOP;
                         instruction.set_operand(Operand::Value(0));
+                        if crossed_located_folded_marker
+                            && !crossed_other_located_marker
+                            && !crosses_exception_boundary
+                            && !preserves_original_fallthrough_nop
+                            && !preserves_compound_fallthrough_nop
+                            && !preserves_copied_finally_break_nop
+                            && !ownerless_compound_exit
+                            && instruction.jump_policy.always_retains_nop()
+                            && instruction.no_location_policy.borrow_fallthrough()
+                                == BorrowFallthrough::BarrierIfRemoved
+                            && previous_line == Some(instruction.location.line)
+                            && next_line == Some(instruction.location.line)
+                        {
+                            // Both folded arms have vanished from this source line.
+                            // Keep their empty-block barrier for borrowed-load analysis,
+                            // then remove the redundant jump's NOP with the other marker.
+                            instruction.jump_policy.mark_borrow_empty_block();
+                        }
                         if ownerless_compound_exit {
                             // Only this unchanged original jump survived as the normal-exit NOP.
                             // Copied, retargeted, and still-live exits retain their own owners.
