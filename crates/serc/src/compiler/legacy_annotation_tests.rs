@@ -4466,7 +4466,28 @@ fn annotation_class_cells_follow_target_evaluation_rules() {
                 "type Alias = __class__",
                 "type Alias = [__class__ for __class__ in ()]",
             ] {
-                let module = compile(&format!("{future}class C:\n    {definition}\n"), version);
+                let source = format!("{future}class C:\n    {definition}\n");
+                if version == PythonVersion::Py312
+                    && definition == "type Alias = [__class__ for __class__ in ()]"
+                {
+                    let error = compile_with_options(
+                        &source,
+                        "legacy_annotations.py",
+                        &CompileOptions {
+                            python_version: version,
+                            ..CompileOptions::default()
+                        },
+                    )
+                    .unwrap_err();
+                    assert!(
+                        error.to_string().contains(
+                            "Cannot use comprehension in annotation scope within class scope"
+                        ),
+                        "{error}"
+                    );
+                    continue;
+                }
+                let module = compile(&source, version);
                 let class = child(&module, "C");
                 let has_class_cell = class
                     .locals
