@@ -11,6 +11,20 @@ fn comprehension(kind: &str, element: &str, target: &str) -> String {
 }
 
 #[test]
+#[ignore = "A nested function incorrectly promotes a global generator reference to a cell"]
+fn nested_generator_reference_resolves_global_after_first_iterable() {
+    let source = r"x = 'global'
+def outer():
+    def f():
+        return (x for y in [x for x in [1]])
+    return next(f())
+print(outer())
+";
+    common::assert_executes(source, "global\n");
+    common::assert_matches_cpython_marshal(source, "nested_generator_global.py");
+}
+
+#[test]
 fn matches_cpython_external_closures_in_comprehension_assignment_targets() {
     let source = r#"
 def collections(key, values):
