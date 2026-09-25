@@ -742,7 +742,13 @@ fn dump_mismatches(
 fn discover(roots: &[PathBuf], extensions: &[String]) -> Result<Vec<PathBuf>, String> {
     let mut paths = Vec::new();
     for root in roots {
-        for entry in WalkDir::new(root).follow_links(false) {
+        for entry in WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| {
+                entry.depth() == 0 || !entry.file_type().is_dir() || entry.file_name() != ".git"
+            })
+        {
             let entry = entry.map_err(|error| {
                 format!("failed to walk corpus root {}: {error}", root.display())
             })?;
@@ -1508,6 +1514,33 @@ mod tests {
             vec![
                 directory.path().join("module.py"),
                 directory.path().join("module.pyi")
+            ]
+        );
+    }
+
+    #[test]
+    fn discovery_excludes_git_metadata_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join(".git/hooks")).unwrap();
+        fs::create_dir_all(directory.path().join("nested/.git/hooks")).unwrap();
+        fs::create_dir_all(directory.path().join(".github")).unwrap();
+        fs::write(directory.path().join(".git/hooks/helper.py"), "pass\n").unwrap();
+        fs::write(
+            directory.path().join("nested/.git/hooks/helper.pyi"),
+            "pass\n",
+        )
+        .unwrap();
+        fs::write(directory.path().join(".github/script.py"), "pass\n").unwrap();
+        fs::write(directory.path().join("module.py"), "pass\n").unwrap();
+        fs::write(directory.path().join("nested/module.pyi"), "pass\n").unwrap();
+
+        let roots = [directory.path().to_path_buf()];
+        assert_eq!(
+            discover(&roots, &["pyi".to_string()]).unwrap(),
+            vec![
+                directory.path().join(".github/script.py"),
+                directory.path().join("module.py"),
+                directory.path().join("nested/module.pyi"),
             ]
         );
     }
