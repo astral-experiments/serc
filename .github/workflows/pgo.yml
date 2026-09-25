@@ -9,6 +9,7 @@ on:
       - scripts/build-pgo-release
       - scripts/check-cpython-compatibility
       - scripts/check-ruff-pin
+      - scripts/ruff-corpus-expectations
       - scripts/pgo_corpus.py
       - scripts/test_pgo_corpus.py
       - scripts/benchmarks/**
@@ -23,6 +24,7 @@ on:
       - scripts/build-pgo-release
       - scripts/check-cpython-compatibility
       - scripts/check-ruff-pin
+      - scripts/ruff-corpus-expectations
       - scripts/pgo_corpus.py
       - scripts/test_pgo_corpus.py
       - scripts/benchmarks/**
