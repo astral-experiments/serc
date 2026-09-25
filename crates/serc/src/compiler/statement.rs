@@ -18758,10 +18758,40 @@ impl<'source> Compiler<'source> {
                                         || suite_has_linear_borrow_fallthrough(&handler.body))
                             })
                         })));
+        // A guarded while whose recovery contains the only break shares an
+        // original empty normal-exit array with the outer try.
+        let guarded_while_recovery_exit = !statement.is_star
+            && statement.orelse.is_empty()
+            && statement.finalbody.is_empty()
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && matches!(statement.body.as_slice(), [Stmt::If(guard)]
+            if guard.elif_else_clauses.is_empty()
+                && condition_has_linear_runtime_leaves(&guard.test)
+                && !expression_suspends_current_scope(&guard.test)
+                && matches!(guard.body.as_slice(), [Stmt::While(loop_)]
+                    if loop_.orelse.is_empty()
+                        && condition_has_linear_runtime_leaves(&loop_.test)
+                        && !expression_suspends_current_scope(&loop_.test)
+                        && matches!(loop_.body.as_slice(), [Stmt::Try(recovery)]
+                            if !recovery.is_star
+                                && recovery.orelse.is_empty()
+                                && recovery.finalbody.is_empty()
+                                && matches!(recovery.body.as_slice(), [Stmt::Break(_)])
+                                && !recovery.handlers.is_empty()
+                                && recovery.handlers.iter().all(|handler| {
+                                    handler.as_except_handler().is_some_and(|handler| {
+                                        handler.type_.is_some()
+                                            && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+                                    })
+                                }))));
         let normal_exit_starts_in_empty_block = borrow_exit_has_successor
             && (suite_ends_in_empty_try_exit_block(normal_exit_suite, loop_tail.is_some())
                 || handler_contains_terminal_nested_try
                 || guarded_pass_recovery_exit
+                || guarded_while_recovery_exit
                 || (handler_contains_nested_handler_cold_join
                     && (borrow_exit_has_source_successor
                         || statement.handlers.iter().any(|handler| {
