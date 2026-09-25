@@ -45,6 +45,11 @@ filesystem path and preserves filename values that Rust strings cannot
 represent, including non-UTF-8 filenames on Unix. It also rejects paths
 containing a null character before decoding the source.
 
+`CompileOptions::native_build_profile` selects instruction ordering for specific
+native builds before constant folding. See the
+[native arithmetic profiles](../../docs/cpython-build-profiles.md) for artifact
+identities and math-library qualification requirements.
+
 Filesystem callers should snapshot metadata before reading the source, then pass
 that timestamp and raw byte length to `to_timestamp_pyc`. This prevents a
 concurrent edit from receiving a cache header that incorrectly marks the new

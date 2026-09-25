@@ -1,3 +1,4 @@
+use super::native_profile::{self, Linux314Profile};
 use std::borrow::{Borrow, Cow};
 use std::collections::hash_map::Entry;
 use std::hash::{Hash, Hasher};
@@ -770,7 +771,7 @@ impl Compiler<'_> {
                         }
                     }
                 } else if !matches!(
-                    fold_constant_for_version(&subscript.slice, self.context.python_version),
+                    self.context.fold_constant(&subscript.slice),
                     Some(Constant::Int(value)) if u8::try_from(value).is_ok()
                 ) {
                     self.record_folded_value(&subscript.slice)?;
@@ -1904,6 +1905,23 @@ pub(super) fn fold_constant_with_literals(
     literal: &impl Fn(&Expr) -> Option<Constant>,
     boolean_sequence_repetition: bool,
 ) -> Option<Constant> {
+    fold_constant_with_profile(
+        expression,
+        python_version,
+        crate::NativeBuildProfile::Default,
+        literal,
+        boolean_sequence_repetition,
+    )
+}
+
+/// Fold before constant admission using the compilation's immutable native profile.
+pub(super) fn fold_constant_with_profile(
+    expression: &Expr,
+    python_version: PythonVersion,
+    native_build_profile: crate::NativeBuildProfile,
+    literal: &impl Fn(&Expr) -> Option<Constant>,
+    boolean_sequence_repetition: bool,
+) -> Option<Constant> {
     if let Some(constant) = literal(expression) {
         return Some(constant);
     }
@@ -1932,9 +1950,10 @@ pub(super) fn fold_constant_with_literals(
             .elts
             .iter()
             .map(|value| {
-                fold_constant_with_literals(
+                fold_constant_with_profile(
                     value,
                     python_version,
+                    native_build_profile,
                     literal,
                     boolean_sequence_repetition,
                 )
@@ -1945,14 +1964,16 @@ pub(super) fn fold_constant_with_literals(
             &subscript.value,
             &subscript.slice,
             python_version,
+            native_build_profile,
             literal,
             boolean_sequence_repetition,
         ),
         Expr::Slice(slice) => constant_slice_with_literals(slice, literal),
         Expr::UnaryOp(unary) => match unary.op {
-            UnaryOp::UAdd => match fold_constant_with_literals(
+            UnaryOp::UAdd => match fold_constant_with_profile(
                 &unary.operand,
                 python_version,
+                native_build_profile,
                 literal,
                 boolean_sequence_repetition,
             )? {
@@ -1988,27 +2009,30 @@ pub(super) fn fold_constant_with_literals(
                     return Some(Constant::Bool(depth.is_multiple_of(2)));
                 }
                 if matches!(unary.operand.as_ref(), Expr::Tuple(_)) {
-                    fold_constant_with_literals(
+                    fold_constant_with_profile(
                         &unary.operand,
                         python_version,
+                        native_build_profile,
                         literal,
                         boolean_sequence_repetition,
                     )?;
                 }
                 literal_truthiness(&unary.operand).map(|value| Constant::Bool(!value))
             }
-            UnaryOp::USub => fold_constant_with_literals(
+            UnaryOp::USub => fold_constant_with_profile(
                 &unary.operand,
                 python_version,
+                native_build_profile,
                 literal,
                 boolean_sequence_repetition,
             )?
             .into_numeric_value()
             .negated(),
             UnaryOp::Invert => {
-                let operand = fold_constant_with_literals(
+                let operand = fold_constant_with_profile(
                     &unary.operand,
                     python_version,
+                    native_build_profile,
                     literal,
                     boolean_sequence_repetition,
                 )?;
@@ -2027,20 +2051,35 @@ pub(super) fn fold_constant_with_literals(
             }
         },
         Expr::BinOp(binary) => {
-            let left = fold_constant_with_literals(
+            let left = fold_constant_with_profile(
                 &binary.left,
                 python_version,
+                native_build_profile,
                 literal,
                 boolean_sequence_repetition,
             )?
             .into_numeric_value();
-            let right = fold_constant_with_literals(
+            let right = fold_constant_with_profile(
                 &binary.right,
                 python_version,
+                native_build_profile,
                 literal,
                 boolean_sequence_repetition,
             )?
             .into_numeric_value();
+            let scalar = |left, right, operator| {
+                if native_build_profile != crate::NativeBuildProfile::Default {
+                    native_profile::binary(left, right, operator)
+                } else {
+                    match operator {
+                        '+' => left + right,
+                        '-' => left - right,
+                        '*' => left * right,
+                        '/' => left / right,
+                        _ => unreachable!(),
+                    }
+                }
+            };
             match (left, binary.op, right) {
                 (left, operator @ (Operator::Add | Operator::Sub | Operator::Mult), right)
                     if is_integer_constant(&left) && is_integer_constant(&right) =>
@@ -2096,16 +2135,16 @@ pub(super) fn fold_constant_with_literals(
                     fold_integer_bitwise(&left, operator, &right)
                 }
                 (Constant::Float(left), Operator::Add, Constant::Float(right)) => {
-                    Some(Constant::Float(left + right))
+                    Some(Constant::Float(scalar(left, right, '+')))
                 }
                 (Constant::Float(left), Operator::Sub, Constant::Float(right)) => {
-                    Some(Constant::Float(left - right))
+                    Some(Constant::Float(scalar(left, right, '-')))
                 }
                 (Constant::Float(left), Operator::Mult, Constant::Float(right)) => {
-                    Some(Constant::Float(left * right))
+                    Some(Constant::Float(scalar(left, right, '*')))
                 }
                 (Constant::Float(left), Operator::Div, Constant::Float(right)) if right != 0.0 => {
-                    Some(Constant::Float(left / right))
+                    Some(Constant::Float(scalar(left, right, '/')))
                 }
                 (
                     left,
@@ -2121,10 +2160,12 @@ pub(super) fn fold_constant_with_literals(
                     let left = constant_as_float(&left)?;
                     let right = constant_as_float(&right)?;
                     match operator {
-                        Operator::Add => Some(Constant::Float(left + right)),
-                        Operator::Sub => Some(Constant::Float(left - right)),
-                        Operator::Mult => Some(Constant::Float(left * right)),
-                        Operator::Div if right != 0.0 => Some(Constant::Float(left / right)),
+                        Operator::Add => Some(Constant::Float(scalar(left, right, '+'))),
+                        Operator::Sub => Some(Constant::Float(scalar(left, right, '-'))),
+                        Operator::Mult => Some(Constant::Float(scalar(left, right, '*'))),
+                        Operator::Div if right != 0.0 => {
+                            Some(Constant::Float(scalar(left, right, '/')))
+                        }
                         Operator::Pow => fold_float_power(left, right),
                         Operator::Div => None,
                         _ => unreachable!(),
@@ -2137,19 +2178,25 @@ pub(super) fn fold_constant_with_literals(
                     if matches!(left, Constant::Complex { .. })
                         || matches!(right, Constant::Complex { .. }) =>
                 {
-                    fold_complex_arithmetic(&left, operator, &right, python_version)
+                    fold_complex_arithmetic(
+                        &left,
+                        operator,
+                        &right,
+                        python_version,
+                        native_build_profile,
+                    )
                 }
                 (left, Operator::Div, right)
                     if matches!(left, Constant::Complex { .. })
                         || matches!(right, Constant::Complex { .. }) =>
                 {
-                    fold_complex_division(&left, &right, python_version)
+                    fold_complex_division(&left, &right, python_version, native_build_profile)
                 }
                 (left, Operator::Pow, right)
                     if matches!(left, Constant::Complex { .. })
                         || matches!(right, Constant::Complex { .. }) =>
                 {
-                    fold_complex_power(&left, &right, python_version)
+                    fold_complex_power(&left, &right, python_version, native_build_profile)
                 }
                 (Constant::String(mut left), Operator::Add, Constant::String(right)) => {
                     left.push_str(&right);
@@ -2916,6 +2963,7 @@ fn fold_literal_subscript(
     value: &Expr,
     index: &Expr,
     python_version: PythonVersion,
+    native_build_profile: crate::NativeBuildProfile,
     literal: &impl Fn(&Expr) -> Option<Constant>,
     boolean_sequence_repetition: bool,
 ) -> Option<Constant> {
@@ -2982,8 +3030,13 @@ fn fold_literal_subscript(
         Some((lower.min(upper)..upper).step_by(step).collect())
     }
 
-    let value =
-        fold_constant_with_literals(value, python_version, literal, boolean_sequence_repetition)?;
+    let value = fold_constant_with_profile(
+        value,
+        python_version,
+        native_build_profile,
+        literal,
+        boolean_sequence_repetition,
+    )?;
     if !matches!(index, Expr::Slice(_)) {
         let index = if python_version <= PythonVersion::Py313 {
             // The legacy AST optimizer sees source-aware folds such as `~True` in indices.
@@ -3154,9 +3207,21 @@ fn fold_complex_arithmetic(
     operator: Operator,
     right: &Constant,
     python_version: PythonVersion,
+    native_build_profile: crate::NativeBuildProfile,
 ) -> Option<Constant> {
     let (left_real, left_imag) = constant_complex_parts(left)?;
     let (right_real, right_imag) = constant_complex_parts(right)?;
+    if let Some(profile) = Linux314Profile::from_config(native_build_profile) {
+        let (real, imag) = native_profile::arithmetic(
+            (left_real, left_imag),
+            matches!(left, Constant::Complex { .. }),
+            (right_real, right_imag),
+            matches!(right, Constant::Complex { .. }),
+            operator,
+            profile,
+        );
+        return Some(Constant::Complex { real, imag });
+    }
     // Before 3.14, CPython converts real operands to complex with imaginary +0.0.
     // The newer mixed formulas preserve different signed zeros and NaN components.
     let (real, imag) = match (left, right) {
@@ -3322,9 +3387,20 @@ fn fold_complex_division(
     left: &Constant,
     right: &Constant,
     python_version: PythonVersion,
+    native_build_profile: crate::NativeBuildProfile,
 ) -> Option<Constant> {
     let left_parts = constant_complex_parts(left)?;
     let right_parts = constant_complex_parts(right)?;
+    if let Some(profile) = Linux314Profile::from_config(native_build_profile) {
+        let (real, imag) = native_profile::divide(
+            left_parts,
+            matches!(left, Constant::Complex { .. }),
+            right_parts,
+            matches!(right, Constant::Complex { .. }),
+            profile,
+        )?;
+        return Some(Constant::Complex { real, imag });
+    }
     // Apple's CPython builds contract the general quotient expressions, including
     // the negation of a NaN addend in the imaginary numerator.
     let contract = cfg!(all(target_os = "macos", target_arch = "aarch64"));
@@ -3410,11 +3486,18 @@ fn fold_complex_power(
     base: &Constant,
     exponent: &Constant,
     python_version: PythonVersion,
+    native_build_profile: crate::NativeBuildProfile,
 ) -> Option<Constant> {
     let base = constant_complex_parts(base)?;
     let (exponent_real, exponent_imag) = constant_complex_parts(exponent)?;
+    let profile = Linux314Profile::from_config(native_build_profile);
     if exponent_imag != 0.0 || exponent_real != exponent_real.floor() || exponent_real.abs() > 100.0
     {
+        if let Some(profile) = profile {
+            let (real, imag) =
+                native_profile::general_power(base, (exponent_real, exponent_imag), profile)?;
+            return Some(Constant::Complex { real, imag });
+        }
         // Match _Py_c_pow, preserving its operation order and signed zeros.
         if base.0 == 0.0 && base.1 == 0.0 {
             if exponent_imag != 0.0 || exponent_real < 0.0 {
@@ -3461,19 +3544,26 @@ fn fold_complex_power(
         reason = "the exact integral exponent is bounded to CPython's [-100, 100] fast path"
     )]
     let exponent = exponent_real as i64;
+    let product = |left, right| match profile {
+        Some(profile) => native_profile::product(left, right, profile),
+        None => versioned_complex_product(left, right, python_version),
+    };
     let mut result = (1.0, 0.0);
     let mut power = base;
     let magnitude = exponent.unsigned_abs();
     let mut mask = 1_u64;
     while mask > 0 && magnitude >= mask {
         if magnitude & mask != 0 {
-            result = versioned_complex_product(result, power, python_version);
+            result = product(result, power);
         }
         mask <<= 1;
-        power = versioned_complex_product(power, power, python_version);
+        power = product(power, power);
     }
     if exponent < 0 {
-        result = complex_power_reciprocal(result, python_version)?;
+        result = match profile {
+            Some(profile) => native_profile::quotient((1.0, 0.0), result, profile),
+            None => complex_power_reciprocal(result, python_version),
+        }?;
     }
     (!result.0.is_infinite() && !result.1.is_infinite()).then_some(Constant::Complex {
         real: result.0,
@@ -4337,9 +4427,13 @@ mod tests {
             PythonVersion::Py315,
         ] {
             for (left, right) in [(&real_infinity, &finite), (&finite, &real_infinity)] {
-                let Some(Constant::Complex { real, imag }) =
-                    fold_complex_arithmetic(left, Operator::Mult, right, python_version)
-                else {
+                let Some(Constant::Complex { real, imag }) = fold_complex_arithmetic(
+                    left,
+                    Operator::Mult,
+                    right,
+                    python_version,
+                    crate::NativeBuildProfile::Default,
+                ) else {
                     panic!("complex multiplication should be folded");
                 };
                 if python_version >= PythonVersion::Py314 {
@@ -4356,9 +4450,13 @@ mod tests {
                     (&real_infinity, &Constant::Float(1.0)),
                     (&Constant::Float(1.0), &real_infinity),
                 ] {
-                    let Some(Constant::Complex { real, imag }) =
-                        fold_complex_arithmetic(left, Operator::Mult, right, python_version)
-                    else {
+                    let Some(Constant::Complex { real, imag }) = fold_complex_arithmetic(
+                        left,
+                        Operator::Mult,
+                        right,
+                        python_version,
+                        crate::NativeBuildProfile::Default,
+                    ) else {
                         panic!("mixed complex multiplication should be folded");
                     };
                     assert_eq!(real.to_bits(), f64::INFINITY.to_bits());

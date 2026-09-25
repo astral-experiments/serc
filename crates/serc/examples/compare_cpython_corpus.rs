@@ -303,6 +303,7 @@ fn main() -> ExitCode {
     let compile_options = CompileOptions {
         python_version: options.python_version,
         initial_intern_state: profile.map(|profile| profile.state).unwrap_or_default(),
+        ..CompileOptions::default()
     };
     let mut paths = match discover(&options.roots, &options.extensions) {
         Ok(paths) => paths,

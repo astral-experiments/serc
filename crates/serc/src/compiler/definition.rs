@@ -24,7 +24,7 @@ use crate::target::operands::{
 };
 use crate::{CompileError, PythonVersion};
 
-use super::constant::{fold_constant_for_version, folded_constant_owner_slots};
+use super::constant::folded_constant_owner_slots;
 use super::scope::{
     LoweringFunctionPlan, NameId, ReferenceCollector, annotation_nested_required_names,
     collect_conditional_simple_annotations, collect_simple_annotations, expression_required_names,
@@ -716,7 +716,7 @@ impl Compiler<'_> {
             {
                 positional_defaults
                     .iter()
-                    .map(|default| fold_constant_for_version(default, self.context.python_version))
+                    .map(|default| self.context.fold_constant(default))
                     .collect::<Option<Vec<_>>>()
             } else {
                 None

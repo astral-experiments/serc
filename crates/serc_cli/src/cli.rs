@@ -12,7 +12,10 @@ use clap::builder::Styles;
 use clap::builder::styling::{AnsiColor, Effects};
 use clap::{Parser, Subcommand, ValueHint};
 use rayon::prelude::*;
-use serc::{CompileError, CompileOptions, PythonVersion, compile_bytes_with_path_and_options};
+use serc::{
+    CompileError, CompileOptions, NativeBuildProfile, PythonVersion,
+    compile_bytes_with_path_and_options,
+};
 use walkdir::WalkDir;
 
 const STYLES: Styles = Styles::styled()
@@ -50,6 +53,10 @@ struct CompileCommand {
     /// Python language and bytecode version to target (3.12, 3.13, 3.14, or 3.15).
     #[arg(long, default_value_t = PythonVersion::default())]
     python_version: PythonVersion,
+
+    /// Floating-point instruction ordering for a named CPython native build.
+    #[arg(long, default_value_t = NativeBuildProfile::default())]
+    native_build_profile: NativeBuildProfile,
 
     /// Maximum number of files to compile in parallel [default: available CPUs].
     #[arg(short, long)]
@@ -90,6 +97,7 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
     let mut failures = 0_usize;
     let options = CompileOptions {
         python_version: command.python_version,
+        native_build_profile: command.native_build_profile,
         ..CompileOptions::default()
     };
 

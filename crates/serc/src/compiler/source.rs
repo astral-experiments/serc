@@ -24,7 +24,7 @@ use crate::code_object::{
 
 use super::constant::{
     constant_slice_with_literals, explicit_surrogate_string, fold_constant,
-    fold_constant_for_version, fold_constant_with_literals, is_literal_constant, literal_constant,
+    fold_constant_for_version, fold_constant_with_profile, is_literal_constant, literal_constant,
 };
 use super::scope::{ModulePlan, NameId, ScopeArena};
 use super::symbol::mangle_name;
@@ -123,6 +123,7 @@ impl ConstantOrigins {
 #[derive(Debug)]
 pub(super) struct CompilationContext<'source> {
     pub(super) python_version: crate::PythonVersion,
+    pub(super) native_build_profile: crate::NativeBuildProfile,
     pub(super) filename: CodeFilename,
     pub(super) source: &'source str,
     pub(super) tokens: &'source Tokens,
@@ -157,6 +158,19 @@ pub(super) struct CallShape<'a> {
 }
 
 impl<'source> CompilationContext<'source> {
+    pub(super) fn fold_constant(&self, expression: &Expr) -> Option<Constant> {
+        if self.native_build_profile == crate::NativeBuildProfile::Default {
+            return fold_constant_for_version(expression, self.python_version);
+        }
+        fold_constant_with_profile(
+            expression,
+            self.python_version,
+            self.native_build_profile,
+            &literal_constant,
+            true,
+        )
+    }
+
     #[cfg(test)]
     pub(super) fn new(
         filename: &str,
@@ -173,12 +187,31 @@ impl<'source> CompilationContext<'source> {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn with_python_version(
         filename: CodeFilename,
         source: &'source str,
         tokens: &'source Tokens,
         body: &'source Suite,
         python_version: crate::PythonVersion,
+    ) -> Self {
+        Self::with_profile(
+            filename,
+            source,
+            tokens,
+            body,
+            python_version,
+            crate::NativeBuildProfile::Default,
+        )
+    }
+
+    pub(super) fn with_profile(
+        filename: CodeFilename,
+        source: &'source str,
+        tokens: &'source Tokens,
+        body: &'source Suite,
+        python_version: crate::PythonVersion,
+        native_build_profile: crate::NativeBuildProfile,
     ) -> Self {
         let name_capacity = if body.is_empty() {
             0
@@ -217,6 +250,7 @@ impl<'source> CompilationContext<'source> {
             .then(RefCell::default);
         Self {
             python_version,
+            native_build_profile,
             filename,
             source,
             tokens,
@@ -1296,9 +1330,10 @@ impl Compiler<'_> {
             }
             _ => literal_constant(expression),
         };
-        let constant = fold_constant_with_literals(
+        let constant = fold_constant_with_profile(
             expression,
             self.context.python_version,
+            self.context.native_build_profile,
             &literal,
             self.context.python_version >= crate::PythonVersion::Py314,
         )?;

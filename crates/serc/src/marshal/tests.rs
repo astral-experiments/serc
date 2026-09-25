@@ -1434,6 +1434,7 @@ fn partial_intern_state_accepts_unique_scalar_frozensets() {
     let mut options = CompileOptions {
         python_version: PythonVersion::Py313,
         initial_intern_state: InitialInternState::from_partial(std::iter::empty::<&str>()),
+        ..CompileOptions::default()
     };
     let bytes = compile_with_options(source, "unique.py", &options)
         .unwrap()
@@ -1460,6 +1461,7 @@ fn partial_intern_state_accepts_shared_co_consts_with_one_frozenset_slot() {
     let mut options = CompileOptions {
         python_version: PythonVersion::Py313,
         initial_intern_state: InitialInternState::from_partial(std::iter::empty::<&str>()),
+        ..CompileOptions::default()
     };
     let bytes = compile_with_options(source, "tuple_owner.py", &options)
         .unwrap()
@@ -1601,6 +1603,7 @@ fn partial_intern_state_preserves_unique_set_origins_needed_by_later_shared_sets
     let options = CompileOptions {
         python_version: PythonVersion::Py313,
         initial_intern_state: InitialInternState::from_partial(std::iter::empty::<&str>()),
+        ..CompileOptions::default()
     };
     assert_eq!(
         compile_with_options(source, "earlier_unique.py", &options).unwrap_err(),
@@ -1620,6 +1623,7 @@ fn partial_intern_state_keeps_shared_tuple_origins_for_later_sensitive_sets() {
     let options = CompileOptions {
         python_version: PythonVersion::Py313,
         initial_intern_state: InitialInternState::from_partial(std::iter::empty::<&str>()),
+        ..CompileOptions::default()
     };
     assert_eq!(
         compile_with_options(source, "shared_tuple_origin.py", &options).unwrap_err(),
@@ -1691,6 +1695,7 @@ fn partial_intern_state_accepts_definite_reconstruction_with_unknown_members() {
             let mut options = CompileOptions {
                 python_version: PythonVersion::Py313,
                 initial_intern_state: InitialInternState::from_partial([known]),
+                ..CompileOptions::default()
             };
             let bytes = compile_with_options(&source, "dominated.py", &options)
                 .unwrap()
@@ -1836,6 +1841,7 @@ fn partial_intern_state_rejects_relevant_unknowns_before_returning_a_module() {
     let mut options = CompileOptions {
         python_version: PythonVersion::Py313,
         initial_intern_state: InitialInternState::from_partial(std::iter::empty::<&str>()),
+        ..CompileOptions::default()
     };
     assert_eq!(
         compile_with_options(source, "partial.py", &options).unwrap_err(),
@@ -1991,6 +1997,7 @@ fn partial_absence_proofs_preserve_shared_constants_and_input_exceptions() {
     let mut options = CompileOptions {
         python_version: PythonVersion::Py313,
         initial_intern_state: state.clone(),
+        ..CompileOptions::default()
     };
     let module = compile_with_options(source, "absence.py", &options).unwrap();
     let cloned_module = module.clone();

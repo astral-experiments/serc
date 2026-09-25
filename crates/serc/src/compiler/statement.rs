@@ -1922,7 +1922,7 @@ impl<'source> Compiler<'source> {
                 && self.control.finally.active_finally_end_blocks == 0
                 && body.get(index.wrapping_sub(1)).is_some_and(|previous| {
                     matches!(previous, Stmt::Expr(expression)
-                        if fold_constant_for_version(&expression.value, self.context.python_version).is_some())
+                        if self.context.fold_constant(&expression.value).is_some())
                 })
                 && self.assembler.record_constant_pass_cluster(location)
             {
@@ -2023,7 +2023,9 @@ impl<'source> Compiler<'source> {
                 {
                     let first_fold = self.output.deferred_constants.len();
                     if self.context.python_version == crate::PythonVersion::Py314 {
-                        operand_folds = self.record_folded_collection_operands(std::iter::once(expression.value.as_ref()))?;
+                        operand_folds = self.record_folded_collection_operands(std::iter::once(
+                            expression.value.as_ref(),
+                        ))?;
                     } else {
                         self.record_folded_value(&expression.value)?;
                     }
@@ -2155,10 +2157,8 @@ impl<'source> Compiler<'source> {
                     .is_none_or(is_plain_function_statement)
                 && body.get(index + 1).is_none_or(is_plain_function_statement)
             {
-                let previous_current_statement_has_following = std::mem::replace(
-                    &mut self.control.statements.context.has_following,
-                    true,
-                );
+                let previous_current_statement_has_following =
+                    std::mem::replace(&mut self.control.statements.context.has_following, true);
                 let result = self.compile_statement(statement);
                 self.control.statements.context.has_following =
                     previous_current_statement_has_following;
@@ -2244,7 +2244,7 @@ impl<'source> Compiler<'source> {
                     Some(Stmt::Return(statement))
                         if matches!(
                             statement.value.as_deref(),
-                            Some(value @ Expr::Tuple(tuple)) if fold_constant_for_version(value, self.context.python_version).is_some()
+                            Some(value @ Expr::Tuple(tuple)) if self.context.fold_constant(value).is_some()
                                 && !(tuple.elts.len() == 2
                                     && tuple.elts.iter().all(is_literal_constant))
                         )
@@ -2395,7 +2395,9 @@ impl<'source> Compiler<'source> {
                     for target in &assignment.targets {
                         collect_target_names(target, &mut target_names);
                     }
-                    self.name_id_set(target_names).into_iter().collect::<NameSet>()
+                    self.name_id_set(target_names)
+                        .into_iter()
+                        .collect::<NameSet>()
                         .with_aliases_from(&self.symbols.initialized_locals)
                 } else {
                     NameSet::default()
@@ -2412,7 +2414,8 @@ impl<'source> Compiler<'source> {
                     emit_protected_async_for_end_nop,
                 );
                 let same_region_continuation = (!is_final
-                    || self.control.statements.context.same_region_continuation == Some(statement.range()))
+                    || self.control.statements.context.same_region_continuation
+                        == Some(statement.range()))
                 .then_some(statement.range());
                 let previous_suite_fallthrough_to_loop_backedge = std::mem::replace(
                     &mut self.control.loops.suite_fallthrough_to_loop_backedge,
@@ -2432,7 +2435,10 @@ impl<'source> Compiler<'source> {
                     copied_nested_handler_join_successor: preceded_by_copied_nested_handler_join,
                     inherited_has_following: inherited_statement_has_following,
                     inherited_followed_by_small_return: inherited_small_return,
-                    propagates_following_to_suites: matches!(statement, Stmt::If(_) | Stmt::With(_)),
+                    propagates_following_to_suites: matches!(
+                        statement,
+                        Stmt::If(_) | Stmt::With(_)
+                    ),
                     same_region_continuation,
                     has_following: !is_final,
                     followed_by_implicit_return: is_final
@@ -2862,9 +2868,7 @@ impl<'source> Compiler<'source> {
         // This header is an original array even when every body path exits the loop.
         self.assembler.record_exception_owner_block_boundary(start);
         if early_condition_truthiness(&statement.test) == Some(true) {
-            if let Some(constant) =
-                fold_constant_for_version(&statement.test, self.context.python_version)
-            {
+            if let Some(constant) = self.context.fold_constant(&statement.test) {
                 self.add_constant(constant)?;
             }
             self.assembler
@@ -2875,7 +2879,9 @@ impl<'source> Compiler<'source> {
                 compiler.compile_jump_if(&statement.test, false, condition_false)
             })?;
         }
-        let body_entry = if fold_constant_for_version(&statement.test, self.context.python_version)
+        let body_entry = if self
+            .context
+            .fold_constant(&statement.test)
             .is_some_and(|constant| constant.is_truthy())
         {
             // The folded test and authored body retain separate original instruction arrays.
@@ -10737,14 +10743,11 @@ impl<'source> Compiler<'source> {
                         let return_location = self.source_location(statement.range);
                         let return_spans_lines = return_location.line != return_location.end_line;
                         if unwinds_return_finally || !with_unwind_starts.is_empty() {
-                            let constant =
-                                fold_constant_for_version(value, self.context.python_version)
-                                    .ok_or_else(|| {
-                                        CompileError::Internal(
-                                            "literal return value did not fold to a constant"
-                                                .to_string(),
-                                        )
-                                    })?;
+                            let constant = self.context.fold_constant(value).ok_or_else(|| {
+                                CompileError::Internal(
+                                    "literal return value did not fold to a constant".to_string(),
+                                )
+                            })?;
                             self.emit_preprocessed_constant(value, constant)?;
                         } else if return_spans_lines {
                             let value_location = self.source_location(value.range());
@@ -10759,14 +10762,11 @@ impl<'source> Compiler<'source> {
                                 return_location
                             };
                             self.assembler.set_location(location);
-                            let constant =
-                                fold_constant_for_version(value, self.context.python_version)
-                                    .ok_or_else(|| {
-                                        CompileError::Internal(
-                                            "literal return value did not fold to a constant"
-                                                .to_string(),
-                                        )
-                                    })?;
+                            let constant = self.context.fold_constant(value).ok_or_else(|| {
+                                CompileError::Internal(
+                                    "literal return value did not fold to a constant".to_string(),
+                                )
+                            })?;
                             self.emit_preprocessed_constant(value, constant)?;
                         } else {
                             self.assembler
@@ -11031,9 +11031,7 @@ impl<'source> Compiler<'source> {
                 .first()
                 .is_none_or(|clause| clause.test.is_none())
         {
-            if let Some(constant) =
-                fold_constant_for_version(&statement.test, self.context.python_version)
-            {
+            if let Some(constant) = self.context.fold_constant(&statement.test) {
                 self.add_constant(constant)?;
             }
             self.assembler
@@ -11480,7 +11478,7 @@ impl<'source> Compiler<'source> {
                         || self.control.in_iterator_loop()
                         || body.len() > 1
                         || ((matches!(body, [Stmt::Expr(expression)]
-                            if fold_constant_for_version(&expression.value, self.context.python_version).is_none())
+                            if self.context.fold_constant(&expression.value).is_none())
                             || matches!(
                                 body,
                                 [Stmt::Assign(_) | Stmt::AugAssign(_) | Stmt::Assert(_)]
@@ -16662,9 +16660,7 @@ impl<'source> Compiler<'source> {
             // CPython interns a folded loop test before compiling the body, even though the
             // optimized condition emits no load. Unused nonzero constants are pruned later;
             // if the value is used in the body, this preserves its source-order slot.
-            if let Some(constant) =
-                fold_constant_for_version(&statement.test, self.context.python_version)
-            {
+            if let Some(constant) = self.context.fold_constant(&statement.test) {
                 self.add_constant(constant)?;
             }
             if !truthiness {
@@ -17312,7 +17308,9 @@ impl<'source> Compiler<'source> {
                     .retain_last_not_taken_structural_exception_owner();
             }
         }
-        if fold_constant_for_version(&statement.test, self.context.python_version)
+        if self
+            .context
+            .fold_constant(&statement.test)
             .is_some_and(|constant| constant.is_truthy())
         {
             // The authored body starts a separate original array after the constant test.
@@ -18220,7 +18218,7 @@ impl<'source> Compiler<'source> {
                     self.compile_discarded_annotation_slice(element)?;
                 }
             }
-            _ if fold_constant_for_version(expression, self.context.python_version).is_some() => {
+            _ if self.context.fold_constant(expression).is_some() => {
                 if let Some(constant) = first_literal_constant(expression) {
                     self.add_constant(constant)?;
                 }
@@ -18262,9 +18260,7 @@ impl<'source> Compiler<'source> {
         if condition_truthiness == Some(true)
             && self.context.python_version != crate::PythonVersion::Py313
         {
-            if let Some(constant) =
-                fold_constant_for_version(&statement.test, self.context.python_version)
-            {
+            if let Some(constant) = self.context.fold_constant(&statement.test) {
                 self.add_constant(constant)?;
             }
             if let Some(message) = &statement.msg {
@@ -20187,7 +20183,7 @@ impl<'source> Compiler<'source> {
             // Include lambda defaults when declining current-scope yields. Awaited
             // case bodies retain the same original match-success records.
             if !suite_contains_yield_with_headers(std::slice::from_ref(tail), true, false)
-                && fold_constant_for_version(&matched.subject, self.context.python_version).is_none()
+                && self.context.fold_constant(&matched.subject).is_none()
                 && !expression_contains_inline_branch(&matched.subject)
                 && !expression_suspends_current_scope(&matched.subject)
                 && matched.cases.last().is_some_and(|case| {
@@ -20936,8 +20932,7 @@ impl<'source> Compiler<'source> {
                 self.assembler.set_location(self.source_location(range));
             } else if statement.finalbody.is_empty()
                 && let Some(Stmt::Match(matched)) = statement.orelse.last()
-                && fold_constant_for_version(&matched.subject, self.context.python_version)
-                    .is_none()
+                && self.context.fold_constant(&matched.subject).is_none()
                 && matched
                     .cases
                     .last()
@@ -21108,7 +21103,7 @@ impl<'source> Compiler<'source> {
                         && suite_contains_loop_break(&tail.body)
                         && matches!(tail.orelse.last(), Some(Stmt::Assign(assignment))
                             if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
-                                && fold_constant_for_version(&assignment.value, self.context.python_version).is_some()
+                                && self.context.fold_constant(&assignment.value).is_some()
                                 && self.assembler.current_original_block_location()
                                     == Some(self.source_location(assignment.targets[0].range()))));
             // A final class failure falls through to its own original try exit.
@@ -25618,7 +25613,7 @@ impl<'source> Compiler<'source> {
             && !suite_contains_loop_break(&statement.body)
             && (statement.finalbody.iter().all(|statement| match statement {
                 Stmt::Expr(expression) => {
-                    fold_constant_for_version(&expression.value, self.context.python_version).is_none()
+                    self.context.fold_constant(&expression.value).is_none()
                         && !expression_contains_inline_branch(&expression.value)
                 }
                 Stmt::Assign(assignment) => {
@@ -25673,7 +25668,7 @@ impl<'source> Compiler<'source> {
                             && suite_has_linear_borrow_fallthrough(tail))))
             && matches!(statement.body.last(), Some(Stmt::While(loop_statement))
                 if loop_statement.orelse.is_empty()
-                    && fold_constant_for_version(&loop_statement.test, self.context.python_version).is_none()
+                    && self.context.fold_constant(&loop_statement.test).is_none()
                     && !expression_contains_inline_branch(&loop_statement.test));
         // A runtime while's sole false edge retains the located normal-exit NOP
         // before this manager-protected cleanup. A named recovery's bare return
@@ -25943,8 +25938,7 @@ impl<'source> Compiler<'source> {
                 || coroutine_guarded_recovery_entry
                 || statement.finalbody.iter().all(|statement| match statement {
                     Stmt::Expr(expression) => {
-                        fold_constant_for_version(&expression.value, self.context.python_version)
-                            .is_none()
+                        self.context.fold_constant(&expression.value).is_none()
                             && !expression_contains_inline_branch(&expression.value)
                     }
                     Stmt::Assign(assignment) => {
@@ -26297,8 +26291,7 @@ impl<'source> Compiler<'source> {
                 .first()
                 .is_some_and(|entry| match entry {
                     Stmt::Expr(expression) => {
-                        fold_constant_for_version(&expression.value, self.context.python_version)
-                            .is_none()
+                        self.context.fold_constant(&expression.value).is_none()
                             && !expression_contains_inline_branch(&expression.value)
                     }
                     Stmt::Assign(assignment) => {
@@ -27204,7 +27197,7 @@ impl<'source> Compiler<'source> {
                                         && !expression_suspends_current_scope(&expression.value)))
                                     && matches!(last, Stmt::Assign(assignment)
                                         if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
-                                            && fold_constant_for_version(&assignment.value, self.context.python_version).is_some())
+                                            && self.context.fold_constant(&assignment.value).is_some())
                             }))
             })
             && matches!(statement.finalbody.as_slice(), [Stmt::If(cleanup)]
@@ -27629,7 +27622,7 @@ impl<'source> Compiler<'source> {
                     .as_except_handler()
                     .is_some_and(|handler| handler.name.is_some())
             })
-            && let Some(constant) = fold_constant_for_version(value, self.context.python_version)
+            && let Some(constant) = self.context.fold_constant(value)
         {
             self.add_constant(constant)?;
         }
@@ -27673,7 +27666,7 @@ impl<'source> Compiler<'source> {
             self.control.finally.copies_terminating_finally_returns || !overriding_return;
         let noop_finally_body = statement.finalbody.iter().all(|statement| {
             matches!(statement, Stmt::Pass(_))
-                || matches!(statement, Stmt::Expr(expression) if fold_constant_for_version(&expression.value, self.context.python_version).is_some())
+                || matches!(statement, Stmt::Expr(expression) if self.context.fold_constant(&expression.value).is_some())
         });
         if noop_finally_body {
             for noop in &statement.finalbody {
@@ -27768,8 +27761,7 @@ impl<'source> Compiler<'source> {
                     let has_instructions =
                         compiler.assembler.instruction_count() > instruction_count;
                     if let Some(Stmt::Expr(tail)) = statement.body.last()
-                        && fold_constant_for_version(&tail.value, compiler.context.python_version)
-                            .is_some()
+                        && compiler.context.fold_constant(&tail.value).is_some()
                         && compiler.assembler.last_instruction_is_nop()
                     {
                         let range = if let Expr::FString(fstring) = tail.value.as_ref() {
@@ -28176,8 +28168,7 @@ impl<'source> Compiler<'source> {
                 .last()
                 .is_some_and(|last| match last {
                     Stmt::Expr(expression) => {
-                        fold_constant_for_version(&expression.value, self.context.python_version)
-                            .is_none()
+                        self.context.fold_constant(&expression.value).is_none()
                     }
                     Stmt::AnnAssign(assignment) => assignment.value.is_some(),
                     Stmt::Assign(_)
@@ -28420,7 +28411,7 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_overriding_finally_returns == 0
             && let Some(tail @ Stmt::Match(matched)) = statement.body.last()
             && !suite_contains_yield_with_headers(std::slice::from_ref(tail), true, false)
-            && fold_constant_for_version(&matched.subject, self.context.python_version).is_none()
+            && self.context.fold_constant(&matched.subject).is_none()
             && !expression_contains_inline_branch(&matched.subject)
             && !expression_suspends_current_scope(&matched.subject)
             && let Some(case) = matched.cases.last()
@@ -30014,7 +30005,7 @@ impl<'source> Compiler<'source> {
                     !matches!(statement, Stmt::Pass(_))
                         && !matches!(
                             statement,
-                            Stmt::Expr(expression) if fold_constant_for_version(&expression.value, self.context.python_version).is_some()
+                            Stmt::Expr(expression) if self.context.fold_constant(&expression.value).is_some()
                         )
                 })
             {
@@ -30842,7 +30833,7 @@ impl<'source> Compiler<'source> {
             },
         )?;
         if remaining.is_empty()
-            && matches!(body, [Stmt::Expr(expression)] if fold_constant_for_version(&expression.value, self.context.python_version).is_some())
+            && matches!(body, [Stmt::Expr(expression)] if self.context.fold_constant(&expression.value).is_some())
         {
             region_exclusions.clear();
         }
