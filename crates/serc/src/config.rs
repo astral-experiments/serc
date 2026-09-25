@@ -89,11 +89,76 @@ impl fmt::Display for ParsePythonVersionError {
 
 impl Error for ParsePythonVersionError {}
 
+/// Floating-point instruction ordering for an explicitly selected native CPython build.
+///
+/// `Default` preserves Serc's existing target-dependent arithmetic. The named
+/// profiles select instruction ordering of the exact CPython 3.14.5 Linux x86-64
+/// artifacts, including the sign of folded NaNs. They require a GNU/Linux x86-64
+/// host. Selection does not inspect or authenticate an installed interpreter.
+///
+/// General powers still use the host math library. Callers must qualify the
+/// selected artifact in the same math-library and floating-point environment;
+/// a matching Python version, compiler name, or profile alone does not establish
+/// byte-for-byte compatibility. See `docs/cpython-build-profiles.md` for the
+/// qualified artifact identities and environment requirements.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NativeBuildProfile {
+    #[default]
+    Default,
+    /// actions/python-versions 3.14.5-25647354415, built with GCC 13.3.0.
+    Cpython3145ActionsGcc,
+    /// uv CPython 3.14.5, built June 2, 2026 with Clang 22.1.3.
+    Cpython3145UvClang,
+}
+
+impl NativeBuildProfile {
+    pub(crate) fn validate(self, version: PythonVersion) -> Result<(), crate::CompileError> {
+        if self != Self::Default
+            && (version != PythonVersion::Py314
+                || !cfg!(all(
+                    target_os = "linux",
+                    target_arch = "x86_64",
+                    target_env = "gnu"
+                )))
+        {
+            return Err(crate::CompileError::Unsupported(format!(
+                "native build profile {self} requires Python 3.14.5 on GNU/Linux x86-64"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for NativeBuildProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Default => "default",
+            Self::Cpython3145ActionsGcc => "cpython-3.14.5-actions-gcc-13.3-linux-x86_64",
+            Self::Cpython3145UvClang => "cpython-3.14.5-uv-clang-22.1.3-linux-x86_64",
+        })
+    }
+}
+
+impl FromStr for NativeBuildProfile {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "default" => Ok(Self::Default),
+            "cpython-3.14.5-actions-gcc-13.3-linux-x86_64" => Ok(Self::Cpython3145ActionsGcc),
+            "cpython-3.14.5-uv-clang-22.1.3-linux-x86_64" => Ok(Self::Cpython3145UvClang),
+            _ => Err(format!("unsupported native build profile {value:?}")),
+        }
+    }
+}
+
 /// Configuration retained by a compiled module for target-specific serialization.
 #[derive(Clone, Debug, Default)]
 pub struct CompileOptions {
     /// The Python language and bytecode version to target. Defaults to Python 3.14.
     pub python_version: PythonVersion,
+    /// Native arithmetic rules used before constants are pooled. Defaults to existing behavior.
+    pub native_build_profile: NativeBuildProfile,
     /// Canonical strings present before compiling. See [`InitialInternState`] for state modes.
     pub initial_intern_state: InitialInternState,
 }
@@ -110,6 +175,165 @@ mod tests {
     };
 
     #[test]
+    fn native_profiles_reject_unrelated_targets() {
+        use super::NativeBuildProfile;
+        for native_build_profile in [
+            NativeBuildProfile::Cpython3145ActionsGcc,
+            NativeBuildProfile::Cpython3145UvClang,
+        ] {
+            assert_eq!(
+                native_build_profile.to_string().parse(),
+                Ok(native_build_profile)
+            );
+            if !cfg!(all(
+                target_os = "linux",
+                target_arch = "x86_64",
+                target_env = "gnu"
+            )) {
+                let options = CompileOptions {
+                    native_build_profile,
+                    ..CompileOptions::default()
+                };
+                assert!(matches!(
+                    compile_with_options("pass\n", "profile.py", &options),
+                    Err(crate::CompileError::Unsupported(_))
+                ));
+            }
+            for python_version in [
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py315,
+            ] {
+                let options = CompileOptions {
+                    python_version,
+                    native_build_profile,
+                    ..CompileOptions::default()
+                };
+                assert!(matches!(
+                    compile_with_options("pass\n", "profile.py", &options),
+                    Err(crate::CompileError::Unsupported(_))
+                ));
+            }
+        }
+        assert!("cpython-3.14.5".parse::<NativeBuildProfile>().is_err());
+        assert_eq!(NativeBuildProfile::default(), NativeBuildProfile::Default);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+    fn native_profiles_reach_nested_constants_before_pooling() {
+        use super::NativeBuildProfile;
+        use crate::code_object::Constant;
+
+        fn complex_bits(value: &Constant, output: &mut Vec<(u64, u64)>) {
+            match value.clone().into_numeric_value() {
+                Constant::Complex { real, imag } => output.push((real.to_bits(), imag.to_bits())),
+                Constant::Tuple(values) | Constant::FrozenSet(values) => {
+                    for value in &values {
+                        complex_bits(value, output);
+                    }
+                }
+                Constant::Code(code) => {
+                    for value in &code.constants {
+                        complex_bits(value, output);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let negative_nan = 0xfff8_0000_0000_0000;
+        for expression in [
+            "(1e309 - 1e309 + 1j) / (1 + 2j)",
+            "(1e309 - 1e309 + 1j) / (2 + 1j)",
+        ] {
+            for source in [
+                format!("value = {expression}\n"),
+                format!("value = ({expression},)\n"),
+                format!("value = True and ({expression})\n"),
+                format!("def value():\n    return {expression}\n"),
+                format!("def value(arg=({expression})):\n    return arg\n"),
+                format!("value = lambda arg=({expression}): arg\n"),
+            ] {
+                let default = compile(&source, "profile.py").unwrap().marshal();
+                let mut outputs = Vec::new();
+                for (native_build_profile, expected_imag) in [
+                    (NativeBuildProfile::Cpython3145ActionsGcc, negative_nan),
+                    (
+                        NativeBuildProfile::Cpython3145UvClang,
+                        0x7ff8_0000_0000_0000,
+                    ),
+                ] {
+                    let options = CompileOptions {
+                        native_build_profile,
+                        ..CompileOptions::default()
+                    };
+                    let module = compile_with_options(&source, "profile.py", &options).unwrap();
+                    let mut bits = Vec::new();
+                    for value in &module.code.constants {
+                        complex_bits(value, &mut bits);
+                    }
+                    assert_eq!(bits, vec![(negative_nan, expected_imag)], "{source}");
+                    outputs.push(module.marshal());
+                }
+                assert_ne!(outputs[0], outputs[1], "{source}");
+                assert_eq!(compile(&source, "profile.py").unwrap().marshal(), default);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+    fn native_profiles_preserve_mixed_and_power_nan_bits() {
+        use super::NativeBuildProfile;
+        use crate::code_object::Constant;
+
+        let negative_nan = 0xfff8_0000_0000_0000;
+        let positive_nan = 0x7ff8_0000_0000_0000;
+        for native_build_profile in [
+            NativeBuildProfile::Cpython3145ActionsGcc,
+            NativeBuildProfile::Cpython3145UvClang,
+        ] {
+            let options = CompileOptions {
+                native_build_profile,
+                ..CompileOptions::default()
+            };
+            let power_imag = if native_build_profile == NativeBuildProfile::Cpython3145ActionsGcc {
+                positive_nan
+            } else {
+                negative_nan
+            };
+            for (expression, expected) in [
+                (
+                    "(-(1e309 - 1e309) + 1j) * (1e309 - 1e309)",
+                    (negative_nan, negative_nan),
+                ),
+                ("(1e309 - 1e309 + 1j) ** 0.5", (negative_nan, negative_nan)),
+                ("(1e309j - 1e309j) ** 1j", (negative_nan, power_imag)),
+                ("(1e309 - 1e309 + 1j) ** -1", (positive_nan, positive_nan)),
+            ] {
+                let source = format!("value = {expression}\n");
+                let module = compile_with_options(&source, "profile.py", &options).unwrap();
+                let Constant::Complex { real, imag } = module
+                    .code
+                    .constants
+                    .last()
+                    .unwrap()
+                    .clone()
+                    .into_numeric_value()
+                else {
+                    panic!("expected a folded complex value");
+                };
+                assert_eq!(
+                    (real.to_bits(), imag.to_bits()),
+                    expected,
+                    "{native_build_profile}: {expression}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn byte_decoding_updates_intern_state_without_mutating_callers() {
         let absent = InitialInternState::from_partial_with_absence([] as [&str; 0], |_, _| true);
         for python_version in [
@@ -121,6 +345,7 @@ mod tests {
             let options = CompileOptions {
                 python_version,
                 initial_intern_state: absent.clone(),
+                ..CompileOptions::default()
             };
             let source = b"# coding: cp1251\npass\n";
             let module = compile_bytes_with_options(source, "module.py", &options).unwrap();
@@ -198,6 +423,7 @@ mod tests {
             let custom = CompileOptions {
                 python_version,
                 initial_intern_state: absent.without_standard_source_codec_effects(),
+                ..CompileOptions::default()
             };
             let module = compile_bytes_with_options(source, "module.py", &custom).unwrap();
             assert_eq!(
@@ -209,6 +435,7 @@ mod tests {
             let partial = CompileOptions {
                 python_version,
                 initial_intern_state: InitialInternState::from_partial([] as [&str; 0]),
+                ..CompileOptions::default()
             };
             let module = compile_bytes_with_options(source, "module.py", &partial).unwrap();
             assert_eq!(
@@ -242,6 +469,7 @@ mod tests {
             let options = CompileOptions {
                 python_version,
                 initial_intern_state: state.clone(),
+                ..CompileOptions::default()
             };
             assert_eq!(
                 compile_with_options(source, "codec.py", &options).unwrap_err(),
@@ -261,6 +489,7 @@ mod tests {
         let options = CompileOptions {
             python_version: PythonVersion::Py312,
             initial_intern_state: state,
+            ..CompileOptions::default()
         };
         let module = compile_bytes_with_options(source.as_bytes(), "codec.py", &options).unwrap();
         assert_eq!(

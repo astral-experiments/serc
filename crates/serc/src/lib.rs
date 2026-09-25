@@ -20,7 +20,7 @@ use std::path::Path;
 
 use code_object::{CodeFilename, CodeObject};
 use compiler::Compiler;
-pub use config::{CompileOptions, ParsePythonVersionError, PythonVersion};
+pub use config::{CompileOptions, NativeBuildProfile, ParsePythonVersionError, PythonVersion};
 pub use initial_intern_state::InitialInternState;
 use ruff_text_size::{TextRange, TextSize};
 pub use source::{SourceDecodeError, decode_source};
@@ -374,6 +374,9 @@ fn compile_normalized(
     filename: CodeFilename,
     options: &CompileOptions,
 ) -> Result<CompiledModule, CompileError> {
+    options
+        .native_build_profile
+        .validate(options.python_version)?;
     let target_version = match options.python_version {
         PythonVersion::Py312 => ruff_python_ast::PythonVersion::PY312,
         PythonVersion::Py313 => ruff_python_ast::PythonVersion::PY313,
@@ -391,12 +394,13 @@ fn compile_normalized(
         return Err(CompileError::invalid_syntax(error.to_string(), error.range));
     }
     compiler::syntax::validate(source, parsed.suite(), options.python_version)?;
-    let code = Compiler::module_with_python_version(
+    let code = Compiler::module_with_profile(
         filename,
         source,
         parsed.tokens(),
         parsed.suite(),
         options.python_version,
+        options.native_build_profile,
     )
     .compile_module(parsed.suite())?;
     marshal::validate_initial_intern_state(

@@ -606,6 +606,7 @@ impl LoadedModel {
         };
         CompileOptions {
             python_version: options.python_version,
+            native_build_profile: options.native_build_profile,
             initial_intern_state: state,
         }
     }
@@ -1474,6 +1475,7 @@ mod tests {
                     &CompileOptions {
                         python_version: PythonVersion::Py313,
                         initial_intern_state: InitialInternState::from_complete(entries),
+                        ..CompileOptions::default()
                     },
                 )
                 .unwrap()
@@ -1613,6 +1615,7 @@ mod tests {
                 &CompileOptions {
                     python_version: PythonVersion::Py313,
                     initial_intern_state: state,
+                    ..CompileOptions::default()
                 },
             )
             .map(|module| module.marshal())
@@ -1722,6 +1725,7 @@ mod tests {
         let options = CompileOptions {
             python_version: PythonVersion::Py312,
             initial_intern_state: InitialInternState::new(["retained_path_atom"]),
+            ..CompileOptions::default()
         };
         let source =
             "f = lambda x: x in {'retained_path_atom', 'z'}\nx in {'retained_path_atom', 'z'}\n";
@@ -1734,6 +1738,7 @@ mod tests {
         let baseline = CompileOptions {
             python_version: PythonVersion::Py312,
             initial_intern_state: model.state.clone(),
+            ..CompileOptions::default()
         };
         let first = model.options_for("retained_path_atom/file.py", source.as_bytes(), &options);
         let second = model.options_for("other_directory/file.py", source.as_bytes(), &options);

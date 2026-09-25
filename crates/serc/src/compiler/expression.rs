@@ -518,8 +518,7 @@ impl Compiler<'_> {
         let match_has_following = !terminal && self.control.statements.context.has_following;
         if self.context.python_version >= PythonVersion::Py314
             && matches!(statement.subject.as_ref(), Expr::Tuple(_))
-            && let Some(constant) =
-                fold_constant_for_version(&statement.subject, self.context.python_version)
+            && let Some(constant) = self.context.fold_constant(&statement.subject)
         {
             self.record_folded_operands(&statement.subject)?;
             if self.output.constants.is_empty()
@@ -1598,9 +1597,7 @@ impl Compiler<'_> {
             .set_location(self.source_location(pattern.range()));
         match pattern {
             Pattern::MatchValue(pattern) => {
-                if let Some(constant) =
-                    fold_constant_for_version(&pattern.value, self.context.python_version)
-                {
+                if let Some(constant) = self.context.fold_constant(&pattern.value) {
                     // CPython omits unary plus from literal patterns' expression AST,
                     // so the constant load uses the numeric operand's location.
                     if let Expr::UnaryOp(unary) = pattern.value.as_ref()
@@ -2045,7 +2042,7 @@ impl Compiler<'_> {
             && let Some(keys) = pattern
                 .keys
                 .iter()
-                .map(|value| fold_constant_for_version(value, self.context.python_version))
+                .map(|value| self.context.fold_constant(value))
                 .collect::<Option<Vec<_>>>()
         {
             // Pattern literals are folded by AST optimization before code generation.
@@ -3803,7 +3800,7 @@ impl Compiler<'_> {
             {
                 positional_defaults
                     .iter()
-                    .map(|default| fold_constant_for_version(default, self.context.python_version))
+                    .map(|default| self.context.fold_constant(default))
                     .collect::<Option<Vec<_>>>()
             } else {
                 None
@@ -7729,7 +7726,7 @@ impl Compiler<'_> {
             let is_last = index + 1 == expression.values.len();
             if short_circuited {
                 self.pre_register_expression_names(value)?;
-                if fold_constant_for_version(value, self.context.python_version).is_some() {
+                if self.context.fold_constant(value).is_some() {
                     self.record_folded_value(value)?;
                 }
                 continue;
@@ -7743,8 +7740,7 @@ impl Compiler<'_> {
                     short_circuited = true;
                 } else {
                     self.record_folded_value(value)?;
-                    folded_prefix |= index == 0
-                        && fold_constant_for_version(value, self.context.python_version).is_some();
+                    folded_prefix |= index == 0 && self.context.fold_constant(value).is_some();
                 }
                 continue;
             }

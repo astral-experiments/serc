@@ -18,6 +18,7 @@ mod expression;
 mod legacy_annotation_tests;
 mod legacy_native_labels;
 mod legacy_native_seed_bound;
+mod native_profile;
 mod orchestration;
 mod scope;
 mod source;

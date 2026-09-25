@@ -29,9 +29,7 @@ use crate::target::local_kinds::{
 use crate::target::operands::{FunctionAttribute, ResumeLocation, UnaryIntrinsic};
 use crate::{CompileError, PythonVersion};
 
-use super::constant::{
-    DeferredConstantTarget, OutputState, fold_constant, fold_constant_for_version, literal_constant,
-};
+use super::constant::{DeferredConstantTarget, OutputState, fold_constant, literal_constant};
 use super::definition::clean_doc;
 use super::scope::{
     LoweringFunctionPlan, NameId, NameSet, ScopeId, collect_conditional_simple_annotations,
@@ -278,6 +276,7 @@ impl<'source> Compiler<'source> {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn module_with_python_version(
         filename: impl Into<CodeFilename>,
         source: &'source str,
@@ -285,12 +284,31 @@ impl<'source> Compiler<'source> {
         body: &'source Suite,
         python_version: crate::PythonVersion,
     ) -> Box<Self> {
-        let context = Rc::new(CompilationContext::with_python_version(
+        Self::module_with_profile(
+            filename,
+            source,
+            tokens,
+            body,
+            python_version,
+            crate::NativeBuildProfile::Default,
+        )
+    }
+
+    pub(crate) fn module_with_profile(
+        filename: impl Into<CodeFilename>,
+        source: &'source str,
+        tokens: &'source Tokens,
+        body: &'source Suite,
+        python_version: crate::PythonVersion,
+        native_build_profile: crate::NativeBuildProfile,
+    ) -> Box<Self> {
+        let context = Rc::new(CompilationContext::with_profile(
             filename.into(),
             source,
             tokens,
             body,
             python_version,
+            native_build_profile,
         ));
         let future_flags = context.module_plan().future_flags;
         let unit = CodeUnit::from_spec(CodeUnitSpec {
@@ -677,8 +695,7 @@ impl<'source> Compiler<'source> {
             } else if deferred_annotations
                 && module_annotations
                 && (fold_constant(&expression.value).is_some()
-                    || fold_constant_for_version(&expression.value, self.context.python_version)
-                        .is_some())
+                    || self.context.fold_constant(&expression.value).is_some())
             {
                 if self.context.python_version >= PythonVersion::Py314
                     && literal_constant(&expression.value).is_none()
@@ -958,8 +975,7 @@ impl<'source> Compiler<'source> {
         debug_assert!(self.unit.class_conditional_annotations.is_empty());
         if let Some(Stmt::Expr(expression)) = body.last()
             && (fold_constant(&expression.value).is_some()
-                || fold_constant_for_version(&expression.value, self.context.python_version)
-                    .is_some())
+                || self.context.fold_constant(&expression.value).is_some())
         {
             let range = if let Expr::FString(fstring) = expression.value.as_ref() {
                 self.fstring_result_range(fstring)
@@ -976,8 +992,7 @@ impl<'source> Compiler<'source> {
             && matches!(statement.test.as_ref(), Expr::EllipsisLiteral(_))
             && let Some(Stmt::Expr(expression)) = statement.body.last()
             && (fold_constant(&expression.value).is_some()
-                || fold_constant_for_version(&expression.value, self.context.python_version)
-                    .is_some())
+                || self.context.fold_constant(&expression.value).is_some())
         {
             if statement.elif_else_clauses.is_empty() {
                 // Without an exit jump, the footer inherits the final expression's location.

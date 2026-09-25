@@ -1,14 +1,11 @@
-# CPython build-profile diagnostic
+# CPython native build profiles
 
 Two CPython 3.14.5 builds produce different folded complex NaN bits on the same
 Linux x86-64 host. Both report magic number `2b0e0d0a`. Release and platform
-identity therefore do not uniquely determine every native marshal byte. The
-target-build policy is unresolved in
-[#576](https://github.com/astral-sh/serc/issues/576).
-
-This diagnostic records native behavior. It does not select a supported build,
-change Serc's compiler, normalize NaNs, or relax any existing compatibility
-comparison.
+identity therefore do not uniquely determine every native marshal byte. Serc
+provides explicit instruction-order profiles for the two identified builds. The
+default preserves existing behavior. Profile selection requires the
+[qualified runtime environment](#runtime-requirements) described below.
 
 ## Reproduce
 
@@ -71,18 +68,49 @@ and negation followed by addition in the Clang library. The Linux difference is
 not a fused-multiply-add operation. These observations describe the two hashed
 builds; they do not establish a rule for every GCC or Clang build.
 
-## Policy still required
+## Selecting a profile
 
-We need to decide whether to support one concrete reference build per
-target/platform or explicitly represent and select multiple native build
-profiles. A version/OS condition cannot distinguish these two oracles. Neither
-NaN normalization nor excluding these cases would preserve the byte-for-byte
-contract.
+`CompileOptions::native_build_profile` and the CLI's `--native-build-profile`
+select floating-point instruction ordering before constants are pooled. A
+profile is immutable for one compilation, including nested scopes. Selecting
+another profile does not change existing compiled modules.
 
-This draft adds diagnostic coverage only. It does not fix #576 or extend
-existing corpus results to arbitrary CPython builds. The separate
-nonfinite-folding issue [#559](https://github.com/astral-sh/serc/issues/559) and
-its macOS correction retain their own regressions.
+| Selection                                      | Reference artifact                               |
+| ---------------------------------------------- | ------------------------------------------------ |
+| `default`                                      | Existing target-dependent behavior               |
+| `cpython-3.14.5-actions-gcc-13.3-linux-x86_64` | The Actions GCC 13.3.0 artifact identified above |
+| `cpython-3.14.5-uv-clang-22.1.3-linux-x86_64`  | The uv Clang 22.1.3 artifact identified above    |
+
+For the library API, the two explicit selections are
+`NativeBuildProfile::Cpython3145ActionsGcc` and
+`NativeBuildProfile::Cpython3145UvClang`. These describe specific artifacts, not
+generic GCC or Clang modes. Selecting one does not locate, identify, or
+authenticate an interpreter. A different Python target or a host other than
+GNU/Linux x86-64 is rejected.
+
+No profile normalizes NaNs after compilation or serialization. NaN identity,
+payload, constant ordering, and marshal reference handling remain part of the
+byte-for-byte comparison.
+
+## Runtime requirements
+
+General powers still call the host math library. The caller must qualify the
+selected reference build and Serc in the same compatible math-library,
+CPU-dispatch, and floating-point environment. Changing libm, its selected
+implementation, or floating-point control settings requires requalification
+against the reference interpreter. Profile selection alone does not establish
+byte-for-byte identity in an arbitrary environment.
+
+The reference environment used GNU libc 2.39 (`Ubuntu GLIBC 2.39-0ubuntu8.9`).
+Both reference interpreters dynamically used the same system `libm.so.6` and
+`libc.so.6`; the uv executable contains its Python implementation, whereas the
+Actions executable dynamically loads libpython. The libraries used for
+qualification have these SHA256 identities:
+
+| Library | SHA256                                                             |
+| ------- | ------------------------------------------------------------------ |
+| libm    | `fce00b6f25f459cf4ae0b7fae4257909a1a8a86f9149e7c029a5d617baf1ccd0` |
+| libc    | `3a15d66867d83762c7f2f1e37359cb8f6c5743edb369c65285cb0b1c4f7498bf` |
 
 ## Linux CI reference builds for 3.12 and 3.13
 
@@ -110,4 +138,4 @@ The other CI interpreters still come from uv. Every original fixture and byte
 comparison remains enabled. These pins define the concrete Linux CI references
 only: they do not replace independently pinned full-corpus oracles, establish
 binary identity with those oracles, or extend their results to other builds.
-Selecting a general target-build policy remains open in #576.
+Named profile selection currently covers the two CPython 3.14.5 artifacts above.
