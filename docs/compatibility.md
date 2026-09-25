@@ -69,6 +69,8 @@ required Ruff gate:
 The [latest measurement](../corpora/results/current.json), from September 22,
 2026, uses CPython 3.14.5 and Serc `af3806c`. It records compiler and corpus
 identities, every outcome category, and a link to the original evidence summary.
+The Ruff fixture measurement uses commit
+`e4a063a136ae0e3d6801bd0dad47d09a0f419530`, earlier than the required gate.
 
 | Corpus               |      Files | CPython-rejected | Byte-identical accepted | Byte mismatches | Accepted-input compiler failures | Accepted-input match rate |
 | -------------------- | ---------: | ---------------: | ----------------------: | --------------: | -------------------------------: | ------------------------: |
