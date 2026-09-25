@@ -106,6 +106,27 @@ impl Compiler<'_> {
             .function(scope_id)
             .ok_or_else(|| CompileError::Internal("function scope has no plan".to_string()))?;
         let mut plan = source_plan.clone();
+        for &(name, canonical, comprehension_cell) in &source_plan.deferred_generator_globals {
+            if arena.enclosing_function_binds(scope_id, canonical)
+                || self.symbols.active_temporaries.contains(name)
+            {
+                continue;
+            }
+            let mut aliases = vec![name];
+            for &(alias, original) in &plan.local_aliases {
+                if alias == name || original == name {
+                    aliases.extend([alias, original]);
+                }
+            }
+            for alias in aliases {
+                plan.comprehension_shadowed_targets.insert(alias);
+                if !comprehension_cell {
+                    plan.cellvars.remove(&alias);
+                    plan.inlined_comprehension_cellvars.remove(&alias);
+                }
+                plan.mark_global(alias);
+            }
+        }
         plan.resolve_required(&arena.names, |name| match &self.unit.scope {
             Scope::Class { free_indices, .. } => {
                 arena.names.get("__class__") == Some(name)
@@ -555,6 +576,10 @@ impl NameInterner {
 pub(super) struct FunctionPlan {
     pub(super) locals: Vec<NameId>,
     pub(super) local_aliases: Vec<(NameId, NameId)>,
+    /// Function bindings, excluding temporary comprehension targets.
+    pub(super) lexical_bindings: FxHashSet<NameId>,
+    /// Comprehension targets whose generator references may resolve globally.
+    pub(super) deferred_generator_globals: Vec<(NameId, NameId, bool)>,
     pub(super) cell_sort_names: FxHashMap<NameId, String>,
     pub(super) globals: FxHashSet<NameId>,
     pub(super) annotation_references: FxHashSet<NameId>,
@@ -806,6 +831,37 @@ impl FunctionPlan {
             .iter()
             .map(|name| mangle_name(name.as_str(), private_name))
             .collect::<FxHashSet<_>>();
+        // A nested function cannot decide whether a generator reference is global until
+        // the enclosing functions' bindings have been analyzed.
+        let deferred_generator_globals = if module_parent {
+            Vec::new()
+        } else {
+            let outside_generator_names = generator_requirements
+                .iter()
+                .filter(|name| outside_inlined_comprehension_requirements.contains(*name))
+                .map(|name| mangle_name(name, private_name))
+                .collect::<FxHashSet<_>>();
+            locals
+                .comprehension_targets
+                .iter()
+                .filter_map(|name| {
+                    let canonical = mangle_name(name.as_str(), private_name);
+                    (outside_generator_names.contains(&canonical)
+                        && !non_comprehension_names.contains(&canonical))
+                    .then(|| {
+                        let comprehension_cell = inlined_comprehension_cellvars
+                            .iter()
+                            .chain(&local_annotation_cellvars)
+                            .any(|candidate| mangle_name(candidate, private_name) == canonical);
+                        (name.to_string(), canonical.into_owned(), comprehension_cell)
+                    })
+                })
+                .collect()
+        };
+        let lexical_bindings = non_comprehension_names
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
         let mut comprehension_shadowed_targets = locals
             .comprehension_targets
             .iter()
@@ -822,6 +878,17 @@ impl FunctionPlan {
                 .filter(|name| locals.globals.contains(name.as_str()))
                 .cloned(),
         );
+        let deferred_generator_globals = deferred_generator_globals
+            .into_iter()
+            .map(|(name, canonical, comprehension_cell)| {
+                (
+                    names.intern(&name),
+                    names.intern(&canonical),
+                    comprehension_cell,
+                )
+            })
+            .collect();
+        let lexical_bindings = names.intern_set(lexical_bindings);
         let mut local_aliases = coalesce_private_locals(
             &mut locals.names,
             private_name,
@@ -1031,6 +1098,8 @@ impl FunctionPlan {
                     )
                 })
                 .collect(),
+            lexical_bindings,
+            deferred_generator_globals,
             globals: names.intern_set(locals.globals),
             cell_sort_names: FxHashMap::default(),
             annotation_references: names.intern_set(annotation_references),
@@ -1581,6 +1650,7 @@ enum ScopePlan {
 
 #[derive(Debug)]
 struct ScopeNode {
+    parent: Option<ScopeId>,
     plan: ScopePlan,
     children: Vec<ScopeId>,
 }
@@ -1694,6 +1764,7 @@ impl Default for ScopeArena {
             names: NameInterner::default(),
             module: ModulePlan::default(),
             nodes: IndexVec::from([ScopeNode {
+                parent: None,
                 plan: ScopePlan::Module,
                 children: Vec::new(),
             }]),
@@ -1825,6 +1896,7 @@ impl ScopeArena {
     fn add_scope(&mut self, parent: ScopeId, origin: ScopeOrigin, plan: ScopePlan) -> ScopeId {
         let id = self.nodes.next_index();
         self.nodes.push(ScopeNode {
+            parent: Some(parent),
             plan,
             children: Vec::new(),
         });
@@ -2079,6 +2151,37 @@ impl ScopeArena {
 
     fn child(&self, parent: ScopeId, origin: ScopeOrigin) -> Option<ScopeId> {
         self.by_parent_and_origin.get(&(parent, origin)).copied()
+    }
+
+    /// Class locals do not bind names for methods. An explicit function global stops
+    /// the search even when an outer function happens to bind the same name.
+    fn enclosing_function_binds(&self, id: ScopeId, name: NameId) -> bool {
+        let mut parent = self.nodes[id].parent;
+        while let Some(id) = parent {
+            let node = &self.nodes[id];
+            match &node.plan {
+                ScopePlan::Module => return false,
+                ScopePlan::Function(plan) => {
+                    if plan.globals.contains(&name) {
+                        return false;
+                    }
+                    if plan.lexical_bindings.contains(&name)
+                        || plan.type_parameter_names.contains(&name)
+                    {
+                        return true;
+                    }
+                }
+                ScopePlan::Class(plan) => {
+                    if self.names.resolve(name) == "__class__"
+                        || plan.type_parameter_names.contains(&name)
+                    {
+                        return true;
+                    }
+                }
+            }
+            parent = node.parent;
+        }
+        false
     }
 
     pub(super) fn function(&self, id: ScopeId) -> Option<&FunctionPlan> {
