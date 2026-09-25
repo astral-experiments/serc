@@ -1787,6 +1787,7 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
     struct AnnotationStrings<'ast> {
         needs_normalization: bool,
         fstrings: Vec<&'ast ruff_python_ast::ExprFString>,
+        integer_attribute_values: Vec<&'ast ruff_python_ast::ExprNumberLiteral>,
         unpacked_keywords: Vec<&'ast ruff_python_ast::Keyword>,
         templates: Vec<&'ast ruff_python_ast::ExprTString>,
     }
@@ -1802,6 +1803,14 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
                 Expr::TString(string) => {
                     self.needs_normalization = true;
                     self.templates.push(string);
+                }
+                Expr::Attribute(attribute) => {
+                    if let Expr::NumberLiteral(number) = attribute.value.as_ref()
+                        && matches!(number.value, ruff_python_ast::Number::Int(_))
+                    {
+                        self.integer_attribute_values.push(number);
+                    }
+                    walk_expr(self, expression);
                 }
                 Expr::Call(call) => {
                     self.needs_normalization |= call
@@ -1999,6 +2008,31 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
         })
         .flatten()
         .collect::<Vec<_>>();
+    // Ruff renders an integer attribute as `(1).real`; CPython uses `1 .real`.
+    let mut integer_attribute_replacements = Vec::new();
+    for number in generated_strings.integer_attribute_values {
+        let opening = usize::from(number.start()).saturating_sub(1);
+        let closing = usize::from(number.end());
+        if parenthesis_pairs.contains(&(opening, closing)) {
+            let mut value = if let ruff_python_ast::Number::Int(integer) = &number.value
+                && integer.as_u64().is_none()
+            {
+                let token = integer.to_string();
+                if ["0x", "0X", "0o", "0O", "0b", "0B"]
+                    .iter()
+                    .any(|prefix| token.starts_with(*prefix))
+                {
+                    annotation_integer_to_decimal(&token)
+                } else {
+                    token
+                }
+            } else {
+                annotation[usize::from(number.start())..closing].to_owned()
+            };
+            value.push(' ');
+            integer_attribute_replacements.push((opening..closing + 1, value));
+        }
+    }
     // CPython accepts a conditional expression after **; the generator uses atom
     // precedence and adds parentheses around these lower-precedence expressions.
     for keyword in generated_strings.unpacked_keywords {
@@ -2033,15 +2067,66 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
             .into_iter()
             .map(|index| (index..index + 1, String::new())),
     );
-    replacements.sort_unstable_by_key(|(range, _)| std::cmp::Reverse(range.start));
-    for (range, replacement) in replacements {
-        annotation.replace_range(range, &replacement);
+    let has_integer_attributes = !integer_attribute_replacements.is_empty();
+    replacements.extend(integer_attribute_replacements);
+    let non_overlapping = if has_integer_attributes {
+        replacements.sort_unstable_by_key(|(range, _)| range.start);
+        replacements
+            .windows(2)
+            .all(|pair| pair[0].0.end <= pair[1].0.start)
+    } else {
+        false
+    };
+    if non_overlapping {
+        // Apply disjoint edits in one pass: deleting one parenthesis at a time would
+        // repeatedly shift the remaining string for wide annotations.
+        let mut corrected = String::with_capacity(annotation.len());
+        let mut previous = 0;
+        for (range, replacement) in replacements {
+            corrected.push_str(&annotation[previous..range.start]);
+            corrected.push_str(&replacement);
+            previous = range.end;
+        }
+        corrected.push_str(&annotation[previous..]);
+        annotation = corrected;
+    } else {
+        replacements.sort_unstable_by_key(|(range, _)| std::cmp::Reverse(range.start));
+        for (range, replacement) in replacements {
+            annotation.replace_range(range, &replacement);
+        }
     }
     if matches!(expression, Expr::Tuple(tuple) if !tuple.elts.is_empty()) {
         annotation.insert(0, '(');
         annotation.push(')');
     }
     annotation
+}
+
+/// Format a nondecimal integer token using the decimal spelling CPython unparses.
+fn annotation_integer_to_decimal(token: &str) -> String {
+    use std::fmt::Write as _;
+
+    const DECIMAL_BASE: u64 = 1_000_000_000;
+    let mut decimal = vec![0_u32];
+    for limb in super::constant::big_integer_digits(token).into_iter().rev() {
+        let mut carry = u64::from(limb);
+        for part in &mut decimal {
+            let value = u64::from(*part) * (1 << 15) + carry;
+            *part = u32::try_from(value % DECIMAL_BASE).expect("decimal limb fits in u32");
+            carry = value / DECIMAL_BASE;
+        }
+        if carry != 0 {
+            decimal.push(u32::try_from(carry).expect("decimal carry fits in u32"));
+        }
+    }
+    let mut output = decimal
+        .pop()
+        .expect("the decimal representation is nonempty")
+        .to_string();
+    for part in decimal.into_iter().rev() {
+        write!(output, "{part:09}").expect("writing to a string cannot fail");
+    }
+    output
 }
 
 /// These expressions cannot contain any of the constructs corrected after Ruff generates them.

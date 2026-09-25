@@ -261,6 +261,7 @@ mod ordinary_condition_owner_slots;
 mod original_array_exit_copies;
 mod overriding_finally_return_compatibility;
 mod post_async_with_condition_owner_compatibility;
+mod postponed_annotation_integer_attribute_compatibility;
 mod postponed_annotation_string_compatibility;
 mod primitive_tuple_finally_owners;
 mod protected_comprehension_filter_rejection_compatibility;
