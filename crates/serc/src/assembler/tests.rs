@@ -7177,6 +7177,62 @@ fn unlocated_borrow_marker_does_not_block_redundant_jump_removal() {
 }
 
 #[test]
+fn retained_borrow_marker_does_not_create_a_skipped_line_event() {
+    let first_target = super::Label::from_u32(1);
+    let second_target = super::Label::from_u32(2);
+    let mut marker = Instruction::new(
+        NOP,
+        Operand::Value(0),
+        SourceLocation::new(2, 2, 0, 1),
+        None,
+    );
+    marker.jump_policy.mark_borrow_empty_block();
+    marker.jump_policy.retain_nop();
+    marker
+        .no_location_policy
+        .set_borrow_fallthrough(BorrowFallthrough::BarrierIfRemoved);
+    let mut second_jump = Instruction::new(
+        JUMP_FORWARD,
+        Operand::Forward(second_target),
+        SourceLocation::new(3, 3, 0, 1),
+        None,
+    );
+    second_jump
+        .no_location_policy
+        .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+    let mut pipeline = optimization_pipeline(vec![
+        pass_instruction(LOAD_CONST, 0, 1),
+        Item::Instruction(Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(first_target),
+            SourceLocation::new(1, 1, 0, 1),
+            None,
+        )),
+        Item::Instruction(marker),
+        Item::Label(first_target),
+        Item::Instruction(second_jump),
+        Item::Label(second_target),
+        pass_instruction(RETURN_VALUE, 0, 3),
+    ]);
+
+    pipeline.remove_redundant_forward_jumps(true);
+    let mut items = pipeline.graph.into_items();
+    super::OptimizationPipeline::remove_borrow_empty_block_markers(&mut items);
+
+    // If the marker's line event survives, the earlier edge must still skip it.
+    let first_jump_survives = items.iter().any(|item| {
+        matches!(item, Item::Instruction(instruction)
+            if instruction.opcode == JUMP_FORWARD
+                && instruction.operand() == Operand::Forward(first_target))
+    });
+    let marker_survives = items.iter().any(|item| {
+        matches!(item, Item::Instruction(instruction)
+            if instruction.opcode == NOP && instruction.location.line == 2)
+    });
+    assert!(first_jump_survives || !marker_survives);
+}
+
+#[test]
 fn borrow_marker_conversion_retries_without_another_jump_deletion() {
     let target = super::Label::from_u32(1);
     let mut marker = Instruction::new(
