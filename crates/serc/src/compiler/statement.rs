@@ -28684,7 +28684,7 @@ impl<'source> Compiler<'source> {
                 && !shared_manager_exit
                 && !statement.is_star
                 && statement.orelse.is_empty()
-                && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && self.unit.flags & CO_ASYNC_GENERATOR == 0
                 && matches!(conditional_exit, Some(NestedIfExitLocation::Unlocated))
                 && empty_unlocated_manager_tail
                 && let Some(exit_entry) = exit_exclusion_start
@@ -28712,8 +28712,9 @@ impl<'source> Compiler<'source> {
                 // ordinary handlers finish before this normal-finally array; their cleanup
                 // does not add a POP_BLOCK to this join. The graph certificate checks the
                 // original jump and every entry alias independently of handler shape.
-                // Its manager POP_BLOCK has no line event to retain. Keep the jump
-                // through exit copying, then let ordinary late removal retire it.
+                // Its manager POP_BLOCK has no line event to retain, including in a
+                // coroutine. Keep the jump through exit copying, then let ordinary
+                // late removal retire it.
                 self.assembler
                     .defer_synthetic_manager_join_removal(normal_exit, exit_entry);
             } else if preserve_exit_nop && !separate_manager_pop {

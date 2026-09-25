@@ -106,3 +106,25 @@ fn matches_cpython_manager_pop_after_conditional_for_exhaustion() {
     let source = "def example(manager, values, flag):\n    with manager:\n        if flag:\n            for value in values:\n                consume(value)\n        else:\n            raise Error\n    finish()\n";
     common::assert_matches_cpython_marshal(source, "manager_pop_conditional_for.py");
 }
+
+#[test]
+fn matches_cpython_nested_manager_in_coroutine_finally() {
+    for (prefix, suspension, inner) in [
+        ("", "", "log()"),
+        ("", "    yield value\n", "log()"),
+        ("async ", "", "log()"),
+        ("async ", "    await before()\n", "await log()"),
+    ] {
+        for condition in ["first and second", "first or second", "first"] {
+            for after in ["", "    finish()\n"] {
+                let source = format!(
+                    "{prefix}def f():\n{suspension}    with context():\n        try:\n            action()\n        finally:\n            if {condition}:\n                with suppress(Exception):\n                    {inner}\n{after}"
+                );
+                common::assert_matches_cpython_marshal(
+                    &source,
+                    "nested_manager_coroutine_finally.py",
+                );
+            }
+        }
+    }
+}
