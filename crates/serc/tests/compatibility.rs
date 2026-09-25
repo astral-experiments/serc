@@ -1570,6 +1570,48 @@ def parent():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_annotation_only_local_captured_by_function_annotation() {
+        let source = r"def outer():
+    value = 7
+    def middle():
+        value: int
+        def inner(item: value) -> value:
+            pass
+        return inner
+    return middle()
+
+try:
+    print(outer().__annotations__)
+except NameError:
+    print('unbound')
+";
+        assert_matches_cpython_marshal(source, "annotation_only_local_capture.py");
+        assert_executes(source, "unbound\n");
+
+        let future_source = format!("from __future__ import annotations\n{source}");
+        assert_matches_cpython_marshal(&future_source, "future_annotation_only_local.py");
+        assert_executes(&future_source, "{'item': 'value', 'return': 'value'}\n");
+
+        let private_source = r"class C:
+    def outer(self):
+        __value = 7
+        def middle():
+            __value: int
+            def inner(item: __value):
+                pass
+            return inner
+        return middle()
+
+try:
+    print(C().outer().__annotations__)
+except NameError:
+    print('unbound')
+";
+        assert_matches_cpython_marshal(private_source, "private_annotation_only_local.py");
+        assert_executes(private_source, "unbound\n");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_class_type_aliases() {
         let source = "from __future__ import annotations\n\nclass Container:\n    Local = int\n    type Alias = Local\n    type Generic[T] = tuple[Local, T]\n    type Factory[T] = lambda: (Local, T)\n";
         assert_matches_cpython_marshal(source, "class_alias.py");

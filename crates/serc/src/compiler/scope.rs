@@ -916,9 +916,10 @@ impl FunctionPlan {
                 || lambda_requirements.contains(name.as_str())
                 || generator_requirements.contains(name.as_str())
                 || annotation_scope_requirements.contains(name.as_str())
-                || names
-                    .get(name)
-                    .is_some_and(|name| nested_function_requirements.contains(&name))
+                || names.get(name).is_some_and(|name| {
+                    nested_function_requirements.contains(&name)
+                        || nested_function_annotation_references.contains(&name)
+                })
         });
         local_aliases.retain(|(_, original)| locals.names.contains(original));
         let mut annotation_cell_locals = local_annotation_cellvars
