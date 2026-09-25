@@ -69,6 +69,14 @@ impl Compiler<'_> {
                 self.class_scope_shadows_annotation_name(name)
             }
         };
+        self.class_visible_annotation_requirements_with(expression, shadows)
+    }
+
+    fn class_visible_annotation_requirements_with(
+        &self,
+        expression: &Expr,
+        shadows: impl Fn(NameId) -> bool,
+    ) -> BTreeSet<String> {
         let mut required = expression_required_names(expression);
         if required
             .iter()
@@ -83,17 +91,41 @@ impl Compiler<'_> {
     fn type_parameter_scope_requirements(
         &self,
         type_params: &ruff_python_ast::TypeParams,
-        unmangled: bool,
+        private_class: Option<&str>,
     ) -> BTreeSet<String> {
+        let private_type_names = private_class
+            .map(|_| {
+                type_params
+                    .iter()
+                    .map(|parameter| parameter.name().as_str())
+                    .collect::<FxHashSet<_>>()
+            })
+            .unwrap_or_default();
+        let shadows = |name| {
+            if let Some(private_class) = private_class {
+                let source_name = self.resolve_name(name);
+                let name = if private_type_names.contains(source_name) {
+                    self.required_name_id(&super::symbol::mangle_name(
+                        source_name,
+                        Some(private_class),
+                    ))
+                } else {
+                    name
+                };
+                self.class_scope_shadows_unmangled_annotation_name(name)
+            } else {
+                self.class_scope_shadows_annotation_name(name)
+            }
+        };
         let mut required = BTreeSet::new();
         for parameter in type_params {
             if let TypeParam::TypeVar(parameter) = parameter
                 && let Some(bound) = parameter.bound.as_deref()
             {
-                required.extend(self.class_visible_annotation_requirements(bound, unmangled));
+                required.extend(self.class_visible_annotation_requirements_with(bound, shadows));
             }
             if let Some(default) = parameter.default() {
-                required.extend(self.class_visible_annotation_requirements(default, unmangled));
+                required.extend(self.class_visible_annotation_requirements_with(default, shadows));
             }
         }
         required
@@ -151,7 +183,7 @@ impl Compiler<'_> {
             .iter()
             .map(|parameter| self.required_name_id(parameter.name().as_str()))
             .collect();
-        let mut requirements = self.type_parameter_scope_requirements(type_params, false);
+        let mut requirements = self.type_parameter_scope_requirements(type_params, None);
         requirements.extend(self.class_visible_annotation_requirements(value, false));
         let requirements = self.name_ids(&requirements);
         let cellvars = requirements
@@ -289,7 +321,7 @@ impl Compiler<'_> {
                 .map(|parameter| self.required_name_id(parameter.name().as_str())),
         );
         let type_parameter_requirements =
-            self.name_ids(self.type_parameter_scope_requirements(type_params, false));
+            self.name_ids(self.type_parameter_scope_requirements(type_params, None));
         let wrapper_local_names: FxHashSet<_> = locals.iter().copied().collect();
         let mut wrapper_plan = LoweringFunctionPlan {
             locals,
@@ -801,7 +833,8 @@ impl Compiler<'_> {
         locals.push(self.required_name_id(".type_params"));
         let (_, class_plan) = self.class_plan(definition)?;
         let required_names = &class_plan.required;
-        let type_parameter_requirements = self.type_parameter_scope_requirements(type_params, true);
+        let type_parameter_requirements =
+            self.type_parameter_scope_requirements(type_params, Some(definition.name.as_str()));
         let mut type_parameter_cell_requirements = type_parameter_requirements.clone();
         let mut wrapper_requirements = type_parameter_requirements;
         let mut header_references = ReferenceCollector::default();
@@ -2164,6 +2197,7 @@ pub(super) fn clean_doc(docstring: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::code_object::{CodeObject, Constant};
+    use crate::target::local_kinds::CO_FAST_FREE;
     use crate::{CompileOptions, PythonVersion, compile_with_options};
 
     fn find_code<'a>(code: &'a CodeObject, name: &str) -> Option<&'a CodeObject> {
@@ -2174,6 +2208,45 @@ mod tests {
             Constant::Code(child) => find_code(child, name),
             _ => None,
         })
+    }
+
+    #[test]
+    fn nested_generic_class_private_bounds_capture_their_own_parameters() {
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            for (binding, captures_parameter) in [
+                ("__T = int", true),
+                ("global __T", true),
+                ("_Inner__T = int", false),
+                ("global _Inner__T", false),
+            ] {
+                let source =
+                    format!("class Outer:\n    {binding}\n    class Inner[__T: __T]: pass\n");
+                let module = compile_with_options(
+                    &source,
+                    "nested_generic_class_private.py",
+                    &CompileOptions {
+                        python_version,
+                        ..CompileOptions::default()
+                    },
+                )
+                .unwrap();
+                let bound = find_code(&module.code, "__T").unwrap();
+                let has_parameter = bound
+                    .locals
+                    .iter()
+                    .zip(&bound.local_kinds)
+                    .any(|(name, kind)| name == "_Inner__T" && kind & CO_FAST_FREE != 0);
+                assert_eq!(
+                    has_parameter, captures_parameter,
+                    "{python_version:?}: {binding}"
+                );
+            }
+        }
     }
 
     #[test]
