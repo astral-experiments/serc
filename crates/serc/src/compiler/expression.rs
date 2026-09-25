@@ -43,7 +43,7 @@ use super::constant::{
     PercentFormatPart, double_negated_ellipsis, explicit_surrogate_string, first_literal_constant,
     fold_constant, fold_constant_for_version, folded_bool_operand, folded_constant_owner_slots,
     instruction_folded_ellipsis_depth, is_small_literal_tuple_element, number_constant,
-    optimized_percent_format, python_constant_values_equal, two_element_slice_optimization,
+    optimized_percent_format, two_element_slice_optimization, unique_frozenset_constants,
 };
 use super::scope::{
     LoweringFunctionPlan, NameId, NameSet, analyze_lambda_scope, analyze_lambda_scope_with_mangler,
@@ -6713,16 +6713,7 @@ impl Compiler<'_> {
     /// Records set construction before Python equality removes duplicate operands.
     fn fold_frozenset_constant(&mut self, constants: Vec<Constant>) -> Constant {
         self.output.has_frozenset_constants = true;
-        let mut unique = Vec::with_capacity(constants.len());
-        for constant in &constants {
-            if !unique
-                .iter()
-                .any(|existing| python_constant_values_equal(existing, constant))
-            {
-                unique.push(constant.clone());
-            }
-        }
-        let result = Constant::FrozenSet(unique);
+        let result = Constant::FrozenSet(unique_frozenset_constants(&constants, Constant::clone));
         self.record_folded_constant_dependencies(&result, constants);
         result
     }

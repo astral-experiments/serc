@@ -29,7 +29,7 @@ use super::RETURN_VALUE;
 
 use super::constant::{
     DeferredConstantTarget, constant_slice, fold_constant, fold_constant_for_version,
-    literal_constant, python_constant_values_equal,
+    literal_constant, unique_frozenset_constants,
 };
 use super::scope::{NameId, NameSet, definitely_evaluated_references};
 use super::source::unparse_annotation;
@@ -968,16 +968,10 @@ impl Compiler<'_> {
                     .map(|element| compiler.source_aware_fold_constant(element))
                     .collect::<Option<Vec<_>>>()?;
                 if is_set {
-                    let mut unique = Vec::with_capacity(values.len());
-                    for value in values {
-                        if !unique
-                            .iter()
-                            .any(|existing| python_constant_values_equal(existing, &value))
-                        {
-                            unique.push(value);
-                        }
-                    }
-                    Some(Constant::FrozenSet(unique))
+                    Some(Constant::FrozenSet(unique_frozenset_constants(
+                        values,
+                        std::convert::identity,
+                    )))
                 } else {
                     Some(Constant::Tuple(values))
                 }
