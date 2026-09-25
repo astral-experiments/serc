@@ -23710,11 +23710,15 @@ impl<'source> Compiler<'source> {
                         && (handler.name.is_some()
                             || (handler_cleanup_from_original_join
                                 && matches!(handler.body.as_slice(), [Stmt::With(manager)]
-                                    if !manager.is_async && suite_terminates(&manager.body))))
+                                    if !manager.is_async && suite_terminates(&manager.body)))
+                            || (handler_ends_with_nonterminal_with
+                                && !self.control.exceptions.active_exception_handlers.is_empty()
+                                && matches!(handler.body.as_slice(), [Stmt::With(manager)]
+                                    if !manager.is_async)))
                     {
-                        // An original join leaves the cleanup eligible for copying onto
-                        // unconditional predecessors. A terminating manager can also reach
-                        // this join when it suppresses the exception from its body.
+                        // An original join leaves cleanup eligible for copying onto
+                        // unconditional predecessors. A nested manager can reach it
+                        // through normal completion or exception suppression.
                         self.assembler.allow_last_no_location_block_inlining();
                         if handler_cleanup_from_original_join {
                             self.assembler.allow_last_unconditional_block_inlining();

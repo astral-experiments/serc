@@ -246,3 +246,29 @@ fn nested_manager_reraise_matches_cpython_handler_cleanup() {
         }
     }
 }
+
+#[test]
+fn nested_manager_fallthrough_matches_cpython_handler_cleanup() {
+    for (scope, suspension) in [
+        ("def", ""),
+        ("def", "    yield value\n"),
+        ("async def", ""),
+        ("async def", "    await before()\n"),
+    ] {
+        for outer in ["except Error as error:", "except Error:"] {
+            for inner in ["except Error:", "except Error as inner:"] {
+                for outer_body in ["return run()", "run()"] {
+                    for inner_body in ["return retry()", "retry()"] {
+                        let source = format!(
+                            "{scope} f():\n{suspension}    try:\n        {outer_body}\n    {outer}\n        try:\n            {inner_body}\n        {inner}\n            with context():\n                work()\n"
+                        );
+                        common::assert_matches_cpython_marshal(
+                            &source,
+                            "nested_manager_fallthrough.py",
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
