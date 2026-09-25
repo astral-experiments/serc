@@ -638,8 +638,15 @@ impl Compiler<'_> {
                     if !truthiness || !context.fail_pop.is_empty() {
                         // Constant folding removes the guard's jump after CPython
                         // has already established its failure-block boundary.
+                        let irrefutable_pattern = context.fail_pop.is_empty();
                         self.ensure_match_fail_pop(&mut context, 0);
-                        let range = if is_wildcard_pattern(&case.pattern) {
+                        let range = if is_wildcard_pattern(&case.pattern)
+                            && !(self.context.python_version >= PythonVersion::Py314
+                                && !truthiness
+                                && match_has_following
+                                && !has_default
+                                && !copied_subject)
+                        {
                             case.pattern.range()
                         } else {
                             guard.range()
@@ -663,15 +670,32 @@ impl Compiler<'_> {
                                 .assembler
                                 .last_instruction_location()
                                 .is_some_and(|previous| previous.line == location.line);
+                        let redundant_false_join = self.context.python_version
+                            >= PythonVersion::Py314
+                            && !truthiness
+                            && match_has_following
+                            && !has_default
+                            && !copied_subject
+                            && (matches!(case.pattern, Pattern::MatchOr(_))
+                                || (irrefutable_pattern
+                                    && matches!(case.pattern, Pattern::MatchAs(_))))
+                            && self
+                                .assembler
+                                .last_instruction_location()
+                                .is_some_and(|previous| previous.line == location.line);
                         self.assembler.set_location(
-                            if redundant_capture_line || redundant_pattern_line {
+                            if redundant_capture_line
+                                || redundant_pattern_line
+                                || redundant_false_join
+                            {
                                 SourceLocation::NONE
                             } else {
                                 location
                             },
                         );
                         self.emit(NOP, 0, 0)?;
-                        if redundant_capture_line || redundant_pattern_line {
+                        if redundant_capture_line || redundant_pattern_line || redundant_false_join
+                        {
                             // Keep the folded guard's slot for original block sizing without
                             // giving it a duplicate source line at the pattern success join.
                             self.assembler.preserve_last_no_location();
