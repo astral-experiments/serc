@@ -58,3 +58,76 @@ fn matches_cpython_unreachable_cleanup_does_not_raise_stack_bound() {
         common::assert_matches_cpython_marshal(source, "unreachable_suspension_cleanup.py");
     }
 }
+
+#[test]
+fn matches_cpython_removed_suspension_cleanup_inside_a_live_loop() {
+    for source in [
+        "def f(values):\n    for value in values:\n        if False:\n            yield from values\n",
+        "async def f(values):\n    for value in values:\n        if False:\n            await work(value)\n",
+    ] {
+        common::assert_matches_cpython_marshal(source, "unreachable_loop_cleanup.py");
+    }
+}
+
+#[test]
+fn matches_cpython_315_removed_and_live_suspension_cleanup() {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    use serc::{CompileOptions, PythonVersion, compile_with_options};
+
+    let version = PythonVersion::Py315;
+    let target = version.target();
+    let python = std::env::var_os("SERC_TEST_PYTHON_315").unwrap_or_else(|| "python3.15".into());
+    let script = r"
+import importlib.util, marshal, sys
+assert sys.implementation.name == 'cpython'
+assert sys.version.split()[0] == sys.argv[1]
+assert importlib.util.MAGIC_NUMBER.hex() == sys.argv[2]
+code = compile(sys.stdin.read(), sys.argv[3], 'exec', dont_inherit=True, optimize=0)
+sys.stdout.buffer.write(marshal.dumps(code))
+";
+    let filename = "suspension_cleanup_315.py";
+    let options = CompileOptions {
+        python_version: version,
+        ..CompileOptions::default()
+    };
+    for source in [
+        "def f(values):\n    for value in values:\n        if False:\n            yield from values\n",
+        "async def f(values):\n    for value in values:\n        if False:\n            await work(value)\n",
+        "def f(values):\n    for value in values:\n        yield from values\n",
+        "def f(values):\n    if False:\n        yield from values\n",
+    ] {
+        let mut oracle = Command::new(&python)
+            .args(["-I", "-S", "-X", "utf8", "-c", script])
+            .args([
+                target.tag.strip_prefix('v').unwrap(),
+                &target.magic_hex(),
+                filename,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        oracle
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(source.as_bytes())
+            .unwrap();
+        let expected = oracle.wait_with_output().unwrap();
+        assert!(
+            expected.status.success(),
+            "CPython 3.15 oracle failed: {}",
+            String::from_utf8_lossy(&expected.stderr)
+        );
+        assert_eq!(
+            compile_with_options(source, filename, &options)
+                .unwrap()
+                .marshal(),
+            expected.stdout,
+            "marshal mismatch for {source}"
+        );
+    }
+}
