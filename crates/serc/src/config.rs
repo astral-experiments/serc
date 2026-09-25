@@ -100,12 +100,176 @@ pub struct CompileOptions {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::{CompileOptions, PythonVersion};
     use crate::{
         CPYTHON_TARGET, InitialInternState, compile, compile_bytes,
-        compile_bytes_with_intern_state, compile_bytes_with_options, compile_with_intern_state,
-        compile_with_options,
+        compile_bytes_with_intern_state, compile_bytes_with_options,
+        compile_bytes_with_path_and_options, compile_with_intern_state, compile_with_options,
     };
+
+    #[test]
+    fn byte_decoding_updates_intern_state_without_mutating_callers() {
+        let absent = InitialInternState::from_partial_with_absence([] as [&str; 0], |_, _| true);
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let options = CompileOptions {
+                python_version,
+                initial_intern_state: absent.clone(),
+            };
+            let source = b"# coding: cp1251\npass\n";
+            let module = compile_bytes_with_options(source, "module.py", &options).unwrap();
+            let path_module =
+                compile_bytes_with_path_and_options(source, Path::new("module.py"), &options)
+                    .unwrap();
+            for result in [module, path_module] {
+                assert_eq!(
+                    result
+                        .initial_intern_state
+                        .membership_for(python_version, "encoding_table"),
+                    Some(true)
+                );
+                assert_eq!(
+                    result
+                        .initial_intern_state
+                        .membership_for(python_version, "decoding_table"),
+                    Some(true)
+                );
+                assert_eq!(
+                    result
+                        .initial_intern_state
+                        .membership_for(python_version, "unrelated_absent"),
+                    Some(false)
+                );
+            }
+            assert_eq!(
+                options
+                    .initial_intern_state
+                    .membership_for(python_version, "encoding_table"),
+                Some(false)
+            );
+            let text =
+                compile_with_options("# coding: cp1251\npass\n", "module.py", &options).unwrap();
+            assert_eq!(
+                text.initial_intern_state
+                    .membership_for(python_version, "encoding_table"),
+                Some(false)
+            );
+            let fast =
+                compile_bytes_with_options(b"# coding: ascii\npass\n", "module.py", &options)
+                    .unwrap();
+            assert_eq!(
+                fast.initial_intern_state
+                    .membership_for(python_version, "ascii_encode"),
+                Some(false)
+            );
+            let alias =
+                compile_bytes_with_options(b"# coding: cp367\npass\n", "module.py", &options)
+                    .unwrap();
+            assert_eq!(
+                alias
+                    .initial_intern_state
+                    .membership_for(python_version, "ascii_encode"),
+                Some(true)
+            );
+            assert_eq!(
+                alias
+                    .initial_intern_state
+                    .membership_for(python_version, "cp367"),
+                Some(true)
+            );
+            let multibyte =
+                compile_bytes_with_options(b"# coding: euc-jp\npass\n", "module.py", &options)
+                    .unwrap();
+            for name in ["readlines", "writelines", "stream"] {
+                assert_eq!(
+                    multibyte
+                        .initial_intern_state
+                        .membership_for(python_version, name),
+                    Some(true),
+                    "{python_version}, {name}"
+                );
+            }
+            let custom = CompileOptions {
+                python_version,
+                initial_intern_state: absent.without_standard_source_codec_effects(),
+            };
+            let module = compile_bytes_with_options(source, "module.py", &custom).unwrap();
+            assert_eq!(
+                module
+                    .initial_intern_state
+                    .membership_for(python_version, "encoding_table"),
+                Some(false)
+            );
+            let partial = CompileOptions {
+                python_version,
+                initial_intern_state: InitialInternState::from_partial([] as [&str; 0]),
+            };
+            let module = compile_bytes_with_options(source, "module.py", &partial).unwrap();
+            assert_eq!(
+                module
+                    .initial_intern_state
+                    .membership_for(python_version, "encoding_table"),
+                Some(true)
+            );
+            assert_eq!(
+                module
+                    .initial_intern_state
+                    .membership_for(python_version, "unknown_value"),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn source_codecs_resolve_retained_qualified_names_for_modern_targets() {
+        use crate::CompileError;
+
+        let source = "# coding: cp1251\nclass Codec:\n    class encode: pass\n";
+        let state = InitialInternState::from_partial_with_absence([] as [&str; 0], |_, value| {
+            value != "Codec.encode"
+        });
+        for python_version in [
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let options = CompileOptions {
+                python_version,
+                initial_intern_state: state.clone(),
+            };
+            assert_eq!(
+                compile_with_options(source, "codec.py", &options).unwrap_err(),
+                CompileError::UnresolvedInternState {
+                    value: "Codec.encode".into()
+                }
+            );
+            let module =
+                compile_bytes_with_options(source.as_bytes(), "codec.py", &options).unwrap();
+            assert_eq!(
+                module
+                    .initial_intern_state
+                    .membership_for(python_version, "Codec.encode"),
+                Some(true)
+            );
+        }
+        let options = CompileOptions {
+            python_version: PythonVersion::Py312,
+            initial_intern_state: state,
+        };
+        let module = compile_bytes_with_options(source.as_bytes(), "codec.py", &options).unwrap();
+        assert_eq!(
+            module
+                .initial_intern_state
+                .membership_for(PythonVersion::Py312, "Codec.encode"),
+            None
+        );
+    }
 
     #[test]
     fn version_configuration_selects_exact_target() {

@@ -301,14 +301,15 @@ pub fn compile_bytes_with_intern_state(
 /// Decode and compile source bytes using the selected target and initial string intern state.
 ///
 /// This function performs no filesystem I/O. See [`decode_source`] for source encoding behavior.
+/// The initial intern state describes the state before byte-source decoding; by default,
+/// standard codec imports and successful codec lookups contribute retained strings.
 pub fn compile_bytes_with_options(
     source: &[u8],
     filename: &str,
     options: &CompileOptions,
 ) -> Result<CompiledModule, CompileError> {
     validate_filename(filename)?;
-    let source = decode_source(source).map_err(CompileError::Decode)?;
-    compile_normalized(&source, filename.into(), options)
+    compile_byte_source(source, filename.into(), options)
 }
 
 /// Decode and compile source bytes with an operating-system filename and the selected options.
@@ -324,8 +325,41 @@ pub fn compile_bytes_with_path_and_options(
     if filename.as_os_str().as_encoded_bytes().contains(&0) {
         return Err(CompileError::InvalidFilename);
     }
-    let source = decode_source(source).map_err(CompileError::Decode)?;
-    compile_normalized(&source, CodeFilename::from_path(filename), options)
+    compile_byte_source(source, CodeFilename::from_path(filename), options)
+}
+
+fn compile_byte_source(
+    source: &[u8],
+    filename: CodeFilename,
+    options: &CompileOptions,
+) -> Result<CompiledModule, CompileError> {
+    let decoded = source::decode_source_with_codec(source).map_err(CompileError::Decode)?;
+    if !options
+        .initial_intern_state
+        .models_standard_source_codec_effects()
+    {
+        return compile_normalized(&decoded.source, filename, options);
+    }
+    let strings = decoded.codec.map_or(&[][..], |codec| {
+        target::source_codec_strings(options.python_version, codec)
+    });
+    if strings.is_empty() && decoded.registry_name.is_none() {
+        return compile_normalized(&decoded.source, filename, options);
+    }
+    let state = options.initial_intern_state.with_additional_strings(
+        strings
+            .iter()
+            .copied()
+            .chain(decoded.registry_name.as_deref()),
+    );
+    compile_normalized(
+        &decoded.source,
+        filename,
+        &CompileOptions {
+            initial_intern_state: state,
+            ..options.clone()
+        },
+    )
 }
 
 fn validate_filename(filename: &str) -> Result<(), CompileError> {
