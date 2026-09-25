@@ -33224,9 +33224,16 @@ fn supports_direct_terminating_finally_returns(statement: &ruff_python_ast::Stmt
     let [Stmt::Return(body)] = statement.body.as_slice() else {
         return false;
     };
-    let [Stmt::Return(finalizer)] = statement.finalbody.as_slice() else {
+    let Some((Stmt::Return(finalizer), prefix)) = statement.finalbody.split_last() else {
         return false;
     };
+    if !prefix.iter().all(|statement| {
+        matches!(statement, Stmt::Expr(expression)
+            if !expression_contains_inline_branch(&expression.value)
+                && !expression_suspends_current_scope(&expression.value))
+    }) {
+        return false;
+    }
     !statement.is_star
         && statement.handlers.is_empty()
         && statement.orelse.is_empty()

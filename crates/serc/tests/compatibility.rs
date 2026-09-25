@@ -18,6 +18,41 @@ mod tests {
     use serc_fixtures as fixtures;
 
     #[test]
+    fn terminating_finally_keeps_pending_return_until_cleanup_finishes() {
+        let source = r#"
+class Tracked:
+    def __del__(self):
+        print("destroyed")
+
+def pending():
+    return Tracked()
+
+def cleanup(raises):
+    print("cleanup")
+    if raises:
+        raise ValueError()
+
+def replace_return(raises):
+    try:
+        return pending()
+    finally:
+        cleanup(raises)
+        return 42
+
+print(replace_return(False))
+try:
+    replace_return(True)
+except ValueError:
+    print("caught")
+"#;
+        assert_matches_cpython_marshal(source, "terminating_finally_return.py");
+        assert_executes(
+            source,
+            "cleanup\ndestroyed\n42\ncleanup\ndestroyed\ncaught\n",
+        );
+    }
+
+    #[test]
     fn exposes_the_pinned_cpython_source_identity() {
         assert_eq!(CPYTHON_TARGET.tag, "v3.14.5");
         assert_eq!(
