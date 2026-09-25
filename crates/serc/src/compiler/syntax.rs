@@ -16,6 +16,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{CompileError, PythonVersion};
 
+use super::constant::explicit_surrogate_string;
 use super::statement::suite_contains_yield_in_function_scope;
 use super::symbol::mangle_name;
 
@@ -50,33 +51,27 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
     body: &[Stmt],
     python_version: PythonVersion,
 ) -> Result<(), CompileError> {
-    let mut validator = Validator::<PRUNE_STATEMENTS> {
-        checker: SemanticSyntaxChecker::new(),
-        checker_prefix: CheckerPrefix::Initial,
-        error: RefCell::new(None),
-        pending_pattern: None,
-        lowering_pattern_error: false,
-        bare_starred: None,
-        check_bare_starred: true,
-        source,
-        body,
-        python_version: match python_version {
-            PythonVersion::Py312 => ast::PythonVersion::PY312,
-            PythonVersion::Py313 => ast::PythonVersion::PY313,
-            PythonVersion::Py314 => ast::PythonVersion::PY314,
-            PythonVersion::Py315 => ast::PythonVersion::PY315,
-        },
-        future_annotations: body.iter().any(|statement| {
-            matches!(statement, Stmt::ImportFrom(import)
-                if import.level == 0 && import.module.as_deref() == Some("__future__")
-                    && import.names.iter().any(|alias| alias.name.as_str() == "annotations"))
-        }),
-        private_name: None,
-        mangled_names: None,
-        scopes: vec![Scope::new(ScopeKind::Module)],
-    };
-    validator.visit_body(body);
+    let mut validator = new_validator::<PRUNE_STATEMENTS, false>(source, body, python_version);
+    validator.visit_scope_body(body);
     let error = validator.error.into_inner();
+    if matches!(&error, Some(CompileError::InvalidDocstring { .. })) {
+        // Native validates future directives before cleaning docstrings. Revisit only this rare
+        // error path so an invalid directive anywhere retains its higher diagnostic priority.
+        let mut validator = new_validator::<false, true>(source, body, python_version);
+        validator.visit_body(body);
+        if let Some(future_error) = validator.error.into_inner() {
+            return Err(future_error);
+        }
+        // Symbol-table diagnostics precede docstring cleanup too, including declarations in
+        // another scope. Keep walking past code-generation errors to find those diagnostics.
+        let mut validator = new_validator::<false, false>(source, body, python_version);
+        validator.pre_lowering_only = true;
+        validator.visit_body(body);
+        if let Some(priority_error) = validator.error.into_inner() {
+            return Err(priority_error);
+        }
+        validate_declarations(source, body, python_version)?;
+    }
     let lowering_error =
         validator.lowering_pattern_error || (error.is_none() && validator.bare_starred.is_some());
     let result = error
@@ -96,6 +91,39 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
     validate_declarations(source, body, python_version)
 }
 
+fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>(
+    source: &'source str,
+    body: &'ast [Stmt],
+    python_version: PythonVersion,
+) -> Validator<'source, 'ast, PRUNE_STATEMENTS, FUTURE_ONLY> {
+    Validator {
+        checker: SemanticSyntaxChecker::new(),
+        checker_prefix: CheckerPrefix::Initial,
+        error: RefCell::new(None),
+        pending_pattern: None,
+        lowering_pattern_error: false,
+        bare_starred: None,
+        check_bare_starred: true,
+        pre_lowering_only: false,
+        source,
+        body,
+        python_version: match python_version {
+            PythonVersion::Py312 => ast::PythonVersion::PY312,
+            PythonVersion::Py313 => ast::PythonVersion::PY313,
+            PythonVersion::Py314 => ast::PythonVersion::PY314,
+            PythonVersion::Py315 => ast::PythonVersion::PY315,
+        },
+        future_annotations: body.iter().any(|statement| {
+            matches!(statement, Stmt::ImportFrom(import)
+                if import.level == 0 && import.module.as_deref() == Some("__future__")
+                    && import.names.iter().any(|alias| alias.name.as_str() == "annotations"))
+        }),
+        private_name: None,
+        mangled_names: None,
+        scopes: vec![Scope::new(ScopeKind::Module)],
+    }
+}
+
 #[cfg(test)]
 fn validate_without_statement_pruning(
     source: &str,
@@ -103,6 +131,56 @@ fn validate_without_statement_pruning(
     python_version: PythonVersion,
 ) -> Result<(), CompileError> {
     validate_with_statement_pruning::<false>(source, body, python_version)
+}
+
+/// Returns the UTF-8 failure CPython encounters before it starts cleaning a docstring.
+fn surrogate_docstring_error(source: &str, string: &ast::ExprStringLiteral) -> Option<String> {
+    if !string
+        .value
+        .iter()
+        .any(|part| !part.flags.prefix().is_raw() && part.as_str().contains('\u{fffd}'))
+    {
+        return None;
+    }
+
+    let mut value = Vec::new();
+    for part in &string.value {
+        if !part.flags.prefix().is_raw()
+            && let Some(restored) = explicit_surrogate_string(part.as_str(), &source[part.range])
+        {
+            value.extend(restored);
+        } else {
+            value.extend_from_slice(part.as_str().as_bytes());
+        }
+    }
+
+    // The restored value is UTF-8 with surrogate code points retained. Only leading bytes
+    // contribute a character position, and CPython reports the first contiguous surrogate run.
+    let mut first = None;
+    let mut end = 0;
+    for (position, (offset, _)) in value
+        .iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte & 0xc0 != 0x80)
+        .enumerate()
+    {
+        if let [0xed, middle @ 0xa0..=0xbf, last @ 0x80..=0xbf, ..] = value[offset..] {
+            let codepoint = 0xd000 | (u16::from(middle & 0x3f) << 6) | u16::from(last & 0x3f);
+            first.get_or_insert((position, codepoint));
+            end = position + 1;
+        } else if first.is_some() {
+            break;
+        }
+    }
+    let (start, codepoint) = first?;
+    let characters = if end == start + 1 {
+        format!("character '\\u{codepoint:04x}' in position {start}")
+    } else {
+        format!("characters in position {start}-{}", end - 1)
+    };
+    Some(format!(
+        "'utf-8' codec can't encode {characters}: surrogates not allowed"
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -160,7 +238,8 @@ impl<'ast> Scope<'ast> {
     }
 }
 
-struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool> {
+struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> {
+    pre_lowering_only: bool,
     checker: SemanticSyntaxChecker,
     checker_prefix: CheckerPrefix,
     error: RefCell<Option<CompileError>>,
@@ -324,9 +403,12 @@ fn pattern_capture_names(pattern: &Pattern) -> FxHashSet<&str> {
     names.0
 }
 
-impl<'ast, const PRUNE_STATEMENTS: bool> Validator<'_, 'ast, PRUNE_STATEMENTS> {
+impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
+    Validator<'_, 'ast, PRUNE_STATEMENTS, FUTURE_ONLY>
+{
     fn record_bare_starred(&mut self, expression: &Expr, kind: BareStarredKind) {
-        if self.check_bare_starred
+        if !self.pre_lowering_only
+            && self.check_bare_starred
             && self.bare_starred.is_none()
             && self.error.borrow().is_none()
             && expression.is_starred_expr()
@@ -342,6 +424,22 @@ impl<'ast, const PRUNE_STATEMENTS: bool> Validator<'_, 'ast, PRUNE_STATEMENTS> {
         self.check_bare_starred = previous;
     }
 
+    fn visit_scope_body(&mut self, body: &'ast [Stmt]) {
+        if !self.pre_lowering_only
+            && self.error.borrow().is_none()
+            && self.python_version >= ast::PythonVersion::PY313
+            && let Some(Stmt::Expr(statement)) = body.first()
+            && let Expr::StringLiteral(string) = statement.value.as_ref()
+            && let Some(message) = surrogate_docstring_error(self.source, string)
+        {
+            *self.error.borrow_mut() = Some(CompileError::InvalidDocstring {
+                message,
+                range: string.range,
+            });
+        }
+        self.visit_body(body);
+    }
+
     fn scope(&self) -> &Scope<'ast> {
         self.scopes
             .last()
@@ -355,6 +453,9 @@ impl<'ast, const PRUNE_STATEMENTS: bool> Validator<'_, 'ast, PRUNE_STATEMENTS> {
     }
 
     fn reject_except_star_transfer(&self, statement: &Stmt) {
+        if self.pre_lowering_only {
+            return;
+        }
         let mut error = self.error.borrow_mut();
         if error.is_none() {
             *error = Some(CompileError::invalid_syntax(
@@ -497,6 +598,23 @@ impl<'ast, const PRUNE_STATEMENTS: bool> Validator<'_, 'ast, PRUNE_STATEMENTS> {
         let mut checker = std::mem::take(&mut self.checker);
         visit(&mut checker, self);
         self.checker = checker;
+    }
+
+    fn check_statement(&mut self, statement: &Stmt) {
+        // Relative imports of a module named __future__ are ordinary imports. The shared
+        // checker identifies directives by their module spelling, so hide that spelling here.
+        if let Stmt::ImportFrom(import) = statement
+            && import.level > 0
+            && import.module.as_deref() == Some("__future__")
+        {
+            let mut import = import.clone();
+            import.module = None;
+            self.with_checker(|checker, context| {
+                checker.visit_stmt(&Stmt::ImportFrom(import), context);
+            });
+        } else {
+            self.with_checker(|checker, context| checker.visit_stmt(statement, context));
+        }
     }
 
     fn statement_needs_checker(&mut self, statement: &Stmt) -> bool {
@@ -648,9 +766,16 @@ fn unreachable_pattern(
     }
 }
 
-impl<'ast, const PRUNE_STATEMENTS: bool> Visitor<'ast> for Validator<'_, 'ast, PRUNE_STATEMENTS> {
+impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
+    for Validator<'_, 'ast, PRUNE_STATEMENTS, FUTURE_ONLY>
+{
     fn visit_stmt(&mut self, statement: &'ast Stmt) {
         if self.error.borrow().is_some() {
+            return;
+        }
+        if FUTURE_ONLY {
+            self.check_statement(statement);
+            walk_stmt(self, statement);
             return;
         }
         let mut prechecked_match_cases = 0;
@@ -678,7 +803,8 @@ impl<'ast, const PRUNE_STATEMENTS: bool> Visitor<'ast> for Validator<'_, 'ast, P
             _ => {}
         }
         // This precedes return-value checks and except* transfer checks, as in CPython.
-        if let Stmt::Return(statement) = statement
+        if !self.pre_lowering_only
+            && let Stmt::Return(statement) = statement
             && statement.value.is_some()
             && matches!(
                 self.scope().kind,
@@ -697,7 +823,8 @@ impl<'ast, const PRUNE_STATEMENTS: bool> Visitor<'ast> for Validator<'_, 'ast, P
         }
         // A loop contained within the handler can be exited without leaving except*.
         // Independent function and class scopes start without the enclosing boundary.
-        if matches!(statement, Stmt::Break(_) | Stmt::Continue(_))
+        if !self.pre_lowering_only
+            && matches!(statement, Stmt::Break(_) | Stmt::Continue(_))
             && self.scope().except_star_loop_depth == Some(self.scope().loop_depth)
         {
             self.reject_except_star_transfer(statement);
@@ -705,7 +832,9 @@ impl<'ast, const PRUNE_STATEMENTS: bool> Visitor<'ast> for Validator<'_, 'ast, P
         }
         // Ruff checks reachability across whole cases but does not reject unreachable arms of an
         // OR pattern. Walk both boundaries in CPython's order before checking binding differences.
-        if let Stmt::Match(statement) = statement {
+        if !self.pre_lowering_only
+            && let Stmt::Match(statement) = statement
+        {
             self.visit_expr(&statement.subject);
             self.defer_pattern_reachability(statement);
             if let Some(pending) = self.pending_pattern.take() {
@@ -722,18 +851,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool> Visitor<'ast> for Validator<'_, 'ast, P
         // Relative imports of a module named __future__ are ordinary imports. The shared
         // checker identifies directives by their module spelling, so hide that spelling here.
         if self.statement_needs_checker(statement) {
-            if let Stmt::ImportFrom(import) = statement
-                && import.level > 0
-                && import.module.as_deref() == Some("__future__")
-            {
-                let mut import = import.clone();
-                import.module = None;
-                self.with_checker(|checker, context| {
-                    checker.visit_stmt(&Stmt::ImportFrom(import), context);
-                });
-            } else {
-                self.with_checker(|checker, context| checker.visit_stmt(statement, context));
-            }
+            self.check_statement(statement);
         }
         if let Some(pending) = self.pending_pattern.take() {
             if self.error.borrow().is_none() && self.bare_starred.is_none() {
@@ -805,7 +923,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool> Visitor<'ast> for Validator<'_, 'ast, P
                             ),
                         parameters: Some(&function.parameters),
                     },
-                    |visitor| visitor.visit_body(&function.body),
+                    |visitor| visitor.visit_scope_body(&function.body),
                 );
             }
             Stmt::ClassDef(class) => {
@@ -832,7 +950,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool> Visitor<'ast> for Validator<'_, 'ast, P
                             }
                             visitor.mangled_names = None;
                             visitor.with_scope(ScopeKind::Class, |visitor| {
-                                visitor.visit_body(&class.body);
+                                visitor.visit_scope_body(&class.body);
                             });
                         },
                     );
@@ -842,7 +960,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool> Visitor<'ast> for Validator<'_, 'ast, P
                     }
                     self.with_private_context(class.name.as_str(), None, |visitor| {
                         visitor.with_scope(ScopeKind::Class, |visitor| {
-                            visitor.visit_body(&class.body);
+                            visitor.visit_scope_body(&class.body);
                         });
                     });
                 }
@@ -896,6 +1014,9 @@ impl<'ast, const PRUNE_STATEMENTS: bool> Visitor<'ast> for Validator<'_, 'ast, P
     }
 
     fn visit_expr(&mut self, expression: &'ast Expr) {
+        if FUTURE_ONLY {
+            return;
+        }
         // This adapter does not supply declarations to Ruff's global-order check. A bare name
         // therefore only needs checking when it assigns to or deletes `__debug__`. Ordinary
         // literals and attribute wrappers cannot report errors or update validation state.
@@ -1011,6 +1132,9 @@ impl<'ast, const PRUNE_STATEMENTS: bool> Visitor<'ast> for Validator<'_, 'ast, P
     }
 
     fn visit_parameters(&mut self, parameters: &'ast ast::Parameters) {
+        if FUTURE_ONLY {
+            return;
+        }
         self.validate_private_parameters(parameters);
         walk_parameters(self, parameters);
     }
@@ -1037,7 +1161,9 @@ impl<'ast, const PRUNE_STATEMENTS: bool> Visitor<'ast> for Validator<'_, 'ast, P
     }
 }
 
-impl<const PRUNE_STATEMENTS: bool> SemanticSyntaxContext for Validator<'_, '_, PRUNE_STATEMENTS> {
+impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContext
+    for Validator<'_, '_, PRUNE_STATEMENTS, FUTURE_ONLY>
+{
     fn future_annotations_or_stub(&self) -> bool {
         self.future_annotations
     }
@@ -1145,6 +1271,14 @@ impl<const PRUNE_STATEMENTS: bool> SemanticSyntaxContext for Validator<'_, '_, P
 
     fn report_semantic_error(&self, error: SemanticSyntaxError) {
         use SemanticSyntaxErrorKind as Kind;
+        if FUTURE_ONLY
+            && !matches!(
+                &error.kind,
+                Kind::FutureFeatureNotDefined(_) | Kind::LateFutureImport | Kind::LazyFutureImport
+            )
+        {
+            return;
+        }
         // The declaration pass checks complete symbol histories and places errors on the full
         // CPython statement, including parameters and module-level nonlocals.
         if matches!(
@@ -1170,10 +1304,11 @@ impl<const PRUNE_STATEMENTS: bool> SemanticSyntaxContext for Validator<'_, '_, P
         {
             return;
         }
-        if self.bare_starred.is_some() {
+        if self.bare_starred.is_some() || self.pre_lowering_only {
             // Bare stars fail during code generation. Keep walking for errors from earlier
             // compiler phases; 3.14 moved await and writes to __debug__ into such a phase.
             let code_generation_error = match &error.kind {
+                Kind::ReturnInGenerator => self.pre_lowering_only,
                 Kind::BreakOutsideLoop
                 | Kind::ContinueOutsideLoop
                 | Kind::ReturnOutsideFunction
