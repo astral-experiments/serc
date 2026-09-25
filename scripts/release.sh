@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Prepare a release commit with Rooster, as in uv.
+# Prepare for a release.
+#
+# All additional options are passed to `rooster`.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -8,16 +10,27 @@ if [[ -n "$(git status --porcelain)" ]]; then
     exit 1
 fi
 
-# The first release has no prior tag; use the version already in the manifests.
-if [[ $# == 0 ]] && ! git tag --list | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-    set -- --version "$(uv version --short)"
+# Rooster expects version files to start at 0.0.0 when there is no previous
+# tag. Our first release starts at the version already in the manifests.
+if ! git tag --list | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+$'; then
+    if [[ $# == 0 ]]; then
+        set -- --version "$(uv version --short)"
+    fi
+    uv run --locked --python 3.12 --only-group release rooster release --no-update-version-files "$@"
+else
+    uv run --locked --python 3.12 --only-group release rooster release "$@"
 fi
-uv run --locked --default-index https://pypi.org/simple --python 3.12 --only-group release rooster release --no-update-version-files "$@"
+
+# Keep the CLI's dependency on the library in step with both crate versions.
 version="$(python3 scripts/update-release-version.py)"
 python3 scripts/check-release.py
-cargo update -p serc -p serc-cli
-uv lock --default-index https://pypi.org/simple
 
-git switch -c "charlie/release-$version"
-git add CHANGELOG.md pyproject.toml uv.lock Cargo.lock crates/serc/Cargo.toml crates/serc_cli/Cargo.toml
-git commit -m "Bump version to $version"
+echo "Updating lockfiles..."
+cargo update -p serc -p serc-cli
+uv lock --no-locked --default-index https://pypi.org/simple
+
+echo "Creating release branch..."
+git checkout -b "release/$version"
+# The first release creates the changelog rather than updating an existing file.
+git add CHANGELOG.md
+git commit -am "Bump version to $version"

@@ -15,6 +15,28 @@ UPDATE = runpy.run_path(str(ROOT / "scripts/update-release-version.py"))
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_rewrite_latest_changelog_section(self):
+        script = ROOT / "scripts/update-latest-changelog-section.py"
+        for history in ("", "\n## 0.1.0\n\nOlder release.\n"):
+            with (
+                self.subTest(history=history),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                changelog = root / "CHANGELOG.md"
+                candidate = root / "candidate.md"
+                changelog.write_text(
+                    "# Changelog\n\n## 0.2.0\n\nGenerated.\n" + history
+                )
+                candidate.write_text("## 0.2.0\n\nRewritten.\n")
+                subprocess.run(
+                    [sys.executable, script, changelog, candidate], check=True
+                )
+                self.assertEqual(
+                    changelog.read_text(),
+                    "# Changelog\n\n## 0.2.0\n\nRewritten.\n" + history,
+                )
+
     def test_version_update_keeps_python_library_and_cli_in_sync(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
