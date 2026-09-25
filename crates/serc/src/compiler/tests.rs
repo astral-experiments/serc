@@ -356,20 +356,20 @@ fn opcode_locations_preserve_multiline_attribute_and_call_ranges() {
     );
 }
 
+fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
+    let mut byte = table[*index];
+    *index += 1;
+    let mut value = u32::from(byte & 0x3f);
+    while byte & 0x40 != 0 {
+        byte = table[*index];
+        *index += 1;
+        value = (value << 6) | u32::from(byte & 0x3f);
+    }
+    value
+}
+
 #[test]
 fn generator_call_condition_owners_preserve_original_while_blocks() {
-    fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
-        let mut byte = table[*index];
-        *index += 1;
-        let mut value = u32::from(byte & 0x3f);
-        while byte & 0x40 != 0 {
-            byte = table[*index];
-            *index += 1;
-            value = (value << 6) | u32::from(byte & 0x3f);
-        }
-        value
-    }
-
     let source = r#"def debug_callable_control():
     while (__debug__)():
         yield 1
@@ -1874,18 +1874,6 @@ fn source_positions_preserve_crlf_boundaries_and_eof() {
 
 #[test]
 fn coroutine_handler_finally_pop_blocks_match_cpython_owners() {
-    fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
-        let mut byte = table[*index];
-        *index += 1;
-        let mut value = u32::from(byte & 0x3f);
-        while byte & 0x40 != 0 {
-            byte = table[*index];
-            *index += 1;
-            value = (value << 6) | u32::from(byte & 0x3f);
-        }
-        value
-    }
-
     let source = r"async def fresh():
     try:
         await source
@@ -1946,18 +1934,6 @@ async def owned(self):
 
 #[test]
 fn coroutine_boolean_value_markers_follow_current_cfg_slot_history() {
-    fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
-        let mut byte = table[*index];
-        *index += 1;
-        let mut value = u32::from(byte & 0x3f);
-        while byte & 0x40 != 0 {
-            byte = table[*index];
-            *index += 1;
-            value = (value << 6) | u32::from(byte & 0x3f);
-        }
-        value
-    }
-
     let source = r#"async def later_value_marker(func, instance, args, kwargs):
     tool_call = get_argument_value(args, kwargs, 0, "tool_call", True)
     tool_name = getattr(tool_call, "tool_name", None) or "Pydantic Tool"
@@ -2055,18 +2031,6 @@ async def iterator_keyword_gap(items, fallback, run):
 
 #[test]
 fn async_with_terminal_condition_markers_respect_direct_body_and_argument_boundaries() {
-    fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
-        let mut byte = table[*index];
-        *index += 1;
-        let mut value = u32::from(byte & 0x3f);
-        while byte & 0x40 != 0 {
-            byte = table[*index];
-            *index += 1;
-            value = (value << 6) | u32::from(byte & 0x3f);
-        }
-        value
-    }
-
     let source = r"async def hazardous_method_ifexp_arg(manager, state, value, fallback):
     async with manager:
         if state.first:
@@ -2231,18 +2195,6 @@ async def nested_manager_inner_single(outer, inner, state, value):
 
 #[test]
 fn multiline_comprehension_filter_markers_respect_owner_boundaries() {
-    fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
-        let mut byte = table[*index];
-        *index += 1;
-        let mut value = u32::from(byte & 0x3f);
-        while byte & 0x40 != 0 {
-            byte = table[*index];
-            *index += 1;
-            value = (value << 6) | u32::from(byte & 0x3f);
-        }
-        value
-    }
-
     let source = r"def multiline_set(values, suffix):
     return {
         item
@@ -2503,18 +2455,6 @@ fn coroutine_iterator_assignment_conditions_respect_prefix_and_tail_boundaries()
 
 #[test]
 fn coroutine_iterator_condition_markers_respect_region_and_scope_boundaries() {
-    fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
-        let mut byte = table[*index];
-        *index += 1;
-        let mut value = u32::from(byte & 0x3f);
-        while byte & 0x40 != 0 {
-            byte = table[*index];
-            *index += 1;
-            value = (value << 6) | u32::from(byte & 0x3f);
-        }
-        value
-    }
-
     let source = r"async def protected_loop(values, get_state, use):
     try:
         for item in values:
@@ -2636,18 +2576,6 @@ async def async_generator_control(values, get_state, use):
 
 #[test]
 fn chained_generator_filters_keep_their_first_comparison_marker_owned() {
-    fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
-        let mut byte = table[*index];
-        *index += 1;
-        let mut value = u32::from(byte & 0x3f);
-        while byte & 0x40 != 0 {
-            byte = table[*index];
-            *index += 1;
-            value = (value << 6) | u32::from(byte & 0x3f);
-        }
-        value
-    }
-
     let source = r"def integer_filter(items):
     return (item for item in items if not (0 < item < 10))
 
@@ -2965,18 +2893,6 @@ def nested_finally_break(manager, active, stop):
 
 #[test]
 fn comparison_markers_distinguish_forward_and_threaded_loop_fallthroughs() {
-    fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
-        let mut byte = table[*index];
-        *index += 1;
-        let mut value = u32::from(byte & 0x3f);
-        while byte & 0x40 != 0 {
-            byte = table[*index];
-            *index += 1;
-            value = (value << 6) | u32::from(byte & 0x3f);
-        }
-        value
-    }
-
     let source = r"def f(container1, container2):
     a_idx, b_idx = 0, 0
     max_a, max_b = len(container1), len(container2)
