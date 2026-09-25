@@ -11,6 +11,240 @@ fn comprehension(kind: &str, element: &str, target: &str) -> String {
 }
 
 #[test]
+fn nested_generator_reference_resolves_global_after_first_iterable() {
+    let source = r"x = 'global'
+def outer():
+    def f():
+        return (x for y in [x for x in [1]])
+    return next(f())
+print(outer())
+";
+    common::assert_executes(source, "global\n");
+    common::assert_matches_cpython_marshal(source, "nested_generator_global.py");
+}
+
+#[test]
+fn nested_generator_temporary_preserves_enclosing_binding_rules() {
+    let cases = [
+        (
+            r"x = 'global'
+def outer():
+    x = 'outer'
+    def f():
+        return (x for y in [x for x in [1]])
+    return next(f())
+try:
+    print(outer())
+except NameError:
+    print('unbound')
+",
+            "unbound\n",
+        ),
+        (
+            r"x = 'global'
+def outer():
+    x: int
+    def f():
+        return (x for y in [x for x in [1]])
+    return next(f())
+try:
+    print(outer())
+except NameError:
+    print('unbound')
+",
+            "unbound\n",
+        ),
+        (
+            r"x = 'global'
+def outer():
+    [(x := i) for i in [1]]
+    def f():
+        return (x for y in [x for x in [1]])
+    return next(f())
+try:
+    print(outer())
+except NameError:
+    print('unbound')
+",
+            "unbound\n",
+        ),
+        (
+            r"x = 'global'
+def outer():
+    x = 'outer'
+    def middle():
+        nonlocal x
+        def f():
+            return (x for y in [x for x in [1]])
+        return next(f())
+    return middle()
+try:
+    print(outer())
+except NameError:
+    print('unbound')
+",
+            "unbound\n",
+        ),
+        (
+            r"x = 'global'
+def outer():
+    x = 'outer'
+    def middle():
+        global x
+        def f():
+            return (x for y in [x for x in [1]])
+        return next(f())
+    return middle()
+print(outer())
+",
+            "global\n",
+        ),
+        (
+            r"x = 'global'
+def outer():
+    [x for x in [2]]
+    def f():
+        return (x for y in [x for x in [1]])
+    return next(f())
+print(outer())
+",
+            "global\n",
+        ),
+        (
+            r"x = 'global'
+def outer():
+    def f():
+        return (x for y in [(lambda: x) for x in [1]])
+    return next(f())
+print(outer())
+",
+            "global\n",
+        ),
+        (
+            r"x = 'global'
+z = 'also global'
+def outer():
+    def f():
+        first = 0
+        return ((x, z, first) for y in [(x, z) for x, z in [(1, 2)]])
+    return next(f())
+print(outer())
+",
+            "('global', 'also global', 0)\n",
+        ),
+        (
+            r"x = 'global'
+def outer():
+    x = 'outer'
+    class C:
+        global x
+        def f(self):
+            return (x for y in [x for x in [1]])
+    return next(C().f())
+try:
+    print(outer())
+except NameError:
+    print('unbound')
+",
+            "unbound\n",
+        ),
+        (
+            r"_C__x = 'global'
+class C:
+    def outer(self):
+        def f():
+            return (__x for y in [__x for __x in [1]])
+        return next(f())
+print(C().outer())
+",
+            "global\n",
+        ),
+        (
+            r"_C__x = 'global'
+class C:
+    def outer(self):
+        def f():
+            return (__x for y in [_C__x for __x in [1]])
+        return next(f())
+print(C().outer())
+",
+            "global\n",
+        ),
+    ];
+    for (source, expected) in cases {
+        common::assert_executes(source, expected);
+        common::assert_matches_cpython_marshal(source, "nested_generator_scope.py");
+    }
+}
+
+#[test]
+fn nested_generator_global_matches_other_cpython_targets() {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    use serc::{CompileOptions, PythonVersion, compile_with_options};
+
+    let oracle = r"
+import importlib.util, marshal, sys
+assert sys.implementation.name == 'cpython'
+assert sys.version.split()[0] == sys.argv[1]
+assert importlib.util.MAGIC_NUMBER.hex() == sys.argv[2]
+code = compile(sys.stdin.read(), sys.argv[3], 'exec', dont_inherit=True, optimize=0)
+sys.stdout.buffer.write(marshal.dumps(code))
+";
+    let filename = "nested_generator_scope.py";
+    for (version, variable, default) in [
+        (PythonVersion::Py312, "SERC_TEST_PYTHON_312", "python3.12"),
+        (PythonVersion::Py313, "SERC_TEST_PYTHON_313", "python3.13"),
+        (PythonVersion::Py315, "SERC_TEST_PYTHON_315", "python3.15"),
+    ] {
+        let python = std::env::var_os(variable).unwrap_or_else(|| default.into());
+        let target = version.target();
+        let options = CompileOptions {
+            python_version: version,
+            ..CompileOptions::default()
+        };
+        for source in [
+            "def outer():\n    def f():\n        return (x for y in [x for x in [1]])\n",
+            "def outer():\n    x = 1\n    def f():\n        return (x for y in [x for x in [1]])\n",
+            "def outer():\n    def f():\n        return (x for y in [(lambda: x) for x in [1]])\n",
+        ] {
+            let mut child = Command::new(&python)
+                .args(["-I", "-S", "-X", "utf8", "-c", oracle])
+                .args([
+                    target.tag.strip_prefix('v').unwrap(),
+                    &target.magic_hex(),
+                    filename,
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(source.as_bytes())
+                .unwrap();
+            let expected = child.wait_with_output().unwrap();
+            assert!(
+                expected.status.success(),
+                "{version}: {}",
+                String::from_utf8_lossy(&expected.stderr)
+            );
+            assert_eq!(
+                compile_with_options(source, filename, &options)
+                    .unwrap()
+                    .marshal(),
+                expected.stdout,
+                "{version}: {source}"
+            );
+        }
+    }
+}
+
+#[test]
 fn matches_cpython_external_closures_in_comprehension_assignment_targets() {
     let source = r#"
 def collections(key, values):
