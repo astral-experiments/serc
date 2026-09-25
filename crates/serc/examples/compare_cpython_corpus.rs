@@ -110,6 +110,13 @@ struct Outcome {
     kind: OutcomeKind,
     detail: String,
     oracle_rejected: bool,
+    mismatch_bytes: Option<MismatchBytes>,
+}
+
+#[derive(Debug)]
+struct MismatchBytes {
+    ours: Vec<u8>,
+    oracle: Vec<u8>,
 }
 
 enum CompilerInput {
@@ -399,31 +406,62 @@ fn main() -> ExitCode {
         }
     };
 
+    // Stage mismatches in the destination filesystem so that the original
+    // bytes do not all have to remain in memory until reporting finishes.
+    let dump_stage = match options.dump_mismatches.as_deref() {
+        Some(directory) => {
+            match fs_err::create_dir_all(directory).and_then(|()| tempfile::tempdir_in(directory)) {
+                Ok(stage) => Some(stage),
+                Err(error) => {
+                    eprintln!("failed to prepare mismatch dumps: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        None => None,
+    };
+
     let started = Instant::now();
-    let outcomes: Vec<_> = pool.install(|| {
+    let outcomes: Result<Vec<_>, std::io::Error> = pool.install(|| {
         paths
             .par_iter()
             .enumerate()
             .map(|(index, path)| {
                 if let Some(reader) = &reader {
-                    return reader.compare(index, path, &compile_options, caller_model.as_ref());
+                    return Ok(reader.compare(
+                        index,
+                        path,
+                        &compile_options,
+                        caller_model.as_ref(),
+                    ));
                 }
                 let mut observation = cache.as_ref().map(|writer| writer.begin(index, path));
-                let outcome = compare(
+                let mut outcome = compare(
                     path,
                     &options.python,
                     options.source_bytes,
                     &compile_options,
                     caller_model.as_ref(),
                     observation.as_mut(),
+                    options.dump_mismatches.is_some(),
                 );
                 if let Some(observation) = observation {
                     observation.finish(&outcome);
                 }
-                outcome
+                if let Some(stage) = &dump_stage {
+                    stage_mismatch(&mut outcome, stage.path(), index)?;
+                }
+                Ok(outcome)
             })
             .collect()
     });
+    let outcomes = match outcomes {
+        Ok(outcomes) => outcomes,
+        Err(error) => {
+            eprintln!("failed to stage mismatch dumps: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let mut counts = BTreeMap::<OutcomeKind, usize>::new();
     for outcome in &outcomes {
@@ -483,16 +521,8 @@ fn main() -> ExitCode {
     }
 
     if let Some(directory) = &options.dump_mismatches {
-        if let Err(error) = pool.install(|| {
-            dump_mismatches(
-                &outcomes,
-                &options.python,
-                directory,
-                options.source_bytes,
-                &compile_options,
-                caller_model.as_ref(),
-            )
-        }) {
+        let stage = dump_stage.as_ref().expect("dump stage initialized");
+        if let Err(error) = pool.install(|| dump_mismatches(&outcomes, stage.path(), directory)) {
             eprintln!("failed to dump mismatches: {error}");
             return ExitCode::FAILURE;
         }
@@ -699,40 +729,42 @@ fn parse_expected_outcome(value: &str) -> Result<(OutcomeKind, usize), String> {
     Ok((kind, count))
 }
 
+fn stage_mismatch(outcome: &mut Outcome, stage: &Path, index: usize) -> Result<(), std::io::Error> {
+    if outcome.kind != OutcomeKind::ByteMismatch {
+        return Ok(());
+    }
+    let bytes = outcome
+        .mismatch_bytes
+        .take()
+        .ok_or_else(|| std::io::Error::other("original mismatch bytes were not retained"))?;
+    fs_err::write(stage.join(format!("{index}.ours")), bytes.ours)?;
+    fs_err::write(stage.join(format!("{index}.cpython")), bytes.oracle)
+}
+
 fn dump_mismatches(
     outcomes: &[Outcome],
-    python: &str,
+    stage: &Path,
     directory: &Path,
-    source_bytes: bool,
-    options: &CompileOptions,
-    caller_model: Option<&caller_intern_model::LoadedModel>,
 ) -> Result<(), std::io::Error> {
-    fs_err::create_dir_all(directory)?;
     outcomes
         .iter()
-        .filter(|outcome| outcome.kind == OutcomeKind::ByteMismatch)
+        .enumerate()
+        .filter(|(_, outcome)| outcome.kind == OutcomeKind::ByteMismatch)
         .collect::<Vec<_>>()
         .into_par_iter()
         .enumerate()
-        .map(|(index, outcome)| {
-            let source = if source_bytes {
-                CompilerInput::Bytes(fs_err::read(&outcome.path)?)
-            } else {
-                CompilerInput::Text(read_utf8_file(&outcome.path)?)
-            };
+        .map(|(index, (source_index, outcome))| {
             let filename = outcome.path.to_string_lossy();
-            let ours = compile_module_input(&source, &filename, options, caller_model)
-                .expect("a mismatch compiled successfully in the first pass")
-                .marshal();
-            let oracle = Command::new(python)
-                .args(["-I", "-S", "-c", ORACLE])
-                .arg(&outcome.path)
-                .output()?
-                .stdout;
             let stem = format!("{index:04}");
             fs_err::write(directory.join(format!("{stem}.path")), filename.as_bytes())?;
-            fs_err::write(directory.join(format!("{stem}.ours.marshal")), ours)?;
-            fs_err::write(directory.join(format!("{stem}.cpython.marshal")), oracle)
+            fs_err::rename(
+                stage.join(format!("{source_index}.ours")),
+                directory.join(format!("{stem}.ours.marshal")),
+            )?;
+            fs_err::rename(
+                stage.join(format!("{source_index}.cpython")),
+                directory.join(format!("{stem}.cpython.marshal")),
+            )
         })
         .collect::<Vec<Result<(), std::io::Error>>>()
         .into_iter()
@@ -776,6 +808,7 @@ fn compare(
     options: &CompileOptions,
     caller_model: Option<&caller_intern_model::LoadedModel>,
     mut observation: Option<&mut native_output_cache::Observation<'_>>,
+    retain_mismatch_bytes: bool,
 ) -> Outcome {
     let output = Command::new(python)
         .args(["-I", "-S", "-c", ORACLE])
@@ -799,6 +832,7 @@ fn compare(
                     one_line(&output.stderr)
                 ),
                 oracle_rejected: false,
+                mismatch_bytes: None,
             };
         }
         Err(error) => {
@@ -807,6 +841,7 @@ fn compare(
                 kind: OutcomeKind::OracleFailure,
                 detail: error.to_string(),
                 oracle_rejected: false,
+                mismatch_bytes: None,
             };
         }
     };
@@ -829,6 +864,7 @@ fn compare(
                 },
                 detail: error.to_string(),
                 oracle_rejected,
+                mismatch_bytes: None,
             };
         }
     };
@@ -839,7 +875,7 @@ fn compare(
         observation.compiled(&source, &compiled);
     }
 
-    classify(path, oracle, compiled)
+    classify_with_mismatch_bytes(path, oracle, compiled, retain_mismatch_bytes)
 }
 
 /// Consume an optional file encoding signature before passing decoded text to the compiler.
@@ -912,7 +948,17 @@ fn capture_compiler(compile: impl FnOnce() -> Result<Vec<u8>, CompileError>) -> 
 }
 
 fn classify(path: &Path, oracle: OracleOutcome, compiled: CompilerOutcome) -> Outcome {
+    classify_with_mismatch_bytes(path, oracle, compiled, false)
+}
+
+fn classify_with_mismatch_bytes(
+    path: &Path,
+    oracle: OracleOutcome,
+    compiled: CompilerOutcome,
+    retain_mismatch_bytes: bool,
+) -> Outcome {
     let oracle_rejected = matches!(&oracle, OracleOutcome::Rejected(_));
+    let mut mismatch_bytes = None;
     let (kind, detail) = match (oracle, compiled) {
         (OracleOutcome::Compiled(oracle), CompilerOutcome::Compiled(ours)) => {
             if ours == oracle {
@@ -925,14 +971,15 @@ fn classify(path: &Path, oracle: OracleOutcome, compiled: CompilerOutcome) -> Ou
                     .unwrap_or_else(|| ours.len().min(oracle.len()));
                 let ours_byte = ours.get(first_difference).copied();
                 let oracle_byte = oracle.get(first_difference).copied();
-                (
-                    OutcomeKind::ByteMismatch,
-                    format!(
-                        "first difference at byte {first_difference} ({ours_byte:?} != {oracle_byte:?}); ours={} bytes, CPython={} bytes",
-                        ours.len(),
-                        oracle.len()
-                    ),
-                )
+                let detail = format!(
+                    "first difference at byte {first_difference} ({ours_byte:?} != {oracle_byte:?}); ours={} bytes, CPython={} bytes",
+                    ours.len(),
+                    oracle.len()
+                );
+                if retain_mismatch_bytes {
+                    mismatch_bytes = Some(MismatchBytes { ours, oracle });
+                }
+                (OutcomeKind::ByteMismatch, detail)
             }
         }
         (OracleOutcome::Compiled(_), CompilerOutcome::Unsupported(detail)) => {
@@ -969,6 +1016,7 @@ fn classify(path: &Path, oracle: OracleOutcome, compiled: CompilerOutcome) -> Ou
         kind,
         detail,
         oracle_rejected,
+        mismatch_bytes,
     }
 }
 
@@ -1248,48 +1296,124 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn mismatch_dumps_reuse_the_explicit_state_for_both_input_modes() {
+    fn mismatch_dumps_preserve_the_original_comparison_for_both_input_modes() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().unwrap();
         let oracle = directory.path().join("oracle");
-        fs::write(&oracle, "#!/bin/sh\nprintf 'oracle bytes'\n").unwrap();
-        fs::set_permissions(&oracle, fs::Permissions::from_mode(0o700)).unwrap();
         let path = directory.path().join("source.py");
+        let second_path = directory.path().join("second.py");
         let source = "f = lambda x: x in {'profile_specific_identifier', 'z'}\nx in {'profile_specific_identifier', 'z'}\n";
-        fs::write(&path, source).unwrap();
         let state = serc::InitialInternState::new(["profile_specific_identifier"]);
         let expected = serc::compile_with_intern_state(source, path.to_str().unwrap(), &state)
             .unwrap()
             .marshal();
-        let outcomes = [super::Outcome {
-            path,
-            kind: OutcomeKind::ByteMismatch,
-            detail: String::new(),
-            oracle_rejected: false,
-        }];
+        let second_expected =
+            serc::compile_with_intern_state(source, second_path.to_str().unwrap(), &state)
+                .unwrap()
+                .marshal();
         for source_bytes in [false, true] {
+            fs::write(&path, source).unwrap();
+            fs::write(&second_path, source).unwrap();
+            fs::write(&oracle, "#!/bin/sh\nprintf 'oracle bytes'\n").unwrap();
+            fs::set_permissions(&oracle, fs::Permissions::from_mode(0o700)).unwrap();
+            let options = CompileOptions {
+                initial_intern_state: state.clone(),
+                ..CompileOptions::default()
+            };
+            let without_dump = super::compare(
+                &path,
+                oracle.to_str().unwrap(),
+                source_bytes,
+                &options,
+                None,
+                None,
+                false,
+            );
+            assert_eq!(without_dump.kind, OutcomeKind::ByteMismatch);
+            assert!(without_dump.mismatch_bytes.is_none());
+            let mut outcome = super::compare(
+                &path,
+                oracle.to_str().unwrap(),
+                source_bytes,
+                &options,
+                None,
+                None,
+                true,
+            );
+            assert_eq!(outcome.kind, OutcomeKind::ByteMismatch);
+            fs::write(&oracle, "#!/bin/sh\nprintf 'other oracle bytes'\n").unwrap();
+            let mut second_outcome = super::compare(
+                &second_path,
+                oracle.to_str().unwrap(),
+                source_bytes,
+                &options,
+                None,
+                None,
+                true,
+            );
+            assert_eq!(second_outcome.kind, OutcomeKind::ByteMismatch);
+
             let dump = directory
                 .path()
                 .join(if source_bytes { "bytes" } else { "text" });
-            super::dump_mismatches(
-                &outcomes,
-                oracle.to_str().unwrap(),
-                &dump,
-                source_bytes,
-                &CompileOptions {
-                    initial_intern_state: state.clone(),
-                    ..CompileOptions::default()
-                },
-                None,
-            )
-            .unwrap();
+            fs::create_dir_all(&dump).unwrap();
+            let stage = tempfile::tempdir_in(&dump).unwrap();
+            super::stage_mismatch(&mut outcome, stage.path(), 0).unwrap();
+            super::stage_mismatch(&mut second_outcome, stage.path(), 2).unwrap();
+            assert!(outcome.mismatch_bytes.is_none());
+            assert!(second_outcome.mismatch_bytes.is_none());
+
+            // Neither the source nor a subsequent oracle invocation may replace
+            // the bytes that produced the reported mismatch.
+            fs::write(&path, "changed = True\n").unwrap();
+            fs::write(&second_path, "changed = True\n").unwrap();
+            fs::write(&oracle, "#!/bin/sh\nexit 1\n").unwrap();
+            let exact = super::Outcome {
+                path: path.clone(),
+                kind: OutcomeKind::Exact,
+                detail: String::new(),
+                oracle_rejected: false,
+                mismatch_bytes: None,
+            };
+            super::dump_mismatches(&[outcome, exact, second_outcome], stage.path(), &dump).unwrap();
             assert_eq!(fs::read(dump.join("0000.ours.marshal")).unwrap(), expected);
             assert_eq!(
                 fs::read(dump.join("0000.cpython.marshal")).unwrap(),
                 b"oracle bytes"
             );
+            assert_eq!(
+                fs::read(dump.join("0001.ours.marshal")).unwrap(),
+                second_expected
+            );
+            assert_eq!(
+                fs::read(dump.join("0001.cpython.marshal")).unwrap(),
+                b"other oracle bytes"
+            );
+            assert_eq!(
+                fs::read_to_string(dump.join("0000.path")).unwrap(),
+                path.to_string_lossy()
+            );
+            assert_eq!(
+                fs::read_to_string(dump.join("0001.path")).unwrap(),
+                second_path.to_string_lossy()
+            );
         }
+    }
+
+    #[test]
+    fn mismatch_staging_reports_io_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let not_a_directory = directory.path().join("file");
+        fs::write(&not_a_directory, b"not a directory").unwrap();
+        let mut outcome = super::classify_with_mismatch_bytes(
+            Path::new("source.py"),
+            super::OracleOutcome::Compiled(b"oracle".to_vec()),
+            super::CompilerOutcome::Compiled(b"serc".to_vec()),
+            true,
+        );
+        assert_eq!(outcome.kind, OutcomeKind::ByteMismatch);
+        assert!(super::stage_mismatch(&mut outcome, &not_a_directory, 0).is_err());
     }
 
     #[test]
