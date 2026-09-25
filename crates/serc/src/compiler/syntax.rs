@@ -594,6 +594,70 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
         }
     }
 
+    fn python_312_class_alias_lambda(&self, alias: &ast::StmtTypeAlias) -> Option<TextRange> {
+        #[derive(Default)]
+        struct FirstRestriction(Option<Result<TextRange, ()>>);
+
+        impl<'ast> Visitor<'ast> for FirstRestriction {
+            fn visit_expr(&mut self, expression: &'ast Expr) {
+                if self.0.is_some() {
+                    return;
+                }
+                match expression {
+                    Expr::Lambda(_) => self.0 = Some(Ok(expression.range())),
+                    // These restrictions take precedence when symbol analysis reaches them first.
+                    Expr::Named(_)
+                    | Expr::Yield(_)
+                    | Expr::YieldFrom(_)
+                    | Expr::Await(_)
+                    | Expr::ListComp(_)
+                    | Expr::SetComp(_)
+                    | Expr::DictComp(_)
+                    | Expr::Generator(_) => self.0 = Some(Err(())),
+                    Expr::Dict(dict) => {
+                        // CPython visits every key before any value during symbol analysis.
+                        for item in &dict.items {
+                            if let Some(key) = &item.key {
+                                self.visit_expr(key);
+                            }
+                        }
+                        for item in &dict.items {
+                            self.visit_expr(&item.value);
+                        }
+                    }
+                    _ => walk_expr(self, expression),
+                }
+            }
+        }
+
+        if matches!(alias.name.as_ref(), Expr::Name(name) if name.id.as_str() == "__debug__") {
+            return None;
+        }
+        let mut first = FirstRestriction::default();
+        if let Some(parameters) = alias.type_params.as_deref() {
+            let mut names = FxHashSet::default();
+            for parameter in parameters {
+                let name = parameter.name().as_str();
+                if name == "__debug__"
+                    || name == "__classdict__"
+                    || !names.insert(mangle_name(name, self.private_name).into_owned())
+                {
+                    return first.0.and_then(Result::ok);
+                }
+                if let ast::TypeParam::TypeVar(parameter) = parameter
+                    && let Some(bound) = parameter.bound.as_deref()
+                {
+                    first.visit_expr(bound);
+                }
+                if let Some(default) = parameter.default() {
+                    first.visit_expr(default);
+                }
+            }
+        }
+        first.visit_expr(&alias.value);
+        first.0.and_then(Result::ok)
+    }
+
     fn with_checker(&mut self, visit: impl FnOnce(&mut SemanticSyntaxChecker, &Self)) {
         let mut checker = std::mem::take(&mut self.checker);
         visit(&mut checker, self);
@@ -847,6 +911,17 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                 }
                 self.pending_pattern = Some(pending);
             }
+        }
+        if self.python_version == ast::PythonVersion::PY312
+            && matches!(self.scope().kind, ScopeKind::Class)
+            && let Stmt::TypeAlias(alias) = statement
+            && let Some(range) = self.python_312_class_alias_lambda(alias)
+        {
+            *self.error.borrow_mut() = Some(CompileError::invalid_syntax(
+                "Cannot use lambda in annotation scope within class scope",
+                range,
+            ));
+            return;
         }
         // Relative imports of a module named __future__ are ordinary imports. The shared
         // checker identifies directives by their module spelling, so hide that spelling here.

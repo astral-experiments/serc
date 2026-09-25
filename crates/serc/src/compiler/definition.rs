@@ -169,6 +169,7 @@ impl Compiler<'_> {
             let classdict = self.required_name_id("__classdict__");
             self.insert_lexical_name(&mut freevars, classdict);
         }
+        freevars.sort_unstable_by_key(|name| self.mangled_name(self.resolve_name(*name)));
         let plan = LoweringFunctionPlan {
             locals,
             cellvars,
@@ -1505,6 +1506,7 @@ impl Compiler<'_> {
             let classdict = self.required_name_id("__classdict__");
             self.insert_lexical_name(&mut freevars, classdict);
         }
+        freevars.sort_unstable_by_key(|name| self.mangled_name(self.resolve_name(*name)));
         let freevar_set: FxHashSet<_> = freevars.iter().copied().collect();
         let globals = references
             .references
