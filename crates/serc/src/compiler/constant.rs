@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::borrow::{Borrow, Cow};
 use std::collections::hash_map::Entry;
 use std::hash::{Hash, Hasher};
 
@@ -310,16 +310,7 @@ impl crate::assembler::ConstantTable for OutputState {
     fn fold_sequence(&mut self, values: Vec<Constant>, is_set: bool) -> Result<u32, CompileError> {
         let result = if is_set {
             self.has_frozenset_constants = true;
-            let mut unique = Vec::with_capacity(values.len());
-            for constant in &values {
-                if !unique
-                    .iter()
-                    .any(|existing| python_constant_values_equal(existing, constant))
-                {
-                    unique.push(constant.clone());
-                }
-            }
-            Constant::FrozenSet(unique)
+            Constant::FrozenSet(unique_frozenset_constants(&values, Constant::clone))
         } else {
             Constant::Tuple(values.clone())
         };
@@ -1521,6 +1512,24 @@ enum NumericReal {
 
 pub(super) fn python_constant_values_equal(left: &Constant, right: &Constant) -> bool {
     ConstantEquality::PythonValue.equal(left, right)
+}
+
+/// Preserve the first representative of each Python-equal frozenset member.
+pub(super) fn unique_frozenset_constants<T: Borrow<Constant>>(
+    constants: impl IntoIterator<Item = T>,
+    into_constant: impl Fn(T) -> Constant,
+) -> Vec<Constant> {
+    let constants = constants.into_iter();
+    let mut unique = Vec::with_capacity(constants.size_hint().0);
+    for constant in constants {
+        if !unique
+            .iter()
+            .any(|existing| python_constant_values_equal(existing, constant.borrow()))
+        {
+            unique.push(into_constant(constant));
+        }
+    }
+    unique
 }
 
 fn numeric_parts(value: &Constant) -> Option<(NumericReal, f64)> {
@@ -3630,16 +3639,10 @@ fn first_constant(
                 .map(|element| self.compiler.source_aware_fold_constant(element))
                 .collect::<Option<Vec<_>>>()?;
             if is_set {
-                let mut unique = Vec::with_capacity(constants.len());
-                for constant in constants {
-                    if !unique
-                        .iter()
-                        .any(|existing| python_constant_values_equal(existing, &constant))
-                    {
-                        unique.push(constant);
-                    }
-                }
-                Some(Constant::FrozenSet(unique))
+                Some(Constant::FrozenSet(unique_frozenset_constants(
+                    constants,
+                    std::convert::identity,
+                )))
             } else {
                 Some(Constant::Tuple(constants))
             }
