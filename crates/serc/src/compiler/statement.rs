@@ -28768,9 +28768,42 @@ impl<'source> Compiler<'source> {
                 // The manager POP_BLOCK remains a separate ownerless record; actual
                 // copying and threading determine any later replacement's owner.
                 if self.context.python_version >= crate::PythonVersion::Py314 {
+                    // A chained guard in a generator or coroutine reaches the inner manager's
+                    // suppression join before the enclosing manager is popped. Its
+                    // threaded jumps keep the enclosing manager as their owner.
+                    let suspended_chained_manager_exit = preserve_exit_nop
+                        && capture_manager_pop
+                        && matches!(
+                            self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
+                            CO_GENERATOR | CO_COROUTINE
+                        )
+                        && self.control.exceptions.active_exception_handlers.is_empty()
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .is_empty()
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && !statement.is_star
+                        && statement.handlers.is_empty()
+                        && statement.orelse.is_empty()
+                        && self.control.withs.active_with_exits.len() == 1
+                        && self.control.loops.contexts.is_empty()
+                        && matches!(conditional_exit, Some(NestedIfExitLocation::Located(_)))
+                        && finalizer_tail_count == 0
+                        && matches!(statement.finalbody.as_slice(), [Stmt::If(tail)]
+                            if tail.elif_else_clauses.is_empty()
+                                && matches!(tail.test.as_ref(), Expr::Compare(compare) if compare.ops.len() > 1)
+                                && matches!(tail.body.as_slice(), [Stmt::With(manager)]
+                                    if !manager.is_async
+                                        && manager.items.len() == 1
+                                        && suite_has_linear_borrow_fallthrough(&manager.body)));
                     if !original_sync_conditional_manager_jump
                         && !original_async_generator_conditional_manager_jump
                         && !original_nested_raising_manager_jump
+                        && !suspended_chained_manager_exit
                     {
                         for exclusions in &mut self.control.withs.active_with_region_exclusions {
                             exclusions.push((exit_exclusion_start, exit_exclusion_end));

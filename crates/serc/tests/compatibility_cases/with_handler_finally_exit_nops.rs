@@ -143,3 +143,32 @@ fn matches_cpython_nested_manager_in_async_generator_finally() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_suspended_chained_guarded_manager_finally() {
+    for (scope, suspension) in [
+        ("def", ""),
+        ("def", "    yield value\n"),
+        ("async def", ""),
+        ("async def", "    await before()\n"),
+    ] {
+        for condition in ["first < second < third", "first < second"] {
+            for work in ["log()", "work()\nlog()"] {
+                for after in ["", "    finish()\n"] {
+                    for outer in [true, false] {
+                        let indent = if outer { "        " } else { "    " };
+                        let manager = if outer { "    with context():\n" } else { "" };
+                        let work = work.replace('\n', &format!("\n{indent}            "));
+                        let source = format!(
+                            "{scope} f():\n{suspension}{manager}{indent}try:\n{indent}    action()\n{indent}finally:\n{indent}    if {condition}:\n{indent}        with suppress(Exception):\n{indent}            {work}\n{after}"
+                        );
+                        common::assert_matches_cpython_marshal(
+                            &source,
+                            "generator_chained_guarded_manager.py",
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
