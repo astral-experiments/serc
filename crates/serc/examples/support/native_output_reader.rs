@@ -485,6 +485,7 @@ impl Reader {
                     kind: OutcomeKind::OracleFailure,
                     detail: format!("admitted native cache failed: {error}"),
                     oracle_rejected: false,
+                    mismatch_bytes: None,
                 }
             }
         }
