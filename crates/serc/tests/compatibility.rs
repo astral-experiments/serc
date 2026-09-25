@@ -18,6 +18,48 @@ mod tests {
     use serc_fixtures as fixtures;
 
     #[test]
+    fn exceptional_finally_break_copies_nested_handler_cleanup() {
+        let source = r#"
+def run(log):
+    for i in range(1):
+        try:
+            try:
+                raise RuntimeError("pending")
+            finally:
+                try:
+                    break
+                finally:
+                    try:
+                        raise KeyError("inner")
+                    except KeyError:
+                        log.append("handled")
+        except Exception as error:
+            log.append(("outer", type(error).__name__))
+    return log
+"#;
+        assert_matches_cpython_marshal(source, "nested_handler_finally_break.py");
+        let named = source.replace("except KeyError:", "except KeyError as error:");
+        assert_matches_cpython_marshal(&named, "named_handler_finally_break.py");
+        let traced = format!(
+            r#"{source}
+import sys
+events = []
+def trace(frame, event, arg):
+    if frame.f_code.co_name == "run":
+        frame.f_trace_opcodes = True
+        if event == "opcode":
+            events.append(frame.f_lasti)
+    return trace
+sys.settrace(trace)
+print(run([]))
+sys.settrace(None)
+print(len(events))
+"#
+        );
+        assert_executes(&traced, "['handled']\n37\n");
+    }
+
+    #[test]
     fn nested_constant_condition_matches_cpython_marshal() {
         for condition in [
             "False if d else False",
