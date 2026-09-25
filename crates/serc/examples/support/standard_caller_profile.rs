@@ -15,7 +15,22 @@ use super::initial_intern_profile::LoadedProfile;
 
 // Only independently reviewed complete source proofs may supply an absence rule.
 // A proof document cannot authorize itself by setting `closure_complete`.
-const REVIEWED_PROOFS: &[&str] = &[];
+const REVIEWED_PROOFS: &[ReviewedProof] = &[ReviewedProof {
+    sha256: "5a7e6ca0176ab8e07bae6bde1d54226439462b6e82493e110f4863ce2bbf45e0",
+    semantics: StateSemantics::GuaranteedRetainedPartial,
+}];
+
+struct ReviewedProof {
+    sha256: &'static str,
+    semantics: StateSemantics,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum StateSemantics {
+    GuaranteedRetainedPartial,
+    RetainedWithAbsence,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -60,6 +75,8 @@ struct Oracle {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct State {
+    semantics: StateSemantics,
+    positive_proof_complete: bool,
     retained_strings: Vec<String>,
     retained_runtime_paths: Vec<String>,
     possible_ascii_words: Vec<String>,
@@ -141,11 +158,15 @@ pub(super) fn load(
     oracle: &str,
 ) -> Result<LoadedProfile, String> {
     let proof_hash = digest(bytes);
-    require(
-        REVIEWED_PROOFS.contains(&proof_hash.as_str()),
-        "standard caller source proof has not been independently admitted",
-    )?;
+    let admission = REVIEWED_PROOFS
+        .iter()
+        .find(|entry| entry.sha256 == proof_hash)
+        .ok_or("standard caller source proof has not been independently admitted")?;
     let proof: SourceProof = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    require(
+        proof.state.semantics == admission.semantics,
+        "source proof semantics differ from independent admission",
+    )?;
     proof.validate(version, source_bytes, oracle)?;
     let directory = path
         .parent()
@@ -182,20 +203,36 @@ pub(super) fn load(
                     );
                 }
                 let retained_entries = retained.len();
-                let possible: BTreeSet<_> = proof.state.possible_ascii_words.into_iter().collect();
-                let possible_entries = possible.len();
-                let state = InitialInternState::from_partial_with_absence(
-                    retained,
-                    move |target, value| {
-                        target == version && ascii_word(value) && !possible.contains(value)
-                    },
-                );
+                let (state, description) = match proof.state.semantics {
+                    StateSemantics::GuaranteedRetainedPartial => (
+                        InitialInternState::from_partial(retained),
+                        format!(
+                            "{retained_entries} guaranteed retained entries; every unproved entry unknown"
+                        ),
+                    ),
+                    StateSemantics::RetainedWithAbsence => {
+                        let possible: BTreeSet<_> =
+                            proof.state.possible_ascii_words.into_iter().collect();
+                        let possible_entries = possible.len();
+                        (
+                            InitialInternState::from_partial_with_absence(
+                                retained,
+                                move |target, value| {
+                                    target == version
+                                        && ascii_word(value)
+                                        && !possible.contains(value)
+                                },
+                            ),
+                            format!(
+                                "{retained_entries} guaranteed retained entries; {possible_entries} possible ASCII words"
+                            ),
+                        )
+                    }
+                };
                 return Ok(LoadedProfile {
                     state,
                     snapshot_sha256: proof_hash,
-                    description: format!(
-                        "{retained_entries} guaranteed retained entries; {possible_entries} possible ASCII words"
-                    ),
+                    description,
                     qualified_oracle: Some(qualified),
                 });
             }
@@ -324,9 +361,19 @@ impl SourceProof {
             "standard caller proof requires Linux x86_64 with the GIL",
         )?;
         require(
-            self.state.closure_complete && self.coverage.unresolved.is_empty(),
-            "source proof has unresolved closure obligations",
+            self.state.positive_proof_complete,
+            "source proof has unproved retained-entry claims",
         )?;
+        match self.state.semantics {
+            StateSemantics::GuaranteedRetainedPartial => require(
+                !self.state.closure_complete,
+                "partial source proof must not declare complete absence coverage",
+            )?,
+            StateSemantics::RetainedWithAbsence => require(
+                self.state.closure_complete && self.coverage.unresolved.is_empty(),
+                "source proof has unresolved absence-closure obligations",
+            )?,
+        }
         require(
             !self.coverage.module_loads.is_empty()
                 && !self.coverage.retained_owners.is_empty()
