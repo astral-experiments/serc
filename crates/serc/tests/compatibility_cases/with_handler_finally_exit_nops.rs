@@ -172,3 +172,20 @@ fn matches_cpython_suspended_chained_guarded_manager_finally() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_async_generator_guarded_manager_owner() {
+    for condition in ["first or second", "first"] {
+        for inner in ["log()", "await log()"] {
+            for after in ["", "    finish()\n"] {
+                let source = format!(
+                    "async def f():\n    yield value\n    with context():\n        try:\n            action()\n        finally:\n            if {condition}:\n                with suppress(Exception):\n                    {inner}\n{after}"
+                );
+                common::assert_matches_cpython_marshal(
+                    &source,
+                    "async_generator_guarded_manager_owner.py",
+                );
+            }
+        }
+    }
+}

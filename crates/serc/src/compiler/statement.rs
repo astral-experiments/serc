@@ -28800,10 +28800,39 @@ impl<'source> Compiler<'source> {
                                     if !manager.is_async
                                         && manager.items.len() == 1
                                         && suite_has_linear_borrow_fallthrough(&manager.body)));
+                    // A located guard join in an async generator still precedes
+                    // the enclosing manager's POP_BLOCK. Threaded exits from the
+                    // nested manager retain that enclosing exception owner.
+                    let async_generator_guarded_manager_exit = preserve_exit_nop
+                        && capture_manager_pop
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_ASYNC_GENERATOR
+                        && self.control.exceptions.active_exception_handlers.is_empty()
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .is_empty()
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && !statement.is_star
+                        && statement.handlers.is_empty()
+                        && statement.orelse.is_empty()
+                        && self.control.withs.active_with_exits.len() == 1
+                        && self.control.loops.contexts.is_empty()
+                        && matches!(conditional_exit, Some(NestedIfExitLocation::Located(_)))
+                        && finalizer_tail_count == 0
+                        && matches!(statement.finalbody.as_slice(), [Stmt::If(tail)]
+                            if tail.elif_else_clauses.is_empty()
+                                && condition_has_only_runtime_tests(&tail.test)
+                                && matches!(tail.body.as_slice(), [Stmt::With(manager)]
+                                    if !manager.is_async && manager.items.len() == 1));
                     if !original_sync_conditional_manager_jump
                         && !original_async_generator_conditional_manager_jump
                         && !original_nested_raising_manager_jump
                         && !suspended_chained_manager_exit
+                        && !async_generator_guarded_manager_exit
                     {
                         for exclusions in &mut self.control.withs.active_with_region_exclusions {
                             exclusions.push((exit_exclusion_start, exit_exclusion_end));
