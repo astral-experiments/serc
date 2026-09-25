@@ -34,13 +34,15 @@ magic = importlib.util.MAGIC_NUMBER.hex()
 if (
     implementation != EXPECTED_IMPLEMENTATION
     or version != EXPECTED_VERSION
+    or sys.version_info[3:] != ("final", 0)
     or magic != EXPECTED_MAGIC
 ):
     print(
         f"ERROR\texpected {EXPECTED_IMPLEMENTATION} "
         f"{'.'.join(map(str, EXPECTED_VERSION))} "
         f"magic {EXPECTED_MAGIC}, "
-        f"got {implementation} {'.'.join(map(str, version))} magic {magic}",
+        f"got {implementation} {'.'.join(map(str, version))} "
+        f"{sys.version_info.releaselevel} {sys.version_info.serial} magic {magic}",
         flush=True,
     )
     raise SystemExit(2)
@@ -1460,6 +1462,27 @@ mod tests {
         discover, expected_row_count, parse_sample_response, process_timer_result,
         profile_from_executable, ratio_statistics, summarize, verify_exact_marshal, write_raw,
     };
+
+    #[test]
+    fn python_helper_rejects_prerelease_interpreters() {
+        let python = std::env::var("SERC_TEST_PYTHON").unwrap_or_else(|_| "python3.14".to_string());
+        let script = "import collections, sys; Version = collections.namedtuple('Version', 'major minor micro releaselevel serial'); sys.version_info = Version(3, 14, 5, 'candidate', 1); exec(sys.argv.pop(1))";
+        let output = std::process::Command::new(python)
+            .args([
+                "-I",
+                "-S",
+                "-c",
+                script,
+                super::PYTHON_HELPER,
+                serc::CPYTHON_TARGET.implementation,
+                &serc::CPYTHON_TARGET.version_string(),
+                &serc::CPYTHON_TARGET.magic_hex(),
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("candidate 1"));
+    }
 
     #[test]
     fn python_helper_benchmarks_only_accepted_sources() {

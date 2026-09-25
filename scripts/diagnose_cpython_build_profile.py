@@ -55,7 +55,7 @@ def folded_bits(expression: str) -> dict[str, str]:
 
 
 def main() -> None:
-    if sys.implementation.name != "cpython" or sys.version_info[:3] != (3, 14, 5):
+    if sys.implementation.name != "cpython" or sys.version_info != (3, 14, 5, "final", 0):
         raise SystemExit("Run this diagnostic with the exact CPython 3.14.5 oracle.")
     build = {
         name: sysconfig.get_config_var(name)

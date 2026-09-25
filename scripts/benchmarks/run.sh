@@ -129,10 +129,10 @@ fi
 import importlib.util
 import sys
 
-expected = ("cpython", (3, 14, 5), "2b0e0d0a")
+expected = ("cpython", (3, 14, 5, "final", 0), "2b0e0d0a")
 actual = (
     sys.implementation.name,
-    sys.version_info[:3],
+    tuple(sys.version_info),
     importlib.util.MAGIC_NUMBER.hex(),
 )
 if actual != expected:
