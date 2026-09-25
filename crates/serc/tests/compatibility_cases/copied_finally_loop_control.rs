@@ -122,6 +122,114 @@ fn matches_cpython_marshal_for_copied_finally_loop_control() {
 }
 
 #[test]
+fn overridden_continue_markers_stay_outside_exception_regions() {
+    let indent = |body: &str| format!("    {}", body.replace('\n', "\n    "));
+    for (prefix, suspension) in [
+        ("", ""),
+        ("", "yield None\n"),
+        ("async ", ""),
+        ("async ", "yield None\n"),
+    ] {
+        for (inner_loop, surrounding) in [
+            ("for sub in item", "none"),
+            ("for sub in item", "except"),
+            ("for sub in item", "manager"),
+            ("while flag", "none"),
+            ("while flag", "manager"),
+        ] {
+            let inner =
+                format!("{inner_loop}:\n    try:\n        continue\n    finally:\n        break");
+            let finally = format!(
+                "for item in items:\n    try:\n        work(item)\n    finally:\n{}",
+                indent(&indent(&inner)),
+            );
+            let body = match surrounding {
+                "none" => finally,
+                "except" => format!("try:\n{}\nexcept Error:\n    recover()", indent(&finally)),
+                "manager" => format!("with manager:\n{}", indent(&finally)),
+                _ => unreachable!(),
+            };
+            let source = format!(
+                "{prefix}def f(items, flag, manager):\n{}\n",
+                indent(&format!("{suspension}{body}")),
+            );
+            common::assert_matches_cpython_marshal(&source, "overridden_continue_finally.py");
+        }
+    }
+}
+
+#[test]
+fn overriding_loop_control_controls_match_cpython() {
+    for (pending, replacement, enclosing) in [
+        (
+            "continue",
+            "break",
+            "try:\n{body}\nexcept Error:\n    recover()",
+        ),
+        ("continue", "break", "with manager:\n{body}"),
+        (
+            "break",
+            "continue",
+            "try:\n{body}\nexcept Error:\n    recover()",
+        ),
+    ] {
+        let body = format!(
+            "for item in items:\n    try:\n        {pending}\n    finally:\n        {replacement}"
+        );
+        let body = format!("    {}", body.replace('\n', "\n    "));
+        let source = format!(
+            "def f(items, manager):\n    {}\n",
+            enclosing.replace("{body}", &body).replace('\n', "\n    "),
+        );
+        common::assert_matches_cpython_marshal(&source, "overriding_loop_control.py");
+    }
+}
+
+#[test]
+fn overridden_continue_preserves_exception_chaining() {
+    let source = r"def run(fail_work, fail_iter):
+    events = []
+
+    def children():
+        events.append('first')
+        if fail_iter:
+            raise RuntimeError('iter')
+        yield 1
+        events.append('second')
+        yield 2
+
+    def work():
+        events.append('work')
+        if fail_work:
+            raise ValueError('work')
+
+    try:
+        for item in [children()]:
+            try:
+                work()
+            finally:
+                for sub in item:
+                    try:
+                        continue
+                    finally:
+                        break
+            events.append('completed')
+    except Exception as exc:
+        context = type(exc.__context__).__name__ if exc.__context__ else 'None'
+        events.append(f'{type(exc).__name__}:{exc}:{context}')
+    return events
+
+for fail_work in (False, True):
+    for fail_iter in (False, True):
+        print(run(fail_work, fail_iter))
+";
+    common::assert_executes(
+        source,
+        "['work', 'first', 'completed']\n['work', 'first', 'RuntimeError:iter:None']\n['work', 'first', 'ValueError:work:None']\n['work', 'first', 'RuntimeError:iter:ValueError']\n",
+    );
+}
+
+#[test]
 fn matches_cpython_marshal_for_interleaved_finally_manager_loop_control() {
     let source = r"def f(items, flag, manager):
     for item in items:
