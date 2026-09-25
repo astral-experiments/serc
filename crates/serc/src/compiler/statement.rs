@@ -5017,6 +5017,15 @@ impl<'source> Compiler<'source> {
                             self.assembler.preserve_direct_inlined_jump_nop(break_jump);
                         }
                     }
+                    if has_copied_finalizer
+                        && defer_finally_end
+                        && !context.prevent_break_exit_inlining
+                    {
+                        // A copied finalizer can leave a handler jump into this artificial
+                        // exceptional-finally cleanup. Copy the unlocated continuation before
+                        // its break target receives the final return.
+                        self.assembler.allow_last_no_location_block_inlining();
+                    }
                     if let Some(jump_exclusion_start) = jump_exclusion_start {
                         let jump_exclusion_end = self.assembler.label();
                         self.assembler.mark(jump_exclusion_end);
