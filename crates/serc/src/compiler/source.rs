@@ -1789,6 +1789,7 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
         strings: Vec<&'ast ruff_python_ast::ExprStringLiteral>,
         fstrings: Vec<&'ast ruff_python_ast::ExprFString>,
         integer_attribute_values: Vec<&'ast ruff_python_ast::ExprNumberLiteral>,
+        large_integer_values: Vec<&'ast ruff_python_ast::ExprNumberLiteral>,
         unpacked_keywords: Vec<&'ast ruff_python_ast::Keyword>,
         templates: Vec<&'ast ruff_python_ast::ExprTString>,
     }
@@ -1815,6 +1816,12 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
                         self.integer_attribute_values.push(number);
                     }
                     walk_expr(self, expression);
+                }
+                Expr::NumberLiteral(number) => {
+                    if matches!(&number.value, ruff_python_ast::Number::Int(integer) if integer.as_u64().is_none())
+                    {
+                        self.large_integer_values.push(number);
+                    }
                 }
                 Expr::Call(call) => {
                     self.needs_normalization |= call
@@ -2021,6 +2028,7 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
         .collect::<Vec<_>>();
     // Ruff renders an integer attribute as `(1).real`; CPython uses `1 .real`.
     let mut integer_attribute_replacements = Vec::new();
+    let mut integer_attribute_ranges = FxHashSet::default();
     for number in generated_strings.integer_attribute_values {
         let opening = usize::from(number.start()).saturating_sub(1);
         let closing = usize::from(number.end());
@@ -2029,10 +2037,7 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
                 && integer.as_u64().is_none()
             {
                 let token = integer.to_string();
-                if ["0x", "0X", "0o", "0O", "0b", "0B"]
-                    .iter()
-                    .any(|prefix| token.starts_with(*prefix))
-                {
+                if annotation_is_nondecimal_integer(&token) {
                     annotation_integer_to_decimal(&token)
                 } else {
                     token
@@ -2042,6 +2047,23 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
             };
             value.push(' ');
             integer_attribute_replacements.push((opening..closing + 1, value));
+            integer_attribute_ranges.insert(number.range);
+        }
+    }
+    // Ruff retains the original base for large integers; CPython emits decimal.
+    let mut large_integer_replacements = Vec::new();
+    for number in generated_strings.large_integer_values {
+        if integer_attribute_ranges.contains(&number.range) {
+            continue;
+        }
+        if let ruff_python_ast::Number::Int(integer) = &number.value {
+            let token = integer.to_string();
+            if annotation_is_nondecimal_integer(&token) {
+                large_integer_replacements.push((
+                    std::ops::Range::<usize>::from(number.range),
+                    annotation_integer_to_decimal(&token),
+                ));
+            }
         }
     }
     // CPython accepts a conditional expression after **; the generator uses atom
@@ -2078,9 +2100,11 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
             .into_iter()
             .map(|index| (index..index + 1, String::new())),
     );
-    let has_integer_attributes = !integer_attribute_replacements.is_empty();
+    let has_integer_edits =
+        !integer_attribute_replacements.is_empty() || !large_integer_replacements.is_empty();
     replacements.extend(integer_attribute_replacements);
-    let non_overlapping = if has_integer_attributes {
+    replacements.extend(large_integer_replacements);
+    let non_overlapping = if has_integer_edits {
         replacements.sort_unstable_by_key(|(range, _)| range.start);
         replacements
             .windows(2)
@@ -2111,6 +2135,12 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
         annotation.push(')');
     }
     annotation
+}
+
+fn annotation_is_nondecimal_integer(token: &str) -> bool {
+    ["0x", "0X", "0o", "0O", "0b", "0B"]
+        .iter()
+        .any(|prefix| token.starts_with(*prefix))
 }
 
 /// Format a nondecimal integer token using the decimal spelling CPython unparses.
