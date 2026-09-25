@@ -430,6 +430,12 @@ impl Compiler<'_> {
                         CompileError::Internal(format!("missing class nonlocal variable `{name}`"))
                     })?;
                     self.emit(deref, index, effect)
+                } else if let Some(index) = free_indices.get(&name_id).copied()
+                    && !self.class_scope_binds_name(name)
+                {
+                    // Compiler-generated class assignments use the same symbol classification
+                    // as explicit accesses. Only explicit class bindings force a namespace write.
+                    self.emit(deref, index, effect)
                 } else {
                     let index = self.name_index_with_id(name, name_id)?;
                     self.emit(namespace, index, effect)
