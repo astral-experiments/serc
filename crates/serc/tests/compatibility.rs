@@ -15294,3 +15294,21 @@ fn matches_cpython_exceptional_finally_iterator_depth_boundaries() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+#[ignore = "nested continues in finally currently produce a negative stack depth"]
+fn nested_finally_continues_preserve_stack_and_exception_owners() {
+    common::assert_matches_cpython_marshal(
+        r"def f(items):
+    for item in items:
+        try:
+            pass
+        finally:
+            try:
+                continue
+            finally:
+                continue
+",
+        "nested_finally_continues.py",
+    );
+}
