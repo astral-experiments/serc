@@ -428,18 +428,25 @@ pub(crate) trait ConstantTable {
     fn get(&self, index: u32) -> &Constant;
     fn intern(&mut self, constant: Constant) -> Result<u32, CompileError>;
     fn fold_sequence(&mut self, values: Vec<Constant>, is_set: bool) -> Result<u32, CompileError>;
+
+    /// Reallocate non-reflexive values for a copied exit, leaving other constants unchanged.
+    /// The remap is shared across the copy to preserve aliases among its constants.
     fn reallocate_non_reflexive_constant(
         &mut self,
         index: u32,
         remap: &mut crate::code_object::NonReflexiveRemap,
     ) -> Result<u32, CompileError>;
     fn len(&self) -> usize;
+
+    /// Retain code-generation constants in order, then replay flowgraph admissions,
+    /// including early booleans and folded dependencies. Returns old-to-new indices.
     fn retain_used(
         &mut self,
         used: &[bool],
         order: &[u32],
         early_booleans: &[bool],
     ) -> Vec<Option<u32>>;
+    /// Retain used constants in their existing order, returning old-to-new indices.
     fn retain_used_in_order(&mut self, used: &[bool]) -> Vec<Option<u32>>;
 }
 
