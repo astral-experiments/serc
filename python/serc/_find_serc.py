@@ -65,8 +65,8 @@ def _matching_parents(path: str | None, match: str) -> str | None:
     Return the parent directory of `path` after trimming a `match` from the end.
     The match is expected to contain `/` as a path separator, while the `path`
     is expected to use the platform's path separator (e.g., `os.sep`). The path
-    components are compared case-insensitively and a `*` wildcard can be used
-    in the `match`.
+    components are matched using `fnmatch`, which normalizes case according to
+    the platform and supports shell-style wildcards in the `match`.
     """
     from fnmatch import fnmatch
 
