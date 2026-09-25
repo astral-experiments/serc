@@ -6738,31 +6738,73 @@ fn generator_required_names_with_cache<'ast>(
     required
 }
 
-pub(super) fn generator_cellvars(generator: &ruff_python_ast::ExprGenerator) -> FxHashSet<String> {
-    fn extend_local_names(expression: &Expr, local_names: &mut FxHashSet<String>) {
-        let mut names = Vec::new();
-        collect_nested_comprehension_target_names(expression, &mut names);
-        local_names.extend(names);
-    }
-
+fn generator_cellvar_local_names(generator: &ruff_python_ast::ExprGenerator) -> FxHashSet<String> {
     let mut local_names = FxHashSet::default();
     for comprehension in &generator.generators {
         let mut names = Vec::new();
         collect_target_names(&comprehension.target, &mut names);
         local_names.extend(names);
     }
+    let mut extend_local_names = |expression: &Expr| {
+        let mut names = Vec::new();
+        collect_nested_comprehension_target_names(expression, &mut names);
+        local_names.extend(names);
+    };
+    extend_local_names(&generator.elt);
+    for (index, comprehension) in generator.generators.iter().enumerate() {
+        extend_local_names(&comprehension.target);
+        if index > 0 {
+            extend_local_names(&comprehension.iter);
+        }
+        for condition in &comprehension.ifs {
+            extend_local_names(condition);
+        }
+    }
+    local_names
+}
 
-    extend_local_names(&generator.elt, &mut local_names);
+/// Analyze captures after resolving colliding private spellings, preserving target names.
+pub(super) fn generator_cellvars_with_mangler(
+    generator: &ruff_python_ast::ExprGenerator,
+    mangle: &impl Fn(&str) -> String,
+) -> FxHashSet<String> {
+    let expression = Expr::Generator(generator.clone());
+    let mut spellings = VariableSpellings::default();
+    spellings.visit_expr(&expression);
+    let aliases = colliding_private_spellings(&spellings.names, mangle);
+    if aliases.is_empty() {
+        return generator_cellvars(generator);
+    }
+    let normalize = |name: &str| {
+        aliases
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_owned())
+    };
+    let mut normalized = expression;
+    ruff_python_ast::visitor::transformer::Transformer::visit_expr(
+        &PrivateVariableNormalizer { mangle: &normalize },
+        &mut normalized,
+    );
+    let Expr::Generator(normalized) = normalized else {
+        unreachable!()
+    };
+    let cells = generator_cellvars(&normalized);
+    generator_cellvar_local_names(generator)
+        .into_iter()
+        .filter(|name| cells.contains(&normalize(name)))
+        .collect()
+}
+
+pub(super) fn generator_cellvars(generator: &ruff_python_ast::ExprGenerator) -> FxHashSet<String> {
+    let local_names = generator_cellvar_local_names(generator);
     let mut nested_requirements = nested_expression_required_names(&generator.elt);
     for (index, comprehension) in generator.generators.iter().enumerate() {
-        extend_local_names(&comprehension.target, &mut local_names);
         nested_requirements.extend(nested_expression_required_names(&comprehension.target));
         if index > 0 {
-            extend_local_names(&comprehension.iter, &mut local_names);
             nested_requirements.extend(nested_expression_required_names(&comprehension.iter));
         }
         for condition in &comprehension.ifs {
-            extend_local_names(condition, &mut local_names);
             nested_requirements.extend(nested_expression_required_names(condition));
         }
     }

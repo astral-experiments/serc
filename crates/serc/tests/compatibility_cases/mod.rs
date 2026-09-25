@@ -150,6 +150,7 @@ mod generator_external_shadow;
 mod generator_handler_finally_nop_owner_compatibility;
 mod generator_iterator_negated_name_ifexp_owner_compatibility;
 mod generator_lambda_walrus_scope;
+mod generator_private_alias_capture;
 mod generator_raising_finally_return;
 mod generator_walrus_temporaries;
 mod generator_with_finally_condition_compatibility;
