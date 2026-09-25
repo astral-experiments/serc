@@ -36,9 +36,6 @@ use self::{
     symbol::SymbolState,
 };
 
-// CPython initially emits owned local loads, then strength-reduces safe loads
-// to borrowed references after the control-flow graph has reached its final
-// shape. The assembler mirrors that dataflow pass.
 const SUPPORTED_FUTURE_FLAGS: u32 = CO_FUTURE_BARRY_AS_BDFL | CO_FUTURE_ANNOTATIONS;
 const SHADOWED_SUPER_SENTINEL: &str = "\0shadowed super";
 // CPython's flowgraph optimizer folds constant sequences only up to
