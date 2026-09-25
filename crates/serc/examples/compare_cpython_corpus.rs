@@ -21,10 +21,26 @@ mod initial_intern_profile;
 mod native_output_cache;
 #[path = "support/native_output_reader.rs"]
 mod native_output_reader;
+#[path = "support/standard_caller_profile.rs"]
+mod standard_caller_profile;
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
 const WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
+
+struct OracleInvocation<'a> {
+    python: &'a str,
+    qualified: Option<&'a standard_caller_profile::QualifiedOracle>,
+}
+
+impl OracleInvocation<'_> {
+    fn command(&self) -> Command {
+        self.qualified.map_or_else(
+            || Command::new(self.python),
+            standard_caller_profile::QualifiedOracle::command,
+        )
+    }
+}
 
 const ORACLE: &str = r#"
 import marshal
@@ -280,11 +296,15 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    if let Err(message) = verify_python(&options.python, options.python_version) {
+    let inherited_oracle = OracleInvocation {
+        python: &options.python,
+        qualified: None,
+    };
+    if let Err(message) = verify_python(&inherited_oracle, options.python_version) {
         eprintln!("{message}");
         return ExitCode::from(2);
     }
-    let profile = match options
+    let mut profile = match options
         .initial_intern_state
         .as_deref()
         .map(|path| {
@@ -304,6 +324,27 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let qualified = profile
+        .as_mut()
+        .and_then(|profile| profile.qualified_oracle.take());
+    if qualified.is_some()
+        && (options.caller_intern_model.is_some()
+            || read_config.is_some()
+            || env::var_os("SERC_NATIVE_CACHE_WRITE").is_some())
+    {
+        eprintln!("standard source profiles cannot use legacy caller models or native caches");
+        return ExitCode::from(2);
+    }
+    let oracle = OracleInvocation {
+        python: &options.python,
+        qualified: qualified.as_ref(),
+    };
+    if qualified.is_some()
+        && let Err(message) = verify_python(&oracle, options.python_version)
+    {
+        eprintln!("{message}");
+        return ExitCode::from(2);
+    }
     if let Some(profile) = &profile {
         let role = if options.caller_intern_model.is_some() {
             "Native provenance snapshot"
@@ -311,8 +352,8 @@ fn main() -> ExitCode {
             "Partial caller intern-state evidence"
         };
         println!(
-            "{role}: {} ({} observed entries; {} guaranteed retained entries)",
-            profile.snapshot_sha256, profile.entries, profile.retained_entries
+            "{role}: {} ({})",
+            profile.snapshot_sha256, profile.description
         );
     }
     let caller_model = match options
@@ -372,7 +413,7 @@ fn main() -> ExitCode {
     if let Some(limit) = options.limit {
         paths.truncate(limit);
     }
-    if caller_model.is_some() {
+    if caller_model.is_some() || qualified.is_some() {
         for path in &paths {
             if let Err(error) = caller_intern_model::validate_filename(path) {
                 eprintln!(
@@ -483,7 +524,7 @@ fn main() -> ExitCode {
                 let mut observation = cache.as_ref().map(|writer| writer.begin(index, path));
                 let mut outcome = compare(
                     path,
-                    &options.python,
+                    &oracle,
                     options.source_bytes,
                     &compile_options,
                     caller_model.as_ref(),
@@ -714,9 +755,13 @@ impl PythonIdentity {
     }
 }
 
-fn verify_python(python: &str, python_version: PythonVersion) -> Result<(), String> {
+fn verify_python(
+    oracle: &OracleInvocation<'_>,
+    python_version: PythonVersion,
+) -> Result<(), String> {
     let target = python_version.target();
-    let output = Command::new(python)
+    let python = oracle.python;
+    let output = oracle.command()
         .args([
             "-B",
             "-I",
@@ -856,14 +901,16 @@ fn discover(roots: &[PathBuf], extensions: &[String]) -> Result<Vec<PathBuf>, St
 
 fn compare(
     path: &Path,
-    python: &str,
+    oracle: &OracleInvocation<'_>,
     source_bytes: bool,
     options: &CompileOptions,
     caller_model: Option<&caller_intern_model::LoadedModel>,
     mut observation: Option<&mut native_output_cache::Observation<'_>>,
     retain_mismatch_bytes: bool,
 ) -> Outcome {
-    let output = Command::new(python)
+    let standard_caller = oracle.qualified.is_some();
+    let output = oracle
+        .command()
         .args(["-I", "-S", "-c", ORACLE])
         .arg(path)
         .output();
@@ -923,7 +970,27 @@ fn compare(
     };
 
     let filename = path.to_string_lossy();
-    let compiled = compile_input(&source, &filename, options, caller_model);
+    let file_options = if standard_caller
+        && matches!(
+            options.python_version,
+            PythonVersion::Py312 | PythonVersion::Py313
+        ) {
+        let mut selected = options.clone();
+        selected.initial_intern_state = options.initial_intern_state.with_additional_strings(
+            filename
+                .split('/')
+                .filter(|part| !part.is_empty() && *part != "."),
+        );
+        Some(selected)
+    } else {
+        None
+    };
+    let compiled = compile_input(
+        &source,
+        &filename,
+        file_options.as_ref().unwrap_or(options),
+        caller_model,
+    );
     if let Some(observation) = observation {
         observation.compiled(&source, &compiled);
     }
@@ -1445,7 +1512,10 @@ mod tests {
             };
             let without_dump = super::compare(
                 &path,
-                oracle.to_str().unwrap(),
+                &super::OracleInvocation {
+                    python: oracle.to_str().unwrap(),
+                    qualified: None,
+                },
                 source_bytes,
                 &options,
                 None,
@@ -1456,7 +1526,10 @@ mod tests {
             assert!(without_dump.mismatch_bytes.is_none());
             let mut outcome = super::compare(
                 &path,
-                oracle.to_str().unwrap(),
+                &super::OracleInvocation {
+                    python: oracle.to_str().unwrap(),
+                    qualified: None,
+                },
                 source_bytes,
                 &options,
                 None,
@@ -1467,7 +1540,10 @@ mod tests {
             fs::write(&oracle, "#!/bin/sh\nprintf 'other oracle bytes'\n").unwrap();
             let mut second_outcome = super::compare(
                 &second_path,
-                oracle.to_str().unwrap(),
+                &super::OracleInvocation {
+                    python: oracle.to_str().unwrap(),
+                    qualified: None,
+                },
                 source_bytes,
                 &options,
                 None,
@@ -1592,7 +1668,14 @@ mod tests {
     #[test]
     fn oracle_distinguishes_compilation_rejections_and_io_failures() {
         let python = std::env::var("SERC_TEST_PYTHON").unwrap_or_else(|_| "python3.14".to_string());
-        verify_python(&python, PythonVersion::Py314).unwrap();
+        verify_python(
+            &super::OracleInvocation {
+                python: &python,
+                qualified: None,
+            },
+            PythonVersion::Py314,
+        )
+        .unwrap();
         let directory = tempfile::tempdir().unwrap();
 
         for (filename, source, expected_status) in [
