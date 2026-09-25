@@ -643,9 +643,29 @@ pub(super) struct ScopeBodyFacts {
     local_annotation_cellvars: FxHashSet<String>,
 }
 
+/// Separate storage is needed only while pending private declarations can make
+/// emitted names differ from the frozen symbol table. Canonical header scopes
+/// use the ordinary function layout without changing their capture analysis.
+#[derive(Clone, Debug, Default)]
+pub(super) struct HeaderLocalStoragePlan {
+    /// Physical fast-local names in emission order, including frozen parameter names.
+    pub(super) fast_locals: Vec<NameId>,
+    /// Comprehension declaration symbols and the names of their save/restore slots.
+    ///
+    /// A later private type parameter can have a raw declaration symbol and a
+    /// mangled save slot. Distinct symbols can also save the same physical slot.
+    pub(super) comprehension_slots: Vec<(NameId, NameId)>,
+    /// Additional physical cells created for comprehension save slots.
+    ///
+    /// These cells do not introduce declaration symbols or closure bindings.
+    pub(super) cellvars: FxHashSet<NameId>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct LoweringFunctionPlan {
     pub(super) locals: Vec<NameId>,
+    /// Separates generic-header declaration symbols from generated storage names.
+    pub(super) header_local_storage: Option<HeaderLocalStoragePlan>,
     pub(super) local_aliases: Vec<(NameId, NameId)>,
     pub(super) free_aliases: Vec<(NameId, NameId)>,
     pub(super) cell_sort_names: FxHashMap<NameId, String>,
@@ -1288,6 +1308,7 @@ impl FunctionPlan {
     pub(super) fn into_lowering_plan(self) -> LoweringFunctionPlan {
         LoweringFunctionPlan {
             locals: self.locals,
+            header_local_storage: None,
             local_aliases: self.local_aliases,
             free_aliases: Vec::new(),
             cell_sort_names: self.cell_sort_names,
@@ -2156,7 +2177,10 @@ impl ScopeArena {
                 plan.required
                     .iter()
                     // The synthetic generic scope provides these cells to the class.
-                    .filter(|name| !plan.type_parameter_names.contains(*name))
+                    .filter(|name| {
+                        !plan.type_parameter_names.contains(*name)
+                            && !plan.canonical_type_parameter_names.contains(*name)
+                    })
                     .map(|name| plan.enclosing_names.get(name).copied().unwrap_or(*name)),
             );
             unmangled_required.extend(
@@ -4199,35 +4223,62 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
         let body_comprehension_captures =
             std::mem::take(&mut self.facts.annotation_comprehension_requirements.captures);
         self.collect_type_parameter_class_closures(type_params);
-        self.collect_type_parameter_comprehensions(type_params);
-        let type_names: BTreeSet<_> = type_params
+        let type_names = type_params
             .iter()
-            .map(|parameter| parameter.name().as_str().to_string())
-            .collect();
-        let mut required = type_parameter_required_names(type_params);
-        // Nested captures bypass class bindings; direct header loads use the class namespace.
+            .map(|parameter| {
+                mangle_name(parameter.name().as_str(), Some(definition.name.as_str())).into_owned()
+            })
+            .collect::<BTreeSet<_>>();
+        let mut declared = FxHashSet::default();
+        let mut required = BTreeSet::new();
+        let mut nested = BTreeSet::new();
+        let mut collect = |expression: &Expr, declared: &FxHashSet<&str>| {
+            let mangle = |name: &str| {
+                if declared.contains(name) {
+                    mangle_name(name, Some(definition.name.as_str())).into_owned()
+                } else {
+                    name.to_owned()
+                }
+            };
+            required.extend(
+                expression_required_names_with_mangler(expression, &mangle)
+                    .into_iter()
+                    .map(|name| mangle(&name)),
+            );
+            nested.extend(
+                annotation_nested_required_names_with_mangler(expression, &mangle)
+                    .into_iter()
+                    .map(|name| mangle(&name)),
+            );
+        };
+        for parameter in type_params {
+            declared.insert(parameter.name().as_str());
+            if let TypeParam::TypeVar(parameter) = parameter
+                && let Some(bound) = parameter.bound.as_deref()
+            {
+                collect(bound, &declared);
+            }
+            if let Some(default) = parameter.default() {
+                collect(default, &declared);
+            }
+        }
         if let Some(arguments) = definition.arguments.as_deref() {
             for argument in &arguments.args {
-                self.collect_annotation_comprehensions(argument, Some(type_params));
-                self.facts.nested_lambda_requirements.extend(
-                    annotation_nested_required_names(argument)
-                        .difference(&type_names)
-                        .cloned(),
-                );
-                required.extend(expression_required_names(argument));
-                if !type_names.contains("__class__") {
-                    self.collect_annotation_class_reference(argument);
-                }
+                collect(argument, &declared);
             }
             for keyword in &arguments.keywords {
-                self.collect_annotation_comprehensions(&keyword.value, Some(type_params));
-                self.facts.nested_lambda_requirements.extend(
-                    annotation_nested_required_names(&keyword.value)
-                        .difference(&type_names)
-                        .cloned(),
-                );
-                required.extend(expression_required_names(&keyword.value));
-                if !type_names.contains("__class__") {
+                collect(&keyword.value, &declared);
+            }
+        }
+        self.facts
+            .nested_lambda_requirements
+            .extend(nested.difference(&type_names).cloned());
+        if !type_names.contains("__class__") {
+            if let Some(arguments) = definition.arguments.as_deref() {
+                for argument in &arguments.args {
+                    self.collect_annotation_class_reference(argument);
+                }
+                for keyword in &arguments.keywords {
                     self.collect_annotation_class_reference(&keyword.value);
                 }
             }
@@ -4965,6 +5016,295 @@ fn contextual_expression_requirements(
     })
 }
 
+/// Collect expression requirements using the private-name identity in force at this point.
+pub(super) fn expression_required_names_with_mangler(
+    expression: &Expr,
+    mangle: &impl Fn(&str) -> String,
+) -> BTreeSet<String> {
+    analyze_expression_scope_with_mangler(
+        &ruff_python_ast::Parameters::default(),
+        expression,
+        mangle,
+    )
+    .analysis
+    .required
+}
+
+/// Collect nested annotation requirements using the enclosing symbol identity.
+pub(super) fn annotation_nested_required_names_with_mangler(
+    expression: &Expr,
+    mangle: &impl Fn(&str) -> String,
+) -> BTreeSet<String> {
+    contextual_expression_requirements(expression, mangle, annotation_nested_required_names)
+}
+
+/// Plan fast storage independently of a generic header's frozen symbol table.
+///
+/// CPython freezes parameter symbols during analysis, then uses the completed
+/// private-name restriction when allocating comprehension save slots.
+pub(super) fn header_expression_storage(
+    parameters: &ruff_python_ast::Parameters,
+    expression: &Expr,
+    symbol_name: &impl Fn(&str) -> String,
+    instruction_name: &impl Fn(&str) -> String,
+    names: &NameInterner,
+    prefix: &[NameId],
+) -> HeaderLocalStoragePlan {
+    let mut depth = crate::stack::ExpressionDepth::default();
+    depth.visit_parameters(parameters);
+    depth.visit_expr(expression);
+    crate::stack::with_depth(depth.maximum(), || {
+        let mut seen = FxHashSet::default();
+        let slots = inlined_comprehension_local_names_in_expression(expression)
+            .into_iter()
+            .map(|name| (symbol_name(&name), instruction_name(&name)))
+            .filter(|(symbol, _)| seen.insert(symbol.clone()))
+            .collect::<Vec<_>>();
+        let mut symbol_expression = expression.clone();
+        ruff_python_ast::visitor::transformer::Transformer::visit_expr(
+            &PrivateVariableNormalizer {
+                mangle: symbol_name,
+            },
+            &mut symbol_expression,
+        );
+        let mut symbol_parameters = parameters.clone();
+        ruff_python_ast::visitor::transformer::Transformer::visit_parameters(
+            &PrivateVariableNormalizer {
+                mangle: symbol_name,
+            },
+            &mut symbol_parameters,
+        );
+        let facts = expression_scope_facts(
+            &symbol_parameters,
+            &symbol_expression,
+            &mut ExpressionScopeCache::default(),
+        );
+        let ordinary_locals = facts
+            .locals
+            .non_comprehension_bindings
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let mut storage_names = parameters_in_locals_order(parameters)
+            .map(|parameter| symbol_name(parameter.name.as_str()))
+            .collect::<Vec<_>>();
+        collect_header_slot_names(
+            &symbol_expression,
+            &ordinary_locals,
+            &facts.cellvars,
+            instruction_name,
+            &mut storage_names,
+        );
+        let id = |name: &str| {
+            names
+                .get(name)
+                .expect("generic-header storage name is interned")
+        };
+        let mut fast_locals = prefix.to_vec();
+        let mut seen_storage = FxHashSet::default();
+        fast_locals.extend(
+            storage_names
+                .iter()
+                .filter(|name| seen_storage.insert(name.as_str()))
+                .map(|name| id(name)),
+        );
+        let cellvars = inlined_comprehension_cell_names_in_expression(&symbol_expression)
+            .iter()
+            .map(|name| id(&instruction_name(name)))
+            .collect();
+        HeaderLocalStoragePlan {
+            fast_locals,
+            comprehension_slots: slots
+                .iter()
+                .map(|(symbol, storage)| (id(symbol), id(storage)))
+                .collect(),
+            cellvars,
+        }
+    })
+}
+
+/// Collect generic-header storage in code generation order without merging symbols.
+fn collect_header_slot_names(
+    expression: &Expr,
+    ordinary_locals: &FxHashSet<String>,
+    cellvars: &FxHashSet<String>,
+    instruction_name: &impl Fn(&str) -> String,
+    names: &mut Vec<String>,
+) {
+    struct Collector<'a, M> {
+        ordinary_locals: &'a FxHashSet<String>,
+        cellvars: &'a FxHashSet<String>,
+        instruction_name: &'a M,
+        names: &'a mut Vec<String>,
+    }
+
+    impl<'ast, M: Fn(&str) -> String> Visitor<'ast> for Collector<'_, M> {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+
+            let (generators, key, value) = match expression {
+                Expr::ListComp(comprehension) => (
+                    &comprehension.generators[..],
+                    None,
+                    comprehension.elt.as_ref(),
+                ),
+                Expr::SetComp(comprehension) => (
+                    &comprehension.generators[..],
+                    None,
+                    comprehension.elt.as_ref(),
+                ),
+                Expr::DictComp(comprehension) => (
+                    &comprehension.generators[..],
+                    comprehension.key.as_deref(),
+                    comprehension.value.as_ref(),
+                ),
+                Expr::Generator(generator) => {
+                    if let Some(first) = generator.generators.first() {
+                        self.visit_expr(&first.iter);
+                    }
+                    return;
+                }
+                Expr::Lambda(lambda) => {
+                    visit_lambda_defaults(self, lambda);
+                    return;
+                }
+                Expr::Name(name) => {
+                    let emitted = (self.instruction_name)(name.id.as_str());
+                    if self.ordinary_locals.contains(&emitted) && !self.cellvars.contains(&emitted)
+                    {
+                        self.names.push(emitted);
+                    }
+                    return;
+                }
+                _ => {
+                    walk_expr(self, expression);
+                    return;
+                }
+            };
+            if let Some(first) = generators.first() {
+                self.visit_expr(&first.iter);
+            }
+            let temporary_names = comprehension_temporary_names(generators, key, value);
+            let mut direct_targets = Vec::new();
+            for generator in generators {
+                collect_target_names(&generator.target, &mut direct_targets);
+            }
+            let deferred_outer_names = comprehension_name_bindings(generators, key, value)
+                .into_iter()
+                .filter(|(name, bound)| !bound && !direct_targets.contains(name))
+                .map(|(name, _)| name)
+                .collect::<FxHashSet<_>>();
+            // Decide which scope owns each save before mapping symbols to
+            // storage names: two pending spellings can share storage while
+            // remaining distinct in the declaration-time symbol tables.
+            self.names.extend(
+                temporary_names
+                    .into_iter()
+                    .filter(|name| !deferred_outer_names.contains(name))
+                    .map(|name| (self.instruction_name)(&name)),
+            );
+            for (index, generator) in generators.iter().enumerate() {
+                if index > 0 {
+                    self.visit_expr(&generator.iter);
+                }
+                self.visit_expr(&generator.target);
+                for condition in &generator.ifs {
+                    self.visit_expr(condition);
+                }
+            }
+            if let Some(key) = key {
+                self.visit_expr(key);
+            }
+            self.visit_expr(value);
+        }
+    }
+
+    Collector {
+        ordinary_locals,
+        cellvars,
+        instruction_name,
+        names,
+    }
+    .visit_expr(expression);
+}
+
+/// Plan a header generator's fast slots from the operations that actually allocate them.
+///
+/// Ordinary accesses are eligible only under their declaration-time symbols.
+/// Inlined saves use completed instruction names and can allocate separate slots
+/// even when the corresponding declaration symbol is a cell or a pending name.
+pub(super) fn header_generator_storage(
+    generator: &ruff_python_ast::ExprGenerator,
+    generator_locals: &FxHashSet<String>,
+    generator_cellvars: &FxHashSet<String>,
+    symbol_name: &impl Fn(&str) -> String,
+    instruction_name: &impl Fn(&str) -> String,
+    names: &NameInterner,
+) -> HeaderLocalStoragePlan {
+    let id = |name: &str| {
+        names
+            .get(name)
+            .expect("generic-header storage name is interned")
+    };
+    let mut fast_locals = vec![".0".to_string()];
+    let mut comprehension_slots = Vec::new();
+    let mut seen_symbols = FxHashSet::default();
+    let mut cellvars = FxHashSet::default();
+    let mut collect = |expression: &Expr| {
+        let mut depth = crate::stack::ExpressionDepth::default();
+        depth.visit_expr(expression);
+        crate::stack::with_depth(depth.maximum(), || {
+            for name in inlined_comprehension_local_names_in_expression(expression) {
+                let symbol = symbol_name(&name);
+                if seen_symbols.insert(symbol.clone()) {
+                    comprehension_slots.push((id(&symbol), id(&instruction_name(&name))));
+                }
+            }
+
+            let mut symbol_expression = expression.clone();
+            ruff_python_ast::visitor::transformer::Transformer::visit_expr(
+                &PrivateVariableNormalizer {
+                    mangle: symbol_name,
+                },
+                &mut symbol_expression,
+            );
+            collect_header_slot_names(
+                &symbol_expression,
+                generator_locals,
+                generator_cellvars,
+                instruction_name,
+                &mut fast_locals,
+            );
+            cellvars.extend(
+                inlined_comprehension_cell_names_in_expression(&symbol_expression)
+                    .iter()
+                    .map(|name| id(&instruction_name(name))),
+            );
+        });
+    };
+    for (index, comprehension) in generator.generators.iter().enumerate() {
+        // The outermost iterable runs in the enclosing scope before this
+        // generator starts, so its temporary slots belong to that scope.
+        if index > 0 {
+            collect(&comprehension.iter);
+        }
+        collect(&comprehension.target);
+        for condition in &comprehension.ifs {
+            collect(condition);
+        }
+    }
+    collect(&generator.elt);
+    let mut seen_storage = FxHashSet::default();
+    fast_locals.retain(|name| seen_storage.insert(name.clone()));
+    HeaderLocalStoragePlan {
+        fast_locals: fast_locals.iter().map(|name| id(name)).collect(),
+        comprehension_slots,
+        cellvars,
+    }
+}
+
 /// Only normalize identities with multiple observed source spellings.
 fn colliding_private_spellings(
     spellings: &BTreeSet<String>,
@@ -5138,6 +5478,11 @@ fn expression_scope_facts<'ast>(
     // Lambda defaults are evaluated here too; nested lambda bodies retain their own captures.
     if !locals.comprehension_targets.is_empty() {
         outside_references.visit_expr(body);
+        // An outer comprehension may read a name that only a nested
+        // comprehension binds. The nested save does not make that read local.
+        outside_references
+            .references
+            .extend(annotation_comprehension_requirements(body).captures);
     }
     let cellvars: FxHashSet<_> = nested_requirements
         .iter()
@@ -6275,17 +6620,20 @@ pub(super) fn comprehension_cell_names_in_private_context(
     value: &Expr,
     private_name: Option<&str>,
 ) -> FxHashSet<String> {
+    comprehension_cell_names_with_mangler(generators, key, value, &|name| {
+        mangle_name(name, private_name).into_owned()
+    })
+}
+
+/// Return captured target spellings using declaration-time symbol identities.
+pub(super) fn comprehension_cell_names_with_mangler(
+    generators: &[ruff_python_ast::Comprehension],
+    key: Option<&Expr>,
+    value: &Expr,
+    mangle: &impl Fn(&str) -> String,
+) -> FxHashSet<String> {
     let nested_required = |expression: &Expr| {
-        private_name.map_or_else(
-            || nested_expression_required_names(expression),
-            |private_name| {
-                contextual_expression_requirements(
-                    expression,
-                    &|name| mangle_name(name, Some(private_name)).into_owned(),
-                    nested_expression_required_names,
-                )
-            },
-        )
+        contextual_expression_requirements(expression, mangle, nested_expression_required_names)
     };
     let mut targets = Vec::new();
     let mut required = BTreeSet::new();
@@ -6311,11 +6659,11 @@ pub(super) fn comprehension_cell_names_in_private_context(
 
     let required = required
         .iter()
-        .map(|name| mangle_name(name, private_name))
+        .map(|name| mangle(name))
         .collect::<FxHashSet<_>>();
     targets
         .into_iter()
-        .filter(|name| required.contains(&mangle_name(name, private_name)))
+        .filter(|name| required.contains(&mangle(name)))
         .collect()
 }
 

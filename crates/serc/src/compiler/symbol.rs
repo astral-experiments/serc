@@ -120,6 +120,28 @@ impl Compiler<'_> {
             .unwrap_or_else(|| panic!("module analysis did not intern `{name}`"))
     }
 
+    /// Resolve an instruction's spelling against a canonical generic-header plan.
+    ///
+    /// Ordinary scopes keep their existing raw-name lookup. In a generic header,
+    /// plans contain declaration-time symbol identities, while instruction lookup
+    /// uses the completed type-parameter mangling restriction.
+    pub(super) fn instruction_name_id(&self, name: &str, raw: NameId) -> NameId {
+        if self.unit.header_symbol_names_are_final {
+            self.required_name_id(&self.mangled_name_cow(name))
+        } else {
+            raw
+        }
+    }
+
+    /// Return the symbol-table identity frozen at this expression's declaration.
+    pub(super) fn symbol_analysis_name_id(&self, name: &str) -> NameId {
+        if self.unit.header_symbol_names_are_final {
+            self.required_name_id(&self.symbol_analysis_name(name))
+        } else {
+            self.required_name_id(name)
+        }
+    }
+
     pub(super) fn name_ids<I, S>(&self, names: I) -> Vec<NameId>
     where
         I: IntoIterator<Item = S>,
@@ -155,7 +177,8 @@ impl Compiler<'_> {
     }
 
     pub(super) fn contains_name(&self, names: &NameSet, name: &str) -> bool {
-        self.name_id(name).is_some_and(|name| names.contains(name))
+        self.name_id(name)
+            .is_some_and(|raw| names.contains(self.instruction_name_id(name, raw)))
     }
 
     pub(super) fn resolve_name(&self, name: NameId) -> &str {
@@ -164,7 +187,7 @@ impl Compiler<'_> {
 
     pub(super) fn scope_index(&self, indices: &FxHashMap<NameId, u32>, name: &str) -> Option<u32> {
         self.name_id(name)
-            .and_then(|name| indices.get(&name).copied())
+            .and_then(|raw| indices.get(&self.instruction_name_id(name, raw)).copied())
     }
 
     pub(super) fn is_cell(&self, name: &str) -> bool {
@@ -192,8 +215,14 @@ impl Compiler<'_> {
     }
 
     pub(super) fn temporary_index(&self, name: &str) -> Option<u32> {
-        self.name_id(name)
-            .and_then(|name| self.symbols.temporary_indices.get(&name).copied())
+        self.name_id(name).and_then(|raw| {
+            let symbol = if self.unit.header_symbol_names_are_final {
+                self.symbol_analysis_name_id(name)
+            } else {
+                raw
+            };
+            self.symbols.temporary_indices.get(&symbol).copied()
+        })
     }
 
     fn active_temporary_index(&self, name: NameId) -> u32 {
@@ -228,7 +257,8 @@ impl Compiler<'_> {
     }
 
     pub(super) fn load_name(&mut self, name: &str) -> Result<(), CompileError> {
-        let name_id = self.required_name_id(name);
+        let raw_name_id = self.required_name_id(name);
+        let name_id = self.instruction_name_id(name, raw_name_id);
         if self.active_temporary_binds_name(name_id) {
             let index = self.active_temporary_index(name_id);
             return self.emit(
@@ -346,6 +376,12 @@ impl Compiler<'_> {
                         self.emit(LOAD_FAST_CHECK, index, 1)
                     }
                 } else {
+                    if self.unit.header_symbol_names_are_final {
+                        // Code generation can mangle a later type parameter to a
+                        // spelling absent from this declaration-time symbol table.
+                        let index = self.name_index_with_id(name, name_id)?;
+                        return self.emit(LOAD_NAME, index, 1);
+                    }
                     if let Some(classdict) = annotation_classdict_index {
                         self.emit(LOAD_DEREF, classdict, 1)?;
                         let index = self.name_index_with_id(name, name_id)?;
@@ -366,13 +402,26 @@ impl Compiler<'_> {
             return;
         };
         let names = &self.context.scopes.names;
-        self.symbols
-            .initialized_locals
-            .extend(references.into_iter().filter_map(|reference| {
+        if !self.unit.header_symbol_names_are_final {
+            self.symbols
+                .initialized_locals
+                .extend(references.into_iter().filter_map(|reference| {
+                    names
+                        .get(reference)
+                        .filter(|name| indices.contains_key(name))
+                }));
+            return;
+        }
+        let initialized = references
+            .into_iter()
+            .filter_map(|reference| {
                 names
                     .get(reference)
+                    .map(|raw| self.instruction_name_id(reference, raw))
                     .filter(|name| indices.contains_key(name))
-            }));
+            })
+            .collect::<Vec<_>>();
+        self.symbols.initialized_locals.extend(initialized);
     }
 
     pub(super) fn store_name(&mut self, name: &str) -> Result<(), CompileError> {
@@ -403,6 +452,7 @@ impl Compiler<'_> {
         name_id: NameId,
         mutation: NameMutation,
     ) -> Result<(), CompileError> {
+        let name_id = self.instruction_name_id(name, name_id);
         let (global, namespace, deref, fast, effect) = match mutation {
             NameMutation::Store => (STORE_GLOBAL, STORE_NAME, STORE_DEREF, STORE_FAST, -1),
             NameMutation::Delete => (DELETE_GLOBAL, DELETE_NAME, DELETE_DEREF, DELETE_FAST, 0),
@@ -478,6 +528,10 @@ impl Compiler<'_> {
                         self.emit(fast, index, effect)
                     }
                 } else {
+                    if self.unit.header_symbol_names_are_final {
+                        let index = self.name_index_with_id(name, name_id)?;
+                        return self.emit(namespace, index, effect);
+                    }
                     Err(CompileError::Internal(format!(
                         "missing local variable `{name}`"
                     )))
@@ -568,8 +622,29 @@ impl Compiler<'_> {
         }
     }
 
+    /// Resolve a child's declaration-time closure identity in its parent.
+    ///
+    /// Header descendants use declaration-time names, including passthrough
+    /// captures whose spelling differs from the completed codegen name.
+    pub(super) fn child_closure_index(&self, name: NameId) -> Result<u32, CompileError> {
+        if self.unit.header_symbol_names_are_final {
+            return self.physical_closure_index(name)?.ok_or_else(|| {
+                CompileError::Internal(format!(
+                    "missing generic-header closure variable `{}`",
+                    self.resolve_name(name)
+                ))
+            });
+        }
+        self.closure_index_id(name)
+    }
+
     pub(super) fn can_provide_closure(&self, name: &str) -> bool {
-        let Some(name_id) = self.name_id(name) else {
+        let symbol_name = if self.unit.header_symbol_names_are_final {
+            Cow::Owned(self.symbol_analysis_name(name))
+        } else {
+            Cow::Borrowed(name)
+        };
+        let Some(name_id) = self.name_id(&symbol_name) else {
             return false;
         };
         self.can_provide_closure_id(name_id)
@@ -611,9 +686,22 @@ impl Compiler<'_> {
     /// Resolve an emitted capture identity without applying the current source-name context.
     pub(super) fn physical_closure_index(&self, name: NameId) -> Result<Option<u32>, CompileError> {
         let spelling = self.resolve_name(name);
+        if self.unit.header_symbol_names_are_final
+            && self.unit.generic_target_qualified_name.is_some()
+            && let Scope::Function { indices, cells, .. } = &self.unit.scope
+            && cells.contains(name)
+            && let Some(index) = indices.get(&name)
+        {
+            return Ok(Some(*index));
+        }
         // Own synthetic class cells and active comprehension cells retain their precedence.
         for candidate in self.symbols.cell_names.iter_unordered() {
-            if self.mangled_name(self.resolve_name(candidate)) == spelling
+            let matches = if self.unit.header_symbol_names_are_final {
+                candidate == name
+            } else {
+                self.mangled_name(self.resolve_name(candidate)) == spelling
+            };
+            if matches
                 && (!self.symbols.hidden_names.contains(candidate)
                     || self.symbols.active_temporaries.contains(candidate))
                 && self.can_provide_closure_id(candidate)
@@ -623,11 +711,12 @@ impl Compiler<'_> {
         }
         let start = self.symbols.locals.len() - self.symbols.free_names.len();
         for (index, candidate) in self.symbols.free_names.iter().enumerate() {
-            let matches = if self.unit.free_names_are_final {
-                *candidate == name
-            } else {
-                self.mangled_name(self.resolve_name(*candidate)) == spelling
-            };
+            let matches =
+                if self.unit.free_names_are_final || self.unit.header_symbol_names_are_final {
+                    *candidate == name
+                } else {
+                    self.mangled_name(self.resolve_name(*candidate)) == spelling
+                };
             if matches {
                 return to_u32(start + index, "physical closure variable index").map(Some);
             }
@@ -638,7 +727,7 @@ impl Compiler<'_> {
     pub(super) fn emit_closure_tuple(&mut self, names: &[NameId]) -> Result<(), CompileError> {
         let indices = names
             .iter()
-            .map(|name| self.closure_index_id(*name))
+            .map(|name| self.child_closure_index(*name))
             .collect::<Result<Vec<_>, _>>()?;
         self.emit_closure_indices(&indices)
     }
@@ -712,8 +801,13 @@ impl Compiler<'_> {
         restore: ComprehensionRestore,
     ) -> Result<EmittedInstruction, CompileError> {
         let emitted = self.emit_instruction(STORE_FAST, restore.index)?;
+        // Header saves can give distinct symbols the same cell storage slot.
+        // Preserve CPython's STORE_FAST_MAYBE_NULL through duplicate-store and
+        // fusion optimizations, including cell saves on Python 3.13 and later.
         if usize::try_from(restore.index).is_ok_and(|index| index < self.symbols.fast_local_count)
-            && !self.symbols.cell_names.contains(restore.name)
+            && (!self.symbols.cell_names.contains(restore.name)
+                || self.unit.header_symbol_names_are_final
+                    && self.context.python_version >= PythonVersion::Py313)
         {
             self.assembler
                 .mark_store_fast_as_maybe_null_comprehension_restore(emitted);
@@ -796,6 +890,21 @@ impl Compiler<'_> {
 
     pub(super) fn mangled_name(&self, name: &str) -> String {
         self.mangled_name_cow(name).into_owned()
+    }
+
+    /// Resolve a source name as it was seen while analyzing the header.
+    ///
+    /// The wrapper advances `pending_private_type_parameters` as it visits
+    /// declarations. Descendant annotation scopes retain a frozen copy.
+    pub(super) fn symbol_analysis_name(&self, name: &str) -> String {
+        if self
+            .name_id(name)
+            .is_some_and(|name_id| self.unit.pending_private_type_parameters.contains(&name_id))
+        {
+            name.to_owned()
+        } else {
+            self.mangled_name(name)
+        }
     }
 
     pub(super) fn mangled_name_cow<'a>(&self, name: &'a str) -> Cow<'a, str> {

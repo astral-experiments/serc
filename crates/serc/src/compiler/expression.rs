@@ -50,12 +50,13 @@ use super::scope::{
     collect_generator_slot_names, collect_nested_comprehension_target_names,
     collect_self_iterated_nested_comprehension_targets, collect_target_names,
     comprehension_cell_names, comprehension_cell_names_in_private_context,
-    comprehension_name_bindings, comprehension_name_bindings_with_mangler,
-    comprehension_scope_facts, comprehension_temporary_names, generator_cellvars,
-    generator_cellvars_with_mangler, generator_external_names,
-    generator_has_private_spelling_collisions, generator_private_local_aliases,
-    generator_required_names, generator_required_names_with_mangler,
-    global_comprehension_temporary_names, global_comprehension_walrus_names,
+    comprehension_cell_names_with_mangler, comprehension_name_bindings,
+    comprehension_name_bindings_with_mangler, comprehension_scope_facts,
+    comprehension_temporary_names, generator_cellvars, generator_cellvars_with_mangler,
+    generator_external_names, generator_has_private_spelling_collisions,
+    generator_private_local_aliases, generator_required_names,
+    generator_required_names_with_mangler, global_comprehension_temporary_names,
+    global_comprehension_walrus_names, header_expression_storage, header_generator_storage,
     inlined_comprehension_cell_names_in_expression, legacy_class_comprehension_names,
     parameter_default_expressions,
 };
@@ -3742,7 +3743,8 @@ impl Compiler<'_> {
         if name.id.as_str() == "__debug__" {
             return Ok(SpecializedLowering::NotApplicable);
         }
-        let name_id = self.required_name_id(name.id.as_str());
+        let raw_name_id = self.required_name_id(name.id.as_str());
+        let name_id = self.instruction_name_id(name.id.as_str(), raw_name_id);
         if self.unit.annotation_classdict_index.is_some()
             && !self.class_scope_declares_global(name_id)
         {
@@ -3760,7 +3762,9 @@ impl Compiler<'_> {
                 ..
             } => {
                 globals.contains(name_id)
-                    || (!indices.contains_key(&name_id) && !free_indices.contains_key(&name_id))
+                    || (!self.unit.header_symbol_names_are_final
+                        && !indices.contains_key(&name_id)
+                        && !free_indices.contains_key(&name_id))
             }
             Scope::Class {
                 globals,
@@ -3874,28 +3878,50 @@ impl Compiler<'_> {
             self.emit(BUILD_MAP, count, 1 - i32::try_from(count).unwrap() * 2)?;
         }
 
-        // Generic class headers need their declaration-time mangling restriction,
-        // which differs from the completed whitelist retained for code generation.
-        // Keep their existing analysis until that separate context is available.
-        let (analysis, local_aliases) =
-            if self.unit.private_name.is_some() && self.unit.mangled_names.is_none() {
-                let contextual =
-                    analyze_lambda_scope_with_mangler(lambda, &|name| self.mangled_name(name));
-                (contextual.analysis, contextual.local_aliases)
+        let header_symbols = self.unit.header_symbol_names_are_final;
+        let symbol_name = |name: &str| {
+            if header_symbols {
+                self.symbol_analysis_name(name)
             } else {
-                (analyze_lambda_scope(lambda), Vec::new())
-            };
-        let freevar_names = analysis
+                self.mangled_name(name)
+            }
+        };
+        let (analysis, local_aliases) = if self.unit.private_name.is_some()
+            && (self.unit.mangled_names.is_none() || header_symbols)
+        {
+            let contextual = analyze_lambda_scope_with_mangler(lambda, &symbol_name);
+            (contextual.analysis, contextual.local_aliases)
+        } else {
+            (analyze_lambda_scope(lambda), Vec::new())
+        };
+        let required = analysis
             .required
             .iter()
-            .filter(|name| self.can_provide_closure(name))
-            .cloned()
+            .map(|name| {
+                if header_symbols {
+                    symbol_name(name)
+                } else {
+                    name.clone()
+                }
+            })
             .collect::<BTreeSet<_>>();
-        let globals = self.name_id_set(analysis.required.difference(&freevar_names));
+        let mut freevar_names = BTreeSet::new();
+        for name in &required {
+            let can_capture = if header_symbols {
+                self.physical_closure_index(self.required_name_id(name))?
+                    .is_some()
+            } else {
+                self.can_provide_closure(name)
+            };
+            if can_capture {
+                freevar_names.insert(name.clone());
+            }
+        }
+        let globals = self.name_id_set(required.difference(&freevar_names));
         let mut freevars = self.name_ids(&freevar_names);
         let free_aliases = self.coalesce_private_freevars(&mut freevars);
         let closure_names = freevars.clone();
-        let cell_sort_names = if local_aliases.is_empty() {
+        let cell_sort_names = if local_aliases.is_empty() || header_symbols {
             FxHashMap::default()
         } else {
             analysis
@@ -3904,22 +3930,60 @@ impl Compiler<'_> {
                 .map(|name| (self.required_name_id(name), self.mangled_name(name)))
                 .collect()
         };
+        let header_local_storage =
+            (header_symbols && !self.unit.pending_private_type_parameters.is_empty()).then(|| {
+                header_expression_storage(
+                    lambda
+                        .parameters
+                        .as_deref()
+                        .unwrap_or(&ruff_python_ast::Parameters::default()),
+                    &lambda.body,
+                    &symbol_name,
+                    &|name| self.mangled_name(name),
+                    &self.context.scopes.names,
+                    &[],
+                )
+            });
         let plan = LoweringFunctionPlan {
-            locals: self.name_ids(analysis.locals),
-            local_aliases: local_aliases
-                .into_iter()
-                .map(|(alias, original)| {
-                    (
-                        self.required_name_id(&alias),
-                        self.required_name_id(&original),
-                    )
-                })
-                .collect(),
+            header_local_storage,
+            locals: self.name_ids(analysis.locals.iter().map(|name| {
+                if header_symbols {
+                    symbol_name(name)
+                } else {
+                    name.clone()
+                }
+            })),
+            local_aliases: if header_symbols {
+                Vec::new()
+            } else {
+                local_aliases
+                    .into_iter()
+                    .map(|(alias, original)| {
+                        (
+                            self.required_name_id(&alias),
+                            self.required_name_id(&original),
+                        )
+                    })
+                    .collect()
+            },
             cell_sort_names,
             globals,
-            cellvars: self.name_id_set(analysis.cellvars),
-            inlined_comprehension_cellvars: self
-                .name_id_set(analysis.inlined_comprehension_cellvars),
+            cellvars: self.name_id_set(analysis.cellvars.iter().map(|name| {
+                if header_symbols {
+                    symbol_name(name)
+                } else {
+                    name.clone()
+                }
+            })),
+            inlined_comprehension_cellvars: self.name_id_set(
+                analysis.inlined_comprehension_cellvars.iter().map(|name| {
+                    if header_symbols {
+                        symbol_name(name)
+                    } else {
+                        name.clone()
+                    }
+                }),
+            ),
             freevars,
             free_aliases,
             ..LoweringFunctionPlan::default()
@@ -4047,18 +4111,24 @@ impl Compiler<'_> {
                 discard_result,
             );
         }
-        let comprehension_cell_names = comprehension_cell_names_in_private_context(
-            generators,
-            key,
-            value,
-            self.unit
-                .private_name
-                .as_deref()
-                .filter(|_| self.unit.mangled_names.is_none()),
-        );
-        let comprehension_cell_ids = self
-            .name_id_set(&comprehension_cell_names)
-            .into_iter()
+        let comprehension_cell_names = if self.unit.header_symbol_names_are_final {
+            comprehension_cell_names_with_mangler(generators, key, value, &|name| {
+                self.symbol_analysis_name(name)
+            })
+        } else {
+            comprehension_cell_names_in_private_context(
+                generators,
+                key,
+                value,
+                self.unit
+                    .private_name
+                    .as_deref()
+                    .filter(|_| self.unit.mangled_names.is_none()),
+            )
+        };
+        let comprehension_cell_ids = comprehension_cell_names
+            .iter()
+            .map(|name| self.symbol_analysis_name_id(name))
             .collect::<NameSet>()
             .with_aliases_from(&self.symbols.cell_names);
         let base_depth = self.control.stack.depth;
@@ -4146,7 +4216,7 @@ impl Compiler<'_> {
                     generators,
                     key,
                     value,
-                    |name| globals.contains(self.required_name_id(name)),
+                    |name| globals.contains(self.symbol_analysis_name_id(name)),
                     self.unit.private_name.as_deref(),
                 )
             }
@@ -4159,7 +4229,7 @@ impl Compiler<'_> {
                 generators,
                 key,
                 value,
-                |name| globals.contains(self.required_name_id(name)),
+                |name| globals.contains(self.symbol_analysis_name_id(name)),
                 self.unit.private_name.as_deref(),
             )
         } else {
@@ -4169,6 +4239,20 @@ impl Compiler<'_> {
             // Save explicit-global walrus slots in symbol order without changing their accesses.
             // Only iteration targets belong in active_temporary_names above.
             temporary_names = global_saves;
+        }
+        if self.unit.header_symbol_names_are_final {
+            // Save ownership follows declaration symbols. A pending private read
+            // must not be merged with a nested target's explicit mangled spelling.
+            for names in [
+                &mut temporary_names,
+                &mut active_temporary_names,
+                &mut local_names,
+                &mut self_iterated_nested_targets,
+            ] {
+                for name in names {
+                    *name = self.symbol_analysis_name(name);
+                }
+            }
         }
         // An inner target read by its own iterable must keep the enclosing value live until the
         // inner comprehension starts and takes ownership of its save/restore.
@@ -4186,7 +4270,11 @@ impl Compiler<'_> {
         let deferred_external_targets = if nested_temporary_names.is_empty() {
             FxHashSet::default()
         } else {
-            let bindings = if self.control.generators.generator_expression
+            let bindings = if self.unit.header_symbol_names_are_final {
+                comprehension_name_bindings_with_mangler(generators, key, value, &|name| {
+                    self.symbol_analysis_name(name)
+                })
+            } else if self.control.generators.generator_expression
                 && self.unit.private_name.is_some()
             {
                 comprehension_name_bindings_with_mangler(generators, key, value, &|name| {
@@ -4201,7 +4289,7 @@ impl Compiler<'_> {
                     if *bound || !nested_temporary_names.contains(name.as_str()) {
                         return false;
                     }
-                    let name_id = self.required_name_id(name);
+                    let name_id = self.symbol_analysis_name_id(name);
                     if global_walrus_names.contains(&self.mangled_name(name)) {
                         return false;
                     }
@@ -4231,7 +4319,9 @@ impl Compiler<'_> {
 
         let mut seen_temporaries = FxHashSet::default();
         temporary_names.retain(|name| {
-            let key = if matches!(&self.unit.scope, Scope::Function { .. }) {
+            let key = if self.unit.header_symbol_names_are_final {
+                self.symbol_analysis_name(name)
+            } else if matches!(&self.unit.scope, Scope::Function { .. }) {
                 self.mangled_name(name)
             } else {
                 name.clone()
@@ -4243,7 +4333,7 @@ impl Compiler<'_> {
         let mut comprehension_free_cell_indices = FxHashMap::default();
         if let Scope::Function { free_indices, .. } = &self.unit.scope {
             for name in &temporary_names {
-                let name_id = self.required_name_id(name);
+                let name_id = self.symbol_analysis_name_id(name);
                 if comprehension_cell_ids.contains(name_id)
                     && self.is_cell(name)
                     && let Some(index) = free_indices.get(&name_id).copied()
@@ -4259,12 +4349,12 @@ impl Compiler<'_> {
             let index = self.ensure_temporary(name)?;
             temporary_indices.push(index);
             self.emit(LOAD_FAST_AND_CLEAR, index, 1)?;
-            if comprehension_cell_ids.contains(self.required_name_id(name))
+            if comprehension_cell_ids.contains(self.symbol_analysis_name_id(name))
                 && !global_walrus_names.contains(&self.mangled_name(name))
                 && self.is_cell(name)
             {
                 let cell_index = comprehension_free_cell_indices
-                    .get(&self.required_name_id(name))
+                    .get(&self.symbol_analysis_name_id(name))
                     .copied()
                     .unwrap_or(index);
                 self.emit(MAKE_CELL, cell_index, 0)?;
@@ -4275,7 +4365,7 @@ impl Compiler<'_> {
             .zip(&temporary_indices)
             .map(|(name, index)| ComprehensionRestore {
                 index: *index,
-                name: self.required_name_id(name),
+                name: self.symbol_analysis_name_id(name),
             })
             .collect::<Vec<_>>();
         if !temporary_names.is_empty() {
@@ -4287,7 +4377,7 @@ impl Compiler<'_> {
         }
         let mut local_names: NameSet = local_names
             .iter()
-            .map(|name| self.required_name_id(name))
+            .map(|name| self.symbol_analysis_name_id(name))
             .collect();
         if self.control.generators.generator_expression {
             local_names = local_names.with_aliases_from(&self.symbols.cell_names);
@@ -4295,7 +4385,7 @@ impl Compiler<'_> {
         let direct_temporary_ids = local_names.iter_unordered().collect::<Vec<_>>();
         let active_temporary_ids: Vec<_> = active_temporary_names
             .iter()
-            .map(|name| self.required_name_id(name))
+            .map(|name| self.symbol_analysis_name_id(name))
             .collect();
         let previous_active_temporary_ids: NameSet = active_temporary_ids
             .iter()
@@ -4379,7 +4469,7 @@ impl Compiler<'_> {
                 .names
                 .iter()
                 .filter_map(|name| {
-                    let name_id = self.required_name_id(name);
+                    let name_id = self.symbol_analysis_name_id(name);
                     (!facts.walrus_targets.contains(name)
                         && self.symbols.module_globals.contains(name_id))
                     .then_some(name_id)
@@ -4390,11 +4480,11 @@ impl Compiler<'_> {
             added_module_globals = facts
                 .walrus_targets
                 .iter()
-                .map(|name| self.required_name_id(name))
+                .map(|name| self.symbol_analysis_name_id(name))
                 .filter(|name| !self.symbols.module_globals.contains(*name))
                 .collect();
             for name in facts.names {
-                let name_id = self.required_name_id(&name);
+                let name_id = self.symbol_analysis_name_id(&name);
                 if !self.symbols.imported_scope_names.contains(name_id)
                     || facts.walrus_targets.contains(&name)
                 {
@@ -4669,19 +4759,55 @@ impl Compiler<'_> {
             BUILD_MAP => "<dictcomp>",
             _ => unreachable!("comprehension collection opcode"),
         };
+        let header_symbols = self.unit.header_symbol_names_are_final;
+        let symbol_name = |name: &str| {
+            if header_symbols {
+                self.symbol_analysis_name(name)
+            } else {
+                name.to_owned()
+            }
+        };
         let mut locals = vec![".0".to_string()];
         locals.extend(comprehension_temporary_names(generators, key, value));
+        let cells = if header_symbols {
+            comprehension_cell_names_with_mangler(generators, key, value, &symbol_name)
+        } else {
+            comprehension_cell_names(generators, key, value)
+        };
+        let bindings = if header_symbols {
+            comprehension_name_bindings_with_mangler(generators, key, value, &symbol_name)
+        } else {
+            comprehension_name_bindings(generators, key, value)
+        };
         let mut globals = FxHashSet::default();
-        let mut freevars = Vec::new();
-        for (name, bound) in comprehension_name_bindings(generators, key, value) {
+        let mut freevars = BTreeSet::new();
+        for (name, bound) in bindings {
             if !bound {
-                if self.can_provide_closure(&name) {
-                    freevars.push(name);
+                let name = symbol_name(&name);
+                let can_capture = if header_symbols {
+                    self.physical_closure_index(self.required_name_id(&name))?
+                        .is_some()
+                } else {
+                    self.can_provide_closure(&name)
+                };
+                if can_capture {
+                    freevars.insert(name);
                 } else {
                     globals.insert(name);
                 }
             }
         }
+        if header_symbols {
+            locals.retain(|name| {
+                symbol_name(name) == self.mangled_name(name) || cells.contains(name)
+            });
+        }
+        let mut seen = FxHashSet::default();
+        let locals = locals
+            .into_iter()
+            .map(|name| symbol_name(&name))
+            .filter(|name| seen.insert(name.clone()))
+            .collect::<Vec<_>>();
         let mut inlined_cellvars = inlined_comprehension_cell_names_in_expression(value);
         if let Some(key) = key {
             inlined_cellvars.extend(inlined_comprehension_cell_names_in_expression(key));
@@ -4699,8 +4825,9 @@ impl Compiler<'_> {
         let plan = LoweringFunctionPlan {
             locals: self.name_ids(locals),
             globals: self.name_id_set(globals),
-            cellvars: self.name_id_set(comprehension_cell_names(generators, key, value)),
-            inlined_comprehension_cellvars: self.name_id_set(inlined_cellvars),
+            cellvars: self.name_id_set(cells.iter().map(|name| symbol_name(name))),
+            inlined_comprehension_cellvars: self
+                .name_id_set(inlined_cellvars.iter().map(|name| symbol_name(name))),
             freevars: self.name_ids(freevars),
             ..LoweringFunctionPlan::default()
         };
@@ -4754,13 +4881,18 @@ impl Compiler<'_> {
             ));
         }
         let is_async = generator_is_async(generator);
+        let symbol_name = |name: &str| {
+            if self.unit.header_symbol_names_are_final {
+                self.symbol_analysis_name(name)
+            } else {
+                self.mangled_name(name)
+            }
+        };
 
         let private_spelling_collisions = self.unit.private_name.is_some()
-            && generator_has_private_spelling_collisions(generator, &|name| {
-                self.mangled_name(name)
-            });
+            && generator_has_private_spelling_collisions(generator, &symbol_name);
         let mut generator_cellvars = if private_spelling_collisions {
-            generator_cellvars_with_mangler(generator, &|name| self.mangled_name(name))
+            generator_cellvars_with_mangler(generator, &symbol_name)
         } else {
             generator_cellvars(generator)
         };
@@ -4771,16 +4903,16 @@ impl Compiler<'_> {
         let generator_locals = generator_locals.into_iter().collect::<FxHashSet<_>>();
         let generator_local_names = generator_locals
             .iter()
-            .map(|name| self.mangled_name(name))
+            .map(|name| symbol_name(name))
             .collect::<FxHashSet<_>>();
         let (external_names, external_closures, captured_targets) =
-            generator_external_names(generator, &|name| self.mangled_name(name));
+            generator_external_names(generator, &symbol_name);
         let external_closures = external_closures
             .iter()
-            .map(|name| self.mangled_name(name))
+            .map(|name| symbol_name(name))
             .collect::<FxHashSet<_>>();
         generator_cellvars.retain(|name| {
-            let canonical = self.mangled_name(name);
+            let canonical = symbol_name(name);
             !external_closures.contains(&canonical)
                 || generator_local_names.contains(&canonical)
                 || captured_targets.contains(&canonical)
@@ -4878,7 +5010,7 @@ impl Compiler<'_> {
         let mut seen = FxHashSet::default();
         locals.retain(|name| seen.insert(name.clone()));
         let local_aliases = if private_spelling_collisions {
-            generator_private_local_aliases(generator, &mut locals, &|name| self.mangled_name(name))
+            generator_private_local_aliases(generator, &mut locals, &symbol_name)
         } else {
             Vec::new()
         };
@@ -4924,17 +5056,28 @@ impl Compiler<'_> {
             );
         }
         let required_names = if private_spelling_collisions {
-            generator_required_names_with_mangler(generator, &|name| self.mangled_name(name))
+            generator_required_names_with_mangler(generator, &symbol_name)
         } else {
             generator_required_names(generator)
         };
         let mut globals = FxHashSet::default();
         let mut freevars = BTreeSet::new();
         for name in required_names {
-            if self.can_provide_closure(&name) {
-                freevars.insert(name);
+            let symbol = if self.unit.header_symbol_names_are_final {
+                symbol_name(&name)
             } else {
-                globals.insert(name);
+                name
+            };
+            let can_capture = if self.unit.header_symbol_names_are_final {
+                self.physical_closure_index(self.required_name_id(&symbol))?
+                    .is_some()
+            } else {
+                self.can_provide_closure(&symbol)
+            };
+            if can_capture {
+                freevars.insert(symbol);
+            } else {
+                globals.insert(symbol);
             }
         }
         // A child's target may be saved by an enclosing comprehension even when a
@@ -4942,24 +5085,56 @@ impl Compiler<'_> {
         // global classification separate from the temporary save order.
         let temporary_names = locals
             .iter()
-            .map(|name| self.mangled_name(name))
+            .map(|name| symbol_name(name))
             .filter(|name| !generator_local_names.contains(name))
             .collect::<FxHashSet<_>>();
         for name in external_names.into_iter().collect::<BTreeSet<_>>() {
-            if temporary_names.contains(&self.mangled_name(&name))
+            if temporary_names.contains(&symbol_name(&name))
                 && !self.generator_has_enclosing_binding(&name)
             {
-                globals.insert(name);
+                globals.insert(if self.unit.header_symbol_names_are_final {
+                    symbol_name(&name)
+                } else {
+                    name
+                });
             }
         }
         let cell_sort_names = if private_spelling_collisions {
             locals
                 .iter()
-                .map(|name| (self.required_name_id(name), self.mangled_name(name)))
+                .map(|name| (self.required_name_id(name), symbol_name(name)))
                 .collect()
         } else {
             FxHashMap::default()
         };
+        if self.unit.header_symbol_names_are_final {
+            locals.retain(|name| {
+                symbol_name(name) == self.mangled_name(name) || generator_cellvars.contains(name)
+            });
+            locals = locals.into_iter().map(|name| symbol_name(&name)).collect();
+            let mut seen = FxHashSet::default();
+            locals.retain(|name| seen.insert(name.clone()));
+            generator_cellvars = generator_cellvars
+                .into_iter()
+                .map(|name| symbol_name(&name))
+                .collect();
+            inlined_cellvars = inlined_cellvars
+                .into_iter()
+                .map(|name| symbol_name(&name))
+                .collect();
+        }
+        let header_local_storage = (self.unit.header_symbol_names_are_final
+            && !self.unit.pending_private_type_parameters.is_empty())
+        .then(|| {
+            header_generator_storage(
+                generator,
+                &generator_local_names,
+                &generator_cellvars,
+                &symbol_name,
+                &|name| self.mangled_name(name),
+                &self.context.scopes.names,
+            )
+        });
         let locals = self.name_ids(locals);
         let globals = self.name_id_set(globals);
         let generator_cellvars = self.name_id_set(generator_cellvars);
@@ -4968,17 +5143,22 @@ impl Compiler<'_> {
         let closure_names = freevars.clone();
         let generator_range = self.generator_expression_range(generator);
         let plan = LoweringFunctionPlan {
+            header_local_storage,
             locals,
             cell_sort_names,
-            local_aliases: local_aliases
-                .iter()
-                .map(|(alias, original)| {
-                    (
-                        self.required_name_id(alias),
-                        self.required_name_id(original),
-                    )
-                })
-                .collect(),
+            local_aliases: if self.unit.header_symbol_names_are_final {
+                Vec::new()
+            } else {
+                local_aliases
+                    .iter()
+                    .map(|(alias, original)| {
+                        (
+                            self.required_name_id(alias),
+                            self.required_name_id(original),
+                        )
+                    })
+                    .collect()
+            },
             globals,
             cellvars: generator_cellvars,
             inlined_comprehension_cellvars: self.name_id_set(inlined_cellvars),
@@ -6720,7 +6900,7 @@ impl Compiler<'_> {
         if let Some(index) = self.temporary_index(name) {
             return Ok(index);
         }
-        let name_id = self.required_name_id(name);
+        let name_id = self.symbol_analysis_name_id(name);
         let existing = match &self.unit.scope {
             Scope::Function { indices, .. } => indices.get(&name_id).copied(),
             Scope::Module | Scope::Class { .. } => None,
