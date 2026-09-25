@@ -26,6 +26,14 @@ mod tests {
         );
     }
 
+    // Diagnostic for https://github.com/astral-sh/serc/issues/739.
+    #[test]
+    #[ignore = "issue #739: nested constant condition retains a spurious jump"]
+    fn nested_constant_condition_matches_cpython_marshal() {
+        let source = "def f(d):\n    return 1 if (False if d else False) else 2\n";
+        assert_matches_cpython_marshal(source, "nested_constant_condition.py");
+    }
+
     #[test]
     fn terminal_guard_returns_and_raises_match_cpython() {
         let source = "def guard(flag, other):\n    if flag:\n        return flag + 1\n    if other is None:\n        raise ValueError('missing', other)\n    return other\n\ndef side_local(flag):\n    if flag:\n        value = 4\n        return value\n    return value\n\ndef side_deletion(flag):\n    if flag:\n        del flag\n        raise RuntimeError('deleted')\n    return flag\n\ndef continuing_binding(flag, value):\n    prepared = value\n    if flag:\n        prepared = flag\n        return prepared\n    if prepared is None:\n        return 42\n    return prepared\n\ndef side_check(flag):\n    if flag:\n        result\n        raise RuntimeError\n    return result\n";
