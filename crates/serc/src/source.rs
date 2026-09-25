@@ -73,6 +73,23 @@ enum Utf8Encoding {
     Alias,
 }
 
+/// Standard-library modules that CPython imports while decoding byte source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SourceCodec {
+    Ascii,
+    Latin1,
+    Iso885915,
+    EucJp,
+    Koi8R,
+    Windows1251,
+}
+
+pub(crate) struct DecodedSource<'a> {
+    pub(crate) source: Cow<'a, str>,
+    pub(crate) codec: Option<SourceCodec>,
+    pub(crate) registry_name: Option<String>,
+}
+
 /// Decode Python source bytes and normalize them for parsing.
 ///
 /// Serc accepts UTF-8 source, including a single UTF-8 BOM and CPython-compatible UTF-8
@@ -80,6 +97,12 @@ enum Utf8Encoding {
 /// Windows 1251 cookies are also decoded with CPython-compatible aliases and strict mappings.
 /// Newlines are normalized to `\n`. The returned value borrows `bytes` for unchanged UTF-8 source.
 pub fn decode_source(bytes: &[u8]) -> Result<Cow<'_, str>, SourceDecodeError> {
+    Ok(decode_source_with_codec(bytes)?.source)
+}
+
+pub(crate) fn decode_source_with_codec(
+    bytes: &[u8],
+) -> Result<DecodedSource<'_>, SourceDecodeError> {
     if bytes.contains(&0) {
         return Err(SourceDecodeError::NullByte);
     }
@@ -127,7 +150,54 @@ pub fn decode_source(bytes: &[u8]) -> Result<Cow<'_, str>, SourceDecodeError> {
                 .ok_or_else(|| SourceDecodeError::InvalidEncoding(encoding_name.to_string()))?
         }
     };
-    Ok(normalize_decoded_source(source))
+    let (codec, registry_name) =
+        declared.map_or((None, None), |name| codec_registry_effects(name, encoding));
+    Ok(DecodedSource {
+        source: normalize_decoded_source(source),
+        codec,
+        registry_name,
+    })
+}
+
+/// Mirror the tokenizer's UTF-8/Latin-1 normalization and Unicode decoder shortcuts.
+/// Successful codec-registry lookups retain the normalized requested name as well
+/// as the standard codec module's code and dictionary keys.
+fn codec_registry_effects(
+    name: &str,
+    encoding: SourceEncoding,
+) -> (Option<SourceCodec>, Option<String>) {
+    let normalized = normalize_codec_name(name);
+    let fast_path = match encoding {
+        SourceEncoding::Utf8(Utf8Encoding::BomCompatible) => true,
+        SourceEncoding::Utf8(Utf8Encoding::Alias) => normalized == "utf8" || normalized == "utf_8",
+        SourceEncoding::Ascii => matches!(normalized.as_str(), "ascii" | "us_ascii"),
+        SourceEncoding::Latin1 => {
+            classify_latin1_encoding(name)
+                || matches!(
+                    normalized.as_str(),
+                    "latin1" | "latin_1" | "iso_8859_1" | "iso8859_1"
+                )
+        }
+        SourceEncoding::Iso885915
+        | SourceEncoding::EucJp
+        | SourceEncoding::Koi8R
+        | SourceEncoding::Windows1251 => false,
+    };
+    if fast_path {
+        return (None, None);
+    }
+    let codec = match encoding {
+        // encodings.utf_8 is loaded during normal CPython startup; the caller's
+        // pre-decoding state already describes the module's retained strings.
+        SourceEncoding::Utf8(_) => None,
+        SourceEncoding::Ascii => Some(SourceCodec::Ascii),
+        SourceEncoding::Latin1 => Some(SourceCodec::Latin1),
+        SourceEncoding::Iso885915 => Some(SourceCodec::Iso885915),
+        SourceEncoding::EucJp => Some(SourceCodec::EucJp),
+        SourceEncoding::Koi8R => Some(SourceCodec::Koi8R),
+        SourceEncoding::Windows1251 => Some(SourceCodec::Windows1251),
+    };
+    (codec, Some(normalized))
 }
 
 fn decode_legacy(encoding: SourceEncoding, bytes: &[u8]) -> Option<Cow<'_, str>> {
@@ -435,9 +505,56 @@ mod tests {
     use std::borrow::Cow;
 
     use super::{
-        SourceDecodeError, SourceEncoding, classify_source_encoding, declared_encoding,
-        decode_euc_jp, decode_source, normalize_source,
+        SourceCodec, SourceDecodeError, SourceEncoding, classify_source_encoding,
+        declared_encoding, decode_euc_jp, decode_source, decode_source_with_codec,
+        normalize_source,
     };
+
+    #[test]
+    fn codec_effects_distinguish_decoder_shortcuts_and_registry_aliases() {
+        for name in [
+            "utf-8",
+            "utf_8_sig",
+            "utf8",
+            "ascii",
+            "us_ascii",
+            "latin1",
+            "latin_1",
+            "iso_8859_1_1987",
+        ] {
+            let source = format!("# coding: {name}\npass\n");
+            let decoded = decode_source_with_codec(source.as_bytes()).unwrap();
+            assert_eq!(
+                (decoded.codec, decoded.registry_name),
+                (None, None),
+                "{name}"
+            );
+        }
+        for (name, codec, registry_name) in [
+            ("utf", None, "utf"),
+            ("cp65001", None, "cp65001"),
+            ("cp367", Some(SourceCodec::Ascii), "cp367"),
+            ("cp819", Some(SourceCodec::Latin1), "cp819"),
+            ("u.jis", Some(SourceCodec::EucJp), "u.jis"),
+            (
+                "windows.1251",
+                Some(SourceCodec::Windows1251),
+                "windows.1251",
+            ),
+            ("koi8-r", Some(SourceCodec::Koi8R), "koi8_r"),
+            ("latin9", Some(SourceCodec::Iso885915), "latin9"),
+        ] {
+            let source = format!("# coding: {name}\npass\n");
+            let decoded = decode_source_with_codec(source.as_bytes()).unwrap();
+            assert_eq!(
+                (decoded.codec, decoded.registry_name.as_deref()),
+                (codec, Some(registry_name)),
+                "{name}"
+            );
+        }
+        let decoded = decode_source_with_codec(b"pass\n").unwrap();
+        assert_eq!((decoded.codec, decoded.registry_name), (None, None));
+    }
 
     #[test]
     fn borrows_source_without_normalization() {

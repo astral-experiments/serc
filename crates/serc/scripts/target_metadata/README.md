@@ -91,3 +91,22 @@ installation paths in the
 not in these sorted, unique supplements. Update the fixture's pinned digest in
 [`generate_cpython_target.py`](../generate_cpython_target.py), then
 [regenerate and check the target](../../README.md#updating-the-cpython-target).
+
+Source-codec intern strings are generated separately for each supported target.
+Byte-source decoding may load a standard codec before compilation; the generated
+sets describe names made immortal by its code objects and strings retained by
+its codec module, plus the CJK mapping exports. Generation reads only files from
+the exact pinned CPython commit and runs with that same CPython release. The CJK
+supplement also derives retained native type descriptor names from the
+referenced method, member, and getset tables and their clinic definitions. For
+example, verify the 3.14 target with:
+
+```sh
+/path/to/python3.14.5 -I -S -B crates/serc/scripts/generate_source_codec_interns.py --target-version 3.14 --cpython /path/to/cpython-3.14.5 --check
+```
+
+Use `--target-version 3.12`, `3.13`, or `3.15` with the corresponding pinned
+interpreter and checkout for the other tables. Omit `--check` to regenerate. The
+compiler separately models successful codec-registry lookup names and the
+built-in decoder shortcuts; custom registries can supply their own post-decode
+intern state using `without_standard_source_codec_effects`.

@@ -528,6 +528,133 @@ sys.stdout.buffer.write(marshal.dumps(code))
         assert_matches_cpython_marshal_bytes(&latin9, "latin9_all_bytes.py");
     }
 
+    const SOURCE_CODEC_IDENTITY_BODY: &str = "def first(value):\n    return value in {'encoding_table', 'novel_marker'}, 1\n\ndef second(value):\n    'second docstring'\n    return value in {'encoding_table', 'novel_marker'}, 2\n";
+
+    #[test]
+    fn matches_cpython_marshal_for_utf8_codec_identity_control() {
+        let source = format!("# coding: utf-8\n{SOURCE_CODEC_IDENTITY_BODY}");
+        assert_matches_cpython_marshal_bytes(source.as_bytes(), "source_codec_identity.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_when_source_codecs_intern_constants() {
+        for encoding in [
+            "cp1251",
+            "windows.1251",
+            "iso-8859-15",
+            "latin9",
+            "koi8-r",
+            "cskoi8r",
+        ] {
+            let source = format!("# coding: {encoding}\n{SOURCE_CODEC_IDENTITY_BODY}");
+            assert_matches_cpython_marshal_bytes(source.as_bytes(), "source_codec_identity.py");
+        }
+    }
+
+    #[test]
+    fn matches_codec_imports_and_registry_alias_interning() {
+        for (encoding, value) in [
+            ("cp1251", "decoding_table"),
+            ("euc-jp", "__map_jisx0208"),
+            ("euc-jp", "__create_codec"),
+            ("euc-jp", "readlines"),
+            ("euc-jp", "writelines"),
+            ("euc-jp", "stream"),
+            ("cp367", "ascii_encode"),
+            ("cp819", "latin_1_encode"),
+            ("cp65001", "cp65001"),
+            ("u.jis", "u.jis"),
+        ] {
+            let body = format!(
+                "def first(value):\n    return value in {{{value:?}, 'novel_marker'}}, 1\n\ndef second(value):\n    'second docstring'\n    return value in {{{value:?}, 'novel_marker'}}, 2\n"
+            );
+            let source = format!("# coding: {encoding}\n{body}");
+            assert_matches_cpython_marshal_bytes(source.as_bytes(), "codec_effects.py");
+        }
+    }
+
+    #[test]
+    fn matches_source_codec_interns_for_all_targets() {
+        use std::io::Write as _;
+        use std::path::Path;
+        use std::process::{Command, Stdio};
+
+        use serc::{
+            CompileOptions, PythonVersion, compile_bytes_with_options,
+            compile_bytes_with_path_and_options,
+        };
+
+        let script = "import importlib.util, marshal, sys; assert sys.implementation.name == 'cpython'; assert sys.version.split()[0] == sys.argv[1]; assert importlib.util.MAGIC_NUMBER.hex() == sys.argv[2]; code = compile(sys.stdin.buffer.read(), 'codec_effects.py', 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))";
+        for (version, variable, default) in [
+            (PythonVersion::Py312, "SERC_TEST_PYTHON_312", "python3.12"),
+            (PythonVersion::Py313, "SERC_TEST_PYTHON_313", "python3.13"),
+            (PythonVersion::Py314, "SERC_TEST_PYTHON", "python3.14"),
+            (PythonVersion::Py315, "SERC_TEST_PYTHON_315", "python3.15"),
+        ] {
+            let executable = std::env::var_os(variable).unwrap_or_else(|| default.into());
+            let target = version.target();
+            let options = CompileOptions {
+                python_version: version,
+                ..CompileOptions::default()
+            };
+            for (encoding, value) in [
+                ("utf-8", "encoding_table"),
+                ("cp1251", "encoding_table"),
+                ("cp1251", "Codec.encode"),
+                ("iso-8859-15", "decoding_table"),
+                ("koi8-r", "encoding_table"),
+                ("euc-jp", "__map_jisx0208"),
+                ("euc-jp", "readlines"),
+                ("euc-jp", "writelines"),
+                ("euc-jp", "stream"),
+                ("cp367", "ascii_encode"),
+                ("cp819", "latin_1_encode"),
+                ("cp65001", "cp65001"),
+            ] {
+                let source = if value == "Codec.encode" {
+                    format!("# coding: {encoding}\nclass Codec:\n    class encode: pass\n")
+                } else {
+                    format!(
+                        "# coding: {encoding}\ndef first(value):\n    return value in {{{value:?}, 'novel_marker'}}, 1\n\ndef second(value):\n    'second docstring'\n    return value in {{{value:?}, 'novel_marker'}}, 2\n"
+                    )
+                };
+                let mut oracle = Command::new(&executable)
+                    .args(["-B", "-I", "-S", "-X", "utf8", "-c", script])
+                    .args([target.tag.strip_prefix('v').unwrap(), &target.magic_hex()])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap_or_else(|error| panic!("could not start {executable:?}: {error}"));
+                oracle
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(source.as_bytes())
+                    .unwrap();
+                let expected = oracle.wait_with_output().unwrap();
+                assert!(
+                    expected.status.success(),
+                    "{version}, {encoding}: {}",
+                    String::from_utf8_lossy(&expected.stderr)
+                );
+                let named =
+                    compile_bytes_with_options(source.as_bytes(), "codec_effects.py", &options)
+                        .unwrap()
+                        .marshal();
+                let path = compile_bytes_with_path_and_options(
+                    source.as_bytes(),
+                    Path::new("codec_effects.py"),
+                    &options,
+                )
+                .unwrap()
+                .marshal();
+                assert_eq!(named, expected.stdout, "{version}, {encoding}");
+                assert_eq!(path, expected.stdout, "{version}, {encoding}, path");
+            }
+        }
+    }
+
     #[test]
     fn normalizes_byte_source_bom_and_text_source_newlines_before_compiling() {
         let source =

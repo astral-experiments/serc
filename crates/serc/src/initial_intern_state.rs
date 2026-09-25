@@ -16,7 +16,12 @@ use crate::target::is_preinterned_string_for;
 /// leaves every unproved entry unknown and rejects byte-relevant uncertainty.
 /// [`Self::from_partial_with_absence`] also accepts an immutable absence proof.
 ///
-/// Entries describe canonical strings retained throughout compilation. This models
+/// Entries describe canonical strings retained throughout compilation. For byte
+/// source they describe the state before source decoding; the standard codec's
+/// retained entries are added during decoding. Use
+/// [`Self::without_standard_source_codec_effects`] for a custom codec registry,
+/// modified standard codec modules or cached codecs, or when the supplied state
+/// already includes decoding's effects. This models
 /// a fixed bootstrap, not a long-lived interpreter session in which mortal interned
 /// strings may disappear. Compiling an import statement does not execute the import
 /// or change this state. Clones share the immutable entries.
@@ -25,6 +30,7 @@ pub struct InitialInternState {
     strings: Option<Arc<FxHashSet<Box<str>>>>,
     additional_strings: Option<Arc<FxHashSet<Box<str>>>>,
     mode: InitialInternMode,
+    skip_standard_source_codec_effects: bool,
 }
 
 type AbsencePredicate = dyn Fn(PythonVersion, &str) -> bool + Send + Sync;
@@ -171,6 +177,25 @@ impl InitialInternState {
             additional_strings: Some(Arc::new(additional_strings)),
             ..self.clone()
         }
+    }
+
+    /// Use the supplied state without adding standard source-codec import effects.
+    ///
+    /// This is intended for callers modeling an interpreter with a custom codec
+    /// registry, modified standard codec modules or cached codecs, or a state already
+    /// captured after decoding. The caller must account for any strings interned by
+    /// its decoder and codec-registry lookup. This has no effect when compiling
+    /// already-decoded text.
+    #[must_use]
+    pub fn without_standard_source_codec_effects(&self) -> Self {
+        Self {
+            skip_standard_source_codec_effects: true,
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn models_standard_source_codec_effects(&self) -> bool {
+        !self.skip_standard_source_codec_effects
     }
 
     pub(crate) fn uses_startup_state(&self) -> bool {
