@@ -103,6 +103,9 @@ jobs:
             CHANGELOG.md \
             "$RUNNER_TEMP/changelog-section.md"
 
+      - name: "Format changelog"
+        run: npx prettier@3.9.0 --write CHANGELOG.md
+
       - name: "Commit changelog rewrite"
         run: |
           git diff --check -- CHANGELOG.md
