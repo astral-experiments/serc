@@ -100,3 +100,13 @@ argument; the mypy_primer and PGO scripts accept `--initial-intern-state`. Their
 outcome counts and rejection checks remain mandatory, including zero unresolved
 intern states. Unsupported runtime builds fail qualification before any files
 are compared.
+
+Source-only target profiles bind a mandatory
+`source-derived-caller-initial-state` artifact through the nonempty
+`startup_profile_sha256`. The independent admission identifies this provenance
+kind separately from captured native-owner evidence. The artifact must agree
+with the outer profile's target, generator, source hashes, runtime admissions,
+and exact retained strings and runtime-relative paths. Its generator interpreter
+hash must match an admitted runtime executable. Missing artifacts, changed
+positive arrays, or mixed provenance kinds reject admission. This artifact
+proves only retained positives; every unlisted value remains unknown.

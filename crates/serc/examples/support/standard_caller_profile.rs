@@ -18,11 +18,19 @@ use super::initial_intern_profile::LoadedProfile;
 const REVIEWED_PROOFS: &[ReviewedProof] = &[ReviewedProof {
     sha256: "5a7e6ca0176ab8e07bae6bde1d54226439462b6e82493e110f4863ce2bbf45e0",
     semantics: StateSemantics::GuaranteedRetainedPartial,
+    startup_provenance: StartupProvenance::CapturedNativeOwners,
 }];
 
 struct ReviewedProof {
     sha256: &'static str,
     semantics: StateSemantics,
+    startup_provenance: StartupProvenance,
+}
+
+#[derive(Clone, Copy)]
+enum StartupProvenance {
+    CapturedNativeOwners,
+    SourceDerived,
 }
 
 #[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
@@ -51,7 +59,7 @@ struct SourceProof {
     coverage: Coverage,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Target {
     implementation: String,
@@ -84,7 +92,7 @@ struct State {
     closure_complete: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Artifact {
     path: String,
@@ -99,6 +107,24 @@ struct Coverage {
     intern_sinks: Vec<Value>,
     dynamic_name_recipes: Vec<Value>,
     unresolved: Vec<Value>,
+}
+
+/// A mandatory positive derivation artifact for profiles without captured roots.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceDerivedStartup {
+    schema_version: u32,
+    kind: String,
+    semantics: StateSemantics,
+    target: Target,
+    scope: String,
+    generator_sha256: String,
+    compiler_executable_sha256: String,
+    input_sha256: BTreeMap<String, String>,
+    runtime_admissions: Vec<Artifact>,
+    recipes: Vec<Value>,
+    retained_strings: Vec<String>,
+    retained_runtime_paths: Vec<String>,
 }
 
 /// An owned runtime whose immutable contents and environment were qualified.
@@ -171,6 +197,7 @@ pub(super) fn load(
     let directory = path
         .parent()
         .ok_or("source proof has no containing directory")?;
+    proof.validate_startup_provenance(directory, admission.startup_provenance)?;
     let preparer =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/prepare_cpython_caller.py");
     let preparer_hash = digest(&fs_err::read(&preparer).map_err(|error| error.to_string())?);
@@ -313,6 +340,99 @@ fn prepare_runtime(
 }
 
 impl SourceProof {
+    /// Verify the required provenance kind and its complete positive-state binding.
+    fn validate_startup_provenance(
+        &self,
+        directory: &Path,
+        provenance: StartupProvenance,
+    ) -> Result<(), String> {
+        let artifacts: Vec<_> = self
+            .coverage
+            .retained_owners
+            .iter()
+            .filter(|item| item["kind"] == "source-derived-initial-state-artifact")
+            .collect();
+        match provenance {
+            StartupProvenance::CapturedNativeOwners => require(
+                artifacts.is_empty(),
+                "captured-root profile claims source-only provenance",
+            ),
+            StartupProvenance::SourceDerived => {
+                require(
+                    artifacts.len() == 1,
+                    "source-derived startup artifact is required",
+                )?;
+                let artifact = artifacts[0];
+                let path = artifact["path"]
+                    .as_str()
+                    .ok_or("startup artifact path missing")?;
+                require(
+                    artifact["sha256"].as_str() == Some(&self.startup_profile_sha256),
+                    "startup artifact reference differs from required provenance hash",
+                )?;
+                let bytes = fs_err::read(directory.join(relative_path(path)?))
+                    .map_err(|error| error.to_string())?;
+                require(
+                    digest(&bytes) == self.startup_profile_sha256,
+                    "startup artifact hash differs",
+                )?;
+                let startup: SourceDerivedStartup =
+                    serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+                require(
+                    startup.schema_version == 1
+                        && startup.kind == "source-derived-caller-initial-state"
+                        && startup.scope == "isolated-fixed-caller-before-compilation"
+                        && startup.semantics == StateSemantics::GuaranteedRetainedPartial,
+                    "unsupported source-derived startup contract",
+                )?;
+                require(
+                    startup.target == self.target
+                        && startup.generator_sha256 == self.generator_sha256
+                        && startup.input_sha256 == self.input_sha256
+                        && startup.runtime_admissions == self.runtime_admissions
+                        && !startup.recipes.is_empty(),
+                    "startup artifact source, target, generator or runtime provenance differs",
+                )?;
+                require(
+                    startup.retained_strings == self.state.retained_strings
+                        && startup.retained_runtime_paths == self.state.retained_runtime_paths,
+                    "startup artifact retained positives differ from caller profile",
+                )?;
+                require(
+                    valid_hash(&startup.compiler_executable_sha256),
+                    "startup compiler hash is invalid",
+                )?;
+                let mut matching_compiler = false;
+                for runtime in &self.runtime_admissions {
+                    let bytes = fs_err::read(directory.join(relative_path(&runtime.path)?))
+                        .map_err(|error| error.to_string())?;
+                    require(
+                        digest(&bytes) == runtime.sha256,
+                        "runtime admission artifact hash differs",
+                    )?;
+                    let runtime: Value =
+                        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+                    let executable = runtime["executable"]
+                        .as_str()
+                        .ok_or("runtime executable missing")?;
+                    matching_compiler |= runtime["files"]
+                        .as_array()
+                        .ok_or("runtime file manifest missing")?
+                        .iter()
+                        .any(|file| {
+                            file["path"].as_str() == Some(executable)
+                                && file["sha256"].as_str()
+                                    == Some(&startup.compiler_executable_sha256)
+                        });
+                }
+                require(
+                    matching_compiler,
+                    "source generator compiler has no admitted runtime binding",
+                )
+            }
+        }
+    }
+
     fn validate(
         &self,
         version: PythonVersion,
@@ -482,6 +602,103 @@ mod tests {
         .err()
         .expect("unreviewed proof must fail before interpreter invocation");
         assert!(error.contains("has not been independently admitted"));
+    }
+
+    /// Exercise provenance binding without executing an interpreter or admitting a fixture.
+    #[test]
+    fn source_provenance_requires_the_artifact_and_exact_positive_runtime_bindings() {
+        use serde_json::json;
+        let directory = tempfile::tempdir().unwrap();
+        let mut profile: Value = serde_json::from_slice(include_bytes!(
+            "../../scripts/target_metadata/cpython_3_14_5_caller.json"
+        ))
+        .unwrap();
+        let parse = |value: &Value| serde_json::from_value::<SourceProof>(value.clone()).unwrap();
+        let missing = parse(&profile)
+            .validate_startup_provenance(directory.path(), StartupProvenance::SourceDerived)
+            .unwrap_err();
+        assert!(missing.contains("artifact is required"));
+
+        let runtime_bytes = include_bytes!(
+            "../../scripts/target_metadata/cpython_3_14_5_caller_runtime_linux_x86_64.json"
+        );
+        let runtime: Value = serde_json::from_slice(runtime_bytes).unwrap();
+        fs_err::write(
+            directory
+                .path()
+                .join(profile["runtime_admissions"][0]["path"].as_str().unwrap()),
+            runtime_bytes,
+        )
+        .unwrap();
+        let compiler = runtime["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == runtime["executable"])
+            .unwrap()["sha256"]
+            .clone();
+        let artifact = json!({
+            "schema_version": 1,
+            "kind": "source-derived-caller-initial-state",
+            "semantics": "guaranteed-retained-partial",
+            "scope": "isolated-fixed-caller-before-compilation",
+            "target": profile["target"],
+            "generator_sha256": profile["generator_sha256"],
+            "compiler_executable_sha256": compiler,
+            "input_sha256": profile["input_sha256"],
+            "runtime_admissions": profile["runtime_admissions"],
+            "recipes": [{"kind": "test-only-source-owner"}],
+            "retained_strings": profile["state"]["retained_strings"],
+            "retained_runtime_paths": profile["state"]["retained_runtime_paths"],
+        });
+        let bind = |profile: &mut Value, artifact: &Value| {
+            let bytes = serde_json::to_vec(artifact).unwrap();
+            let hash = digest(&bytes);
+            fs_err::write(directory.path().join("startup.json"), bytes).unwrap();
+            profile["startup_profile_sha256"] = json!(hash);
+            profile["coverage"]["retained_owners"] = json!([{
+                "kind": "source-derived-initial-state-artifact", "path": "startup.json", "sha256": hash
+            }]);
+        };
+        bind(&mut profile, &artifact);
+        parse(&profile)
+            .validate_startup_provenance(directory.path(), StartupProvenance::SourceDerived)
+            .unwrap();
+        let confusion = parse(&profile)
+            .validate_startup_provenance(directory.path(), StartupProvenance::CapturedNativeOwners)
+            .unwrap_err();
+        assert!(confusion.contains("claims source-only provenance"));
+
+        for (field, replacement, message) in [
+            (
+                "retained_strings",
+                json!(["unproved-extra-owner"]),
+                "retained positives differ",
+            ),
+            (
+                "runtime_admissions",
+                json!([]),
+                "runtime provenance differs",
+            ),
+            (
+                "compiler_executable_sha256",
+                json!("0".repeat(64)),
+                "compiler has no admitted runtime binding",
+            ),
+            (
+                "kind",
+                json!("captured-intern-table"),
+                "unsupported source-derived startup contract",
+            ),
+        ] {
+            let mut changed = artifact.clone();
+            changed[field] = replacement;
+            bind(&mut profile, &changed);
+            let error = parse(&profile)
+                .validate_startup_provenance(directory.path(), StartupProvenance::SourceDerived)
+                .unwrap_err();
+            assert!(error.contains(message), "{field}: {error}");
+        }
     }
 
     #[cfg(unix)]
