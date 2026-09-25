@@ -1,6 +1,29 @@
 use crate::common;
 
 #[test]
+fn matches_cpython_borrows_after_guarded_loop_recovery() {
+    for scope in ["def", "async def"] {
+        for guard in ["x", "not x", "x is not None"] {
+            for condition in ["x", "x != y"] {
+                for inner in ["except E:", "except E as error:"] {
+                    for outer in ["except E:", "except (E, F) as error:"] {
+                        for tail in ["use(x)", "return use(x)"] {
+                            let source = format!(
+                                "{scope} f(x, y):\n    try:\n        if {guard}:\n            while {condition}:\n                try:\n                    break\n                {inner}\n                    pass\n    {outer}\n        pass\n    {tail}\n"
+                            );
+                            common::assert_matches_cpython_marshal(
+                                &source,
+                                "guarded_loop_recovery_borrows.py",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn matches_cpython_borrows_after_surviving_while_breaks() {
     for scope in 0..4 {
         let is_async = scope == 1 || scope == 3;
