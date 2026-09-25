@@ -27,8 +27,8 @@ fn capture_boundary(python_version: PythonVersion) -> &'static str {
 pub(super) struct LoadedProfile {
     pub(super) state: InitialInternState,
     pub(super) snapshot_sha256: String,
-    pub(super) entries: usize,
-    pub(super) retained_entries: usize,
+    pub(super) description: String,
+    pub(super) qualified_oracle: Option<super::standard_caller_profile::QualifiedOracle>,
 }
 
 struct ValidatedSnapshot {
@@ -141,7 +141,19 @@ pub(super) fn load(
     source_bytes: bool,
     oracle: &str,
 ) -> Result<LoadedProfile, String> {
-    let profile: Profile = read_json(&read(path)?)?;
+    let bytes = read(path)?;
+    let envelope: Value = read_json(&bytes)?;
+    if envelope.get("kind").and_then(Value::as_str) == Some("standard-caller-source-proof") {
+        return super::standard_caller_profile::load(
+            path,
+            &bytes,
+            python,
+            python_version,
+            source_bytes,
+            oracle,
+        );
+    }
+    let profile: Profile = read_json(&bytes)?;
     profile.validate_contract(python_version, source_bytes, oracle)?;
     let executable = profile.executable.read()?;
     let snapshot = profile.snapshot.read()?;
@@ -186,10 +198,14 @@ pub(super) fn load(
     profile.validate_capture(&capture, oracle)?;
     let snapshot = validate_snapshot(read_json(&snapshot)?, &capture)?;
     Ok(LoadedProfile {
-        retained_entries: snapshot.static_strings.len(),
+        description: format!(
+            "{} observed entries; {} guaranteed retained entries",
+            snapshot.entries,
+            snapshot.static_strings.len()
+        ),
+        qualified_oracle: None,
         state: InitialInternState::from_partial(snapshot.static_strings),
         snapshot_sha256: profile.snapshot.sha256,
-        entries: snapshot.entries,
     })
 }
 

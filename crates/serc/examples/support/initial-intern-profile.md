@@ -18,7 +18,7 @@ assumption, and the option cannot be combined with compatibility-gate counts,
 `--require-all`, rejection-parity validation, a caller profile/model, or native
 cache operations.
 
-## Profile format
+## Captured profile format
 
 The [reader](initial_intern_profile.rs) defines the version 1 envelope and
 rejects unknown fields:
@@ -61,3 +61,39 @@ establish consistency, not authorship or proof of observer correctness; retain
 reviewed extraction tooling and its evidence. A fixed profile does not establish
 initial absence for unknown entries or trace subsequent mortal-string lifetimes.
 Profiles are generated artifacts, not source-controlled corpus word lists.
+
+## Standard caller source proofs
+
+A `standard-caller-source-proof` is a separate version 1 document. The
+[source-proof reader](standard_caller_profile.rs) requires an independently
+reviewed artifact hash, the exact target and unchanged oracle, complete source
+coverage, and a matching runtime admission. A document cannot grant itself
+admission by declaring its closure complete.
+
+The proof distinguishes guaranteed retained strings from all possibly present
+ASCII words. An absent ASCII word is known absent only when the complete source
+closure proves that fact. Other strings remain unknown. Python 3.12 and 3.13 add
+the current filename's retained POSIX components independently for each input;
+Python 3.14 and 3.15 do not apply that earlier pathlib behavior. All standard
+profiles require filenames whose spelling is already canonical for the unchanged
+pathlib oracle.
+
+Runtime qualification occurs once per run. The preparer verifies the exact
+interpreter, library, and standard-library files, then creates an owned
+read-only copy without bytecode caches or site packages. It verifies the
+expected frozen, source, and native module selections. The oracle uses that copy
+under the admitted complete environment, preserving its script, arguments,
+compile options, warnings, and raw-byte comparison. The original interpreter
+installation is unchanged, and the temporary copy is removed when the run ends.
+
+These profiles describe the qualified runtime and environment, not arbitrary
+inherited process settings. They cannot be combined with legacy caller models or
+native output caches. Existing captured-profile and cache invocations retain
+their original runtime behavior.
+
+The ordinary compatibility scripts select the target's reviewed standard
+profile. `check-cpython-compatibility` accepts an explicit profile as its third
+argument; the mypy_primer and PGO scripts accept `--initial-intern-state`. Their
+outcome counts and rejection checks remain mandatory, including zero unresolved
+intern states. Unsupported runtime builds fail qualification before any files
+are compared.

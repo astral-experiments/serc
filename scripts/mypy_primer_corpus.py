@@ -581,6 +581,7 @@ def compatibility_command(
     roots: Sequence[Path],
     files: int,
     limit: int | None,
+    caller_profile: Path,
 ) -> list[str]:
     command = [
         "cargo",
@@ -595,6 +596,8 @@ def compatibility_command(
         "--",
         "--python",
         python,
+        "--initial-intern-state",
+        str(caller_profile),
         "--expected-files",
         str(files),
         "--source-bytes",
@@ -615,6 +618,7 @@ def compatibility_command(
             ("exact", expected_exact),
             ("byte-mismatch", EXPECTED_BYTE_MISMATCHES),
             ("unsupported", 0),
+            ("unresolved-intern-state", 0),
             ("parse-mismatch", 0),
             ("compiler-failure", EXPECTED_COMPILER_FAILURES),
             ("matched-rejection", EXPECTED_MATCHED_REJECTIONS),
@@ -639,7 +643,9 @@ def check_compatibility(args: argparse.Namespace) -> None:
         checkout_path(args.corpus_root, repository)
         for repository in lock["repositories"]
     ]
-    command = compatibility_command(args.python, roots, content["files"], args.limit)
+    command = compatibility_command(
+        args.python, roots, content["files"], args.limit, args.initial_intern_state
+    )
     os.execvp(command[0], command)
 
 
@@ -694,6 +700,13 @@ def parser() -> argparse.ArgumentParser:
     )
     check_parser.add_argument(
         "--python", default=os.environ.get("CPYTHON", "python3.14")
+    )
+    check_parser.add_argument(
+        "--initial-intern-state",
+        type=Path,
+        default=REPO_ROOT
+        / "crates/serc/scripts/target_metadata/cpython_3_14_5_caller.json",
+        help="reviewed caller profile matching the exact CPython runtime",
     )
     check_parser.add_argument("--limit", type=positive_int)
     check_parser.set_defaults(handler=check_compatibility)

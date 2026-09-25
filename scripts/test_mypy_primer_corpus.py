@@ -154,7 +154,9 @@ def get_projects():
     def test_compatibility_command_accounts_for_every_outcome(self) -> None:
         roots = [Path("/corpus/first"), Path("/corpus/second")]
         files = 100_000
-        full = corpus.compatibility_command("python3.14", roots, files, None)
+        profile = Path("/profiles/caller.json")
+        full = corpus.compatibility_command("python3.14", roots, files, None, profile)
+        self.assertEqual(full[full.index("--initial-intern-state") + 1], str(profile))
         expected_outcomes = {
             value.split("=", 1)[0]: int(value.split("=", 1)[1])
             for option, value in pairwise(full)
@@ -170,6 +172,7 @@ def get_projects():
                 "matched-rejection",
                 "byte-mismatch",
                 "unsupported",
+                "unresolved-intern-state",
                 "parse-mismatch",
                 "compiler-failure",
                 "rejection-mismatch",
@@ -188,7 +191,10 @@ def get_projects():
         self.assertLessEqual(expected_rejected, files - expected_exact)
         self.assertNotIn("--require-all", full)
 
-        limited = corpus.compatibility_command("python3.14", roots, files, 100)
+        limited = corpus.compatibility_command("python3.14", roots, files, 100, profile)
+        self.assertEqual(
+            limited[limited.index("--initial-intern-state") + 1], str(profile)
+        )
         self.assertNotIn("--expected-outcome", limited)
         self.assertNotIn("--expected-cpython-rejected", limited)
         self.assertEqual(limited[limited.index("--limit") + 1], "100")

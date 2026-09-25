@@ -3,15 +3,22 @@
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-if [[ $# -gt 2 ]]; then
-    echo "usage: check-cpython-compatibility [PYTHON [3.12|3.13|3.14|3.15]]" >&2
+if [[ $# -gt 3 ]]; then
+    echo "usage: check-cpython-compatibility [PYTHON [3.12|3.13|3.14|3.15 [PROFILE.json]]]" >&2
     exit 2
 fi
 
 python_version="${2:-3.14}"
 expected_args="$("$repo_root/scripts/ruff-corpus-expectations" "$python_version")"
+case "$python_version" in
+    3.12) target_profile=cpython_3_12_14_caller.json ;;
+    3.13) target_profile=cpython_3_13_15_caller.json ;;
+    3.14) target_profile=cpython_3_14_5_caller.json ;;
+    3.15) target_profile=cpython_3_15_0rc2_caller.json ;;
+esac
 python="${1:-${CPYTHON:-python$python_version}}"
 ruff="$repo_root/vendor/ruff"
+caller_profile="${3:-$repo_root/crates/serc/scripts/target_metadata/$target_profile}"
 
 "$repo_root/scripts/check-ruff-pin"
 
@@ -34,6 +41,8 @@ done
 comparison_args=(
     --python "$python"
     --python-version "$python_version"
+    --initial-intern-state "$caller_profile"
+    --expected-outcome unresolved-intern-state=0
 )
 while IFS= read -r arg; do
     comparison_args+=("$arg")

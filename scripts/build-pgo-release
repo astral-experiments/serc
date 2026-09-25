@@ -48,8 +48,17 @@ def main():
         type=Path,
         help="build/profile root (default: target/pgo-release)",
     )
+    parser.add_argument(
+        "--initial-intern-state",
+        type=Path,
+        help="reviewed caller profile matching the exact CPython runtime",
+    )
     args = parser.parse_args()
     repo = Path(__file__).resolve().parent.parent
+    caller_profile = (
+        args.initial_intern_state
+        or repo / "crates/serc/scripts/target_metadata/cpython_3_14_5_caller.json"
+    ).resolve()
     output = (args.output_dir or repo / "target/pgo-release").resolve()
     if (
         output.is_relative_to(repo)
@@ -336,6 +345,10 @@ def main():
                 args.python,
                 "--python-version",
                 "3.14",
+                "--initial-intern-state",
+                caller_profile,
+                "--expected-outcome",
+                "unresolved-intern-state=0",
                 *expectations,
             ],
             {
