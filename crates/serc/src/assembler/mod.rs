@@ -4,6 +4,7 @@ mod fusion_owner_slots;
 mod ir;
 mod layout;
 mod legacy_native_labels;
+mod native_slots;
 mod passes;
 
 #[cfg(test)]

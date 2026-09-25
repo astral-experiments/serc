@@ -4,6 +4,7 @@ use std::cmp::Reverse;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
+use super::native_slots::{NativeSlots, SlotOwner};
 use super::{
     Instruction, Item, Label, LayoutAssembler, NormalizedExceptionOwner, Operand, SourceLocation,
 };
@@ -2210,9 +2211,8 @@ impl ExceptionOwnerProvenance {
         let original_folds =
             self.original_uniform_fold_positions(&instructions.iter().collect::<Vec<_>>());
         let mut setup_count = 0;
-        let mut folded_slots = 0usize;
         let mut membership_folds = 0;
-        let mut null_setup_cells = FxHashSet::default();
+        let mut slots = NativeSlots::default();
         for (index, instruction) in instructions.iter().enumerate() {
             let membership_fold = instruction.opcode == LOAD_CONST
                 && original_folds.contains(&index)
@@ -2234,8 +2234,24 @@ impl ExceptionOwnerProvenance {
                 if membership_folds > 1 {
                     return false;
                 }
-                folded_slots +=
-                    usize::from(instruction.local_policy.hidden_exception_owner_slots());
+                for _ in 0..instruction.local_policy.hidden_exception_owner_slots() {
+                    slots.push_removed(SlotOwner::Unknown);
+                }
+            }
+            // The compiler has already emitted the marker, but the native CFG
+            // appends it only after removing the folded instruction cells.
+            if index + 1 < instructions.len() {
+                // A global call folds its original PUSH_NULL into LOAD_GLOBAL.
+                if matches!((instruction.opcode, instruction.operand()),
+                    (LOAD_GLOBAL, Operand::Value(value)) if value & 1 != 0)
+                {
+                    slots.push_removed(SlotOwner::Unknown);
+                }
+                slots.push(if instruction.opcode == NOP {
+                    SlotOwner::RetainedSetup
+                } else {
+                    SlotOwner::Unknown
+                });
             }
             if index >= body.len() {
                 continue;
@@ -2289,7 +2305,6 @@ impl ExceptionOwnerProvenance {
                     {
                         return false;
                     }
-                    null_setup_cells.insert(index + folded_slots);
                     setup_count += 1;
                 }
                 LOAD_FAST => {
@@ -2358,15 +2373,6 @@ impl ExceptionOwnerProvenance {
                         })
                     {
                         return false;
-                    }
-                }
-                LOAD_GLOBAL => {
-                    // CP removes the separately emitted PUSH_NULL before
-                    // marker insertion. Keep its original cell in the SETUP
-                    // coordinates; a folded prefix is accepted only when the
-                    // append lands on an authenticated NULL SETUP cell below.
-                    if matches!(instruction.operand(), Operand::Value(value) if value & 1 != 0) {
-                        folded_slots += 1;
                     }
                 }
                 PUSH_NULL => {
@@ -2502,7 +2508,8 @@ impl ExceptionOwnerProvenance {
                         return false;
                     }
                 }
-                LOAD_NAME | LOAD_ATTR | LOAD_CONST | STORE_NAME | CALL | IMPORT_NAME => {}
+                LOAD_GLOBAL | LOAD_NAME | LOAD_ATTR | LOAD_CONST | STORE_NAME | CALL
+                | IMPORT_NAME => {}
                 crate::target::opcodes::SWAP if comprehension_restore_count > 0 && index == 0 => {}
                 _ => return false,
             }
@@ -2513,7 +2520,10 @@ impl ExceptionOwnerProvenance {
         (setup_count > 0 || comprehension_restore_count > 0)
             // With no folds, the append is fresh. Certified membership/global
             // folds may instead leave the retained SETUP in that exact array cell.
-            && (folded_slots == 0 || null_setup_cells.contains(&(instructions.len() - 1)))
+            && matches!(
+                slots.appended_owner(),
+                None | Some(SlotOwner::RetainedSetup)
+            )
             && self
                 .setups
                 .iter()
@@ -3851,8 +3861,7 @@ impl LayoutAssembler {
                     &|label| provenance.is_normal_try_copy_label(*label),
                 )
                 .unwrap_or_default();
-            let mut removed = Vec::new();
-            let mut null_setup_cells = FxHashSet::default();
+            let mut slots = NativeSlots::default();
             let mut retained = false;
             let mut valid = true;
             let mut previous = None;
@@ -3887,13 +3896,11 @@ impl LayoutAssembler {
                                 // even though our location marker precedes both labels.
                                 // Both original cells are NULL; do not infer which one
                                 // supplied the surviving physical NOP from that marker.
-                                null_setup_cells.insert(logical - 1 + removed.len());
+                                slots.set_last_owner(SlotOwner::RetainedSetup);
                                 retained = true;
                             }
                             [(_, None)] => {
-                                let cell = logical + removed.len();
-                                null_setup_cells.insert(cell);
-                                removed.push(cell);
+                                slots.push_removed(SlotOwner::RemovedSetup);
                             }
                             [] => {
                                 let retained_range_endpoint =
@@ -3949,6 +3956,7 @@ impl LayoutAssembler {
                             break;
                         }
                         previous = Some(instruction);
+                        slots.push(SlotOwner::Unknown);
                         logical += 1;
                     }
                 }
@@ -3956,7 +3964,6 @@ impl LayoutAssembler {
             let condition = origin.instruction;
             if !valid
                 || !retained
-                || !null_setup_cells.contains(&(logical + 1))
                 || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
                 || !matches!(condition.operand(), Operand::Forward(_))
                 || condition.local_policy.hidden_exception_owner_slots() != 3
@@ -3966,6 +3973,18 @@ impl LayoutAssembler {
                 || condition.exception_policy() != super::ExceptionPolicy::default()
                 || condition.jump_policy.borrow_empty_block()
             {
+                continue;
+            }
+            // The specialized condition occupies one live slot. Its three
+            // folded native records are removed before the marker is appended.
+            slots.push(SlotOwner::Unknown);
+            for _ in 0..3 {
+                slots.push_removed(SlotOwner::Unknown);
+            }
+            if !matches!(
+                slots.appended_owner(),
+                Some(SlotOwner::RetainedSetup | SlotOwner::RemovedSetup)
+            ) {
                 continue;
             }
             // Region endpoints do not split the original instruction array. Only an
@@ -4101,7 +4120,8 @@ impl LayoutAssembler {
             };
             let mut logical = array_start;
             let mut removed = 0;
-            let mut null_cell = None;
+            let mut has_retained_setup = false;
+            let mut slots = NativeSlots::default();
             let mut previous = None;
             let mut tail = ExceptionOwnerTail::default();
             let mut valid = true;
@@ -4119,9 +4139,10 @@ impl LayoutAssembler {
                         match setups.as_slice() {
                             [(_, None)] if provenance.synchronous_with_setups.contains(label) => {
                                 removed += 1;
+                                slots.push_removed(SlotOwner::RemovedSetup);
                             }
                             [(_, Some(location))] => {
-                                if null_cell.is_some()
+                                if has_retained_setup
                                     || !logical
                                         .checked_sub(1)
                                         .is_some_and(|index| retained_setup_nops.contains(&index))
@@ -4133,7 +4154,8 @@ impl LayoutAssembler {
                                     valid = false;
                                     break;
                                 }
-                                null_cell = Some(logical - 1 + removed);
+                                slots.set_last_owner(SlotOwner::RetainedSetup);
+                                has_retained_setup = true;
                             }
                             [] => {
                                 let retained_endpoint =
@@ -4205,6 +4227,7 @@ impl LayoutAssembler {
                             break;
                         }
                         previous = Some(instruction);
+                        slots.push(SlotOwner::Unknown);
                         logical += 1;
                     }
                 }
@@ -4212,7 +4235,11 @@ impl LayoutAssembler {
             // The exact Boolean expansion is already revalidated. Reinsert the
             // preceding erased manager SETUPs to recover the retained NOP's cell;
             // earlier folds occur before this final compaction and cancel out.
-            if valid && removed > 0 && logical == marker_index && null_cell == Some(marker_index) {
+            if valid
+                && removed > 0
+                && logical == marker_index
+                && slots.appended_owner() == Some(SlotOwner::RetainedSetup)
+            {
                 result.insert(marker_index);
             }
         }
