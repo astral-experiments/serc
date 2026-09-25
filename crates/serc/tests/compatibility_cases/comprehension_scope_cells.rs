@@ -1,6 +1,61 @@
 use crate::common;
 use crate::common::indent;
 
+#[test]
+fn generator_inline_cell_slot_order_matches_cpython() {
+    let source = r"g = (locals() for x, y in [(1, 2)] if [lambda: x for x in [1]])
+print(list(next(g)))
+";
+    common::assert_executes(source, "['.0', 'y', 'x']\n");
+    common::assert_matches_cpython_marshal(source, "generator_inline_cell_slot_order.py");
+
+    for (index, expression) in [
+        "(locals() for x, y in [(1, 2)] if [lambda: y for y in [1]])",
+        "(locals() for x, y in [(1, 2)] if [lambda: x for x in [1]] if [lambda: y for y in [1]])",
+        "(locals() for x, y, z in [(1, 2, 3)] if [lambda: z for z in [1]] if [lambda: x for x in [1]])",
+        "([lambda: x for x in [1]] for x, y in [(1, 2)] if [lambda: y for y in [1]])",
+        "(locals() for x in [1] if [lambda: z for z in [1]] for y in [2])",
+        "(locals() for x in [1] for y in [2] if [lambda: x for x in [1]])",
+        "(locals() for x, y in [(1, 2)] if [lambda: (x, y) for x in [1]])",
+        "(locals() for x, y in [(1, 2)] if [lambda: x for z in [1]])",
+        "(locals() for x, y in [(1, 2)] if [x for x in [1]])",
+        "(locals() for x, y in [(1, 2)] if [lambda: x for x in [lambda: y for y in [1]]])",
+        "(locals() for x, y in [(1, 2)] if [lambda: y for y in [lambda: x for x in [1]]])",
+        "(locals() for x, y in [(1, 2)] for box[[lambda: x for x in [1]]] in [3])",
+        "(locals() for x, box[[lambda: y for y in [1]]], z, y in [values])",
+        "(locals() for z in [1] for y in [x] for x in [2])",
+        "(locals() for a in [1] if [x for y in [1]] for z in [2] for x in [3])",
+        "(lambda: x for x in [1])",
+        "(lambda: (x, z) for x, z in [(1, 2)])",
+        "(locals() for x, a, z, y in [values] if [y for a in [1] if [lambda: y for y in [1]] if [lambda: z for z in [1]]])",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let source = format!("g = {expression}\n");
+        let filename = format!("generator_inline_cell_slot_order_{index}.py");
+        common::assert_matches_cpython_marshal(&source, &filename);
+    }
+
+    let source = r"g = (lambda: x for x, z in [(1, 2)] if [x for x in [1]] for z in [2])
+print(next(g)())
+";
+    common::assert_executes(source, "1\n");
+    common::assert_matches_cpython_marshal(source, "generator_shadowed_cell_slot.py");
+
+    let source = r"async def f(it):
+    return (locals() async for x, y in it if [lambda: x for x in [1]])
+";
+    common::assert_matches_cpython_marshal(source, "async_generator_inline_cell_slot.py");
+
+    let source = r"values = (1, 2)
+class C:
+    g = (lambda: __x for y, _C__x in [values] if [__x for __x in [1]] for z in [2])
+print(C.g.gi_code.co_varnames)
+";
+    common::assert_executes(source, "('.0', 'y', '_C__x', 'z')\n");
+}
+
 fn comprehension(kind: &str, element: &str, target: &str) -> String {
     match kind {
         "list" => format!("[{element} for {target} in values]"),

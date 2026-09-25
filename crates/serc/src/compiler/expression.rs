@@ -47,12 +47,13 @@ use super::constant::{
 };
 use super::scope::{
     LoweringFunctionPlan, NameId, NameSet, analyze_lambda_scope, analyze_lambda_scope_with_mangler,
-    collect_nested_comprehension_target_names, collect_self_iterated_nested_comprehension_targets,
-    collect_target_names, comprehension_cell_names, comprehension_cell_names_in_private_context,
+    collect_generator_slot_names, collect_nested_comprehension_target_names,
+    collect_self_iterated_nested_comprehension_targets, collect_target_names,
+    comprehension_cell_names, comprehension_cell_names_in_private_context,
     comprehension_name_bindings, comprehension_scope_facts, comprehension_temporary_names,
-    generator_cellvars, generator_required_names, global_comprehension_temporary_names,
-    inlined_comprehension_cell_names_in_expression, legacy_class_comprehension_names,
-    parameter_default_expressions,
+    generator_cellvars, generator_has_private_spelling_collisions, generator_required_names,
+    global_comprehension_temporary_names, inlined_comprehension_cell_names_in_expression,
+    legacy_class_comprehension_names, parameter_default_expressions,
 };
 use super::source::{
     debug_text_range, first_expression_instruction_range, fstring_literal_range,
@@ -4714,40 +4715,106 @@ impl Compiler<'_> {
         }
         let is_async = generator_is_async(generator);
 
-        let mut locals = vec![".0".to_string()];
-        // Captured inlined targets retain their fast-local slots, unlike cells belonging
-        // only to the generator. This distinction also determines the final cell order.
-        let mut inlined_cellvars = FxHashSet::default();
+        let generator_cellvars = generator_cellvars(generator);
+        let mut generator_locals = Vec::new();
+        for comprehension in &generator.generators {
+            collect_target_names(&comprehension.target, &mut generator_locals);
+        }
+        let generator_locals = generator_locals.into_iter().collect::<FxHashSet<_>>();
+
+        // Inlined comprehensions need a fast slot for every target they save, even
+        // when the enclosing generator accesses the same name through a cell.
+        let mut inlined_cellvars = inlined_comprehension_cell_names_in_expression(&generator.elt);
         for (index, comprehension) in generator.generators.iter().enumerate() {
             if index > 0 {
-                // A later iterable executes before its target is stored. Inlined
-                // comprehensions in that iterable therefore reserve their temporary fast
-                // locals before the generator target.
-                collect_nested_comprehension_target_names(&comprehension.iter, &mut locals);
                 inlined_cellvars.extend(inlined_comprehension_cell_names_in_expression(
                     &comprehension.iter,
                 ));
             }
-            collect_target_names(&comprehension.target, &mut locals);
-        }
-        collect_nested_comprehension_target_names(&generator.elt, &mut locals);
-        inlined_cellvars.extend(inlined_comprehension_cell_names_in_expression(
-            &generator.elt,
-        ));
-        for (index, comprehension) in generator.generators.iter().enumerate() {
-            collect_nested_comprehension_target_names(&comprehension.target, &mut locals);
-            if index > 0 {
-                collect_nested_comprehension_target_names(&comprehension.iter, &mut locals);
-            }
+            inlined_cellvars.extend(inlined_comprehension_cell_names_in_expression(
+                &comprehension.target,
+            ));
             for condition in &comprehension.ifs {
-                collect_nested_comprehension_target_names(condition, &mut locals);
                 inlined_cellvars.extend(inlined_comprehension_cell_names_in_expression(condition));
+            }
+        }
+
+        let mut locals = vec![".0".to_string()];
+        for (index, comprehension) in generator.generators.iter().enumerate() {
+            if index > 0 {
+                collect_generator_slot_names(
+                    &comprehension.iter,
+                    &generator_locals,
+                    &generator_cellvars,
+                    &mut locals,
+                );
+            }
+            collect_generator_slot_names(
+                &comprehension.target,
+                &generator_locals,
+                &generator_cellvars,
+                &mut locals,
+            );
+            for condition in &comprehension.ifs {
+                collect_generator_slot_names(
+                    condition,
+                    &generator_locals,
+                    &generator_cellvars,
+                    &mut locals,
+                );
+            }
+        }
+        collect_generator_slot_names(
+            &generator.elt,
+            &generator_locals,
+            &generator_cellvars,
+            &mut locals,
+        );
+        inlined_cellvars.extend(
+            locals
+                .iter()
+                .filter(|name| generator_cellvars.contains(*name))
+                .cloned(),
+        );
+        // Cell-only generator targets have no fast-local use, but still need
+        // entries for the function's separately ordered cell slots.
+        locals.extend(generator_cellvars.iter().cloned());
+
+        if self.unit.private_name.is_some()
+            && generator_has_private_spelling_collisions(generator, &|name| self.mangled_name(name))
+        {
+            // Distinct source spellings can denote one mangled name. Until generator
+            // slot planning supports aliases, preserve its previous allocation path.
+            locals = vec![".0".to_string()];
+            inlined_cellvars.clear();
+            for (index, comprehension) in generator.generators.iter().enumerate() {
+                if index > 0 {
+                    collect_nested_comprehension_target_names(&comprehension.iter, &mut locals);
+                    inlined_cellvars.extend(inlined_comprehension_cell_names_in_expression(
+                        &comprehension.iter,
+                    ));
+                }
+                collect_target_names(&comprehension.target, &mut locals);
+            }
+            collect_nested_comprehension_target_names(&generator.elt, &mut locals);
+            inlined_cellvars.extend(inlined_comprehension_cell_names_in_expression(
+                &generator.elt,
+            ));
+            for (index, comprehension) in generator.generators.iter().enumerate() {
+                collect_nested_comprehension_target_names(&comprehension.target, &mut locals);
+                if index > 0 {
+                    collect_nested_comprehension_target_names(&comprehension.iter, &mut locals);
+                }
+                for condition in &comprehension.ifs {
+                    collect_nested_comprehension_target_names(condition, &mut locals);
+                    inlined_cellvars
+                        .extend(inlined_comprehension_cell_names_in_expression(condition));
+                }
             }
         }
         let mut seen = FxHashSet::default();
         locals.retain(|name| seen.insert(name.clone()));
         let required_names = generator_required_names(generator);
-        let generator_cellvars = generator_cellvars(generator);
         let mut globals = FxHashSet::default();
         let mut freevars = BTreeSet::new();
         for name in required_names {
