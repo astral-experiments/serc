@@ -543,7 +543,7 @@ def verify_checkouts(
     if expected_content is None:
         raise CorpusError(
             "corpus lock has no frozen content identity; run "
-            "`scripts/mypy-primer-corpus.py lock-content` as part of an intentional update"
+            "`python3 scripts/mypy_primer_corpus.py lock-content` as part of an intentional update"
         )
     if actual_content != expected_content:
         raise CorpusError(
