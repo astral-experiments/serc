@@ -439,6 +439,9 @@ impl Reader {
                     json!({"status": "unsupported", "error": error})
                 }
                 CompilerOutcome::Failed(error) => json!({"status": "failed", "error": error}),
+                CompilerOutcome::UnresolvedInternState(error) => {
+                    json!({"status": "unresolved-intern-state", "error": error})
+                }
             };
             let after = fs::read(path)?;
             require(
