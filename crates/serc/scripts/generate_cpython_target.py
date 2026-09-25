@@ -1435,6 +1435,7 @@ def check_numeric_authority() -> None:
     raw_operand = re.compile(
         rf"\b(?:{'|'.join(operand_opcodes)})\s*,\s*(?:0x[0-9A-Fa-f]+|\d+)"
     )
+    opcode_names = parse_opcodes_from_generated_names()
     for path in paths:
         relative = path.relative_to(CRATE_ROOT)
         source = path.read_text()
@@ -1444,7 +1445,7 @@ def check_numeric_authority() -> None:
             raise ValueError(
                 f"{relative} duplicates a numeric target operand near `{match.group(0)}`"
             )
-        for name in parse_opcodes_from_generated_names():
+        for name in opcode_names:
             pattern = rf"^\s*const\s+{re.escape(name)}\s*:\s*u8\s*=\s*\d+"
             if re.search(pattern, source, re.MULTILINE):
                 raise ValueError(f"{relative} duplicates numeric opcode {name}")
