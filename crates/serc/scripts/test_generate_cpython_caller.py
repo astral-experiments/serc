@@ -1,4 +1,5 @@
 """Source-only tests for candidate coverage and mandatory frozen interns."""
+from __future__ import annotations
 
 import unittest
 

@@ -110,3 +110,27 @@ and exact retained strings and runtime-relative paths. Its generator interpreter
 hash must match an admitted runtime executable. Missing artifacts, changed
 positive arrays, or mixed provenance kinds reject admission. This artifact
 proves only retained positives; every unlisted value remains unknown.
+
+## Scoped initial absence
+
+A separately pinned `standard-caller-scoped-absence` companion can classify the
+complement of a reviewed possible-name set within one explicit domain. The
+positive profile remains partial and unchanged. Neither a caller-supplied
+companion nor its `scope_complete` flag grants admission.
+
+The supported domain is ASCII dotted identifiers, allowing `<locals>` after the
+first component. It excludes plain words, Unicode identifiers, arbitrary
+strings, and other anonymous-scope spellings. Candidate names remain unknown
+unless a retained-owner proof independently establishes their presence. The
+complement supplies an absence fact only for the bound target's initial state,
+before target-source decoding. Per-input retained filename components take
+precedence over this fact on targets whose pathlib implementation interns them.
+
+Each companion binds the exact positive profile, target, oracle, selected
+runtime admission, generator executable, generator/helper sources, and source
+inventory. Runtime qualification still occurs once per run. The
+[source-domain argument](../../scripts/target_metadata/caller_dotted_proof.md)
+describes the native and Python name-producing paths included by the generator.
+This certificate does not cover later decoding, warnings, parser-triggered
+imports, or arbitrary callbacks; those effects require their own chronological
+state model. Every remaining byte-relevant unknown still rejects validation.
