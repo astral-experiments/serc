@@ -152,13 +152,13 @@ mod tests {
                 negative: false,
                 digits: vec![1, 0, 0, 0, 16],
             },
-            Constant::Float(18446744073709551616.0),
+            Constant::Float(18_446_744_073_709_551_616.0),
             Constant::Complex {
-                real: 18446744073709551616.0,
+                real: 18_446_744_073_709_551_616.0,
                 imag: 0.0,
             },
             Constant::Complex {
-                real: 18446744073709551616.0,
+                real: 18_446_744_073_709_551_616.0,
                 imag: 1.0,
             },
             Constant::Float(f64::INFINITY),

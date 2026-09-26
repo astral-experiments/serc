@@ -1624,7 +1624,7 @@ pub(super) fn python_numeric_value_key(value: &Constant) -> Option<PythonNumeric
 
 fn normalized_float_zero(value: f64) -> u64 {
     let bits = value.to_bits();
-    if bits & 0x7fff_ffff_ffff_ffff == 0 {
+    if bits.trailing_zeros() >= 63 {
         0
     } else {
         bits
