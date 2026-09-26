@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hasher;
 use std::marker::PhantomData;
@@ -365,7 +365,7 @@ struct ShortNameCache(Box<NameCaches>);
 #[derive(Debug)]
 struct NameCaches {
     short: [Cell<ShortNameEntry>; 128],
-    medium: [Cell<MediumNameEntry>; 128],
+    medium: OnceCell<Box<[Cell<MediumNameEntry>; 128]>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -393,14 +393,7 @@ impl Default for ShortNameCache {
                     length: 0,
                 })
             }; 128],
-            medium: [const {
-                Cell::new(MediumNameEntry {
-                    first: 0,
-                    last: 0,
-                    id: None,
-                    length: 0,
-                })
-            }; 128],
+            medium: OnceCell::new(),
         }))
     }
 }
@@ -427,7 +420,7 @@ impl ShortNameCache {
 
     #[inline]
     fn get_medium(&self, key: MediumNameKey) -> Option<NameId> {
-        let entry = self.0.medium[key.slot()].get();
+        let entry = self.0.medium.get()?[key.slot()].get();
         if entry.first == key.first && entry.last == key.last && entry.length == key.length {
             entry.id
         } else {
@@ -437,7 +430,19 @@ impl ShortNameCache {
 
     #[inline]
     fn insert_medium(&self, key: MediumNameKey, id: NameId) {
-        self.0.medium[key.slot()].set(MediumNameEntry {
+        let entries = self.0.medium.get_or_init(|| {
+            Box::new(
+                [const {
+                    Cell::new(MediumNameEntry {
+                        first: 0,
+                        last: 0,
+                        id: None,
+                        length: 0,
+                    })
+                }; 128],
+            )
+        });
+        entries[key.slot()].set(MediumNameEntry {
             first: key.first,
             last: key.last,
             id: Some(id),
@@ -8827,6 +8832,21 @@ def function():
         assert_eq!(unseeded.get(seed), None);
         assert_eq!(unseeded.intern(&colliding), NameId::from_usize(0));
         assert_eq!(unseeded.intern(seed), NameId::from_usize(1));
+    }
+
+    #[test]
+    fn medium_name_cache_allocates_only_after_a_successful_medium_lookup() {
+        let mut names = NameInterner::seeded();
+        assert!(names.short_names.0.medium.get().is_none());
+        assert_eq!(names.get("not_present"), None);
+        assert!(names.short_names.0.medium.get().is_none());
+        assert_eq!(
+            names.get("__annotations__"),
+            Some(NameInterner::seed_id("__annotations__").unwrap())
+        );
+        assert!(names.short_names.0.medium.get().is_some());
+        let dynamic = names.intern("new_medium_name");
+        assert_eq!(names.get("new_medium_name"), Some(dynamic));
     }
 
     #[test]
