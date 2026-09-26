@@ -2612,8 +2612,15 @@ impl OptimizationPipeline {
     /// the original `POP_BLOCK` and Pass slots lets the existing copier carry their labels
     /// and exception ranges through the same ascending, once-per-round copy schedule.
     pub(in crate::assembler) fn prepare_normal_try_copy_plan(&mut self) {
-        // Prefix restoration and every selected cleanup require a forward jump.
-        if !self.graph.features().has_forward_jump() {
+        // Prefix restoration and every selected cleanup require a forward jump and
+        // a recorded normal exit or discard owner that can certify a cleanup crossing.
+        if !self.graph.features().has_forward_jump()
+            || (self.exception_owner_provenance.normal_try_exits.is_empty()
+                && self
+                    .exception_owner_provenance
+                    .normal_try_jump_owners
+                    .is_empty())
+        {
             return;
         }
         let pass_prefixes = self.restore_normal_try_pass_prefixes();
@@ -4498,6 +4505,43 @@ mod tests {
             [Label::from_u32(7), Label::from_u32(8), Label::from_u32(9)]
         );
     }
+
+    #[test]
+    fn forward_exits_without_original_cleanup_owners_leave_the_copy_plan_unchanged() {
+        let mut pipeline = two_exits();
+        pipeline.exception_owner_provenance.normal_try_exits.clear();
+        pipeline
+            .exception_owner_provenance
+            .normal_try_jump_owners
+            .clear();
+        let original_items = pipeline.graph.copy_items();
+        let original_regions = format!("{:?}", pipeline.exception_regions);
+        let original_next_label = pipeline.next_label;
+
+        // The full planner still sees the authored break, forward joins and protected
+        // ranges, but none can certify a path crossing an original cleanup.
+        pipeline.prepare_normal_try_copy_plan_with_discards(
+            &[],
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+            &FxHashMap::default(),
+        );
+        pipeline.prepare_normal_try_copy_plan();
+
+        assert_eq!(pipeline.graph.copy_items(), original_items);
+        assert_eq!(
+            format!("{:?}", pipeline.exception_regions),
+            original_regions
+        );
+        assert_eq!(pipeline.next_label, original_next_label);
+        assert!(
+            pipeline
+                .exception_owner_provenance
+                .normal_try_copy_steps
+                .is_empty()
+        );
+    }
+
     #[test]
     fn label_only_intermediate_block_does_not_certify_an_early_jump_barrier() {
         let mut pipeline = two_exits();

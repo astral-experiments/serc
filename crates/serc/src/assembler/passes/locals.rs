@@ -34,6 +34,36 @@ use crate::target::{
 
 pub(in crate::assembler) type LocalNopDonors = FxHashSet<(i32, i32, i32, i32)>;
 
+fn is_local_nop_donor(instruction: &Instruction) -> bool {
+    instruction.opcode == NOP
+        && instruction.location.line >= 0
+        && !instruction.fusion_policy.is_converted_pop_block()
+        && !instruction.jump_policy.always_retains_nop()
+        && !instruction.jump_policy.preserves_explicit_nop()
+        && !instruction.jump_policy.borrow_empty_block()
+}
+
+/// Filters out graphs without consecutive donor and converted POP instructions.
+fn has_local_nop_donor_candidate<'a>(items: impl IntoIterator<Item = &'a Item>) -> bool {
+    let mut donor_line = None;
+    for item in items {
+        let Item::Instruction(instruction) = item else {
+            continue;
+        };
+        if donor_line.is_some_and(|line| {
+            instruction.opcode == NOP
+                && instruction.fusion_policy.is_converted_pop_block()
+                && (instruction.location.line == line || instruction.location.line < 0)
+        }) {
+            // The full capture still authenticates boundaries for an unlocated POP and
+            // checks that no other occurrence uses the candidate location.
+            return true;
+        }
+        donor_line = is_local_nop_donor(instruction).then_some(instruction.location.line);
+    }
+    false
+}
+
 /// Original block entries retained for CPython's final borrowing traversal.
 #[derive(Clone, Copy)]
 pub(in crate::assembler) struct BorrowEntryLabels<'a> {
@@ -1193,6 +1223,92 @@ fn conditional_enters_original_block(
     false
 }
 
+/// Final-borrowing label categories indexed only as far as the last bound label.
+struct BorrowBoundaryLabels {
+    flags: Vec<u8>,
+    has_empty_borrow_edge: bool,
+}
+
+impl BorrowBoundaryLabels {
+    const BOUNDARY: u8 = 1;
+    const COLD_JOIN: u8 = 2;
+
+    fn collect(
+        items: &[Item],
+        exception_targets: impl IntoIterator<Item = Label>,
+        unreachable: &FxHashSet<Label>,
+        preserved: &FxHashSet<Label>,
+    ) -> Self {
+        let mut highest_bound_label = None;
+        let mut targets = SmallVec::<[(Label, u8); 16]>::new();
+        let mut has_empty_borrow_edge = false;
+        for item in items {
+            match item {
+                Item::Label(label) => {
+                    highest_bound_label = highest_bound_label.max(Some(label.index()));
+                }
+                Item::Instruction(instruction) => match instruction.operand() {
+                    Operand::Forward(label) => {
+                        has_empty_borrow_edge |= instruction.jump_policy.borrow_empty_block();
+                        targets.push((label, Self::BOUNDARY));
+                    }
+                    Operand::Backward(label) => {
+                        has_empty_borrow_edge |= instruction.jump_policy.borrow_empty_block();
+                        let flags = if instruction.opcode == JUMP_BACKWARD_NO_INTERRUPT {
+                            Self::BOUNDARY | Self::COLD_JOIN
+                        } else {
+                            Self::BOUNDARY
+                        };
+                        targets.push((label, flags));
+                    }
+                    Operand::Deferred(_) => {
+                        has_empty_borrow_edge |= instruction.jump_policy.borrow_empty_block();
+                    }
+                    Operand::Value(_) => {}
+                },
+            }
+        }
+        let mut labels = vec![0; highest_bound_label.map_or(0, |index| index + 1)];
+        for (target, flags) in targets {
+            if let Some(slot) = labels.get_mut(target.index()) {
+                *slot |= flags;
+            }
+        }
+        // Exception range endpoints are aliases; handlers create borrowing blocks.
+        for target in exception_targets
+            .into_iter()
+            .chain(unreachable.iter().copied())
+            .chain(preserved.iter().copied())
+        {
+            if let Some(slot) = labels.get_mut(target.index()) {
+                *slot |= Self::BOUNDARY;
+            }
+        }
+        Self {
+            flags: labels,
+            has_empty_borrow_edge,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.flags.len()
+    }
+
+    fn is_boundary(&self, label: Label) -> bool {
+        self.has(label, Self::BOUNDARY)
+    }
+
+    fn is_cold_join(&self, label: Label) -> bool {
+        self.has(label, Self::COLD_JOIN)
+    }
+
+    fn has(&self, label: Label, flags: u8) -> bool {
+        self.flags
+            .get(label.index())
+            .is_some_and(|value| value & flags != 0)
+    }
+}
+
 fn borrow_block_ranges(
     items: &[Item],
     boundary_labels: &FxHashSet<Label>,
@@ -1209,7 +1325,7 @@ fn borrow_block_ranges(
         .map_or(0, |index| index + 1);
     borrow_block_ranges_with_label_count(
         items,
-        boundary_labels,
+        |label| boundary_labels.contains(&label),
         borrow_unreachable_labels,
         preserved_block_boundaries,
         label_count,
@@ -1218,7 +1334,7 @@ fn borrow_block_ranges(
 
 fn borrow_block_ranges_with_label_count(
     items: &[Item],
-    boundary_labels: &FxHashSet<Label>,
+    is_boundary: impl Fn(Label) -> bool,
     borrow_unreachable_labels: &FxHashSet<Label>,
     preserved_block_boundaries: &FxHashSet<Label>,
     label_count: usize,
@@ -1233,7 +1349,7 @@ fn borrow_block_ranges_with_label_count(
 
     for (index, item) in items.iter().enumerate() {
         if let Item::Label(label) = item {
-            let is_boundary = boundary_labels.contains(label);
+            let is_boundary = is_boundary(*label);
             // Empty original blocks stop CPython's borrow traversal. Exception-range
             // aliases alone do not establish an original block before this boundary.
             if is_boundary
@@ -1717,7 +1833,7 @@ pub(in crate::assembler) fn optimize_linear_assertion_load_fast(
                     store_local(&mut unsafe_loads, &stack, argument & 15, reference);
                 }
                 COPY => stack.push(stack.copy_from_top_linear(argument)),
-                SWAP => unreachable!("linear assertion borrowing requires a SWAP-free stream"),
+                SWAP => stack.swap_from_top(argument),
                 opcode
                     if matches!(
                         opcode,
@@ -2347,7 +2463,8 @@ impl OptimizationPipeline {
         let mut initialized = vec![false; local_count - 64];
         let mut previous_has_fallthrough = false;
         let mut previous_array = None;
-        for block in self.graph.order().to_vec() {
+        for block_index in 0..self.graph.len() {
+            let block = self.graph.block_at(block_index);
             let original_array = original_arrays.and_then(|arrays| arrays.get(&block).copied());
             let continues_region = previous_has_fallthrough
                 && if original_arrays.is_some() {
@@ -2420,9 +2537,9 @@ impl OptimizationPipeline {
             .checked_shl(u32::try_from(initialized).unwrap())
             .unwrap_or(0);
         let mut unsafe_high_locals = vec![true; local_count.saturating_sub(64)];
-        let order = self.graph.order().to_vec();
         let mut has_checked_load = false;
-        for block in order {
+        for block_index in 0..self.graph.len() {
+            let block = self.graph.block_at(block_index);
             unsafe_high_locals.fill(true);
             for instruction in self.graph.instructions_mut(block) {
                 update_assertion_local_checks(
@@ -2442,7 +2559,10 @@ impl OptimizationPipeline {
     /// Records authored NOP donors before cleanup copying can collapse their arrays.
     pub(in crate::assembler) fn capture_local_nop_donors(&self) -> LocalNopDonors {
         let mut donors = LocalNopDonors::default();
-        if self.exception_regions.is_empty() || !self.graph.features().has_fast_load() {
+        if self.exception_regions.is_empty()
+            || !self.graph.features().has_fast_load()
+            || !has_local_nop_donor_candidate(self.graph.iter_items())
+        {
             return donors;
         }
         let mut boundaries = self.exception_owner_provenance.block_boundaries.clone();
@@ -2484,13 +2604,7 @@ impl OptimizationPipeline {
                     other_occurrences.insert(key);
                 }
             }
-            previous = (instruction.opcode == NOP
-                && instruction.location.line >= 0
-                && !instruction.fusion_policy.is_converted_pop_block()
-                && !instruction.jump_policy.always_retains_nop()
-                && !instruction.jump_policy.preserves_explicit_nop()
-                && !instruction.jump_policy.borrow_empty_block())
-            .then_some((*instruction, false));
+            previous = is_local_nop_donor(instruction).then_some((*instruction, false));
         }
         if let Some((donor, _)) = previous {
             let location = donor.location;
@@ -2611,6 +2725,40 @@ impl OptimizationPipeline {
         original_arrays: Option<&FxHashMap<BasicBlockId, usize>>,
         nop_donors: Option<&LocalNopDonors>,
     ) {
+        #[cfg(test)]
+        let original = self.graph.clone();
+        self.add_checks_for_uninitialized_loads_with_writeback::<PROVE_INITIALIZED, true>(
+            local_count,
+            parameter_count,
+            original_arrays,
+            nop_donors,
+        );
+        #[cfg(test)]
+        {
+            let optimized = std::mem::replace(&mut self.graph, original);
+            self.add_checks_for_uninitialized_loads_with_writeback::<PROVE_INITIALIZED, false>(
+                local_count,
+                parameter_count,
+                original_arrays,
+                nop_donors,
+            );
+            assert_eq!(optimized.copy_items(), self.graph.copy_items());
+            assert_eq!(optimized.order(), self.graph.order());
+            assert_eq!(optimized.features(), self.graph.features());
+            self.graph = optimized;
+        }
+    }
+
+    fn add_checks_for_uninitialized_loads_with_writeback<
+        const PROVE_INITIALIZED: bool,
+        const LAZY_WRITES: bool,
+    >(
+        &mut self,
+        local_count: usize,
+        parameter_count: usize,
+        original_arrays: Option<&FxHashMap<BasicBlockId, usize>>,
+        nop_donors: Option<&LocalNopDonors>,
+    ) {
         if local_count == 0 {
             return;
         }
@@ -2680,7 +2828,7 @@ impl OptimizationPipeline {
             return;
         }
         let graph = &self.graph;
-        let order = graph.order().to_vec();
+        let order = graph.order();
         let block_slot_count = order
             .iter()
             .map(|block| block.index())
@@ -2694,55 +2842,60 @@ impl OptimizationPipeline {
             block_starts[block.index()] = item_count;
             item_count += graph[block].items().len();
         }
-        let mut label_positions = vec![None; usize::try_from(self.next_label).unwrap()];
-        for (index, item) in graph.iter_items().enumerate() {
-            if let Item::Label(label) = item {
-                label_positions[label.index()] = Some(index);
-            }
-        }
-
-        let mut exception_regions = self
-            .exception_regions
-            .iter()
-            .enumerate()
-            .filter_map(|(index, region)| {
-                let start = label_positions
-                    .get(region.start.index())
-                    .copied()
-                    .flatten()?;
-                let end = label_positions.get(region.end.index()).copied().flatten()?;
-                if end <= start {
-                    return None;
+        let mut exception_successors = if self.exception_regions.is_empty() {
+            Vec::new()
+        } else {
+            let mut label_positions = vec![None; usize::try_from(self.next_label).unwrap()];
+            for (index, item) in graph.iter_items().enumerate() {
+                if let Item::Label(label) = item {
+                    label_positions[label.index()] = Some(index);
                 }
-                let target = graph.label_block(region.target).and_then(|block| {
-                    block_indices
-                        .get(block.index())
+            }
+
+            let mut exception_regions = self
+                .exception_regions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, region)| {
+                    let start = label_positions
+                        .get(region.start.index())
                         .copied()
-                        .filter(|index| *index != usize::MAX)
-                })?;
-                let (priority_start, priority_end) = match region.priority {
-                    ExceptionRegionPriority::OriginalRange(start, end) => (
-                        label_positions.get(start.index()).copied().flatten()?,
-                        label_positions.get(end.index()).copied().flatten()?,
-                    ),
-                    ExceptionRegionPriority::Resolved { start, end } => (start, end),
-                };
-                let priority = (
-                    region.is_scope_fallback,
-                    Reverse(priority_start),
-                    priority_end,
-                    index,
-                );
-                Some((start, end - start, target, priority))
-            })
-            .collect::<Vec<_>>();
-        // Fragment boundaries do not change original exception nesting. Apply lower-priority
-        // ranges first so the same original owner used by exception tables wins each slot.
-        exception_regions.sort_unstable_by_key(|(_, _, _, priority)| Reverse(*priority));
-        let mut exception_successors = vec![None; item_count];
-        for (start, span, target, _) in exception_regions {
-            exception_successors[start..start + span].fill(Some(target));
-        }
+                        .flatten()?;
+                    let end = label_positions.get(region.end.index()).copied().flatten()?;
+                    if end <= start {
+                        return None;
+                    }
+                    let target = graph.label_block(region.target).and_then(|block| {
+                        block_indices
+                            .get(block.index())
+                            .copied()
+                            .filter(|index| *index != usize::MAX)
+                    })?;
+                    let (priority_start, priority_end) = match region.priority {
+                        ExceptionRegionPriority::OriginalRange(start, end) => (
+                            label_positions.get(start.index()).copied().flatten()?,
+                            label_positions.get(end.index()).copied().flatten()?,
+                        ),
+                        ExceptionRegionPriority::Resolved { start, end } => (start, end),
+                    };
+                    let priority = (
+                        region.is_scope_fallback,
+                        Reverse(priority_start),
+                        priority_end,
+                        index,
+                    );
+                    Some((start, end - start, target, priority))
+                })
+                .collect::<Vec<_>>();
+            // Fragment boundaries do not change original exception nesting. Apply lower-priority
+            // ranges first so the same original owner used by exception tables wins each slot.
+            exception_regions.sort_unstable_by_key(|(_, _, _, priority)| Reverse(*priority));
+            let mut successors = vec![None; item_count];
+            for (start, span, target, _) in exception_regions {
+                successors[start..start + span].fill(Some(target));
+            }
+            successors
+        };
 
         // Native local analysis follows NOP compaction. Ownerless setup/POP
         // records cannot transmit uncertainty through a physical enclosing range.
@@ -2788,8 +2941,20 @@ impl OptimizationPipeline {
             .checked_shl(u32::try_from(initialized).unwrap())
             .unwrap_or(0);
         let mut unsafe_high_locals = vec![true; local_count.saturating_sub(64)];
-        let mut needs_check = vec![false; item_count];
-        let mut checked_loads_needing_check = vec![false; item_count];
+        // Original checked and unchecked loads occupy disjoint, immutable positions throughout
+        // dataflow. Their positive results can share one lazily allocated positional array.
+        let mut needs_check = if LAZY_WRITES {
+            Vec::new()
+        } else {
+            vec![false; item_count]
+        };
+        let mut checked_loads_needing_check = if LAZY_WRITES {
+            Vec::new()
+        } else {
+            vec![false; item_count]
+        };
+        let mut saw_existing_checked = false;
+        let mut saw_unsafe_ordinary = false;
         // Visit the entry and forward CFG edges first; the monotonic worklist still revisits
         // loop headers, while assertion-heavy acyclic graphs usually converge in one pass.
         let mut pending = (0..order.len()).rev().collect::<Vec<_>>();
@@ -2815,6 +2980,11 @@ impl OptimizationPipeline {
                 let Item::Instruction(instruction) = item else {
                     continue;
                 };
+                // Writeback lowers every original checked load without a positive result,
+                // including records excluded below by metadata or by an invalid local index.
+                if LAZY_WRITES && instruction.opcode == LOAD_FAST_CHECK {
+                    saw_existing_checked = true;
+                }
                 if instruction.local_policy.is_post_analysis_closure_load()
                     || instruction.local_policy.is_known_initialized_load()
                 {
@@ -2823,10 +2993,10 @@ impl OptimizationPipeline {
                 // Legacy exit copies preserve the donor's absent exception owner even
                 // inside a protected destination. Those instructions cannot contribute
                 // uncertainty to the destination's handler.
-                let ownerless_legacy_copy = self.python_version <= crate::PythonVersion::Py313
-                    && instruction.exception_policy().exclusion()
-                        == super::super::ExceptionExclusion::Always;
-                if !ownerless_legacy_copy
+                if !(exception_successors.is_empty()
+                    || (self.python_version <= crate::PythonVersion::Py313
+                        && instruction.exception_policy().exclusion()
+                            == super::super::ExceptionExclusion::Always))
                     && let Some(target) = exception_successors[block_starts[block.index()] + offset]
                 {
                     propagate(target, unsafe_locals);
@@ -2867,8 +3037,15 @@ impl OptimizationPipeline {
                             unsafe_high_locals[local - 64]
                         };
                         if is_unsafe {
-                            checked_loads_needing_check[block_starts[block.index()] + offset] =
-                                true;
+                            if LAZY_WRITES {
+                                if needs_check.is_empty() {
+                                    needs_check.resize(item_count, false);
+                                }
+                                needs_check[block_starts[block.index()] + offset] = true;
+                            } else {
+                                checked_loads_needing_check[block_starts[block.index()] + offset] =
+                                    true;
+                            }
                         }
                         if local < 64 {
                             unsafe_locals &= !(1 << local);
@@ -2883,6 +3060,12 @@ impl OptimizationPipeline {
                             unsafe_high_locals[local - 64]
                         };
                         if is_unsafe {
+                            if LAZY_WRITES {
+                                saw_unsafe_ordinary = true;
+                                if needs_check.is_empty() {
+                                    needs_check.resize(item_count, false);
+                                }
+                            }
                             needs_check[block_starts[block.index()] + offset] = true;
                         }
                         if local < 64 {
@@ -2911,19 +3094,37 @@ impl OptimizationPipeline {
             }
         }
 
+        // All ordered blocks were initially queued, even if unreachable. With neither an
+        // original checked load nor an ordinary load needing one, no opcode can change.
+        if LAZY_WRITES && !saw_existing_checked && !saw_unsafe_ordinary {
+            return;
+        }
         let graph = &mut self.graph;
         let mut created_check = false;
-        for block in order {
+        for block_index in 0..graph.len() {
+            let block = graph.block_at(block_index);
             for (offset, item) in graph.iter_items_mut(block).enumerate() {
                 let ItemMut::Instruction(instruction) = item else {
                     continue;
                 };
                 let index = block_starts[block.index()] + offset;
                 match instruction.opcode {
-                    LOAD_FAST_CHECK if !checked_loads_needing_check[index] => {
+                    LOAD_FAST_CHECK
+                        if !(if LAZY_WRITES {
+                            needs_check.get(index).copied().unwrap_or(false)
+                        } else {
+                            checked_loads_needing_check[index]
+                        }) =>
+                    {
                         instruction.opcode = LOAD_FAST;
                     }
-                    LOAD_FAST if needs_check[index] => {
+                    LOAD_FAST
+                        if if LAZY_WRITES {
+                            needs_check.get(index).copied().unwrap_or(false)
+                        } else {
+                            needs_check[index]
+                        } =>
+                    {
                         instruction.opcode = LOAD_FAST_CHECK;
                         created_check = true;
                     }
@@ -3444,7 +3645,10 @@ impl OptimizationPipeline {
         assertion_side_exits: bool,
         retained_finally_entries: &FxHashMap<Label, Label>,
     ) {
-        Self::optimize_load_fast_with_retained_entries_inner::<true>(
+        #[cfg(test)]
+        let mut eagerly_scanned = items.to_vec();
+
+        Self::optimize_load_fast_with_retained_entries_inner::<true, true>(
             python_version,
             items,
             exception_regions,
@@ -3454,9 +3658,27 @@ impl OptimizationPipeline {
             assertion_side_exits,
             retained_finally_entries,
         );
+
+        #[cfg(test)]
+        {
+            Self::optimize_load_fast_with_retained_entries_inner::<true, false>(
+                python_version,
+                &mut eagerly_scanned,
+                exception_regions,
+                entries,
+                preserved_block_boundaries,
+                borrow_block_aliases,
+                assertion_side_exits,
+                retained_finally_entries,
+            );
+            assert_eq!(items, eagerly_scanned);
+        }
     }
 
-    fn optimize_load_fast_with_retained_entries_inner<const DIRECT: bool>(
+    fn optimize_load_fast_with_retained_entries_inner<
+        const DIRECT: bool,
+        const GATE_SCANS: bool,
+    >(
         python_version: crate::PythonVersion,
         items: &mut [Item],
         exception_regions: &[ExceptionRegion],
@@ -3541,38 +3763,15 @@ impl OptimizationPipeline {
         } else if assertion_side_exits {
             (assertion_borrow_block_ranges(items), None)
         } else {
-            let mut block_labels = FxHashSet::default();
             // Cold-handler relocation keeps its shared warm break block nonempty. The
             // surviving authored break still reaches its exit, even when an adjacent
             // removed loop anchor records a disconnected fallthrough at that target.
-            let mut cold_join_targets = FxHashSet::default();
-            let mut highest_bound_label = None;
-            for item in items.iter() {
-                match item {
-                    Item::Label(label) => {
-                        highest_bound_label = highest_bound_label.max(Some(label.index()));
-                    }
-                    Item::Instruction(instruction) => match instruction.operand() {
-                        Operand::Forward(label) => {
-                            block_labels.insert(label);
-                        }
-                        Operand::Backward(label) => {
-                            block_labels.insert(label);
-                            if instruction.opcode == JUMP_BACKWARD_NO_INTERRUPT {
-                                cold_join_targets.insert(label);
-                            }
-                        }
-                        Operand::Value(_) | Operand::Deferred(_) => {}
-                    },
-                }
-            }
-            // CPython's borrow analysis operates on CFG blocks. Protected-range
-            // boundaries do not create blocks, but exception handlers do.
-            for region in exception_regions {
-                block_labels.insert(region.target);
-            }
-            block_labels.extend(borrow_unreachable_labels.iter().copied());
-            block_labels.extend(preserved_block_boundaries.iter().copied());
+            let labels = BorrowBoundaryLabels::collect(
+                items,
+                exception_regions.iter().map(|region| region.target),
+                borrow_unreachable_labels,
+                preserved_block_boundaries,
+            );
 
             let borrow_boundaries = if borrow_block_aliases.is_empty() {
                 std::borrow::Cow::Borrowed(preserved_block_boundaries)
@@ -3587,10 +3786,10 @@ impl OptimizationPipeline {
             let (blocks, label_blocks, borrow_unreachable_blocks) =
                 borrow_block_ranges_with_label_count(
                     items,
-                    &block_labels,
+                    |label| labels.is_boundary(label),
                     borrow_unreachable_labels,
                     &borrow_boundaries,
-                    highest_bound_label.map_or(0, |index| index + 1),
+                    labels.len(),
                 );
             let jump_entry_blocks = if borrow_jump_entry_labels.is_empty() {
                 Vec::new()
@@ -3697,11 +3896,15 @@ impl OptimizationPipeline {
             };
             let surviving_instruction_offsets = (!borrow_finally_entries.is_empty()
                 || !pre_copy_jump_entries.is_empty()
-                || items.iter().any(|item| {
-                    matches!(item, Item::Instruction(instruction)
-                        if instruction.jump_policy.borrow_empty_block()
-                            && !matches!(instruction.operand(), Operand::Value(_)))
-                }))
+                || if GATE_SCANS {
+                    labels.has_empty_borrow_edge
+                } else {
+                    items.iter().any(|item| {
+                        matches!(item, Item::Instruction(instruction)
+                            if instruction.jump_policy.borrow_empty_block()
+                                && !matches!(instruction.operand(), Operand::Value(_)))
+                    })
+                })
             .then(|| {
                 let mut retention = BorrowMarkerRetention::new(items);
                 let mut offsets = Vec::with_capacity(items.len() + 1);
@@ -3780,77 +3983,89 @@ impl OptimizationPipeline {
                     // A surviving original direct jump can become a physical NOP
                     // when cold handlers move away. Its exact target certificate
                     // admits fallthrough without reopening erased handler exits.
-                    let original_finally_entry = items[blocks[block].clone()]
-                        .iter()
-                        .rev()
-                        .find_map(|item| match item {
-                            Item::Label(label) => Some(label),
-                            Item::Instruction(_) => None,
-                        })
-                        .and_then(|source| retained_finally_entries.get(source))
-                        .is_some_and(|target| {
-                            label_blocks.get(target.index()).copied() == Some(block + 1)
-                                && items[blocks[block + 1].clone()].iter().all(|item| {
-                                    !matches!(item, Item::Label(label)
-                                            if borrow_unreachable_labels.contains(label)
-                                                && !borrow_finally_entries.contains_key(label))
-                                })
-                                && items[blocks[block + 1].clone()]
-                                    .iter()
-                                    .find_map(|item| match item {
-                                        Item::Instruction(instruction) => Some(instruction),
-                                        Item::Label(_) => None,
-                                    })
-                                    .is_some_and(|instruction| {
-                                        (!matches!(instruction.opcode, NOP | NOT_TAKEN)
-                                            || (instruction.opcode == NOP
-                                                && items[blocks[block + 1].clone()].iter().any(
-                                                    |item| {
-                                                        matches!(item, Item::Label(label)
-                                                        if borrow_block_aliases.contains(label)
-                                                            && borrow_finally_entries.get(label)
-                                                                .is_some_and(Option::is_some))
-                                                    },
-                                                )))
-                                            && !instruction.jump_policy.borrow_empty_block()
-                                    })
-                        });
-                    let retained_finally_entry = last.opcode == NOP
-                        && last.jump_policy.retained_nop()
-                            == crate::assembler::ir::RetainedJumpNop::DirectTarget
+                    let inspect_finally_source = !retained_finally_entries.is_empty()
                         && finally_jump_sources.get(block).copied().unwrap_or(false)
-                        && jump_entry_blocks.get(block + 1).copied().unwrap_or(false)
-                        // Earlier physical instructions can precede the exact
-                        // original source labels after block merging. Replay has
-                        // authenticated the final source label and its sole NOP.
+                        && jump_entry_blocks.get(block + 1).copied().unwrap_or(false);
+                    let original_finally_entry = (!GATE_SCANS || inspect_finally_source)
                         && items[blocks[block].clone()]
                             .iter()
                             .rev()
-                            .take_while(|item| !matches!(item, Item::Label(_)))
-                            .filter(|item| matches!(item, Item::Instruction(_)))
-                            .count()
-                            == 1
-                        && original_finally_entry;
+                            .find_map(|item| match item {
+                                Item::Label(label) => Some(label),
+                                Item::Instruction(_) => None,
+                            })
+                            .and_then(|source| retained_finally_entries.get(source))
+                            .is_some_and(|target| {
+                                label_blocks.get(target.index()).copied() == Some(block + 1)
+                                    && items[blocks[block + 1].clone()].iter().all(|item| {
+                                        !matches!(item, Item::Label(label)
+                                            if borrow_unreachable_labels.contains(label)
+                                                && !borrow_finally_entries.contains_key(label))
+                                    })
+                                    && items[blocks[block + 1].clone()]
+                                        .iter()
+                                        .find_map(|item| match item {
+                                            Item::Instruction(instruction) => Some(instruction),
+                                            Item::Label(_) => None,
+                                        })
+                                        .is_some_and(|instruction| {
+                                            (!matches!(instruction.opcode, NOP | NOT_TAKEN)
+                                                || (instruction.opcode == NOP
+                                                    && items[blocks[block + 1].clone()]
+                                                        .iter()
+                                                        .any(|item| {
+                                                            matches!(item, Item::Label(label)
+                                                        if borrow_block_aliases.contains(label)
+                                                            && borrow_finally_entries.get(label)
+                                                                .is_some_and(Option::is_some))
+                                                        })))
+                                                && !instruction.jump_policy.borrow_empty_block()
+                                        })
+                            });
+                    let retained_finally_entry = if GATE_SCANS && !original_finally_entry {
+                        false
+                    } else {
+                        let has_retained_source = last.opcode == NOP
+                            && last.jump_policy.retained_nop()
+                                == crate::assembler::ir::RetainedJumpNop::DirectTarget
+                            && finally_jump_sources.get(block).copied().unwrap_or(false)
+                            && jump_entry_blocks.get(block + 1).copied().unwrap_or(false)
+                            // Earlier physical instructions can precede the exact
+                            // original source labels after block merging. Replay has
+                            // authenticated the final source label and its sole NOP.
+                            && items[blocks[block].clone()]
+                                .iter()
+                                .rev()
+                                .take_while(|item| !matches!(item, Item::Label(_)))
+                                .filter(|item| matches!(item, Item::Instruction(_)))
+                                .count()
+                                == 1;
+                        has_retained_source && original_finally_entry
+                    };
                     // Removing a redundant ordinary jump preserves fallthrough when
                     // its original source still has its complete nonempty prefix.
                     // The same endpoint certificate rejects empty or merged targets.
                     // A sole surviving authored NOP is populated too, but only
                     // the exact source/target replay above may admit this route.
                     // DirectTarget jump surrogates retain their separate policy.
-                    let retained_source_nop = last.opcode == NOP
-                        && last.operand() == Operand::Value(0)
-                        && last.location.line >= 0
-                        && !last.fusion_policy.is_converted_pop_block()
-                        && last.pre_fold_extra_instructions() == 0
-                        && last.local_policy.hidden_exception_owner_slots() == 0
-                        && last.jump_policy.retained_nop()
-                            == crate::assembler::ir::RetainedJumpNop::None
-                        && items[blocks[block].clone()]
-                            .iter()
-                            .filter(|item| matches!(item, Item::Instruction(_)))
-                            .count()
-                            == 1
-                        && original_finally_entry;
+                    let retained_source_nop = if GATE_SCANS && !original_finally_entry {
+                        false
+                    } else {
+                        let is_sole_source_nop = last.opcode == NOP
+                            && last.operand() == Operand::Value(0)
+                            && last.location.line >= 0
+                            && !last.fusion_policy.is_converted_pop_block()
+                            && last.pre_fold_extra_instructions() == 0
+                            && last.local_policy.hidden_exception_owner_slots() == 0
+                            && last.jump_policy.retained_nop()
+                                == crate::assembler::ir::RetainedJumpNop::None
+                            && items[blocks[block].clone()]
+                                .iter()
+                                .filter(|item| matches!(item, Item::Instruction(_)))
+                                .count()
+                                == 1;
+                        is_sole_source_nop && original_finally_entry
+                    };
                     let erased_finally_entry = (!matches!(last.opcode, NOP | NOT_TAKEN)
                         || retained_source_nop)
                         && finally_jump_sources.get(block).copied().unwrap_or(false)
@@ -3878,6 +4093,7 @@ impl OptimizationPipeline {
                     // This admission belongs to the live conditional, never to another
                     // route entering an earlier empty label in the same physical range.
                     if is_conditional_jump(last.opcode)
+                        && (!GATE_SCANS || !retained_finally_entries.is_empty())
                         && let Some(finally) = items[blocks[block].clone()]
                             .iter()
                             .rev()
@@ -3930,7 +4146,7 @@ impl OptimizationPipeline {
                     );
                     let shared_break = last.fusion_policy.is_authored_break()
                         && items[blocks[block].clone()].iter().any(|item| {
-                            matches!(item, Item::Label(label) if cold_join_targets.contains(label))
+                            matches!(item, Item::Label(label) if labels.is_cold_join(*label))
                         });
                     // Removed breaks have only fallthrough. When enabled for this exit,
                     // a surviving authored break can enter its nonempty continuation;
@@ -4047,23 +4263,40 @@ impl OptimizationPipeline {
                     // entry without turning a removed jump's NOP into a new CFG edge.
                     let mut has_original_prefix = false;
                     let mut nearest_label = None;
-                    for item in &items[blocks[block].clone()] {
-                        match item {
-                            Item::Label(label) => {
-                                nearest_label = Some(*label);
-                                if original_block_boundaries.contains(label) {
-                                    has_original_prefix = false;
+                    let inspect_jump_source = is_unconditional_jump(last.opcode)
+                        && last.no_location_policy.borrow_fallthrough()
+                            == BorrowFallthrough::Reachable
+                        && !last.jump_policy.borrow_empty_block()
+                        && jump_entry_blocks.get(target).copied().unwrap_or(false)
+                        && (!pre_copy_jump_entries.is_empty()
+                            || (last.fusion_policy.is_authored_break()
+                                && !authored_finally_break_entries.is_empty()))
+                        && surviving_instruction_offsets
+                            .as_ref()
+                            .is_some_and(|offsets| {
+                                offsets[blocks[block].end] != offsets[blocks[target].start]
+                            });
+                    if !GATE_SCANS || inspect_jump_source {
+                        for item in &items[blocks[block].clone()] {
+                            match item {
+                                Item::Label(label) => {
+                                    nearest_label = Some(*label);
+                                    if original_block_boundaries.contains(label) {
+                                        has_original_prefix = false;
+                                    }
                                 }
+                                Item::Instruction(instruction)
+                                    if std::ptr::eq(instruction, last) =>
+                                {
+                                    break;
+                                }
+                                Item::Instruction(instruction)
+                                    if !matches!(instruction.opcode, NOP | NOT_TAKEN) =>
+                                {
+                                    has_original_prefix = true;
+                                }
+                                Item::Instruction(_) => {}
                             }
-                            Item::Instruction(instruction) if std::ptr::eq(instruction, last) => {
-                                break;
-                            }
-                            Item::Instruction(instruction)
-                                if !matches!(instruction.opcode, NOP | NOT_TAKEN) =>
-                            {
-                                has_original_prefix = true;
-                            }
-                            Item::Instruction(_) => {}
                         }
                     }
                     // The surviving instructions must belong to this original array.
@@ -4456,9 +4689,9 @@ impl OptimizationPipeline {
         }
 
         let graph = &mut self.graph;
-        let order = graph.order().to_vec();
         let mut changed = false;
-        for block in order {
+        for block_index in 0..graph.len() {
+            let block = graph.block_at(block_index);
             changed |= graph.fuse_adjacent_instructions(block, fuse_pair);
         }
         changed
@@ -4470,7 +4703,8 @@ mod tests {
     use rustc_hash::{FxHashMap, FxHashSet};
 
     use super::{
-        assertion_borrow_block_ranges, borrow_block_ranges, borrow_block_ranges_with_label_count,
+        BorrowBoundaryLabels, assertion_borrow_block_ranges, borrow_block_ranges,
+        borrow_block_ranges_with_label_count,
     };
     use crate::assembler::{
         BorrowFallthrough, BorrowLoopExitPolicy, Instruction, Item, JUMP_BACKWARD_NO_INTERRUPT,
@@ -4486,6 +4720,47 @@ mod tests {
             SourceLocation::NONE,
             None,
         ))
+    }
+
+    #[test]
+    fn local_nop_donor_candidates_require_an_eligible_adjacent_instruction() {
+        let donor = Instruction::new(
+            NOP,
+            Operand::Value(0),
+            SourceLocation::new(7, 7, 0, 1),
+            None,
+        );
+        let converted = |line| {
+            let mut instruction = Instruction::new(
+                NOP,
+                Operand::Value(0),
+                SourceLocation::new(line, line, 0, 1),
+                None,
+            );
+            instruction.fusion_policy.mark_converted_pop_block();
+            Item::Instruction(instruction)
+        };
+        let candidate = |items: &[Item]| super::has_local_nop_donor_candidate(items);
+        let label = Item::Label(Label::from_u32(0));
+        assert!(candidate(&[Item::Instruction(donor), label, converted(7)]));
+        assert!(candidate(&[Item::Instruction(donor), label, converted(-1)]));
+        assert!(!candidate(&[Item::Instruction(donor), converted(8)]));
+        assert!(!candidate(&[converted(7), Item::Instruction(donor)]));
+        assert!(!candidate(&[
+            Item::Instruction(donor),
+            instruction(LOAD_FAST, Operand::Value(0)),
+            converted(7),
+        ]));
+        assert!(!candidate(&[Item::Instruction(donor)]));
+
+        let mut ineligible = [donor; 4];
+        ineligible[0].location = SourceLocation::NONE;
+        ineligible[1].fusion_policy.mark_converted_pop_block();
+        ineligible[2].jump_policy.preserve_explicit_nop();
+        ineligible[3].jump_policy.mark_borrow_empty_block();
+        for donor in ineligible {
+            assert!(!candidate(&[Item::Instruction(donor), converted(7)]));
+        }
     }
 
     fn borrow_instruction(opcode: crate::target::Opcode, operand: Operand, depth: u32) -> Item {
@@ -4505,25 +4780,40 @@ mod tests {
     }
 
     fn general_borrow<const DIRECT: bool>(items: &mut [Item], unreachable: &FxHashSet<Label>) {
-        super::OptimizationPipeline::optimize_load_fast_with_retained_entries_inner::<DIRECT>(
+        let mut eagerly_scanned = items.to_vec();
+        let empty_labels = FxHashSet::default();
+        let empty_entries = FxHashMap::default();
+        let entries = super::BorrowEntryLabels {
+            unreachable,
+            loop_exits: &FxHashMap::default(),
+            finally_entries: &FxHashMap::default(),
+            finally_jump_sources: &FxHashMap::default(),
+            jump_entries: &empty_labels,
+            original_boundaries: &empty_labels,
+            pre_copy_jump_entries: &empty_entries,
+            authored_finally_break_entries: &FxHashMap::default(),
+        };
+        super::OptimizationPipeline::optimize_load_fast_with_retained_entries_inner::<DIRECT, true>(
             crate::PythonVersion::Py314,
             items,
             &[],
-            super::BorrowEntryLabels {
-                unreachable,
-                loop_exits: &FxHashMap::default(),
-                finally_entries: &FxHashMap::default(),
-                finally_jump_sources: &FxHashMap::default(),
-                jump_entries: &FxHashSet::default(),
-                original_boundaries: &FxHashSet::default(),
-                pre_copy_jump_entries: &FxHashMap::default(),
-                authored_finally_break_entries: &FxHashMap::default(),
-            },
-            &FxHashSet::default(),
-            &FxHashSet::default(),
+            entries,
+            &empty_labels,
+            &empty_labels,
             false,
-            &FxHashMap::default(),
+            &empty_entries,
         );
+        super::OptimizationPipeline::optimize_load_fast_with_retained_entries_inner::<DIRECT, false>(
+            crate::PythonVersion::Py314,
+            &mut eagerly_scanned,
+            &[],
+            entries,
+            &empty_labels,
+            &empty_labels,
+            false,
+            &empty_entries,
+        );
+        assert_eq!(items, eagerly_scanned);
     }
 
     fn borrow_opcodes(items: &[Item]) -> Vec<crate::target::Opcode> {
@@ -4865,6 +5155,243 @@ mod tests {
             false,
             &[LOAD_FAST, LOAD_FAST_CHECK],
         );
+    }
+
+    #[test]
+    fn lazy_initial_local_writeback_keeps_original_checked_load_semantics() {
+        use crate::PythonVersion;
+        use crate::assembler::OperandPatchId;
+        use crate::target::opcodes::LOAD_FAST_CHECK;
+
+        let [target, dead] = [0, 1].map(Label::from_u32);
+        let make = |items: Vec<Item>, version| {
+            let mut assembler = crate::assembler::Assembler::from_linear_items(items);
+            assembler.next_label = 2;
+            let mut pipeline = assembler.into_optimization_pipeline();
+            pipeline.python_version = version;
+            pipeline
+        };
+        let loads = |pipeline: &super::OptimizationPipeline| {
+            pipeline
+                .graph
+                .iter_items()
+                .filter_map(|item| match item {
+                    Item::Instruction(instruction)
+                        if matches!(instruction.opcode, LOAD_FAST | LOAD_FAST_CHECK) =>
+                    {
+                        Some(instruction.opcode)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            for (operand, policy, expected) in [
+                (Operand::Value(0), 0, LOAD_FAST),
+                (Operand::Value(1), 0, LOAD_FAST_CHECK),
+                (Operand::Value(8), 0, LOAD_FAST),
+                (Operand::Value(0), 1, LOAD_FAST),
+                (Operand::Value(0), 2, LOAD_FAST),
+                (Operand::Value(1), 1, LOAD_FAST),
+                (Operand::Value(1), 2, LOAD_FAST),
+                (Operand::Deferred(OperandPatchId::from_u32(0)), 0, LOAD_FAST),
+            ] {
+                let mut checked =
+                    Instruction::new(LOAD_FAST_CHECK, operand, SourceLocation::NONE, None);
+                match policy {
+                    1 => checked.local_policy.mark_post_analysis_closure_load(),
+                    2 => checked.local_policy.mark_known_initialized_load(),
+                    _ => {}
+                }
+                let mut pipeline = make(
+                    vec![
+                        instruction(LOAD_FAST, Operand::Value(0)),
+                        instruction(JUMP_FORWARD, Operand::Forward(target)),
+                        Item::Label(target),
+                        Item::Instruction(checked),
+                        instruction(LOAD_FAST, Operand::Value(0)),
+                        instruction(RETURN_VALUE, Operand::Value(0)),
+                        Item::Label(dead),
+                        instruction(RETURN_VALUE, Operand::Value(0)),
+                    ],
+                    version,
+                );
+                assert!(pipeline.graph.features().has_checked_fast_load());
+                pipeline.add_checks_for_uninitialized_loads_in_arrays::<false>(2, 1, None, None);
+                assert_eq!(
+                    loads(&pipeline),
+                    [LOAD_FAST, expected, LOAD_FAST],
+                    "{version:?} {operand:?} {policy}"
+                );
+                assert!(pipeline.graph.features().has_checked_fast_load());
+            }
+
+            let mut pipeline = make(
+                vec![
+                    instruction(LOAD_FAST, Operand::Value(0)),
+                    instruction(JUMP_FORWARD, Operand::Forward(target)),
+                    Item::Label(target),
+                    instruction(LOAD_FAST_CHECK, Operand::Value(1)),
+                    instruction(LOAD_FAST, Operand::Value(1)),
+                    instruction(RETURN_VALUE, Operand::Value(0)),
+                ],
+                version,
+            );
+            pipeline.add_checks_for_uninitialized_loads_in_arrays::<false>(2, 1, None, None);
+            assert_eq!(loads(&pipeline), [LOAD_FAST, LOAD_FAST_CHECK, LOAD_FAST]);
+
+            for post_analysis in [false, true] {
+                let mut pipeline = make(
+                    vec![
+                        instruction(LOAD_FAST, Operand::Value(0)),
+                        instruction(JUMP_FORWARD, Operand::Forward(target)),
+                        Item::Label(target),
+                        instruction(LOAD_FAST, Operand::Value(1)),
+                        instruction(RETURN_VALUE, Operand::Value(0)),
+                    ],
+                    version,
+                );
+                assert!(!pipeline.graph.features().has_checked_fast_load());
+                let block = pipeline.graph.label_block(target).unwrap();
+                let checked = pipeline.graph.instructions_mut(block).next().unwrap();
+                checked.opcode = LOAD_FAST_CHECK;
+                if post_analysis {
+                    checked.local_policy.mark_post_analysis_closure_load();
+                } else {
+                    checked.local_policy.mark_known_initialized_load();
+                }
+                assert!(!pipeline.graph.features().has_checked_fast_load());
+                pipeline.add_checks_for_uninitialized_loads_in_arrays::<false>(2, 1, None, None);
+                assert_eq!(loads(&pipeline), [LOAD_FAST, LOAD_FAST]);
+                assert!(!pipeline.graph.features().has_checked_fast_load());
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_initial_local_writeback_visits_unreachable_and_preserved_high_loads() {
+        use crate::PythonVersion;
+        use crate::target::opcodes::{LOAD_FAST_CHECK, STORE_FAST};
+
+        let target = Label::from_u32(0);
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            for (middle, expected) in [
+                (
+                    vec![
+                        instruction(RETURN_VALUE, Operand::Value(0)),
+                        Item::Label(target),
+                        instruction(LOAD_FAST, Operand::Value(1)),
+                        instruction(LOAD_FAST, Operand::Value(64)),
+                    ],
+                    vec![LOAD_FAST, LOAD_FAST, LOAD_FAST_CHECK],
+                ),
+                (
+                    vec![
+                        instruction(JUMP_FORWARD, Operand::Forward(target)),
+                        Item::Label(target),
+                        instruction(STORE_FAST, Operand::Value(64)),
+                        instruction(LOAD_FAST_CHECK, Operand::Value(64)),
+                    ],
+                    vec![LOAD_FAST, LOAD_FAST],
+                ),
+            ] {
+                let mut items = vec![instruction(LOAD_FAST, Operand::Value(0))];
+                items.extend(middle);
+                items.push(instruction(RETURN_VALUE, Operand::Value(0)));
+                let mut assembler = crate::assembler::Assembler::from_linear_items(items);
+                assembler.next_label = 1;
+                let mut pipeline = assembler.into_optimization_pipeline();
+                pipeline.python_version = version;
+                pipeline.add_checks_for_uninitialized_loads_in_arrays::<false>(65, 65, None, None);
+                let loads = pipeline
+                    .graph
+                    .iter_items()
+                    .filter_map(|item| match item {
+                        Item::Instruction(instruction)
+                            if matches!(instruction.opcode, LOAD_FAST | LOAD_FAST_CHECK) =>
+                        {
+                            Some(instruction.opcode)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(loads, expected, "{version:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn exception_free_local_dataflow_matches_empty_protected_ranges() {
+        use crate::PythonVersion;
+        use crate::target::opcodes::{LOAD_FAST_CHECK, STORE_FAST};
+
+        let initialized = Label::from_u32(0);
+        let join = Label::from_u32(1);
+        let value = Operand::Value;
+        let items = vec![
+            instruction(LOAD_FAST, value(0)),
+            instruction(POP_JUMP_IF_TRUE, Operand::Forward(initialized)),
+            instruction(NOT_TAKEN, value(0)),
+            instruction(JUMP_FORWARD, Operand::Forward(join)),
+            Item::Label(initialized),
+            instruction(STORE_FAST, value(1)),
+            Item::Label(join),
+            instruction(LOAD_FAST, value(1)),
+            instruction(RETURN_VALUE, value(0)),
+        ];
+        let empty_region = super::ExceptionRegion {
+            is_scope_fallback: false,
+            priority: super::ExceptionRegionPriority::OriginalRange(initialized, initialized),
+            start: initialized,
+            end: initialized,
+            target: join,
+            depth: 0,
+            preserve_lasti: false,
+        };
+
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let analyze = |regions| {
+                let mut assembler = crate::assembler::Assembler::from_linear_items(items.clone());
+                assembler.next_label = 2;
+                assembler.exception_regions = regions;
+                let mut pipeline = assembler.into_optimization_pipeline();
+                pipeline.python_version = python_version;
+                pipeline.add_checks_for_uninitialized_loads_in_arrays::<false>(2, 1, None, None);
+                pipeline.graph
+            };
+
+            let exception_free = analyze(Vec::new());
+            let empty_protected = analyze(vec![empty_region]);
+            assert_eq!(exception_free.copy_items(), empty_protected.copy_items());
+            assert!(exception_free.features().has_checked_fast_load());
+            let loads = exception_free
+                .iter_items()
+                .filter_map(|item| match item {
+                    Item::Instruction(instruction)
+                        if matches!(instruction.opcode, LOAD_FAST | LOAD_FAST_CHECK) =>
+                    {
+                        Some(instruction.opcode)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(loads, [LOAD_FAST, LOAD_FAST_CHECK]);
+        }
     }
 
     #[test]
@@ -5532,8 +6059,13 @@ mod tests {
         let unreachable = FxHashSet::from_iter([target, unbound_forward]);
         let preserved = FxHashSet::default();
         let automatic = borrow_block_ranges(&items, &boundaries, &unreachable, &preserved);
-        let precalculated =
-            borrow_block_ranges_with_label_count(&items, &boundaries, &unreachable, &preserved, 8);
+        let precalculated = borrow_block_ranges_with_label_count(
+            &items,
+            |label| boundaries.contains(&label),
+            &unreachable,
+            &preserved,
+            8,
+        );
 
         assert_eq!(automatic, precalculated);
         assert_eq!(automatic.0, [0..3, 3..6, 6..7, 7..8]);
@@ -5566,6 +6098,118 @@ mod tests {
                 optimized[index],
                 Item::Instruction(instruction) if instruction.opcode == LOAD_FAST_BORROW
             ));
+        }
+    }
+
+    #[test]
+    fn dense_borrow_label_categories_match_hash_ranges_for_bound_and_sparse_labels() {
+        let labels = [2, 7, 15, 17, 32, 33, 41].map(Label::from_u32);
+        let [
+            start,
+            forward,
+            cold,
+            handler,
+            unreachable_label,
+            preserved_label,
+            last,
+        ] = labels;
+        let unbound_hole = Label::from_u32(31);
+        let unbound = Label::from_u32(u32::MAX - 1);
+        let items = [
+            Item::Label(start),
+            instruction(LOAD_FAST, Operand::Value(0)),
+            instruction(POP_JUMP_IF_TRUE, Operand::Forward(forward)),
+            Item::Label(forward),
+            Item::Label(cold),
+            instruction(LOAD_FAST, Operand::Value(1)),
+            Item::Label(handler),
+            instruction(JUMP_FORWARD, Operand::Forward(cold)),
+            Item::Label(unreachable_label),
+            Item::Label(preserved_label),
+            instruction(JUMP_FORWARD, Operand::Forward(unbound_hole)),
+            instruction(JUMP_BACKWARD_NO_INTERRUPT, Operand::Backward(cold)),
+            instruction(JUMP_BACKWARD_NO_INTERRUPT, Operand::Backward(unbound)),
+            Item::Label(last),
+            instruction(RETURN_VALUE, Operand::Value(0)),
+        ];
+        let unreachable = FxHashSet::from_iter([unreachable_label, unbound]);
+        let preserved = FxHashSet::from_iter([preserved_label, unbound]);
+        let boundaries = FxHashSet::from_iter([
+            forward,
+            cold,
+            handler,
+            unreachable_label,
+            preserved_label,
+            unbound_hole,
+            unbound,
+        ]);
+        let cold_joins = FxHashSet::from_iter([cold, unbound]);
+        let dense =
+            BorrowBoundaryLabels::collect(&items, [handler, unbound], &unreachable, &preserved);
+        assert_eq!(dense.len(), last.index() + 1);
+        for label in labels.into_iter().chain([unbound_hole]) {
+            assert_eq!(dense.is_boundary(label), boundaries.contains(&label));
+            assert_eq!(dense.is_cold_join(label), cold_joins.contains(&label));
+        }
+        assert!(!dense.is_boundary(unbound));
+        assert!(!dense.is_cold_join(unbound));
+        assert_eq!(
+            borrow_block_ranges_with_label_count(
+                &items,
+                |label| dense.is_boundary(label),
+                &unreachable,
+                &preserved,
+                dense.len(),
+            ),
+            borrow_block_ranges(&items, &boundaries, &unreachable, &preserved),
+        );
+
+        let no_bound_items = [instruction(
+            JUMP_BACKWARD_NO_INTERRUPT,
+            Operand::Backward(unbound),
+        )];
+        let no_bound =
+            BorrowBoundaryLabels::collect(&no_bound_items, [unbound], &unreachable, &preserved);
+        assert_eq!(no_bound.len(), 0);
+        assert!(!no_bound.is_cold_join(unbound));
+    }
+
+    #[test]
+    fn dense_borrow_categories_retain_exact_empty_edge_policy() {
+        use crate::assembler::OperandPatchId;
+
+        let label = Label::from_u32(4);
+        let operands = [
+            Operand::Value(0),
+            Operand::Forward(label),
+            Operand::Backward(label),
+            Operand::Deferred(OperandPatchId::from_u32(0)),
+        ];
+        for operand in operands {
+            for marker in [false, true] {
+                let mut candidate = Instruction::new(NOP, operand, SourceLocation::NONE, None);
+                if marker {
+                    candidate.jump_policy.mark_borrow_empty_block();
+                }
+                let items = [
+                    Item::Label(label),
+                    instruction(LOAD_FAST, Operand::Value(0)),
+                    Item::Instruction(candidate),
+                ];
+                let categories = BorrowBoundaryLabels::collect(
+                    &items,
+                    [],
+                    &FxHashSet::default(),
+                    &FxHashSet::default(),
+                );
+                let original = items.iter().any(|item| {
+                    matches!(item, Item::Instruction(instruction)
+                        if instruction.jump_policy.borrow_empty_block()
+                            && !matches!(instruction.operand(), Operand::Value(_)))
+                });
+                assert_eq!(categories.has_empty_borrow_edge, original);
+                assert_eq!(original, marker && operand != Operand::Value(0));
+            }
         }
     }
 

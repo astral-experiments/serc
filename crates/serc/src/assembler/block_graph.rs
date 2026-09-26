@@ -2,16 +2,20 @@ use std::ops::Index;
 
 use ruff_index::{IndexVec, newtype_index};
 use rustc_hash::FxHashSet;
+use smallvec::SmallVec;
 
 use crate::target::opcodes::{
-    COPY, IS_OP, LOAD_FAST, LOAD_FAST_BORROW, LOAD_FAST_CHECK, LOAD_FAST_LOAD_FAST,
-    POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, STORE_FAST, SWAP,
-    TO_BOOL, UNARY_NOT,
+    COPY, IS_OP, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, KW_NAMES, LOAD_CONST,
+    LOAD_FAST, LOAD_FAST_BORROW, LOAD_FAST_CHECK, LOAD_FAST_LOAD_FAST, NOP, NOT_TAKEN,
+    POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, RETURN_CONST,
+    STORE_FAST, SWAP, TO_BOOL, UNARY_NOT,
 };
 
+#[cfg(test)]
+use super::block_jump_target;
 use super::{
-    ExceptionRegion, Instruction, Item, Label, Operand, block_has_fallthrough, block_jump_target,
-    ends_scope, is_unconditional_jump,
+    BorrowFallthrough, ExceptionPolicy, ExceptionRegion, Instruction, Item, Label, Operand,
+    block_has_fallthrough, ends_scope, is_unconditional_jump,
 };
 
 /// A stable handle to a basic block.
@@ -81,6 +85,20 @@ impl BasicBlock {
             Item::Label(_) => None,
         })
     }
+
+    /// Finds the fallthrough and explicit target from the same final instruction.
+    pub(super) fn successors(&self) -> (bool, Option<Label>) {
+        let Some(instruction) = self.last_instruction() else {
+            return (true, None);
+        };
+        let falls_through =
+            !ends_scope(instruction.opcode) && !is_unconditional_jump(instruction.opcode);
+        let target = match instruction.operand() {
+            Operand::Forward(target) | Operand::Backward(target) => Some(target),
+            Operand::Value(_) | Operand::Deferred(_) => None,
+        };
+        (falls_through, target)
+    }
 }
 
 /// Conservative opcode and IR-policy summary for gating assembler passes.
@@ -100,44 +118,80 @@ impl PipelineFeatures {
     const COPY_TOP: u16 = 1 << 9;
     const CHECKED_FAST_LOAD: u16 = 1 << 10;
     const IDENTITY_COMPARISON: u16 = 1 << 11;
+    const NOT_TAKEN: u16 = 1 << 12;
+    const ORIGINAL_FUSION_OWNER_CANDIDATE: u16 = 1 << 13;
+    const CHECK_COPY: u16 = 1 << 14;
+    const CHECK_FUSION_OWNER: u16 = 1 << 15;
+
+    const FORWARD_FEATURES: u16 = Self::FORWARD_JUMP | Self::FORWARD_CONDITIONAL;
+    const CHECK_FEATURES: u16 = Self::CHECK_COPY | Self::CHECK_FUSION_OWNER;
+
+    /// Static features and the policy checks relevant to each semantic IR opcode.
+    const BY_OPCODE: [u16; 256] = {
+        let mut flags = [0; 256];
+        flags[JUMP_BACKWARD.code() as usize] = Self::FORWARD_JUMP;
+        flags[JUMP_BACKWARD_NO_INTERRUPT.code() as usize] = Self::FORWARD_JUMP;
+        flags[JUMP_FORWARD.code() as usize] = Self::FORWARD_JUMP;
+        flags[POP_JUMP_IF_FALSE.code() as usize] =
+            Self::FORWARD_CONDITIONAL | Self::POP_CONDITIONAL;
+        flags[POP_JUMP_IF_TRUE.code() as usize] = Self::FORWARD_CONDITIONAL | Self::POP_CONDITIONAL;
+        flags[POP_JUMP_IF_NONE.code() as usize] = Self::POP_CONDITIONAL;
+        flags[POP_JUMP_IF_NOT_NONE.code() as usize] = Self::POP_CONDITIONAL;
+        flags[SWAP.code() as usize] = Self::SWAP_TRIGGER;
+        flags[LOAD_FAST_CHECK.code() as usize] = Self::FAST_LOAD | Self::CHECKED_FAST_LOAD;
+        flags[LOAD_FAST.code() as usize] = Self::FAST_LOAD;
+        flags[LOAD_FAST_BORROW.code() as usize] = Self::FAST_LOAD;
+        flags[LOAD_FAST_LOAD_FAST.code() as usize] = Self::FAST_LOAD;
+        flags[STORE_FAST.code() as usize] = Self::STORE_FAST_TRIGGER;
+        flags[TO_BOOL.code() as usize] = Self::BOOLEAN_CONVERSION;
+        flags[UNARY_NOT.code() as usize] = Self::BOOLEAN_CONVERSION;
+        flags[IS_OP.code() as usize] = Self::IDENTITY_COMPARISON;
+        flags[COPY.code() as usize] = Self::CHECK_COPY;
+        flags[NOT_TAKEN.code() as usize] = Self::NOT_TAKEN | Self::CHECK_FUSION_OWNER;
+        flags[NOP.code() as usize] = Self::CHECK_FUSION_OWNER;
+        flags[LOAD_CONST.code() as usize] = Self::CHECK_FUSION_OWNER;
+        flags[RETURN_CONST.code() as usize] = Self::CHECK_FUSION_OWNER;
+        flags[KW_NAMES.code() as usize] = Self::CHECK_FUSION_OWNER;
+        flags
+    };
 
     fn record(&mut self, instruction: &Instruction) {
-        self.0 |= match instruction.opcode {
-            opcode
-                if is_unconditional_jump(opcode)
-                    && matches!(instruction.operand(), Operand::Forward(_)) =>
-            {
-                Self::FORWARD_JUMP
+        let opcode_features = Self::BY_OPCODE[usize::from(instruction.opcode.code())];
+        let mut features = opcode_features & !(Self::FORWARD_FEATURES | Self::CHECK_FEATURES);
+        let operand = instruction.operand();
+        match operand {
+            Operand::Forward(_) => {
+                features |= (opcode_features & Self::FORWARD_FEATURES) | Self::JUMP;
             }
-            POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE
-                if matches!(instruction.operand(), Operand::Forward(_)) =>
-            {
-                Self::FORWARD_CONDITIONAL
+            Operand::Backward(_) => features |= Self::JUMP,
+            Operand::Value(_) | Operand::Deferred(_) => {}
+        }
+        if opcode_features & Self::CHECK_COPY != 0 && operand == Operand::Value(1) {
+            features |= Self::COPY_TOP;
+        }
+        if opcode_features & Self::CHECK_FUSION_OWNER != 0 {
+            let has_owner = if opcode_features & Self::NOT_TAKEN != 0 {
+                matches!(
+                    instruction.exception_policy(),
+                    ExceptionPolicy::NoneUnchangedBooleanSingleton
+                        | ExceptionPolicy::NonePresent
+                        | ExceptionPolicy::NoneAbsent
+                )
+            } else {
+                // Constant reachability can turn an unused indexed constant into a
+                // NOP without changing the folded slots or its fallthrough policy.
+                instruction.pre_fold_extra_instructions() == 2
+                    && instruction.no_location_policy.borrow_fallthrough()
+                        == BorrowFallthrough::Barrier
+            };
+            if has_owner {
+                features |= Self::ORIGINAL_FUSION_OWNER_CANDIDATE;
             }
-            SWAP => Self::SWAP_TRIGGER,
-            LOAD_FAST_CHECK => Self::FAST_LOAD | Self::CHECKED_FAST_LOAD,
-            LOAD_FAST | LOAD_FAST_BORROW | LOAD_FAST_LOAD_FAST => Self::FAST_LOAD,
-            STORE_FAST => Self::STORE_FAST_TRIGGER,
-            TO_BOOL | UNARY_NOT => Self::BOOLEAN_CONVERSION,
-            IS_OP => Self::IDENTITY_COMPARISON,
-            COPY if instruction.operand() == Operand::Value(1) => Self::COPY_TOP,
-            _ => 0,
-        };
+        }
         if instruction.jump_policy.borrow_empty_block() {
-            self.0 |= Self::BORROW_EMPTY_BLOCK;
+            features |= Self::BORROW_EMPTY_BLOCK;
         }
-        if matches!(
-            instruction.operand(),
-            Operand::Forward(_) | Operand::Backward(_)
-        ) {
-            self.0 |= Self::JUMP;
-        }
-        if matches!(
-            instruction.opcode,
-            POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
-        ) {
-            self.0 |= Self::POP_CONDITIONAL;
-        }
+        self.0 |= features;
     }
 
     fn merge(&mut self, other: Self) {
@@ -191,6 +245,15 @@ impl PipelineFeatures {
     pub(super) const fn has_copy_top(self) -> bool {
         self.0 & Self::COPY_TOP != 0
     }
+
+    pub(super) const fn has_not_taken(self) -> bool {
+        self.0 & Self::NOT_TAKEN != 0
+    }
+
+    /// Whether an authored marker or folded assertion could carry an original fusion owner.
+    pub(super) const fn has_original_fusion_owner_candidate(self) -> bool {
+        self.0 & Self::ORIGINAL_FUSION_OWNER_CANDIDATE != 0
+    }
 }
 
 /// The assembler's block-aware intermediate representation.
@@ -206,25 +269,35 @@ pub(super) struct BlockGraph {
     features: PipelineFeatures,
 }
 
+#[cfg(test)]
 fn normalized_segment_lengths<'a>(
     items: impl IntoIterator<Item = &'a Item>,
-    item_count: usize,
     preserved_block_boundaries: &FxHashSet<Label>,
-) -> (Vec<usize>, PipelineFeatures) {
-    let mut lengths = Vec::with_capacity(item_count);
+) -> (SmallVec<[usize; 16]>, PipelineFeatures) {
+    normalized_segment_lengths_with_labels(items, preserved_block_boundaries, |_, _| {})
+}
+
+/// Visits each label after its normalized block's ordinal has been determined.
+fn normalized_segment_lengths_with_labels<'a>(
+    items: impl IntoIterator<Item = &'a Item>,
+    preserved_block_boundaries: &FxHashSet<Label>,
+    mut visit_label: impl FnMut(Label, usize),
+) -> (SmallVec<[usize; 16]>, PipelineFeatures) {
+    let mut lengths = SmallVec::new();
     let mut length = 0;
     let mut has_instruction = false;
     let mut features = PipelineFeatures::default();
     for item in items {
-        if let Item::Instruction(instruction) = item {
-            features.record(instruction);
-        }
-        if let Item::Label(label) = item
-            && (has_instruction || (length > 0 && preserved_block_boundaries.contains(label)))
-        {
-            lengths.push(length);
-            length = 0;
-            has_instruction = false;
+        match item {
+            Item::Label(label) => {
+                if has_instruction || (length > 0 && preserved_block_boundaries.contains(label)) {
+                    lengths.push(length);
+                    length = 0;
+                    has_instruction = false;
+                }
+                visit_label(*label, lengths.len());
+            }
+            Item::Instruction(instruction) => features.record(instruction),
         }
         let ends_block = matches!(item, Item::Instruction(instruction) if
             !matches!(instruction.operand(), Operand::Value(_))
@@ -245,11 +318,11 @@ fn normalized_segment_lengths<'a>(
 
 fn collect_segments<T>(
     items: impl IntoIterator<Item = T>,
-    segment_lengths: Vec<usize>,
+    segment_lengths: &[usize],
 ) -> Vec<Vec<T>> {
     let mut items = items.into_iter();
     let mut segments = Vec::with_capacity(segment_lengths.len());
-    for length in segment_lengths {
+    for &length in segment_lengths {
         debug_assert!(length > 0);
         let mut segment = Vec::with_capacity(length);
         for _ in 0..length {
@@ -317,12 +390,21 @@ pub(super) fn fuse_adjacent_instructions(
 }
 
 impl BlockGraph {
+    #[cfg(test)]
     fn partition_items(
         items: Vec<Item>,
         preserved_block_boundaries: &FxHashSet<Label>,
     ) -> (Vec<Vec<Item>>, PipelineFeatures) {
+        Self::partition_items_with_labels(items, preserved_block_boundaries, |_, _| {})
+    }
+
+    fn partition_items_with_labels(
+        items: Vec<Item>,
+        preserved_block_boundaries: &FxHashSet<Label>,
+        visit_label: impl FnMut(Label, usize),
+    ) -> (Vec<Vec<Item>>, PipelineFeatures) {
         let (lengths, features) =
-            normalized_segment_lengths(&items, items.len(), preserved_block_boundaries);
+            normalized_segment_lengths_with_labels(&items, preserved_block_boundaries, visit_label);
         if lengths.len() == 1 {
             return (vec![items], features);
         }
@@ -342,20 +424,29 @@ impl BlockGraph {
         items: Vec<Item>,
         preserved_block_boundaries: &FxHashSet<Label>,
     ) -> Self {
-        let (blocks, features) = Self::partition_items(items, preserved_block_boundaries);
+        let mut label_blocks = Vec::new();
+        let (blocks, features) = Self::partition_items_with_labels(
+            items,
+            preserved_block_boundaries,
+            |label, ordinal| {
+                Self::bind_label_in_index(
+                    &mut label_blocks,
+                    label,
+                    BasicBlockId::from_usize(ordinal),
+                );
+            },
+        );
         let blocks = blocks
             .into_iter()
             .map(BasicBlock::new)
             .collect::<IndexVec<BasicBlockId, _>>();
         let order = blocks.indices().collect();
-        let mut graph = Self {
+        Self {
             blocks,
             order,
-            label_blocks: Vec::new(),
+            label_blocks,
             features,
-        };
-        graph.rebuild_label_index();
-        graph
+        }
     }
 
     pub(super) fn len(&self) -> usize {
@@ -437,11 +528,20 @@ impl BlockGraph {
     ) -> Result<(), String> {
         self.validate_order(&order)?;
         self.order = order;
-        if self.is_normalized(preserved_block_boundaries) {
-            self.rebuild_label_index();
-        } else {
-            self.normalize_blocks(preserved_block_boundaries);
+        let mut label_blocks = std::mem::take(&mut self.label_blocks);
+        label_blocks.fill(None);
+        let (segment_lengths, features) =
+            self.plan_normalization(preserved_block_boundaries, &mut label_blocks);
+        let prefix = segment_lengths
+            .iter()
+            .copied()
+            .zip(self.order.iter().map(|block| self[*block].items.len()))
+            .take_while(|(normalized, physical)| normalized == physical)
+            .count();
+        if prefix != segment_lengths.len() || prefix != self.order.len() {
+            self.repartition_from_segments(&segment_lengths, features, prefix);
         }
+        self.label_blocks = label_blocks;
         Ok(())
     }
 
@@ -459,16 +559,20 @@ impl BlockGraph {
         self.label_blocks.get(label.index()).copied().flatten()
     }
 
-    fn clear_label_index(&mut self) {
-        self.label_blocks.fill(None);
+    fn bind_label(&mut self, label: Label, block: BasicBlockId) {
+        Self::bind_label_in_index(&mut self.label_blocks, label, block);
     }
 
-    fn bind_label(&mut self, label: Label, block: BasicBlockId) {
+    fn bind_label_in_index(
+        label_blocks: &mut Vec<Option<BasicBlockId>>,
+        label: Label,
+        block: BasicBlockId,
+    ) {
         let index = label.index();
-        if index >= self.label_blocks.len() {
-            self.label_blocks.resize(index + 1, None);
+        if index >= label_blocks.len() {
+            label_blocks.resize(index + 1, None);
         }
-        let previous = self.label_blocks[index].replace(block);
+        let previous = label_blocks[index].replace(block);
         debug_assert_eq!(previous, None, "label is bound more than once");
     }
 
@@ -500,9 +604,15 @@ impl BlockGraph {
     }
 
     pub(super) fn allocate_block(&mut self, items: Vec<Item>) -> BasicBlockId {
+        let block = self.allocate_unbound_block(items);
+        self.bind_block_labels(block, 0);
+        block
+    }
+
+    /// Adds a block whose labels are installed separately by its caller.
+    fn allocate_unbound_block(&mut self, items: Vec<Item>) -> BasicBlockId {
         let block = self.blocks.next_index();
         self.blocks.push(BasicBlock::new(items));
-        self.bind_block_labels(block, 0);
         block
     }
 
@@ -511,48 +621,92 @@ impl BlockGraph {
         items: Vec<Item>,
         preserved_block_boundaries: &FxHashSet<Label>,
     ) -> Vec<BasicBlockId> {
-        let (segments, features) = Self::partition_items(items, preserved_block_boundaries);
+        let first_block = self.blocks.len();
+        let (segments, features) = Self::partition_items_with_labels(
+            items,
+            preserved_block_boundaries,
+            |label, ordinal| {
+                self.bind_label(label, BasicBlockId::from_usize(first_block + ordinal));
+            },
+        );
         self.features.merge(features);
         segments
             .into_iter()
-            .map(|items| self.allocate_block(items))
+            .map(|items| self.allocate_unbound_block(items))
             .collect()
     }
 
     /// Repartitions existing blocks without changing the identity of each
     /// block's first resulting segment.
-    pub(super) fn normalize_blocks(&mut self, preserved_block_boundaries: &FxHashSet<Label>) {
-        // Labels may move from an existing block into a newly allocated suffix.
-        // Rebuild the index after repartitioning instead of treating that move
-        // as a duplicate binding.
-        self.clear_label_index();
-        let item_count = self
-            .order
-            .iter()
-            .map(|block| self[*block].items.len())
-            .sum();
-        let (segment_lengths, features) =
-            normalized_segment_lengths(self.iter_items(), item_count, preserved_block_boundaries);
+    #[cfg(test)]
+    pub(super) fn normalize_blocks(&mut self, boundaries: &FxHashSet<Label>) {
+        self.normalize_blocks_from(0, boundaries);
+    }
+
+    /// Repartitions only after the first physical boundary normalization would change.
+    pub(super) fn normalize_blocks_if_needed(&mut self, boundaries: &FxHashSet<Label>) {
+        if let Err(prefix) = self.normalized_prefix(boundaries) {
+            self.normalize_blocks_from(prefix, boundaries);
+        }
+    }
+
+    /// Refreshes all normalization metadata but leaves verified prefix vectors in place.
+    fn normalize_blocks_from(&mut self, prefix: usize, boundaries: &FxHashSet<Label>) {
+        let mut label_blocks = std::mem::take(&mut self.label_blocks);
+        label_blocks.fill(None);
+        let (segment_lengths, features) = self.plan_normalization(boundaries, &mut label_blocks);
+        self.repartition_from_segments(&segment_lengths, features, prefix);
+        self.label_blocks = label_blocks;
+    }
+
+    /// Records normalized segment lengths and binds labels to their eventual arena identities.
+    fn plan_normalization(
+        &self,
+        preserved_block_boundaries: &FxHashSet<Label>,
+        label_blocks: &mut Vec<Option<BasicBlockId>>,
+    ) -> (SmallVec<[usize; 16]>, PipelineFeatures) {
+        // Normalization reuses ordered IDs before allocating any additional suffix blocks.
+        let first_new_block = self.blocks.len();
+        normalized_segment_lengths_with_labels(
+            self.iter_items(),
+            preserved_block_boundaries,
+            |label, ordinal| {
+                let block = self.order.get(ordinal).copied().unwrap_or_else(|| {
+                    BasicBlockId::from_usize(first_new_block + ordinal - self.order.len())
+                });
+                Self::bind_label_in_index(label_blocks, label, block);
+            },
+        )
+    }
+
+    /// Applies an already inspected partition while preserving its reused block identities.
+    fn repartition_from_segments(
+        &mut self,
+        segment_lengths: &[usize],
+        features: PipelineFeatures,
+        prefix: usize,
+    ) {
+        debug_assert!(prefix <= self.order.len().min(segment_lengths.len()));
         self.features.merge(features);
         let original_order = std::mem::take(&mut self.order);
-        let items = original_order
+        let items = original_order[prefix..]
             .iter()
             .copied()
             .flat_map(|block| std::mem::take(&mut self.blocks[block].items));
-        let segments = collect_segments(items, segment_lengths);
+        let segments = collect_segments(items, &segment_lengths[prefix..]);
 
-        let mut reusable = original_order.into_iter();
-        let mut order = Vec::with_capacity(segments.len());
+        let mut order = Vec::with_capacity(prefix + segments.len());
+        order.extend_from_slice(&original_order[..prefix]);
+        let mut reusable = original_order.into_iter().skip(prefix);
         for items in segments {
             if let Some(block) = reusable.next() {
                 self.blocks[block].items = items;
                 order.push(block);
             } else {
-                order.push(self.allocate_block(items));
+                order.push(self.allocate_unbound_block(items));
             }
         }
         self.order = order;
-        self.rebuild_label_index();
     }
 
     /// Rejoins certified internal continuations without changing any instruction or label.
@@ -624,8 +778,15 @@ impl BlockGraph {
     }
 
     /// Returns whether normalization would preserve every physical block boundary.
+    #[cfg(test)]
     pub(super) fn is_normalized(&self, boundaries: &FxHashSet<Label>) -> bool {
+        self.normalized_prefix(boundaries).is_ok()
+    }
+
+    /// Returns the number of physical blocks that are already exact when a boundary differs.
+    fn normalized_prefix(&self, boundaries: &FxHashSet<Label>) -> Result<(), usize> {
         let mut physical_lengths = self.order.iter().map(|block| self[*block].items.len());
+        let mut prefix = 0;
         let mut length = 0;
         let mut has_instruction = false;
         for item in self.iter_items() {
@@ -633,8 +794,9 @@ impl BlockGraph {
                 && (has_instruction || (length > 0 && boundaries.contains(label)))
             {
                 if physical_lengths.next() != Some(length) {
-                    return false;
+                    return Err(prefix);
                 }
+                prefix += 1;
                 length = 0;
                 has_instruction = false;
             }
@@ -645,16 +807,24 @@ impl BlockGraph {
             has_instruction |= matches!(item, Item::Instruction(_));
             if ends_block {
                 if physical_lengths.next() != Some(length) {
-                    return false;
+                    return Err(prefix);
                 }
+                prefix += 1;
                 length = 0;
                 has_instruction = false;
             }
         }
-        if length > 0 && physical_lengths.next() != Some(length) {
-            return false;
+        if length > 0 {
+            if physical_lengths.next() != Some(length) {
+                return Err(prefix);
+            }
+            prefix += 1;
         }
-        physical_lengths.next().is_none()
+        if physical_lengths.next().is_some() {
+            Err(prefix)
+        } else {
+            Ok(())
+        }
     }
 
     pub(super) fn append_to_block(
@@ -750,12 +920,7 @@ impl BlockGraph {
         for block in self.order.iter().copied() {
             for item in self[block].items() {
                 if let Item::Label(label) = item {
-                    let index = label.index();
-                    if index >= label_blocks.len() {
-                        label_blocks.resize(index + 1, None);
-                    }
-                    let previous = label_blocks[index].replace(block);
-                    debug_assert_eq!(previous, None, "label is bound more than once");
+                    Self::bind_label_in_index(&mut label_blocks, *label, block);
                 }
             }
         }
@@ -810,6 +975,19 @@ impl BlockGraph {
                 .enumerate()
                 .all(|(index, block)| block.index() == index)
         );
+        // Only a label-only block with a physical successor can be coalesced. In
+        // its absence the initial IDs, reachability bitmap and label index are final.
+        if !self.order[..self.order.len().saturating_sub(1)]
+            .iter()
+            .any(|block| {
+                self[*block]
+                    .items()
+                    .iter()
+                    .all(|item| matches!(item, Item::Label(_)))
+            })
+        {
+            return;
+        }
 
         let original = std::mem::take(&mut self.blocks);
         let reachable_len = reachable.as_ref().map(|reachable| reachable.len());
@@ -995,6 +1173,157 @@ impl BlockGraph {
     }
 
     pub(super) fn reachable_blocks(&self, exception_regions: &[ExceptionRegion]) -> Vec<bool> {
+        let reachable = self.find_reachable_blocks(exception_regions);
+        #[cfg(test)]
+        assert_eq!(
+            reachable,
+            self.reference_reachable_blocks(exception_regions)
+        );
+        reachable
+    }
+
+    fn find_reachable_blocks(&self, exception_regions: &[ExceptionRegion]) -> Vec<bool> {
+        let mut reachable = vec![false; self.blocks.len()];
+        let Some(mut entry) = self.order.first().copied() else {
+            return reachable;
+        };
+        if exception_regions.is_empty() && !self.features.has_jump() {
+            let mut blocks = self.order.iter().copied();
+            loop {
+                let Some(block) = blocks.next() else {
+                    return reachable;
+                };
+                let (falls_through, target) = self[block].successors();
+                if target.is_some() {
+                    // A low-level in-place edit may have introduced a new jump
+                    // without refreshing features. The visited prefix has no
+                    // outgoing jumps, so resume ordinary traversal at this block.
+                    entry = block;
+                    break;
+                }
+                reachable[block.index()] = true;
+                if !falls_through {
+                    return reachable;
+                }
+            }
+        }
+        let mut order_positions = vec![usize::MAX; self.blocks.len()];
+        for (position, block) in self.order.iter().copied().enumerate() {
+            order_positions[block.index()] = position;
+        }
+        if exception_regions.is_empty() {
+            let mut pending = vec![entry];
+            self.follow_reachable_blocks(&mut pending, &order_positions, &mut reachable);
+            return reachable;
+        }
+        let mut region_blocks = exception_regions
+            .iter()
+            .filter_map(|region| {
+                let start = self.label_block(region.start)?;
+                let end = self.label_block(region.end)?;
+                let start_position = order_positions[start.index()];
+                let end_position = order_positions[end.index()];
+                // An empty protected body still has an original control-flow entry.
+                // Its handler is reachable only if that entry is reachable, including
+                // when a copied finally body has become dead before optimization.
+                Some((
+                    start_position,
+                    if start == end {
+                        start_position + 1
+                    } else {
+                        end_position
+                    },
+                    self.label_block(region.target)?,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut pending = Vec::with_capacity(region_blocks.len().saturating_add(1));
+        pending.push(entry);
+        if region_blocks.len() <= 4 {
+            while let Some(mut block) = pending.pop() {
+                loop {
+                    if std::mem::replace(&mut reachable[block.index()], true) {
+                        break;
+                    }
+                    let position = order_positions[block.index()];
+                    let (falls_through, target) = self[block].successors();
+                    if let Some(target) = target.and_then(|target| self.label_block(target)) {
+                        pending.push(target);
+                    }
+                    region_blocks.retain(|(start, end, handler)| {
+                        let is_protected = *start <= position && position < *end;
+                        if is_protected {
+                            pending.push(*handler);
+                        }
+                        !is_protected
+                    });
+                    if falls_through && let Some(next) = self.order.get(position + 1) {
+                        block = *next;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            return reachable;
+        }
+        let mut reachable_prefix = Vec::new();
+        loop {
+            self.follow_reachable_blocks(&mut pending, &order_positions, &mut reachable);
+
+            if region_blocks.is_empty() {
+                break;
+            }
+            if reachable_prefix.is_empty() {
+                reachable_prefix.resize(self.order.len() + 1, 0);
+            }
+            for (position, block) in self.order.iter().copied().enumerate() {
+                reachable_prefix[position + 1] =
+                    reachable_prefix[position] + usize::from(reachable[block.index()]);
+            }
+            region_blocks.retain(|(start, end, handler)| {
+                if *start < *end && reachable_prefix[*start] < reachable_prefix[*end] {
+                    pending.push(*handler);
+                    false
+                } else {
+                    true
+                }
+            });
+            if pending.is_empty() {
+                break;
+            }
+        }
+        reachable
+    }
+
+    /// Exhausts ordinary CFG edges by walking fallthrough and queuing explicit targets.
+    fn follow_reachable_blocks(
+        &self,
+        pending: &mut Vec<BasicBlockId>,
+        order_positions: &[usize],
+        reachable: &mut [bool],
+    ) {
+        while let Some(mut block) = pending.pop() {
+            loop {
+                if std::mem::replace(&mut reachable[block.index()], true) {
+                    break;
+                }
+                let position = order_positions[block.index()];
+                let (falls_through, target) = self[block].successors();
+                if let Some(target) = target.and_then(|target| self.label_block(target)) {
+                    pending.push(target);
+                }
+                if falls_through && let Some(next) = self.order.get(position + 1) {
+                    block = *next;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The unoptimized traversal verifies each unit-test call against the same full arena bitmap.
+    #[cfg(test)]
+    fn reference_reachable_blocks(&self, exception_regions: &[ExceptionRegion]) -> Vec<bool> {
         let mut reachable = vec![false; self.blocks.len()];
         let Some(entry) = self.order.first().copied() else {
             return reachable;
@@ -1116,30 +1445,20 @@ impl BlockGraph {
             [block] => return std::mem::take(&mut self.blocks[*block].items),
             _ => {}
         }
-        let mut blocks = self
-            .blocks
-            .into_iter()
-            .map(Some)
-            .collect::<IndexVec<BasicBlockId, _>>();
-        let item_count = self
-            .order
-            .iter()
-            .map(|block| {
-                blocks[*block]
-                    .as_ref()
-                    .expect("block appears more than once in emission order")
-                    .items
-                    .len()
-            })
-            .sum();
-        let mut items = Vec::with_capacity(item_count);
+        let mut items = Vec::with_capacity(self.item_count());
+        let mut seen = SmallVec::<[u64; 2]>::new();
+        seen.resize(self.blocks.len().div_ceil(u64::BITS as usize), 0);
         for block in self.order {
-            items.append(
-                &mut blocks[block]
-                    .take()
-                    .expect("block appears more than once in emission order")
-                    .items,
+            let index = block.index();
+            let word = &mut seen[index / u64::BITS as usize];
+            let bit = 1 << (index % u64::BITS as usize);
+            assert_eq!(
+                *word & bit,
+                0,
+                "block appears more than once in emission order"
             );
+            *word |= bit;
+            items.append(&mut self.blocks[block].items);
         }
         items
     }
@@ -1206,11 +1525,215 @@ mod tests {
     }
 
     #[test]
+    fn opcode_feature_table_matches_instruction_classification() {
+        use crate::assembler::OperandPatchId;
+        use crate::target::opcodes::{
+            BEFORE_WITH, CALL, COMPARE_OP, CONTAINS_OP, COPY_FREE_VARS, FOR_ITER, LIST_APPEND,
+            LOAD_FAST_AND_CLEAR, LOAD_FAST_BORROW_LOAD_FAST_BORROW, LOAD_GLOBAL, LOAD_SMALL_INT,
+            MATCH_CLASS, POP_TOP, RAISE_VARARGS, RESUME, SEND, STORE_FAST_LOAD_FAST,
+            STORE_FAST_STORE_FAST, UNPACK_EX, WITH_EXCEPT_START,
+        };
+
+        fn original(instruction: &Instruction) -> PipelineFeatures {
+            use PipelineFeatures as Features;
+
+            let mut flags = match instruction.opcode {
+                opcode
+                    if is_unconditional_jump(opcode)
+                        && matches!(instruction.operand(), Operand::Forward(_)) =>
+                {
+                    Features::FORWARD_JUMP
+                }
+                POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE
+                    if matches!(instruction.operand(), Operand::Forward(_)) =>
+                {
+                    Features::FORWARD_CONDITIONAL
+                }
+                SWAP => Features::SWAP_TRIGGER,
+                LOAD_FAST_CHECK => Features::FAST_LOAD | Features::CHECKED_FAST_LOAD,
+                LOAD_FAST | LOAD_FAST_BORROW | LOAD_FAST_LOAD_FAST => Features::FAST_LOAD,
+                STORE_FAST => Features::STORE_FAST_TRIGGER,
+                TO_BOOL | UNARY_NOT => Features::BOOLEAN_CONVERSION,
+                IS_OP => Features::IDENTITY_COMPARISON,
+                COPY if instruction.operand() == Operand::Value(1) => Features::COPY_TOP,
+                NOT_TAKEN => {
+                    Features::NOT_TAKEN
+                        | if matches!(
+                            instruction.exception_policy(),
+                            ExceptionPolicy::NoneUnchangedBooleanSingleton
+                                | ExceptionPolicy::NonePresent
+                                | ExceptionPolicy::NoneAbsent
+                        ) {
+                            Features::ORIGINAL_FUSION_OWNER_CANDIDATE
+                        } else {
+                            0
+                        }
+                }
+                NOP | LOAD_CONST | RETURN_CONST | KW_NAMES
+                    if instruction.pre_fold_extra_instructions() == 2
+                        && instruction.no_location_policy.borrow_fallthrough()
+                            == BorrowFallthrough::Barrier =>
+                {
+                    Features::ORIGINAL_FUSION_OWNER_CANDIDATE
+                }
+                _ => 0,
+            };
+            if instruction.jump_policy.borrow_empty_block() {
+                flags |= Features::BORROW_EMPTY_BLOCK;
+            }
+            if matches!(
+                instruction.operand(),
+                Operand::Forward(_) | Operand::Backward(_)
+            ) {
+                flags |= Features::JUMP;
+            }
+            if matches!(
+                instruction.opcode,
+                POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
+            ) {
+                flags |= Features::POP_CONDITIONAL;
+            }
+            PipelineFeatures(flags)
+        }
+
+        let classified = [
+            JUMP_BACKWARD,
+            JUMP_BACKWARD_NO_INTERRUPT,
+            JUMP_FORWARD,
+            POP_JUMP_IF_FALSE,
+            POP_JUMP_IF_TRUE,
+            POP_JUMP_IF_NONE,
+            POP_JUMP_IF_NOT_NONE,
+            SWAP,
+            LOAD_FAST_CHECK,
+            LOAD_FAST,
+            LOAD_FAST_BORROW,
+            LOAD_FAST_LOAD_FAST,
+            STORE_FAST,
+            TO_BOOL,
+            UNARY_NOT,
+            IS_OP,
+            COPY,
+            NOT_TAKEN,
+            NOP,
+            LOAD_CONST,
+            RETURN_CONST,
+            KW_NAMES,
+        ];
+        for (index, flags) in PipelineFeatures::BY_OPCODE.into_iter().enumerate() {
+            let expected = classified
+                .iter()
+                .any(|opcode| usize::from(opcode.code()) == index);
+            assert_eq!(flags != 0, expected, "opcode index {index}");
+        }
+
+        let unclassified = [
+            BEFORE_WITH,
+            CALL,
+            COMPARE_OP,
+            CONTAINS_OP,
+            COPY_FREE_VARS,
+            FOR_ITER,
+            LIST_APPEND,
+            LOAD_FAST_AND_CLEAR,
+            LOAD_FAST_BORROW_LOAD_FAST_BORROW,
+            LOAD_GLOBAL,
+            LOAD_SMALL_INT,
+            MATCH_CLASS,
+            POP_TOP,
+            RAISE_VARARGS,
+            RESUME,
+            RETURN_VALUE,
+            SEND,
+            STORE_FAST_LOAD_FAST,
+            STORE_FAST_STORE_FAST,
+            UNPACK_EX,
+            WITH_EXCEPT_START,
+        ];
+        let target = Label::from_u32(1);
+        for opcode in classified.into_iter().chain(unclassified) {
+            for operand in [
+                Operand::Value(0),
+                Operand::Value(1),
+                Operand::Value(2),
+                Operand::Forward(target),
+                Operand::Backward(target),
+                Operand::Deferred(OperandPatchId::from_u32(0)),
+            ] {
+                for (folds, fallthrough, exception, borrow) in [
+                    (
+                        0,
+                        BorrowFallthrough::Reachable,
+                        ExceptionPolicy::NoneUnchanged,
+                        false,
+                    ),
+                    (
+                        2,
+                        BorrowFallthrough::Barrier,
+                        ExceptionPolicy::NoneUnchanged,
+                        true,
+                    ),
+                    (
+                        1,
+                        BorrowFallthrough::Barrier,
+                        ExceptionPolicy::NonePresent,
+                        false,
+                    ),
+                    (
+                        2,
+                        BorrowFallthrough::BarrierIfRemoved,
+                        ExceptionPolicy::NoneAbsent,
+                        true,
+                    ),
+                    (
+                        2,
+                        BorrowFallthrough::Reachable,
+                        ExceptionPolicy::NoneUnchangedBooleanSingleton,
+                        false,
+                    ),
+                    (
+                        3,
+                        BorrowFallthrough::Barrier,
+                        ExceptionPolicy::NoneDynamicCondition,
+                        true,
+                    ),
+                ] {
+                    let mut instruction =
+                        Instruction::new(opcode, operand, SourceLocation::NONE, None);
+                    instruction.add_pre_fold_extra_instructions(folds);
+                    instruction
+                        .no_location_policy
+                        .set_borrow_fallthrough(fallthrough);
+                    instruction.set_exception_policy(exception);
+                    if borrow {
+                        instruction.jump_policy.mark_borrow_empty_block();
+                    }
+                    let expected = original(&instruction);
+                    let mut actual = PipelineFeatures::default();
+                    actual.record(&instruction);
+                    assert_eq!(actual, expected, "{instruction:?}");
+
+                    let mut accumulated =
+                        PipelineFeatures(PipelineFeatures::FAST_LOAD | PipelineFeatures::JUMP);
+                    accumulated.record(&instruction);
+                    assert_eq!(
+                        accumulated.0,
+                        expected.0 | PipelineFeatures::FAST_LOAD | PipelineFeatures::JUMP
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn graph_construction_summarizes_all_pass_triggers() {
         let target = Label::from_u32(0);
         let mut borrow_marker =
             Instruction::new(NOP, Operand::Value(0), SourceLocation::NONE, None);
         borrow_marker.jump_policy.mark_borrow_empty_block();
+        let mut branch_marker =
+            Instruction::new(NOT_TAKEN, Operand::Value(0), SourceLocation::NONE, None);
+        branch_marker.set_exception_policy(ExceptionPolicy::NonePresent);
         let graph = BlockGraph::from_items(
             vec![
                 instruction(JUMP_FORWARD, Operand::Forward(target)),
@@ -1222,6 +1745,7 @@ mod tests {
                 instruction(IS_OP, Operand::Value(0)),
                 instruction(COPY, Operand::Value(1)),
                 Item::Instruction(borrow_marker),
+                Item::Instruction(branch_marker),
                 Item::Label(target),
                 instruction(RETURN_VALUE, Operand::Value(0)),
             ],
@@ -1241,6 +1765,8 @@ mod tests {
         assert!(features.has_jump());
         assert!(features.has_pop_conditional());
         assert!(features.has_copy_top());
+        assert!(features.has_not_taken());
+        assert!(features.has_original_fusion_owner_candidate());
     }
 
     #[test]
@@ -1270,6 +1796,60 @@ mod tests {
         assert!(features.has_jump());
         assert!(features.has_pop_conditional());
         assert!(!features.has_copy_top());
+        assert!(!features.has_not_taken());
+        assert!(!features.has_original_fusion_owner_candidate());
+    }
+
+    #[test]
+    fn original_fusion_owner_features_distinguish_authored_marker_and_folded_nop_policies() {
+        let marker = |policy| {
+            let mut instruction =
+                Instruction::new(NOT_TAKEN, Operand::Value(0), SourceLocation::NONE, None);
+            instruction.set_exception_policy(policy);
+            Item::Instruction(instruction)
+        };
+        let folded = |opcode, folds, fallthrough| {
+            let mut instruction =
+                Instruction::new(opcode, Operand::Value(0), SourceLocation::NONE, None);
+            instruction.add_pre_fold_extra_instructions(folds);
+            instruction
+                .no_location_policy
+                .set_borrow_fallthrough(fallthrough);
+            Item::Instruction(instruction)
+        };
+        for (item, has_marker, has_owner) in [
+            (marker(ExceptionPolicy::NonePresent), true, true),
+            (marker(ExceptionPolicy::NoneAbsent), true, true),
+            (
+                marker(ExceptionPolicy::NoneUnchangedBooleanSingleton),
+                true,
+                true,
+            ),
+            (marker(ExceptionPolicy::NoneDynamicCondition), true, false),
+            (folded(NOP, 2, BorrowFallthrough::Barrier), false, true),
+            (folded(NOP, 1, BorrowFallthrough::Barrier), false, false),
+            (
+                folded(NOP, 2, BorrowFallthrough::BarrierIfRemoved),
+                false,
+                false,
+            ),
+            (
+                folded(LOAD_CONST, 2, BorrowFallthrough::Barrier),
+                false,
+                true,
+            ),
+            (
+                folded(RETURN_CONST, 2, BorrowFallthrough::Barrier),
+                false,
+                true,
+            ),
+            (folded(KW_NAMES, 2, BorrowFallthrough::Barrier), false, true),
+        ] {
+            let graph = BlockGraph::from_items(vec![item], &FxHashSet::default());
+            let features = graph.features();
+            assert_eq!(features.has_not_taken(), has_marker);
+            assert_eq!(features.has_original_fusion_owner_candidate(), has_owner);
+        }
     }
 
     #[test]
@@ -1294,6 +1874,114 @@ mod tests {
         assert!(graph.features().has_forward_jump());
         assert!(graph.features().has_swap());
         assert!(graph.features().has_jump());
+    }
+
+    #[test]
+    fn reachability_handles_straight_prefixes_cycles_and_chained_exception_entries() {
+        let label = Label::from_u32;
+        let mut graph = BlockGraph::from_items(Vec::new(), &FxHashSet::default());
+        let blocks = [
+            vec![
+                Item::Label(label(0)),
+                instruction(NOP, Operand::Value(0)),
+                Item::Label(label(20)),
+            ],
+            vec![
+                Item::Label(label(1)),
+                instruction(POP_JUMP_IF_TRUE, Operand::Forward(label(4))),
+            ],
+            vec![
+                Item::Label(label(2)),
+                instruction(JUMP_FORWARD, Operand::Forward(label(6))),
+            ],
+            vec![Item::Label(label(3)), instruction(NOP, Operand::Value(0))],
+            vec![
+                Item::Label(label(4)),
+                instruction(POP_JUMP_IF_TRUE, Operand::Backward(label(4))),
+            ],
+            vec![
+                Item::Label(label(5)),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ],
+            vec![Item::Label(label(6)), instruction(NOP, Operand::Value(0))],
+            vec![
+                Item::Label(label(7)),
+                instruction(JUMP_BACKWARD, Operand::Backward(label(6))),
+            ],
+            vec![Item::Label(label(8))],
+            vec![
+                Item::Label(label(9)),
+                instruction(POP_JUMP_IF_TRUE, Operand::Forward(label(99))),
+            ],
+            vec![
+                Item::Label(label(10)),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ],
+        ]
+        .into_iter()
+        .map(|items| graph.push_block(items))
+        .collect::<Vec<_>>();
+
+        // Direct arena mutation need not update the conservative feature: a
+        // detected jump must resume the general walk at the end of the prefix.
+        assert!(!graph.features().has_jump());
+        let no_handlers = [
+            true, true, true, false, true, true, true, true, false, false, false,
+        ];
+        assert_eq!(graph.reachable_blocks(&[]), no_handlers);
+        graph.features.0 |= PipelineFeatures::JUMP;
+        assert_eq!(graph.reachable_blocks(&[]), no_handlers);
+
+        let region = |start, end, target| ExceptionRegion {
+            start: label(start),
+            end: label(end),
+            target: label(target),
+            depth: 0,
+            preserve_lasti: false,
+            is_scope_fallback: false,
+            priority: super::super::ExceptionRegionPriority::Resolved { start: 0, end: 0 },
+        };
+        let regions = [
+            region(1, 2, 8),
+            region(8, 8, 3),
+            region(3, 4, 9),
+            region(9, 9, 9),
+            region(6, 7, 10),
+            region(99, 10, 3),
+        ];
+        assert_eq!(
+            graph.reachable_blocks(&regions[..1]),
+            [
+                true, true, true, false, true, true, true, true, true, true, true
+            ],
+        );
+        for regions in [&regions[..4], &regions[..5], &regions[..]] {
+            assert_eq!(graph.reachable_blocks(regions), [true; 11]);
+        }
+
+        graph
+            .replace_order(
+                [0, 1, 4, 6, 2, 8, 7, 9, 10, 5, 3]
+                    .map(|index| blocks[index])
+                    .into(),
+            )
+            .unwrap();
+        let reachable = graph.reachable_blocks(&[]);
+        assert!(reachable[blocks[4].index()]);
+        assert!(!reachable[blocks[3].index()]);
+        for regions in [&regions[..4], &regions[..5]] {
+            assert!(graph.reachable_blocks(regions)[blocks[0].index()]);
+        }
+        graph.retain_order(|block| block != blocks[8]);
+        assert!(!graph.reachable_blocks(&regions)[blocks[8].index()]);
+
+        let mut straight = BlockGraph::from_items(Vec::new(), &FxHashSet::default());
+        straight.push_block(vec![Item::Label(label(0))]);
+        straight.push_block(vec![instruction(RETURN_VALUE, Operand::Value(0))]);
+        straight.push_block(vec![instruction(NOP, Operand::Value(0))]);
+        assert_eq!(straight.reachable_blocks(&[]), [true, true, false]);
+        straight.retain_order(|block| block.index() != 0);
+        assert_eq!(straight.reachable_blocks(&[]), [false, true, false]);
     }
 
     #[test]
@@ -1333,6 +2021,149 @@ mod tests {
     }
 
     #[test]
+    fn prefix_normalization_matches_full_repartition_across_mutations() {
+        let labels = std::array::from_fn::<_, 5, _>(Label::from_usize);
+        let extra = Label::from_u32(8);
+        let graph = BlockGraph::from_items(
+            labels
+                .into_iter()
+                .flat_map(|label| {
+                    [
+                        Item::Label(label),
+                        instruction(NOP, Operand::Value(0)),
+                        instruction(RETURN_VALUE, Operand::Value(0)),
+                    ]
+                })
+                .collect(),
+            &FxHashSet::default(),
+        );
+        let assert_graph_eq = |actual: &BlockGraph, expected: &BlockGraph, mask, order_case| {
+            assert_eq!(
+                actual.order, expected.order,
+                "mask {mask} order {order_case}"
+            );
+            assert_eq!(
+                actual.label_blocks, expected.label_blocks,
+                "mask {mask} order {order_case}"
+            );
+            assert_eq!(
+                actual.features, expected.features,
+                "mask {mask} order {order_case}"
+            );
+            assert_eq!(
+                actual.blocks.len(),
+                expected.blocks.len(),
+                "mask {mask} order {order_case}"
+            );
+            for block in actual.blocks.indices() {
+                assert_eq!(
+                    actual[block].items(),
+                    expected[block].items(),
+                    "mask {mask} order {order_case} block {block:?}"
+                );
+            }
+        };
+        for mask in 0..1024_u32 {
+            let mut mutated = graph.clone();
+            let original_order = mutated.order.clone();
+            let first_instruction = ItemPosition::new(original_order[0], 1);
+            mutated.instruction_mut(first_instruction).unwrap().opcode = SWAP;
+            for index in 0..4 {
+                if mask & (1 << index) != 0 {
+                    let block = original_order[index];
+                    let last = mutated[block].items().len() - 1;
+                    mutated
+                        .instruction_mut(ItemPosition::new(block, last))
+                        .unwrap()
+                        .opcode = NOP;
+                }
+                if mask & (1 << (index + 4)) != 0 {
+                    mutated.remove_item_at(original_order[index + 1], 0);
+                }
+            }
+            if mask & (1 << 8) != 0 {
+                let block = original_order[2];
+                mutated.insert_label(block, 1, extra);
+                mutated.append_to_block(block, [instruction(NOP, Operand::Value(0))]);
+            }
+            if mask & (1 << 9) != 0 {
+                mutated.retain_items(original_order[3], |_| false);
+            }
+            let boundaries = if mask & 1 == 0 {
+                FxHashSet::from_iter([extra])
+            } else {
+                FxHashSet::default()
+            };
+            let mut actual = mutated.clone();
+            let mut expected = mutated.clone();
+            let verified = actual.normalized_prefix(&boundaries);
+            let prefix = verified.err().unwrap_or(actual.order.len());
+            let pointers = actual.order[..prefix]
+                .iter()
+                .map(|block| actual[*block].items().as_ptr())
+                .collect::<Vec<_>>();
+            actual.normalize_blocks_if_needed(&boundaries);
+            if verified.is_err() {
+                expected.normalize_blocks(&boundaries);
+            }
+            assert_graph_eq(&actual, &expected, mask, 0);
+            for (&block, pointer) in actual.order[..prefix].iter().zip(pointers) {
+                assert_eq!(
+                    actual[block].items().as_ptr(),
+                    pointer,
+                    "mask {mask} block {block:?}"
+                );
+            }
+
+            for order_case in 1..4 {
+                let mut final_order = original_order.clone();
+                match order_case {
+                    1 => final_order.rotate_left(2),
+                    2 => final_order.reverse(),
+                    3 => {
+                        final_order.remove(1);
+                    }
+                    _ => unreachable!(),
+                }
+                let mut actual = mutated.clone();
+                let mut expected = mutated.clone();
+                actual
+                    .replace_order_and_normalize(final_order.clone(), &boundaries)
+                    .unwrap();
+                expected.replace_order(final_order).unwrap();
+                if !expected.is_normalized(&boundaries) {
+                    expected.normalize_blocks(&boundaries);
+                }
+                assert_graph_eq(&actual, &expected, mask, order_case);
+            }
+        }
+    }
+
+    #[test]
+    fn normalized_segment_lengths_stay_inline_until_the_spill_boundary() {
+        for count in [0, 1, 2, 15, 16, 17, 65] {
+            let items = (0..count)
+                .flat_map(|index| {
+                    [
+                        Item::Label(Label::from_usize(index)),
+                        instruction(LOAD_FAST, Operand::Value(0)),
+                        instruction(RETURN_VALUE, Operand::Value(0)),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let (lengths, features) = normalized_segment_lengths(&items, &FxHashSet::default());
+            assert_eq!(lengths.as_slice(), vec![3; count]);
+            assert_eq!(lengths.spilled(), count > 16);
+            assert_eq!(features.has_fast_load(), count > 0);
+            assert!(!features.has_jump());
+
+            let graph = BlockGraph::from_items(items.clone(), &FxHashSet::default());
+            assert_eq!(graph.len(), count);
+            assert_eq!(graph.copy_items(), items);
+        }
+    }
+
+    #[test]
     fn partitioning_reuses_a_single_segment_allocation() {
         let mut items = Vec::with_capacity(16);
         items.push(Item::Label(Label::from_u32(0)));
@@ -1344,6 +2175,245 @@ mod tests {
 
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].as_ptr(), pointer);
+    }
+
+    #[test]
+    fn initial_label_index_matches_rebuilding_normalized_blocks() {
+        use crate::assembler::OperandPatchId;
+
+        let labels = [97, 0, 9, 3, 48, 1, 73].map(Label::from_u32);
+        let items = [
+            instruction(NOP, Operand::Value(0)),
+            Item::Label(labels[0]),
+            Item::Label(labels[1]),
+            instruction(LOAD_FAST, Operand::Value(0)),
+            Item::Label(labels[2]),
+            instruction(POP_JUMP_IF_TRUE, Operand::Forward(labels[4])),
+            Item::Label(labels[3]),
+            Item::Label(labels[4]),
+            instruction(JUMP_BACKWARD, Operand::Backward(labels[2])),
+            instruction(NOP, Operand::Deferred(OperandPatchId::from_u32(0))),
+            Item::Label(labels[5]),
+            instruction(RETURN_VALUE, Operand::Value(0)),
+            Item::Label(labels[6]),
+        ];
+
+        for boundary_mask in 0..(1 << labels.len()) {
+            let boundaries = labels
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, label)| (boundary_mask & (1 << index) != 0).then_some(label))
+                .collect::<FxHashSet<_>>();
+            for length in 0..=items.len() {
+                let mut graph = BlockGraph::from_items(items[..length].to_vec(), &boundaries);
+                let initial = graph.label_blocks.clone();
+                graph.rebuild_label_index();
+                assert_eq!(
+                    initial, graph.label_blocks,
+                    "boundary mask {boundary_mask:#09b}, item count {length}"
+                );
+                assert_eq!(graph.copy_items(), items[..length]);
+                assert_eq!(graph.label_block(Label::from_u32(125)), None);
+            }
+        }
+    }
+
+    #[test]
+    fn partition_label_binding_matches_rebuilding_reordered_and_added_blocks() {
+        let labels = [31, 5, 88, 1, 47].map(Label::from_u32);
+        let added_labels = [12, 62, 28].map(Label::from_u32);
+        let absent = Label::from_u32(120);
+        let reserved = Label::from_u32(121);
+        let items = [
+            Item::Label(labels[0]),
+            instruction(NOP, Operand::Value(0)),
+            Item::Label(labels[1]),
+            Item::Label(labels[2]),
+            instruction(JUMP_FORWARD, Operand::Forward(labels[4])),
+            Item::Label(labels[3]),
+            instruction(RETURN_VALUE, Operand::Value(0)),
+            Item::Label(labels[4]),
+        ];
+        let added_items = [
+            Item::Label(added_labels[0]),
+            Item::Label(added_labels[1]),
+            instruction(JUMP_FORWARD, Operand::Forward(added_labels[2])),
+            Item::Label(added_labels[2]),
+            instruction(RETURN_VALUE, Operand::Value(0)),
+        ];
+
+        for boundary_mask in 0..(1 << labels.len()) {
+            let boundaries = labels
+                .into_iter()
+                .chain(added_labels)
+                .enumerate()
+                .filter_map(|(index, label)| {
+                    (index >= labels.len() || boundary_mask & (1 << index) != 0).then_some(label)
+                })
+                .collect::<FxHashSet<_>>();
+            for split in 1..items.len() {
+                let mut graph = BlockGraph::from_items(Vec::new(), &boundaries);
+                graph.push_block(vec![Item::Label(absent)]);
+                let first = graph.push_block(items[..split].to_vec());
+                graph.allocate_block(vec![Item::Label(reserved)]);
+                let second = graph.push_block(items[split..].to_vec());
+                graph.replace_order(vec![second, first]).unwrap();
+                let expected_items = graph.copy_items();
+
+                graph.normalize_blocks(&boundaries);
+
+                assert!(graph.is_normalized(&boundaries));
+                assert_eq!(graph.copy_items(), expected_items);
+                assert_eq!(graph.order()[0], second);
+                if graph.len() > 1 {
+                    assert_eq!(graph.order()[1], first);
+                }
+                assert_eq!(graph.label_block(absent), None);
+                assert_eq!(graph.label_block(reserved), None);
+                let normalized_index = graph.label_blocks.clone();
+                graph.rebuild_label_index();
+                assert_eq!(normalized_index, graph.label_blocks);
+
+                let added = graph.allocate_blocks_from_items(added_items.to_vec(), &boundaries);
+                assert_eq!(added.len(), 3);
+                for (label, block) in added_labels.into_iter().zip(&added) {
+                    assert_eq!(graph.label_block(label), Some(*block));
+                }
+                graph.order.extend(added);
+                let allocated_index = graph.label_blocks.clone();
+                graph.rebuild_label_index();
+                assert_eq!(allocated_index, graph.label_blocks);
+            }
+        }
+    }
+
+    #[test]
+    fn partition_label_binding_matches_previous_allocation_and_normalization() {
+        fn normalize_reference(graph: &mut BlockGraph, boundaries: &FxHashSet<Label>) {
+            graph.label_blocks.fill(None);
+            let (lengths, features) = normalized_segment_lengths(graph.iter_items(), boundaries);
+            graph.features.merge(features);
+            let original_order = std::mem::take(&mut graph.order);
+            let items = original_order
+                .iter()
+                .copied()
+                .flat_map(|block| std::mem::take(&mut graph.blocks[block].items));
+            let segments = collect_segments(items, &lengths);
+            let mut reusable = original_order.into_iter();
+            let mut order = Vec::with_capacity(segments.len());
+            for items in segments {
+                if let Some(block) = reusable.next() {
+                    graph.blocks[block].items = items;
+                    order.push(block);
+                } else {
+                    order.push(graph.allocate_block(items));
+                }
+            }
+            graph.order = order;
+            graph.rebuild_label_index();
+        }
+
+        fn allocate_reference(
+            graph: &mut BlockGraph,
+            items: Vec<Item>,
+            boundaries: &FxHashSet<Label>,
+        ) -> Vec<BasicBlockId> {
+            let (segments, features) = BlockGraph::partition_items(items, boundaries);
+            graph.features.merge(features);
+            segments
+                .into_iter()
+                .map(|items| graph.allocate_block(items))
+                .collect()
+        }
+
+        fn assert_graphs_match(actual: &BlockGraph, expected: &BlockGraph) {
+            assert_eq!(actual.order, expected.order);
+            assert_eq!(actual.label_blocks, expected.label_blocks);
+            assert_eq!(actual.features, expected.features);
+            assert_eq!(actual.blocks.len(), expected.blocks.len());
+            for block in actual.blocks.indices() {
+                assert_eq!(actual[block].items(), expected[block].items());
+            }
+        }
+
+        let labels = [83, 3, 32, 1].map(Label::from_u32);
+        let added_labels = [6, 61, 39].map(Label::from_u32);
+        let omitted = Label::from_u32(110);
+        let detached = Label::from_u32(125);
+        let items = [
+            Item::Label(labels[0]),
+            instruction(NOP, Operand::Value(0)),
+            Item::Label(labels[1]),
+            Item::Label(labels[2]),
+            instruction(LOAD_FAST, Operand::Value(0)),
+            instruction(RETURN_VALUE, Operand::Value(0)),
+            Item::Label(labels[3]),
+        ];
+        let added = [
+            Item::Label(added_labels[0]),
+            Item::Label(added_labels[1]),
+            instruction(JUMP_FORWARD, Operand::Forward(added_labels[2])),
+            Item::Label(added_labels[2]),
+            instruction(RETURN_VALUE, Operand::Value(0)),
+        ];
+
+        for boundary_mask in 0..8 {
+            let boundaries = [labels[1], labels[2], added_labels[1]]
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, label)| (boundary_mask & (1 << index) != 0).then_some(label))
+                .collect::<FxHashSet<_>>();
+            for split_mask in 0..1 << (items.len() - 1) {
+                for reverse in [false, true] {
+                    let mut base = BlockGraph::from_items(Vec::new(), &boundaries);
+                    base.push_block(vec![Item::Label(omitted)]);
+                    let mut order = Vec::new();
+                    let mut start = 0;
+                    for end in 1..=items.len() {
+                        if end == items.len() || split_mask & (1 << (end - 1)) != 0 {
+                            order.push(base.push_block(items[start..end].to_vec()));
+                            start = end;
+                        }
+                    }
+                    if reverse {
+                        order.reverse();
+                    }
+                    base.replace_order(order).unwrap();
+                    let detached_block = base.allocate_block(vec![Item::Label(detached)]);
+
+                    let mut actual = base.clone();
+                    let mut expected = base.clone();
+                    actual.normalize_blocks(&boundaries);
+                    normalize_reference(&mut expected, &boundaries);
+                    assert_graphs_match(&actual, &expected);
+                    assert_eq!(actual.label_block(omitted), None);
+                    assert_eq!(actual.label_block(detached), None);
+
+                    for length in [0, added.len()] {
+                        let mut actual = base.clone();
+                        let mut expected = base.clone();
+                        let actual_ids = actual
+                            .allocate_blocks_from_items(added[..length].to_vec(), &boundaries);
+                        let expected_ids = allocate_reference(
+                            &mut expected,
+                            added[..length].to_vec(),
+                            &boundaries,
+                        );
+                        assert_eq!(actual_ids, expected_ids);
+                        assert_graphs_match(&actual, &expected);
+                        assert_eq!(actual.label_block(detached), Some(detached_block));
+                    }
+                }
+            }
+        }
+
+        let mut actual = BlockGraph::from_items(Vec::new(), &FxHashSet::default());
+        actual.allocate_block(vec![Item::Label(detached)]);
+        let mut expected = actual.clone();
+        actual.normalize_blocks(&FxHashSet::default());
+        normalize_reference(&mut expected, &FxHashSet::default());
+        assert_graphs_match(&actual, &expected);
+        assert_eq!(actual.label_block(detached), None);
     }
 
     #[test]
@@ -1428,6 +2498,17 @@ mod tests {
         assert_eq!(graph.label_block(second_label), Some(second));
         assert_eq!(graph.label_block(inserted_label), Some(inserted));
         graph.validate().unwrap();
+        assert_eq!(
+            graph.into_items(),
+            [
+                Item::Label(second_label),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+                Item::Label(inserted_label),
+                instruction(NOP, Operand::Value(0)),
+                Item::Label(first_label),
+                instruction(JUMP_FORWARD, Operand::Forward(second_label)),
+            ]
+        );
     }
 
     #[test]
@@ -1443,6 +2524,17 @@ mod tests {
         assert_eq!(error, "block 0 appears more than once");
         assert_eq!(graph.order(), &[block]);
         graph.validate().unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "block appears more than once in emission order")]
+    fn emitting_items_rejects_duplicate_blocks() {
+        let mut graph = BlockGraph::from_items(Vec::new(), &FxHashSet::default());
+        for _ in 0..130 {
+            graph.push_block(vec![instruction(RETURN_VALUE, Operand::Value(0))]);
+        }
+        graph.order.push(graph.block_at(129));
+        graph.into_items();
     }
 
     #[test]
@@ -1493,6 +2585,15 @@ mod tests {
         assert!(!graph[dropped].items().is_empty());
 
         graph.validate().unwrap();
+        assert_eq!(
+            graph.into_items(),
+            [
+                Item::Label(retained_label),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+                Item::Label(inserted_label),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ]
+        );
     }
 
     #[test]
@@ -1700,8 +2801,7 @@ mod tests {
                 .enumerate()
                 .filter_map(|(index, label)| (boundary_mask & (1 << index) != 0).then_some(label))
                 .collect::<FxHashSet<_>>();
-            let (normalized_lengths, _) =
-                normalized_segment_lengths(&items, items.len(), &boundaries);
+            let (normalized_lengths, _) = normalized_segment_lengths(&items, &boundaries);
             for split_mask in 0..(1 << (items.len() - 1)) {
                 let mut graph = BlockGraph {
                     blocks: IndexVec::new(),
@@ -1721,10 +2821,118 @@ mod tests {
 
                 assert_eq!(
                     graph.is_normalized(&boundaries),
-                    physical_lengths == normalized_lengths,
+                    physical_lengths.as_slice() == normalized_lengths.as_slice(),
                     "boundary mask {boundary_mask:#05b}, split mask {split_mask:#010b}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn replacing_and_normalizing_order_matches_separate_label_rebuild() {
+        fn reference(
+            graph: &mut BlockGraph,
+            order: Vec<BasicBlockId>,
+            boundaries: &FxHashSet<Label>,
+        ) {
+            graph.validate_order(&order).unwrap();
+            graph.order = order;
+            if graph.is_normalized(boundaries) {
+                graph.rebuild_label_index();
+            } else {
+                graph.normalize_blocks(boundaries);
+            }
+        }
+
+        let labels = [
+            Label::from_u32(0),
+            Label::from_u32(4),
+            Label::from_u32(11),
+            Label::from_u32(23),
+        ];
+        let items = [
+            Item::Label(labels[0]),
+            Item::Label(labels[1]),
+            instruction(NOP, Operand::Value(0)),
+            instruction(RETURN_VALUE, Operand::Value(0)),
+            Item::Label(labels[2]),
+            instruction(NOP, Operand::Value(0)),
+            Item::Label(labels[3]),
+        ];
+        let mut normalized_cases = 0;
+        let mut unnormalized_cases = 0;
+        for boundary_mask in 0..4 {
+            let boundaries = [labels[1], labels[3]]
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, label)| (boundary_mask & (1 << index) != 0).then_some(label))
+                .collect::<FxHashSet<_>>();
+            for split_mask in 0..(1 << (items.len() - 1)) {
+                let mut graph = BlockGraph::from_items(Vec::new(), &FxHashSet::default());
+                let mut start = 0;
+                for end in 1..=items.len() {
+                    if end == items.len() || split_mask & (1 << (end - 1)) != 0 {
+                        graph.push_block(items[start..end].to_vec());
+                        start = end;
+                    }
+                }
+                // Both an omitted nonempty block and an emitted empty block exercise
+                // entries that the previous label index cannot be allowed to keep.
+                let omitted = graph.allocate_block(vec![Item::Label(Label::from_u32(29))]);
+                let empty = graph.allocate_block(vec![instruction(NOP, Operand::Value(0))]);
+                graph.remove_item_at(empty, 0);
+                let original_order = graph.order().to_vec();
+                let orders = [
+                    original_order.clone(),
+                    original_order.iter().copied().rev().collect(),
+                    original_order.iter().copied().skip(1).collect(),
+                    original_order.iter().copied().chain([empty]).collect(),
+                    [empty]
+                        .into_iter()
+                        .chain(original_order.iter().copied())
+                        .collect(),
+                    vec![omitted],
+                    vec![],
+                ];
+                for order in orders {
+                    let mut actual = graph.clone();
+                    let mut expected = graph.clone();
+                    expected.order.clone_from(&order);
+                    if expected.is_normalized(&boundaries) {
+                        normalized_cases += 1;
+                    } else {
+                        unnormalized_cases += 1;
+                    }
+                    reference(&mut expected, order.clone(), &boundaries);
+                    actual
+                        .replace_order_and_normalize(order, &boundaries)
+                        .unwrap();
+                    assert_eq!(actual.order(), expected.order());
+                    assert_eq!(actual.label_blocks, expected.label_blocks);
+                    assert_eq!(actual.copy_items(), expected.copy_items());
+                    assert_eq!(actual.features(), expected.features());
+                    assert_eq!(actual.blocks.len(), expected.blocks.len());
+                    for block in actual.blocks.indices() {
+                        assert_eq!(actual[block].items(), expected[block].items());
+                    }
+                    actual.validate().unwrap();
+                }
+            }
+        }
+        assert!(normalized_cases > 100);
+        assert!(unnormalized_cases > 100);
+
+        let mut graph = BlockGraph::from_items(vec![Item::Label(labels[0])], &FxHashSet::default());
+        let order = graph.order().to_vec();
+        let label_blocks = graph.label_blocks.clone();
+        for invalid in [vec![order[0]; 2], vec![BasicBlockId::from_usize(100)]] {
+            assert!(
+                graph
+                    .replace_order_and_normalize(invalid, &FxHashSet::default())
+                    .is_err()
+            );
+            assert_eq!(graph.order(), order);
+            assert_eq!(graph.label_blocks, label_blocks);
         }
     }
 
@@ -1779,6 +2987,53 @@ mod tests {
             &FxHashSet::default(),
         );
         assert!(!graph.is_normalized_jump_free_single_block(&FxHashSet::from_iter([preserved,])));
+    }
+
+    #[test]
+    fn initial_boundary_removal_matches_unpreserved_partition_and_reachability() {
+        let labels = [0, 1, 2, 3, 4, 5].map(Label::from_u32);
+        let items = vec![
+            Item::Label(labels[0]),
+            Item::Label(labels[1]),
+            instruction(JUMP_FORWARD, Operand::Forward(labels[3])),
+            Item::Label(labels[2]),
+            instruction(NOP, Operand::Value(0)),
+            Item::Label(labels[3]),
+            instruction(RETURN_VALUE, Operand::Value(0)),
+            Item::Label(labels[4]),
+            Item::Label(labels[5]),
+        ];
+        let expected = BlockGraph::from_items(items.clone(), &FxHashSet::default());
+        let expected_reachable = expected.reachable_blocks(&[]);
+        for mask in 0..1 << labels.len() {
+            let boundaries = labels
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, label)| (mask & (1 << index) != 0).then_some(label))
+                .collect();
+            let mut graph = BlockGraph::from_items(items.clone(), &boundaries);
+            let mut reachable = graph.reachable_blocks(&[]);
+            graph.remove_initial_preserved_boundaries(Some(&mut reachable));
+            assert_eq!(reachable, expected_reachable, "boundary mask {mask:#08b}");
+            assert_eq!(graph.order(), expected.order(), "boundary mask {mask:#08b}");
+            assert_eq!(graph.label_blocks, expected.label_blocks);
+            assert_eq!(graph.features(), expected.features());
+            assert!(
+                graph.iter().zip(expected.iter()).all(|(left, right)| {
+                    left.0 == right.0 && left.1.items() == right.1.items()
+                })
+            );
+            graph.validate().unwrap();
+        }
+
+        for items in [Vec::new(), vec![Item::Label(labels[0])]] {
+            let mut graph = BlockGraph::from_items(items, &FxHashSet::from_iter([labels[0]]));
+            let mut reachable = graph.reachable_blocks(&[]);
+            let order_pointer = graph.order.as_ptr();
+            graph.remove_initial_preserved_boundaries(Some(&mut reachable));
+            assert_eq!(graph.order.as_ptr(), order_pointer);
+            assert_eq!(reachable, graph.reachable_blocks(&[]));
+        }
     }
 
     #[test]

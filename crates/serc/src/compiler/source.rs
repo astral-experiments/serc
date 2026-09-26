@@ -659,7 +659,7 @@ pub(super) struct SourceAnalysis<'ast> {
     finally_bodies: FxHashMap<TextRange, &'ast [Stmt]>,
     origins: FxHashMap<Cow<'ast, str>, Cell<StringConstantOrigin>>,
     // Source-only identifiers still enter `origins` directly, in their original visitation order.
-    expression_origin_names: Vec<u64>,
+    expression_origin_names: Vec<ExpressionOriginNames>,
     private_name: Option<String>,
     mangled_names: Option<FxHashSet<String>>,
     generated_mangled_strings: FxHashSet<String>,
@@ -668,6 +668,13 @@ pub(super) struct SourceAnalysis<'ast> {
     static_attribute_names: FxHashSet<String>,
     has_percent_replacement: bool,
     requires_empty_bytes_cache_trace: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ExpressionOriginNames {
+    seen: u64,
+    // Whether the raw spelling contains `__`; only these need context-dependent work on reuse.
+    private: u64,
 }
 
 pub(super) struct SourceClassState {
@@ -716,25 +723,39 @@ impl<'ast> SourceAnalysis<'ast> {
         let index = name_id.index();
         let word_index = index / u64::BITS as usize;
         if word_index >= self.expression_origin_names.len() {
-            self.expression_origin_names.resize(word_index + 1, 0);
+            self.expression_origin_names
+                .resize(word_index + 1, ExpressionOriginNames::default());
         }
         let word = &mut self.expression_origin_names[word_index];
         let bit = 1 << (index % u64::BITS as usize);
-        if *word & bit == 0 {
-            *word |= bit;
+        let private = if word.seen & bit == 0 {
+            word.seen |= bit;
             self.origins.entry(Cow::Borrowed(name)).or_default();
+            let private = has_double_underscore(name);
+            if private {
+                word.private |= bit;
+            }
+            private
+        } else {
+            word.private & bit != 0
+        };
+        if private {
+            self.record_private_name_effects(name);
         }
-        self.record_raw_name_effects(name);
     }
 
     fn record_raw_name_effects(&mut self, name: &'ast str) {
         if has_double_underscore(name) {
-            self.restricted_private_identifier |= self.mangled_names.is_some();
-            self.raw_private_identifiers.insert(name);
-            let mangled = self.mangled_name(name);
-            if mangled != name {
-                self.generated_mangled_strings.insert(mangled.into_owned());
-            }
+            self.record_private_name_effects(name);
+        }
+    }
+
+    fn record_private_name_effects(&mut self, name: &'ast str) {
+        self.restricted_private_identifier |= self.mangled_names.is_some();
+        self.raw_private_identifiers.insert(name);
+        let mangled = self.mangled_name(name);
+        if mangled != name {
+            self.generated_mangled_strings.insert(mangled.into_owned());
         }
     }
 
@@ -1121,37 +1142,77 @@ impl Compiler<'_> {
         keyword: TokenKind,
         is_async: bool,
     ) -> SourceLocation {
-        let tokens = self.context.tokens.in_range(ruff_text_size::TextRange::new(
-            range.start(),
-            name_range.start(),
-        ));
-        let start = tokens
-            .iter()
-            .enumerate()
-            .rfind(|(_, token)| token.kind() == keyword)
-            .map_or(range.start(), |(keyword_index, keyword)| {
-                if is_async {
-                    tokens[..keyword_index]
-                        .iter()
-                        .rfind(|token| token.kind() == TokenKind::Async)
-                        .map_or(keyword.start(), ruff_text_size::Ranged::start)
-                } else {
-                    keyword.start()
-                }
-            });
+        // The parser supplies token-aligned ranges for the definition and its name.
+        let token_start = || {
+            let tokens = self.context.tokens.in_range(ruff_text_size::TextRange::new(
+                range.start(),
+                name_range.start(),
+            ));
+            tokens
+                .iter()
+                .enumerate()
+                .rfind(|(_, token)| token.kind() == keyword)
+                .map_or(range.start(), |(keyword_index, keyword)| {
+                    if is_async {
+                        tokens[..keyword_index]
+                            .iter()
+                            .rfind(|token| token.kind() == TokenKind::Async)
+                            .map_or(keyword.start(), ruff_text_size::Ranged::start)
+                    } else {
+                        keyword.start()
+                    }
+                })
+        };
+        let prefix: &[u8] = match (keyword, is_async) {
+            (TokenKind::Def, false) => b"def ",
+            (TokenKind::Def, true) => b"async def ",
+            (TokenKind::Class, false) => b"class ",
+            _ => &[],
+        };
+        let name_start = usize::from(name_range.start());
+        let fast_start = name_start.checked_sub(prefix.len()).and_then(|start| {
+            let preceding = self.context.source.as_bytes().get(start.wrapping_sub(1));
+            (start >= usize::from(range.start())
+                && !prefix.is_empty()
+                && (start == usize::from(range.start())
+                    || preceding.is_some_and(u8::is_ascii_whitespace))
+                && self.context.source.as_bytes().get(start..name_start) == Some(prefix))
+            .then(|| ruff_text_size::TextSize::try_from(start).unwrap())
+        });
+        let start = fast_start.unwrap_or_else(token_start);
         let (line, column) = self.source_position(u32::from(start));
         let (end_line, end_column) = self.definition_end_position(range);
         SourceLocation::new(line, end_line, column, end_column)
     }
 
     fn definition_end_position(&self, range: ruff_text_size::TextRange) -> (i32, i32) {
-        let end = self
+        let token_end = || {
+            self.context
+                .tokens
+                .after(range.end())
+                .first()
+                .filter(|token| token.kind() == TokenKind::Semi)
+                .map_or(range.end(), ruff_text_size::Ranged::end)
+        };
+        let tail = self
             .context
-            .tokens
-            .after(range.end())
-            .first()
-            .filter(|token| token.kind() == TokenKind::Semi)
-            .map_or(range.end(), ruff_text_size::Ranged::end);
+            .source
+            .as_bytes()
+            .get(usize::from(range.end())..);
+        let fast_end = tail.and_then(|tail| {
+            let blanks = tail
+                .iter()
+                .take_while(|byte| matches!(byte, b' ' | b'\t' | b'\x0c'))
+                .count();
+            match tail.get(blanks) {
+                None | Some(b'\n' | b'\r' | b'#') => Some(range.end()),
+                Some(b';') => {
+                    Some(range.end() + ruff_text_size::TextSize::try_from(blanks + 1).unwrap())
+                }
+                _ => None,
+            }
+        });
+        let end = fast_end.unwrap_or_else(token_end);
         self.source_position(u32::from(end))
     }
 
@@ -1269,11 +1330,30 @@ impl Compiler<'_> {
     }
 
     /// Folds constants while preserving surrogate escapes that Ruff represents as U+FFFD.
+    #[inline]
     pub(super) fn source_aware_fold_constant(&self, expression: &Expr) -> Option<Constant> {
-        struct RequiresRuntimeConstruction {
-            python_version: crate::PythonVersion,
-            found: bool,
+        match expression {
+            Expr::StringLiteral(string) => Some(self.string_literal_constant(string)),
+            Expr::NoneLiteral(_)
+            | Expr::BooleanLiteral(_)
+            | Expr::EllipsisLiteral(_)
+            | Expr::NumberLiteral(_)
+            | Expr::BytesLiteral(_) => literal_constant(expression),
+            Expr::Name(name) => (name.ctx == ExprContext::Load && name.id.as_str() == "__debug__")
+                .then_some(Constant::Bool(true)),
+            Expr::FString(_)
+            | Expr::Tuple(_)
+            | Expr::Subscript(_)
+            | Expr::Slice(_)
+            | Expr::UnaryOp(_)
+            | Expr::BinOp(_) => self.source_aware_fold_compound(expression),
+            // Runtime-only expressions cannot fold, even when all their descendants are literals.
+            _ => None,
         }
+    }
+
+    fn source_aware_fold_compound(&self, expression: &Expr) -> Option<Constant> {
+        struct RequiresRuntimeConstruction(bool);
 
         impl<'a> Visitor<'a> for RequiresRuntimeConstruction {
             fn visit_expr(&mut self, expression: &'a Expr) {
@@ -1281,19 +1361,9 @@ impl Compiler<'_> {
                     return crate::grow_stack(|| self.visit_expr(expression));
                 }
 
-                let requires_runtime = if self.python_version <= crate::PythonVersion::Py313 {
-                    // The AST optimizer leaves slices and joined strings at runtime.
-                    matches!(expression, Expr::Slice(_) | Expr::FString(_))
-                } else {
-                    // BUILD_TUPLE folds after TO_BOOL, so UNARY_NOT still consumes
-                    // a runtime Boolean, including inside a larger constant expression.
-                    matches!(expression, Expr::UnaryOp(unary)
-                        if unary.op == ruff_python_ast::UnaryOp::Not
-                            && matches!(unary.operand.as_ref(), Expr::Tuple(_)))
-                };
-                if requires_runtime {
-                    self.found = true;
-                } else if !self.found {
+                if matches!(expression, Expr::Slice(_) | Expr::FString(_)) {
+                    self.0 = true;
+                } else if !self.0 {
                     walk_expr(self, expression);
                 }
             }
@@ -1341,24 +1411,23 @@ impl Compiler<'_> {
             }
             _ => literal_constant(expression),
         };
+        let modern = self.context.python_version >= crate::PythonVersion::Py314;
         let constant = fold_constant_with_profile(
             expression,
             self.context.python_version,
             self.context.native_build_profile,
             &literal,
-            self.context.python_version >= crate::PythonVersion::Py314,
+            modern,
         )?;
 
-        // A literal callback returning None permits generic folding. Check successful
-        // folds for runtime-only descendants so nested occurrences cannot fall back.
-        // Most runtime expressions stop folding at their first nonconstant operand and
-        // never need a second walk through their remaining descendants.
-        let mut runtime = RequiresRuntimeConstruction {
-            python_version: self.context.python_version,
-            found: false,
-        };
+        // Modern folding already rejects `not <tuple>` recursively. The legacy AST optimizer
+        // leaves slices and joined strings at runtime even where generic folding accepts them.
+        if modern {
+            return Some(constant);
+        }
+        let mut runtime = RequiresRuntimeConstruction(false);
         runtime.visit_expr(expression);
-        (!runtime.found).then_some(constant)
+        (!runtime.0).then_some(constant)
     }
 
     pub(super) fn source_aware_constant_slice(
@@ -2676,13 +2745,74 @@ fn python_string_repr(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write;
+
     use super::*;
+
+    #[test]
+    fn source_aware_atomic_folding_preserves_literal_values_and_surrogates() {
+        use crate::PythonVersion::{Py312, Py313, Py314, Py315};
+
+        for (source, expected) in [
+            ("None", Constant::None),
+            ("False", Constant::Bool(false)),
+            ("...", Constant::Ellipsis),
+            ("42", Constant::Int(42)),
+            ("-2**2", Constant::SignedInt(-4)),
+            ("(-2)**2", Constant::Int(4)),
+            ("'a' 'b'", Constant::String("ab".into())),
+            ("b'a' b'\\xff'", Constant::Bytes(vec![b'a', 0xff])),
+            (
+                "'a' '\\ud800'",
+                Constant::SurrogateString(vec![b'a', 0xed, 0xa0, 0x80]),
+            ),
+            ("r'\\ud800'", Constant::String(r"\ud800".into())),
+            ("'\\ufffd'", Constant::String("\u{fffd}".into())),
+        ] {
+            let parsed = ruff_python_parser::parse_module(source).unwrap();
+            let [Stmt::Expr(statement)] = parsed.suite().as_slice() else {
+                unreachable!("test cases are expressions");
+            };
+            for version in [Py312, Py313, Py314, Py315] {
+                let compiler = Compiler::module_with_python_version(
+                    "fold.py",
+                    source,
+                    parsed.tokens(),
+                    parsed.suite(),
+                    version,
+                );
+                let actual = compiler
+                    .source_aware_fold_constant(&statement.value)
+                    .expect("literal should fold");
+                assert_eq!(
+                    std::mem::discriminant(&actual),
+                    std::mem::discriminant(&expected),
+                    "{version:?} {source}: {actual:?}",
+                );
+                assert!(
+                    crate::compiler::constant::python_constant_values_equal(&actual, &expected),
+                    "{version:?} {source}: {actual:?}",
+                );
+            }
+        }
+    }
 
     #[test]
     fn source_aware_folding_keeps_target_runtime_expressions() {
         use crate::PythonVersion::{Py312, Py313, Py314, Py315};
 
         for (source, legacy, modern) in [
+            ("__debug__", true, true),
+            ("name", false, false),
+            ("(1, 2).real", false, false),
+            ("[1, 2]", false, false),
+            ("{1, 2}", false, false),
+            ("{'a': 1}", false, false),
+            ("1 == 2", false, false),
+            ("1 and 2", false, false),
+            ("1 if 2 else 3", false, false),
+            ("lambda: 1", false, false),
+            ("[x for x in (1, 2)]", false, false),
             ("'abc'[1]", true, true),
             ("('abc',)[0]", true, true),
             ("'abc'[1:]", false, true),
@@ -2690,8 +2820,13 @@ mod tests {
             ("f'abc'", false, true),
             ("(f'abc',)", false, true),
             ("f'{value}'", false, false),
+            ("not f'abc'", false, true),
+            ("not f'{(not ())}'", false, false),
             ("not ()", true, false),
             ("((not ()),)", true, false),
+            ("('a', 'b')[not ()]", true, false),
+            ("('a', 'b')[(not (),)[0]]", true, false),
+            ("1 + (not ())", true, false),
             ("~True", true, false),
             ("'\\ud800' + 'x'", true, true),
             ("helper(not (), f'abc', 'abc'[1:])", false, false),
@@ -3112,6 +3247,41 @@ class RepeatOuter[__T: (__shared, prefix__suffix)]:
             reference.restricted_private_identifier
         );
         assert!(combined.raw_private_identifiers.contains("prefix__suffix"));
+    }
+
+    #[test]
+    fn expression_name_index_caches_private_spelling_across_id_words_and_contexts() {
+        let mut source = String::new();
+        for index in 0..140 {
+            writeln!(source, "plain_{index}.member").unwrap();
+        }
+        source.push_str(
+            "__private\nprefix__suffix\nclass First[T: prefix__suffix]:\n    self.__private\nclass Second:\n    self.__private\nplain_139.member\n",
+        );
+        let parsed = ruff_python_parser::parse_module(&source).unwrap();
+        let mut analysis = SourceAnalysis::new(crate::PythonVersion::Py314, 0);
+        let arena = ScopeArena::analyze_with_source(
+            parsed.suite(),
+            crate::PythonVersion::Py314,
+            &mut analysis,
+        );
+        let cached = |name: &str| {
+            let id = arena.names.get(name).unwrap().index();
+            let word = &analysis.expression_origin_names[id / 64];
+            let bit = 1 << (id % 64);
+            (word.seen & bit != 0, word.private & bit != 0)
+        };
+        for index in 0..140 {
+            assert_eq!(cached(&format!("plain_{index}")), (true, false));
+        }
+        assert_eq!(cached("member"), (true, false));
+        assert_eq!(cached("__private"), (true, true));
+        assert_eq!(cached("prefix__suffix"), (true, true));
+        assert!(analysis.restricted_private_identifier);
+        assert_eq!(
+            analysis.generated_mangled_strings,
+            FxHashSet::from_iter(["_First__private".to_owned(), "_Second__private".to_owned()])
+        );
     }
 
     #[test]

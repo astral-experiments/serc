@@ -213,7 +213,7 @@ pub(super) struct ObjectGraph<'a> {
     python_version: PythonVersion,
     objects: FxHashMap<HashedObjectKey<'a>, ObjectId>,
     interned_strings: FxHashMap<&'a str, ObjectId>,
-    metadata_aliased_constants: FxHashSet<usize>,
+    aliases: GraphAliases,
     metadata_slots: Box<[Option<ObjectId>]>,
     cached_empty_bytes: Option<ObjectId>,
     cached_empty_tuple: Option<ObjectId>,
@@ -223,7 +223,6 @@ pub(super) struct ObjectGraph<'a> {
     uncached_percent_constant: bool,
     fresh_empty_bytes_constant: bool,
     needs_reference_sorting: bool,
-    legacy_qualified_name_aliases: FxHashSet<usize>,
     objects_by_id: IndexVec<ObjectId, Object>,
     occurrences: Vec<Occurrence>,
     frozen_set_orders: Vec<(usize, FrozenSetMembers<'a>)>,
@@ -232,36 +231,23 @@ pub(super) struct ObjectGraph<'a> {
     unique_objects: FxHashSet<HashedObjectKey<'a>>,
 }
 
-impl<'a> ObjectGraph<'a> {
-    #[cfg(test)]
-    pub(super) fn for_code(code: &'a CodeObject) -> Self {
-        Self::for_code_with_options(code, PythonVersion::Py314, &InitialInternState::default())
-    }
+#[derive(Clone, Debug, Default)]
+struct GraphAliases {
+    metadata_constants: FxHashSet<usize>,
+    legacy_qualified_names: FxHashSet<usize>,
+}
 
-    pub(super) fn for_code_with_options(
+struct GraphPreprocessing<'a> {
+    explicitly_interned: FxHashSet<&'a str>,
+    recreated_frozensets: FxHashSet<usize>,
+}
+
+impl<'a> GraphPreprocessing<'a> {
+    fn for_code(
         code: &'a CodeObject,
         python_version: PythonVersion,
         initial_intern_state: &InitialInternState,
-    ) -> Self {
-        let graph = Self::build_for_code(code, python_version, initial_intern_state, None);
-        if graph.needs_reference_sorting {
-            // Tuple members sort by complete marshal streams: their descendants' reference flags
-            // depend on sharing across the entire code graph. Resolve that sharing before recording
-            // occurrences; explicitly interned scalar strings also sort by their interned tag.
-            // Python 3.12 also needs this pass for scalar members because it borrows their roots
-            // while computing sort keys.
-            Self::build_for_code(code, python_version, initial_intern_state, Some(&graph))
-        } else {
-            graph
-        }
-    }
-
-    fn build_for_code(
-        code: &'a CodeObject,
-        python_version: PythonVersion,
-        initial_intern_state: &InitialInternState,
-        sort_graph: Option<&Self>,
-    ) -> Self {
+    ) -> (Self, GraphAliases) {
         let mut explicitly_interned = FxHashSet::default();
         let mut metadata_tuples = FxHashSet::default();
         let needs_metadata_alias_scan = !code.marshal_provenance.metadata_alias_scan_unnecessary;
@@ -287,9 +273,68 @@ impl<'a> ObjectGraph<'a> {
             &mut recreated_frozensets,
         )
         .expect("compiled module must have resolved byte-relevant intern state");
-        let explicitly_interned = (!explicitly_interned.is_empty()).then_some(&explicitly_interned);
-        let recreated_frozensets =
-            (!recreated_frozensets.is_empty()).then_some(&recreated_frozensets);
+        let aliases = GraphAliases {
+            metadata_constants: collect_metadata_aliased_constants(code, &metadata_tuples),
+            legacy_qualified_names: if python_version == PythonVersion::Py312 {
+                legacy_qualified_name_aliases(code)
+            } else {
+                FxHashSet::default()
+            },
+        };
+        (
+            Self {
+                explicitly_interned,
+                recreated_frozensets,
+            },
+            aliases,
+        )
+    }
+}
+
+impl<'a> ObjectGraph<'a> {
+    #[cfg(test)]
+    pub(super) fn for_code(code: &'a CodeObject) -> Self {
+        Self::for_code_with_options(code, PythonVersion::Py314, &InitialInternState::default())
+    }
+
+    pub(super) fn for_code_with_options(
+        code: &'a CodeObject,
+        python_version: PythonVersion,
+        initial_intern_state: &InitialInternState,
+    ) -> Self {
+        let (preprocessing, aliases) =
+            GraphPreprocessing::for_code(code, python_version, initial_intern_state);
+        let graph = Self::build_for_code(code, python_version, &preprocessing, aliases, None);
+        if graph.needs_reference_sorting {
+            // Tuple members sort by complete marshal streams: their descendants' reference flags
+            // depend on sharing across the entire code graph. Resolve that sharing before recording
+            // occurrences; explicitly interned scalar strings also sort by their interned tag.
+            // Python 3.12 also needs this pass for scalar members because it borrows their roots
+            // while computing sort keys. Compilation interning and aliases do not depend on wire
+            // order, so both graph traversals use the same preprocessing.
+            Self::build_for_code(
+                code,
+                python_version,
+                &preprocessing,
+                graph.aliases.clone(),
+                Some(&graph),
+            )
+        } else {
+            graph
+        }
+    }
+
+    fn build_for_code(
+        code: &'a CodeObject,
+        python_version: PythonVersion,
+        preprocessing: &GraphPreprocessing<'a>,
+        aliases: GraphAliases,
+        sort_graph: Option<&Self>,
+    ) -> Self {
+        let explicitly_interned = (!preprocessing.explicitly_interned.is_empty())
+            .then_some(&preprocessing.explicitly_interned);
+        let recreated_frozensets = (!preprocessing.recreated_frozensets.is_empty())
+            .then_some(&preprocessing.recreated_frozensets);
         let metadata_domain = usize::try_from(code.marshal_provenance.metadata_ids.domain_len)
             .ok()
             .filter(|len| *len <= MAX_DENSE_METADATA_SLOTS);
@@ -313,12 +358,7 @@ impl<'a> ObjectGraph<'a> {
         }
         let mut graph = Self {
             python_version,
-            legacy_qualified_name_aliases: if python_version == PythonVersion::Py312 {
-                legacy_qualified_name_aliases(code)
-            } else {
-                FxHashSet::default()
-            },
-            metadata_aliased_constants: collect_metadata_aliased_constants(code, &metadata_tuples),
+            aliases,
             cache_scalars: code.constants.len() >= MIN_CACHED_SCALAR_CONSTANTS,
             preallocated_interned_strings: interned_capacity.is_some(),
             interned_strings,
@@ -378,7 +418,8 @@ impl<'a> ObjectGraph<'a> {
     fn sort_key_properties(&self, value: &'a Constant) -> (bool, bool) {
         if let Constant::String(value) = value {
             if self
-                .metadata_aliased_constants
+                .aliases
+                .metadata_constants
                 .contains(&std::ptr::from_ref(value).addr())
             {
                 return (true, true);
@@ -2555,7 +2596,8 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
                 .qualified_name_is_canonical
                 .unwrap_or_else(|| {
                     self.graph
-                        .legacy_qualified_name_aliases
+                        .aliases
+                        .legacy_qualified_names
                         .contains(&std::ptr::from_ref(code).addr())
                 });
             let key = if aliases_constant {
@@ -2589,7 +2631,8 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
                             !should_intern(value)
                                 && (self
                                     .graph
-                                    .metadata_aliased_constants
+                                    .aliases
+                                    .metadata_constants
                                     .contains(&std::ptr::from_ref(value).addr())
                                     || self
                                         .explicitly_interned
@@ -2624,7 +2667,8 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
                 let interned = should_intern(value)
                     || self
                         .graph
-                        .metadata_aliased_constants
+                        .aliases
+                        .metadata_constants
                         .contains(&std::ptr::from_ref(value).addr())
                     || self
                         .explicitly_interned

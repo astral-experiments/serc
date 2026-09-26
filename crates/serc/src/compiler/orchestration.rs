@@ -32,8 +32,8 @@ use crate::{CompileError, PythonVersion};
 use super::constant::{DeferredConstantTarget, OutputState, fold_constant, literal_constant};
 use super::definition::clean_doc;
 use super::scope::{
-    LoweringFunctionPlan, NameId, NameSet, ScopeId, collect_conditional_simple_annotations,
-    collect_simple_annotations, has_annotations,
+    LoweringFunctionPlan, NameId, NameInterner, NameSet, ScopeId,
+    collect_conditional_simple_annotations, collect_simple_annotations, has_annotations,
 };
 use super::source::{CompilationContext, implicit_return_range};
 use super::statement::{
@@ -41,6 +41,44 @@ use super::statement::{
 };
 use super::symbol::{ReraiseStackState, ResumeDepth, SymbolState, to_u32};
 use super::{Compiler, Scope};
+
+/// Orders fast locals ahead of sorted cell-only locals while reserving the later free slots.
+#[inline]
+fn partition_function_locals(
+    plan: &LoweringFunctionPlan,
+    parameter_count: usize,
+    names: &NameInterner,
+) -> (Vec<NameId>, usize) {
+    let mut locals = Vec::with_capacity(plan.locals.len().saturating_add(plan.freevars.len()));
+    if plan.cellvars.is_empty() {
+        locals.extend_from_slice(&plan.locals);
+        let fast_local_count = locals.len();
+        return (locals, fast_local_count);
+    }
+
+    let mut cell_only_locals = Vec::new();
+    for (index, &name) in plan.locals.iter().enumerate() {
+        if index >= parameter_count
+            && plan.cellvars.contains(&name)
+            && !plan.inlined_comprehension_cellvars.contains(&name)
+        {
+            cell_only_locals.push(name);
+        } else {
+            locals.push(name);
+        }
+    }
+    let fast_local_count = locals.len();
+    cell_only_locals.sort_by(|left, right| {
+        let spelling = |name| {
+            plan.cell_sort_names
+                .get(&name)
+                .map_or_else(|| names.resolve(name), String::as_str)
+        };
+        spelling(*left).cmp(spelling(*right))
+    });
+    locals.extend(cell_only_locals);
+    (locals, fast_local_count)
+}
 
 /// Proves that the surviving constants cannot be changed by interning a metadata tuple.
 ///
@@ -354,7 +392,7 @@ impl<'source> Compiler<'source> {
         .unwrap_or(usize::MAX);
         let names = &context.scopes.names;
         let header_storage = plan.header_local_storage.as_ref();
-        let mut locals: Vec<_> = if let Some(storage) = header_storage {
+        let (mut locals, fast_local_count) = if let Some(storage) = header_storage {
             let mut seen = FxHashSet::default();
             if storage.fast_locals.iter().any(|name| !seen.insert(*name))
                 || storage
@@ -367,52 +405,32 @@ impl<'source> Compiler<'source> {
                     "invalid generic-header fast-local storage layout".to_string(),
                 ));
             }
-            storage.fast_locals.clone()
-        } else {
-            plan.locals
-                .iter()
-                .enumerate()
-                .filter(|(index, name)| {
-                    *index < parameter_count
-                        || !plan.cellvars.contains(*name)
-                        || plan.inlined_comprehension_cellvars.contains(*name)
-                })
-                .map(|(_, name)| *name)
-                .collect()
-        };
-        let fast_local_count = locals.len();
-        let mut cell_only_locals: Vec<_> = if header_storage.is_some() {
-            plan.cellvars
+            let mut locals = storage.fast_locals.clone();
+            let fast_local_count = locals.len();
+            let mut cell_only_locals: Vec<_> = plan
+                .cellvars
                 .iter()
                 .filter(|name| !locals.contains(name))
                 .copied()
-                .collect()
+                .collect();
+            cell_only_locals.sort_by(|left, right| {
+                let spelling = |name| {
+                    plan.cell_sort_names
+                        .get(&name)
+                        .map_or_else(|| names.resolve(name), String::as_str)
+                };
+                spelling(*left).cmp(spelling(*right))
+            });
+            locals.extend(cell_only_locals);
+            (locals, fast_local_count)
         } else {
-            plan.locals
-                .iter()
-                .enumerate()
-                .filter(|(index, name)| {
-                    *index >= parameter_count
-                        && plan.cellvars.contains(*name)
-                        && !plan.inlined_comprehension_cellvars.contains(*name)
-                })
-                .map(|(_, name)| *name)
-                .collect()
+            partition_function_locals(plan, parameter_count, names)
         };
-        cell_only_locals.sort_by(|left, right| {
-            let spelling = |name| {
-                plan.cell_sort_names
-                    .get(&name)
-                    .map_or_else(|| names.resolve(name), String::as_str)
-            };
-            spelling(*left).cmp(spelling(*right))
-        });
-        locals.extend(cell_only_locals);
-        let mut indices = locals
-            .iter()
-            .enumerate()
-            .map(|(index, name)| Ok((*name, to_u32(index, "local variable count")?)))
-            .collect::<Result<FxHashMap<_, _>, CompileError>>()?;
+        let mut indices = FxHashMap::default();
+        indices.reserve(locals.len().saturating_add(plan.local_aliases.len()));
+        for (index, &name) in locals.iter().enumerate() {
+            indices.insert(name, to_u32(index, "local variable count")?);
+        }
         let mut temporary_indices = FxHashMap::default();
         if let Some(storage) = header_storage {
             for &(symbol, physical) in &storage.comprehension_slots {
@@ -449,12 +467,11 @@ impl<'source> Compiler<'source> {
             temporary_indices.insert(original, index);
         }
         let local_count = locals.len();
-        let mut free_indices = plan
-            .freevars
-            .iter()
-            .enumerate()
-            .map(|(index, name)| Ok((*name, to_u32(local_count + index, "free variable count")?)))
-            .collect::<Result<FxHashMap<_, _>, CompileError>>()?;
+        let mut free_indices = FxHashMap::default();
+        free_indices.reserve(plan.freevars.len().saturating_add(plan.free_aliases.len()));
+        for (index, &name) in plan.freevars.iter().enumerate() {
+            free_indices.insert(name, to_u32(local_count + index, "free variable count")?);
+        }
         for &(alias, original) in &plan.free_aliases {
             free_indices.insert(alias, free_indices[&original]);
         }
@@ -1578,5 +1595,90 @@ impl CodeUnit {
             first_line_number: spec.first_line_number,
             annotation_thunk: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod function_local_tests {
+    use super::*;
+
+    #[test]
+    fn function_local_partition_matches_two_reference_passes() {
+        fn reference(
+            plan: &LoweringFunctionPlan,
+            parameter_count: usize,
+            names: &NameInterner,
+        ) -> (Vec<NameId>, usize) {
+            let mut locals: Vec<_> = plan
+                .locals
+                .iter()
+                .enumerate()
+                .filter(|(index, name)| {
+                    *index < parameter_count
+                        || !plan.cellvars.contains(*name)
+                        || plan.inlined_comprehension_cellvars.contains(*name)
+                })
+                .map(|(_, name)| *name)
+                .collect();
+            let fast_local_count = locals.len();
+            let mut cell_only_locals: Vec<_> = plan
+                .locals
+                .iter()
+                .enumerate()
+                .filter(|(index, name)| {
+                    *index >= parameter_count
+                        && plan.cellvars.contains(*name)
+                        && !plan.inlined_comprehension_cellvars.contains(*name)
+                })
+                .map(|(_, name)| *name)
+                .collect();
+            cell_only_locals.sort_by(|left, right| {
+                let spelling = |name| {
+                    plan.cell_sort_names
+                        .get(&name)
+                        .map_or_else(|| names.resolve(name), String::as_str)
+                };
+                spelling(*left).cmp(spelling(*right))
+            });
+            locals.extend(cell_only_locals);
+            (locals, fast_local_count)
+        }
+
+        let mut names = NameInterner::default();
+        let local = ["z", "a", "m", "b", "t", "c"].map(|name| names.intern(name));
+        let free = ["free_one", "free_two"].map(|name| names.intern(name));
+        let set = |mask: u32| {
+            local
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, name)| (mask & (1 << index) != 0).then_some(name))
+                .collect()
+        };
+        for cell_mask in 0..1 << local.len() {
+            for comprehension_mask in 0..1 << local.len() {
+                for parameter_count in 0..=local.len() + 1 {
+                    let plan = LoweringFunctionPlan {
+                        locals: local.to_vec(),
+                        freevars: free.to_vec(),
+                        cellvars: set(cell_mask),
+                        inlined_comprehension_cellvars: set(comprehension_mask),
+                        cell_sort_names: FxHashMap::from_iter([
+                            (local[0], "0".to_owned()),
+                            (local[1], "y".to_owned()),
+                        ]),
+                        ..LoweringFunctionPlan::default()
+                    };
+                    assert_eq!(
+                        partition_function_locals(&plan, parameter_count, &names),
+                        reference(&plan, parameter_count, &names),
+                        "cells={cell_mask}, comprehensions={comprehension_mask}, parameters={parameter_count}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            partition_function_locals(&LoweringFunctionPlan::default(), 0, &names),
+            (Vec::new(), 0)
+        );
     }
 }
