@@ -1,5 +1,6 @@
 #[cfg(any(test, debug_assertions))]
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 
 use super::block_graph::BlockGraph;
 use super::fusion_owner_slots::FusionOwnerCertificates;
@@ -237,7 +238,9 @@ impl Assembler {
                 mut graph,
                 mut reachable,
             } => {
-                graph.remove_initial_preserved_boundaries(Some(&mut reachable));
+                if !self.preserved_block_boundaries.is_empty() {
+                    graph.remove_initial_preserved_boundaries(Some(&mut reachable));
+                }
                 (graph, Some(reachable))
             }
         };
@@ -485,13 +488,24 @@ impl Assembler {
                 }
             }
         }
-        for item in graph.iter_items() {
-            if let Item::Instruction(instruction) = item
-                && let Operand::Forward(label) | Operand::Backward(label) = instruction.operand()
-            {
-                self.exception_owner_provenance
-                    .block_boundaries
-                    .insert(label);
+        #[cfg(test)]
+        assert!(
+            graph.features().has_jump()
+                || !graph.iter_items().any(|item| {
+                    matches!(item, Item::Instruction(instruction)
+                        if matches!(instruction.operand(), Operand::Forward(_) | Operand::Backward(_)))
+                })
+        );
+        if graph.features().has_jump() {
+            for item in graph.iter_items() {
+                if let Item::Instruction(instruction) = item
+                    && let Operand::Forward(label) | Operand::Backward(label) =
+                        instruction.operand()
+                {
+                    self.exception_owner_provenance
+                        .block_boundaries
+                        .insert(label);
+                }
             }
         }
         // Later CFG passes can restore protected jump owners but only from this map.
@@ -637,7 +651,11 @@ impl OptimizationPipeline {
         self.prepare_plain_tuple_copy_plan();
         self.prepare_conditional_normal_try_joins();
         original_owners.retain_pipeline(&self);
-        let original_location_absence = self.capture_original_location_absence();
+        let original_location_absence = if assertion_side_exits {
+            rustc_hash::FxHashSet::default()
+        } else {
+            self.capture_original_location_absence()
+        };
         let synthesized_predecessor_locations = if self.has_synthesized_percent_target_locations {
             self.resolve_synthesized_percent_locations();
             original_owners.retain_pipeline(&self);
@@ -714,7 +732,14 @@ impl OptimizationPipeline {
         self.borrow_authored_finally_break_origins =
             crate::assembler::ir::AuthoredFinallyBreakOrigins::default();
         // Also clear scratch origins on assertion-only and duplicate-pass early-return paths.
-        Self::clear_initial_borrow_jump_entries(&mut self.graph);
+        if !self.borrow_jump_entry_labels.is_empty() {
+            Self::clear_initial_borrow_jump_entries(&mut self.graph);
+        }
+        #[cfg(test)]
+        assert!(self.graph.iter_items().all(|item| {
+            !matches!(item, Item::Instruction(instruction)
+                if instruction.initial_borrow_jump_target().is_some())
+        }));
         original_owners.retain_after_exit_copy(
             &self,
             &copied_exit_owner_retargets,
@@ -967,13 +992,17 @@ impl OptimizationPipeline {
         }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveRedundantSwapsBeforePops)?;
-        self.remove_redundant_nops();
-        fusion_owners.retain_pipeline(&self);
+        let nop_cleanup = self.remove_redundant_nops();
+        if nop_cleanup.may_have_changed {
+            fusion_owners.retain_pipeline(&self);
+        }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveRedundantNops)?;
         if !assertion_side_exits {
-            self.remove_redundant_forward_jumps(true);
-            fusion_owners.retain_pipeline(&self);
+            if nop_cleanup.has_forward_jump {
+                self.remove_redundant_forward_jumps(true);
+                fusion_owners.retain_pipeline(&self);
+            }
             // Manager exits can expose a redundant POP_BLOCK after their jump disappears.
             if self.remove_redundant_with_exit_nops() {
                 fusion_owners.retain_pipeline(&self);
@@ -1203,6 +1232,36 @@ impl OptimizationPipeline {
     }
 }
 
+/// Symbolic labels and jump targets collected alongside the first physical layout pass.
+#[derive(Default)]
+struct InitialSymbolicJumps {
+    labels: SmallVec<[(Label, u32); 32]>,
+    targets: SmallVec<[Label; 16]>,
+}
+
+impl InitialSymbolicJumps {
+    fn record_label(&mut self, label: Label, instruction_index: usize) {
+        self.labels.push((
+            label,
+            u32::try_from(instruction_index).expect("final symbolic instruction index fits u32"),
+        ));
+    }
+
+    fn finish(self, label_count: usize) -> Option<(Vec<Option<u32>>, bool)> {
+        if self.targets.is_empty() {
+            return None;
+        }
+        let mut indices = vec![None; label_count];
+        for (label, index) in self.labels {
+            indices[label.index()] = Some(index);
+        }
+        let can_be_unextended = self.targets.into_iter().all(|target| {
+            label_position(&indices, target).is_some_and(|index| u8::try_from(index).is_ok())
+        });
+        Some((indices, can_be_unextended))
+    }
+}
+
 impl LayoutAssembler {
     /// Computes wire operands without changing semantic instruction provenance.
     #[inline]
@@ -1296,7 +1355,7 @@ impl LayoutAssembler {
         }
         let mut labels = vec![None; usize::try_from(self.next_label).unwrap()];
         if self.python_version == crate::PythonVersion::Py314
-            && let Some(((bytecode, line_table, max_depth), instruction_count)) =
+            && let Some((bytecode, line_table, max_depth)) =
                 self.encode_small_final_artifacts(&mut labels, first_line_number)?
         {
             #[cfg(any(test, debug_assertions))]
@@ -1304,7 +1363,7 @@ impl LayoutAssembler {
             let exception_table = if self.exception_regions.is_empty() {
                 Vec::new()
             } else {
-                self.exception_table(&vec![0; instruction_count], &labels)?
+                self.unextended_exception_table(&labels)?
             };
             return Ok(AssembledCode {
                 bytecode,
@@ -1317,6 +1376,8 @@ impl LayoutAssembler {
         let mut instruction_count = 0;
         let mut code_units = 0;
         let mut can_be_unextended = true;
+        let mut symbolic_jumps =
+            (self.items.len() > usize::from(u8::MAX)).then(InitialSymbolicJumps::default);
         for item in &self.items {
             match *item {
                 Item::Instruction(instruction) => {
@@ -1324,12 +1385,20 @@ impl LayoutAssembler {
                     code_units += 1 + u32::from(instruction.opcode.caches_for(self.python_version));
                     can_be_unextended &= match self.encoded_operand(&instruction)? {
                         Operand::Value(argument) => u8::try_from(argument).is_ok(),
-                        Operand::Forward(_) | Operand::Backward(_) => true,
+                        Operand::Forward(target) | Operand::Backward(target) => {
+                            if let Some(symbolic_jumps) = &mut symbolic_jumps {
+                                symbolic_jumps.targets.push(target);
+                            }
+                            true
+                        }
                         Operand::Deferred(_) => false,
                     };
                 }
                 Item::Label(label) => {
                     labels[label.index()] = Some(code_units);
+                    if let Some(symbolic_jumps) = &mut symbolic_jumps {
+                        symbolic_jumps.record_label(label, instruction_count);
+                    }
                 }
             }
         }
@@ -1373,25 +1442,13 @@ impl LayoutAssembler {
             && !native_jump_widths
             && instruction_count > usize::from(u8::MAX)
         {
-            let mut indices = vec![None; labels.len()];
-            let mut index = 0_u32;
-            for item in &self.items {
-                match *item {
-                    Item::Instruction(_) => index += 1,
-                    Item::Label(label) => indices[label.index()] = Some(index),
-                }
-            }
-            can_be_unextended &= self.items.iter().all(|item| match item {
-                Item::Instruction(instruction) => match instruction.operand() {
-                    Operand::Forward(label) | Operand::Backward(label) => {
-                        label_position(&indices, label)
-                            .is_some_and(|index| u8::try_from(index).is_ok())
-                    }
-                    Operand::Value(_) | Operand::Deferred(_) => true,
-                },
-                Item::Label(_) => true,
-            });
-            Some(indices)
+            symbolic_jumps
+                .expect("a scope with more than 255 instructions has more than 255 items")
+                .finish(labels.len())
+                .map(|(indices, jumps_can_be_unextended)| {
+                    can_be_unextended &= jumps_can_be_unextended;
+                    indices
+                })
         } else {
             None
         };
@@ -1405,7 +1462,7 @@ impl LayoutAssembler {
             let exception_table = if self.exception_regions.is_empty() {
                 Vec::new()
             } else {
-                self.exception_table(&vec![0; instruction_count], &labels)?
+                self.unextended_exception_table(&labels)?
             };
             return Ok(AssembledCode {
                 bytecode,
@@ -1579,6 +1636,119 @@ mod uniform_jump_seed_tests {
             removed_max_depth: None,
             next_label: 1,
             has_next_location: false,
+        }
+    }
+
+    #[test]
+    fn fused_symbolic_scan_preserves_target_index_width_boundaries() {
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            for (uniform, exact) in [(false, None), (true, None), (false, Some(0))] {
+                for target_index in [254, 255, 256] {
+                    let mut layout = boundary_layout(version, uniform, exact, false);
+                    let instruction = |opcode, operand| {
+                        Item::Instruction(Instruction::new(
+                            opcode,
+                            operand,
+                            SourceLocation::NONE,
+                            None,
+                        ))
+                    };
+                    let target = Label::from_u32(0);
+                    let caches = usize::from(JUMP_BACKWARD.caches_for(version));
+                    let mut jump = Instruction::new(
+                        JUMP_BACKWARD,
+                        Operand::Backward(target),
+                        SourceLocation::NONE,
+                        None,
+                    );
+                    if let Some(exact) = exact {
+                        jump.set_legacy_initial_jump_argument(exact);
+                    }
+                    layout.items =
+                        std::iter::repeat_n(instruction(NOP, Operand::Value(0)), target_index)
+                            .chain([Item::Label(target)])
+                            .chain(std::iter::repeat_n(
+                                instruction(NOP, Operand::Value(0)),
+                                254 - caches,
+                            ))
+                            .chain([Item::Instruction(jump)])
+                            .collect();
+                    let code = layout.finish(1).unwrap().bytecode;
+                    let jump_end = code.len() - 2 * caches;
+                    let unextended = target_index <= 255
+                        || (version == PythonVersion::Py312 && (uniform || exact.is_some()));
+                    assert_eq!(
+                        &code[jump_end - 4..jump_end],
+                        if unextended {
+                            [
+                                NOP.code_for(version),
+                                0,
+                                JUMP_BACKWARD.code_for(version),
+                                255,
+                            ]
+                        } else {
+                            [
+                                EXTENDED_ARG.code_for(version),
+                                1,
+                                JUMP_BACKWARD.code_for(version),
+                                0,
+                            ]
+                        },
+                        "{version:?}, uniform={uniform}, exact={exact:?}, target={target_index}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn large_jump_free_layout_ignores_sparse_labels_on_both_width_paths() {
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            for argument in [1, 0x1234] {
+                let fixture = |labels: bool| {
+                    let mut layout = boundary_layout(version, false, None, false);
+                    let instruction = |opcode, operand| {
+                        Item::Instruction(Instruction::new(
+                            opcode,
+                            Operand::Value(operand),
+                            SourceLocation::new(1, 1, 0, 1),
+                            None,
+                        ))
+                    };
+                    layout.items.clear();
+                    for index in 0..=310 {
+                        if labels && matches!(index, 0 | 254 | 255 | 256 | 310) {
+                            layout.items.push(Item::Label(Label::from_usize(index * 2)));
+                        }
+                        if index == 0 {
+                            layout.items.push(instruction(LOAD_CONST, argument));
+                        } else if index == 310 {
+                            layout.items.push(instruction(RETURN_VALUE, 0));
+                        } else {
+                            layout.items.push(instruction(NOP, 0));
+                        }
+                    }
+                    layout.next_label = if labels { 621 } else { 0 };
+                    layout.finish(1).unwrap()
+                };
+                let sparse = fixture(true);
+                let bare = fixture(false);
+                assert_eq!(sparse.bytecode, bare.bytecode);
+                assert_eq!(sparse.line_table, bare.line_table);
+                assert_eq!(sparse.exception_table, bare.exception_table);
+                assert_eq!(sparse.max_depth, bare.max_depth);
+                assert_eq!(sparse.removed_max_depth, bare.removed_max_depth);
+            }
         }
     }
 

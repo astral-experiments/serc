@@ -4610,14 +4610,24 @@ fn terminal_guard_optimizer_matches_the_graph_and_keeps_side_local_state_isolate
                 assembler
             };
             let mut linear = build();
+            assert!(!linear.has_proven_linear_terminal_guards);
             assert!(linear.has_only_linear_terminal_guards());
             assert_eq!(
                 linear.used_constant_indices(6),
                 [false, true, false, true, true, false]
             );
+            assert!(linear.has_proven_linear_terminal_guards);
             assert!(matches!(linear.code, UnoptimizedCode::Linear(_)));
+            let remap = [Some(0), Some(1), None, Some(2), Some(3), None];
+            linear.remap_constant_indices(&remap);
+            assert!(
+                super::terminal_guard_constant_indices(linear.linear_items(), &mut [])
+                    .unwrap_or(false)
+            );
+            assert!(linear.has_only_linear_terminal_guards());
 
             let mut generic = build();
+            generic.remap_constant_indices(&remap);
             let graph = super::block_graph::BlockGraph::from_items(
                 generic.linear_items().to_vec(),
                 &rustc_hash::FxHashSet::default(),
@@ -4633,6 +4643,271 @@ fn terminal_guard_optimizer_matches_the_graph_and_keeps_side_local_state_isolate
             assert_eq!(actual.removed_max_depth, expected.removed_max_depth);
         }
     }
+}
+
+#[test]
+fn single_terminal_guards_keep_fallthrough_marker_aliases_and_match_the_graph() {
+    let [target, alias, trailing, unexpected] = [0, 1, 2, 3].map(super::Label::from_u32);
+    let value = |opcode, argument, line, depth| {
+        Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Value(argument),
+            SourceLocation::new(line, line, 0, 5),
+            Some(depth),
+        ))
+    };
+    let branch = |opcode, target| {
+        Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Forward(target),
+            SourceLocation::new(2, 2, 0, 5),
+            Some(0),
+        ))
+    };
+    let make_items = |condition, terminal_side, trailing_label| {
+        let mut items = vec![
+            value(RESUME, ResumeLocation::AT_FUNC_START.argument(), 1, 0),
+            value(LOAD_FAST, 0, 2, 1),
+            branch(condition, target),
+            value(NOT_TAKEN, 0, 2, 0),
+            Item::Label(alias),
+            value(LOAD_CONST, 2, 3, 1),
+            value(STORE_FAST, 1, 3, 0),
+            value(DELETE_FAST, 0, 3, 0),
+        ];
+        if terminal_side {
+            items.extend([value(LOAD_FAST, 1, 4, 1), value(RETURN_VALUE, 0, 4, 0)]);
+        }
+        items.extend([
+            Item::Label(target),
+            value(LOAD_FAST, 1, 5, 1),
+            value(POP_TOP, 0, 5, 0),
+            value(LOAD_FAST, 0, 5, 1),
+            value(POP_TOP, 0, 5, 0),
+            value(LOAD_CONST, 3, 6, 1),
+            value(RETURN_VALUE, 0, 6, 0),
+        ]);
+        if trailing_label {
+            items.push(Item::Label(trailing));
+        }
+        items
+    };
+    let make_assembler = |items| {
+        let mut assembler = Assembler::from_linear_items(items);
+        assembler.next_label = 3;
+        assembler
+    };
+    for condition in [
+        POP_JUMP_IF_FALSE,
+        POP_JUMP_IF_TRUE,
+        POP_JUMP_IF_NONE,
+        POP_JUMP_IF_NOT_NONE,
+    ] {
+        for terminal_side in [false, true] {
+            for trailing_label in [false, true] {
+                let items = make_items(condition, terminal_side, trailing_label);
+                assert!(super::terminal_guard_constant_indices(&items, &mut []).is_none());
+                assert_eq!(
+                    super::single_marker_alias_guard_constant_indices(&items, &mut []),
+                    Some(true)
+                );
+                let mut linear = make_assembler(items.clone());
+                assert_eq!(
+                    linear.used_constant_indices(5),
+                    [false, false, true, true, false]
+                );
+                assert!(matches!(linear.code, UnoptimizedCode::Linear(_)));
+                assert!(linear.has_proven_linear_terminal_guards);
+                assert_terminal_guards_match_graph(|| make_assembler(items.clone()), 2, 1);
+            }
+        }
+    }
+    let original = make_items(POP_JUMP_IF_FALSE, true, true);
+    let mut too_many_labels = make_assembler(original.clone());
+    too_many_labels.next_label = 5;
+    assert!(!too_many_labels.has_only_linear_terminal_guards());
+    let mut before_marker = original.clone();
+    before_marker.swap(3, 4);
+    let mut inside_side = original.clone();
+    inside_side.insert(8, Item::Label(unexpected));
+    let mut duplicate_target = original.clone();
+    duplicate_target.push(Item::Label(target));
+    let mut duplicate_alias = original.clone();
+    duplicate_alias.push(Item::Label(alias));
+    let mut second_jump = original;
+    second_jump.insert(8, branch(POP_JUMP_IF_FALSE, unexpected));
+    for items in [
+        before_marker,
+        inside_side,
+        duplicate_target,
+        duplicate_alias,
+        second_jump,
+    ] {
+        assert_eq!(
+            super::single_marker_alias_guard_constant_indices(&items, &mut []),
+            None
+        );
+    }
+}
+
+#[test]
+fn single_terminal_guards_keep_empty_stack_return_aliases_and_borrow_across_them() {
+    let [target, marker_alias, side_alias, join_alias] = [0, 1, 2, 3].map(super::Label::from_u32);
+    let value = |opcode, argument, line, depth| {
+        Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Value(argument),
+            if line < 0 {
+                SourceLocation::NONE
+            } else {
+                SourceLocation::new(line, line, 0, 8)
+            },
+            Some(depth),
+        ))
+    };
+    let forced = |local, line| {
+        let Item::Instruction(mut load) = value(LOAD_FAST, local, line, 1) else {
+            unreachable!()
+        };
+        load.local_policy = LocalPolicy::for_load(true, false);
+        Item::Instruction(load)
+    };
+    let make_items = |condition, side, join, previous_line, load_line, return_line| {
+        let mut items = vec![
+            value(RESUME, ResumeLocation::AT_FUNC_START.argument(), 1, 0),
+            value(LOAD_FAST, 0, 2, 1),
+            Item::Instruction(Instruction::new(
+                condition,
+                Operand::Forward(target),
+                SourceLocation::new(2, 2, 0, 8),
+                Some(0),
+            )),
+            value(NOT_TAKEN, 0, 2, 0),
+            Item::Label(marker_alias),
+            forced(1, previous_line),
+            value(POP_TOP, 0, previous_line, 0),
+        ];
+        if side {
+            items.push(Item::Label(side_alias));
+        }
+        items.extend([
+            value(LOAD_CONST, 1, load_line, 1),
+            value(RETURN_VALUE, 0, return_line, 0),
+            Item::Label(target),
+            forced(2, previous_line),
+            value(POP_TOP, 0, previous_line, 0),
+        ]);
+        if join {
+            items.push(Item::Label(join_alias));
+        }
+        items.extend([
+            value(LOAD_CONST, 2, load_line, 1),
+            value(RETURN_VALUE, 0, return_line, 0),
+        ]);
+        items
+    };
+    let assembler = |items, join| {
+        let mut assembler = Assembler::from_linear_items(items);
+        assembler.next_label = if join { 4 } else { 3 };
+        assembler
+    };
+    for condition in [POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE] {
+        for (side, join) in [(true, false), (false, true), (true, true)] {
+            for previous_line in [-1, 4] {
+                for load_line in [-1, 4] {
+                    for return_line in [-1, 4] {
+                        let items = make_items(
+                            condition,
+                            side,
+                            join,
+                            previous_line,
+                            load_line,
+                            return_line,
+                        );
+                        let same_located_source = previous_line >= 0
+                            && previous_line == load_line
+                            && load_line == return_line;
+                        assert_eq!(
+                            super::single_marker_alias_guard_constant_indices(&items, &mut []),
+                            same_located_source.then_some(true)
+                        );
+                        if !same_located_source {
+                            continue;
+                        }
+                        assert_terminal_guards_match_graph(|| assembler(items.clone(), join), 3, 3);
+                        let actual = assembler(items, join).finish_code(1, 3, 3).unwrap();
+                        for local in [1, 2] {
+                            assert!(
+                                actual
+                                    .bytecode
+                                    .as_chunks::<2>()
+                                    .0
+                                    .iter()
+                                    .any(|pair| *pair == [LOAD_FAST_BORROW.code(), local])
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let original = make_items(POP_JUMP_IF_FALSE, true, false, 4, 4, 4);
+    let tail = original
+        .iter()
+        .position(|item| *item == Item::Label(side_alias))
+        .unwrap();
+    for (relative, replacement) in [
+        (-1_isize, value(POP_TOP, 0, 3, 1)),
+        (1, value(LOAD_SMALL_INT, 1, 4, 1)),
+        (1, value(LOAD_CONST, 1, 4, 2)),
+        (2, value(RETURN_VALUE, 0, 4, 1)),
+        (2, value(RAISE_VARARGS, 1, 4, 0)),
+    ] {
+        let mut changed = original.clone();
+        let index = tail.checked_add_signed(relative).unwrap();
+        changed[index] = replacement;
+        assert_eq!(
+            super::single_marker_alias_guard_constant_indices(&changed, &mut []),
+            None
+        );
+    }
+    for location in [
+        SourceLocation::new(4, 4, 12, 18),
+        SourceLocation::new(4, 5, 3, 11),
+    ] {
+        let mut matching = original.clone();
+        for index in [tail - 1, tail + 1, tail + 2] {
+            let Item::Instruction(instruction) = &mut matching[index] else {
+                unreachable!()
+            };
+            instruction.location = location;
+        }
+        assert_eq!(
+            super::single_marker_alias_guard_constant_indices(&matching, &mut []),
+            Some(true)
+        );
+        assert_terminal_guards_match_graph(|| assembler(matching.clone(), false), 3, 3);
+        for index in [tail - 1, tail + 1, tail + 2] {
+            let mut mismatch = original.clone();
+            let Item::Instruction(instruction) = &mut mismatch[index] else {
+                unreachable!()
+            };
+            instruction.location = location;
+            assert_eq!(
+                super::single_marker_alias_guard_constant_indices(&mismatch, &mut []),
+                None
+            );
+        }
+    }
+    let mut special_load = original;
+    let Item::Instruction(load) = &mut special_load[tail + 1] else {
+        unreachable!()
+    };
+    load.no_location_policy.preserve_location();
+    assert_eq!(
+        super::single_marker_alias_guard_constant_indices(&special_load, &mut []),
+        None
+    );
 }
 
 #[test]
@@ -4666,6 +4941,9 @@ fn terminal_guard_recognition_keeps_nested_and_nonterminal_branches_on_the_graph
         items.extend([Item::Label(first), pass_instruction(RETURN_VALUE, 0, 3)]);
         let mut assembler = Assembler::from_linear_items(items);
         assembler.next_label = 2;
+        assert!(!assembler.has_only_linear_terminal_guards());
+        assembler.used_constant_indices(2);
+        assert!(!assembler.has_proven_linear_terminal_guards);
         assert!(!assembler.has_only_linear_terminal_guards());
     }
 }
@@ -4825,6 +5103,152 @@ fn assert_linear_matches_graph(
     assert_eq!(actual.exception_table, expected.exception_table);
     assert_eq!(actual.max_depth, expected.max_depth);
     assert_eq!(actual.removed_max_depth, expected.removed_max_depth);
+}
+
+#[test]
+fn ordinary_linear_blocked_swaps_match_the_block_graph_pipeline() {
+    let item = |opcode, argument, line, depth| {
+        Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Value(argument),
+            if line < 0 {
+                SourceLocation::NONE
+            } else {
+                SourceLocation::new(line, line, 0, 8)
+            },
+            Some(depth),
+        ))
+    };
+    let prefix = [
+        item(RESUME, ResumeLocation::AT_FUNC_START.argument(), 1, 0),
+        item(LOAD_FAST, 0, 2, 1),
+        item(LOAD_FAST, 1, 2, 2),
+    ];
+    for line in [-1, 2, 3] {
+        for (locals, parameters, body) in [
+            (
+                2,
+                2,
+                vec![
+                    item(SWAP, 2, line, 2),
+                    item(POP_TOP, 0, 3, 1),
+                    item(IMPORT_FROM, 0, 3, 2),
+                    item(POP_TOP, 0, 3, 1),
+                ],
+            ),
+            (
+                3,
+                2,
+                vec![
+                    item(SWAP, 2, line, 2),
+                    item(POP_TOP, 0, 3, 1),
+                    item(IMPORT_FROM, 0, 4, 2),
+                    item(STORE_FAST, 2, 4, 1),
+                    item(STORE_FAST, 0, 5, 0),
+                    item(LOAD_FAST, 2, 5, 1),
+                ],
+            ),
+            (
+                2,
+                1,
+                vec![item(SWAP, 2, line, 2), item(STORE_GLOBAL, 0, 3, 1)],
+            ),
+            (
+                2,
+                2,
+                vec![
+                    item(SWAP, 2, line, 2),
+                    item(STORE_ATTR, 0, 3, 0),
+                    item(LOAD_FAST, 0, 3, 1),
+                ],
+            ),
+            (
+                3,
+                3,
+                vec![
+                    item(SWAP, 2, line, 2),
+                    item(LOAD_FAST, 2, 3, 3),
+                    item(BUILD_TUPLE, 3, 3, 1),
+                ],
+            ),
+            (
+                3,
+                3,
+                vec![
+                    item(LOAD_FAST, 2, 2, 3),
+                    item(SWAP, 3, line, 3),
+                    item(POP_TOP, 0, 3, 2),
+                    item(IMPORT_FROM, 0, 3, 3),
+                    item(BUILD_TUPLE, 3, 3, 1),
+                ],
+            ),
+        ] {
+            let mut items = prefix.to_vec();
+            items.extend(body);
+            items.push(item(RETURN_VALUE, 0, 6, 0));
+            assert_linear_matches_graph(
+                || Assembler::from_linear_items(items.clone()),
+                locals,
+                parameters,
+            );
+        }
+    }
+}
+
+#[test]
+fn ordinary_linear_blocked_swaps_reject_rewritable_or_nonordinary_swaps() {
+    let value = |opcode, argument, depth| {
+        Instruction::new(
+            opcode,
+            Operand::Value(argument),
+            SourceLocation::new(2, 2, 0, 8),
+            Some(depth),
+        )
+    };
+    let item = |opcode, argument, depth| Item::Instruction(value(opcode, argument, depth));
+    let prefix = [
+        item(RESUME, ResumeLocation::AT_FUNC_START.argument(), 0),
+        item(LOAD_FAST, 0, 1),
+        item(LOAD_FAST, 1, 2),
+    ];
+    let mut marked = value(SWAP, 2, 2);
+    marked.add_pre_fold_extra_instructions(1);
+    for body in [
+        vec![
+            item(SWAP, 2, 2),
+            item(STORE_FAST, 0, 1),
+            item(STORE_FAST, 1, 0),
+            item(LOAD_FAST, 0, 1),
+        ],
+        vec![
+            item(SWAP, 2, 2),
+            item(POP_TOP, 0, 1),
+            item(POP_TOP, 0, 0),
+            item(LOAD_FAST, 0, 1),
+        ],
+        vec![
+            item(SWAP, 2, 2),
+            item(POP_TOP, 0, 1),
+            item(NOP, 0, 1),
+            item(IMPORT_FROM, 0, 2),
+            item(POP_TOP, 0, 1),
+        ],
+        vec![item(SWAP, 2, 2), item(TO_BOOL, 0, 2), item(POP_TOP, 0, 1)],
+        vec![
+            item(SWAP, 2, 2),
+            item(LOAD_FAST, 0, 3),
+            item(SWAP, 2, 3),
+            item(STORE_GLOBAL, 0, 2),
+            item(POP_TOP, 0, 1),
+        ],
+        vec![item(SWAP, 1, 2), item(STORE_GLOBAL, 0, 1)],
+        vec![Item::Instruction(marked), item(STORE_GLOBAL, 0, 1)],
+    ] {
+        let mut items = prefix.to_vec();
+        items.extend(body);
+        items.push(item(RETURN_VALUE, 0, 0));
+        assert!(!Assembler::from_linear_items(items).has_only_linear_instructions(2));
+    }
 }
 
 #[test]
@@ -5040,6 +5464,97 @@ fn ordinary_linear_cells_and_closures_match_the_block_graph_pipeline() {
             local_count,
             parameter_count,
         );
+    }
+}
+
+#[test]
+fn ordinary_linear_disjoint_cell_initializers_match_the_block_graph_pipeline() {
+    let item = |opcode, argument, depth| {
+        Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Value(argument),
+            SourceLocation::new(2, 2, 0, 20),
+            Some(depth),
+        ))
+    };
+    let prefix = |opcode, argument| {
+        Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Value(argument),
+            SourceLocation::NONE,
+            Some(0),
+        ))
+    };
+    let closure = |local, depth| {
+        let Item::Instruction(mut instruction) = item(LOAD_FAST, local, depth) else {
+            unreachable!();
+        };
+        instruction.local_policy.mark_post_analysis_closure_load();
+        instruction.fusion_policy.prevent_with_previous();
+        Item::Instruction(instruction)
+    };
+    let resume = item(RESUME, ResumeLocation::AT_FUNC_START.argument(), 0);
+    let ret = item(RETURN_VALUE, 0, 0);
+    for (local_count, cell, other) in [(3, 1, 2), (64, 63, 62)] {
+        for setup in [MAKE_CELL, COPY_FREE_VARS] {
+            let items = vec![
+                prefix(setup, cell),
+                resume,
+                item(LOAD_FAST, 0, 1),
+                item(STORE_DEREF, cell, 0),
+                closure(cell, 1),
+                item(BUILD_TUPLE, 1, 1),
+                item(LOAD_CONST, 0, 2),
+                item(MAKE_FUNCTION, 0, 2),
+                item(SET_FUNCTION_ATTRIBUTE, 8, 1),
+                item(STORE_FAST, other, 0),
+                item(LOAD_FAST, other, 1),
+                ret,
+            ];
+            assert_linear_matches_graph(
+                || Assembler::from_linear_items(items.clone()),
+                local_count,
+                1,
+            );
+        }
+    }
+    for body in [
+        vec![
+            item(LOAD_FAST, 1, 1),
+            item(STORE_DEREF, 0, 0),
+            item(LOAD_FAST, 1, 1),
+        ],
+        vec![closure(0, 1), item(POP_TOP, 0, 0), item(LOAD_FAST, 1, 1)],
+        vec![item(LOAD_FAST, 1, 1), item(POP_TOP, 0, 0), closure(0, 1)],
+    ] {
+        let mut items = vec![resume];
+        items.extend(body);
+        items.push(ret);
+        assert_linear_matches_graph(|| Assembler::from_linear_items(items.clone()), 2, 0);
+    }
+    for (local_count, cell) in [(2, 0), (64, 63), (65, 64)] {
+        for body in [
+            vec![
+                item(LOAD_CONST, 0, 1),
+                item(STORE_DEREF, cell, 0),
+                item(LOAD_FAST, cell, 1),
+            ],
+            vec![
+                closure(cell, 1),
+                item(POP_TOP, 0, 0),
+                item(LOAD_FAST, cell, 1),
+            ],
+            vec![
+                item(LOAD_FAST, cell, 1),
+                item(POP_TOP, 0, 0),
+                closure(cell, 1),
+            ],
+        ] {
+            let mut items = vec![resume];
+            items.extend(body);
+            items.push(ret);
+            assert!(!Assembler::from_linear_items(items).has_only_linear_instructions(local_count));
+        }
     }
 }
 
@@ -6426,6 +6941,155 @@ fn canceled_unpack_rotations_preserve_distinct_capture_nop_lines() {
             })
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn original_location_absence_needs_an_unlocated_label_with_no_donor() {
+    let [entry, left, right, join, alias] =
+        std::array::from_fn(|index| super::Label::from_u32(u32::try_from(index).unwrap()));
+    let jump = |opcode, target, line| {
+        Item::Instruction(Instruction::new(
+            opcode,
+            target,
+            SourceLocation::new(line, line, 0, 0),
+            None,
+        ))
+    };
+
+    let pipeline = optimization_pipeline(vec![
+        pass_instruction(LOAD_CONST, 0, 1),
+        jump(POP_JUMP_IF_TRUE, Operand::Forward(join), 1),
+        pass_instruction(NOP, 0, -1),
+        Item::Label(join),
+        pass_instruction(RETURN_VALUE, 0, 2),
+    ]);
+    assert!(pipeline.capture_original_location_absence().is_empty());
+
+    let pipeline = optimization_pipeline(vec![
+        pass_instruction(LOAD_CONST, 0, 1),
+        jump(JUMP_FORWARD, Operand::Forward(join), 1),
+        Item::Label(join),
+        pass_instruction(NOP, 0, -1),
+        pass_instruction(RETURN_VALUE, 0, -1),
+    ]);
+    assert!(pipeline.capture_original_location_absence().is_empty());
+
+    let pipeline = optimization_pipeline(vec![
+        pass_instruction(LOAD_CONST, 0, 1),
+        jump(POP_JUMP_IF_TRUE, Operand::Forward(join), 1),
+        Item::Label(join),
+        pass_instruction(NOP, 0, -1),
+        pass_instruction(RETURN_VALUE, 0, -1),
+    ]);
+    assert_eq!(
+        pipeline.capture_original_location_absence(),
+        [join].into_iter().collect()
+    );
+
+    let pipeline = optimization_pipeline(vec![
+        Item::Label(entry),
+        pass_instruction(NOP, 0, -1),
+        pass_instruction(LOAD_CONST, 0, 1),
+        jump(JUMP_BACKWARD, Operand::Backward(entry), 1),
+    ]);
+    assert!(pipeline.capture_original_location_absence().is_empty());
+
+    let mut pipeline = optimization_pipeline(vec![
+        pass_instruction(LOAD_CONST, 0, 1),
+        jump(POP_JUMP_IF_TRUE, Operand::Forward(right), 1),
+        Item::Label(left),
+        pass_instruction(LOAD_CONST, 0, 2),
+        jump(JUMP_FORWARD, Operand::Forward(join), -1),
+        Item::Label(right),
+        pass_instruction(LOAD_CONST, 0, 3),
+        jump(JUMP_FORWARD, Operand::Forward(join), -1),
+        Item::Label(join),
+        Item::Label(alias),
+        pass_instruction(NOP, 0, -1),
+        pass_instruction(RETURN_VALUE, 0, -1),
+    ]);
+    assert_eq!(
+        pipeline.capture_original_location_absence(),
+        [join, alias].into_iter().collect()
+    );
+    pipeline.original_nop_targets.insert(alias);
+    assert!(pipeline.capture_original_location_absence().is_empty());
+}
+
+#[test]
+fn original_location_absence_matches_the_unoptimized_graph() {
+    const SEGMENTS: usize = 8;
+    let labels: [[super::Label; 2]; SEGMENTS] = std::array::from_fn(|index| {
+        std::array::from_fn(|alias| {
+            super::Label::from_u32(u32::try_from(index * 7 + alias).unwrap())
+        })
+    });
+    for case in 0_u32..256 {
+        let mut random = case + 1;
+        let mut next = || {
+            random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            random >> 16
+        };
+        let mut items = Vec::new();
+        let mut nop_targets = Vec::new();
+        if next() & 1 != 0 {
+            items.push(pass_instruction(NOP, 0, -1));
+        }
+        for (index, aliases) in labels.iter().enumerate() {
+            for label in aliases {
+                items.push(Item::Label(*label));
+                if next().is_multiple_of(11) {
+                    nop_targets.push(*label);
+                }
+            }
+            let mut head = Instruction::new(
+                NOP,
+                Operand::Value(0),
+                if next().is_multiple_of(3) {
+                    SourceLocation::new(1, 1, 0, 0)
+                } else {
+                    SourceLocation::NONE
+                },
+                None,
+            );
+            if next().is_multiple_of(9) {
+                head.add_pre_fold_extra_instructions(1);
+            }
+            items.push(Item::Instruction(head));
+            let target_index = usize::try_from(next()).unwrap() % SEGMENTS;
+            let target = labels[target_index][usize::try_from(next() % 2).unwrap()];
+            let backwards = target_index <= index;
+            let target = if backwards {
+                Operand::Backward(target)
+            } else {
+                Operand::Forward(target)
+            };
+            let (opcode, operand) = match next() % 5 {
+                0 => (NOP, Operand::Value(0)),
+                1 => (RETURN_VALUE, Operand::Value(0)),
+                2 if backwards => (JUMP_BACKWARD, target),
+                2 => (JUMP_FORWARD, target),
+                _ => (POP_JUMP_IF_TRUE, target),
+            };
+            items.push(Item::Instruction(Instruction::new(
+                opcode,
+                operand,
+                SourceLocation::NONE,
+                None,
+            )));
+        }
+        items.push(Item::Label(super::Label::from_u32(100)));
+        let mut pipeline = optimization_pipeline(items);
+        if case.is_multiple_of(2) {
+            pipeline.next_label = 0;
+        }
+        pipeline.original_nop_targets.extend(nop_targets);
+        assert_eq!(
+            pipeline.capture_original_location_absence(),
+            pipeline.capture_original_location_absence_unoptimized_for_test(),
+            "graph case {case}",
+        );
     }
 }
 

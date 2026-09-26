@@ -1672,6 +1672,7 @@ pub(crate) struct Assembler {
     pub(super) has_constant_pop_candidate: bool,
     pub(super) has_assertion_side_exit_candidate: bool,
     pub(super) has_proven_linear_assertion_side_exits: bool,
+    pub(super) has_proven_linear_terminal_guards: bool,
     pub(super) has_synthesized_percent_target_locations: bool,
     pub(super) has_next_location: bool,
 }
@@ -1904,6 +1905,7 @@ impl Default for Assembler {
             has_constant_pop_candidate: false,
             has_assertion_side_exit_candidate: false,
             has_proven_linear_assertion_side_exits: false,
+            has_proven_linear_terminal_guards: false,
             has_synthesized_percent_target_locations: false,
             has_next_location: false,
             deferred_shared_jump_blocks: FxHashSet::default(),

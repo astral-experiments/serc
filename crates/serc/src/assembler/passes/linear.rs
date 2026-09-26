@@ -29,10 +29,19 @@ struct LinearCandidates {
     individual_load: bool,
     combined_load: bool,
     fusable_instructions: usize,
+    conditional_targets: u8,
 }
 
 impl LinearCandidates {
     fn from_items(items: &[Item]) -> Self {
+        Self::collect::<false>(items)
+    }
+
+    fn with_conditional_targets(items: &[Item]) -> Self {
+        Self::collect::<true>(items)
+    }
+
+    fn collect<const TRACK_TARGETS: bool>(items: &[Item]) -> Self {
         let mut candidates = Self::default();
         let mut previous_was_store = false;
         for item in items {
@@ -41,6 +50,12 @@ impl LinearCandidates {
                 continue;
             };
             let opcode = instruction.opcode;
+            if TRACK_TARGETS
+                && let Operand::Forward(label) = instruction.operand()
+                && let Some(bit) = 1_u8.checked_shl(label.as_u32())
+            {
+                candidates.conditional_targets |= bit;
+            }
             let is_store = opcode == STORE_FAST;
             candidates.adjacent_stores |= previous_was_store && is_store;
             previous_was_store = is_store;
@@ -184,8 +199,11 @@ fn add_checks_for_uninitialized_loads(
     for item in items {
         let instruction = match item {
             Item::Label(label) => {
-                if let Some((target, initialized)) = continuing_state.take() {
-                    debug_assert_eq!(*label, target);
+                if continuing_state
+                    .as_ref()
+                    .is_some_and(|(target, _)| *target == *label)
+                    && let Some((_, initialized)) = continuing_state.take()
+                {
                     if block_has_instruction {
                         // The last side arm can fall through to the same continuing target.
                         unsafe_locals |= initialized;
@@ -229,11 +247,21 @@ fn add_checks_for_uninitialized_loads(
     }
 }
 
-fn optimize_guard_load_fast(python_version: crate::PythonVersion, mut items: &mut [Item]) {
+fn optimize_guard_load_fast(
+    python_version: crate::PythonVersion,
+    mut items: &mut [Item],
+    conditional_targets: Option<u8>,
+) {
     loop {
         let mut block_has_instruction = false;
         let boundary = items.iter().position(|item| match item {
-            Item::Label(_) => block_has_instruction,
+            Item::Label(label) => {
+                block_has_instruction
+                    && conditional_targets.is_none_or(|targets| {
+                        1_u8.checked_shl(label.as_u32())
+                            .is_none_or(|bit| targets & bit != 0)
+                    })
+            }
             Item::Instruction(instruction) => {
                 block_has_instruction = matches!(instruction.operand(), Operand::Value(_))
                     && !ends_scope(instruction.opcode)
@@ -355,7 +383,14 @@ impl Assembler {
         let UnoptimizedCode::Linear(mut items) = self.code else {
             unreachable!("linear assertion optimizer requires linear instructions");
         };
-        let candidates = LinearCandidates::from_items(&items);
+        // A small certified guard can contain unreferenced return aliases. The generic
+        // borrowing traversal ignores them; all physical labels remain for the other passes.
+        let track_conditional_targets = (3..=4).contains(&self.next_label);
+        let candidates = if track_conditional_targets {
+            LinearCandidates::with_conditional_targets(&items)
+        } else {
+            LinearCandidates::from_items(&items)
+        };
         optimize_boolean_conversions_and_redundant_stores(&mut items, constants, &candidates);
         #[cfg(any(test, debug_assertions))]
         super::validate_structure(
@@ -417,7 +452,11 @@ impl Assembler {
             if self.next_label == 0 {
                 optimize_linear_assertion_load_fast(self.python_version, &mut items);
             } else {
-                optimize_guard_load_fast(self.python_version, &mut items);
+                optimize_guard_load_fast(
+                    self.python_version,
+                    &mut items,
+                    track_conditional_targets.then_some(candidates.conditional_targets),
+                );
             }
         }
         #[cfg(any(test, debug_assertions))]

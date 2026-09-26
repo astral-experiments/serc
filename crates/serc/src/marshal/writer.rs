@@ -73,23 +73,21 @@ pub(crate) fn encode_code_with_options(
     python_version: PythonVersion,
     initial_intern_state: &InitialInternState,
 ) -> Vec<u8> {
-    let mut output = Vec::new();
-    encode_code_into_with_mode(
+    encode_code_with_mode(
         code,
         python_version,
         initial_intern_state,
-        &mut output,
+        &[],
         ReferenceMode::Forced,
-    );
-    output
+    )
 }
 
-pub(crate) fn encode_pyc_code_into_with_options(
+pub(crate) fn encode_pyc_code_with_options(
     code: &CodeObject,
     python_version: PythonVersion,
     initial_intern_state: &InitialInternState,
-    output: &mut Vec<u8>,
-) {
+    header: &[u8; 16],
+) -> Vec<u8> {
     // CPython 3.15's borrowed local loads leave py_compile's root code object
     // uniquely owned at marshal.dumps. A retained-code marshal call still has
     // an external owner, which encode_code_with_options models separately.
@@ -97,34 +95,38 @@ pub(crate) fn encode_pyc_code_into_with_options(
         PythonVersion::Py312 | PythonVersion::Py313 | PythonVersion::Py314 => ReferenceMode::Forced,
         PythonVersion::Py315 => ReferenceMode::IfShared,
     };
-    encode_code_into_with_mode(
+    encode_code_with_mode(
         code,
         python_version,
         initial_intern_state,
-        output,
+        header,
         root_reference,
-    );
+    )
 }
 
-fn encode_code_into_with_mode(
+fn encode_code_with_mode(
     code: &CodeObject,
     python_version: PythonVersion,
     initial_intern_state: &InitialInternState,
-    output: &mut Vec<u8>,
+    prefix: &[u8],
     root_reference: ReferenceMode,
-) {
+) -> Vec<u8> {
     let mut graph = ObjectGraph::for_code_with_options(code, python_version, initial_intern_state);
-    output.reserve(graph.estimated_wire_size());
+    // The root bytecode is only a small part of many modules. Use the complete graph estimate for
+    // both bare marshal and header-prefixed .pyc output so the writer starts with one allocation.
+    let mut output = Vec::with_capacity(prefix.len().saturating_add(graph.estimated_wire_size()));
+    output.extend_from_slice(prefix);
     let occurrences = graph.take_occurrences();
     let mut writer = Writer {
         graph: &mut graph,
-        output,
+        output: &mut output,
         reference_count: 0,
         occurrences,
         frozen_set_order_index: 0,
     };
     traverse_code_with_mode(code, root_reference, &mut writer);
     writer.finish();
+    output
 }
 
 struct Writer<'output, 'graph, 'code> {
@@ -236,10 +238,34 @@ impl Writer<'_, '_, '_> {
         let Some(flag) = self.write_reference(reference) else {
             return;
         };
+        if interned {
+            self.string_payload::<true>(value, flag);
+        } else {
+            self.string_payload::<false>(value, flag);
+        }
+    }
+
+    fn interned_string_with_object(&mut self, object: ObjectId, value: &str) {
+        let object = self.graph.object_for_writing(object);
+        debug_assert!(object.is_interned(), "marshal metadata must be interned");
+        let reference =
+            object.reference_for_write(ReferenceMode::Forced, &mut self.reference_count);
+        match reference {
+            ObjectReference::Existing(index) => self.byte_and_long(TYPE_REF, index.as_u32()),
+            ObjectReference::New => self.string_payload::<true>(value, FLAG_REF),
+            ObjectReference::Unshared => {
+                unreachable!("forced marshal reference cannot be unshared")
+            }
+        }
+    }
+
+    #[inline]
+    fn string_payload<const INTERNED: bool>(&mut self, value: &str, flag: u8) {
         let bytes = value.as_bytes();
-        if value.is_ascii() && bytes.len() < 256 {
+        let ascii = value.is_ascii();
+        if ascii && bytes.len() < 256 {
             self.output.extend_from_slice(&[
-                if interned {
+                if INTERNED {
                     TYPE_SHORT_ASCII_INTERNED
                 } else {
                     TYPE_SHORT_ASCII
@@ -248,13 +274,13 @@ impl Writer<'_, '_, '_> {
             ]);
         } else {
             self.byte_and_long(
-                if value.is_ascii() {
-                    if interned {
+                if ascii {
+                    if INTERNED {
                         TYPE_ASCII_INTERNED
                     } else {
                         TYPE_ASCII
                     }
-                } else if interned {
+                } else if INTERNED {
                     TYPE_INTERNED
                 } else {
                     TYPE_UNICODE
@@ -266,6 +292,16 @@ impl Writer<'_, '_, '_> {
             );
         }
         self.output.extend_from_slice(bytes);
+    }
+
+    fn code_metadata_string(&mut self, value: &str) {
+        let object = self.next_object(OccurrenceKind::MetadataString);
+        if self.graph.python_version() == PythonVersion::Py312 {
+            // Qualified names and generic-parameter names can retain uninterned identities.
+            self.string_with_object(object, value, ReferenceMode::IfShared);
+        } else {
+            self.interned_string_with_object(object, value);
+        }
     }
 
     fn surrogate_string_with_object(
@@ -553,25 +589,40 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
     #[inline]
     fn metadata_string(&mut self, value: &'code str, _metadata_id: Option<MetadataId>) {
         let object = self.next_object(OccurrenceKind::MetadataString);
-        self.string_with_object(object, value, ReferenceMode::IfShared);
+        self.interned_string_with_object(object, value);
     }
 
     fn code_filename(&mut self, code: &'code CodeObject, _metadata_id: Option<MetadataId>) {
-        let reference_mode = if self.graph.python_version() == PythonVersion::Py312 {
-            // The compile caller retains its filename alongside the code object.
-            ReferenceMode::Forced
-        } else {
-            ReferenceMode::IfShared
-        };
+        let legacy = self.graph.python_version() == PythonVersion::Py312;
         let object = self.next_object(OccurrenceKind::MetadataString);
         match &code.filename {
             CodeFilename::Utf8(filename) => {
-                self.string_with_object(object, filename, reference_mode);
+                if legacy {
+                    // The compile caller retains its filename alongside the code object.
+                    self.string_with_object(object, filename, ReferenceMode::Forced);
+                } else {
+                    self.interned_string_with_object(object, filename);
+                }
             }
             CodeFilename::Surrogate(filename) => {
+                let reference_mode = if legacy {
+                    ReferenceMode::Forced
+                } else {
+                    ReferenceMode::IfShared
+                };
                 self.surrogate_string_with_object(object, filename, reference_mode);
             }
         }
+    }
+
+    #[inline]
+    fn code_name(&mut self, code: &'code CodeObject, _metadata_id: Option<MetadataId>) {
+        self.code_metadata_string(&code.name);
+    }
+
+    #[inline]
+    fn code_qualified_name(&mut self, code: &'code CodeObject, _metadata_id: Option<MetadataId>) {
+        self.code_metadata_string(&code.qualified_name);
     }
 
     #[inline]

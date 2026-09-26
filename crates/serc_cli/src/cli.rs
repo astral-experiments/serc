@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::hint::black_box;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -427,7 +427,7 @@ fn compile_path_with_metadata(
                 .map_err(|error| format!("failed to inspect {}: {error}", path.display()))
         })
         .transpose()?;
-    let source_bytes = fs_err::read(path)
+    let source_bytes = read_source(path, metadata.as_ref())
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
     let module =
         compile_bytes_with_path_and_options(&source_bytes, path, options).map_err(|error| {
@@ -462,10 +462,14 @@ fn compile_path_with_metadata(
             path.display()
         )
     })?;
-    fs_err::create_dir_all(parent)
-        .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
-    let mut temporary = temporary_cache_file(parent, &metadata)
-        .map_err(|error| format!("failed to create a temporary cache file: {error}"))?;
+    let mut temporary = if let Ok(temporary) = temporary_cache_file(parent, &metadata) {
+        temporary
+    } else {
+        fs_err::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+        temporary_cache_file(parent, &metadata)
+            .map_err(|error| format!("failed to create a temporary cache file: {error}"))?
+    };
     temporary
         .write_all(&pyc)
         .map_err(|error| format!("failed to write a temporary cache file: {error}"))?;
@@ -473,6 +477,35 @@ fn compile_path_with_metadata(
         .persist(&output)
         .map(|_| ())
         .map_err(|error| format!("failed to replace {}: {error}", output.display()))
+}
+
+/// Reuse the timestamp snapshot as a size hint without querying the opened file again.
+fn read_source(path: &Path, metadata: Option<&std::fs::Metadata>) -> io::Result<Vec<u8>> {
+    let Some(metadata) = metadata else {
+        return fs_err::read(path);
+    };
+    // The path can change before it is opened, and special files can report zero bytes.
+    // Cap the initial allocation and still read through EOF regardless of the snapshot.
+    let capacity = usize::try_from(metadata.len())
+        .unwrap_or(usize::MAX)
+        .min(1024 * 1024)
+        + 1;
+    let mut contents = vec![0; capacity];
+    let mut source = fs_err::File::open(path)?;
+    let mut read = 0;
+    while read < contents.len() {
+        match source.read(&mut contents[read..]) {
+            Ok(0) => {
+                contents.truncate(read);
+                return Ok(contents);
+            }
+            Ok(count) => read += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    source.read_to_end(&mut contents)?;
+    Ok(contents)
 }
 
 /// Encodes signed Unix seconds for a CPython timestamp cache header.
@@ -866,6 +899,58 @@ mod tests {
             fs_err::read(cache_path(&source_path, PythonVersion::Py314).unwrap()).unwrap(),
             expected
         );
+    }
+
+    #[test]
+    fn reads_replaced_sources_through_eof_with_the_original_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("module.py");
+        let original_mtime = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+        for (original, replacement) in [("", "value = 123456\n"), ("value = 123456\n", "")] {
+            fs_err::write(&source_path, original).unwrap();
+            let source = fs_err::File::options()
+                .write(true)
+                .open(&source_path)
+                .unwrap();
+            source
+                .set_times(std::fs::FileTimes::new().set_modified(original_mtime))
+                .unwrap();
+            drop(source);
+            compile_path_with_metadata(&source_path, false, &CompileOptions::default(), |path| {
+                let metadata = fs_err::metadata(path)?;
+                let replacement_path = directory.path().join("replacement.py");
+                fs_err::write(&replacement_path, replacement)?;
+                fs_err::rename(&replacement_path, path)?;
+                Ok(metadata)
+            })
+            .unwrap();
+
+            let expected =
+                serc::compile_bytes(replacement.as_bytes(), source_path.to_str().unwrap())
+                    .unwrap()
+                    .to_timestamp_pyc(1_700_000_000, u32::try_from(original.len()).unwrap());
+            assert_eq!(
+                fs_err::read(cache_path(&source_path, PythonVersion::Py314).unwrap()).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn reports_cache_directory_creation_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("module.py");
+        let cache_directory = directory.path().join("__pycache__");
+        fs_err::write(&source_path, "pass\n").unwrap();
+        fs_err::write(&cache_directory, "not a directory").unwrap();
+
+        let error =
+            compile_path_with_metadata(&source_path, false, &CompileOptions::default(), |path| {
+                fs_err::metadata(path)
+            })
+            .unwrap_err();
+        assert!(error.starts_with(&format!("failed to create {}:", cache_directory.display())));
     }
 
     #[test]
