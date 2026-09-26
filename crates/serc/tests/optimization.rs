@@ -430,6 +430,130 @@ fn elided_inner_else_keeps_for_loop_backedge_location() {
 }
 
 #[test]
+fn elided_inner_else_in_for_else_matches_cpython() {
+    for (prefix, finalbody) in [
+        ("", "        finish()\n"),
+        (
+            "            if c:\n                break\n",
+            "        finish()\n",
+        ),
+        (
+            "            if c:\n                continue\n",
+            "        finish()\n",
+        ),
+        (
+            "",
+            "        try:\n            finish()\n        finally:\n            cleanup()\n",
+        ),
+    ] {
+        let source = format!(
+            "def f(xs, a, b, c):\n    z = 0\n    for x in xs:\n        if a:\n{prefix}            if b:\n                z = x\n            else:\n                assert b\n        else:\n            work(x)\n    else:\n{finalbody}"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "elided_inner_else_for_else.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+}
+
+#[test]
+fn elided_inner_else_for_else_preserves_backedge_trace() {
+    const SOURCE: &str = "def f(xs, a, b, c):\n    z = 0\n    for x in xs:\n        if a:\n            if c:\n                break\n            if b:\n                z = x\n            else:\n                assert b\n        else:\n            work(x)\n    else:\n        finish()\n";
+    const TRACE: &str = r"
+import dis, marshal, sys
+scope = {}
+events = []
+def finish(): events.append('finish')
+def work(x): events.append(('work', x))
+scope.update(finish=finish, work=work)
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+f = scope['f']
+targets = [i.offset for i in dis.get_instructions(f)
+           if i.opname.startswith('JUMP_BACKWARD') and i.positions.lineno == 7]
+if len(targets) != 1:
+    raise RuntimeError(('backedge', targets))
+target = targets[0]
+if any(e.start <= target < e.end for e in dis.Bytecode(f).exception_entries):
+    raise RuntimeError('backedge unexpectedly has an exception owner')
+class Fault(Exception): pass
+hits = []
+def trace(frame, event, arg):
+    if frame.f_code is f.__code__:
+        frame.f_trace_opcodes = True
+        if event == 'opcode' and frame.f_lasti == target:
+            hits.append(target)
+            raise Fault()
+    return trace
+sys.settrace(trace)
+try:
+    try:
+        f([1, 2], True, False, False)
+        raise RuntimeError('injection missed')
+    except Fault:
+        pass
+finally:
+    sys.settrace(None)
+if hits != [target] or events:
+    raise RuntimeError((hits, events))
+f([1, 2], True, False, True)
+if events:
+    raise RuntimeError(('break ran loop else', events))
+f([1, 2], True, False, False)
+if events != ['finish']:
+    raise RuntimeError(('normal loop else', events))
+";
+    for python_version in [PythonVersion::Py314, PythonVersion::Py315] {
+        let index = VERSIONS
+            .iter()
+            .position(|(version, _, _)| *version == python_version)
+            .unwrap();
+        for optimization_level in [OptimizationLevel::One, OptimizationLevel::Two] {
+            let native = oracle(
+                SOURCE.as_bytes(),
+                "elided_inner_else_for_else.py",
+                python_version,
+                optimization_level,
+            );
+            assert!(native.status.success());
+            let actual = compile_with_options(
+                SOURCE,
+                "elided_inner_else_for_else.py",
+                &CompileOptions {
+                    python_version,
+                    optimization_level,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .marshal();
+            assert_eq!(actual, native.stdout);
+            for payload in [&native.stdout, &actual] {
+                let mut child = Command::new(ORACLES[index].get().unwrap())
+                    .args(["-I", "-S", "-c", TRACE])
+                    .stdin(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child.stdin.take().unwrap().write_all(payload).unwrap();
+                let result = child.wait_with_output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{python_version:?} {optimization_level:?}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn nested_terminal_if_before_elided_assert_matches_cpython() {
     for source in [
         "def f(a,b):\n if a:\n  if b:\n   x = 1\n  assert a\n",

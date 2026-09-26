@@ -16728,9 +16728,12 @@ impl<'source> Compiler<'source> {
                     && self.control.exceptions.active_exception_group_handlers == 0
                     && self.control.finally.is_inactive_for_return_unwind()
                     && self.control.loops.contexts.len() == 1
-                    && self.control.loops.contexts.last().is_some_and(|context| {
-                        context.iterator_cleanup == IteratorCleanup::Sync && !context.has_orelse
-                    })
+                    && self
+                        .control
+                        .loops
+                        .contexts
+                        .last()
+                        .is_some_and(|context| context.iterator_cleanup == IteratorCleanup::Sync)
                     && condition_has_linear_runtime_leaves(&statement.test)
                     && !expression_suspends_current_scope(&statement.test)
                     && suite_has_linear_borrow_fallthrough(&statement.body)
