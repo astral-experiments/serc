@@ -579,6 +579,23 @@ for name, injected, expected in [
     }
 }
 
+#[test]
+fn protected_comprehension_before_elided_assertion_keeps_return_locations() {
+    for source in [
+        "def f(a, ys):\n try:\n  if a:\n   x = [i for i in ys]\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a, ys):\n try:\n  x = 3\n  if a:\n   x = {i for i in ys}\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a, ys):\n try:\n  if a:\n   x = {i: i for i in ys}\n  assert a\n except:\n  work()\n",
+        "def f(a, b, x, ys):\n try:\n  if a:\n   assert a\n  else:\n   assert b\n  x = 3\n  if b:\n   x = [i for i in ys]\n  assert a\n except ValueError:\n  work()\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "sub/protected_comprehension_assert.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
 const ORACLE_IDENTITY: &str = r"
 import importlib.util, sys
 assert sys.implementation.name == 'cpython'

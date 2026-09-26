@@ -1584,6 +1584,42 @@ impl<'source> Compiler<'source> {
         self.compile_suite_inner(body, false)
     }
 
+    fn protected_terminal_comprehension_before_elided(
+        &self,
+        statement: &Stmt,
+        following: &[Stmt],
+    ) -> bool {
+        !following.is_empty()
+            && following.iter().all(|statement| {
+                matches!(
+                    self.context.optimized_locations.get(&statement.range()),
+                    Some(super::optimization::OptimizedLocation::Elided)
+                )
+            })
+            && matches!(statement, Stmt::If(conditional)
+                if matches!(conditional.test.as_ref(), Expr::Name(_))
+                    && conditional.elif_else_clauses.is_empty()
+                    && matches!(conditional.body.as_slice(), [Stmt::Assign(assignment)]
+                        if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                            && matches!(assignment.value.as_ref(), Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_))))
+    }
+
+    fn supports_protected_terminal_comprehension(&self) -> bool {
+        self.context.python_version >= crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .len()
+                == 1
+            && !self.control.in_exception_handler()
+            && self.control.finally.is_inactive_for_return_unwind()
+    }
+
     pub(super) fn compile_suite_inner(
         &mut self,
         body: &[Stmt],
@@ -1792,9 +1828,24 @@ impl<'source> Compiler<'source> {
                                     Some(super::optimization::OptimizedLocation::Elided)
                                 ))))
                         && !suite_contains_yield(&conditional.body));
+            let protected_terminal_comprehension_before_elided = final_expression_becomes_return
+                && self.supports_protected_terminal_comprehension()
+                && self
+                    .control
+                    .exceptions
+                    .implicit_return_exception_exclusion_depth
+                    == Some(1)
+                && self
+                    .control
+                    .exceptions
+                    .direct_try_body_statements
+                    .contains(&statement.range())
+                && self
+                    .protected_terminal_comprehension_before_elided(statement, &body[index + 1..]);
             let terminal_if_before_elided = terminal_before_elided_assertions
                 || terminal_comprehension_before_elided
-                || terminal_nested_before_elided;
+                || terminal_nested_before_elided
+                || protected_terminal_comprehension_before_elided;
             if (is_final || terminal_if_before_elided) && final_expression_becomes_return {
                 match statement {
                     Stmt::While(statement)
@@ -20345,7 +20396,18 @@ impl<'source> Compiler<'source> {
                     || statement
                         .body
                         .last()
-                        .is_some_and(terminal_try_distributes_implicit_return))
+                        .is_some_and(terminal_try_distributes_implicit_return)
+                    || (self.supports_protected_terminal_comprehension()
+                        && statement
+                            .body
+                            .iter()
+                            .enumerate()
+                            .any(|(index, body_statement)| {
+                                self.protected_terminal_comprehension_before_elided(
+                                    body_statement,
+                                    &statement.body[index + 1..],
+                                )
+                            })))
             {
                 let exception_region_depth = self
                     .control
