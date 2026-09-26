@@ -1,7 +1,7 @@
 //! Source validation runs before lowering can discard unreachable statements.
 
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use ruff_python_ast::visitor::{
     Visitor, walk_expr, walk_interpolated_string_element, walk_parameters, walk_pattern, walk_stmt,
@@ -53,14 +53,35 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
 ) -> Result<(), CompileError> {
     let mut validator = new_validator::<PRUNE_STATEMENTS, false>(source, body, python_version);
     validator.visit_scope_body(body);
-    let error = validator.error.into_inner();
-    if matches!(&error, Some(CompileError::InvalidDocstring { .. })) {
-        // Native validates future directives before cleaning docstrings. Revisit only this rare
-        // error path so an invalid directive anywhere retains its higher diagnostic priority.
-        let mut validator = new_validator::<false, true>(source, body, python_version);
-        validator.visit_body(body);
-        if let Some(future_error) = validator.error.into_inner() {
-            return Err(future_error);
+    let lowering_keyword_error = validator.lowering_keyword_error.get();
+    let mut error = validator.error.into_inner();
+    if lowering_keyword_error && let Some(CompileError::InvalidSyntax { range, .. }) = &error {
+        // A class body is compiled before its bases and class-call keywords. Revisit only
+        // classes containing the lowering error, leaving the ordinary symbol walk unchanged.
+        let mut replay = new_validator::<PRUNE_STATEMENTS, false>(source, body, python_version);
+        replay.class_lowering_target = Some(*range);
+        replay.visit_scope_body(body);
+        error = replay
+            .error
+            .into_inner()
+            .or_else(|| {
+                replay
+                    .bare_starred
+                    .map(|(range, kind)| CompileError::invalid_syntax(kind.message(), range))
+            })
+            .or(error);
+    }
+    if matches!(&error, Some(CompileError::InvalidDocstring { .. })) || lowering_keyword_error {
+        // Revisit these error paths for diagnostics from earlier compiler phases.
+        // Future directives moved ahead of call lowering in Python 3.14.
+        if !lowering_keyword_error
+            || matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315)
+        {
+            let mut validator = new_validator::<false, true>(source, body, python_version);
+            validator.visit_body(body);
+            if let Some(future_error) = validator.error.into_inner() {
+                return Err(future_error);
+            }
         }
         // Symbol-table diagnostics precede docstring cleanup too, including declarations in
         // another scope. Keep walking past code-generation errors to find those diagnostics.
@@ -101,8 +122,14 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
         checked_type_params: None,
         checker_prefix: CheckerPrefix::Initial,
         error: RefCell::new(None),
+        reported_future_feature: Cell::new(None),
         pending_pattern: None,
         lowering_pattern_error: false,
+        lowering_keyword_error: Cell::new(false),
+        checking_class_header: Cell::new(false),
+        suppress_class_keyword: Cell::new(false),
+        class_lowering_target: None,
+        class_lowering_depth: 0,
         bare_starred: None,
         check_bare_starred: true,
         pre_lowering_only: false,
@@ -226,6 +253,7 @@ struct Scope<'ast> {
     loop_depth: usize,
     except_star_loop_depth: Option<usize>,
     in_try: bool,
+    deferred_annotations: Vec<&'ast Expr>,
 }
 
 impl<'ast> Scope<'ast> {
@@ -235,6 +263,7 @@ impl<'ast> Scope<'ast> {
             loop_depth: 0,
             except_star_loop_depth: None,
             in_try: false,
+            deferred_annotations: Vec::new(),
         }
     }
 }
@@ -306,8 +335,14 @@ struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
     checked_type_params: Option<&'ast ast::TypeParams>,
     checker_prefix: CheckerPrefix,
     error: RefCell<Option<CompileError>>,
+    reported_future_feature: Cell<Option<TextRange>>,
     pending_pattern: Option<PendingPattern<'ast>>,
     lowering_pattern_error: bool,
+    lowering_keyword_error: Cell<bool>,
+    checking_class_header: Cell<bool>,
+    suppress_class_keyword: Cell<bool>,
+    class_lowering_target: Option<TextRange>,
+    class_lowering_depth: usize,
     bare_starred: Option<(TextRange, BareStarredKind)>,
     check_bare_starred: bool,
     source: &'source str,
@@ -501,6 +536,11 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
             });
         }
         self.visit_body(body);
+        // Modern module and class annotations are lowered after the enclosing body.
+        // Their symbol-table checks already ran when the assignment was encountered.
+        for annotation in std::mem::take(&mut self.scope_mut().deferred_annotations) {
+            self.visit_annotation(annotation);
+        }
     }
 
     fn scope(&self) -> &Scope<'ast> {
@@ -602,6 +642,58 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
         visit(self);
         self.private_name = previous_private;
         self.mangled_names = previous_mangled;
+    }
+
+    fn visit_class_body_in_lowering_order(&mut self, body: &'ast [Stmt]) {
+        self.class_lowering_depth += 1;
+        self.with_scope(ScopeKind::Class, |visitor| visitor.visit_scope_body(body));
+        self.class_lowering_depth -= 1;
+    }
+
+    fn visit_class_arguments_in_lowering_order(&mut self, arguments: &'ast ast::Arguments) {
+        if self.check_bare_starred
+            && self.bare_starred.is_none()
+            && self.error.borrow().is_none()
+            && let Some((name, range)) = repeated_call_keyword(arguments)
+        {
+            self.lowering_keyword_error.set(true);
+            *self.error.borrow_mut() = Some(CompileError::invalid_syntax(
+                format!("keyword argument repeated: {name}"),
+                range,
+            ));
+        }
+        self.visit_arguments(arguments);
+    }
+
+    fn visit_class_in_lowering_order(&mut self, class: &'ast ast::StmtClassDef) {
+        for decorator in &class.decorator_list {
+            self.visit_decorator(decorator);
+        }
+        if let Some(params) = &class.type_params {
+            self.with_private_context(class.name.as_str(), Some(FxHashSet::default()), |visitor| {
+                for parameter in params.iter() {
+                    visitor
+                        .mangled_names
+                        .as_mut()
+                        .expect("generic headers have restricted name mangling")
+                        .insert(parameter.name().as_str());
+                    visitor.visit_type_param(parameter);
+                }
+                let header_names = visitor.mangled_names.take();
+                visitor.visit_class_body_in_lowering_order(&class.body);
+                visitor.mangled_names = header_names;
+                if let Some(arguments) = &class.arguments {
+                    visitor.visit_class_arguments_in_lowering_order(arguments);
+                }
+            });
+        } else {
+            self.with_private_context(class.name.as_str(), None, |visitor| {
+                visitor.visit_class_body_in_lowering_order(&class.body);
+            });
+            if let Some(arguments) = &class.arguments {
+                self.visit_class_arguments_in_lowering_order(arguments);
+            }
+        }
     }
 
     fn validate_private_parameters(&self, parameters: &'ast ast::Parameters) {
@@ -1004,6 +1096,24 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
     }
 }
 
+/// Find the duplicate belonging to the earliest authored keyword, as CPython does.
+fn repeated_call_keyword(arguments: &ast::Arguments) -> Option<(&str, TextRange)> {
+    if arguments.keywords.len() < 2 {
+        return None;
+    }
+    let mut seen = FxHashMap::default();
+    let mut repeated = None;
+    // Reverse traversal preserves the next occurrence of each name without a quadratic scan.
+    for keyword in arguments.keywords.iter().rev() {
+        if let Some(name) = &keyword.arg
+            && let Some(range) = seen.insert(name.as_str(), keyword.range)
+        {
+            repeated = Some((name.as_str(), range));
+        }
+    }
+    repeated
+}
+
 /// Follow CPython's pattern walk: structural subpatterns can match anything, but only the final
 /// arm of an OR pattern may do so, and only when its enclosing pattern permits it.
 fn unreachable_pattern(
@@ -1166,11 +1276,22 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
             }
             return;
         }
+        let replay_class = !self.pre_lowering_only
+            && self.class_lowering_target.is_some()
+            && matches!(statement, Stmt::ClassDef(class)
+                if self.class_lowering_depth > 0
+                    || self.class_lowering_target.is_some_and(|range| class.range.contains_range(range)));
+        let previous_class_header = self
+            .checking_class_header
+            .replace(matches!(statement, Stmt::ClassDef(_)));
+        let previous_suppression = self.suppress_class_keyword.replace(replay_class);
         // Relative imports of a module named __future__ are ordinary imports. The shared
         // checker identifies directives by their module spelling, so hide that spelling here.
         if self.statement_needs_checker(statement) {
             self.check_statement(statement);
         }
+        self.checking_class_header.set(previous_class_header);
+        self.suppress_class_keyword.set(previous_suppression);
         if let Some(pending) = self.pending_pattern.take() {
             if self.error.borrow().is_none() && self.bare_starred.is_none() {
                 self.lowering_pattern_error = true;
@@ -1201,14 +1322,27 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                 if let Some(value) = &statement.value {
                     self.visit_expr(value);
                 }
+                self.visit_expr(&statement.target);
                 // Local variable annotations and, from 3.14, complex variable annotations are
                 // not compiled; their interpolations are never evaluated.
                 let compiled = !self.in_function_scope()
                     && (statement.simple || self.python_version < ast::PythonVersion::PY314);
-                self.with_bare_starred_check(compiled, |visitor| {
-                    visitor.visit_annotation(&statement.annotation);
-                });
-                self.visit_expr(&statement.target);
+                if compiled
+                    && !self.future_annotations
+                    && !self.pre_lowering_only
+                    && self.python_version >= ast::PythonVersion::PY314
+                {
+                    self.scope_mut()
+                        .deferred_annotations
+                        .push(&statement.annotation);
+                    self.pre_lowering_only = true;
+                    self.visit_annotation(&statement.annotation);
+                    self.pre_lowering_only = false;
+                } else {
+                    self.with_bare_starred_check(compiled, |visitor| {
+                        visitor.visit_annotation(&statement.annotation);
+                    });
+                }
             }
             Stmt::Assign(statement) => {
                 // CPython compiles the right-hand side before any chained assignment target.
@@ -1245,6 +1379,10 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                 );
             }
             Stmt::ClassDef(class) => {
+                if replay_class {
+                    self.visit_class_in_lowering_order(class);
+                    return;
+                }
                 for decorator in &class.decorator_list {
                     self.visit_decorator(decorator);
                 }
@@ -1366,6 +1504,22 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
             _ => {}
         }
         if self.error.borrow().is_some() {
+            return;
+        }
+        if self.check_bare_starred
+            && !self.pre_lowering_only
+            && self.bare_starred.is_none()
+            && let Expr::Call(call) = expression
+            && let Some((name, range)) = repeated_call_keyword(&call.arguments)
+        {
+            // CPython checks call keywords before lowering the callable or its arguments.
+            // Stringized and unevaluated annotations do not reach this phase. Revisit the
+            // module for symbol-table errors before returning this lowering diagnostic.
+            self.lowering_keyword_error.set(true);
+            *self.error.borrow_mut() = Some(CompileError::invalid_syntax(
+                format!("keyword argument repeated: {name}"),
+                range,
+            ));
             return;
         }
         let check_expression = match expression {
@@ -1614,6 +1768,13 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
         {
             return;
         }
+        if self.checking_class_header.get()
+            && self.suppress_class_keyword.get()
+            && matches!(error.kind, Kind::DuplicateKeywordArgument(_))
+        {
+            // The replay checks this class call after its body, as CPython lowering does.
+            return;
+        }
         // The declaration pass checks complete symbol histories and places errors on the full
         // CPython statement, including parameters and module-level nonlocals.
         if matches!(
@@ -1643,6 +1804,9 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             // Bare stars fail during code generation. Keep walking for errors from earlier
             // compiler phases; 3.14 moved await and writes to __debug__ into such a phase.
             let code_generation_error = match &error.kind {
+                Kind::LateFutureImport | Kind::FutureFeatureNotDefined(_) => {
+                    self.python_version < ast::PythonVersion::PY314
+                }
                 Kind::ReturnInGenerator => self.pre_lowering_only,
                 Kind::BreakOutsideLoop
                 | Kind::ContinueOutsideLoop
@@ -1654,6 +1818,7 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
                 | Kind::MultipleStarredNamesInSequencePattern
                 | Kind::IrrefutableCasePattern(_)
                 | Kind::DuplicateMatchKey(_)
+                | Kind::DuplicateKeywordArgument(_)
                 | Kind::DuplicateMatchClassAttribute(_) => true,
                 Kind::YieldOutsideFunction(kind) => {
                     !kind.is_await() || self.python_version < ast::PythonVersion::PY314
@@ -1668,12 +1833,32 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             }
         }
         let mut reported = self.error.borrow_mut();
+        // In the modern future-only replay, the shared checker reports an unknown
+        // feature before it reports that the same import is misplaced. Native
+        // compilation checks the placement first, but an earlier import's error
+        // must still retain its priority.
+        let later_future_in_same_statement = FUTURE_ONLY
+            && self.python_version >= ast::PythonVersion::PY314
+            && matches!(error.kind, Kind::LateFutureImport)
+            && self
+                .reported_future_feature
+                .get()
+                .is_some_and(|range| error.range.contains_range(range));
         if reported.is_some()
+            && !later_future_in_same_statement
             && !(self.pending_pattern.is_some()
                 && matches!(error.kind, Kind::WriteToDebug(_))
                 && !matches!(*reported, Some(CompileError::InvalidSyntax { .. })))
         {
             return;
+        }
+        if FUTURE_ONLY && matches!(error.kind, Kind::FutureFeatureNotDefined(_)) {
+            self.reported_future_feature.set(Some(error.range));
+        }
+        if self.checking_class_header.get()
+            && matches!(error.kind, Kind::DuplicateKeywordArgument(_))
+        {
+            self.lowering_keyword_error.set(true);
         }
         // Preserve the existing public diagnostics for checks previously performed in lowering.
         let message = match &error.kind {
