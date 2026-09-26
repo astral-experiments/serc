@@ -24,6 +24,33 @@ const LEVELS: [OptimizationLevel; 3] = [
 static ORACLES: [OnceLock<OsString>; 4] = [const { OnceLock::new() }; 4];
 
 #[test]
+fn nested_terminal_if_before_elided_assert_matches_cpython() {
+    for source in [
+        "def f(a,b):\n if a:\n  if b:\n   x = 1\n  assert a\n",
+        "def f(a,b):\n if a:\n  if b:\n   assert a\n  assert b\n",
+        "def f(a,b,c):\n if a:\n  if b and c:\n   assert b\n  assert a\n",
+        "def f(a,b):\n if a:\n  if b:\n   assert (x := b)\n   assert (y := a)\n  assert a\n",
+        "def f(a,b):\n def read():\n  return x\n if a:\n  if b:\n   assert (x := b)\n  assert a\n",
+        "def f(a,b):\n if a:\n  if b:\n   work()\n  assert a\n  assert b\n",
+        "def f(a,b,x):\n if a:\n  if not b:\n   x += 1\n  assert a\n",
+        "def f(a,b):\n global x\n if a:\n  if b:\n   x = 1\n  assert a\n",
+        "def outer():\n x=0\n def f(a,b):\n  nonlocal x\n  if a:\n   if b:\n    x = 1\n   assert a\n return f\n",
+        "def f(a,b,obj):\n if a:\n  if b:\n   left, *rest = obj\n  assert a\n else:\n  work()\n",
+        "def f(a,b):\n if a:\n  if b:\n   x = 1\n  assert a\n  pass\n",
+        "def f(a,b,cm):\n with cm:\n  if a:\n   if b:\n    x = 1\n   assert a\n",
+        "def f(a,b):\n if a:\n  if b:\n   x = 1\n  assert a\n yield b\n",
+        "async def f(a,b):\n if a:\n  if b:\n   x = 1\n  assert a\n await work()\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "sub/nested_terminal_elided.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn terminal_if_before_elided_assert_matches_cpython_312() {
     for source in [
         "def f(x):\n if x:\n  with context():\n   call()\n else:\n  if x:\n   assert x\n  assert x\n",

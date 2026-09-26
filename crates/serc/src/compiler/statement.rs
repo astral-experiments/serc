@@ -1757,8 +1757,37 @@ impl<'source> Compiler<'source> {
                     && conditional.elif_else_clauses.iter().all(|clause| {
                         clause.test.as_ref().is_none_or(condition_has_linear_runtime_leaves)
                     }));
-            let terminal_if_before_elided =
-                terminal_before_elided_assertions || terminal_comprehension_before_elided;
+            // A nested conditional before removed assertions can contribute its own
+            // return locations to the enclosing terminal branch.
+            let terminal_nested_before_elided = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && !is_final
+                && plain_function_suite
+                && self.control.statements.in_terminal_if_branch_suite
+                && !self.has_active_control_flow_region()
+                && !self.control.in_exception_handler()
+                && self.control.finally.is_inactive_for_return_unwind()
+                && matches!(statement, Stmt::If(_))
+                && body[index + 1..].iter().all(|statement| {
+                    matches!(
+                        self.context.optimized_locations.get(&statement.range()),
+                        Some(super::optimization::OptimizedLocation::Elided)
+                    )
+                })
+                && matches!(statement, Stmt::If(conditional)
+                    if conditional.elif_else_clauses.is_empty()
+                        && condition_has_linear_runtime_leaves(&conditional.test)
+                        && !expression_suspends_current_scope(&conditional.test)
+                        && (suite_has_linear_borrow_fallthrough(&conditional.body)
+                            || (!conditional.body.is_empty()
+                                && conditional.body.iter().all(|statement| matches!(
+                                    self.context.optimized_locations.get(&statement.range()),
+                                    Some(super::optimization::OptimizedLocation::Elided)
+                                ))))
+                        && !suite_contains_yield(&conditional.body));
+            let terminal_if_before_elided = terminal_before_elided_assertions
+                || terminal_comprehension_before_elided
+                || terminal_nested_before_elided;
             if (is_final || terminal_if_before_elided) && final_expression_becomes_return {
                 match statement {
                     Stmt::While(statement)
