@@ -145,15 +145,9 @@ sys.stdout.buffer.write(marshal.dumps(code))
             ] {
                 if let Some(expected) = expected {
                     assert_eq!(String::from_utf8_lossy(&native.stdout).trim(), expected);
-                    // The type-parameter wording is handled by a separate diagnostic fix.
-                    let expected_serc = if kind == "duplicate-type" {
-                        "duplicate type parameter"
-                    } else {
-                        expected
-                    };
                     let error = compiled.unwrap_err();
                     assert!(
-                        error.to_string().ends_with(expected_serc),
+                        error.to_string().ends_with(expected),
                         "{version}: {source}: {error}"
                     );
                 } else {
@@ -182,13 +176,8 @@ sys.stdout.buffer.write(marshal.dumps(code))
                 "{version}: {source}: {output:?}"
             );
             if let Some(expected) = expected {
-                let expected_serc = if kind == "duplicate-type" {
-                    "duplicate type parameter"
-                } else {
-                    expected
-                };
                 assert!(
-                    String::from_utf8_lossy(&output.stderr).contains(expected_serc),
+                    String::from_utf8_lossy(&output.stderr).contains(expected),
                     "{output:?}"
                 );
             }
