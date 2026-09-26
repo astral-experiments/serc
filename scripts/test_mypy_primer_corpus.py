@@ -193,6 +193,7 @@ def get_projects():
         self.assertNotIn("--expected-cpython-rejected", limited)
         self.assertEqual(limited[limited.index("--limit") + 1], "100")
         self.assertIn("--require-all", limited)
+        self.assertIn("--diagnostic-startup-state", limited)
 
 
 if __name__ == "__main__":

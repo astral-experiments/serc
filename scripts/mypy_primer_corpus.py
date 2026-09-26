@@ -626,7 +626,9 @@ def compatibility_command(
             command.extend(["--expected-outcome", f"{outcome}={expected}"])
         command.extend(["--expected-cpython-rejected", str(EXPECTED_CPYTHON_REJECTED)])
     else:
-        command.extend(["--limit", str(limit), "--require-all"])
+        command.extend(
+            ["--limit", str(limit), "--require-all", "--diagnostic-startup-state"]
+        )
     command.extend(map(str, roots))
     return command
 
