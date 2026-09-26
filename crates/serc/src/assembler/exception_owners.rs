@@ -3590,13 +3590,81 @@ impl LayoutAssembler {
             let [start] = starts.as_slice() else {
                 continue;
             };
+            let Some(original_pop_at) = origin
+                .prefix
+                .iter()
+                .position(|item| matches!(item, Item::Instruction(_)))
+            else {
+                continue;
+            };
+            let mut expected = origin.prefix.clone();
+            // When an incoming jump is retained as the immediately preceding NOP,
+            // CPython propagates its location to the leading POP_BLOCK and keeps
+            // both that record and the differently located SETUP NOP. Serc folds
+            // the POP into the setup instead. Reconcile only the captured pair,
+            // with an exact retained-jump witness and no intervening rewrites.
+            let removed_pop = retained_setup_nop.is_some_and(|setup| {
+                let Item::Instruction(pop) = origin.prefix[original_pop_at] else {
+                    return false;
+                };
+                let Some(Item::Instruction(previous)) =
+                    start.checked_sub(1).and_then(|index| self.items.get(index))
+                else {
+                    return false;
+                };
+                let mut located = origin
+                    .incoming
+                    .iter()
+                    .filter(|jump| jump.location.line >= 0);
+                let Some(jump) = located.next() else {
+                    return false;
+                };
+                located.next().is_none()
+                    && jump.jump_policy.retains_nop_for(jump.operand())
+                    && previous.opcode == NOP
+                    && previous.location == jump.location
+                    && previous.depth_after() == jump.depth_after()
+                    && previous.local_policy == jump.local_policy
+                    && previous.no_location_policy == jump.no_location_policy
+                    && previous.jump_policy == jump.jump_policy
+                    && previous.exception_policy() == jump.exception_policy()
+                    && previous.local_policy.hidden_exception_owner_slots() == 0
+                    && previous.pre_fold_extra_instructions() == 0
+                    && setup.location.line >= 0
+                    && setup.location.line != previous.location.line
+                    && setup.local_policy.hidden_exception_owner_slots() == 0
+                    && setup.pre_fold_extra_instructions() == 0
+                    && pop.opcode == NOP
+                    && pop.fusion_policy.is_converted_pop_block()
+                    && pop.location.line < 0
+                    && pop.exception_policy() == super::ExceptionPolicy::EXCLUDE_ALWAYS
+                    && pop.local_policy.hidden_exception_owner_slots() == 0
+                    && pop.pre_fold_extra_instructions() == 0
+                    && origin.prefix[original_pop_at + 1..]
+                        .iter()
+                        .find_map(|item| match item {
+                            Item::Instruction(instruction) => Some(*instruction),
+                            Item::Label(_) => None,
+                        })
+                        == Some(setup)
+            });
+            if removed_pop {
+                expected.remove(original_pop_at);
+                let Some(Item::Instruction(setup)) = expected[original_pop_at..]
+                    .iter_mut()
+                    .find(|item| matches!(item, Item::Instruction(_)))
+                else {
+                    continue;
+                };
+                setup.local_policy.add_hidden_exception_owner_slots(1);
+            }
             let (current, end) =
                 if authored_break_location.is_some() || retained_setup_nop.is_some() {
                     let original_labels = labels.iter().copied().collect::<FxHashSet<_>>();
                     let mut cursor = *start;
-                    let mut current = Vec::with_capacity(origin.prefix.len());
+                    let mut current = Vec::with_capacity(expected.len());
                     let mut valid = true;
-                    for _ in &origin.prefix {
+                    for _ in &expected {
                         while let Some(Item::Label(label)) = self.items.get(cursor)
                             && !original_labels.contains(label)
                         {
@@ -3642,29 +3710,30 @@ impl LayoutAssembler {
                     }
                     (current, cursor)
                 } else {
-                    let Some(current) = self.items.get(*start..*start + origin.prefix.len()) else {
+                    let Some(current) = self.items.get(*start..*start + expected.len()) else {
                         continue;
                     };
-                    (current.to_vec(), *start + origin.prefix.len())
+                    (current.to_vec(), *start + expected.len())
                 };
-            let Some(marker_at) = origin
-                .prefix
+            let Some(marker_at) = expected
                 .iter()
                 .position(|item| matches!(item, Item::Instruction(_)))
             else {
                 continue;
             };
-            let mut expected = origin.prefix.clone();
             let (Item::Instruction(marker), Item::Instruction(original_marker)) =
                 (current[marker_at], &mut expected[marker_at])
             else {
                 continue;
             };
             // Location propagation changes the retained POP_BLOCK's line, not its record identity.
-            original_marker.location = marker.location;
+            if !removed_pop {
+                original_marker.location = marker.location;
+            }
             // Normal-finally lowering can refine this excluded POP_BLOCK's owner
             // after capture without changing its original instruction cell.
-            let excluded_pop_owner_refined = retained_setup_nop.is_some()
+            let excluded_pop_owner_refined = !removed_pop
+                && retained_setup_nop.is_some()
                 && original_marker.exception_policy() == super::ExceptionPolicy::EXCLUDE_ALWAYS
                 && marker.exception_policy() == super::ExceptionPolicy::AlwaysAbsent;
             if excluded_pop_owner_refined {
@@ -3699,10 +3768,11 @@ impl LayoutAssembler {
             }
             if current != expected
                 || marker.opcode != NOP
-                || !marker.fusion_policy.is_converted_pop_block()
-                || (marker.exception_policy() != super::ExceptionPolicy::EXCLUDE_ALWAYS
-                    && !excluded_pop_owner_refined)
-                || marker.local_policy.hidden_exception_owner_slots() != 0
+                || (!removed_pop
+                    && (!marker.fusion_policy.is_converted_pop_block()
+                        || (marker.exception_policy() != super::ExceptionPolicy::EXCLUDE_ALWAYS
+                            && !excluded_pop_owner_refined)
+                        || marker.local_policy.hidden_exception_owner_slots() != 0))
                 || marker.pre_fold_extra_instructions() != 0
                 || marker.jump_policy.borrow_empty_block()
                 || marker.no_location_policy.borrow_fallthrough()
@@ -5605,6 +5675,7 @@ impl LayoutAssembler {
         let mut source_owned_prefix = None;
         let mut pending_retained_prefix = None;
         let mut transferred_pop_setup: Option<(Label, usize)> = None;
+        let mut transferred_setup_null_slot = None;
         let mut retained_pop_prefix = None;
         let mut early_return_nop_slot = None;
         let mut early_return_iterator_slot = None;
@@ -5886,6 +5957,7 @@ impl LayoutAssembler {
                     if has_instruction && is_boundary {
                         retained_pop_prefix = None;
                         original_array_start = instruction_index;
+                        transferred_setup_null_slot = None;
                         captured_null_slots.clear();
                         captured_handler_owner_slots.clear();
                         captured_method_owner_slots.clear();
@@ -6389,6 +6461,20 @@ impl LayoutAssembler {
                             && matching_setups.next().is_none()
                         {
                             transferred_pop_setup = Some((*setup, original_array_start));
+                            // Early compaction leaves the retained SETUP in its original
+                            // NULL cell. Record that physical index before consuming the
+                            // adjacent removed POP; later append must reuse this exact cell.
+                            if let Some(slot) = instruction_index
+                                .checked_add(tail.early_removals)
+                                .and_then(|index| index.checked_add(1))
+                            {
+                                transferred_setup_null_slot = Some((
+                                    original_array_start,
+                                    instruction_index,
+                                    slot,
+                                    tail.early_removals + 1,
+                                ));
+                            }
                         }
                     }
                     // The authored return NOP compacts into iterator disposal.
@@ -8821,6 +8907,42 @@ impl LayoutAssembler {
                             ExceptionOwnerDecision::override_with_region(None),
                         );
                     }
+                    // The retained SETUP's original cell is NULL, even if its compacted
+                    // live record is surrounded by protected instructions. An appended
+                    // marker may reuse it only when no subsequent edit shifts that cell.
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy().exclusion()
+                            == super::ExceptionExclusion::None
+                        && owner_history_exact
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && let Some((array, setup, slot, removals)) = transferred_setup_null_slot
+                        && array == original_array_start
+                        && slot == instruction_index
+                        && removals == tail.early_removals
+                        && instruction_index > setup
+                        && indexed_instructions
+                            .get(instruction_index - 1)
+                            .is_some_and(|jump| {
+                                is_conditional_jump(jump.opcode)
+                                    && matches!(jump.operand(), Operand::Forward(_))
+                                    && jump.location == instruction.location
+                            })
+                        && !jump_targets.iter().any(|label| {
+                            label_positions.get(label).is_some_and(|position| {
+                                setup < *position && *position <= instruction_index
+                            })
+                        })
+                        && owners
+                            .get(instruction_index)
+                            .is_none_or(|owner| !owner.is_definitive())
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision::override_with_region(None),
+                        );
+                    }
                     if retained_setup_null_markers.contains(&instruction_index) {
                         owners.insert(
                             instruction_index,
@@ -9834,6 +9956,7 @@ impl LayoutAssembler {
                     {
                         retained_pop_prefix = None;
                         original_array_start = instruction_index;
+                        transferred_setup_null_slot = None;
                         captured_null_slots.clear();
                         captured_handler_owner_slots.clear();
                         captured_method_owner_slots.clear();
