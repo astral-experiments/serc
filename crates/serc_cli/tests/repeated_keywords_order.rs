@@ -6,6 +6,9 @@ use serc::{CompileError, CompileOptions, PythonVersion, compile_with_options};
 fn repeated_keywords_preserve_native_diagnostic_order() {
     const REPEAT_X: &str = "keyword argument repeated: x";
     const REPEAT_Y: &str = "keyword argument repeated: y";
+    const REPEAT_A: &str = "keyword argument repeated: a";
+    const REPEAT_B: &str = "keyword argument repeated: b";
+    const STAR: &str = "can't use starred expression here";
     const DUPLICATE_TYPE: &str = "duplicate type parameter 'T'";
     const LATE_FUTURE: &str = "from __future__ imports must occur at the beginning of the file";
     const UNKNOWN_FUTURE: &str = "future feature imaginary is not defined";
@@ -90,6 +93,71 @@ fn repeated_keywords_preserve_native_diagnostic_order() {
             "f(x=1, y=1, y=2, x=2)\n",
             (REPEAT_X, "x=2"),
             (REPEAT_X, "x=2"),
+        ),
+        (
+            "@g(a=1,a=2)\nclass C(b=1,b=2): pass\n",
+            (REPEAT_A, "a=2"),
+            (REPEAT_A, "a=2"),
+        ),
+        (
+            "class C(b=1,b=2):\n    g(a=1,a=2)\n",
+            (REPEAT_A, "a=2"),
+            (REPEAT_A, "a=2"),
+        ),
+        (
+            "class C(g(a=1,a=2)):\n    h(b=1,b=2)\n",
+            (REPEAT_B, "b=2"),
+            (REPEAT_B, "b=2"),
+        ),
+        (
+            "class Outer(f(a=1,a=2)):\n    @g(b=1,b=2)\n    class Inner(c=1,c=2): pass\n",
+            (REPEAT_B, "b=2"),
+            (REPEAT_B, "b=2"),
+        ),
+        (
+            "class Outer(f(a=1,a=2)):\n    class Inner(c=1,c=2):\n        g(b=1,b=2)\n",
+            (REPEAT_B, "b=2"),
+            (REPEAT_B, "b=2"),
+        ),
+        (
+            "class C(a=1,a=2):\n    *value\n",
+            (STAR, "*value"),
+            (STAR, "*value"),
+        ),
+        (
+            "*value\nclass C(a=1,a=2): pass\n",
+            (STAR, "*value"),
+            (STAR, "*value"),
+        ),
+        (
+            "class C(a=1,a=2):\n    value: g(b=1,b=2)\n",
+            (REPEAT_B, "b=2"),
+            (REPEAT_B, "b=2"),
+        ),
+        (
+            "class C(a=1,a=2): pass\nfrom __future__ import annotations\n",
+            (REPEAT_A, "a=2"),
+            (LATE_FUTURE, "from __future__ import annotations"),
+        ),
+        (
+            "@g(a=1,a=2)\nclass C[T,T](b=1,b=2): pass\n",
+            (DUPLICATE_TYPE, "T"),
+            (DUPLICATE_TYPE, "T"),
+        ),
+        (
+            "class C(g(a=1,a=2), b=1,b=2): pass\n",
+            (REPEAT_B, "b=2"),
+            (REPEAT_B, "b=2"),
+        ),
+        (
+            "class C[T](g(a=1,a=2)):\n    h(b=1,b=2)\n",
+            (REPEAT_B, "b=2"),
+            (REPEAT_B, "b=2"),
+        ),
+        (
+            "class Outer:\n    class Inner(g(__a=1,__a=2)):\n        h(b=1,b=2)\n",
+            (REPEAT_B, "b=2"),
+            (REPEAT_B, "b=2"),
         ),
     ];
     let oracle = r"
