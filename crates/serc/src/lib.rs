@@ -496,10 +496,15 @@ fn compile_normalized(
         .ok_or_else(|| CompileError::Internal("parser did not return a module".to_string()))?;
     let parsed = ParsedModule(Some(parsed));
     let parsed = parsed.0.as_ref().expect("parsed module is present");
-    if let Some(error) = parsed.errors().first() {
+    let parse_error = parsed.errors().first();
+    if let Some(range) = indentation::first_excess(parsed.tokens()) {
+        if parse_error.is_none_or(|error| range.start() <= error.location.start()) {
+            return Err(indentation::excess_error(range));
+        }
+    }
+    if let Some(error) = parse_error {
         return Err(CompileError::Parse(error.clone()));
     }
-    indentation::validate(parsed.tokens())?;
     if let Some(error) = parsed.unsupported_syntax_errors().first() {
         return Err(CompileError::invalid_syntax(error.to_string(), error.range));
     }

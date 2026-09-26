@@ -2,7 +2,7 @@ use ruff_python_ast::token::{TokenFlags, TokenKind};
 use ruff_python_parser::{Mode, ParseErrorType, ParseOptions, lexer};
 use ruff_text_size::TextRange;
 
-use crate::{CompileError, PythonVersion};
+use crate::{CompileError, PythonVersion, indentation};
 
 /// CPython's tokenizer rejects the 201st simultaneously open delimiter. Replacement
 /// fields in interpolated strings share the same nesting limit as ordinary expressions.
@@ -68,8 +68,14 @@ pub(crate) fn validate(
             TokenKind::Lpar | TokenKind::Lsqb | TokenKind::Lbrace => {
                 if depth == MAX_NESTING {
                     let range = lexer.current_range();
-                    if saw_indent && earlier_indentation_error(source, options, range) {
-                        return Ok(());
+                    if saw_indent {
+                        match earlier_indentation_error(source, options, range) {
+                            EarlierIndentation::Excess(range) => {
+                                return Err(indentation::excess_error(range));
+                            }
+                            EarlierIndentation::Defer => return Ok(()),
+                            EarlierIndentation::None => {}
+                        }
                     }
                     return Err(CompileError::invalid_syntax(
                         "too many nested parentheses",
@@ -110,13 +116,35 @@ pub(crate) fn validate(
     }
 }
 
-fn earlier_indentation_error(source: &str, options: &ParseOptions, range: TextRange) -> bool {
+enum EarlierIndentation {
+    Excess(TextRange),
+    Defer,
+    None,
+}
+
+fn earlier_indentation_error(
+    source: &str,
+    options: &ParseOptions,
+    range: TextRange,
+) -> EarlierIndentation {
     let prefix = &source[..range.start().to_usize()];
     let parsed = ruff_python_parser::parse_unchecked(prefix, options.clone());
-    parsed.errors().first().is_some_and(|error| {
+    let parse_error = parsed.errors().first();
+    if let Some(indent) = indentation::first_excess(parsed.tokens()) {
+        return if parse_error.is_none_or(|error| indent.start() <= error.location.start()) {
+            EarlierIndentation::Excess(indent)
+        } else {
+            EarlierIndentation::Defer
+        };
+    }
+    if parse_error.is_some_and(|error| {
         matches!(error.error, ParseErrorType::UnexpectedIndentation)
             && error.location.start() < range.start()
-    })
+    }) {
+        EarlierIndentation::Defer
+    } else {
+        EarlierIndentation::None
+    }
 }
 
 fn invalid_number_suffix(source: &str, range: TextRange) -> bool {
