@@ -3375,13 +3375,13 @@ impl<'source> Compiler<'source> {
                 == crate::PythonVersion::Py312
                 && (matches!(body.last(), Some(Stmt::Assign(_)))
                     || matches!(
-                        body.iter().rev().skip_while(|statement| {
-                            matches!(statement, Stmt::Global(global) if global.names.is_empty())
+                        body.iter().rev().find(|statement| {
+                            !(matches!(statement, Stmt::Global(global) if global.names.is_empty())
                                 && matches!(
                                     self.context.optimized_locations.get(&statement.range()),
                                     Some(super::optimization::OptimizedLocation::Elided)
-                                )
-                        }).next(),
+                                ))
+                        }),
                         Some(Stmt::Assign(assignment))
                             if matches!(assignment.value.as_ref(),
                                 Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_))
