@@ -55,9 +55,7 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
     validator.visit_scope_body(body);
     let lowering_keyword_error = validator.lowering_keyword_error.get();
     let mut error = validator.error.into_inner();
-    if lowering_keyword_error
-        && let Some(CompileError::InvalidSyntax { range, .. }) = &error
-    {
+    if lowering_keyword_error && let Some(CompileError::InvalidSyntax { range, .. }) = &error {
         // A class body is compiled before its bases and class-call keywords. Revisit only
         // classes containing the lowering error, leaving the ordinary symbol walk unchanged.
         let mut replay = new_validator::<PRUNE_STATEMENTS, false>(source, body, python_version);
@@ -73,9 +71,7 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
             })
             .or(error);
     }
-    if matches!(&error, Some(CompileError::InvalidDocstring { .. }))
-        || lowering_keyword_error
-    {
+    if matches!(&error, Some(CompileError::InvalidDocstring { .. })) || lowering_keyword_error {
         // Revisit these error paths for diagnostics from earlier compiler phases.
         // Future directives moved ahead of call lowering in Python 3.14.
         if !lowering_keyword_error
@@ -674,26 +670,22 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
             self.visit_decorator(decorator);
         }
         if let Some(params) = &class.type_params {
-            self.with_private_context(
-                class.name.as_str(),
-                Some(FxHashSet::default()),
-                |visitor| {
-                    for parameter in params.iter() {
-                        visitor
-                            .mangled_names
-                            .as_mut()
-                            .expect("generic headers have restricted name mangling")
-                            .insert(parameter.name().as_str());
-                        visitor.visit_type_param(parameter);
-                    }
-                    let header_names = visitor.mangled_names.take();
-                    visitor.visit_class_body_in_lowering_order(&class.body);
-                    visitor.mangled_names = header_names;
-                    if let Some(arguments) = &class.arguments {
-                        visitor.visit_class_arguments_in_lowering_order(arguments);
-                    }
-                },
-            );
+            self.with_private_context(class.name.as_str(), Some(FxHashSet::default()), |visitor| {
+                for parameter in params.iter() {
+                    visitor
+                        .mangled_names
+                        .as_mut()
+                        .expect("generic headers have restricted name mangling")
+                        .insert(parameter.name().as_str());
+                    visitor.visit_type_param(parameter);
+                }
+                let header_names = visitor.mangled_names.take();
+                visitor.visit_class_body_in_lowering_order(&class.body);
+                visitor.mangled_names = header_names;
+                if let Some(arguments) = &class.arguments {
+                    visitor.visit_class_arguments_in_lowering_order(arguments);
+                }
+            });
         } else {
             self.with_private_context(class.name.as_str(), None, |visitor| {
                 visitor.visit_class_body_in_lowering_order(&class.body);
