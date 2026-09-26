@@ -12869,6 +12869,9 @@ impl<'source> Compiler<'source> {
                             self.source_location(while_condition_exit_range(&while_statement.test))
                         };
                         self.assembler.set_location(location);
+                    } else if let Some(test) = self.elided_terminating_if_fallthrough(body) {
+                        self.assembler
+                            .set_location(self.source_location(condition_fallthrough_range(test)));
                     } else {
                         self.set_branch_end_location(body, body_start);
                     }
@@ -13489,6 +13492,43 @@ impl<'source> Compiler<'source> {
                 )
             },
         )
+    }
+
+    fn elided_terminating_if_fallthrough<'a>(&self, body: &'a [Stmt]) -> Option<&'a Expr> {
+        if self.context.python_version < crate::PythonVersion::Py314
+            || !matches!(self.unit.scope, Scope::Function { .. })
+            || self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+            || !self.control.loops.contexts.is_empty()
+            || self.control.loops.suite_fallthrough_to_loop_backedge
+            || !self.control.withs.active_with_exits.is_empty()
+            || self.has_active_control_flow_region()
+            || self.control.in_exception_handler()
+            || self.control.exceptions.active_exception_group_handlers != 0
+            || !self.control.finally.is_inactive_for_return_unwind()
+        {
+            return None;
+        }
+        let is_elided = |statement: &Stmt| {
+            matches!(
+                self.context.optimized_locations.get(&statement.range()),
+                Some(super::optimization::OptimizedLocation::Elided)
+            )
+        };
+        if !body.last().is_some_and(is_elided) {
+            return None;
+        }
+        let Stmt::If(statement) = body.iter().rev().find(|stmt| !is_elided(stmt))? else {
+            return None;
+        };
+        (statement.elif_else_clauses.is_empty()
+            && matches!(
+                statement.body.as_slice(),
+                [Stmt::Return(_) | Stmt::Raise(_)]
+            )
+            && condition_has_linear_runtime_leaves(&statement.test)
+            && !expression_suspends_current_scope(&statement.test)
+            && original_condition_has_unique_jump_target(&statement.test, false))
+        .then_some(statement.test.as_ref())
     }
 
     pub(super) fn set_branch_end_location(&mut self, body: &[Stmt], body_start: usize) {

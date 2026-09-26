@@ -113,6 +113,32 @@ fn protected_for_loop_backedge_locations_match_cpython_312() {
 }
 
 #[test]
+fn terminating_if_before_elided_assert_preserves_branch_location() {
+    for source in [
+        "def f(a,b,c):\n if a:\n  if b:\n   raise ValueError()\n  assert a\n else:\n  other()\n after()\n",
+        "def f(a,b,c):\n if a:\n  if not b:\n   raise ValueError()\n  assert a\n else:\n  other()\n after()\n",
+        "def f(a,b,c):\n if a:\n  if b or c:\n   raise ValueError()\n  assert a\n else:\n  other()\n after()\n",
+        "def f(a,b,c):\n if a:\n  if b < c:\n   return 3\n  assert a\n else:\n  other()\n after()\n",
+        "def f(a,b,c):\n if a:\n  other()\n elif c:\n  if check(b):\n   return work(b)\n  assert a\n  assert (z := b)\n else:\n  other()\n after()\n",
+        "def f(a,b,c):\n if a:\n  if b:\n   raise ValueError()\n  assert a\n  pass\n else:\n  other()\n after()\n",
+        "def f(a,b,c):\n if a:\n  if True:\n   raise ValueError()\n  assert a\n else:\n  other()\n after()\n",
+        "def f(a,b,c,cm,xs):\n if a:\n  try:\n   work()\n  finally:\n   cleanup()\n  if b:\n   raise ValueError()\n  assert a\n else:\n  other()\n after()\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "sub/elided_terminating_if.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+}
+
+#[test]
 fn nested_terminal_if_before_elided_assert_matches_cpython() {
     for source in [
         "def f(a,b):\n if a:\n  if b:\n   x = 1\n  assert a\n",
