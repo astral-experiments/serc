@@ -24,7 +24,10 @@ use std::path::Path;
 
 use code_object::{CodeFilename, CodeObject};
 use compiler::Compiler;
-pub use config::{CompileOptions, NativeBuildProfile, ParsePythonVersionError, PythonVersion};
+pub use config::{
+    CompileOptions, NativeBuildProfile, OptimizationLevel, ParseOptimizationLevelError,
+    ParsePythonVersionError, PythonVersion,
+};
 pub use initial_intern_state::InitialInternState;
 use ruff_text_size::{TextRange, TextSize};
 use siphasher::sip::SipHasher13;
@@ -276,7 +279,7 @@ pub fn compile_with_intern_state(
     )
 }
 
-/// Compile a Python module using the selected target and initial string intern state.
+/// Compile a Python module using the selected target, optimization level, and initial intern state.
 pub fn compile_with_options(
     source: &str,
     filename: &str,
@@ -325,7 +328,7 @@ pub fn compile_bytes_with_intern_state(
     )
 }
 
-/// Decode and compile source bytes using the selected target and initial string intern state.
+/// Decode and compile source bytes using the selected target, optimization level, and intern state.
 ///
 /// This function performs no filesystem I/O. See [`decode_source`] for source encoding behavior.
 /// The initial intern state describes the state before byte-source decoding; by default,
@@ -541,16 +544,33 @@ fn compile_normalized(
     if let Some(error) = parsed.unsupported_syntax_errors().first() {
         return Err(CompileError::invalid_syntax(error.to_string(), error.range));
     }
-    compiler::syntax::validate(source, parsed.suite(), options.python_version)?;
-    let code = Compiler::module_with_profile(
+    compiler::syntax::validate_with_optimization(
+        source,
+        parsed.suite(),
+        options.python_version,
+        options.optimization_level,
+    )?;
+    let optimized_body = (options.optimization_level != OptimizationLevel::Zero).then(|| {
+        compiler::optimization::prepare(
+            parsed.suite(),
+            options.optimization_level,
+            options.python_version,
+        )
+    });
+    let body = optimized_body
+        .as_ref()
+        .map_or_else(|| parsed.suite(), |optimized| &optimized.body);
+    let code = Compiler::module_with_scope_body(
         filename,
         source,
         parsed.tokens(),
+        body,
         parsed.suite(),
         options.python_version,
         options.native_build_profile,
+        optimized_body.as_ref(),
     )
-    .compile_module(parsed.suite())?;
+    .compile_module(body)?;
     marshal::validate_initial_intern_state(
         &code,
         options.python_version,

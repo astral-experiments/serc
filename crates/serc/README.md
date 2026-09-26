@@ -37,6 +37,24 @@ let pyc = module.to_timestamp_pyc(1_700_000_000, 12);
 
 `PythonVersion` also provides `Py312`, `Py313`, and `Py314`. The returned
 `CompiledModule` retains the selected target for marshal and `.pyc` output.
+
+Set `CompileOptions::optimization_level` to `OptimizationLevel::One` for
+Python's `-O` behavior (remove assertions and set `__debug__` to false), or
+`OptimizationLevel::Two` for `-OO` behavior (also remove docstrings):
+
+```rust
+use serc::{CompileOptions, OptimizationLevel, compile_with_options};
+
+let options = CompileOptions {
+    optimization_level: OptimizationLevel::Two,
+    ..CompileOptions::default()
+};
+let module = compile_with_options("assert condition\n", "module.py", &options).unwrap();
+```
+
+The default, `OptimizationLevel::Zero`, retains assertions and docstrings and
+sets `__debug__` to true. Optimization is available for all Python targets.
+
 `compile_with_options` accepts UTF-8 text;
 `CompileOptions::initial_intern_state` supplies an oracle process's existing
 interned strings. Partial intern states reject unresolved membership when it can

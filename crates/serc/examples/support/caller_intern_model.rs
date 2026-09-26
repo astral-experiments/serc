@@ -607,6 +607,7 @@ impl LoadedModel {
         CompileOptions {
             python_version: options.python_version,
             native_build_profile: options.native_build_profile,
+            optimization_level: options.optimization_level,
             initial_intern_state: state,
         }
     }

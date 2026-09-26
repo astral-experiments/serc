@@ -34,7 +34,6 @@ use super::scope::{
     inlined_comprehension_local_names_in_expression, nested_expression_required_names,
 };
 use super::source::unparse_annotation;
-use super::statement::function_body_contains_yield;
 use super::symbol::{ComparisonMode, to_u32, unsupported};
 use super::{CPYTHON_STACK_USE_GUIDELINE, Compiler, SUPPORTED_FUTURE_FLAGS, Scope};
 
@@ -595,14 +594,7 @@ impl Compiler<'_> {
         } else {
             0
         }) | (self.unit.flags & SUPPORTED_FUTURE_FLAGS);
-        let contains_yield = self
-            .context
-            .module_plan()
-            .may_contain_yield(&definition.body)
-            && function_body_contains_yield(
-                &definition.body,
-                !self.has_deferred_annotations() && self.unit.flags & CO_FUTURE_ANNOTATIONS == 0,
-            );
+        let contains_yield = self.context.function_contains_yield(definition);
         if definition.is_async && contains_yield {
             parameter_flags |= CO_ASYNC_GENERATOR;
         } else if definition.is_async {
@@ -2207,7 +2199,8 @@ impl Compiler<'_> {
         child.inherit_lexical_context(self);
         child.unit.annotation_thunk = true;
         child.emit_function_prologue()?;
-        let setup_location = self.source_location(body.first().map_or(first.range, Ranged::range));
+        let setup_location =
+            self.physical_source_location(body.first().map_or(first.range, Ranged::range));
         child.assembler.set_location(setup_location);
         child.emit_annotation_format_guard(".format")?;
         child.emit(BUILD_MAP, 0, 1)?;

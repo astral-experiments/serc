@@ -130,6 +130,104 @@ fn help_describes_compile_command() {
 }
 
 #[test]
+fn compile_optimization_modes_match_cpython_and_use_distinct_caches() {
+    use serc::PythonVersion;
+
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("optimized.py");
+    let native_path = directory.path().join("native.pyc");
+    fs_err::write(
+        &source_path,
+        "\"module docstring\"\nassert __debug__\ndebug = __debug__\n\
+         def function():\n    \"function docstring\"\n    assert condition\n    return __debug__\n\
+         class Example:\n    \"class docstring\"\n    debug = __debug__\n",
+    )
+    .unwrap();
+
+    for version in [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
+    ] {
+        for (level, arguments) in [
+            ("0", vec![]),
+            ("0", vec!["--optimize", "0"]),
+            ("1", vec!["-O"]),
+            ("1", vec!["--optimize", "1"]),
+            ("2", vec!["-OO"]),
+            ("2", vec!["--optimize", "2"]),
+        ] {
+            let output = serc()
+                .args([
+                    "compile",
+                    "--quiet",
+                    "--python-version",
+                    &version.to_string(),
+                ])
+                .args(&arguments)
+                .arg(&source_path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{version} {arguments:?}: {output:?}"
+            );
+
+            let mut oracle = match version {
+                PythonVersion::Py312 => common::python_312_command(),
+                PythonVersion::Py313 => common::python_313_command(),
+                PythonVersion::Py314 => common::python_3145_command(),
+                PythonVersion::Py315 => common::python_315_command(),
+            };
+            let native = oracle
+                .args([
+                    "-c",
+                    "import importlib.util, pathlib, py_compile, sys; source, native, level = sys.argv[1:]; py_compile.compile(source, cfile=native, doraise=True, optimize=int(level), invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP); cache = importlib.util.cache_from_source(source, optimization='' if level == '0' else level); assert pathlib.Path(cache).read_bytes() == pathlib.Path(native).read_bytes(), cache",
+                ])
+                .arg(&source_path)
+                .arg(&native_path)
+                .arg(level)
+                .output()
+                .unwrap();
+            assert!(
+                native.status.success(),
+                "{version} {arguments:?}: {native:?}"
+            );
+        }
+    }
+    assert_eq!(
+        fs_err::read_dir(directory.path().join("__pycache__"))
+            .unwrap()
+            .count(),
+        12
+    );
+}
+
+#[test]
+fn optimized_check_mode_skips_cache_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("module.py");
+    fs_err::write(&source_path, "\"docstring\"\nassert condition\n").unwrap();
+    let output = serc()
+        .args(["compile", "--check", "-OO"])
+        .arg(source_path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(!directory.path().join("__pycache__").exists());
+}
+
+#[test]
+fn rejects_invalid_or_conflicting_optimization_options() {
+    for arguments in [vec!["--optimize", "3"], vec!["-O", "--optimize", "2"]] {
+        let output = serc().arg("compile").args(arguments).output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(!output.stderr.is_empty());
+    }
+}
+
+#[test]
 fn compile_writes_a_timestamp_pyc() {
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("module.py");
@@ -1517,40 +1615,51 @@ fn parallel_compile_writes_identical_caches_including_colliding_names() {
     }
     let deeply_nested = format!("value = {}1{}\n", "call(".repeat(24), ")".repeat(24));
     fs_err::write(directory.path().join("deep.py"), deeply_nested).unwrap();
-    let caches = [
-        directory.path().join("__pycache__/py.cpython-314.pyc"),
-        directory.path().join("__pycache__/module.cpython-314.pyc"),
-        directory.path().join("__pycache__/deep.cpython-314.pyc"),
-        nested.join("__pycache__/__init__.cpython-314.pyc"),
-        nested.join("__pycache__/nested.cpython-314.pyc"),
-        nested.join("__pycache__/other.cpython-314.pyc"),
-    ];
-    let serial = serc()
-        .args(["compile", "--jobs", "1"])
-        .arg(directory.path())
-        .output()
-        .unwrap();
-    assert!(serial.status.success(), "{serial:?}");
-    assert_eq!(serial.stdout, b"Compiled 7 files\n");
-    assert!(serial.stderr.is_empty());
-    let expected = caches.each_ref().map(|path| fs_err::read(path).unwrap());
+    for optimization in ["0", "1", "2"] {
+        let caches = [
+            directory.path().join("__pycache__/py.cpython-314.pyc"),
+            directory.path().join("__pycache__/module.cpython-314.pyc"),
+            directory.path().join("__pycache__/deep.cpython-314.pyc"),
+            nested.join("__pycache__/__init__.cpython-314.pyc"),
+            nested.join("__pycache__/nested.cpython-314.pyc"),
+            nested.join("__pycache__/other.cpython-314.pyc"),
+        ]
+        .map(|path| {
+            if optimization == "0" {
+                path
+            } else {
+                path.with_extension(format!("opt-{optimization}.pyc"))
+            }
+        });
+        let serial = serc()
+            .args(["compile", "--jobs", "1", "--optimize", optimization])
+            .arg(directory.path())
+            .output()
+            .unwrap();
+        assert!(serial.status.success(), "{serial:?}");
+        assert_eq!(serial.stdout, b"Compiled 7 files\n");
+        assert!(serial.stderr.is_empty());
+        let expected = caches.each_ref().map(|path| fs_err::read(path).unwrap());
 
-    for jobs in [Some("4"), None, Some("4")] {
-        fs_err::remove_dir_all(directory.path().join("__pycache__")).unwrap();
-        fs_err::remove_dir_all(nested.join("__pycache__")).unwrap();
-        let mut command = serc();
-        command.arg("compile").env("RAYON_NUM_THREADS", "2");
-        if let Some(jobs) = jobs {
-            command.args(["-j", jobs]);
+        for jobs in [Some("4"), None, Some("4")] {
+            fs_err::remove_dir_all(directory.path().join("__pycache__")).unwrap();
+            fs_err::remove_dir_all(nested.join("__pycache__")).unwrap();
+            let mut command = serc();
+            command
+                .args(["compile", "--optimize", optimization])
+                .env("RAYON_NUM_THREADS", "2");
+            if let Some(jobs) = jobs {
+                command.args(["-j", jobs]);
+            }
+            let parallel = command.arg(directory.path()).output().unwrap();
+            assert!(parallel.status.success(), "{parallel:?}");
+            assert_eq!(parallel.stdout, serial.stdout);
+            assert_eq!(parallel.stderr, serial.stderr);
+            assert_eq!(
+                caches.each_ref().map(|path| fs_err::read(path).unwrap()),
+                expected
+            );
         }
-        let parallel = command.arg(directory.path()).output().unwrap();
-        assert!(parallel.status.success(), "{parallel:?}");
-        assert_eq!(parallel.stdout, serial.stdout);
-        assert_eq!(parallel.stderr, serial.stderr);
-        assert_eq!(
-            caches.each_ref().map(|path| fs_err::read(path).unwrap()),
-            expected
-        );
     }
 }
 
