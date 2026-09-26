@@ -111,6 +111,8 @@ mod tests {
     use ruff_python_parser::parse_module;
 
     use super::super::validate;
+    use crate::code_object::Constant;
+    use crate::compiler::constant::{python_constant_values_equal, python_numeric_value_key};
     use crate::{CompileError, PythonVersion};
 
     const TARGETS: [PythonVersion; 4] = [
@@ -119,6 +121,43 @@ mod tests {
         PythonVersion::Py314,
         PythonVersion::Py315,
     ];
+
+    #[test]
+    fn numeric_hash_keys_match_python_equality() {
+        let values = [
+            Constant::Bool(false),
+            Constant::Int(0),
+            Constant::Float(-0.0),
+            Constant::Complex { real: 0.0, imag: -0.0 },
+            Constant::Bool(true),
+            Constant::Int(1),
+            Constant::Float(1.0),
+            Constant::Float(1.5),
+            Constant::Complex { real: 1.0, imag: -0.0 },
+            Constant::Complex { real: 1.0, imag: 1.5 },
+            Constant::BigInt { negative: false, digits: vec![0, 0, 0, 0, 16] },
+            Constant::BigInt { negative: false, digits: vec![1, 0, 0, 0, 16] },
+            Constant::Float(18446744073709551616.0),
+            Constant::Complex { real: 18446744073709551616.0, imag: 0.0 },
+            Constant::Complex { real: 18446744073709551616.0, imag: 1.0 },
+            Constant::Float(f64::INFINITY),
+            Constant::Float(f64::NEG_INFINITY),
+            Constant::Complex { real: 1.0, imag: f64::INFINITY },
+        ];
+        for left in &values {
+            for right in &values {
+                let left_key = python_numeric_value_key(left).unwrap();
+                let right_key = python_numeric_value_key(right).unwrap();
+                assert_eq!(
+                    left_key == right_key,
+                    python_constant_values_equal(left, right),
+                    "{left:?} vs {right:?}"
+                );
+            }
+        }
+        assert!(python_numeric_value_key(&Constant::Float(f64::NAN)).is_none());
+        assert!(python_numeric_value_key(&Constant::Complex { real: 1.0, imag: f64::NAN }).is_none());
+    }
 
     #[test]
     fn large_integer_mapping_keys_compare_exact_values() {
