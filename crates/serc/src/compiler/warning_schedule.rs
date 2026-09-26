@@ -9,7 +9,7 @@
 use std::fmt;
 
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
-use ruff_python_ast::{Expr, Parameters, Stmt, UnaryOp};
+use ruff_python_ast::{Expr, Parameters, Stmt, StmtFunctionDef, UnaryOp};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 
 use crate::code_object::CodeObject;
@@ -91,8 +91,15 @@ impl WarningSchedule {
             unsupported: None,
             frames: Vec::new(),
             disabled_warnings: 0,
+            body_depth: 0,
+            future_annotations: body.iter().any(|statement| {
+                matches!(statement, Stmt::ImportFrom(import)
+                    if import.module.as_ref().is_some_and(|module| module.as_str() == "__future__")
+                        && import.names.iter().any(|alias| alias.name.as_str() == "annotations"))
+            }),
         };
         planner.visit_body(body);
+        planner.deferred_annotations(body, body.first().map_or(TextSize::new(0), Ranged::start));
         if let Some(unsupported) = planner.unsupported {
             return Err(unsupported);
         }
@@ -132,6 +139,9 @@ struct Planner<'source, 'ast> {
     unsupported: Option<UnsupportedWarningSchedule>,
     frames: Vec<Frame<'ast>>,
     disabled_warnings: usize,
+    // Statement-body nesting within the current compiler unit.
+    body_depth: usize,
+    future_annotations: bool,
 }
 
 impl<'ast> Planner<'_, 'ast> {
@@ -172,18 +182,16 @@ impl<'ast> Planner<'_, 'ast> {
         scope: Scope,
         visit: impl FnOnce(&mut Self),
     ) {
-        let qualname = match self.scope {
-            Scope::Module => name.to_string(),
-            Scope::Function => format!("{}.<locals>.{name}", self.qualname),
-            Scope::Class => format!("{}.{name}", self.qualname),
-        };
+        let qualname = self.child_qualname(name);
         let parent_scope = std::mem::replace(&mut self.scope, scope);
         let parent_name = std::mem::replace(&mut self.qualname, qualname);
         // Warning disabling belongs to the compiler, but unwind frames belong
         // to its current unit. A nested function in an exceptional finalizer
         // inherits disabling without inheriting the enclosing unwind frames.
         let parent_frames = std::mem::take(&mut self.frames);
+        let parent_body_depth = std::mem::replace(&mut self.body_depth, 0);
         visit(self);
+        self.body_depth = parent_body_depth;
         self.frames = parent_frames;
         self.events.push(ScheduleEvent::Assembly(AssemblyBoundary {
             name: name.to_string(),
@@ -191,6 +199,91 @@ impl<'ast> Planner<'_, 'ast> {
             firstlineno: self.line(first_line),
         }));
         self.scope = parent_scope;
+    }
+
+    fn child_qualname(&self, name: &str) -> String {
+        match self.scope {
+            Scope::Module => name.to_string(),
+            Scope::Function => format!("{}.<locals>.{name}", self.qualname),
+            Scope::Class => format!("{}.{name}", self.qualname),
+        }
+    }
+
+    /// Annotation scopes are transparent to the qualified names of their children.
+    fn annotation_scope(
+        &mut self,
+        name: &str,
+        qualname: String,
+        first_line: TextSize,
+        visit: impl FnOnce(&mut Self),
+    ) {
+        let parent_frames = std::mem::take(&mut self.frames);
+        visit(self);
+        self.frames = parent_frames;
+        self.events.push(ScheduleEvent::Assembly(AssemblyBoundary {
+            name: name.to_string(),
+            qualname,
+            firstlineno: self.line(first_line),
+        }));
+    }
+
+    // A name cannot emit a warning or assemble a nested code object.
+    fn annotation_expr(&mut self, expression: &'ast Expr) {
+        if !matches!(expression, Expr::Name(_)) {
+            self.unsupported(expression.range(), "complex annotation expression");
+        }
+    }
+
+    fn deferred_annotations(&mut self, body: &'ast [Stmt], first_line: TextSize) {
+        if self.version < PythonVersion::Py314 || self.future_annotations {
+            return;
+        }
+        let annotations: Vec<_> = body
+            .iter()
+            .filter_map(|statement| match statement {
+                Stmt::AnnAssign(annotation) => Some(annotation),
+                _ => None,
+            })
+            .collect();
+        if annotations.is_empty() {
+            return;
+        }
+        let qualname = self.child_qualname("__annotate__");
+        self.annotation_scope("__annotate__", qualname, first_line, |this| {
+            for annotation in annotations {
+                this.annotation_expr(&annotation.annotation);
+            }
+        });
+    }
+
+    fn function_annotations(&mut self, function: &'ast StmtFunctionDef) {
+        let annotations = super::definition::function_annotations(function, self.version);
+        if annotations.is_empty() {
+            return;
+        }
+        if self.future_annotations {
+            self.unsupported(function.range, "future function annotation scope");
+            return;
+        }
+        if self.version < PythonVersion::Py314 {
+            for (_, annotation) in annotations {
+                self.annotation_expr(annotation);
+            }
+            return;
+        }
+        let qualname = if self.version == PythonVersion::Py315 {
+            format!(
+                "{}.__annotate__",
+                self.child_qualname(function.name.as_str())
+            )
+        } else {
+            self.child_qualname("__annotate__")
+        };
+        self.annotation_scope("__annotate__", qualname, function.name.start(), |this| {
+            for (_, annotation) in annotations {
+                this.annotation_expr(annotation);
+            }
+        });
     }
 
     /// Defaults are visited in positional-then-keyword order in the parent unit.
@@ -262,6 +355,14 @@ impl<'ast> Planner<'_, 'ast> {
 }
 
 impl<'ast> Visitor<'ast> for Planner<'_, 'ast> {
+    fn visit_body(&mut self, body: &'ast [Stmt]) {
+        self.body_depth += 1;
+        for statement in body {
+            self.visit_stmt(statement);
+        }
+        self.body_depth -= 1;
+    }
+
     fn visit_interpolated_string_element(
         &mut self,
         element: &'ast ruff_python_ast::InterpolatedStringElement,
@@ -281,17 +382,8 @@ impl<'ast> Visitor<'ast> for Planner<'_, 'ast> {
         }
         match statement {
             Stmt::FunctionDef(function) => {
-                if function.type_params.is_some()
-                    || function.returns.is_some()
-                    || function
-                        .parameters
-                        .iter()
-                        .any(|parameter| parameter.as_parameter().annotation.is_some())
-                {
-                    self.unsupported(
-                        function.range,
-                        "function annotation or type-parameter scope",
-                    );
+                if function.type_params.is_some() {
+                    self.unsupported(function.range, "function type-parameter scope");
                     return;
                 }
                 for decorator in &function.decorator_list {
@@ -302,6 +394,7 @@ impl<'ast> Visitor<'ast> for Planner<'_, 'ast> {
                     .decorator_list
                     .first()
                     .map_or(function.start(), |decorator| decorator.expression.start());
+                self.function_annotations(function);
                 self.child_scope(
                     function.name.as_str(),
                     first_line,
@@ -325,6 +418,7 @@ impl<'ast> Visitor<'ast> for Planner<'_, 'ast> {
                     .map_or(class.start(), |decorator| decorator.expression.start());
                 self.child_scope(class.name.as_str(), first_line, Scope::Class, |this| {
                     this.visit_body(&class.body);
+                    this.deferred_annotations(&class.body, first_line);
                 });
                 // Native codegen_class assembles the body before visiting bases.
                 if let Some(arguments) = &class.arguments {
@@ -377,8 +471,25 @@ impl<'ast> Visitor<'ast> for Planner<'_, 'ast> {
                 self.unwind(false);
             }
             Stmt::Break(_) | Stmt::Continue(_) => self.unwind(true),
-            Stmt::AnnAssign(_) | Stmt::TypeAlias(_) => {
-                self.unsupported(statement.range(), "annotation or type-alias scope");
+            Stmt::AnnAssign(assignment) => {
+                if self.future_annotations
+                    || self.body_depth != 1
+                    || assignment.value.is_some()
+                    || !assignment.simple
+                    || !matches!(assignment.target.as_ref(), Expr::Name(_))
+                    || matches!(self.scope, Scope::Function)
+                {
+                    self.unsupported(assignment.range, "unmodeled annotated assignment");
+                    return;
+                }
+                if self.version < PythonVersion::Py314
+                    && matches!(self.scope, Scope::Module | Scope::Class)
+                {
+                    self.annotation_expr(&assignment.annotation);
+                }
+            }
+            Stmt::TypeAlias(_) => {
+                self.unsupported(statement.range(), "type-alias scope");
             }
             Stmt::Try(statement) => {
                 if statement.is_star {
@@ -766,6 +877,116 @@ mod tests {
                     "assembly:<module>:1",
                 ]
             );
+        }
+    }
+
+    #[test]
+    fn annotations_follow_native_assembly_and_warning_order() {
+        let module = "value: int\n1()\n";
+        let function = "def f(arg: int):\n    1()\n";
+        let class = "class C:\n    value: int\n    def f(self) -> int:\n        1()\n";
+        for version in VERSIONS {
+            let mut expected = vec!["warning:non_callable"];
+            if version >= PythonVersion::Py314 {
+                expected.push("assembly:__annotate__:1");
+            }
+            expected.push("assembly:<module>:1");
+            assert_eq!(summary(module, version), expected, "{version:?}");
+
+            let mut expected = Vec::new();
+            if version >= PythonVersion::Py314 {
+                expected.push(if version == PythonVersion::Py315 {
+                    "assembly:f.__annotate__:1"
+                } else {
+                    "assembly:__annotate__:1"
+                });
+            }
+            expected.extend([
+                "warning:non_callable",
+                "assembly:f:1",
+                "assembly:<module>:1",
+            ]);
+            assert_eq!(summary(function, version), expected, "{version:?}");
+
+            let mut expected = Vec::new();
+            if version >= PythonVersion::Py314 {
+                expected.push(if version == PythonVersion::Py315 {
+                    "assembly:C.f.__annotate__:3"
+                } else {
+                    "assembly:C.__annotate__:3"
+                });
+            }
+            expected.extend(["warning:non_callable", "assembly:C.f:3"]);
+            if version >= PythonVersion::Py314 {
+                expected.push("assembly:C.__annotate__:1");
+            }
+            expected.extend(["assembly:C:1", "assembly:<module>:1"]);
+            assert_eq!(summary(class, version), expected, "{version:?}");
+        }
+    }
+
+    #[test]
+    fn prepared_compilation_accepts_supported_annotation_scopes() {
+        use crate::{
+            CompilationWarningEffect, CompileOptions, InitialInternState, PreparedCompilation,
+        };
+
+        for source in [
+            "value: int\nif 1 is value: pass\n",
+            "def f(arg: int):\n    1()\n",
+            "def f(first, second) -> int:\n    1()\n",
+            "class C:\n    value: int\n    def f(self) -> int:\n        1()\n",
+        ] {
+            for version in VERSIONS {
+                let options = CompileOptions {
+                    python_version: version,
+                    initial_intern_state: InitialInternState::from_complete(
+                        std::iter::empty::<&str>(),
+                    ),
+                    ..CompileOptions::default()
+                };
+                let plan = PreparedCompilation::text(source, "warning_annotations.py", &options)
+                    .unwrap_or_else(|error| panic!("{version:?}: {error:?}\n{source}"));
+                let mut effects = plan.effects();
+                for warning in plan.warnings() {
+                    effects
+                        .record(
+                            warning.ordinal(),
+                            CompilationWarningEffect::NoRetainedAdditions,
+                        )
+                        .unwrap();
+                }
+                plan.finish(&effects)
+                    .unwrap_or_else(|error| panic!("{version:?}: {error:?}\n{source}"));
+            }
+        }
+    }
+
+    #[test]
+    fn unmodeled_annotation_scopes_remain_fail_closed() {
+        for source in [
+            "def f[T](arg: T): pass\n1()\n",
+            "type A = int\n1()\n",
+            "value: list[int]\n1()\n",
+            "value: int = 1\n1()\n",
+            "if condition:\n    value: int\n1()\n",
+            "class C:\n    if condition:\n        value: int\n1()\n",
+            "if condition:\n    pass\nelif other:\n    value: int\n1()\n",
+            "for item in items:\n    value: int\n1()\n",
+            "while condition:\n    value: int\n1()\n",
+            "try:\n    pass\nexcept Exception:\n    value: int\n1()\n",
+            "try:\n    pass\nfinally:\n    value: int\n1()\n",
+            "with manager:\n    value: int\n1()\n",
+            "class Outer:\n    class Inner:\n        if condition:\n            value: int\n1()\n",
+            "from __future__ import annotations\nvalue: int\n1()\n",
+        ] {
+            for version in VERSIONS {
+                let parsed = ruff_python_parser::parse_module(source).unwrap();
+                assert!(
+                    WarningSchedule::plan(parsed.suite(), source, version).is_err(),
+                    "{version:?}: {source}"
+                );
+            }
         }
     }
 }

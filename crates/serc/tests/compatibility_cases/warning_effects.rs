@@ -1,7 +1,7 @@
 use std::io::Write as _;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 
-use serc::{CompilationWarningEffect, CompileOptions, PreparedCompilation};
+use serc::{CompilationWarningEffect, CompileOptions, PreparedCompilation, PythonVersion};
 
 use crate::common;
 
@@ -26,10 +26,21 @@ sys.stderr.write(json.dumps(seen))
 ";
 
 fn compare_in_context(source: &str, marker: &str, retain: bool) -> Vec<u8> {
+    compare_in_context_for(source, marker, retain, PythonVersion::Py314)
+}
+
+fn compare_in_context_for(
+    source: &str,
+    marker: &str,
+    retain: bool,
+    version: PythonVersion,
+) -> Vec<u8> {
     let filename = "warning_effects_context.py";
-    let prepared =
-        PreparedCompilation::bytes(source.as_bytes(), filename, &CompileOptions::default())
-            .unwrap();
+    let options = CompileOptions {
+        python_version: version,
+        ..CompileOptions::default()
+    };
+    let prepared = PreparedCompilation::bytes(source.as_bytes(), filename, &options).unwrap();
     let mut effects = prepared.effects();
     for warning in prepared.warnings() {
         let effect = if retain {
@@ -40,7 +51,33 @@ fn compare_in_context(source: &str, marker: &str, retain: bool) -> Vec<u8> {
         effects.record(warning.ordinal(), effect).unwrap();
     }
     let actual = prepared.finish(&effects).unwrap().marshal();
-    let mut child = common::python_3145_command()
+    let mut python = match version {
+        PythonVersion::Py314 => common::python_3145_command(),
+        _ => {
+            let (variable, fallback) = match version {
+                PythonVersion::Py312 => ("SERC_TEST_PYTHON_312", "python3.12"),
+                PythonVersion::Py313 => ("SERC_TEST_PYTHON_313", "python3.13"),
+                PythonVersion::Py315 => ("SERC_TEST_PYTHON_315", "python3.15"),
+                PythonVersion::Py314 => unreachable!(),
+            };
+            let executable = std::env::var_os(variable).unwrap_or_else(|| fallback.into());
+            let identity = Command::new(&executable)
+                .args(["-I", "-S", "-c", "import importlib.util, sys; print(sys.implementation.name, sys.version.split()[0], importlib.util.MAGIC_NUMBER.hex())"])
+                .output().unwrap();
+            let target = version.target();
+            let expected = format!(
+                "cpython {} {}\n",
+                target.tag.strip_prefix('v').unwrap(),
+                target.magic_hex()
+            );
+            assert!(identity.status.success());
+            assert_eq!(String::from_utf8(identity.stdout).unwrap(), expected);
+            let mut command = Command::new(executable);
+            command.args(["-I", "-S", "-X", "utf8"]);
+            command
+        }
+    };
+    let mut child = python
         .arg("-B")
         .args([
             "-c",
@@ -109,6 +146,63 @@ fn warning_callbacks_resolve_qualified_names_at_assembly() {
     ] {
         compare_in_context(source, "WarningOuter796.Inner", false);
         compare_in_context(source, "WarningOuter796.Inner", true);
+    }
+}
+
+#[test]
+fn warning_callbacks_preserve_annotation_assembly_order() {
+    for (source, marker) in [
+        (
+            "value: int\nif 1 is 1: pass\ndef f(arg: int): pass\n",
+            "__annotate__",
+        ),
+        (
+            "if 1 is 1: pass\nclass WarningAnnotated796:\n    value: int\n    def f(self) -> int:\n        if 1 is 1: pass\n    if 1 is 1: pass\n",
+            "WarningAnnotated796.__annotate__",
+        ),
+        (
+            "def outer():\n    if 1 is 1: pass\n    @decorator\n    def inner(arg: int):\n        if 1 is 1: pass\n    @decorator\n    class WarningAnnotated796:\n        value: int\n        if 1 is 1: pass\n",
+            "outer.<locals>.WarningAnnotated796.__annotate__",
+        ),
+    ] {
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            compare_in_context_for(source, marker, false, version);
+            compare_in_context_for(source, marker, true, version);
+        }
+    }
+    let first = "def first(value):\n    return value in {'warning_callback_marker_796', 'novel_callback_marker_796'}, 1\n";
+    let second = "def second(value):\n    'second docstring'\n    return value in {'warning_callback_marker_796', 'novel_callback_marker_796'}, 2\n";
+    for version in [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
+    ] {
+        for (source, sensitive) in [
+            (
+                format!("value: int\nif 1 is 1: pass\n{first}{second}"),
+                true,
+            ),
+            (
+                format!("{first}\ndef annotated(value: int): pass\nif 1 is 1: pass\n{second}"),
+                false,
+            ),
+            (
+                format!("{first}{second}\nvalue: int\nif 1 is 1: pass\n"),
+                false,
+            ),
+        ] {
+            let quiet =
+                compare_in_context_for(&source, "warning_callback_marker_796", false, version);
+            let retained =
+                compare_in_context_for(&source, "warning_callback_marker_796", true, version);
+            assert_eq!(quiet != retained, sensitive, "{version:?}: {source}");
+        }
     }
 }
 
