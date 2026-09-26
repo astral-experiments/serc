@@ -7,7 +7,7 @@ use super::{
     Instruction, Item, NormalizedExceptionOwner, Operand, OperandPatchId, SourceLocation,
 };
 use crate::target::opcodes::*;
-use crate::target::operands::{CommonConstant, Conversion, ResumeLocation};
+use crate::target::operands::{CommonConstant, Conversion, FunctionAttribute, ResumeLocation};
 
 #[test]
 #[cfg(target_pointer_width = "64")]
@@ -5506,7 +5506,7 @@ fn ordinary_linear_disjoint_cell_initializers_match_the_block_graph_pipeline() {
                 item(BUILD_TUPLE, 1, 1),
                 item(LOAD_CONST, 0, 2),
                 item(MAKE_FUNCTION, 0, 2),
-                item(SET_FUNCTION_ATTRIBUTE, 8, 1),
+                item(SET_FUNCTION_ATTRIBUTE, FunctionAttribute::CLOSURE.argument(), 1),
                 item(STORE_FAST, other, 0),
                 item(LOAD_FAST, other, 1),
                 ret,
