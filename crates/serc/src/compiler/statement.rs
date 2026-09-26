@@ -424,6 +424,8 @@ pub(super) struct ExceptionState {
     pub(super) active_tuple_handler_try_bodies: Vec<bool>,
     // Linear item offset and suspension epoch of the innermost ordinary try body.
     active_try_body_start: Option<(usize, usize)>,
+    // Direct final statement of the innermost ordinary try body.
+    active_try_body_tail: Option<TextRange>,
     active_try_marker_slots: Vec<Option<TryMarkerSlotContext>>,
     active_exception_handlers: Vec<ExceptionHandlerContext>,
     // Exception-group handlers retain their body marker owner after coroutine suspension.
@@ -19513,6 +19515,10 @@ impl<'source> Compiler<'source> {
             self.assembler.item_count(),
             self.control.generators.coroutine_suspension_epoch,
         ));
+        let previous_try_body_tail = std::mem::replace(
+            &mut self.control.exceptions.active_try_body_tail,
+            statement.body.last().map(Ranged::range),
+        );
         self.control
             .exceptions
             .active_try_marker_slots
@@ -20109,6 +20115,7 @@ impl<'source> Compiler<'source> {
             .active_try_body_start
             .is_some_and(|(_, epoch)| self.control.generators.coroutine_suspension_epoch > epoch);
         self.control.exceptions.active_try_body_start = previous_try_body_start;
+        self.control.exceptions.active_try_body_tail = previous_try_body_tail;
         self.control.exceptions.compacting_try_body_pass_join = previous_compacting_pass_join;
         let _tuple_handler_try_body = self
             .control
@@ -27625,6 +27632,36 @@ impl<'source> Compiler<'source> {
                 .active_exception_region_exclusions
                 .len()
                 == 1;
+        let pass_exit_enclosing_finally_depth = (self.context.python_version
+            >= crate::PythonVersion::Py314
+            && pass_finally_location.is_some()
+            && !pass_finally_leaves_manager
+            && !statement.is_star
+            && statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && self.control.exceptions.prevent_try_exit_inlining
+            && self.control.exceptions.active_try_body_tail == Some(statement.range)
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.loops.contexts.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0)
+            .then_some(
+                self.control
+                    .finally
+                    .innermost_finally_exception_exclusion_depth,
+            )
+            .flatten()
+            .filter(|depth| {
+                *depth + 1
+                    == self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+            });
         let overriding_return = matches!(statement.finalbody.last(), Some(Stmt::Return(_)));
         if overriding_return
             && self.control.withs.active_with_region_exclusions.is_empty()
@@ -28276,7 +28313,18 @@ impl<'source> Compiler<'source> {
             |compiler| compiler.with_fallthrough_tracking(|compiler| {
             if let Some(location) = pass_finally_location {
                 compiler.assembler.set_location(location);
-                if original_nested_pass_exit
+                if let Some(depth) = pass_exit_enclosing_finally_depth {
+                    // The inner handler no longer owns its finalizer's normal exit,
+                    // but an outer finally remains active around that exit.
+                    let pass_start = compiler.assembler.label();
+                    compiler.assembler.mark(pass_start);
+                    compiler.emit(NOP, 0, 0)?;
+                    let pass_end = compiler.assembler.label();
+                    compiler.assembler.mark(pass_end);
+                    for exclusions in &mut compiler.control.exceptions.active_exception_region_exclusions[depth..] {
+                        exclusions.push((pass_start, pass_end));
+                    }
+                } else if original_nested_pass_exit
                     || (compiler
                         .control
                         .exceptions.active_exception_region_exclusions
@@ -28741,6 +28789,7 @@ impl<'source> Compiler<'source> {
                 && !drop_shared_manager_exit_nop
                 && conditional_exit.is_none();
             let exception_policy = if !original_nested_pass_exit
+                && pass_exit_enclosing_finally_depth.is_none()
                 && pass_finally_location.is_some()
                 && (pass_finally_leaves_manager
                     || !self
@@ -29040,6 +29089,11 @@ impl<'source> Compiler<'source> {
                 // assigns locations before shared continuations are threaded.
                 self.assembler.set_location(SourceLocation::NONE);
             }
+            let pass_exit_start = pass_exit_enclosing_finally_depth.map(|_| {
+                let start = self.assembler.label();
+                self.assembler.mark(start);
+                start
+            });
             let normal_exit = if original_nested_pass_exit {
                 self.assembler.set_location(SourceLocation::NONE);
                 let exit = self.emit_jump_forward_instruction_preserving_nop(
@@ -29058,6 +29112,16 @@ impl<'source> Compiler<'source> {
                     exception_policy,
                 )?
             };
+            if let (Some(depth), Some(start)) = (pass_exit_enclosing_finally_depth, pass_exit_start)
+            {
+                let end = self.assembler.label();
+                self.assembler.mark(end);
+                for exclusions in
+                    &mut self.control.exceptions.active_exception_region_exclusions[depth..]
+                {
+                    exclusions.push((start, end));
+                }
+            }
             if self.context.python_version >= crate::PythonVersion::Py314
                 && !preserve_exit_nop
                 && matches!(self.unit.scope, Scope::Function { .. })
@@ -29461,8 +29525,10 @@ impl<'source> Compiler<'source> {
                             exclusions.push((exit_exclusion_start, exit_exclusion_end));
                         }
                     }
+                    let exclusion_start = pass_exit_enclosing_finally_depth.unwrap_or(0);
                     for exclusions in
                         &mut self.control.exceptions.active_exception_region_exclusions
+                            [exclusion_start..]
                     {
                         exclusions.push((exit_exclusion_start, exit_exclusion_end));
                     }
