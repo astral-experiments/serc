@@ -318,8 +318,50 @@ fn indentation_depth_preserves_earlier_legacy_template_error() {
                 compile_bytes_with_options(source.as_bytes(), "indentation.py", &options),
             ] {
                 let error = result.unwrap_err();
-                assert!(error.to_string().contains("Cannot use t-strings"), "{version}: {error}");
+                assert!(
+                    error.to_string().contains("Cannot use t-strings"),
+                    "{version}: {error}"
+                );
                 assert!(error.range().unwrap().start().to_usize() < template.len());
+            }
+        }
+    }
+}
+
+#[test]
+fn indentation_depth_preserves_earlier_version_errors() {
+    let deep = nested_source(100, " ");
+    let template = "value = t'hello'\n";
+    for (version, prefix, expected) in [
+        (
+            PythonVersion::Py312,
+            "type A[T = int] = T\n",
+            "Cannot set default type",
+        ),
+        (
+            PythonVersion::Py312,
+            "lazy import os\n",
+            "Cannot use `lazy` import",
+        ),
+        (
+            PythonVersion::Py313,
+            "lazy import os\n",
+            "Cannot use `lazy` import",
+        ),
+    ] {
+        let options = CompileOptions {
+            python_version: version,
+            ..CompileOptions::default()
+        };
+        for suffix in ["", "def f():\n    yield, x\n"] {
+            let source = format!("{prefix}{template}{suffix}{deep}");
+            for result in [
+                compile_with_options(&source, "indentation.py", &options),
+                compile_bytes_with_options(source.as_bytes(), "indentation.py", &options),
+            ] {
+                let error = result.unwrap_err();
+                assert!(error.to_string().contains(expected), "{version}: {error}");
+                assert!(error.range().unwrap().start().to_usize() < prefix.len());
             }
         }
     }

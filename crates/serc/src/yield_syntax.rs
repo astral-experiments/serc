@@ -85,15 +85,24 @@ pub(crate) fn before_indentation_error(
     if yield_error.is_some() {
         return yield_error;
     }
-    // Preserve the earlier version error for a completed legacy template.
-    let error = parsed.unsupported_syntax_errors().iter().find(|error| {
+    // Preserve earlier version errors when a completed legacy template is present.
+    let template = parsed.unsupported_syntax_errors().iter().find(|error| {
         matches!(error.kind, UnsupportedSyntaxErrorKind::TemplateStrings)
             && error.range.end() <= indentation.start()
-            && parsed
-                .errors()
-                .first()
-                .is_none_or(|prior| error.range.start() < prior.location.start())
     })?;
+    let first = parsed.unsupported_syntax_errors().first()?;
+    let error = if first.range.start() <= template.range.start() {
+        first
+    } else {
+        template
+    };
+    if parsed
+        .errors()
+        .first()
+        .is_some_and(|prior| prior.location.start() <= error.range.start())
+    {
+        return None;
+    }
     Some(CompileError::invalid_syntax(error.to_string(), error.range))
 }
 
