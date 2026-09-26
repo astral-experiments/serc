@@ -18729,6 +18729,12 @@ impl<'source> Compiler<'source> {
         if statement.handlers.is_empty() {
             return Err(unsupported("try statement without handlers"));
         }
+        let body_has_elided_assertion = statement.body.iter().any(|body| {
+            matches!(
+                self.context.optimized_locations.get(&body.range()),
+                Some(super::optimization::OptimizedLocation::Elided)
+            )
+        });
         // CPython folds every successful arm of a trailing nested conversion chain directly onto
         // the iterator backedge. Restrict that layout to recursive one-call try/except/else arms
         // so ordinary nested handlers keep their shared joins.
@@ -19947,6 +19953,17 @@ impl<'source> Compiler<'source> {
                             )
                         })
                         .map(|statement| self.source_location(statement.range()))
+                        .or_else(|| {
+                            // Keep the normal exit unlocated when the original setup remains.
+                            // Otherwise that setup supplies the empty body's exit location.
+                            body_has_elided_assertion.then(|| {
+                                if !terminal && emit_statement_nop {
+                                    SourceLocation::NONE
+                                } else {
+                                    self.source_location(statement.range)
+                                }
+                            })
+                        })
                 })
                 .flatten();
             // A terminal folded loop can target the populated normal else entry
@@ -20132,8 +20149,11 @@ impl<'source> Compiler<'source> {
             }
             location
         };
-        if preserve_empty_try_setup && body_noop_location.is_some() {
-            // SETUP survives native reachability and same-line Pass compaction.
+        if (preserve_empty_try_setup
+            || (body_has_elided_assertion && !terminal && emit_statement_nop))
+            && body_noop_location.is_some()
+        {
+            // SETUP survives native reachability for same-line Pass and erased assertions.
             // Keep its actual record through our earlier normal-jump emission;
             // removing it would thread past the empty body and strand its handler.
             self.assembler.preserve_original_empty_try_setup(
@@ -21077,6 +21097,10 @@ impl<'source> Compiler<'source> {
             // until actual copying replaces it with the owner's donor record.
             let exception_policy = if !coroutine_nested_pass_exit
                 && (exclude_nested_normal_exit
+                    || (body_has_elided_assertion
+                        && body_noop_location.is_some()
+                        && statement.orelse.is_empty()
+                        && self.context.python_version >= crate::PythonVersion::Py314)
                     || (body_noop_location.is_some()
                         && self.context.python_version >= crate::PythonVersion::Py314
                         && statement.orelse.is_empty()
@@ -24124,6 +24148,21 @@ impl<'source> Compiler<'source> {
                     // An erased annotation has no NOP to donate a location. Native
                     // cleanup inherits the preceding exception-match or name store.
                     self.assembler.set_location(SourceLocation::NONE);
+                } else if !handler_body_has_instructions
+                    && handler.body.iter().any(|statement| {
+                        matches!(
+                            self.context.optimized_locations.get(&statement.range()),
+                            Some(super::optimization::OptimizedLocation::Elided)
+                        )
+                    })
+                {
+                    // Removed assertions leave the exception matcher or name store as the
+                    // predecessor supplying the handler cleanup's source location.
+                    self.assembler.set_location(
+                        self.assembler
+                            .last_instruction_location()
+                            .unwrap_or(SourceLocation::NONE),
+                    );
                 } else if !handler_body_has_instructions
                     && let Some(statement) = handler.body.last()
                 {

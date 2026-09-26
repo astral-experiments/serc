@@ -5,6 +5,11 @@ Serc targets exact CPython releases, not arbitrary versions or inputs. Python
 [target pins](../crates/serc/README.md#updating-the-cpython-target) for commits
 and magic numbers.
 
+Compilation defaults to Python optimization level 0. The CLI's `-O` / `-OO`
+options and the library's `CompileOptions::optimization_level` select Python's
+optimization levels 1 and 2. The corpus measurements below use level 0 unless
+otherwise specified.
+
 Exact releases can still differ by native build: two CPython 3.14.5 Linux builds
 fold complex NaNs to different marshal bytes. The
 [native build profiles](cpython-build-profiles.md) document the reproducer,

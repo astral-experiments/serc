@@ -708,6 +708,12 @@ impl NameInterner {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AssertionMode {
+    Keep,
+    Elide,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct FunctionPlan {
     pub(super) locals: Vec<NameId>,
@@ -922,6 +928,7 @@ impl FunctionPlan {
         module_parent: bool,
         future_annotations: bool,
         eager_annotations: bool,
+        assertion_mode: AssertionMode,
         facts: ScopeBodyFacts,
         private_name: Option<&str>,
         nested_function_requirements: &FxHashSet<NameId>,
@@ -1003,12 +1010,33 @@ impl FunctionPlan {
         for name in local_annotation_bindings {
             locals.insert_annotation_only(&name);
         }
+        let mut optimized_locals = (assertion_mode == AssertionMode::Elide)
+            .then(|| {
+                let mut optimized = locals.clone();
+                optimized.elide_assertions = true;
+                optimized.collect_suite(&definition.body);
+                optimized
+            })
+            .filter(|locals| locals.elided_assertion);
         locals.collect_suite(&definition.body);
+        if let Some(optimized) = &mut optimized_locals {
+            if let Some(candidates) = &mut optimized.candidate_bindings {
+                for name in &optimized.names {
+                    if let Some(bound) = candidates.get_mut(name) {
+                        *bound |= locals.non_comprehension_bindings.contains(name);
+                    }
+                }
+            }
+            optimized.retain_bindings();
+        }
         locals.retain_bindings();
-        let comprehension_fast_bindings = locals.comprehension_iteration_targets.clone();
-        let comprehension_target_predecessors = locals.comprehension_target_predecessors.clone();
-        let comprehension_annotation_only_predecessors =
-            locals.comprehension_annotation_only_predecessors.clone();
+        let emitted_locals = optimized_locals.as_ref().unwrap_or(&locals);
+        let comprehension_fast_bindings = emitted_locals.comprehension_iteration_targets.clone();
+        let comprehension_target_predecessors =
+            emitted_locals.comprehension_target_predecessors.clone();
+        let comprehension_annotation_only_predecessors = emitted_locals
+            .comprehension_annotation_only_predecessors
+            .clone();
 
         // Child references in a module-level function resolve globally before comprehensions
         // are inlined. A temporary target cannot turn those references into closure captures.
@@ -1302,6 +1330,33 @@ impl FunctionPlan {
                 plan.inlined_comprehension_cellvars
                     .extend([alias, original]);
             }
+        }
+        if let Some(optimized) = optimized_locals {
+            let mut retained = optimized
+                .names
+                .iter()
+                .filter_map(|name| names.get(name))
+                .map(|name| {
+                    plan.local_aliases
+                        .iter()
+                        .find(|(alias, _)| *alias == name)
+                        .map_or(name, |(_, original)| *original)
+                })
+                .filter(|name| plan.locals.contains(name))
+                .collect::<Vec<_>>();
+            retained.dedup();
+            for &name in &plan.locals {
+                if plan.cellvars.contains(&name) && !retained.contains(&name) {
+                    retained.push(name);
+                }
+            }
+            plan.locals = retained;
+            plan.inlined_comprehension_cellvars.retain(|name| {
+                optimized
+                    .comprehension_iteration_targets
+                    .iter()
+                    .any(|target| names.get(target) == Some(*name))
+            });
         }
         let canonical_local = |name| {
             plan.local_aliases
@@ -1829,8 +1884,10 @@ pub(super) struct ScopeArena {
     module: ModulePlan,
     nodes: IndexVec<ScopeId, ScopeNode>,
     by_parent_and_origin: FxHashMap<(ScopeId, ScopeOrigin), ScopeId>,
+    elided_comprehension_cells: FxHashMap<ScopeId, Vec<NameId>>,
     deferred_annotations: bool,
     python_version: PythonVersion,
+    assertion_mode: AssertionMode,
 }
 
 #[derive(Debug, Default)]
@@ -1949,13 +2006,96 @@ impl Default for ScopeArena {
                 children: Vec::new(),
             }]),
             by_parent_and_origin: FxHashMap::default(),
+            elided_comprehension_cells: FxHashMap::default(),
             deferred_annotations: true,
             python_version: PythonVersion::Py314,
+            assertion_mode: AssertionMode::Keep,
         }
     }
 }
 
 impl ScopeArena {
+    /// Captured temporaries from removed assertions remain cells in the enclosing code object.
+    pub(super) fn elided_comprehension_cells(&self, scope: ScopeId) -> &[NameId] {
+        self.elided_comprehension_cells
+            .get(&scope)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Comprehension temporaries are allocated during lowering, after assertion removal.
+    pub(super) fn retain_lowered_comprehension_locals(&mut self, lowered: &Self) {
+        let original_name = |name| {
+            self.names
+                .get(lowered.names.resolve(name))
+                .expect("a lowered comprehension name occurs in the original scope")
+        };
+        let lowered_module_targets = lowered
+            .module
+            .comprehension_targets
+            .iter()
+            .copied()
+            .map(original_name)
+            .collect::<Vec<_>>();
+        let elided_module_cells = self
+            .module
+            .comprehension_targets
+            .iter()
+            .copied()
+            .filter(|name| {
+                self.module.comprehension_cell_names.contains(*name)
+                    && !lowered_module_targets.contains(name)
+            })
+            .collect();
+        self.elided_comprehension_cells
+            .insert(ScopeId::MODULE, elided_module_cells);
+        self.module.comprehension_targets = lowered_module_targets;
+        let lowered_scopes = lowered
+            .by_parent_and_origin
+            .iter()
+            .map(|((_, origin), &id)| (*origin, id))
+            .collect::<FxHashMap<_, _>>();
+        let mut original_scopes = self
+            .by_parent_and_origin
+            .iter()
+            .map(|((_, origin), &id)| (*origin, id))
+            .collect::<Vec<_>>();
+        original_scopes.sort_unstable_by_key(|(_, id)| id.index());
+        for (origin, id) in original_scopes {
+            let Some(&lowered_id) = lowered_scopes.get(&origin) else {
+                continue;
+            };
+            if let (ScopePlan::Class(plan), ScopePlan::Class(lowered_plan)) =
+                (&mut self.nodes[id].plan, &lowered.nodes[lowered_id].plan)
+            {
+                let lowered_targets = lowered_plan
+                    .comprehension_targets
+                    .iter()
+                    .map(|&(name, requires_free)| {
+                        let name = original_name(name);
+                        plan.comprehension_targets
+                            .iter()
+                            .find(|&&(target, _)| target == name)
+                            .copied()
+                            .unwrap_or((name, requires_free))
+                    })
+                    .collect::<Vec<_>>();
+                let mut seen_cells = FxHashSet::default();
+                let elided_cells = plan
+                    .comprehension_targets
+                    .iter()
+                    .filter(|(name, _)| {
+                        plan.comprehension_cells.contains(name)
+                            && !lowered_targets.iter().any(|(target, _)| target == name)
+                    })
+                    .map(|&(name, _)| name)
+                    .filter(|name| seen_cells.insert(*name))
+                    .collect();
+                self.elided_comprehension_cells.insert(id, elided_cells);
+                plan.comprehension_targets = lowered_targets;
+            }
+        }
+    }
+
     pub(super) fn has_class_scopes(&self) -> bool {
         self.nodes
             .iter()
@@ -1990,6 +2130,27 @@ impl ScopeArena {
         python_version: PythonVersion,
         source: &mut SourceAnalysis<'ast>,
     ) -> Self {
+        Self::analyze_with_source_options(body, python_version, source, AssertionMode::Keep)
+    }
+
+    pub(super) fn analyze_with_optimized_assertions(
+        body: &[Stmt],
+        python_version: PythonVersion,
+    ) -> Self {
+        Self::analyze_with_source_options(
+            body,
+            python_version,
+            &mut SourceAnalysis::new(python_version, 0),
+            AssertionMode::Elide,
+        )
+    }
+
+    fn analyze_with_source_options<'ast>(
+        body: &'ast [Stmt],
+        python_version: PythonVersion,
+        source: &mut SourceAnalysis<'ast>,
+        assertion_mode: AssertionMode,
+    ) -> Self {
         let future_flags = future_feature_flags(body);
         let future_annotations = future_flags & CO_FUTURE_ANNOTATIONS != 0;
         let deferred_annotations =
@@ -1999,6 +2160,7 @@ impl ScopeArena {
             names: NameInterner::seeded(),
             deferred_annotations,
             python_version,
+            assertion_mode,
             ..Self::default()
         };
         // The name walk also records scope definitions in preorder. Allocating their nodes first
@@ -2096,7 +2258,7 @@ impl ScopeArena {
     ) {
         // Flat bodies have no closure or evaluation-order edge cases. Their runtime bindings
         // were already collected; a nongeneric function's own annotations are separate.
-        if let Some(inputs) = flat {
+        if let Some(inputs) = flat.filter(|_| self.assertion_mode == AssertionMode::Keep) {
             let annotation_references = if inputs.has_annotations && !future_annotations {
                 self.names.intern_set(FunctionPlan::annotation_references(
                     definition,
@@ -2214,6 +2376,7 @@ impl ScopeArena {
             parent == ScopeId::MODULE,
             future_annotations,
             eager_annotations,
+            self.assertion_mode,
             facts,
             private_name,
             &nested_function_requirements,
@@ -3215,7 +3378,7 @@ fn coalesce_private_locals<'a>(
     aliases
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct LocalCollector {
     names: Vec<Name>,
     seen: FxHashSet<Name>,
@@ -3240,6 +3403,8 @@ struct LocalCollector {
     global_comprehension_saves: bool,
     private_name: Option<String>,
     legacy_class_comprehension_symbols: Option<Vec<(Name, bool)>>,
+    elide_assertions: bool,
+    elided_assertion: bool,
 }
 
 /// Returns the only other spelling with the same private symbol identity.
@@ -3715,6 +3880,10 @@ impl LocalCollector {
                     }
                 }
                 Stmt::Assert(statement) => {
+                    if self.elide_assertions {
+                        self.elided_assertion = true;
+                        continue;
+                    }
                     self.collect_expression(&statement.test);
                     if let Some(message) = &statement.msg {
                         self.collect_expression(message);
@@ -7551,7 +7720,7 @@ pub(super) fn generator_cellvars(generator: &ruff_python_ast::ExprGenerator) -> 
         .filter(|name| local_names.contains(name))
         .collect()
 }
-fn future_feature_flags(body: &[Stmt]) -> u32 {
+pub(super) fn future_feature_flags(body: &[Stmt]) -> u32 {
     body.iter()
         .filter_map(|statement| {
             let Stmt::ImportFrom(import) = statement else {

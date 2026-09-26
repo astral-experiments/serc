@@ -89,6 +89,22 @@ Serc supports the following CPython minor versions:
 Each target writes its own cache tag and bytecode magic number, so the four
 versions can coexist under `__pycache__`.
 
+### Optimization
+
+Use `-O` to remove assertions and set `__debug__` to false, matching Python's
+`-O` mode. Use `-OO` to additionally remove module, class, and function
+docstrings:
+
+```console
+serc compile -O hello.py
+serc compile -OO hello.py
+```
+
+You can also select the level explicitly with `--optimize 0`, `--optimize 1`, or
+`--optimize 2`. Level 0 is the default. Optimized caches use Python's naming
+convention, such as `__pycache__/hello.cpython-314.opt-1.pyc` and
+`__pycache__/hello.cpython-314.opt-2.pyc`, so all three levels can coexist.
+
 ## Rust library
 
 Add Serc to your `Cargo.toml`:

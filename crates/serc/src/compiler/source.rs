@@ -5,11 +5,9 @@ use std::rc::Rc;
 
 use ruff_python_ast::token::{TokenKind, Tokens};
 use ruff_python_ast::visitor::transformer::{Transformer, walk_expr as transform_expr};
-#[cfg(test)]
-use ruff_python_ast::visitor::walk_stmt;
-use ruff_python_ast::visitor::{Visitor, walk_expr};
+use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
 use ruff_python_ast::{
-    Expr, ExprContext, FStringPartRef, InterpolatedStringElement, Operator, Stmt,
+    Expr, ExprContext, FStringPartRef, InterpolatedStringElement, Operator, Stmt, StmtFunctionDef,
     StringLiteralFlags, StringLiteralValue, Suite,
 };
 use ruff_python_codegen::{Generator, Indentation, Mode as CodegenMode};
@@ -27,6 +25,7 @@ use super::constant::{
     fold_constant_for_version, fold_constant_with_profile, is_literal_constant, literal_constant,
 };
 use super::scope::{ModulePlan, NameId, ScopeArena};
+use super::statement::function_body_contains_yield;
 use super::symbol::mangle_name;
 use super::{CachedSourceLine, Compiler};
 
@@ -128,7 +127,10 @@ pub(super) struct CompilationContext<'source> {
     pub(super) source: &'source str,
     pub(super) tokens: &'source Tokens,
     line_index: LineIndex,
+    pub(super) optimized_locations: FxHashMap<TextRange, super::optimization::OptimizedLocation>,
     pub(super) scopes: ScopeArena,
+    original_generator_functions: Option<FxHashSet<TextRange>>,
+    pub(super) module_contains_yield: bool,
     finally_bodies: FxHashMap<TextRange, &'source [Stmt]>,
     constant_string_origins: FxHashMap<Cow<'source, str>, Cell<StringConstantOrigin>>,
     // Class qualified-name and synthesized character identity depend on the first cache admission,
@@ -255,7 +257,10 @@ impl<'source> CompilationContext<'source> {
             source,
             tokens,
             line_index: LineIndex::from_source_text(source),
+            optimized_locations: FxHashMap::default(),
             scopes,
+            original_generator_functions: None,
+            module_contains_yield: false,
             finally_bodies,
             constant_string_origins,
             constant_origins,
@@ -269,6 +274,62 @@ impl<'source> CompilationContext<'source> {
             empty_bytes_origin: Cell::default(),
             interning_events: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Preserve symbol-table and suspension facts established before assertion removal.
+    pub(super) fn preserve_unoptimized_scopes(&mut self, body: &Suite) {
+        struct GeneratorCollector {
+            ranges: FxHashSet<TextRange>,
+            eager_annotations: bool,
+        }
+
+        impl<'ast> Visitor<'ast> for GeneratorCollector {
+            fn visit_stmt(&mut self, statement: &'ast Stmt) {
+                if let Stmt::FunctionDef(function) = statement
+                    && function_body_contains_yield(&function.body, self.eager_annotations)
+                {
+                    self.ranges.insert(function.range);
+                }
+                walk_stmt(self, statement);
+            }
+
+            fn visit_expr(&mut self, expression: &'ast Expr) {
+                if crate::stack_growth_required() {
+                    return crate::grow_stack(|| self.visit_expr(expression));
+                }
+                walk_expr(self, expression);
+            }
+        }
+
+        let mut original_scopes =
+            ScopeArena::analyze_with_optimized_assertions(body, self.python_version);
+        original_scopes.retain_lowered_comprehension_locals(&self.scopes);
+        self.scopes = original_scopes;
+        let eager_annotations = self.python_version <= crate::PythonVersion::Py313
+            && self.module_plan().future_flags & crate::target::code_flags::CO_FUTURE_ANNOTATIONS
+                == 0;
+        self.module_contains_yield = function_body_contains_yield(body, eager_annotations);
+        let mut collector = GeneratorCollector {
+            ranges: FxHashSet::default(),
+            eager_annotations,
+        };
+        collector.visit_body(body);
+        self.original_generator_functions = Some(collector.ranges);
+    }
+
+    /// Use the original function body when optimization has removed a suspension expression.
+    pub(super) fn function_contains_yield(&self, definition: &StmtFunctionDef) -> bool {
+        if let Some(generators) = &self.original_generator_functions {
+            return generators.contains(&definition.range);
+        }
+        self.module_plan().may_contain_yield(&definition.body)
+            && function_body_contains_yield(
+                &definition.body,
+                self.python_version <= crate::PythonVersion::Py313
+                    && self.module_plan().future_flags
+                        & crate::target::code_flags::CO_FUTURE_ANNOTATIONS
+                        == 0,
+            )
     }
 
     /// Recover the original AST suite even when lowering revisits a copied exit.
@@ -1111,6 +1172,33 @@ impl Compiler<'_> {
     }
 
     pub(super) fn source_location(&self, range: ruff_text_size::TextRange) -> SourceLocation {
+        let optimized = self.context.optimized_locations.get(&range);
+        if matches!(
+            optimized,
+            Some(super::optimization::OptimizedLocation::Elided)
+        ) {
+            return SourceLocation::NONE;
+        }
+        let location = self.physical_source_location(range);
+        if matches!(
+            optimized,
+            Some(super::optimization::OptimizedLocation::SyntheticPass)
+        ) {
+            return SourceLocation::new(
+                location.line,
+                location.line,
+                location.column,
+                location.column.saturating_add(4),
+            );
+        }
+        location
+    }
+
+    /// Locate setup instructions that precede the elision of their opening statement.
+    pub(super) fn physical_source_location(
+        &self,
+        range: ruff_text_size::TextRange,
+    ) -> SourceLocation {
         let start = self.source_offset(u32::from(range.start()));
         let end = self.source_offset(u32::from(range.end()));
         let source_line = self.source_line(start);

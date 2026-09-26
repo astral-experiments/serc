@@ -3321,7 +3321,7 @@ fn python312_compound_match_tails_keep_the_original_shared_footer() {
             11, 0, 24, 29, 240, 12, 0, 14, 15, 217, 12, 18, 141, 72,
         ]
     );
-    assert_eq!(function.exception_table.as_slice(), &[]);
+    assert!(function.exception_table.is_empty());
 
     let module = compile(
         "def choose(value, mode, ready, action):\n    if mode:\n        match value:\n            case 1:\n                if ready:\n                    action()\n            case _:\n                action()\n    else:\n        match value:\n            case 2:\n                if ready:\n                    action()\n            case _:\n                action()\n",
@@ -3346,7 +3346,7 @@ fn python312_compound_match_tails_keep_the_original_shared_footer() {
             19, 24, 217, 20, 26, 149, 72, 240, 3, 0, 20, 25, 224, 17, 18, 217, 16, 22, 149, 8,
         ]
     );
-    assert_eq!(function.exception_table.as_slice(), &[]);
+    assert!(function.exception_table.is_empty());
 }
 
 #[test]

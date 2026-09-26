@@ -152,13 +152,66 @@ impl FromStr for NativeBuildProfile {
     }
 }
 
-/// Configuration retained by a compiled module for target-specific serialization.
+/// Python's bytecode optimization level.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum OptimizationLevel {
+    /// Retain assertions and docstrings, and evaluate `__debug__` as true.
+    #[default]
+    Zero,
+    /// Remove assertions and evaluate `__debug__` as false, like Python's `-O`.
+    One,
+    /// Also remove docstrings, like Python's `-OO`.
+    Two,
+}
+
+impl fmt::Display for OptimizationLevel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Zero => "0",
+            Self::One => "1",
+            Self::Two => "2",
+        })
+    }
+}
+
+impl FromStr for OptimizationLevel {
+    type Err = ParseOptimizationLevelError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "0" => Ok(Self::Zero),
+            "1" => Ok(Self::One),
+            "2" => Ok(Self::Two),
+            _ => Err(ParseOptimizationLevelError(value.to_owned())),
+        }
+    }
+}
+
+/// An unsupported optimization level supplied to [`OptimizationLevel::from_str`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParseOptimizationLevelError(String);
+
+impl fmt::Display for ParseOptimizationLevelError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "unsupported optimization level {:?}; expected 0, 1, or 2",
+            self.0
+        )
+    }
+}
+
+impl Error for ParseOptimizationLevelError {}
+
+/// Configuration for compiling Python source and serializing its code objects.
 #[derive(Clone, Debug, Default)]
 pub struct CompileOptions {
     /// The Python language and bytecode version to target. Defaults to Python 3.14.
     pub python_version: PythonVersion,
     /// Native arithmetic rules used before constants are pooled. Defaults to existing behavior.
     pub native_build_profile: NativeBuildProfile,
+    /// The Python optimization level. Defaults to zero (no `-O` or `-OO`).
+    pub optimization_level: OptimizationLevel,
     /// Canonical strings present before compiling. See [`InitialInternState`] for state modes.
     pub initial_intern_state: InitialInternState,
 }
@@ -167,7 +220,7 @@ pub struct CompileOptions {
 mod tests {
     use std::path::Path;
 
-    use super::{CompileOptions, PythonVersion};
+    use super::{CompileOptions, OptimizationLevel, PythonVersion};
     use crate::{
         CPYTHON_TARGET, InitialInternState, compile, compile_bytes,
         compile_bytes_with_intern_state, compile_bytes_with_options,
@@ -498,6 +551,25 @@ mod tests {
                 .membership_for(PythonVersion::Py312, "Codec.encode"),
             None
         );
+    }
+
+    #[test]
+    fn optimization_levels_default_to_zero_and_parse_explicit_values() {
+        assert_eq!(
+            CompileOptions::default().optimization_level,
+            OptimizationLevel::Zero
+        );
+        for (spelling, level) in [
+            ("0", OptimizationLevel::Zero),
+            ("1", OptimizationLevel::One),
+            ("2", OptimizationLevel::Two),
+        ] {
+            assert_eq!(spelling.parse::<OptimizationLevel>().unwrap(), level);
+            assert_eq!(level.to_string(), spelling);
+        }
+        for invalid in ["-1", "3", "", "true"] {
+            assert!(invalid.parse::<OptimizationLevel>().is_err());
+        }
     }
 
     #[test]

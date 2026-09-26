@@ -14,7 +14,7 @@ use ruff_python_parser::semantic_errors::{
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::{CompileError, PythonVersion};
+use crate::{CompileError, OptimizationLevel, PythonVersion};
 
 use super::constant::explicit_surrogate_string;
 use super::statement::suite_contains_yield_in_function_scope;
@@ -26,12 +26,23 @@ mod declarations;
 mod pattern_debug;
 
 /// Validate AST-based syntax restrictions using Ruff's shared checker.
+#[cfg(test)]
 pub(crate) fn validate(
     source: &str,
     body: &[Stmt],
     python_version: PythonVersion,
 ) -> Result<(), CompileError> {
-    validate_with_statement_pruning::<true>(source, body, python_version)
+    validate_with_optimization(source, body, python_version, OptimizationLevel::Zero)
+}
+
+/// Validate syntax before optimization, retaining symbol-table checks in discarded assertions.
+pub(crate) fn validate_with_optimization(
+    source: &str,
+    body: &[Stmt],
+    python_version: PythonVersion,
+    optimization_level: OptimizationLevel,
+) -> Result<(), CompileError> {
+    validate_with_statement_pruning::<true>(source, body, python_version, optimization_level)
 }
 
 fn validate_declarations(
@@ -51,8 +62,10 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
     source: &str,
     body: &[Stmt],
     python_version: PythonVersion,
+    optimization_level: OptimizationLevel,
 ) -> Result<(), CompileError> {
-    let mut validator = new_validator::<PRUNE_STATEMENTS, false>(source, body, python_version);
+    let mut validator =
+        new_validator::<PRUNE_STATEMENTS, false>(source, body, python_version, optimization_level);
     validator.visit_scope_body(body);
     let lowering_keyword_error = validator.lowering_keyword_error.get();
     let debug_pattern_replay =
@@ -65,7 +78,12 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
     if lowering_keyword_error && let Some(CompileError::InvalidSyntax { range, .. }) = &error {
         // A class body is compiled before its bases and class-call keywords. Revisit only
         // classes containing the lowering error, leaving the ordinary symbol walk unchanged.
-        let mut replay = new_validator::<PRUNE_STATEMENTS, false>(source, body, python_version);
+        let mut replay = new_validator::<PRUNE_STATEMENTS, false>(
+            source,
+            body,
+            python_version,
+            optimization_level,
+        );
         replay.class_lowering_target = Some(*range);
         replay.visit_scope_body(body);
         error = replay
@@ -85,7 +103,8 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
             && (!lowering_error
                 || matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315))
         {
-            let mut validator = new_validator::<false, true>(source, body, python_version);
+            let mut validator =
+                new_validator::<false, true>(source, body, python_version, optimization_level);
             validator.visit_body(body);
             if let Some(future_error) = validator.error.into_inner() {
                 return Err(future_error);
@@ -93,7 +112,8 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         }
         // Symbol-table diagnostics precede docstring cleanup too, including declarations in
         // another scope. Keep walking past code-generation errors to find those diagnostics.
-        let mut validator = new_validator::<false, false>(source, body, python_version);
+        let mut validator =
+            new_validator::<false, false>(source, body, python_version, optimization_level);
         validator.pre_lowering_only = true;
         validator.visit_body(body);
         let pattern_debug_range = validator.symbol_pattern_debug_range;
@@ -135,6 +155,7 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
     source: &'source str,
     body: &'ast [Stmt],
     python_version: PythonVersion,
+    optimization_level: OptimizationLevel,
 ) -> Validator<'source, 'ast, PRUNE_STATEMENTS, FUTURE_ONLY> {
     Validator {
         checker: SemanticSyntaxChecker::new(),
@@ -156,6 +177,7 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
         check_bare_starred: true,
         has_declarations: false,
         pre_lowering_only: false,
+        optimization_level,
         source,
         may_have_debug_patterns: source.contains("__debug__") || !source.is_ascii(),
         body,
@@ -182,7 +204,7 @@ fn validate_without_statement_pruning(
     body: &[Stmt],
     python_version: PythonVersion,
 ) -> Result<(), CompileError> {
-    validate_with_statement_pruning::<false>(source, body, python_version)
+    validate_with_statement_pruning::<false>(source, body, python_version, OptimizationLevel::Zero)
 }
 
 /// Returns the UTF-8 failure CPython encounters before it starts cleaning a docstring.
@@ -355,6 +377,7 @@ fn simple_function_checker_view(function: &ast::StmtFunctionDef) -> Option<Stmt>
 
 struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> {
     pre_lowering_only: bool,
+    optimization_level: OptimizationLevel,
     checker: SemanticSyntaxChecker,
     checked_type_params: Option<&'ast ast::TypeParams>,
     checker_prefix: CheckerPrefix,
@@ -553,6 +576,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
 
     fn visit_scope_body(&mut self, body: &'ast [Stmt]) {
         if !self.pre_lowering_only
+            && self.optimization_level != OptimizationLevel::Two
             && self.error.borrow().is_none()
             && self.python_version >= ast::PythonVersion::PY313
             && let Some(Stmt::Expr(statement)) = body.first()
@@ -1403,6 +1427,14 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
             }
         }
         match statement {
+            Stmt::Assert(_) if self.optimization_level != OptimizationLevel::Zero => {
+                // CPython visits assertions in the symbol table, then drops them before code
+                // generation. In particular, yield errors disappear but duplicate parameters
+                // and modern await / __debug__ assignment errors must still be reported.
+                let previous = std::mem::replace(&mut self.pre_lowering_only, true);
+                walk_stmt(self, statement);
+                self.pre_lowering_only = previous;
+            }
             Stmt::Match(statement) => {
                 for case in statement.cases.iter().skip(prechecked_match_cases) {
                     self.visit_match_case(case);
@@ -2058,8 +2090,10 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
 mod tests {
     use ruff_python_parser::parse_module;
 
-    use super::{validate, validate_without_statement_pruning};
-    use crate::{CompileError, CompileOptions, PythonVersion, compile_with_options};
+    use super::{validate, validate_with_optimization, validate_without_statement_pruning};
+    use crate::{
+        CompileError, CompileOptions, OptimizationLevel, PythonVersion, compile_with_options,
+    };
 
     const TARGETS: [PythonVersion; 4] = [
         PythonVersion::Py312,
@@ -2067,6 +2101,64 @@ mod tests {
         PythonVersion::Py314,
         PythonVersion::Py315,
     ];
+
+    #[test]
+    fn optimized_assertions_keep_symbol_table_errors() {
+        for python_version in TARGETS {
+            for optimization_level in [OptimizationLevel::One, OptimizationLevel::Two] {
+                for (source, valid) in [
+                    ("assert (yield 1)", true),
+                    ("async def f():\n assert (yield from [])", true),
+                    ("assert await value", python_version < PythonVersion::Py314),
+                    (
+                        "assert (__debug__ := False)",
+                        python_version < PythonVersion::Py314,
+                    ),
+                    ("assert (lambda x, x: x)", false),
+                    ("async def f():\n assert (yield 1)\n return 2", false),
+                    ("assert value\nfrom __future__ import annotations", false),
+                    ("if __debug__:\n yield 1", false),
+                    ("if not __debug__:\n yield 1", false),
+                ] {
+                    let parsed = parse_module(source).unwrap();
+                    let result = validate_with_optimization(
+                        source,
+                        &parsed.syntax().body,
+                        python_version,
+                        optimization_level,
+                    );
+                    assert_eq!(
+                        result.is_ok(),
+                        valid,
+                        "{python_version} -O{optimization_level}: {source}: {result:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stripped_docstrings_skip_native_utf8_cleanup() {
+        for python_version in TARGETS {
+            for source in ["'\\ud800'", "def f():\n '\\ud800'", "class C:\n '\\ud800'"] {
+                let parsed = parse_module(source).unwrap();
+                for optimization_level in [OptimizationLevel::One, OptimizationLevel::Two] {
+                    let result = validate_with_optimization(
+                        source,
+                        &parsed.syntax().body,
+                        python_version,
+                        optimization_level,
+                    );
+                    assert_eq!(
+                        result.is_ok(),
+                        optimization_level == OptimizationLevel::Two
+                            || python_version == PythonVersion::Py312,
+                        "{python_version} -O{optimization_level}: {source}: {result:?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn duplicate_type_parameter_diagnostics_include_normalized_name() {

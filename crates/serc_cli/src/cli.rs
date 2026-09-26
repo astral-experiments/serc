@@ -13,7 +13,7 @@ use clap::builder::styling::{AnsiColor, Effects};
 use clap::{Parser, Subcommand, ValueEnum, ValueHint};
 use rayon::prelude::*;
 use serc::{
-    CompileError, CompileOptions, NativeBuildProfile, PythonVersion,
+    CompileError, CompileOptions, NativeBuildProfile, OptimizationLevel, PythonVersion,
     compile_bytes_with_path_and_options,
 };
 use walkdir::WalkDir;
@@ -72,6 +72,14 @@ struct CompileCommand {
     #[arg(long, value_enum, default_value = "timestamp")]
     invalidation_mode: InvalidationMode,
 
+    /// Remove assertions and set __debug__ to false; repeat to also remove docstrings.
+    #[arg(short = 'O', action = clap::ArgAction::Count, conflicts_with = "optimize")]
+    optimization_count: u8,
+
+    /// Python optimization level: 0 (default), 1 (-O), or 2 (-OO).
+    #[arg(long, value_name = "LEVEL")]
+    optimize: Option<OptimizationLevel>,
+
     /// Maximum number of files to compile in parallel [default: available CPUs].
     #[arg(short, long)]
     jobs: Option<NonZeroUsize>,
@@ -112,12 +120,20 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
     let options = CompileOptions {
         python_version: command.python_version,
         native_build_profile: command.native_build_profile,
+        optimization_level: command
+            .optimize
+            .unwrap_or(match command.optimization_count {
+                0 => OptimizationLevel::Zero,
+                1 => OptimizationLevel::One,
+                _ => OptimizationLevel::Two,
+            }),
         ..CompileOptions::default()
     };
 
     let (jobs, output_groups) = prepare_compilation(
         &paths,
         options.python_version,
+        options.optimization_level,
         command.check,
         jobs_for_inputs(command.jobs, paths.len()),
     );
@@ -227,13 +243,14 @@ type CompilationGroup<'a> = Vec<(usize, &'a Path)>;
 fn prepare_compilation(
     paths: &[PathBuf],
     python_version: PythonVersion,
+    optimization_level: OptimizationLevel,
     check: bool,
     jobs: usize,
 ) -> (usize, Option<Vec<CompilationGroup<'_>>>) {
     if check || jobs <= 1 {
         return (jobs, None);
     }
-    let groups = compilation_groups(paths, python_version);
+    let groups = compilation_groups(paths, python_version, optimization_level);
     (jobs.min(groups.len()), Some(groups))
 }
 
@@ -257,6 +274,7 @@ fn prioritize_compilation_groups(
 fn compilation_groups(
     paths: &[PathBuf],
     python_version: PythonVersion,
+    optimization_level: OptimizationLevel,
 ) -> Vec<CompilationGroup<'_>> {
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -266,20 +284,22 @@ fn compilation_groups(
     let mut unknown_directory = false;
     let mut identities = Vec::with_capacity(paths.len());
     for path in paths {
-        let output = cache_path(path, python_version).ok().and_then(|output| {
-            let parent = output.parent()?;
-            let filename = output.file_name()?;
-            let directory = Arc::clone(
-                directories
-                    .entry(parent.to_owned())
-                    .or_insert_with(|| Arc::new(cache_directory_identity(parent))),
-            );
-            unknown_directory |= matches!(directory.as_ref(), CacheDirectoryIdentity::Unknown);
-            if !filename.as_encoded_bytes().is_ascii() {
-                non_ascii_directories.insert(Arc::clone(&directory));
-            }
-            Some((directory, filename.to_ascii_lowercase()))
-        });
+        let output = cache_path(path, python_version, optimization_level)
+            .ok()
+            .and_then(|output| {
+                let parent = output.parent()?;
+                let filename = output.file_name()?;
+                let directory = Arc::clone(
+                    directories
+                        .entry(parent.to_owned())
+                        .or_insert_with(|| Arc::new(cache_directory_identity(parent))),
+                );
+                unknown_directory |= matches!(directory.as_ref(), CacheDirectoryIdentity::Unknown);
+                if !filename.as_encoded_bytes().is_ascii() {
+                    non_ascii_directories.insert(Arc::clone(&directory));
+                }
+                Some((directory, filename.to_ascii_lowercase()))
+            });
         identities.push(output);
     }
 
@@ -454,7 +474,7 @@ fn compile_path_with_metadata(
         InvalidationMode::CheckedHash => module.to_hash_pyc(&source_bytes, true),
         InvalidationMode::UncheckedHash => module.to_hash_pyc(&source_bytes, false),
     };
-    let output = cache_path(path, options.python_version)?;
+    let output = cache_path(path, options.python_version, options.optimization_level)?;
 
     let parent = output.parent().ok_or_else(|| {
         format!(
@@ -562,7 +582,11 @@ fn temporary_cache_file(
     tempfile::NamedTempFile::new_in(parent)
 }
 
-fn cache_path(path: &Path, python_version: PythonVersion) -> Result<PathBuf, String> {
+fn cache_path(
+    path: &Path,
+    python_version: PythonVersion,
+    optimization_level: OptimizationLevel,
+) -> Result<PathBuf, String> {
     let filename = path
         .file_name()
         .ok_or_else(|| format!("{} has no file name", path.display()))?;
@@ -590,6 +614,11 @@ fn cache_path(path: &Path, python_version: PythonVersion) -> Result<PathBuf, Str
         filename.push(".");
     }
     filename.push(cache_tag(python_version));
+    match optimization_level {
+        OptimizationLevel::Zero => {}
+        OptimizationLevel::One => filename.push(".opt-1"),
+        OptimizationLevel::Two => filename.push(".opt-2"),
+    }
     filename.push(".pyc");
     let parent = path
         .parent()
@@ -616,7 +645,7 @@ mod tests {
         prioritize_compilation_groups,
     };
     use super::{default_jobs, jobs_for_inputs};
-    use serc::{CompileOptions, PythonVersion};
+    use serc::{CompileOptions, OptimizationLevel, PythonVersion};
     use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, UNIX_EPOCH};
@@ -648,11 +677,23 @@ mod tests {
             directory.path().join("caf\u{e9}.py"),
         ];
 
-        let (jobs, groups) = prepare_compilation(&paths[..3], PythonVersion::Py314, false, 3);
+        let (jobs, groups) = prepare_compilation(
+            &paths[..3],
+            PythonVersion::Py314,
+            OptimizationLevel::Zero,
+            false,
+            3,
+        );
         assert_eq!(jobs, 2);
         assert_eq!(groups.unwrap().len(), 2);
 
-        let (jobs, groups) = prepare_compilation(&paths, PythonVersion::Py314, false, 4);
+        let (jobs, groups) = prepare_compilation(
+            &paths,
+            PythonVersion::Py314,
+            OptimizationLevel::Zero,
+            false,
+            4,
+        );
         assert_eq!(jobs, 1);
         assert_eq!(
             groups.unwrap()[0]
@@ -662,17 +703,30 @@ mod tests {
             [0, 1, 2, 3]
         );
         assert_eq!(
-            prepare_compilation(&paths, PythonVersion::Py314, true, 4),
+            prepare_compilation(
+                &paths,
+                PythonVersion::Py314,
+                OptimizationLevel::Zero,
+                true,
+                4
+            ),
             (4, None)
         );
         assert_eq!(
-            prepare_compilation(&paths, PythonVersion::Py314, false, 1),
+            prepare_compilation(
+                &paths,
+                PythonVersion::Py314,
+                OptimizationLevel::Zero,
+                false,
+                1
+            ),
             (1, None)
         );
         assert_eq!(
             prepare_compilation(
                 &paths[..1],
                 PythonVersion::Py314,
+                OptimizationLevel::Zero,
                 false,
                 jobs_for_inputs(None, 1)
             ),
@@ -709,7 +763,7 @@ mod tests {
             other.join("a.py"),
         ];
         let indices = || {
-            compilation_groups(&paths, PythonVersion::Py314)
+            compilation_groups(&paths, PythonVersion::Py314, OptimizationLevel::Zero)
                 .into_iter()
                 .map(|group| {
                     group
@@ -738,7 +792,7 @@ mod tests {
             missing.join("\u{212a}.py"),
         ];
         let indices = |paths: &[PathBuf]| {
-            compilation_groups(paths, PythonVersion::Py314)
+            compilation_groups(paths, PythonVersion::Py314, OptimizationLevel::Zero)
                 .into_iter()
                 .map(|group| {
                     group
@@ -791,19 +845,39 @@ mod tests {
     #[test]
     fn builds_cache_path() {
         assert_eq!(
-            cache_path(Path::new("package/module.py"), PythonVersion::Py314).unwrap(),
+            cache_path(
+                Path::new("package/module.py"),
+                PythonVersion::Py314,
+                OptimizationLevel::Zero
+            )
+            .unwrap(),
             PathBuf::from("package/__pycache__/module.cpython-314.pyc")
         );
         assert_eq!(
-            cache_path(Path::new("package/.py"), PythonVersion::Py314).unwrap(),
+            cache_path(
+                Path::new("package/.py"),
+                PythonVersion::Py314,
+                OptimizationLevel::Zero
+            )
+            .unwrap(),
             PathBuf::from("package/__pycache__/py.cpython-314.pyc")
         );
         assert_eq!(
-            cache_path(Path::new("package/module.py"), PythonVersion::Py315).unwrap(),
+            cache_path(
+                Path::new("package/module.py"),
+                PythonVersion::Py315,
+                OptimizationLevel::Zero
+            )
+            .unwrap(),
             PathBuf::from("package/__pycache__/module.cpython-315.pyc")
         );
         assert_eq!(
-            cache_path(Path::new("package/module"), PythonVersion::Py315).unwrap(),
+            cache_path(
+                Path::new("package/module"),
+                PythonVersion::Py315,
+                OptimizationLevel::Zero
+            )
+            .unwrap(),
             PathBuf::from("package/__pycache__/modulecpython-315.pyc")
         );
         for (version, tag) in [
@@ -811,11 +885,21 @@ mod tests {
             (PythonVersion::Py313, "cpython-313"),
         ] {
             assert_eq!(
-                cache_path(Path::new("package/module.py"), version).unwrap(),
+                cache_path(
+                    Path::new("package/module.py"),
+                    version,
+                    OptimizationLevel::Zero
+                )
+                .unwrap(),
                 PathBuf::from(format!("package/__pycache__/module.{tag}.pyc")),
             );
             assert_eq!(
-                cache_path(Path::new("package/module"), version).unwrap(),
+                cache_path(
+                    Path::new("package/module"),
+                    version,
+                    OptimizationLevel::Zero
+                )
+                .unwrap(),
                 PathBuf::from(format!("package/__pycache__/module{tag}.pyc")),
             );
         }
@@ -834,7 +918,12 @@ mod tests {
             (b"\xff", b"\xffcpython-314.pyc"),
         ] {
             assert_eq!(
-                cache_path(Path::new(OsStr::from_bytes(name)), PythonVersion::Py314).unwrap(),
+                cache_path(
+                    Path::new(OsStr::from_bytes(name)),
+                    PythonVersion::Py314,
+                    OptimizationLevel::Zero
+                )
+                .unwrap(),
                 Path::new("__pycache__").join(OsStr::from_bytes(expected))
             );
         }
@@ -896,7 +985,10 @@ mod tests {
             .unwrap()
             .to_timestamp_pyc(1_700_000_000, u32::try_from(replacement.len()).unwrap());
         assert_eq!(
-            fs_err::read(cache_path(&source_path, PythonVersion::Py314).unwrap()).unwrap(),
+            fs_err::read(
+                cache_path(&source_path, PythonVersion::Py314, OptimizationLevel::Zero).unwrap()
+            )
+            .unwrap(),
             expected
         );
     }
@@ -937,7 +1029,11 @@ mod tests {
                     .unwrap()
                     .to_timestamp_pyc(1_700_000_000, u32::try_from(original.len()).unwrap());
             assert_eq!(
-                fs_err::read(cache_path(&source_path, PythonVersion::Py314).unwrap()).unwrap(),
+                fs_err::read(
+                    cache_path(&source_path, PythonVersion::Py314, OptimizationLevel::Zero)
+                        .unwrap()
+                )
+                .unwrap(),
                 expected
             );
         }
