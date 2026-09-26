@@ -2151,3 +2151,84 @@ fn nested_chained_condition_in_generator_loop_tail_matches_cpython() {
         &[PythonVersion::Py314, PythonVersion::Py315],
     );
 }
+
+#[test]
+fn protected_loop_elided_else_excludes_conditional_cleanup() {
+    const SOURCE: &str = "def test(xs, manager, flag):\n    try:\n        for x in xs:\n            if x:\n                with manager as value:\n                    pass\n                    pass\n                    global marker\n            else:\n                assert flag\n    finally:\n        cleanup()\n    return\n";
+    const TRACE_ORACLE: &str = r"
+import contextlib, dis, marshal, sys
+class Interrupted(Exception):
+    pass
+
+events = []
+namespace = {'cleanup': lambda: events.append('cleanup')}
+exec(marshal.loads(sys.stdin.buffer.read()), namespace)
+function = namespace['test']
+targets = [instruction.offset for instruction in dis.get_instructions(function)
+           if instruction.positions.lineno == 4
+           and instruction.opname.startswith('POP_JUMP')]
+assert len(targets) == 1, targets
+for value in (False, True):
+    hit = False
+    def trace(frame, event, arg):
+        global hit
+        if frame.f_code is function.__code__:
+            frame.f_trace_opcodes = True
+            if event == 'opcode' and frame.f_lasti == targets[0]:
+                hit = True
+                raise Interrupted()
+        return trace
+    sys.settrace(trace)
+    try:
+        function([value], contextlib.nullcontext(), True)
+    except Interrupted:
+        pass
+    else:
+        raise AssertionError('exception was not propagated')
+    finally:
+        sys.settrace(None)
+    assert hit, 'conditional was not executed'
+    assert not events, events
+";
+    for version in [PythonVersion::Py314, PythonVersion::Py315] {
+        for level in [OptimizationLevel::One, OptimizationLevel::Two] {
+            let expected = oracle(SOURCE.as_bytes(), "protected_loop.py", version, level);
+            assert!(expected.status.success(), "{version}, {level:?}");
+            let actual = compile_with_options(
+                SOURCE,
+                "protected_loop.py",
+                &CompileOptions {
+                    python_version: version,
+                    optimization_level: level,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .marshal();
+            assert_eq!(actual, expected.stdout, "{version}, {level:?}");
+            let index = VERSIONS
+                .iter()
+                .position(|(candidate, _, _)| *candidate == version)
+                .unwrap();
+            for (label, payload) in [
+                ("native", expected.stdout.as_slice()),
+                ("serc", actual.as_slice()),
+            ] {
+                let mut child = Command::new(ORACLES[index].get().unwrap())
+                    .args(["-I", "-S", "-X", "utf8", "-c", TRACE_ORACLE])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child.stdin.take().unwrap().write_all(payload).unwrap();
+                let result = child.wait_with_output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{version}, {level:?}, {label}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        }
+    }
+}

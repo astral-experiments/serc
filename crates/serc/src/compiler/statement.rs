@@ -15531,16 +15531,34 @@ impl<'source> Compiler<'source> {
         let original_optimized_empty_else = eligible_else
             && statement.elif_else_clauses.len() == 1
             && !self.has_active_control_flow_region();
-        let optimized_empty_else = eligible_else
-            && self.control.withs.active_with_region_exclusions.is_empty()
-            && !self.control.in_exception_handler()
+        let protected_finally_loop_else = eligible_else
+            && statement.elif_else_clauses.len() == 1
+            && leading.is_empty()
+            && matches!(statement.test.as_ref(), Expr::Name(_))
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.finally.active_finally_try_bodies == 1
             && self
                 .control
                 .exceptions
                 .active_exception_region_exclusions
-                .is_empty()
+                .len()
+                == 1
+            && self.control.loops.contexts.last().is_some_and(|context| {
+                context.continue_label == restart
+                    && context.iterator_cleanup == IteratorCleanup::Sync
+                    && !context.has_orelse
+                    && context.exception_region_depth == 1
+                    && context.with_depth == self.control.withs.active_with_exits.len()
+                    && context.finally_end_depth == self.control.finally.active_finally_end_blocks
+                    && self.assembler.instruction_count() == context.body_start
+            });
+        let optimized_empty_else = eligible_else
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && !self.control.in_exception_handler()
+            && (self.control.exceptions.active_exception_region_exclusions.is_empty()
+                && self.control.finally.active_finally_try_bodies == 0
+                || protected_finally_loop_else)
             && self.control.exceptions.active_exception_group_handlers == 0
-            && self.control.finally.active_finally_try_bodies == 0
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_copied_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
