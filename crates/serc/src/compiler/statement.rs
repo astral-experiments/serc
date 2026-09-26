@@ -28736,9 +28736,8 @@ impl<'source> Compiler<'source> {
             [Stmt::Pass(statement)] => Some(self.source_location(statement.range)),
             _ => None,
         };
-        // At a synchronous manager's direct tail, the pass and normal-finally
-        // jump disappear into the following POP_BLOCK. Its surviving line marker
-        // has no exception owner, including in suspending scopes.
+        // At a synchronous manager's direct tail, the manager's POP_BLOCK
+        // follows this finalizer. Compaction can leave an ownerless line marker.
         let pass_finally_leaves_manager =
             self.control
                 .withs
@@ -30134,9 +30133,13 @@ impl<'source> Compiler<'source> {
                 && !drop_expression_if_exit_nop
                 && !drop_shared_manager_exit_nop
                 && conditional_exit.is_none();
+            // On legacy targets the normal-finally jump precedes the manager's
+            // POP_BLOCK, so a surviving jump still belongs to the manager.
             let exception_policy = if !original_nested_pass_exit
                 && pass_exit_exception_depth.is_none()
                 && pass_finally_location.is_some()
+                && !(self.context.python_version <= crate::PythonVersion::Py313
+                    && pass_finally_leaves_manager)
                 && (pass_finally_leaves_manager
                     || !self
                         .control

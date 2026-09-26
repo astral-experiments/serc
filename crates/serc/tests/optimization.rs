@@ -3052,6 +3052,102 @@ fn legacy_protected_manager_pass_before_split_try_matches_cpython() {
 }
 
 #[test]
+fn legacy_manager_finally_jump_keeps_manager_owner() {
+    const SOURCE: &str = "def f(manager, work):\n    try:\n        raise ValueError()\n    except ValueError:\n        with manager:\n            pass\n            try:\n                work()\n            finally:\n                pass\n";
+    const TRACE: &str = r"
+import dis, marshal, sys
+scope = {}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+f = scope['f']
+targets = [i.offset for i in dis.get_instructions(f)
+           if i.opname == 'JUMP_FORWARD' and i.positions.lineno == 10]
+if len(targets) != 1:
+    raise RuntimeError(('missing finalizer jump', targets))
+target = targets[0]
+monitor = sys.monitoring
+monitor.use_tool_id(5, 'legacy-manager-finally-owner')
+for error_type in (RuntimeError, StopIteration):
+    for suppress in (False, True):
+        events, hits = [], []
+        class Manager:
+            def __enter__(self):
+                events.append('enter')
+            def __exit__(self, typ, value, traceback):
+                events.append(('exit', typ))
+                return suppress
+        def work():
+            events.append('work')
+        def inject(code, offset):
+            if offset == target:
+                hits.append(offset)
+                raise error_type('injected')
+        monitor.register_callback(5, monitor.events.INSTRUCTION, inject)
+        monitor.set_local_events(5, f.__code__, monitor.events.INSTRUCTION)
+        try:
+            f(Manager(), work)
+            outcome = None
+        except BaseException as error:
+            outcome = type(error)
+        finally:
+            monitor.set_local_events(5, f.__code__, 0)
+            monitor.register_callback(5, monitor.events.INSTRUCTION, None)
+        expected = None if suppress else error_type
+        if hits != [target] or events != ['enter', 'work', ('exit', error_type)] or outcome is not expected:
+            raise RuntimeError((hits, events, outcome, expected))
+monitor.free_tool_id(5)
+";
+
+    for (index, python_version) in [PythonVersion::Py312, PythonVersion::Py313]
+        .into_iter()
+        .enumerate()
+    {
+        for optimization_level in LEVELS {
+            let native = oracle(
+                SOURCE.as_bytes(),
+                "legacy_manager_finally.py",
+                python_version,
+                optimization_level,
+            );
+            assert!(
+                native.status.success(),
+                "{}",
+                String::from_utf8_lossy(&native.stderr)
+            );
+            let actual = compile_with_options(
+                SOURCE,
+                "legacy_manager_finally.py",
+                &CompileOptions {
+                    python_version,
+                    optimization_level,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .marshal();
+            assert_eq!(
+                actual, native.stdout,
+                "{python_version}, {optimization_level:?}"
+            );
+            for code in [&native.stdout, &actual] {
+                let mut child = Command::new(ORACLES[index].get().unwrap())
+                    .args(["-I", "-S", "-B", "-c", TRACE])
+                    .stdin(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child.stdin.take().unwrap().write_all(code).unwrap();
+                let result = child.wait_with_output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{python_version}, {optimization_level:?}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn legacy_protected_manager_pass_before_declaration_matches_cpython() {
     let versions = [PythonVersion::Py312, PythonVersion::Py313];
     for source in [
