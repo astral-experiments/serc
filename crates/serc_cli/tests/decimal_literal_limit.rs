@@ -231,3 +231,248 @@ else:
         }
     }
 }
+
+#[test]
+fn configured_decimal_literal_limit_matches_cpython() {
+    let cases = [
+        (640, format!("value = {}\n", "1".repeat(640)), true),
+        (640, format!("value = {}\n", "1".repeat(641)), false),
+        (641, format!("value = {}\n", "1".repeat(641)), true),
+        (640, format!("value = {}1\n", "1_".repeat(639)), true),
+        (640, format!("value = {}1\n", "1_".repeat(640)), false),
+        (0, format!("value = {}\n", "1".repeat(4301)), true),
+        (4300, format!("value = {}\n", "1".repeat(4301)), false),
+        (5000, format!("value = {}\n", "1".repeat(5000)), true),
+        (5000, format!("value = {}\n", "1".repeat(5001)), false),
+        (
+            640,
+            format!("match x:\n case _: pass\ny = {}\n", "1".repeat(641)),
+            false,
+        ),
+        (
+            640,
+            format!("if False:\n value = {}\n", "1".repeat(641)),
+            false,
+        ),
+        (
+            640,
+            format!(
+                "zeros = {}\nhexadecimal = 0x{}\noctal = 0o{}\nbinary = 0b{}\n",
+                "0".repeat(641),
+                "f".repeat(641),
+                "7".repeat(641),
+                "1".repeat(641),
+            ),
+            true,
+        ),
+        (i32::MAX as u32, "value = 1\n".to_owned(), true),
+    ];
+    let path = std::path::Path::new("configured_decimal.py");
+    let oracle = r"
+import marshal, sys
+sys.set_int_max_str_digits(int(sys.argv[1]))
+try:
+    code = compile(sys.argv[2], sys.argv[3], 'exec', dont_inherit=True, optimize=0)
+except SyntaxError as error:
+    print(error.msg)
+    raise SystemExit(1)
+sys.stdout.buffer.write(marshal.dumps(code))
+";
+    for version in [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
+    ] {
+        for (limit, source, accepted) in &cases {
+            let options = CompileOptions {
+                python_version: version,
+                ..CompileOptions::default()
+            };
+            let mut python = match version {
+                PythonVersion::Py312 => common::python_312_command(),
+                PythonVersion::Py313 => common::python_313_command(),
+                PythonVersion::Py314 => common::python_3145_command(),
+                PythonVersion::Py315 => common::python_315_command(),
+            };
+            let native = python
+                .args(["-c", oracle, &limit.to_string(), source])
+                .arg(path)
+                .output()
+                .unwrap();
+            assert_eq!(native.status.success(), *accepted, "{version}: {native:?}");
+            for compiled in [
+                serc::compile_with_options_and_integer_limits(
+                    source,
+                    path.to_str().unwrap(),
+                    &options,
+                    *limit,
+                    None,
+                ),
+                serc::compile_bytes_with_options_and_integer_limits(
+                    source.as_bytes(),
+                    path.to_str().unwrap(),
+                    &options,
+                    *limit,
+                    None,
+                ),
+                serc::compile_bytes_with_path_options_and_integer_limits(
+                    source.as_bytes(),
+                    path,
+                    &options,
+                    *limit,
+                    None,
+                ),
+            ] {
+                if *accepted {
+                    assert_eq!(
+                        compiled.unwrap().marshal(),
+                        native.stdout,
+                        "{version}, {limit}"
+                    );
+                } else {
+                    let error = compiled.unwrap_err();
+                    assert!(matches!(error, CompileError::InvalidSyntax { .. }));
+                    assert!(
+                        error
+                            .to_string()
+                            .ends_with(String::from_utf8_lossy(&native.stdout).trim()),
+                        "{version}, {limit}: {error}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn decimal_parse_limit_is_validated_and_defaults_are_preserved() {
+    for limit in [1, 639, i32::MAX as u32 + 1, u32::MAX] {
+        let options = CompileOptions::default();
+        for compiled in [
+            serc::compile_with_options_and_integer_limits(
+                "pass\n", "limit.py", &options, limit, None,
+            ),
+            serc::compile_bytes_with_options_and_integer_limits(
+                b"pass\n", "limit.py", &options, limit, None,
+            ),
+            serc::compile_bytes_with_path_options_and_integer_limits(
+                b"pass\n",
+                "limit.py".as_ref(),
+                &options,
+                limit,
+                None,
+            ),
+        ] {
+            assert!(matches!(compiled, Err(CompileError::Unsupported(_))));
+        }
+    }
+    let default = CompileOptions::default();
+    for digits in [641, 4300, 4301] {
+        let source = format!("value = {}\n", "1".repeat(digits));
+        assert_eq!(
+            compile_with_options(&source, "limit.py", &default).map(|code| code.marshal()),
+            serc::compile_with_options_and_integer_limits(
+                &source, "limit.py", &default, 4300, None
+            )
+            .map(|code| code.marshal()),
+        );
+    }
+}
+
+#[test]
+fn decimal_parsing_and_mapping_key_formatting_have_separate_limits() {
+    let key = "1".repeat(641);
+    let source = format!("match subject:\n case {{{key}: _, {key}: _}}: pass\n");
+    for version in [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
+    ] {
+        for (parse_limit, format_limit) in [(640, 0), (0, 640), (4300, 0)] {
+            let options = CompileOptions {
+                python_version: version,
+                ..CompileOptions::default()
+            };
+            for compiled in [
+                serc::compile_with_options_and_integer_limits(
+                    &source,
+                    "mapping.py",
+                    &options,
+                    parse_limit,
+                    Some(format_limit),
+                ),
+                serc::compile_bytes_with_options_and_integer_limits(
+                    source.as_bytes(),
+                    "mapping.py",
+                    &options,
+                    parse_limit,
+                    Some(format_limit),
+                ),
+                serc::compile_bytes_with_path_options_and_integer_limits(
+                    source.as_bytes(),
+                    "mapping.py".as_ref(),
+                    &options,
+                    parse_limit,
+                    Some(format_limit),
+                ),
+            ] {
+                let error = compiled.unwrap_err();
+                match (parse_limit, format_limit) {
+                    (640, 0) => assert!(matches!(error, CompileError::InvalidSyntax { .. })),
+                    (0, 640) => assert_eq!(
+                        error,
+                        CompileError::IntegerStringConversionLimit { max_digits: 640 },
+                    ),
+                    (4300, 0) => assert!(matches!(error, CompileError::InvalidPattern { .. })),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn explicit_decimal_parse_limit_precedes_later_semantic_validation() {
+    let digits = "1".repeat(641);
+    let source = format!("match subject:\n case {{1: _, 1: _}}: pass\nlater = {digits}\n");
+    let malformed = format!("# {digits}\nmatch subject:\n case +: pass\n");
+    for version in [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
+    ] {
+        for limit in [640, 0, 4300] {
+            let options = CompileOptions {
+                python_version: version,
+                ..CompileOptions::default()
+            };
+            let error = serc::compile_with_options_and_integer_limits(
+                &source,
+                "ordering.py",
+                &options,
+                limit,
+                None,
+            )
+            .unwrap_err();
+            if limit == 640 {
+                assert!(matches!(error, CompileError::InvalidSyntax { .. }));
+                assert!(error.to_string().contains("Exceeds the limit (640 digits)"));
+            } else {
+                assert!(matches!(error, CompileError::InvalidPattern { .. }));
+            }
+            assert!(matches!(
+                serc::compile_with_options_and_integer_limits(
+                    &malformed,
+                    "ordering.py",
+                    &options,
+                    limit,
+                    None
+                ),
+                Err(CompileError::Parse(_) | CompileError::InvalidSyntax { .. })
+            ));
+        }
+    }
+}

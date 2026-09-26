@@ -308,7 +308,7 @@ pub fn compile_with_options(
     options: &CompileOptions,
 ) -> Result<CompiledModule, CompileError> {
     validate_filename(filename)?;
-    compile_text_source(source, filename.into(), options, None)
+    compile_text_source(source, filename.into(), options, None, None)
 }
 
 /// Compile source with a proved CPython integer-string limit for duplicate mapping keys.
@@ -316,8 +316,9 @@ pub fn compile_with_options(
 /// `limit` is zero for an unlimited interpreter, or a value from 640 through `i32::MAX`.
 /// It must be the limit at the key-formatting event, after any callbacks have run. The caller
 /// must also establish that earlier callbacks return normally and do not replace the result.
-/// Decimal parsing has a separate limit; duplicate-key diagnostics remain unsupported when a
-/// decimal token could depend on it. Large values that can invoke `_pylong` also remain unsupported
+/// Decimal parsing has a separate limit, set by [`compile_with_options_and_integer_limits`];
+/// duplicate-key diagnostics remain unsupported when a decimal token could depend on an
+/// unestablished parsing limit. Large values that can invoke `_pylong` also remain unsupported
 /// unless CPython's earlier check already proves a conversion-limit error.
 pub fn compile_with_options_and_mapping_key_limit(
     source: &str,
@@ -326,14 +327,44 @@ pub fn compile_with_options_and_mapping_key_limit(
     limit: u32,
 ) -> Result<CompiledModule, CompileError> {
     validate_filename(filename)?;
-    validate_mapping_key_limit(limit)?;
-    compile_text_source(source, filename.into(), options, Some(limit))
+    validate_integer_string_limit(limit)?;
+    compile_text_source(source, filename.into(), options, None, Some(limit))
+}
+
+/// Compile source with explicit parsing and optional duplicate-key formatting limits.
+///
+/// `parse_limit` is the CPython integer-string conversion limit in effect when decimal
+/// literals are parsed. Zero disables the limit; other values must be from 640 through
+/// `i32::MAX`. Unlike [`compile_with_options`], this establishes the parsing limit for
+/// diagnostics that could otherwise depend on an unknown caller setting.
+///
+/// `mapping_key_limit` is independent: `Some(limit)` establishes the limit when a
+/// duplicate mapping key is formatted, with the same callback requirements and
+/// limitations as [`compile_with_options_and_mapping_key_limit`]. `None` leaves that
+/// formatting limit unknown.
+pub fn compile_with_options_and_integer_limits(
+    source: &str,
+    filename: &str,
+    options: &CompileOptions,
+    parse_limit: u32,
+    mapping_key_limit: Option<u32>,
+) -> Result<CompiledModule, CompileError> {
+    validate_filename(filename)?;
+    validate_integer_limits(parse_limit, mapping_key_limit)?;
+    compile_text_source(
+        source,
+        filename.into(),
+        options,
+        Some(parse_limit),
+        mapping_key_limit,
+    )
 }
 
 fn compile_text_source(
     source: &str,
     filename: CodeFilename,
     options: &CompileOptions,
+    parse_int_max_str_digits: Option<u32>,
     mapping_key_int_max_str_digits: Option<u32>,
 ) -> Result<CompiledModule, CompileError> {
     if source.contains('\0') {
@@ -348,7 +379,13 @@ fn compile_text_source(
         ));
     }
     let source = source::normalize_source(source);
-    compile_normalized(&source, filename, options, mapping_key_int_max_str_digits)
+    compile_normalized(
+        &source,
+        filename,
+        options,
+        parse_int_max_str_digits,
+        mapping_key_int_max_str_digits,
+    )
 }
 
 /// Decode and compile Python source bytes for CPython 3.14.5.
@@ -389,7 +426,7 @@ pub fn compile_bytes_with_options(
     options: &CompileOptions,
 ) -> Result<CompiledModule, CompileError> {
     validate_filename(filename)?;
-    compile_byte_source(source, filename.into(), options, None)
+    compile_byte_source(source, filename.into(), options, None, None)
 }
 
 /// Decode and compile source bytes with a proved duplicate-key integer-string limit.
@@ -403,8 +440,30 @@ pub fn compile_bytes_with_options_and_mapping_key_limit(
     limit: u32,
 ) -> Result<CompiledModule, CompileError> {
     validate_filename(filename)?;
-    validate_mapping_key_limit(limit)?;
-    compile_byte_source(source, filename.into(), options, Some(limit))
+    validate_integer_string_limit(limit)?;
+    compile_byte_source(source, filename.into(), options, None, Some(limit))
+}
+
+/// Decode and compile source bytes with explicit parsing and optional formatting limits.
+///
+/// The limits and callback requirements are the same as
+/// [`compile_with_options_and_integer_limits`].
+pub fn compile_bytes_with_options_and_integer_limits(
+    source: &[u8],
+    filename: &str,
+    options: &CompileOptions,
+    parse_limit: u32,
+    mapping_key_limit: Option<u32>,
+) -> Result<CompiledModule, CompileError> {
+    validate_filename(filename)?;
+    validate_integer_limits(parse_limit, mapping_key_limit)?;
+    compile_byte_source(
+        source,
+        filename.into(),
+        options,
+        Some(parse_limit),
+        mapping_key_limit,
+    )
 }
 
 /// Decode and compile source bytes with an operating-system filename and the selected options.
@@ -420,7 +479,13 @@ pub fn compile_bytes_with_path_and_options(
     if filename.as_os_str().as_encoded_bytes().contains(&0) {
         return Err(CompileError::InvalidFilename);
     }
-    compile_byte_source(source, CodeFilename::from_path(filename), options, None)
+    compile_byte_source(
+        source,
+        CodeFilename::from_path(filename),
+        options,
+        None,
+        None,
+    )
 }
 
 /// Decode and compile source bytes with an OS filename and proved duplicate-key limit.
@@ -436,12 +501,38 @@ pub fn compile_bytes_with_path_options_and_mapping_key_limit(
     if filename.as_os_str().as_encoded_bytes().contains(&0) {
         return Err(CompileError::InvalidFilename);
     }
-    validate_mapping_key_limit(limit)?;
+    validate_integer_string_limit(limit)?;
     compile_byte_source(
         source,
         CodeFilename::from_path(filename),
         options,
+        None,
         Some(limit),
+    )
+}
+
+/// Decode source bytes with an OS filename and explicit parsing and formatting limits.
+///
+/// The limits and callback requirements are the same as
+/// [`compile_with_options_and_integer_limits`]. Filenames are preserved as in
+/// [`compile_bytes_with_path_and_options`].
+pub fn compile_bytes_with_path_options_and_integer_limits(
+    source: &[u8],
+    filename: &Path,
+    options: &CompileOptions,
+    parse_limit: u32,
+    mapping_key_limit: Option<u32>,
+) -> Result<CompiledModule, CompileError> {
+    if filename.as_os_str().as_encoded_bytes().contains(&0) {
+        return Err(CompileError::InvalidFilename);
+    }
+    validate_integer_limits(parse_limit, mapping_key_limit)?;
+    compile_byte_source(
+        source,
+        CodeFilename::from_path(filename),
+        options,
+        Some(parse_limit),
+        mapping_key_limit,
     )
 }
 
@@ -449,6 +540,7 @@ fn compile_byte_source(
     source: &[u8],
     filename: CodeFilename,
     options: &CompileOptions,
+    parse_int_max_str_digits: Option<u32>,
     mapping_key_int_max_str_digits: Option<u32>,
 ) -> Result<CompiledModule, CompileError> {
     let decoded = source::decode_source_with_codec(source).map_err(CompileError::Decode)?;
@@ -460,6 +552,7 @@ fn compile_byte_source(
             &decoded.source,
             filename,
             options,
+            parse_int_max_str_digits,
             mapping_key_int_max_str_digits,
         );
     }
@@ -471,6 +564,7 @@ fn compile_byte_source(
             &decoded.source,
             filename,
             options,
+            parse_int_max_str_digits,
             mapping_key_int_max_str_digits,
         );
     }
@@ -487,6 +581,7 @@ fn compile_byte_source(
             initial_intern_state: state,
             ..options.clone()
         },
+        parse_int_max_str_digits,
         mapping_key_int_max_str_digits,
     )
 }
@@ -498,7 +593,18 @@ fn validate_filename(filename: &str) -> Result<(), CompileError> {
     Ok(())
 }
 
-fn validate_mapping_key_limit(limit: u32) -> Result<(), CompileError> {
+fn validate_integer_limits(
+    parse_limit: u32,
+    mapping_key_limit: Option<u32>,
+) -> Result<(), CompileError> {
+    validate_integer_string_limit(parse_limit)?;
+    if let Some(limit) = mapping_key_limit {
+        validate_integer_string_limit(limit)?;
+    }
+    Ok(())
+}
+
+fn validate_integer_string_limit(limit: u32) -> Result<(), CompileError> {
     if limit != 0 && !(640..=2_147_483_647).contains(&limit) {
         return Err(CompileError::Unsupported(
             "integer-to-string limit must be zero or between 640 and i32::MAX".to_owned(),
@@ -632,11 +738,18 @@ fn compile_normalized(
     source: &str,
     filename: CodeFilename,
     options: &CompileOptions,
+    parse_int_max_str_digits: Option<u32>,
     mapping_key_int_max_str_digits: Option<u32>,
 ) -> Result<CompiledModule, CompileError> {
     if stack_growth_required() {
         return grow_stack(|| {
-            compile_normalized(source, filename, options, mapping_key_int_max_str_digits)
+            compile_normalized(
+                source,
+                filename,
+                options,
+                parse_int_max_str_digits,
+                mapping_key_int_max_str_digits,
+            )
         });
     }
     options
@@ -650,7 +763,8 @@ fn compile_normalized(
     };
     let parse_options = ruff_python_parser::ParseOptions::from(ruff_python_parser::Mode::Module)
         .with_target_version(target_version);
-    let may_depend_on_decimal_parse = may_depend_on_decimal_parse(source);
+    let may_depend_on_decimal_parse =
+        parse_int_max_str_digits.is_none() && may_depend_on_decimal_parse(source);
     if let Err(error) = delimiter_nesting::validate(source, &parse_options, options.python_version)
     {
         return Err(if may_depend_on_decimal_parse {
@@ -737,6 +851,7 @@ fn compile_normalized(
         parsed.tokens(),
         parsed.suite(),
         parsed.unsupported_syntax_errors(),
+        parse_int_max_str_digits.unwrap_or(4300),
     )?;
     if options.python_version == PythonVersion::Py312 {
         // Both validators can find errors in one module; CPython reports the first.
