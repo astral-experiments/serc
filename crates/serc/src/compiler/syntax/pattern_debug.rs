@@ -251,12 +251,16 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
     }
 
     fn pattern_error(&mut self, message: impl Into<String>, range: TextRange) {
+        self.pattern_diagnostic(CompileError::InvalidPattern {
+            message: message.into(),
+            range,
+        });
+    }
+
+    fn pattern_diagnostic(&mut self, diagnostic: CompileError) {
         if self.error.borrow().is_none() && self.bare_starred.is_none() {
             self.lowering_pattern_error = true;
-            *self.error.borrow_mut() = Some(CompileError::InvalidPattern {
-                message: message.into(),
-                range,
-            });
+            *self.error.borrow_mut() = Some(diagnostic);
         }
     }
 
@@ -323,33 +327,39 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
                 let mut numeric_keys = LargeNumericKeys::default();
                 for key in &mapping.keys {
                     if let Some(error) = errors.get(&key.range()) {
-                        let message = super::mapping_diagnostic::diagnostic(
+                        let diagnostic = super::mapping_diagnostic::diagnostic(
                             self.source,
                             key,
                             pattern.range(),
                             self.python_version,
-                        )
-                        .map_or_else(|| error.to_string(), |(message, _)| message);
-                        self.pattern_error(message, pattern.range());
+                            self.mapping_key_int_max_str_digits,
+                        );
+                        if let Some(diagnostic) = diagnostic {
+                            self.pattern_diagnostic(diagnostic);
+                        } else {
+                            self.pattern_error(error.to_string(), pattern.range());
+                        }
                         return;
                     }
                     if numeric_keys.duplicate(key, self.python_version) {
-                        let message = super::mapping_diagnostic::diagnostic(
+                        let diagnostic = super::mapping_diagnostic::diagnostic(
                             self.source,
                             key,
                             pattern.range(),
                             self.python_version,
-                        )
-                        .map_or_else(
-                            || {
+                            self.mapping_key_int_max_str_digits,
+                        );
+                        if let Some(diagnostic) = diagnostic {
+                            self.pattern_diagnostic(diagnostic);
+                        } else {
+                            self.pattern_error(
                                 format!(
                                     "mapping pattern checks duplicate key `{}`",
                                     &self.source[key.range()]
-                                )
-                            },
-                            |(message, _)| message,
-                        );
-                        self.pattern_error(message, pattern.range());
+                                ),
+                                pattern.range(),
+                            );
+                        }
                         return;
                     }
                     self.visit_expr(key);

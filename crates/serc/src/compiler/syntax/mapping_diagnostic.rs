@@ -7,7 +7,7 @@ use ruff_python_ast::{self as ast, Expr, Pattern, Stmt};
 use ruff_python_literal::escape::AsciiEscape;
 use ruff_text_size::{Ranged, TextRange};
 
-use crate::{PythonVersion, code_object::Constant};
+use crate::{CompileError, PythonVersion, code_object::Constant};
 
 use super::super::constant::{fold_constant_with_literals, literal_constant};
 use super::super::source::diagnostic_string_literal_repr;
@@ -19,12 +19,14 @@ pub(super) fn find(
     body: &[Stmt],
     key_range: TextRange,
     version: ast::PythonVersion,
-) -> Option<(String, TextRange)> {
+    int_max_str_digits: Option<u32>,
+) -> Option<CompileError> {
     struct Finder<'source> {
         source: &'source str,
         key_range: TextRange,
         version: ast::PythonVersion,
-        found: Option<(String, TextRange)>,
+        int_max_str_digits: Option<u32>,
+        found: Option<CompileError>,
     }
 
     impl<'ast> Visitor<'ast> for Finder<'_> {
@@ -50,7 +52,13 @@ pub(super) fn find(
                     .iter()
                     .find(|key| key.range() == self.key_range)
             {
-                self.found = diagnostic(self.source, key, mapping.range, self.version);
+                self.found = diagnostic(
+                    self.source,
+                    key,
+                    mapping.range,
+                    self.version,
+                    self.int_max_str_digits,
+                );
             } else {
                 walk_pattern(self, pattern);
             }
@@ -63,6 +71,7 @@ pub(super) fn find(
         source,
         key_range,
         version,
+        int_max_str_digits,
         found: None,
     };
     finder.visit_body(body);
@@ -75,18 +84,26 @@ pub(super) fn diagnostic(
     key: &Expr,
     mapping_range: TextRange,
     version: ast::PythonVersion,
-) -> Option<(String, TextRange)> {
+    int_max_str_digits: Option<u32>,
+) -> Option<CompileError> {
     let repr = if let Expr::StringLiteral(string) = key {
         diagnostic_string_literal_repr(string, source, |character| {
             unicode_printable::is_printable(character, version)
         })
     } else {
-        // Avoid unbounded big-integer conversion before applying the decimal-size guard.
+        // Avoid unbounded big-integer conversion. Do not claim a syntax error when the
+        // unconverted integer could instead exceed the caller's conversion limit.
         if matches!(
             key,
             Expr::NumberLiteral(_) | Expr::UnaryOp(_) | Expr::BinOp(_)
         ) && source[key.range()].len() > 8192
         {
+            if is_integer_literal(key) {
+                return Some(CompileError::Unsupported(
+                    "integer mapping-key diagnostic exceeds the supported conversion size"
+                        .to_owned(),
+                ));
+            }
             return None;
         }
         let version = match version {
@@ -95,30 +112,71 @@ pub(super) fn diagnostic(
             ast::PythonVersion::PY314 => PythonVersion::Py314,
             _ => PythonVersion::Py315,
         };
-        constant_repr(&fold_constant_with_literals(
-            key,
-            version,
-            &literal_constant,
-            false,
-        )?)?
+        match constant_repr(
+            &fold_constant_with_literals(key, version, &literal_constant, false)?,
+            int_max_str_digits,
+        ) {
+            Ok(repr) => repr?,
+            Err(error) => return Some(error),
+        }
     };
-    Some((
-        format!("mapping pattern checks duplicate key ({repr})"),
-        mapping_range,
-    ))
+    Some(CompileError::InvalidPattern {
+        message: format!("mapping pattern checks duplicate key ({repr})"),
+        range: mapping_range,
+    })
 }
 
-fn constant_repr(constant: &Constant) -> Option<String> {
-    match constant {
+fn is_integer_literal(key: &Expr) -> bool {
+    match key {
+        Expr::NumberLiteral(number) => matches!(&number.value, ast::Number::Int(_)),
+        Expr::UnaryOp(unary) if matches!(unary.op, ast::UnaryOp::UAdd | ast::UnaryOp::USub) => {
+            is_integer_literal(&unary.operand)
+        }
+        _ => false,
+    }
+}
+
+fn constant_repr(
+    constant: &Constant,
+    int_max_str_digits: Option<u32>,
+) -> Result<Option<String>, CompileError> {
+    Ok(match constant {
         Constant::None => Some("None".to_owned()),
         Constant::Bool(value) => Some(if *value { "True" } else { "False" }.to_owned()),
         Constant::Int(value) => Some(value.to_string()),
         Constant::SignedInt(value) => Some(value.to_string()),
-        // CPython's default integer-to-string limit rejects values above 4,300 decimal digits.
-        // Keep the existing diagnostic for larger values rather than doing unbounded quadratic
-        // conversion while Serc has no equivalent configurable limit.
-        Constant::BigInt { negative, digits } if digits.len() <= 954 => {
-            Some(integer_repr(*negative, digits))
+        Constant::BigInt { negative, digits } => {
+            // CPython supports 15- and 30-bit PyLong digits, while these normalized
+            // marshal digits are 15-bit. Above 1,000 native digits CPython can invoke
+            // the caller-controlled _pylong module before its exact limit check.
+            // Claim ValueError only if the coarse precheck rejects in both layouts.
+            if digits.len() > 1_000 {
+                let native_digits_15 = digits.len();
+                let native_digits_30 = digits.len().div_ceil(2);
+                if let Some(limit @ 1..) = int_max_str_digits
+                    && (limit as usize) / 45 <= (native_digits_15 - 11) / 10
+                    && (limit as usize) / 90 <= (native_digits_30 - 11) / 10
+                {
+                    return Err(CompileError::IntegerStringConversionLimit { max_digits: limit });
+                }
+                return Err(CompileError::Unsupported(
+                    "integer formatting may invoke the caller-controlled _pylong module".to_owned(),
+                ));
+            }
+            let repr = integer_repr(*negative, digits);
+            let decimal_digits = repr.len() - usize::from(*negative);
+            if decimal_digits > 640 {
+                match int_max_str_digits {
+                    None => return Err(CompileError::UnresolvedIntegerStringLimit),
+                    Some(limit) if limit != 0 && decimal_digits > limit as usize => {
+                        return Err(CompileError::IntegerStringConversionLimit {
+                            max_digits: limit,
+                        });
+                    }
+                    Some(_) => {}
+                }
+            }
+            Some(repr)
         }
         Constant::Float(value) => Some(float_repr(*value)),
         Constant::Complex { real, imag } => Some(complex_repr(*real, *imag)),
@@ -129,7 +187,7 @@ fn constant_repr(constant: &Constant) -> Option<String> {
                 .expect("Python bytes representation length fits in usize"),
         ),
         _ => None,
-    }
+    })
 }
 
 fn integer_repr(negative: bool, digits: &[u16]) -> String {
@@ -277,7 +335,450 @@ mod tests {
     use ruff_python_parser::parse_module;
 
     use super::super::validate;
-    use crate::{CompileError, PythonVersion};
+    use crate::{
+        CompileError, CompileOptions, OptimizationLevel, PythonVersion, compile_with_options,
+        compile_with_options_and_mapping_key_limit,
+    };
+
+    fn power_of_two(exponent: usize) -> String {
+        format!("0x{:x}{}", 1_u8 << (exponent % 4), "0".repeat(exponent / 4))
+    }
+
+    fn duplicate_integer_error(
+        key: &str,
+        limit: Option<u32>,
+        version: PythonVersion,
+    ) -> CompileError {
+        let source = format!("match subject:\n case {{{key}: _, {key}: _}}: pass\n");
+        compile_error(&source, version, limit)
+    }
+
+    fn compile_error(source: &str, version: PythonVersion, limit: Option<u32>) -> CompileError {
+        let options = CompileOptions {
+            python_version: version,
+            ..CompileOptions::default()
+        };
+        match limit {
+            Some(limit) => {
+                compile_with_options_and_mapping_key_limit(source, "mapping.py", &options, limit)
+            }
+            None => compile_with_options(source, "mapping.py", &options),
+        }
+        .unwrap_err()
+    }
+
+    #[test]
+    fn integer_repr_limit_is_preserved_with_optimization() {
+        let key = power_of_two(2127);
+        let source = format!("match subject:\n case {{{key}: _, {key}: _}}: pass\n");
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            for optimization_level in [OptimizationLevel::One, OptimizationLevel::Two] {
+                let options = CompileOptions {
+                    python_version,
+                    optimization_level,
+                    ..CompileOptions::default()
+                };
+                assert_eq!(
+                    compile_with_options_and_mapping_key_limit(
+                        &source,
+                        "mapping.py",
+                        &options,
+                        640
+                    )
+                    .unwrap_err(),
+                    CompileError::IntegerStringConversionLimit { max_digits: 640 },
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn integer_repr_limit_is_unknown_unless_established_by_the_caller() {
+        let below = power_of_two(2126); // 640 decimal digits.
+        let above = power_of_two(2127); // 641 decimal digits.
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            assert!(matches!(
+                duplicate_integer_error(&below, None, version),
+                CompileError::InvalidPattern { .. }
+            ));
+            for sign in ["", "-"] {
+                let key = format!("{sign}{above}");
+                assert!(matches!(
+                    duplicate_integer_error(&key, None, version),
+                    CompileError::UnresolvedIntegerStringLimit
+                ));
+                assert_eq!(
+                    duplicate_integer_error(&key, Some(640), version),
+                    CompileError::IntegerStringConversionLimit { max_digits: 640 }
+                );
+                for limit in [0, 641, 4300] {
+                    let error = duplicate_integer_error(&key, Some(limit), version);
+                    let CompileError::InvalidPattern { message, .. } = error else {
+                        panic!("expected duplicate-key diagnostic for {version}: {error:?}");
+                    };
+                    let repr = message
+                        .strip_prefix("mapping pattern checks duplicate key (")
+                        .unwrap()
+                        .strip_suffix(')')
+                        .unwrap();
+                    assert_eq!(repr.trim_start_matches('-').len(), 641);
+                    assert_eq!(repr.starts_with('-'), sign == "-");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn integer_repr_limit_checks_default_boundary_and_configuration() {
+        let below = power_of_two(14284); // 4300 decimal digits.
+        let above = power_of_two(14285); // 4301 decimal digits.
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            assert!(matches!(
+                duplicate_integer_error(&below, Some(4300), version),
+                CompileError::InvalidPattern { .. }
+            ));
+            assert_eq!(
+                duplicate_integer_error(&above, Some(4300), version),
+                CompileError::IntegerStringConversionLimit { max_digits: 4300 }
+            );
+            assert!(matches!(
+                duplicate_integer_error(&above, Some(0), version),
+                CompileError::InvalidPattern { .. }
+            ));
+            assert!(matches!(
+                duplicate_integer_error(&above, Some(4301), version),
+                CompileError::InvalidPattern { .. }
+            ));
+            assert!(matches!(
+                duplicate_integer_error(&above, None, version),
+                CompileError::UnresolvedIntegerStringLimit
+            ));
+        }
+        for limit in [1, 639, u32::MAX] {
+            assert!(matches!(
+                duplicate_integer_error("1", Some(limit), PythonVersion::Py314),
+                CompileError::Unsupported(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn integer_formatting_does_not_assume_the_parse_limit_or_pylong_module() {
+        let key = power_of_two(2127);
+        let source = format!(
+            "match subject:\n case {{{key}: _, {key}: _}}: pass\nlater = {}\n",
+            "1".repeat(641)
+        );
+        let options = CompileOptions::default();
+        assert!(matches!(
+            compile_with_options_and_mapping_key_limit(&source, "mapping.py", &options, 640),
+            Err(CompileError::Unsupported(_))
+        ));
+        let source = format!(
+            "# {}\nmessage = '{}'; match_subject = 1\nmatch subject:\n case {{{key}: _, {key}: _}}: pass\n",
+            "1".repeat(641),
+            "1".repeat(641)
+        );
+        assert!(matches!(
+            compile_with_options_and_mapping_key_limit(&source, "mapping.py", &options, 640),
+            Err(CompileError::IntegerStringConversionLimit { max_digits: 640 })
+        ));
+
+        let huge = power_of_two(30000); // 1,001 native 30-bit limbs.
+        let ambiguous_layout = power_of_two(18000); // 1,201 15-bit limbs, 601 30-bit limbs.
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            assert_eq!(
+                duplicate_integer_error(&huge, Some(4300), version),
+                CompileError::IntegerStringConversionLimit { max_digits: 4300 }
+            );
+            assert!(matches!(
+                duplicate_integer_error(&huge, Some(9000), version),
+                CompileError::Unsupported(_)
+            ));
+            assert!(matches!(
+                duplicate_integer_error(&huge, Some(0), version),
+                CompileError::Unsupported(_)
+            ));
+            assert!(matches!(
+                duplicate_integer_error(&ambiguous_layout, Some(5400), version),
+                CompileError::Unsupported(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn duplicate_key_diagnostics_keep_earlier_phase_errors() {
+        let key = power_of_two(2127);
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let options = CompileOptions {
+                python_version: version,
+                ..CompileOptions::default()
+            };
+            let source = format!(
+                "match subject:\n case {{{key}: _, {key}: _}}: pass\ndef f():\n nonlocal missing\n"
+            );
+            let error =
+                compile_with_options_and_mapping_key_limit(&source, "mapping.py", &options, 640)
+                    .unwrap_err();
+            assert!(
+                matches!(error, CompileError::InvalidSyntax { .. }),
+                "{version}: {error:?}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("no binding for nonlocal 'missing'"),
+                "{version}: {error:?}"
+            );
+            let source = format!(
+                "match subject:\n case {{1: _, 1: _}}: pass\nlater = {}\n",
+                "1".repeat(641)
+            );
+            assert!(matches!(
+                compile_with_options_and_mapping_key_limit(&source, "mapping.py", &options, 640),
+                Err(CompileError::Unsupported(_))
+            ));
+        }
+        for version in [PythonVersion::Py312, PythonVersion::Py313] {
+            for key in ["1".to_owned(), key.clone()] {
+                let source = format!(
+                    "*items\nmatch subject:\n case {{{key}: _, {key}: _, **__debug__}}: pass\n"
+                );
+                let options = CompileOptions {
+                    python_version: version,
+                    ..CompileOptions::default()
+                };
+                let error = compile_with_options_and_mapping_key_limit(
+                    &source,
+                    "mapping.py",
+                    &options,
+                    640,
+                )
+                .unwrap_err();
+                assert!(
+                    error.to_string().contains("starred"),
+                    "{version}: {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_decimal_parse_precedes_earlier_semantic_and_parser_errors() {
+        let long = "1".repeat(641);
+        let separators = format!("{}{}", "1_".repeat(640), "1");
+        let mapping = "match subject:\n case {1: _, 1: _}: pass\n";
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            for prefix in [
+                "",
+                "def f():\n nonlocal missing\n",
+                "if:\n pass\n",
+                "open = (\n",
+            ] {
+                for decimal in [&long, &separators] {
+                    let source = format!("{prefix}{mapping}later = {decimal}\n");
+                    assert!(
+                        matches!(
+                            compile_error(&source, version, Some(640)),
+                            CompileError::Unsupported(_)
+                        ),
+                        "{version}: {prefix:?}"
+                    );
+                }
+            }
+            let source = format!("# {long}\ns = '{long}'\n{mapping}");
+            assert!(matches!(
+                compile_error(&source, version, None),
+                CompileError::InvalidPattern { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn unknown_decimal_parse_guard_is_limited_to_possible_mapping_duplicates() {
+        let decimal = "1".repeat(641);
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            for pattern in ["_", "[item]", "{1: item}"] {
+                let source = format!("match subject:\n case {pattern}: pass\nlater = {decimal}\n");
+                let parsed = parse_module(&source).unwrap();
+                assert!(
+                    !super::super::may_have_duplicate_mapping_key(&parsed.syntax().body),
+                    "{version}: {pattern}"
+                );
+            }
+            for pattern in ["{1: _, 2: _}", "[{1: _, 1: _}]", "{1: _, 1: _} | {2: _}"] {
+                let source = format!("match subject:\n case {pattern}: pass\nlater = {decimal}\n");
+                assert!(
+                    matches!(
+                        compile_error(&source, version, Some(640)),
+                        CompileError::Unsupported(_)
+                    ),
+                    "{version}: {pattern}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn integer_limit_uses_existing_ordered_symbol_replay() {
+        let key = power_of_two(2127);
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let mapping = format!("match subject:\n case {{{key}: _, {key}: _}}: pass\n");
+            for (suffix, expected_modern) in [
+                (
+                    "await subject\nfrom __future__ import annotations\n",
+                    "'await' outside function",
+                ),
+                (
+                    "from __future__ import annotations\nawait subject\n",
+                    "from __future__ imports must occur",
+                ),
+            ] {
+                let error = compile_error(&(mapping.clone() + suffix), version, Some(640));
+                if matches!(version, PythonVersion::Py312 | PythonVersion::Py313) {
+                    assert_eq!(
+                        error,
+                        CompileError::IntegerStringConversionLimit { max_digits: 640 }
+                    );
+                } else {
+                    assert!(
+                        matches!(error, CompileError::InvalidSyntax { .. })
+                            && error.to_string().contains(expected_modern),
+                        "{version}: {error:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn integer_limit_uses_debug_pattern_replay() {
+        let key = power_of_two(2127);
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            for pattern in [
+                format!("{{{key}: _, {key}: _, **__debug__}}"),
+                format!("[{{{key}: _, {key}: _}}, C(__debug__=x)]"),
+            ] {
+                let source = format!("match subject:\n case {pattern}: pass\n");
+                for limit in [None, Some(0), Some(640)] {
+                    let error = compile_error(&source, version, limit);
+                    if matches!(version, PythonVersion::Py314 | PythonVersion::Py315) {
+                        assert!(
+                            matches!(error, CompileError::InvalidSyntax { .. })
+                                && error.to_string().contains("cannot assign to __debug__"),
+                            "{version}: {error:?}"
+                        );
+                    } else {
+                        match limit {
+                            None => {
+                                assert!(matches!(
+                                    error,
+                                    CompileError::UnresolvedIntegerStringLimit
+                                ));
+                            }
+                            Some(0) => {
+                                assert!(matches!(error, CompileError::InvalidPattern { .. }));
+                            }
+                            Some(640) => assert_eq!(
+                                error,
+                                CompileError::IntegerStringConversionLimit { max_digits: 640 }
+                            ),
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_limit_preserves_existing_options_literals_and_input_forms() {
+        use crate::{
+            InitialInternState, NativeBuildProfile,
+            compile_bytes_with_options_and_mapping_key_limit,
+            compile_bytes_with_path_options_and_mapping_key_limit,
+        };
+        use std::path::Path;
+        let options = CompileOptions {
+            python_version: PythonVersion::Py314,
+            native_build_profile: NativeBuildProfile::default(),
+            initial_intern_state: InitialInternState::default(),
+            optimization_level: OptimizationLevel::Zero,
+        };
+        let key = power_of_two(2127);
+        let source = format!("match subject:\n case {{{key}: _, {key}: _}}: pass\n");
+        let expected = CompileError::IntegerStringConversionLimit { max_digits: 640 };
+        assert_eq!(
+            compile_with_options_and_mapping_key_limit(&source, "mapping.py", &options, 640)
+                .unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            compile_bytes_with_options_and_mapping_key_limit(
+                source.as_bytes(),
+                "mapping.py",
+                &options,
+                640
+            )
+            .unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            compile_bytes_with_path_options_and_mapping_key_limit(
+                source.as_bytes(),
+                Path::new("mapping.py"),
+                &options,
+                640
+            )
+            .unwrap_err(),
+            expected
+        );
+    }
 
     #[test]
     fn duplicate_mapping_keys_use_native_repr_and_mapping_span() {
