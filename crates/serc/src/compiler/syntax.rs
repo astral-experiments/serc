@@ -9,7 +9,7 @@ use ruff_python_ast::visitor::{
 use ruff_python_ast::{self as ast, Expr, Pattern, Stmt};
 use ruff_python_parser::semantic_errors::{
     AwaitOutsideAsyncFunctionKind, InvalidExpressionKind, LazyImportContext, SemanticSyntaxChecker,
-    SemanticSyntaxContext, SemanticSyntaxError, SemanticSyntaxErrorKind,
+    SemanticSyntaxContext, SemanticSyntaxError, SemanticSyntaxErrorKind, WriteToDebugKind,
 };
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -23,6 +23,7 @@ use super::symbol::mangle_name;
 #[cfg(test)]
 mod declaration_tests;
 mod declarations;
+mod pattern_debug;
 
 /// Validate AST-based syntax restrictions using Ruff's shared checker.
 pub(crate) fn validate(
@@ -54,6 +55,12 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
     let mut validator = new_validator::<PRUNE_STATEMENTS, false>(source, body, python_version);
     validator.visit_scope_body(body);
     let lowering_keyword_error = validator.lowering_keyword_error.get();
+    let debug_pattern_replay =
+        matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315)
+            && validator.may_have_debug_patterns
+            && pattern_debug::body_has_debug_pattern(body);
+    let lowering_error =
+        lowering_keyword_error || validator.lowering_debug_error || debug_pattern_replay;
     let mut error = validator.error.into_inner();
     if lowering_keyword_error && let Some(CompileError::InvalidSyntax { range, .. }) = &error {
         // A class body is compiled before its bases and class-call keywords. Revisit only
@@ -71,11 +78,12 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
             })
             .or(error);
     }
-    if matches!(&error, Some(CompileError::InvalidDocstring { .. })) || lowering_keyword_error {
+    if matches!(&error, Some(CompileError::InvalidDocstring { .. })) || lowering_error {
         // Revisit these error paths for diagnostics from earlier compiler phases.
         // Future directives moved ahead of call lowering in Python 3.14.
-        if !lowering_keyword_error
-            || matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315)
+        if !debug_pattern_replay
+            && (!lowering_error
+                || matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315))
         {
             let mut validator = new_validator::<false, true>(source, body, python_version);
             validator.visit_body(body);
@@ -88,7 +96,15 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         let mut validator = new_validator::<false, false>(source, body, python_version);
         validator.pre_lowering_only = true;
         validator.visit_body(body);
+        let pattern_debug_range = validator.symbol_pattern_debug_range;
         if let Some(priority_error) = validator.error.into_inner() {
+            if let Some(range) = pattern_debug_range
+                && (source.contains("global") || source.contains("nonlocal"))
+                && let Some(declaration_error) =
+                    declarations::immediate_before_pattern_debug(body, python_version, range)
+            {
+                return Err(declaration_error);
+            }
             return Err(priority_error);
         }
         validate_declarations(source, body, python_version)?;
@@ -123,6 +139,8 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
         checker_prefix: CheckerPrefix::Initial,
         error: RefCell::new(None),
         reported_future_feature: Cell::new(None),
+        collected_match_errors: RefCell::new(None),
+        symbol_pattern_debug_range: None,
         pending_pattern: None,
         lowering_pattern_error: false,
         lowering_keyword_error: Cell::new(false),
@@ -130,10 +148,12 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
         suppress_class_keyword: Cell::new(false),
         class_lowering_target: None,
         class_lowering_depth: 0,
+        lowering_debug_error: false,
         bare_starred: None,
         check_bare_starred: true,
         pre_lowering_only: false,
         source,
+        may_have_debug_patterns: source.contains("__debug__") || !source.is_ascii(),
         body,
         python_version: match python_version {
             PythonVersion::Py312 => ast::PythonVersion::PY312,
@@ -336,6 +356,8 @@ struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
     checker_prefix: CheckerPrefix,
     error: RefCell<Option<CompileError>>,
     reported_future_feature: Cell<Option<TextRange>>,
+    collected_match_errors: RefCell<Option<Vec<SemanticSyntaxError>>>,
+    symbol_pattern_debug_range: Option<TextRange>,
     pending_pattern: Option<PendingPattern<'ast>>,
     lowering_pattern_error: bool,
     lowering_keyword_error: Cell<bool>,
@@ -343,9 +365,11 @@ struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
     suppress_class_keyword: Cell<bool>,
     class_lowering_target: Option<TextRange>,
     class_lowering_depth: usize,
+    lowering_debug_error: bool,
     bare_starred: Option<(TextRange, BareStarredKind)>,
     check_bare_starred: bool,
     source: &'source str,
+    may_have_debug_patterns: bool,
     body: &'ast [Stmt],
     python_version: ast::PythonVersion,
     future_annotations: bool,
@@ -568,6 +592,59 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
         }
     }
 
+    fn check_debug_write(&mut self, name: &str, context: ast::ExprContext, range: TextRange) {
+        // These checks moved from code generation into symbol analysis in Python 3.14,
+        // which also made them apply inside stringized and unevaluated annotations.
+        if name != "__debug__"
+            || (!self.check_bare_starred && self.python_version < ast::PythonVersion::PY314)
+        {
+            return;
+        }
+        let kind = match context {
+            ast::ExprContext::Store => WriteToDebugKind::Store,
+            ast::ExprContext::Del if self.python_version >= ast::PythonVersion::PY314 => {
+                WriteToDebugKind::Delete(self.python_version)
+            }
+            _ => return,
+        };
+        let track_lowering_error = self.python_version < ast::PythonVersion::PY314
+            && !self.pre_lowering_only
+            && self.bare_starred.is_none()
+            && self.error.borrow().is_none();
+        self.report_semantic_error(SemanticSyntaxError {
+            kind: SemanticSyntaxErrorKind::WriteToDebug(kind),
+            range,
+            python_version: self.python_version,
+        });
+        if track_lowering_error && self.error.borrow().is_some() {
+            self.lowering_debug_error = true;
+        }
+    }
+
+    /// Call keyword names are checked before the callable or any argument is lowered.
+    fn check_call_keywords(&mut self, arguments: &ast::Arguments) {
+        if FUTURE_ONLY
+            || !self.check_bare_starred
+            || self.pre_lowering_only
+            || self.bare_starred.is_some()
+            || self.error.borrow().is_some()
+        {
+            return;
+        }
+        let legacy = self.python_version < ast::PythonVersion::PY314;
+        if let Some((name, range)) = invalid_call_keyword(arguments, legacy) {
+            // Legacy compilation checks each forbidden name before its later duplicates.
+            // Modern forbidden-name checks belong to the earlier symbol-table pass.
+            self.lowering_keyword_error.set(true);
+            let message = if legacy && name == "__debug__" {
+                "cannot assign to __debug__".to_owned()
+            } else {
+                format!("keyword argument repeated: {name}")
+            };
+            *self.error.borrow_mut() = Some(CompileError::invalid_syntax(message, range));
+        }
+    }
+
     fn defer_pattern_reachability(&mut self, statement: &'ast ast::StmtMatch) {
         for (index, case) in statement.cases.iter().enumerate() {
             let allow_irrefutable = case.guard.is_some() || index + 1 == statement.cases.len();
@@ -651,17 +728,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
     }
 
     fn visit_class_arguments_in_lowering_order(&mut self, arguments: &'ast ast::Arguments) {
-        if self.check_bare_starred
-            && self.bare_starred.is_none()
-            && self.error.borrow().is_none()
-            && let Some((name, range)) = repeated_call_keyword(arguments)
-        {
-            self.lowering_keyword_error.set(true);
-            *self.error.borrow_mut() = Some(CompileError::invalid_syntax(
-                format!("keyword argument repeated: {name}"),
-                range,
-            ));
-        }
+        self.check_call_keywords(arguments);
         self.visit_arguments(arguments);
     }
 
@@ -1096,19 +1163,29 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
     }
 }
 
-/// Find the duplicate belonging to the earliest authored keyword, as CPython does.
-fn repeated_call_keyword(arguments: &ast::Arguments) -> Option<(&str, TextRange)> {
+/// Find the first keyword-name error in CPython's outer-to-inner validation order.
+fn invalid_call_keyword(
+    arguments: &ast::Arguments,
+    forbid_debug: bool,
+) -> Option<(&str, TextRange)> {
     if arguments.keywords.len() < 2 {
-        return None;
+        return arguments.keywords.first().and_then(|keyword| {
+            keyword.arg.as_ref().and_then(|name| {
+                (forbid_debug && name == "__debug__").then_some((name.as_str(), keyword.range))
+            })
+        });
     }
     let mut seen = FxHashMap::default();
     let mut repeated = None;
     // Reverse traversal preserves the next occurrence of each name without a quadratic scan.
     for keyword in arguments.keywords.iter().rev() {
-        if let Some(name) = &keyword.arg
-            && let Some(range) = seen.insert(name.as_str(), keyword.range)
-        {
-            repeated = Some((name.as_str(), range));
+        if let Some(name) = &keyword.arg {
+            let next = seen.insert(name.as_str(), keyword.range);
+            if forbid_debug && name == "__debug__" {
+                repeated = Some((name.as_str(), keyword.range));
+            } else if let Some(range) = next {
+                repeated = Some((name.as_str(), range));
+            }
         }
     }
     repeated
@@ -1172,6 +1249,13 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
         if FUTURE_ONLY {
             self.check_statement(statement);
             walk_stmt(self, statement);
+            return;
+        }
+        if self.may_have_debug_patterns
+            && let Stmt::Match(match_statement) = statement
+            && pattern_debug::has_debug_pattern(match_statement)
+        {
+            self.visit_debug_match(statement, match_statement);
             return;
         }
         let mut prechecked_match_cases = 0;
@@ -1352,6 +1436,16 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                     self.visit_expr(target);
                 }
             }
+            Stmt::AugAssign(statement) if self.python_version < ast::PythonVersion::PY314 => {
+                // Legacy augmented attribute stores bypass the ordinary attribute-name check.
+                // Their base expression and RHS still undergo normal validation.
+                if let Expr::Attribute(attribute) = statement.target.as_ref() {
+                    self.visit_expr(&attribute.value);
+                } else {
+                    self.visit_expr(&statement.target);
+                }
+                self.visit_expr(&statement.value);
+            }
             Stmt::FunctionDef(function) => {
                 for decorator in &function.decorator_list {
                     self.visit_decorator(decorator);
@@ -1479,7 +1573,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
         }
         // This adapter does not supply declarations to Ruff's global-order check. A bare name
         // therefore only needs checking when it assigns to or deletes `__debug__`. Ordinary
-        // literals and attribute wrappers cannot report errors or update validation state.
+        // literals have no validation state; attribute chains check the target before their base.
         match expression {
             Expr::Name(name)
                 if name.id.as_str() != "__debug__"
@@ -1494,6 +1588,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
             | Expr::NoneLiteral(_)
             | Expr::EllipsisLiteral(_) => return,
             Expr::Attribute(attribute) => {
+                self.check_debug_write(attribute.attr.as_str(), attribute.ctx, attribute.range);
                 let mut base = attribute.value.as_ref();
                 while let Expr::Attribute(attribute) = base {
                     base = attribute.value.as_ref();
@@ -1506,21 +1601,11 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
         if self.error.borrow().is_some() {
             return;
         }
-        if self.check_bare_starred
-            && !self.pre_lowering_only
-            && self.bare_starred.is_none()
-            && let Expr::Call(call) = expression
-            && let Some((name, range)) = repeated_call_keyword(&call.arguments)
-        {
-            // CPython checks call keywords before lowering the callable or its arguments.
-            // Stringized and unevaluated annotations do not reach this phase. Revisit the
-            // module for symbol-table errors before returning this lowering diagnostic.
-            self.lowering_keyword_error.set(true);
-            *self.error.borrow_mut() = Some(CompileError::invalid_syntax(
-                format!("keyword argument repeated: {name}"),
-                range,
-            ));
-            return;
+        if let Expr::Call(call) = expression {
+            self.check_call_keywords(&call.arguments);
+            if self.error.borrow().is_some() {
+                return;
+            }
         }
         let check_expression = match expression {
             // These are the only remaining variants checked by the pinned Ruff visitor. Its
@@ -1626,6 +1711,35 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
         }
         self.validate_private_parameters(parameters);
         walk_parameters(self, parameters);
+    }
+
+    fn visit_pattern(&mut self, pattern: &'ast Pattern) {
+        if let Pattern::MatchClass(class) = pattern {
+            for keyword in &class.arguments.keywords {
+                self.check_debug_write(
+                    keyword.attr.as_str(),
+                    ast::ExprContext::Store,
+                    keyword.pattern.range(),
+                );
+            }
+        }
+        walk_pattern(self, pattern);
+    }
+
+    fn visit_arguments(&mut self, arguments: &'ast ast::Arguments) {
+        self.check_call_keywords(arguments);
+        for argument in &arguments.args {
+            self.visit_expr(argument);
+        }
+        // Native checks explicit keyword names before walking any keyword values.
+        for keyword in &arguments.keywords {
+            if let Some(name) = &keyword.arg {
+                self.check_debug_write(name.as_str(), ast::ExprContext::Store, keyword.range);
+            }
+        }
+        for keyword in &arguments.keywords {
+            self.visit_keyword(keyword);
+        }
     }
 
     fn visit_annotation(&mut self, annotation: &'ast Expr) {
@@ -1760,6 +1874,10 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
 
     fn report_semantic_error(&self, error: SemanticSyntaxError) {
         use SemanticSyntaxErrorKind as Kind;
+        if let Some(errors) = self.collected_match_errors.borrow_mut().as_mut() {
+            errors.push(error);
+            return;
+        }
         if FUTURE_ONLY
             && !matches!(
                 &error.kind,
@@ -1881,6 +1999,8 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             Kind::LateFutureImport => {
                 "from __future__ imports must occur at the beginning of the file".to_owned()
             }
+            Kind::WriteToDebug(WriteToDebugKind::Store) => "cannot assign to __debug__".to_owned(),
+            Kind::WriteToDebug(WriteToDebugKind::Delete(_)) => "cannot delete __debug__".to_owned(),
             Kind::BreakOutsideLoop => "'break' outside loop".to_owned(),
             Kind::ContinueOutsideLoop => "'continue' not properly in loop".to_owned(),
             Kind::ReturnOutsideFunction => "'return' outside function".to_owned(),
@@ -2233,7 +2353,7 @@ mod tests {
             ),
             (
                 "value = ((__debug__ := first).a.b.c, (yield second).d.e.f)",
-                "cannot assign to `__debug__`",
+                "cannot assign to __debug__",
                 "__debug__",
             ),
             (
