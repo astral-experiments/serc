@@ -79,6 +79,61 @@ fn repeated_call_keywords_follow_native_lowering_boundaries() {
             "from __future__ import annotations\nvalue: (lambda: g(x=1, x=2))\n",
             None,
         ),
+        (
+            "class C:\n    value: f(x=1, x=2)\ng(y=1, y=2)\n",
+            Some("keyword argument repeated: x"),
+        ),
+        (
+            "first: f(x=1, x=2)\nsecond: g(y=1, y=2)\n",
+            Some("keyword argument repeated: x"),
+        ),
+        (
+            "f(x=1, x=2).attr: g(y=1, y=2)\n",
+            Some("keyword argument repeated: x"),
+        ),
+        (
+            "f(x=1, x=2).attr: g(y=1, y=2) = 0\n",
+            Some("keyword argument repeated: x"),
+        ),
+        (
+            "f(x=1, x=2)[0]: g(y=1, y=2)\n",
+            Some("keyword argument repeated: x"),
+        ),
+        (
+            "f(x=1, x=2).attr: g(y=1, y=2) = h(z=1, z=2)\n",
+            Some("keyword argument repeated: z"),
+        ),
+        (
+            "from __future__ import annotations\nvalue: f(x=1, x=2)\ng(y=1, y=2)\n",
+            Some("keyword argument repeated: y"),
+        ),
+    ];
+    let annotation_cases = [
+        (
+            "value: f(x=1, x=2)\ng(y=1, y=2)\n",
+            Some("keyword argument repeated: x"),
+            Some("keyword argument repeated: y"),
+        ),
+        (
+            "class C:\n    value: f(x=1, x=2)\n    g(y=1, y=2)\n",
+            Some("keyword argument repeated: x"),
+            Some("keyword argument repeated: y"),
+        ),
+        (
+            "if flag:\n    value: f(x=1, x=2)\n    g(y=1, y=2)\n",
+            Some("keyword argument repeated: x"),
+            Some("keyword argument repeated: y"),
+        ),
+        (
+            "value: f(x=1, x=2)\nclass C:\n    g(y=1, y=2)\n",
+            Some("keyword argument repeated: x"),
+            Some("keyword argument repeated: y"),
+        ),
+        (
+            "obj.attr: f(x=1, x=2)\n",
+            Some("keyword argument repeated: x"),
+            None,
+        ),
     ];
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("repeated_keywords.py");
@@ -101,7 +156,11 @@ sys.stdout.buffer.write(marshal.dumps(code))
             python_version: version,
             ..CompileOptions::default()
         };
-        for (source, mut expected) in cases {
+        let modern = matches!(version, PythonVersion::Py314 | PythonVersion::Py315);
+        let annotations = annotation_cases
+            .iter()
+            .map(|&(source, legacy, deferred)| (source, if modern { deferred } else { legacy }));
+        for (source, mut expected) in cases.into_iter().chain(annotations) {
             if source.starts_with("f(x=1, x=2)\nfrom __future__")
                 && matches!(version, PythonVersion::Py312 | PythonVersion::Py313)
             {

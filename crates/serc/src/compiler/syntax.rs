@@ -236,6 +236,7 @@ struct Scope<'ast> {
     loop_depth: usize,
     except_star_loop_depth: Option<usize>,
     in_try: bool,
+    deferred_annotations: Vec<&'ast Expr>,
 }
 
 impl<'ast> Scope<'ast> {
@@ -245,6 +246,7 @@ impl<'ast> Scope<'ast> {
             loop_depth: 0,
             except_star_loop_depth: None,
             in_try: false,
+            deferred_annotations: Vec::new(),
         }
     }
 }
@@ -512,6 +514,11 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
             });
         }
         self.visit_body(body);
+        // Modern module and class annotations are lowered after the enclosing body.
+        // Their symbol-table checks already ran when the assignment was encountered.
+        for annotation in std::mem::take(&mut self.scope_mut().deferred_annotations) {
+            self.visit_annotation(annotation);
+        }
     }
 
     fn scope(&self) -> &Scope<'ast> {
@@ -1223,14 +1230,27 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                 if let Some(value) = &statement.value {
                     self.visit_expr(value);
                 }
+                self.visit_expr(&statement.target);
                 // Local variable annotations and, from 3.14, complex variable annotations are
                 // not compiled; their interpolations are never evaluated.
                 let compiled = !self.in_function_scope()
                     && (statement.simple || self.python_version < ast::PythonVersion::PY314);
-                self.with_bare_starred_check(compiled, |visitor| {
-                    visitor.visit_annotation(&statement.annotation);
-                });
-                self.visit_expr(&statement.target);
+                if compiled
+                    && !self.future_annotations
+                    && !self.pre_lowering_only
+                    && self.python_version >= ast::PythonVersion::PY314
+                {
+                    self.scope_mut()
+                        .deferred_annotations
+                        .push(&statement.annotation);
+                    self.pre_lowering_only = true;
+                    self.visit_annotation(&statement.annotation);
+                    self.pre_lowering_only = false;
+                } else {
+                    self.with_bare_starred_check(compiled, |visitor| {
+                        visitor.visit_annotation(&statement.annotation);
+                    });
+                }
             }
             Stmt::Assign(statement) => {
                 // CPython compiles the right-hand side before any chained assignment target.
