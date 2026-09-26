@@ -157,6 +157,11 @@ impl OptimizationPipeline {
         if self.python_version == PythonVersion::Py312 {
             self.inline_legacy_exit_blocks(&original_arrays, false);
         }
+        let repeated_backedges = if self.python_version == PythonVersion::Py312 {
+            self.legacy_repeated_backedges(&original_arrays)
+        } else {
+            Vec::new()
+        };
         self.remove_unreachable_instructions();
         loop {
             let before = self.graph.copy_items();
@@ -235,6 +240,26 @@ impl OptimizationPipeline {
         let mut predecessors = self.legacy_predecessors();
         if self.python_version == PythonVersion::Py312 {
             predecessors.retain(|block, _| blocks_before_cold_relocation.contains(block));
+            if !repeated_backedges.is_empty() {
+                let surviving_blocks = self.graph.order().iter().copied().collect::<FxHashSet<_>>();
+                for (block, original) in repeated_backedges {
+                    let mut instructions = self.graph[block].items().iter().filter_map(|item| {
+                        if let Item::Instruction(instruction) = item {
+                            Some(instruction)
+                        } else {
+                            None
+                        }
+                    });
+                    if surviving_blocks.contains(&block)
+                        && let Some(instruction) = instructions.next()
+                        && instructions.next().is_none()
+                        && *instruction == original
+                        && predecessors.get(&block) == Some(&1)
+                    {
+                        predecessors.insert(block, 2);
+                    }
+                }
+            }
         }
         self.resolve_legacy_locations(predecessors, &original_arrays);
         if self.python_version == PythonVersion::Py312 {
@@ -1309,6 +1334,98 @@ impl OptimizationPipeline {
             }
         }
         predecessors
+    }
+
+    /// Recovers repeated visits to an unlocated 3.12 backedge during CFG marking.
+    fn legacy_repeated_backedges(
+        &self,
+        original_arrays: &FxHashMap<BasicBlockId, usize>,
+    ) -> Vec<(BasicBlockId, Instruction)> {
+        if !self.exception_regions.is_empty() || !self.exception_owner_provenance.setups.is_empty()
+        {
+            return Vec::new();
+        }
+        let order = self.graph.order();
+        let Some(&entry) = order.first() else {
+            return Vec::new();
+        };
+        // A conditional that targets its fallthrough queues the same not-yet-
+        // visited block twice in 3.12's depth-first reachability traversal.
+        if !order.windows(2).any(|pair| {
+            block_has_fallthrough(self.graph[pair[0]].items())
+                && block_jump_target(self.graph[pair[0]].items())
+                    .and_then(|label| self.graph.label_block(label))
+                    == Some(pair[1])
+        }) {
+            return Vec::new();
+        }
+        let mut arrays = FxHashSet::default();
+        for &block in order {
+            if self.graph[block].last_instruction().is_none()
+                || !original_arrays
+                    .get(&block)
+                    .is_some_and(|array| arrays.insert(*array))
+            {
+                return Vec::new();
+            }
+        }
+        let positions = order
+            .iter()
+            .enumerate()
+            .map(|(index, &block)| (block, index))
+            .collect::<FxHashMap<_, _>>();
+        let mut visited = FxHashSet::default();
+        let mut visits = FxHashMap::<BasicBlockId, usize>::default();
+        let mut pending = vec![entry];
+        let mut repeated_successors = FxHashSet::default();
+        while let Some(block) = pending.pop() {
+            let Some(&position) = positions.get(&block) else {
+                return Vec::new();
+            };
+            let repeated = !visited.insert(block);
+            let count = visits.entry(block).or_default();
+            *count += 1;
+            if *count > 2 {
+                return Vec::new();
+            }
+            let fallthrough = block_has_fallthrough(self.graph[block].items())
+                .then(|| order.get(position + 1).copied())
+                .flatten();
+            let target = block_jump_target(self.graph[block].items())
+                .and_then(|label| self.graph.label_block(label));
+            for successor in fallthrough.into_iter().chain(target) {
+                if repeated {
+                    repeated_successors.insert(successor);
+                }
+                if !visited.contains(&successor) {
+                    pending.push(successor);
+                }
+            }
+        }
+        order
+            .iter()
+            .copied()
+            .filter(|block| repeated_successors.contains(block))
+            .filter_map(|block| {
+                let mut instructions = self.graph[block].items().iter().filter_map(|item| {
+                    if let Item::Instruction(instruction) = item {
+                        Some(instruction)
+                    } else {
+                        None
+                    }
+                });
+                let instruction = instructions.next()?;
+                if instructions.next().is_none()
+                    && (instruction.opcode == JUMP_BACKWARD
+                        || instruction.opcode == JUMP_BACKWARD_NO_INTERRUPT)
+                    && instruction.location == SourceLocation::NONE
+                {
+                    Some((block, *instruction))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     fn legacy_predecessors(&self) -> FxHashMap<BasicBlockId, usize> {

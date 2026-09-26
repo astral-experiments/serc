@@ -24,6 +24,30 @@ const LEVELS: [OptimizationLevel; 3] = [
 static ORACLES: [OnceLock<OsString>; 4] = [const { OnceLock::new() }; 4];
 
 #[test]
+fn optimized_for_loop_backedge_locations_match_cpython_312() {
+    for source in [
+        "def f(xs):\n for x in xs:\n  if x:\n   assert False\n  if x:\n   assert False\n",
+        "def f(xs):\n for x in xs:\n  if x:\n   assert False\n  if x:\n   assert False\n  if x:\n   assert False\n",
+        "def f(xs):\n for x in xs:\n  if not x:\n   assert False\n  if not x:\n   assert False\n",
+        "def f(xs, pred):\n for x in xs:\n  if pred(x):\n   assert False\n  if pred(x):\n   assert False\n",
+        "def f(xs):\n for y in xs:\n  for x in xs:\n   if x:\n    assert False\n   if x:\n    assert False\n",
+        "def f(xs):\n for x in xs:\n  if x:\n   assert False\n",
+        "def f(xs, y):\n for x in xs:\n  if x and y:\n   assert False\n  if x and y:\n   assert False\n",
+        "def f(xs, y):\n for x in xs:\n  if x or y:\n   assert False\n  if x or y:\n   assert False\n",
+        "def f(xs):\n for x in xs:\n  if x:\n   assert False\n  if x:\n   assert False\n  pass\n",
+        "def f(xs):\n for x in xs:\n  if x:\n   assert False\n  if x:\n   assert False\n  continue\n",
+        "def f(x):\n while x:\n  if x:\n   assert False\n  if x:\n   assert False\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "loop_backedge_locations.py",
+            &LEVELS,
+            &[PythonVersion::Py312],
+        );
+    }
+}
+
+#[test]
 fn nested_terminal_if_before_elided_assert_matches_cpython() {
     for source in [
         "def f(a,b):\n if a:\n  if b:\n   x = 1\n  assert a\n",
