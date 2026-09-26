@@ -29,10 +29,10 @@ their published source revisions and the clean submodule must all match
 
 | CPython   | Byte-identical accepted | CPython-rejected | Matched rejections | Serc accepted | Compiler failures |
 | --------- | ----------------------: | ---------------: | -----------------: | ------------: | ----------------: |
-| 3.12.14   |                   2,190 |              280 |                269 |             9 |                 2 |
-| 3.13.15   |                   2,209 |              261 |                256 |             3 |                 2 |
-| 3.14.5    |                   2,246 |              224 |                219 |             3 |                 2 |
-| 3.15.0rc2 |                   2,266 |              204 |                200 |             2 |                 2 |
+| 3.12.14   |                   2,190 |              280 |                270 |             8 |                 2 |
+| 3.13.15   |                   2,209 |              261 |                257 |             2 |                 2 |
+| 3.14.5    |                   2,246 |              224 |                220 |             2 |                 2 |
+| 3.15.0rc2 |                   2,266 |              204 |                201 |             1 |                 2 |
 
 The last three columns partition CPython-rejected inputs and expose existing
 rejection discrepancies. All other failure categories must be zero. Every
