@@ -6,15 +6,19 @@ use ruff_text_size::{Ranged, TextRange, TextSize};
 
 use crate::CompileError;
 
-/// Match the default decimal conversion limit of the pinned CPython interpreters.
+/// Apply the selected decimal conversion limit of the pinned CPython interpreters.
 /// Validate tokens before lowering, including literals in unreachable statements.
 pub(crate) fn validate(
     source: &str,
     tokens: &Tokens,
     suite: &[Stmt],
     unsupported: &[UnsupportedSyntaxError],
+    max_digits: u32,
 ) -> Result<(), CompileError> {
-    const MAX_DIGITS: usize = 4300;
+    if max_digits == 0 {
+        return Ok(());
+    }
+    let max_digits = max_digits as usize;
     for token in tokens {
         if token.kind() != TokenKind::Int {
             continue;
@@ -23,11 +27,11 @@ pub(crate) fn validate(
         // A valid integer starting with zero is either a power-of-two-base literal,
         // which is exempt, or all zeros, which CPython converts via its C-integer
         // fast path without invoking the limited decimal conversion.
-        if literal.len() <= MAX_DIGITS || literal.starts_with('0') {
+        if literal.len() <= max_digits || literal.starts_with('0') {
             continue;
         }
         let digits = literal.bytes().filter(u8::is_ascii_digit).count();
-        if digits > MAX_DIGITS {
+        if digits > max_digits {
             if let Some(error) = unsupported.first() {
                 // These errors are diagnosed after parsing their whole expression,
                 // so a decimal literal inside it takes precedence.
@@ -44,7 +48,7 @@ pub(crate) fn validate(
             }
             return Err(CompileError::invalid_syntax(
                 format!(
-                    "Exceeds the limit ({MAX_DIGITS} digits) for integer string conversion: value has {digits} digits; use sys.set_int_max_str_digits() to increase the limit - Consider hexadecimal for huge integer literals to avoid decimal conversion limits."
+                    "Exceeds the limit ({max_digits} digits) for integer string conversion: value has {digits} digits; use sys.set_int_max_str_digits() to increase the limit - Consider hexadecimal for huge integer literals to avoid decimal conversion limits."
                 ),
                 token.range(),
             ));

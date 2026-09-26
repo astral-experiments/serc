@@ -63,6 +63,15 @@ filesystem path and preserves filename values that Rust strings cannot
 represent, including non-UTF-8 filenames on Unix. It also rejects paths
 containing a null character before decoding the source.
 
+Use `compile_with_options_and_integer_limits` to select the integer-string
+conversion limit in effect while parsing decimal literals. Its `parse_limit`
+argument accepts zero for unlimited conversion, or a limit from 640 through
+`i32::MAX`. The separate `mapping_key_limit` argument optionally establishes the
+limit when formatting duplicate mapping keys. The existing entrypoints retain
+the default 4,300-digit parsing limit and conservative handling of diagnostics
+that depend on an unestablished parsing limit. Corresponding bytes and path
+entrypoints accept the same explicit limits.
+
 `CompileOptions::native_build_profile` selects instruction ordering for specific
 native builds before constant folding. See the
 [native arithmetic profiles](../../docs/cpython-build-profiles.md) for artifact

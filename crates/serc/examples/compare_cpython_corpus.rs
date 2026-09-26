@@ -158,8 +158,12 @@ struct Options {
     expected_exact: Option<usize>,
     #[arg(long)]
     expected_cpython_rejected: Option<usize>,
+    /// Require all accepted inputs to match; requires caller provenance or an explicit diagnostic assumption.
     #[arg(long)]
     require_all: bool,
+    /// Diagnostic only: allow --require-all to compare bytes using isolated startup state.
+    #[arg(long, conflicts_with_all = ["initial_intern_state", "caller_intern_model"])]
+    diagnostic_startup_state: bool,
     #[arg(long)]
     require_rejection_parity: bool,
     #[arg(long, default_value_t = 10)]
@@ -179,6 +183,36 @@ struct Options {
 }
 
 impl Options {
+    fn validate_caller_state(&self) -> Result<(), &'static str> {
+        if self.require_all && !self.diagnostic_startup_state {
+            if self.initial_intern_state.is_none() {
+                return Err(
+                    "--require-all requires --initial-intern-state matching the oracle caller; use --diagnostic-startup-state only for a diagnostic byte comparison",
+                );
+            }
+            if self.python_version == PythonVersion::Py312 && self.caller_intern_model.is_none() {
+                return Err(
+                    "--require-all on Python 3.12 also requires --caller-intern-model: pathlib interns each filename's components, so one captured snapshot cannot describe every input",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn caller_state_notice(&self) -> &'static str {
+        if self.caller_intern_assume_absent {
+            "Caller intern state: diagnostic assumption that unproved entries are absent"
+        } else if self.caller_intern_model.is_some() {
+            "Caller intern state: validated per-file model"
+        } else if self.initial_intern_state.is_none() {
+            "Caller intern state: diagnostic startup assumption; oracle imports and filenames can change marshal sharing, so a byte mismatch alone does not establish a compiler regression"
+        } else if self.python_version == PythonVersion::Py312 {
+            "Caller intern state: diagnostic fixed snapshot; Python 3.12 filename effects require a per-file model"
+        } else {
+            "Caller intern state: captured process snapshot; assumes its entries remain retained for each input, without proving unknown entries absent"
+        }
+    }
+
     fn validate_assume_absent(&self, cache_read: bool) -> Result<(), String> {
         if self.caller_intern_assume_absent && !cache_read {
             Err("--caller-intern-assume-absent requires admitted native cache reading".to_string())
@@ -208,6 +242,10 @@ impl Options {
 
 fn main() -> ExitCode {
     let options = Options::parse();
+    if let Err(message) = options.validate_caller_state() {
+        eprintln!("{message}");
+        return ExitCode::from(2);
+    }
     let expected_outcomes = match options.expected_outcome_counts() {
         Ok(outcomes) => outcomes,
         Err(message) => {
@@ -300,6 +338,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    println!("{}", options.caller_state_notice());
     let compile_options = CompileOptions {
         python_version: options.python_version,
         initial_intern_state: profile.map(|profile| profile.state).unwrap_or_default(),
@@ -1079,6 +1118,89 @@ mod tests {
         .unwrap();
         assert!(diagnostic.validate_assume_absent(false).is_err());
         assert!(diagnostic.validate_assume_absent(true).is_ok());
+        assert!(
+            diagnostic
+                .caller_state_notice()
+                .contains("diagnostic assumption")
+        );
+    }
+
+    #[test]
+    fn require_all_needs_caller_provenance_and_312_filename_effects() {
+        for version in ["3.12", "3.13", "3.14", "3.15"] {
+            let diagnostic = Options::try_parse_from([
+                "compare_cpython_corpus",
+                "--python-version",
+                version,
+                "--expected-exact",
+                "1",
+            ])
+            .unwrap();
+            assert!(diagnostic.validate_caller_state().is_ok());
+            assert!(
+                diagnostic
+                    .caller_state_notice()
+                    .contains("diagnostic startup assumption")
+            );
+
+            let mut strict = Options::try_parse_from([
+                "compare_cpython_corpus",
+                "--python-version",
+                version,
+                "--require-all",
+            ])
+            .unwrap();
+            assert!(
+                strict
+                    .validate_caller_state()
+                    .unwrap_err()
+                    .contains("--initial-intern-state")
+            );
+            strict.diagnostic_startup_state = true;
+            assert!(strict.validate_caller_state().is_ok());
+            assert!(
+                strict
+                    .caller_state_notice()
+                    .contains("diagnostic startup assumption")
+            );
+            strict.diagnostic_startup_state = false;
+            strict.initial_intern_state = Some("profile.json".into());
+            if version == "3.12" {
+                assert!(
+                    strict
+                        .validate_caller_state()
+                        .unwrap_err()
+                        .contains("--caller-intern-model")
+                );
+                assert!(
+                    strict
+                        .caller_state_notice()
+                        .contains("diagnostic fixed snapshot")
+                );
+                strict.caller_intern_model = Some("model.json".into());
+            } else {
+                assert!(
+                    strict
+                        .caller_state_notice()
+                        .contains("without proving unknown entries absent")
+                );
+            }
+            assert!(strict.validate_caller_state().is_ok());
+        }
+    }
+
+    #[test]
+    fn diagnostic_startup_assumption_cannot_replace_supplied_provenance() {
+        for profile in ["--initial-intern-state", "--caller-intern-model"] {
+            let error = Options::try_parse_from([
+                "compare_cpython_corpus",
+                "--diagnostic-startup-state",
+                profile,
+                "profile.json",
+            ])
+            .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+        }
     }
 
     #[test]
@@ -1451,6 +1573,76 @@ mod tests {
                     .marshal()
             );
             assert_ne!(default, supplied);
+        }
+    }
+
+    #[test]
+    fn oracle_caller_imports_and_filenames_affect_shared_constants() {
+        let source = "def first(value):\n    return value in {'full', 'novel_marker'}, 1\n\ndef second(value):\n    'second docstring'\n    return value in {'full', 'novel_marker'}, 2\n";
+        let directory = tempfile::tempdir().unwrap();
+        for (version, variable, fallback) in [
+            (PythonVersion::Py312, "SERC_TEST_PYTHON_312", "python3.12"),
+            (PythonVersion::Py313, "SERC_TEST_PYTHON_313", "python3.13"),
+            (PythonVersion::Py314, "SERC_TEST_PYTHON", "python3.14"),
+            (PythonVersion::Py315, "SERC_TEST_PYTHON_315", "python3.15"),
+        ] {
+            let python = std::env::var(variable).unwrap_or_else(|_| fallback.to_string());
+            verify_python(&python, version).unwrap();
+            for parent in ["neutral", "novel_marker"] {
+                if parent == "novel_marker" && version != PythonVersion::Py312 {
+                    continue;
+                }
+                let source = if parent == "novel_marker" {
+                    source.replace("'full'", "'path_sibling'")
+                } else {
+                    source.to_string()
+                };
+                let path = directory.path().join(parent).join("input.py");
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, &source).unwrap();
+                let output = Command::new(&python)
+                    .args(["-I", "-S", "-c", ORACLE])
+                    .arg(&path)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+                let mut options = CompileOptions {
+                    python_version: version,
+                    initial_intern_state: if version == PythonVersion::Py315 {
+                        serc::InitialInternState::default()
+                    } else {
+                        serc::InitialInternState::new(["full"])
+                    },
+                    ..CompileOptions::default()
+                };
+                let input = CompilerInput::Bytes(source.as_bytes().to_vec());
+                let fixed_snapshot =
+                    compile_module_input(&input, path.to_str().unwrap(), &options, None)
+                        .unwrap()
+                        .marshal();
+                if version == PythonVersion::Py312 && parent == "novel_marker" {
+                    assert_ne!(fixed_snapshot, output.stdout);
+                    options.initial_intern_state = options
+                        .initial_intern_state
+                        .with_additional_strings(["novel_marker"]);
+                } else {
+                    assert_eq!(fixed_snapshot, output.stdout, "{version}: {parent}");
+                }
+                let matched = compile_module_input(&input, path.to_str().unwrap(), &options, None)
+                    .unwrap()
+                    .marshal();
+                assert_eq!(matched, output.stdout, "{version}: {parent}");
+                if parent == "neutral"
+                    && matches!(version, PythonVersion::Py312 | PythonVersion::Py314)
+                {
+                    options.initial_intern_state = serc::InitialInternState::default();
+                    let startup =
+                        compile_module_input(&input, path.to_str().unwrap(), &options, None)
+                            .unwrap()
+                            .marshal();
+                    assert_ne!(startup, output.stdout, "{version}: {parent}");
+                }
+            }
         }
     }
 

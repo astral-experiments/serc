@@ -50,13 +50,32 @@ update. The 3.12, 3.13, and 3.15 gates pass source bytes to both compilers.
 
 ```console
 cargo run --release -p serc --example compare_cpython_corpus -- \
-  --python-version 3.14 --python /path/to/python3.14.5 --source-bytes --require-all path/to/corpus
+  --python-version 3.14 --python /path/to/python3.14.5 --source-bytes path/to/corpus
 ```
 
 The comparator rejects an oracle with the wrong implementation, release, or
-magic number, and rejects missing or empty corpus roots. `--require-all`
-requires at least one exact match and no failures on CPython-accepted inputs.
-Add `--require-rejection-parity` to require clean Serc rejections for every
+magic number, and rejects missing or empty corpus roots. Without an explicit
+caller-state profile, this is a diagnostic comparison using Serc's isolated
+startup state. The oracle imports `pathlib`, which can intern additional strings
+and change marshal sharing. A byte mismatch alone therefore does not establish a
+compiler regression. Exact counts still report observed byte equality.
+
+`--require-all` requires a validated
+[initial intern-state profile](../crates/serc/examples/support/initial-intern-profile.md)
+for the oracle caller, at least one exact match, and no failures on
+CPython-accepted inputs. Python 3.12 additionally requires
+`--caller-intern-model MODEL.json`, since `pathlib` interns the current
+filename's components; one fixed snapshot cannot describe different input paths.
+Profiles and models retain their documented assumptions: a captured process
+snapshot does not prove the absence or lifetime of every other interned string.
+The explicit `--caller-intern-assume-absent` override remains diagnostic.
+
+For an observed-byte regression check under startup assumptions, use
+`--require-all --diagnostic-startup-state`. The explicit diagnostic override
+preserves the accepted-input failure checks but does not establish that the
+caller's state matches. The Ruff baseline and limited mypy-primer checks use
+this mode; their expected counts and failure categories are unchanged. Add
+`--require-rejection-parity` to require clean Serc rejections for every
 CPython-rejected input. Use `--dump-mismatches DIR` to inspect failures;
 `--limit N` checks only a sorted prefix, not the complete corpus.
 

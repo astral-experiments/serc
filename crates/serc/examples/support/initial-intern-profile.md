@@ -47,3 +47,22 @@ establish consistency, not authorship or proof of observer correctness; retain
 reviewed extraction tooling and its evidence. A fixed profile does not establish
 initial absence for unknown entries or trace subsequent mortal-string lifetimes.
 Profiles are generated artifacts, not source-controlled corpus word lists.
+
+## Comparator admission
+
+`--require-all` requires this profile instead of silently using isolated startup
+state for the oracle's imported modules. On Python 3.12 it also requires
+`--caller-intern-model`, whose validated per-file state includes the current
+filename's retained path components. Merely supplying a profile or model path
+does not bypass artifact, runtime, or oracle validation.
+
+The explicit `--diagnostic-startup-state` override permits `--require-all` under
+startup assumptions and conflicts with profile/model inputs. It preserves all
+outcome checks, but does not establish caller-state compatibility.
+
+Comparisons without `--require-all` remain available for diagnostic counts and
+mismatch inspection. Their output states whether they use startup assumptions, a
+captured process snapshot, a per-file model, or an explicit absence assumption.
+Raw byte comparisons and failure categories are unchanged; these labels do not
+turn mismatches into matches or establish stronger claims than the supplied
+state's contract.
