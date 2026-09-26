@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Generate printable-character ranges from the pinned CPython source trees."""
 
+from __future__ import annotations
+
 import argparse
 import hashlib
-from pathlib import Path
 import re
 import subprocess
+from pathlib import Path
 
 TARGETS = (
     ("3.12.14", "2abcf904b8dac8c999d2b3aac76681abb333798a"),
