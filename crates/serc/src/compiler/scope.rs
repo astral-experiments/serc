@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hasher;
 use std::marker::PhantomData;
@@ -12,6 +12,7 @@ use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
 use ruff_python_ast::{Expr, ExprContext, Pattern, Stmt, StmtClassDef, StmtFunctionDef, TypeParam};
 use ruff_text_size::{Ranged, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
+use smallvec::SmallVec;
 
 use crate::target::code_flags::{CO_FUTURE_ANNOTATIONS, CO_FUTURE_BARRY_AS_BDFL};
 use crate::{CompileError, PythonVersion};
@@ -19,6 +20,11 @@ use crate::{CompileError, PythonVersion};
 use super::source::SourceAnalysis;
 use super::symbol::mangle_name;
 use super::{Compiler, SHADOWED_SUPER_SENTINEL, Scope};
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_GENERIC_SUSPENSION_SEARCH: Cell<bool> = const { Cell::new(false) };
+}
 
 impl Compiler<'_> {
     pub(super) fn scope_arena(&self) -> &ScopeArena {
@@ -203,14 +209,14 @@ impl Compiler<'_> {
         }
         freevars.sort_by_cached_key(|name| {
             let raw = self.resolve_name(*name);
-            let emitted = self.mangled_name(raw);
+            let emitted = self.mangled_name_cow(raw);
             let is_alias = raw != emitted;
             (emitted, is_alias)
         });
         let mut emitted_names = FxHashMap::default();
         let mut aliases = Vec::new();
         freevars.retain(|name| {
-            let emitted = self.mangled_name(self.resolve_name(*name));
+            let emitted = self.mangled_name_cow(self.resolve_name(*name));
             if let Some(&original) = emitted_names.get(&emitted) {
                 aliases.push((*name, original));
                 false
@@ -319,9 +325,48 @@ impl ShortNameKey {
     }
 }
 
-/// Remembers exact short spellings without hashing or probing the full interner again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MediumNameKey {
+    first: u64,
+    last: u64,
+    length: u8,
+}
+
+impl MediumNameKey {
+    #[inline]
+    fn new(name: &str) -> Option<Self> {
+        let bytes = name.as_bytes();
+        let length = bytes.len();
+        if !(9..=16).contains(&length) {
+            return None;
+        }
+        let first = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
+        let last = u64::from_ne_bytes(bytes[length - 8..].try_into().unwrap());
+        Some(Self {
+            first,
+            last,
+            length: u8::try_from(length).unwrap(),
+        })
+    }
+
+    #[inline]
+    fn slot(self) -> usize {
+        let mixed = self.first
+            ^ self.last.rotate_left(37)
+            ^ u64::from(self.length).wrapping_mul(0x517c_c1b7_2722_0a95);
+        usize::try_from(mixed.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - 7)).unwrap()
+    }
+}
+
+/// Remembers exact spellings without hashing or probing the full interner again.
 #[derive(Debug)]
-struct ShortNameCache(Box<[Cell<ShortNameEntry>; 128]>);
+struct ShortNameCache(Box<NameCaches>);
+
+#[derive(Debug)]
+struct NameCaches {
+    short: [Cell<ShortNameEntry>; 128],
+    medium: OnceCell<Box<[Cell<MediumNameEntry>; 128]>>,
+}
 
 #[derive(Clone, Copy, Debug)]
 struct ShortNameEntry {
@@ -330,24 +375,33 @@ struct ShortNameEntry {
     length: u8,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct MediumNameEntry {
+    first: u64,
+    last: u64,
+    id: Option<NameId>,
+    length: u8,
+}
+
 impl Default for ShortNameCache {
     fn default() -> Self {
-        Self(Box::new(
-            [const {
+        Self(Box::new(NameCaches {
+            short: [const {
                 Cell::new(ShortNameEntry {
                     packed: 0,
                     id: None,
                     length: 0,
                 })
             }; 128],
-        ))
+            medium: OnceCell::new(),
+        }))
     }
 }
 
 impl ShortNameCache {
     #[inline]
     fn get(&self, key: ShortNameKey) -> Option<NameId> {
-        let entry = self.0[key.slot()].get();
+        let entry = self.0.short[key.slot()].get();
         if entry.packed == key.packed && entry.length == key.length {
             entry.id
         } else {
@@ -357,8 +411,40 @@ impl ShortNameCache {
 
     #[inline]
     fn insert(&self, key: ShortNameKey, id: NameId) {
-        self.0[key.slot()].set(ShortNameEntry {
+        self.0.short[key.slot()].set(ShortNameEntry {
             packed: key.packed,
+            id: Some(id),
+            length: key.length,
+        });
+    }
+
+    #[inline]
+    fn get_medium(&self, key: MediumNameKey) -> Option<NameId> {
+        let entry = self.0.medium.get()?[key.slot()].get();
+        if entry.first == key.first && entry.last == key.last && entry.length == key.length {
+            entry.id
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn insert_medium(&self, key: MediumNameKey, id: NameId) {
+        let entries = self.0.medium.get_or_init(|| {
+            Box::new(
+                [const {
+                    Cell::new(MediumNameEntry {
+                        first: 0,
+                        last: 0,
+                        id: None,
+                        length: 0,
+                    })
+                }; 128],
+            )
+        });
+        entries[key.slot()].set(MediumNameEntry {
+            first: key.first,
+            last: key.last,
             id: Some(id),
             length: key.length,
         });
@@ -367,6 +453,7 @@ impl ShortNameCache {
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct NameSet {
+    // The last word, when present, is nonzero.
     words: Vec<u64>,
     aliases: Option<Rc<[(NameId, NameId)]>>,
 }
@@ -402,10 +489,16 @@ impl NameSet {
             .is_some_and(|word| word & (1 << (index % u64::BITS as usize)) != 0)
     }
 
+    pub(super) fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+
     pub(super) fn insert(&mut self, name: NameId) -> bool {
         let index = self.canonical(name).index();
         let word_index = index / u64::BITS as usize;
-        self.words.resize(self.words.len().max(word_index + 1), 0);
+        if word_index >= self.words.len() {
+            self.words.resize(word_index + 1, 0);
+        }
         let bit = 1 << (index % u64::BITS as usize);
         let inserted = self.words[word_index] & bit == 0;
         self.words[word_index] |= bit;
@@ -414,12 +507,19 @@ impl NameSet {
 
     pub(super) fn remove(&mut self, name: NameId) -> bool {
         let index = self.canonical(name).index();
-        let Some(word) = self.words.get_mut(index / u64::BITS as usize) else {
+        let word_index = index / u64::BITS as usize;
+        let word_count = self.words.len();
+        let Some(word) = self.words.get_mut(word_index) else {
             return false;
         };
         let bit = 1 << (index % u64::BITS as usize);
         let removed = *word & bit != 0;
         *word &= !bit;
+        if *word == 0 && word_index + 1 == word_count {
+            while self.words.last() == Some(&0) {
+                self.words.pop();
+            }
+        }
         removed
     }
 
@@ -427,12 +527,18 @@ impl NameSet {
         self.words
             .iter()
             .enumerate()
-            .flat_map(|(word_index, word)| {
-                (0..u64::BITS)
-                    .filter(move |bit| word & (1 << bit) != 0)
-                    .map(move |bit| {
-                        NameId::from_usize(word_index * u64::BITS as usize + bit as usize)
-                    })
+            .flat_map(|(word_index, &word)| {
+                let mut remaining = word;
+                std::iter::from_fn(move || {
+                    if remaining == 0 {
+                        return None;
+                    }
+                    let bit = remaining.trailing_zeros();
+                    remaining &= remaining - 1;
+                    Some(NameId::from_usize(
+                        word_index * u64::BITS as usize + bit as usize,
+                    ))
+                })
             })
     }
 }
@@ -524,37 +630,47 @@ impl NameInterner {
         });
         if let Some(key) = ShortNameKey::new(&name) {
             self.short_names.insert(key, id);
+        } else if let Some(key) = MediumNameKey::new(&name) {
+            self.short_names.insert_medium(key, id);
         }
         self.names.push(name);
         id
     }
 
     pub(super) fn get(&self, name: &str) -> Option<NameId> {
-        let short = ShortNameKey::new(name);
-        if let Some(id) = short.and_then(|key| self.short_names.get(key)) {
+        if let Some(key) = ShortNameKey::new(name) {
+            if let Some(id) = self.short_names.get(key) {
+                return Some(id);
+            }
+            let id = self.get_uncached(name)?;
+            self.short_names.insert(key, id);
             return Some(id);
         }
+        if let Some(key) = MediumNameKey::new(name) {
+            if let Some(id) = self.short_names.get_medium(key) {
+                return Some(id);
+            }
+            let id = self.get_uncached(name)?;
+            self.short_names.insert_medium(key, id);
+            return Some(id);
+        }
+        self.get_uncached(name)
+    }
+
+    fn get_uncached(&self, name: &str) -> Option<NameId> {
         if !self.seed_names.is_empty()
             && let Some(id) = Self::seed_id(name)
         {
-            if let Some(key) = short {
-                self.short_names.insert(key, id);
-            }
             return Some(id);
         }
         if self.reverse.is_empty() {
             return None;
         }
-        let id = self
-            .reverse
+        self.reverse
             .find(Self::hash(name), |id| {
                 self.names[id.index() - self.seed_names.len()] == name
             })
-            .copied();
-        if let (Some(key), Some(id)) = (short, id) {
-            self.short_names.insert(key, id);
-        }
-        id
+            .copied()
     }
 
     fn hash(name: &str) -> u64 {
@@ -749,6 +865,55 @@ impl FunctionPlan {
                 self.required.insert(name);
             }
         }
+    }
+
+    /// Header annotations are analyzed separately from a nongeneric function's runtime body.
+    fn annotation_references(
+        definition: &StmtFunctionDef,
+        private_name: Option<&str>,
+    ) -> FxHashSet<String> {
+        let annotation_required = |expression: &Expr| {
+            private_name.map_or_else(
+                || expression_required_names(expression),
+                |private_name| {
+                    contextual_expression_requirements(
+                        expression,
+                        &|name| mangle_name(name, Some(private_name)).into_owned(),
+                        expression_required_names,
+                    )
+                },
+            )
+        };
+        let mut annotation_references = FxHashSet::default();
+        for parameter in definition
+            .parameters
+            .posonlyargs
+            .iter()
+            .chain(&definition.parameters.args)
+        {
+            if let Some(annotation) = parameter.parameter.annotation.as_deref() {
+                annotation_references.extend(annotation_required(annotation));
+            }
+        }
+        if let Some(parameter) = &definition.parameters.vararg
+            && let Some(annotation) = parameter.annotation.as_deref()
+        {
+            annotation_references.extend(annotation_required(annotation));
+        }
+        for parameter in &definition.parameters.kwonlyargs {
+            if let Some(annotation) = parameter.parameter.annotation.as_deref() {
+                annotation_references.extend(annotation_required(annotation));
+            }
+        }
+        if let Some(parameter) = &definition.parameters.kwarg
+            && let Some(annotation) = parameter.annotation.as_deref()
+        {
+            annotation_references.extend(annotation_required(annotation));
+        }
+        if let Some(annotation) = definition.returns.as_deref() {
+            annotation_references.extend(annotation_required(annotation));
+        }
+        annotation_references
     }
 
     fn build(
@@ -960,49 +1125,11 @@ impl FunctionPlan {
             }
         }
 
-        let annotation_required = |expression: &Expr| {
-            private_name.map_or_else(
-                || expression_required_names(expression),
-                |private_name| {
-                    contextual_expression_requirements(
-                        expression,
-                        &|name| mangle_name(name, Some(private_name)).into_owned(),
-                        expression_required_names,
-                    )
-                },
-            )
+        let annotation_references = if future_annotations {
+            FxHashSet::default()
+        } else {
+            Self::annotation_references(definition, private_name)
         };
-        let mut annotation_references = FxHashSet::default();
-        if !future_annotations {
-            for parameter in definition
-                .parameters
-                .posonlyargs
-                .iter()
-                .chain(&definition.parameters.args)
-            {
-                if let Some(annotation) = parameter.parameter.annotation.as_deref() {
-                    annotation_references.extend(annotation_required(annotation));
-                }
-            }
-            if let Some(parameter) = &definition.parameters.vararg
-                && let Some(annotation) = parameter.annotation.as_deref()
-            {
-                annotation_references.extend(annotation_required(annotation));
-            }
-            for parameter in &definition.parameters.kwonlyargs {
-                if let Some(annotation) = parameter.parameter.annotation.as_deref() {
-                    annotation_references.extend(annotation_required(annotation));
-                }
-            }
-            if let Some(parameter) = &definition.parameters.kwarg
-                && let Some(annotation) = parameter.annotation.as_deref()
-            {
-                annotation_references.extend(annotation_required(annotation));
-            }
-            if let Some(annotation) = definition.returns.as_deref() {
-                annotation_references.extend(annotation_required(annotation));
-            }
-        }
 
         if locals.annotation_only.contains("__class__") && !explicit_dunder_class_reference {
             references.remove("__class__");
@@ -1715,6 +1842,7 @@ pub(super) struct ModulePlan {
     pub(super) comprehension_cell_names: NameSet,
     pub(super) has_annotations: bool,
     pub(super) has_simple_annotations: bool,
+    has_suspension_expressions: bool,
     yield_offsets: Vec<TextSize>,
 }
 
@@ -1725,10 +1853,20 @@ struct ModulePlanBuilder {
     comprehension_cell_names: FxHashSet<String>,
     has_annotations: bool,
     has_simple_annotations: bool,
+    has_suspension_expressions: bool,
     yield_offsets: Vec<TextSize>,
 }
 
 impl ModulePlan {
+    /// The scope-aware suspension walker can succeed only for an `await` or async comprehension.
+    pub(super) fn has_suspension_expressions(&self) -> bool {
+        #[cfg(test)]
+        if FORCE_GENERIC_SUSPENSION_SEARCH.get() {
+            return true;
+        }
+        self.has_suspension_expressions
+    }
+
     /// Statement ranges include nested definition decorators and headers. Nested bodies can produce
     /// false positives; the scope-aware walk remains authoritative.
     pub(super) fn may_contain_yield(&self, body: &[Stmt]) -> bool {
@@ -1794,6 +1932,7 @@ impl ModulePlan {
                 .collect(),
             has_annotations: facts.has_annotations,
             has_simple_annotations: facts.has_simple_annotations,
+            has_suspension_expressions: facts.has_suspension_expressions,
             yield_offsets: facts.yield_offsets,
         }
     }
@@ -1955,9 +2094,17 @@ impl ScopeArena {
         future_annotations: bool,
         private_name: Option<&str>,
     ) {
-        // Flat functions have no closure, annotation, or evaluation-order edge cases. Their
-        // bindings and references were already collected during the module-wide name walk.
+        // Flat bodies have no closure or evaluation-order edge cases. Their runtime bindings
+        // were already collected; a nongeneric function's own annotations are separate.
         if let Some(inputs) = flat {
+            let annotation_references = if inputs.has_annotations && !future_annotations {
+                self.names.intern_set(FunctionPlan::annotation_references(
+                    definition,
+                    private_name,
+                ))
+            } else {
+                FxHashSet::default()
+            };
             if private_name.is_none()
                 || !inputs.names.iter().any(|(name, _)| {
                     mangle_name(self.names.resolve(*name), private_name)
@@ -1974,8 +2121,11 @@ impl ScopeArena {
                         required.insert(name);
                     }
                 }
+                let lexical_bindings = locals.iter().copied().collect();
                 self.nodes[id].plan = ScopePlan::Function(FunctionPlan {
                     locals,
+                    lexical_bindings,
+                    annotation_references,
                     required,
                     ..FunctionPlan::default()
                 });
@@ -2025,9 +2175,20 @@ impl ScopeArena {
                         .then(|| (self.names.get(&alias).expect("alias is interned"), original))
                 })
                 .collect();
+            let lexical_bindings = locals
+                .iter()
+                .map(|name| {
+                    let spelling = mangle_name(self.names.resolve(*name), private_name);
+                    self.names
+                        .get(&spelling)
+                        .expect("canonical local names are interned")
+                })
+                .collect();
             self.nodes[id].plan = ScopePlan::Function(FunctionPlan {
                 locals,
                 local_aliases,
+                lexical_bindings,
+                annotation_references,
                 required,
                 ..FunctionPlan::default()
             });
@@ -2303,6 +2464,7 @@ struct FlatFunctionInputs {
     // entry without moving it, matching CPython's load-before-store local ordering.
     names: Vec<(NameId, bool)>,
     name_positions: Option<FxHashMap<NameId, usize>>,
+    has_annotations: bool,
     complex: bool,
 }
 
@@ -2510,15 +2672,17 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
                 });
                 self.current_scope = scope;
                 let outer_flat = self.flat_function.take();
+                let generic = definition.type_params.is_some();
                 let mut flat = FlatFunctionInputs {
                     names: Vec::with_capacity(8),
                     name_positions: None,
-                    complex: definition.type_params.is_some()
-                        || definition.returns.is_some()
-                        || definition
-                            .parameters
-                            .iter()
-                            .any(|parameter| parameter.annotation().is_some()),
+                    has_annotations: !generic
+                        && (definition.returns.is_some()
+                            || definition
+                                .parameters
+                                .iter()
+                                .any(|parameter| parameter.annotation().is_some())),
+                    complex: generic,
                 };
                 for parameter in parameters_in_locals_order(&definition.parameters) {
                     flat.record(self.intern(parameter.name.as_str()), true);
@@ -2773,6 +2937,22 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_, 'ast> {
 
         if matches!(expression, Expr::Yield(_) | Expr::YieldFrom(_)) {
             self.facts.yield_offsets.push(expression.start());
+        }
+        if !self.facts.has_suspension_expressions {
+            let generators = match expression {
+                Expr::Await(_) => {
+                    self.facts.has_suspension_expressions = true;
+                    None
+                }
+                Expr::ListComp(comprehension) => Some(&comprehension.generators[..]),
+                Expr::SetComp(comprehension) => Some(&comprehension.generators[..]),
+                Expr::DictComp(comprehension) => Some(&comprehension.generators[..]),
+                _ => None,
+            };
+            if let Some(generators) = generators {
+                self.facts.has_suspension_expressions |=
+                    generators.iter().any(|generator| generator.is_async);
+            }
         }
         self.requires_module_bindings |= (self.nested_scope_depth == 0 || self.in_module_header)
             && matches!(
@@ -3062,6 +3242,18 @@ struct LocalCollector {
     legacy_class_comprehension_symbols: Option<Vec<(Name, bool)>>,
 }
 
+/// Returns the only other spelling with the same private symbol identity.
+fn private_name_alias<'name>(name: &'name str, private_name: &str) -> Option<Cow<'name, str>> {
+    match mangle_name(name, Some(private_name)) {
+        Cow::Owned(canonical) => Some(Cow::Owned(canonical)),
+        Cow::Borrowed(_) => name
+            .strip_prefix('_')
+            .and_then(|name| name.strip_prefix(private_name.trim_start_matches('_')))
+            .filter(|raw| mangle_name(raw, Some(private_name)) == name)
+            .map(Cow::Borrowed),
+    }
+}
+
 fn reorder_comprehension_fast_cells<T>(
     locals: &mut Vec<T>,
     fast_cells: &[T],
@@ -3279,17 +3471,14 @@ impl LocalCollector {
     fn claim_annotation_only_position(&mut self, name: &str) {
         // A no-value function annotation emits no fast-local operation in CPython. Keep its
         // symbol-table position provisional until the first runtime load or binding claims it.
+        if self.annotation_only.is_empty() {
+            return;
+        }
         let annotation = if self.annotation_only.contains(name) {
             Name::new(name)
         } else if let Some(private_name) = self.private_name.as_deref() {
-            let canonical = mangle_name(name, Some(private_name));
-            let Some(annotation) = self
-                .names
-                .iter()
-                .find(|candidate| {
-                    self.annotation_only.contains(*candidate)
-                        && mangle_name(candidate, Some(private_name)) == canonical
-                })
+            let Some(annotation) = private_name_alias(name, private_name)
+                .and_then(|alias| self.annotation_only.get(alias.as_ref()))
                 .cloned()
             else {
                 return;
@@ -3312,15 +3501,17 @@ impl LocalCollector {
         let Some(candidate_bindings) = self.candidate_bindings.take() else {
             return;
         };
+        debug_assert_eq!(candidate_bindings.len(), self.names.len());
         if let Some(private_name) = self.private_name.as_deref() {
-            let bound: FxHashSet<_> = self
-                .names
-                .iter()
-                .filter(|name| candidate_bindings[*name])
-                .map(|name| mangle_name(name, Some(private_name)).into_owned())
-                .collect();
-            self.names
-                .retain(|name| bound.contains(mangle_name(name, Some(private_name)).as_ref()));
+            self.names.retain(|name| {
+                candidate_bindings[name]
+                    || private_name_alias(name, private_name).is_some_and(|alias| {
+                        candidate_bindings
+                            .get(alias.as_ref())
+                            .copied()
+                            .unwrap_or_default()
+                    })
+            });
         } else {
             self.names.retain(|name| candidate_bindings[name]);
         }
@@ -3691,12 +3882,47 @@ struct NamedExpressionCollector<'a> {
     ignored_candidate_loads: FxHashSet<Name>,
 }
 
+/// Scope collectors ignore attribute spellings and expression contexts along the chain.
+#[inline]
+fn attribute_base(attribute: &ruff_python_ast::ExprAttribute) -> &Expr {
+    let mut base = attribute.value.as_ref();
+    while let Expr::Attribute(attribute) = base {
+        base = attribute.value.as_ref();
+    }
+    base
+}
+
 impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
     fn visit_expr(&mut self, expression: &'ast Expr) {
         if crate::stack_growth_required() {
             return crate::grow_stack(|| self.visit_expr(expression));
         }
 
+        match expression {
+            Expr::Name(name) => {
+                if self.collect_known_loads && name.ctx == ExprContext::Load {
+                    if let Some(references_super) = &mut self.collector.module_references_super {
+                        *references_super |= name.id.as_str() == "super";
+                    }
+                    if !self.ignored_candidate_loads.contains(name.id.as_str()) {
+                        self.collector.insert_candidate(name.id.as_str());
+                    }
+                }
+                return;
+            }
+            Expr::Attribute(attribute) => {
+                self.visit_expr(attribute_base(attribute));
+                return;
+            }
+            Expr::StringLiteral(_)
+            | Expr::BytesLiteral(_)
+            | Expr::NumberLiteral(_)
+            | Expr::BooleanLiteral(_)
+            | Expr::NoneLiteral(_)
+            | Expr::EllipsisLiteral(_)
+            | Expr::IpyEscapeCommand(_) => return,
+            _ => {}
+        }
         if let Expr::Lambda(lambda) = expression {
             visit_lambda_defaults(self, lambda);
             return;
@@ -3729,17 +3955,6 @@ impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
             }
             self.collector.collect_target(&named.target);
             return;
-        }
-        if self.collect_known_loads
-            && let Expr::Name(name) = expression
-            && name.ctx == ExprContext::Load
-        {
-            if let Some(references_super) = &mut self.collector.module_references_super {
-                *references_super |= name.id.as_str() == "super";
-            }
-            if !self.ignored_candidate_loads.contains(name.id.as_str()) {
-                self.collector.insert_candidate(name.id.as_str());
-            }
         }
         let generators = match expression {
             Expr::ListComp(comprehension) => Some(&comprehension.generators[..]),
@@ -3924,7 +4139,7 @@ enum ScopeBodyContext {
 struct ScopeBodyFactsCollector<'ast> {
     facts: ScopeBodyFacts,
     references: FxHashSet<&'ast str>,
-    outside_inlined_comprehension_references: Option<FxHashSet<String>>,
+    outside_inlined_comprehension_references: Option<FxHashSet<Cow<'ast, str>>>,
     skip_annotations: bool,
     collect_function_scope_facts: bool,
     eager_function_annotations: bool,
@@ -3995,7 +4210,10 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
             .collect();
         collector.facts.outside_inlined_comprehension_references = collector
             .outside_inlined_comprehension_references
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .map(Cow::into_owned)
+            .collect();
         if collect_function_scope_facts {
             // A nonlocal declaration establishes an own-scope free symbol even if
             // every use occurs under an inlined comprehension target.
@@ -4443,7 +4661,7 @@ impl<'ast> ScopeBodyFactsCollector<'ast> {
         if self.inlined_comprehension_depth == 0
             && let Some(references) = &mut self.outside_inlined_comprehension_references
         {
-            references.insert(name.to_string());
+            references.insert(Cow::Borrowed(name));
         }
         if name == "super" {
             self.references.insert("__class__");
@@ -4546,6 +4764,26 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
             return crate::grow_stack(|| self.visit_expr(expression));
         }
 
+        match expression {
+            Expr::Name(name) => {
+                if name.ctx == ExprContext::Load {
+                    self.insert_reference(name.id.as_str());
+                }
+                return;
+            }
+            Expr::Attribute(attribute) => {
+                self.visit_expr(attribute_base(attribute));
+                return;
+            }
+            Expr::StringLiteral(_)
+            | Expr::BytesLiteral(_)
+            | Expr::NumberLiteral(_)
+            | Expr::BooleanLiteral(_)
+            | Expr::NoneLiteral(_)
+            | Expr::EllipsisLiteral(_)
+            | Expr::IpyEscapeCommand(_) => return,
+            _ => {}
+        }
         if self.collect_function_scope_facts
             && let Expr::Dict(dictionary) = expression
         {
@@ -4661,7 +4899,7 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
                             .references
                             .iter()
                             .copied()
-                            .map(str::to_string)
+                            .map(Cow::Borrowed)
                             .collect::<FxHashSet<_>>();
                         if !self.facts.explicit_dunder_class_reference {
                             references.remove("__class__");
@@ -4690,7 +4928,7 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
                                 self.outside_inlined_comprehension_references
                                     .as_mut()
                                     .expect("inlined comprehension references are initialized")
-                                    .insert(name);
+                                    .insert(Cow::Owned(name));
                             }
                         }
                     }
@@ -4740,12 +4978,6 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
             }
         }
 
-        if let Expr::Name(name) = expression
-            && name.ctx == ExprContext::Load
-        {
-            self.insert_reference(name.id.as_str());
-        }
-
         let is_generator = matches!(expression, Expr::Generator(_));
         if is_generator {
             self.generator_depth += 1;
@@ -4770,6 +5002,32 @@ impl<'ast> Visitor<'ast> for ReferenceCollector {
             return crate::grow_stack(|| self.visit_expr(expression));
         }
 
+        match expression {
+            Expr::Name(name) => {
+                if name.ctx == ExprContext::Load {
+                    let spelling = name.id.as_str();
+                    if !self.references.contains(spelling) {
+                        self.references.insert(spelling.to_string());
+                    }
+                    if spelling == "super" && !self.references.contains("__class__") {
+                        self.references.insert("__class__".to_string());
+                    }
+                }
+                return;
+            }
+            Expr::Attribute(attribute) => {
+                self.visit_expr(attribute_base(attribute));
+                return;
+            }
+            Expr::StringLiteral(_)
+            | Expr::BytesLiteral(_)
+            | Expr::NumberLiteral(_)
+            | Expr::BooleanLiteral(_)
+            | Expr::NoneLiteral(_)
+            | Expr::EllipsisLiteral(_)
+            | Expr::IpyEscapeCommand(_) => return,
+            _ => {}
+        }
         if let Expr::Lambda(lambda) = expression {
             visit_lambda_defaults(self, lambda);
             return;
@@ -4796,24 +5054,16 @@ impl<'ast> Visitor<'ast> for ReferenceCollector {
             }
             return;
         }
-        if let Expr::Name(name) = expression {
-            if name.ctx == ExprContext::Load {
-                self.references.insert(name.id.as_str().to_string());
-                if name.id.as_str() == "super" {
-                    self.references.insert("__class__".to_string());
-                }
-            }
-        }
         walk_expr(self, expression);
     }
 }
 
 /// Returns the names loaded by an expression only if it has no conditional evaluation.
-pub(super) fn definitely_evaluated_references(expression: &Expr) -> Option<FxHashSet<&str>> {
+pub(super) fn definitely_evaluated_references(expression: &Expr) -> Option<SmallVec<[&str; 4]>> {
     #[derive(Default)]
     struct Collector<'ast> {
         conditional: bool,
-        references: FxHashSet<&'ast str>,
+        references: SmallVec<[&'ast str; 4]>,
     }
 
     impl<'ast> Visitor<'ast> for Collector<'ast> {
@@ -4837,9 +5087,9 @@ pub(super) fn definitely_evaluated_references(expression: &Expr) -> Option<FxHas
                 Expr::Name(name) => {
                     if name.ctx == ExprContext::Load {
                         let name = name.id.as_str();
-                        self.references.insert(name);
+                        self.references.push(name);
                         if name == "super" {
-                            self.references.insert("__class__");
+                            self.references.push("__class__");
                         }
                     }
                 }
@@ -4850,7 +5100,12 @@ pub(super) fn definitely_evaluated_references(expression: &Expr) -> Option<FxHas
 
     let mut collector = Collector::default();
     collector.visit_expr(expression);
-    (!collector.conditional).then_some(collector.references)
+    if collector.conditional {
+        return None;
+    }
+    collector.references.sort_unstable();
+    collector.references.dedup();
+    Some(collector.references)
 }
 
 pub(super) struct LambdaScopeAnalysis {
@@ -5310,6 +5565,9 @@ fn colliding_private_spellings(
     spellings: &BTreeSet<String>,
     mangle: &impl Fn(&str) -> String,
 ) -> FxHashMap<String, String> {
+    if spellings.len() < 2 {
+        return FxHashMap::default();
+    }
     let mut counts: FxHashMap<String, usize> = FxHashMap::default();
     for spelling in spellings {
         *counts.entry(mangle(spelling)).or_default() += 1;
@@ -6594,7 +6852,7 @@ pub(super) fn collect_self_iterated_nested_comprehension_targets(
                     self.names.extend(
                         targets
                             .into_iter()
-                            .filter(|name| references.contains(name.as_str())),
+                            .filter(|name| references.binary_search(&name.as_str()).is_ok()),
                     );
                 }
             }
@@ -7408,9 +7666,179 @@ mod tests {
     use super::super::statement::function_body_contains_yield;
     use super::{
         FlatFunctionInputs, FunctionPlan, LocalCollector, ModuleNameCollector, NameId,
-        NameInterner, SCOPE_SEED_NAMES, ScopeArena, ScopeDefinition, ScopeId,
+        NameInterner, NameSet, SCOPE_SEED_NAMES, ScopeArena, ScopeDefinition, ScopeId,
         definitely_evaluated_references, has_annotations,
     };
+
+    #[test]
+    fn module_suspension_certificate_matches_forced_scope_walk_for_all_targets() {
+        struct ResetGeneric(bool);
+
+        impl Drop for ResetGeneric {
+            fn drop(&mut self) {
+                super::FORCE_GENERIC_SUSPENSION_SEARCH.set(self.0);
+            }
+        }
+
+        let sources = [
+            (
+                r"
+def pure(values, manager):
+    if check(values, manager.field):
+        assert other(values)
+    while check(values):
+        if stop(values):
+            break
+    try:
+        return [item.field for item in values if guard(item)]
+    except Error:
+        return None
+    finally:
+        cleanup(manager)
+def generator(values):
+    yield from values
+",
+                false,
+            ),
+            (
+                r"
+def lazy(values):
+    return (item async for item in values)
+",
+                false,
+            ),
+            (
+                r"
+async def active(values, manager):
+    if await check(values):
+        assert await other(manager)
+    while await check(values):
+        if stop(values):
+            break
+    try:
+        return await finish(values)
+    except Error:
+        return None
+    finally:
+        await cleanup(manager)
+",
+                true,
+            ),
+            (
+                r"
+async def only_async_comprehensions(values):
+    first = [item async for item in values]
+    second = {item async for item in values}
+    third = {item: item async for item in values}
+    return first, second, third
+",
+                true,
+            ),
+            (
+                r"
+def ordinary(values):
+    if check(values):
+        return values
+    async def nested():
+        return (item for item in await consume(values))
+    return nested
+",
+                true,
+            ),
+        ];
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let options = crate::CompileOptions {
+                python_version,
+                ..crate::CompileOptions::default()
+            };
+            for (source, expected) in sources {
+                let parsed = parse_module(source).unwrap();
+                let arena = ScopeArena::analyze_with_python_version(parsed.suite(), python_version);
+                assert_eq!(arena.module().has_suspension_expressions, expected);
+                let fast = crate::compile_with_options(source, "suspension.py", &options).unwrap();
+                let generic = {
+                    let _reset = ResetGeneric(super::FORCE_GENERIC_SUSPENSION_SEARCH.replace(true));
+                    crate::compile_with_options(source, "suspension.py", &options).unwrap()
+                };
+                assert_eq!(
+                    format!("{:?}", fast.code),
+                    format!("{:?}", generic.code),
+                    "{python_version:?}: {source}"
+                );
+                assert_eq!(fast.marshal(), generic.marshal(), "{python_version:?}");
+                let source_size = u32::try_from(source.len()).unwrap();
+                assert_eq!(
+                    fast.to_timestamp_pyc(17, source_size),
+                    generic.to_timestamp_pyc(17, source_size),
+                    "{python_version:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_name_sets_keep_ascending_order_and_recognize_cleared_words() {
+        let ids = [0, 1, 63, 64, 127, 128, 1023, 2048].map(NameId::from_usize);
+        let mut names = NameSet::default();
+        assert!(names.is_empty());
+        assert!(names.iter_unordered().next().is_none());
+
+        for &id in ids.iter().rev() {
+            assert!(names.insert(id));
+            assert!(!names.insert(id));
+        }
+        assert!(!names.is_empty());
+        assert_eq!(names.iter_unordered().collect::<Vec<_>>(), ids);
+
+        for index in [0, 1, 3, 6] {
+            assert!(names.remove(ids[index]));
+        }
+        assert_eq!(names.words.len(), 33);
+        assert_eq!(
+            names.iter_unordered().collect::<Vec<_>>(),
+            [ids[2], ids[4], ids[5], ids[7]]
+        );
+
+        assert!(names.remove(ids[7]));
+        assert_eq!(names.words.len(), 3);
+        assert!(!names.remove(ids[7]));
+        for index in [2, 4, 5] {
+            assert!(names.remove(ids[index]));
+        }
+        assert!(names.is_empty());
+        assert!(names.words.is_empty());
+        assert!(names.iter_unordered().next().is_none());
+        assert!(names.insert(ids[5]));
+        assert_eq!(names.iter_unordered().collect::<Vec<_>>(), [ids[5]]);
+    }
+
+    #[test]
+    fn aliased_name_sets_trim_the_canonical_last_word() {
+        let low = NameId::from_usize(2);
+        let high = NameId::from_usize(2048);
+        let aliases: std::rc::Rc<[(NameId, NameId)]> = std::rc::Rc::from([(low, high)]);
+        let mut names = NameSet::from_iter([low]).with_aliases(Some(&aliases));
+        assert!(names.contains(low));
+        assert!(names.contains(high));
+        assert_eq!(names.words.len(), 33);
+        assert!(names.remove(low));
+        assert!(names.is_empty());
+        assert!(!names.remove(high));
+        assert!(names.insert(high));
+        assert!(names.remove(low));
+        assert!(names.is_empty());
+
+        let aliases: std::rc::Rc<[(NameId, NameId)]> = std::rc::Rc::from([(high, low)]);
+        let mut names = NameSet::from_iter([high]).with_aliases(Some(&aliases));
+        assert_eq!(names.words.len(), 1);
+        assert!(names.remove(high));
+        assert!(names.is_empty());
+    }
 
     #[test]
     fn indexed_yields_match_the_exact_scope_walk_for_all_target_versions() {
@@ -7810,6 +8238,145 @@ def trailing():
     }
 
     #[test]
+    fn annotation_local_claims_match_ordered_private_alias_lookup() {
+        use ruff_python_ast::name::Name;
+
+        const SPELLINGS: &[&str] = &[
+            "ordinary",
+            "other",
+            "__slot",
+            "_C__slot",
+            "_Ω__slot",
+            "_C__Nested__slot",
+            "__slot__",
+            "_C__slot__",
+            "__slot.member",
+            "_C__slot.member",
+            "___slot",
+            "_C___slot",
+            "_Other__slot",
+            "_C__",
+            "__",
+        ];
+
+        for private_name in [
+            None,
+            Some("C"),
+            Some("_C"),
+            Some("__"),
+            Some("Ω"),
+            Some("C__Nested"),
+        ] {
+            for annotations in
+                std::iter::once(SPELLINGS).chain(SPELLINGS.iter().map(std::slice::from_ref))
+            {
+                for reverse in [false, true] {
+                    let mut collector = LocalCollector {
+                        names: SPELLINGS.iter().map(Name::new).collect(),
+                        annotation_only: annotations.iter().map(Name::new).collect(),
+                        private_name: private_name.map(str::to_owned),
+                        ..LocalCollector::default()
+                    };
+                    let mut expected_names = collector.names.clone();
+                    let mut expected_annotations = collector.annotation_only.clone();
+                    let mut claimed = SPELLINGS.to_vec();
+                    if reverse {
+                        claimed.reverse();
+                    }
+                    for name in claimed {
+                        let annotation = if expected_annotations.contains(name) {
+                            Some(Name::new(name))
+                        } else if let Some(private_name) = private_name {
+                            let canonical = super::mangle_name(name, Some(private_name));
+                            expected_names
+                                .iter()
+                                .find(|candidate| {
+                                    expected_annotations.contains(*candidate)
+                                        && super::mangle_name(candidate, Some(private_name))
+                                            == canonical
+                                })
+                                .cloned()
+                        } else {
+                            None
+                        };
+                        if let Some(annotation) = annotation {
+                            expected_annotations.remove(&annotation);
+                            let index = expected_names
+                                .iter()
+                                .position(|name| *name == annotation)
+                                .unwrap();
+                            let annotation = expected_names.remove(index);
+                            expected_names.push(annotation);
+                        }
+
+                        collector.claim_annotation_only_position(name);
+                        assert_eq!(collector.names, expected_names, "{private_name:?}, {name}");
+                        assert_eq!(
+                            collector.annotation_only, expected_annotations,
+                            "{private_name:?}, {name}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn private_local_retention_matches_complete_mangled_binding_set() {
+        use ruff_python_ast::name::Name;
+
+        const SPELLINGS: &[&str] = &[
+            "ordinary",
+            "__slot",
+            "_C__slot",
+            "_Ω__slot",
+            "_C__Nested__slot",
+            "__slot__",
+            "_C__slot__",
+            "__slot.member",
+            "_C__slot.member",
+        ];
+
+        for private_name in [
+            None,
+            Some("C"),
+            Some("_C"),
+            Some("__"),
+            Some("Ω"),
+            Some("C__Nested"),
+        ] {
+            for bound_mask in 0..1_u32 << SPELLINGS.len() {
+                let names: Vec<_> = SPELLINGS.iter().map(Name::new).collect();
+                let candidate_bindings: FxHashMap<_, _> = names
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| (name.clone(), bound_mask & (1 << index) != 0))
+                    .collect();
+                let bound: FxHashSet<_> = names
+                    .iter()
+                    .filter(|name| candidate_bindings[*name])
+                    .map(|name| super::mangle_name(name, private_name).into_owned())
+                    .collect();
+                let expected: Vec<_> = names
+                    .iter()
+                    .filter(|name| bound.contains(super::mangle_name(name, private_name).as_ref()))
+                    .cloned()
+                    .collect();
+                let mut collector = LocalCollector {
+                    names,
+                    candidate_bindings: Some(candidate_bindings),
+                    private_name: private_name.map(str::to_owned),
+                    ..LocalCollector::default()
+                };
+
+                collector.retain_bindings();
+
+                assert_eq!(collector.names, expected, "{private_name:?}, {bound_mask}");
+            }
+        }
+    }
+
+    #[test]
     fn legacy_local_annotations_preserve_symbol_captures_without_runtime_slots() {
         for version in [PythonVersion::Py312, PythonVersion::Py313] {
             for future in [false, true] {
@@ -7943,11 +8510,42 @@ def trailing():
                 panic!("expected one expression statement");
             };
             assert_eq!(
-                definitely_evaluated_references(&statement.value),
+                definitely_evaluated_references(&statement.value)
+                    .map(|names| names.into_iter().collect::<FxHashSet<_>>()),
                 Some(expected.iter().copied().collect()),
                 "source:\n{source}"
             );
         }
+    }
+
+    #[test]
+    fn definitely_evaluated_references_deduplicate_across_inline_and_spilled_storage() {
+        let source = "root(first, second, first, third, fourth, fifth, second, super, __class__)";
+        let parsed = parse_module(source).unwrap();
+        let [ruff_python_ast::Stmt::Expr(statement)] = parsed.suite().as_slice() else {
+            panic!("expected one expression statement");
+        };
+        let names = definitely_evaluated_references(&statement.value).unwrap();
+        assert_eq!(
+            names.as_slice(),
+            [
+                "__class__",
+                "fifth",
+                "first",
+                "fourth",
+                "root",
+                "second",
+                "super",
+                "third"
+            ]
+        );
+
+        let conditional =
+            parse_module("root(first, second, third, fourth, fifth, left and right)").unwrap();
+        let [ruff_python_ast::Stmt::Expr(statement)] = conditional.suite().as_slice() else {
+            panic!("expected one expression statement");
+        };
+        assert!(definitely_evaluated_references(&statement.value).is_none());
     }
 
     #[test]
@@ -7973,6 +8571,72 @@ def trailing():
                 None,
                 "source:\n{source}"
             );
+        }
+    }
+
+    #[test]
+    fn scope_visitors_keep_only_attribute_bases_and_visit_interpolated_values() {
+        let source = r"
+def function():
+    result = receiver.first.second
+    other = factory(argument).third.fourth
+    assigned.inner.final = before
+    del deleted.inner.final
+    values = [target.attr.chain for target in iterable.attr.chain if guard.attr.chain]
+    callback = lambda bound=default.attr.chain: skipped.attr.chain
+    ('plain' 'literal', b'bytes', 10, True, None, ...)
+    return f'{formatted.inner.last} {super().method.attribute}'
+";
+        let parsed = parse_module(source).unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!("expected one function");
+        };
+        let expected = [
+            "receiver",
+            "factory",
+            "argument",
+            "assigned",
+            "before",
+            "deleted",
+            "target",
+            "iterable",
+            "guard",
+            "default",
+            "formatted",
+            "super",
+            "__class__",
+        ];
+        let owned = || {
+            expected
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<FxHashSet<_>>()
+        };
+
+        let facts = super::ScopeBodyFacts::for_function(&function.body);
+        assert_eq!(facts.references, owned());
+        assert_eq!(
+            facts.nested_lambda_requirements,
+            std::collections::BTreeSet::from(["skipped".to_string()])
+        );
+
+        let mut references = super::ReferenceCollector::default();
+        references.visit_body(&function.body);
+        assert_eq!(references.references, owned());
+
+        let mut locals = LocalCollector {
+            candidate_bindings: Some(FxHashMap::default()),
+            module_references_super: Some(false),
+            ..LocalCollector::default()
+        };
+        locals.collect_suite(&function.body);
+        assert_eq!(locals.module_references_super, Some(true));
+        let candidates = locals.candidate_bindings.as_ref().unwrap();
+        for name in expected.into_iter().filter(|name| *name != "__class__") {
+            assert!(candidates.contains_key(name), "missing {name}");
+        }
+        for omitted in ["first", "inner", "chain", "skipped", "method", "attribute"] {
+            assert!(!candidates.contains_key(omitted), "unexpected {omitted}");
         }
     }
 
@@ -8171,6 +8835,69 @@ def trailing():
     }
 
     #[test]
+    fn medium_name_cache_allocates_only_after_a_successful_medium_lookup() {
+        let mut names = NameInterner::seeded();
+        assert!(names.short_names.0.medium.get().is_none());
+        assert_eq!(names.get("not_present"), None);
+        assert!(names.short_names.0.medium.get().is_none());
+        assert_eq!(
+            names.get("__annotations__"),
+            Some(NameInterner::seed_id("__annotations__").unwrap())
+        );
+        assert!(names.short_names.0.medium.get().is_some());
+        let dynamic = names.intern("new_medium_name");
+        assert_eq!(names.get("new_medium_name"), Some(dynamic));
+    }
+
+    #[test]
+    fn medium_name_cache_keeps_full_spellings_and_recovers_from_collisions() {
+        use super::MediumNameKey;
+
+        let mut names = NameInterner::seeded();
+        let samples = [
+            "abcdefghi",
+            "abcdefghi\0",
+            "abcdefghijklmnop",
+            "abcdefghijklmnop\0",
+            "abcdefgh11111111ijklmnop",
+            "abcdefgh22222222ijklmnop",
+            "abcdefgh11111111ijklmnox",
+            "xbcdefgh11111111ijklmnop",
+            "abcdefgh11111111ijklmnopx",
+            "識別子の名前甲乙",
+            "識別子の名前乙甲",
+        ];
+        for (index, spelling) in samples.into_iter().enumerate() {
+            assert_eq!(names.get(spelling), None);
+            let id = names.intern(spelling);
+            assert_eq!(id, NameId::from_usize(SCOPE_SEED_NAMES.len() + index));
+        }
+        for (index, spelling) in samples.into_iter().enumerate().rev() {
+            let id = NameId::from_usize(SCOPE_SEED_NAMES.len() + index);
+            assert_eq!(names.get(spelling), Some(id));
+            assert_eq!(names.resolve(id), spelling);
+            assert_eq!(MediumNameKey::new(spelling).is_some(), spelling.len() <= 16);
+        }
+        let seed = "__annotations__";
+        let seed_id = names.get(seed).unwrap();
+        let seed_key = MediumNameKey::new(seed).unwrap();
+        assert_eq!(names.short_names.get_medium(seed_key), Some(seed_id));
+        let colliding = (0..1_000)
+            .map(|index| format!("dynamic_{index:04}"))
+            .find(|spelling| MediumNameKey::new(spelling).unwrap().slot() == seed_key.slot())
+            .expect("a dynamic name should share the seed cache slot");
+        let dynamic_id = names.intern(&colliding);
+        assert_ne!(seed_id, dynamic_id);
+        for _ in 0..4 {
+            assert_eq!(names.get(seed), Some(seed_id));
+            assert_eq!(names.get(&colliding), Some(dynamic_id));
+        }
+        let mut unseeded = NameInterner::default();
+        assert_eq!(unseeded.get(seed), None);
+        assert_eq!(unseeded.intern(seed), NameId::from_u32(0));
+    }
+
+    #[test]
     fn name_interner_preserves_ids_through_growth_and_repeated_lookup() {
         let mut names = NameInterner::seeded();
         for index in 0..2048 {
@@ -8269,6 +8996,7 @@ def trailing():
         let mut inputs = FlatFunctionInputs {
             names: Vec::new(),
             name_positions: None,
+            has_annotations: false,
             complex: false,
         };
 
@@ -8342,6 +9070,179 @@ def trailing():
                 fast.names.get("_Example__slot").unwrap(),
             )],
         );
+    }
+
+    #[test]
+    fn flat_annotated_functions_match_full_scope_analysis_for_all_versions() {
+        let body = r"
+@decorate((lambda header: header)(decorator_only))
+def simple(pos: Pos, /, normal: Normal = default_only, *args: Var,
+           only: Only, **kwargs: Kw) -> Return:
+    runtime = pos
+    return runtime, body_only
+
+class _Owner:
+    def method(self, __private: _Owner__Alias, *, other: __Alias) -> list[__Return]:
+        __slot = 1
+        _Owner__slot = __slot
+        return other, __slot
+
+    def scopes(self, value: (lambda x: x + __captured)(outer)) -> tuple[(item for item in __items)]:
+        return value, body_only
+
+def outer():
+    annotation_local = default_local = decorator_local = None
+    @decorate(decorator_local)
+    def nested(value: annotation_local = default_local) -> (lambda t: t + annotation_local):
+        return value, body_only
+    return nested
+
+def generic[T](value: T) -> T:
+    return value
+
+def complex(value: Complex) -> Result:
+    local: Declared = value
+    return local
+
+class _Generic[__T]:
+    def typed(self, __value: __T, *, alias: _Generic__T) -> list[__T]:
+        __local = __value
+        _Generic__local = __local
+        return alias, __local
+";
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            for future in [false, true] {
+                let source = if future {
+                    format!("from __future__ import annotations\n{body}")
+                } else {
+                    body.to_owned()
+                };
+                let parsed = parse_module(&source).unwrap();
+                let fast = ScopeArena::analyze_with_python_version(parsed.suite(), version);
+                let deferred = matches!(version, PythonVersion::Py314 | PythonVersion::Py315);
+                let mut full = ScopeArena {
+                    names: NameInterner::seeded(),
+                    deferred_annotations: deferred,
+                    python_version: version,
+                    ..ScopeArena::default()
+                };
+                let (_, mut definitions, _) = ModuleNameCollector::collect_with_source(
+                    &mut full.names,
+                    parsed.suite(),
+                    !deferred && !future,
+                    &mut super::SourceAnalysis::new(version, 0),
+                );
+                let functions = definitions
+                    .iter_mut()
+                    .enumerate()
+                    .filter_map(|(index, input)| {
+                        let ScopeDefinition::Function(definition, flat, _) = &mut input.definition
+                        else {
+                            return None;
+                        };
+                        let definition = *definition;
+                        Some((
+                            definition.name.as_str(),
+                            ScopeId::from_usize(index + 1),
+                            flat.take().is_some(),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    functions
+                        .iter()
+                        .map(|&(name, _, flat)| (name, flat))
+                        .collect::<Vec<_>>(),
+                    [
+                        ("simple", true),
+                        ("method", true),
+                        ("scopes", true),
+                        ("outer", false),
+                        ("nested", true),
+                        ("generic", false),
+                        ("complex", false),
+                        ("typed", true),
+                    ],
+                    "{version:?}, future={future}"
+                );
+                full.build_scopes(definitions, future);
+
+                for (name, id, _) in &functions {
+                    let fast_plan = fast.function(*id).unwrap();
+                    let full_plan = full.function(*id).unwrap();
+                    let context = format!("{version:?}, future={future}, {name}");
+                    assert_eq!(fast_plan.locals, full_plan.locals, "{context}");
+                    assert_eq!(
+                        fast_plan.local_aliases, full_plan.local_aliases,
+                        "{context}"
+                    );
+                    assert_eq!(fast_plan.globals, full_plan.globals, "{context}");
+                    assert_eq!(
+                        fast_plan.lexical_bindings, full_plan.lexical_bindings,
+                        "{context}"
+                    );
+                    assert_eq!(
+                        fast_plan.annotation_references, full_plan.annotation_references,
+                        "{context}"
+                    );
+                    assert_eq!(fast_plan.cellvars, full_plan.cellvars, "{context}");
+                    assert_eq!(fast_plan.freevars, full_plan.freevars, "{context}");
+                    assert_eq!(
+                        fast_plan.annotation_freevars, full_plan.annotation_freevars,
+                        "{context}"
+                    );
+                    assert_eq!(fast_plan.required, full_plan.required, "{context}");
+                    assert_eq!(
+                        fast_plan.inlined_comprehension_cellvars,
+                        full_plan.inlined_comprehension_cellvars,
+                        "{context}"
+                    );
+                    assert_eq!(
+                        fast_plan.comprehension_shadowed_targets,
+                        full_plan.comprehension_shadowed_targets,
+                        "{context}"
+                    );
+                    assert_eq!(
+                        fast_plan.type_parameter_names, full_plan.type_parameter_names,
+                        "{context}"
+                    );
+                    // An existing flat private-alias plan can omit this unused sorting cache.
+                    if !fast_plan.cellvars.is_empty() {
+                        assert_eq!(
+                            fast_plan.cell_sort_names, full_plan.cell_sort_names,
+                            "{context}"
+                        );
+                    }
+                }
+
+                let plan = fast.function(functions[0].1).unwrap();
+                let expected_annotations: FxHashSet<_> = if future {
+                    FxHashSet::default()
+                } else {
+                    ["Pos", "Normal", "Var", "Only", "Kw", "Return"]
+                        .map(|name| fast.names.get(name).unwrap())
+                        .into_iter()
+                        .collect()
+                };
+                assert_eq!(plan.annotation_references, expected_annotations);
+                assert_eq!(
+                    plan.required,
+                    FxHashSet::from_iter([fast.names.get("body_only").unwrap()])
+                );
+                let nested = fast.function(functions[4].1).unwrap();
+                assert_eq!(
+                    nested
+                        .annotation_references
+                        .contains(&fast.names.get("annotation_local").unwrap()),
+                    !future
+                );
+            }
+        }
     }
 
     #[test]
@@ -8422,6 +9323,7 @@ def trailing():
         let mut inputs = FlatFunctionInputs {
             names: Vec::new(),
             name_positions: None,
+            has_annotations: false,
             complex: false,
         };
 
@@ -8449,6 +9351,7 @@ def trailing():
                 (NameId::from_u32(1), 0),
                 (NameId::from_u32(2), 1),
             ])),
+            has_annotations: false,
             complex: false,
         };
 

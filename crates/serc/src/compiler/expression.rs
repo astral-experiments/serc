@@ -10,6 +10,7 @@ use ruff_python_ast::{
 };
 use ruff_text_size::Ranged;
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 use super::{
     BINARY_SLICE, BUILD_INTERPOLATION, BUILD_LIST, BUILD_MAP, BUILD_SET, BUILD_SLICE, BUILD_STRING,
@@ -77,6 +78,11 @@ use super::symbol::{
 use super::{
     CPYTHON_STACK_USE_GUIDELINE, Compiler, SHADOWED_SUPER_SENTINEL, SUPPORTED_FUTURE_FLAGS, Scope,
 };
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_GENERIC_SIMPLE_EXPRESSIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[derive(Clone, Copy)]
 struct ComprehensionLoop {
@@ -2211,7 +2217,90 @@ impl Compiler<'_> {
     }
 
     pub(super) fn compile_expression(&mut self, expression: &Expr) -> Result<(), CompileError> {
+        #[cfg(test)]
+        if FORCE_GENERIC_SIMPLE_EXPRESSIONS.get() {
+            return self.compile_expression_with_boolean_continuation(expression, None);
+        }
+
+        if !self
+            .control
+            .comprehensions
+            .defer_async_comprehension_restore
+            && (matches!(
+                expression,
+                Expr::NoneLiteral(_)
+                    | Expr::BooleanLiteral(_)
+                    | Expr::EllipsisLiteral(_)
+                    | Expr::NumberLiteral(_)
+                    | Expr::StringLiteral(_)
+                    | Expr::BytesLiteral(_)
+            ) || matches!(expression, Expr::Name(name)
+                if name.ctx == ExprContext::Load && name.id.as_str() != "__debug__"))
+        {
+            let starting_depth = self.control.stack.depth;
+            let previous = self.assembler.location();
+            self.assembler
+                .set_location(self.source_location(expression.range()));
+            let result = match expression {
+                Expr::Name(name) => self.load_name(name.id.as_str()),
+                _ => self.compile_literal_expression(expression),
+            }
+            .and_then(|()| {
+                if self.control.stack.depth == starting_depth + 1 {
+                    Ok(())
+                } else {
+                    Err(CompileError::Internal(format!(
+                        "expression changed stack depth from {starting_depth} to {}",
+                        self.control.stack.depth
+                    )))
+                }
+            });
+            self.assembler.set_location(previous);
+            return result;
+        }
         self.compile_expression_with_boolean_continuation(expression, None)
+    }
+
+    /// Emits a scalar AST literal without changing its enclosing source location.
+    fn compile_literal_expression(&mut self, expression: &Expr) -> Result<(), CompileError> {
+        match expression {
+            Expr::NoneLiteral(_) => {
+                let index = self.add_constant(Constant::None)?;
+                self.emit(LOAD_CONST, index, 1)
+            }
+            Expr::BooleanLiteral(boolean) => {
+                let index = self.add_constant(Constant::Bool(boolean.value))?;
+                self.emit(LOAD_CONST, index, 1)
+            }
+            Expr::EllipsisLiteral(_) => {
+                let index = self.add_constant(Constant::Ellipsis)?;
+                self.emit(LOAD_CONST, index, 1)
+            }
+            Expr::NumberLiteral(number) => {
+                let constant = number_constant(&number.value);
+                if self.context.python_version >= PythonVersion::Py314
+                    && let Number::Int(value) = &number.value
+                    && let Some(value) = value.as_u8()
+                {
+                    if self.output.constants.is_empty() {
+                        self.add_constant(constant)?;
+                    }
+                    self.emit(LOAD_SMALL_INT, u32::from(value), 1)
+                } else {
+                    let index = self.add_constant(constant)?;
+                    self.emit(LOAD_CONST, index, 1)
+                }
+            }
+            Expr::StringLiteral(string) => {
+                let index = self.add_constant(self.string_literal_constant(string))?;
+                self.emit(LOAD_CONST, index, 1)
+            }
+            Expr::BytesLiteral(bytes) => {
+                let index = self.add_constant(Constant::Bytes(bytes.value.bytes().collect()))?;
+                self.emit(LOAD_CONST, index, 1)
+            }
+            _ => unreachable!("scalar literal path requires a scalar AST literal"),
+        }
     }
 
     /// Preserve the location of the Boolean test consuming this expression's value.
@@ -2307,41 +2396,12 @@ impl Compiler<'_> {
             Expr::Name(name) if name.ctx == ExprContext::Load => {
                 self.load_name(name.id.as_str())?;
             }
-            Expr::NoneLiteral(_) => {
-                let index = self.add_constant(Constant::None)?;
-                self.emit(LOAD_CONST, index, 1)?;
-            }
-            Expr::BooleanLiteral(boolean) => {
-                let index = self.add_constant(Constant::Bool(boolean.value))?;
-                self.emit(LOAD_CONST, index, 1)?;
-            }
-            Expr::EllipsisLiteral(_) => {
-                let index = self.add_constant(Constant::Ellipsis)?;
-                self.emit(LOAD_CONST, index, 1)?;
-            }
-            Expr::NumberLiteral(number) => {
-                let constant = number_constant(&number.value);
-                if self.context.python_version >= PythonVersion::Py314
-                    && let Number::Int(value) = &number.value
-                    && let Some(value) = value.as_u8()
-                {
-                    if self.output.constants.is_empty() {
-                        self.add_constant(constant)?;
-                    }
-                    self.emit(LOAD_SMALL_INT, u32::from(value), 1)?;
-                } else {
-                    let index = self.add_constant(constant)?;
-                    self.emit(LOAD_CONST, index, 1)?;
-                }
-            }
-            Expr::StringLiteral(string) => {
-                let index = self.add_constant(self.string_literal_constant(string))?;
-                self.emit(LOAD_CONST, index, 1)?;
-            }
-            Expr::BytesLiteral(bytes) => {
-                let index = self.add_constant(Constant::Bytes(bytes.value.bytes().collect()))?;
-                self.emit(LOAD_CONST, index, 1)?;
-            }
+            Expr::NoneLiteral(_)
+            | Expr::BooleanLiteral(_)
+            | Expr::EllipsisLiteral(_)
+            | Expr::NumberLiteral(_)
+            | Expr::StringLiteral(_)
+            | Expr::BytesLiteral(_) => self.compile_literal_expression(expression)?,
             Expr::BinOp(binary) => {
                 if self.compile_optimized_percent_format(binary)?
                     == SpecializedLowering::NotApplicable
@@ -4211,7 +4271,7 @@ impl Compiler<'_> {
             Scope::Module => {
                 global_comprehension_temporary_names(generators, key, value, |_| true, None)
             }
-            Scope::Function { globals, .. } if globals.iter_unordered().next().is_some() => {
+            Scope::Function { globals, .. } if !globals.is_empty() => {
                 global_comprehension_temporary_names(
                     generators,
                     key,
@@ -8808,11 +8868,22 @@ impl Compiler<'_> {
     }
 
     fn compile_simple_expression_operand(&mut self, expression: &Expr) -> Result<(), CompileError> {
+        #[cfg(test)]
+        if FORCE_GENERIC_SIMPLE_EXPRESSIONS.get() {
+            return self.compile_expression_with_boolean_continuation(expression, None);
+        }
+
         let (name, attribute) = match expression {
             Expr::Name(name)
                 if name.ctx == ExprContext::Load && name.id.as_str() != "__debug__" =>
             {
                 (name, None)
+            }
+            Expr::Attribute(attribute)
+                if attribute.ctx == ExprContext::Load
+                    && matches!(attribute.value.as_ref(), Expr::Attribute(_)) =>
+            {
+                return self.compile_simple_attribute_chain(expression);
             }
             Expr::Attribute(attribute)
                 if attribute.ctx == ExprContext::Load
@@ -8837,6 +8908,55 @@ impl Compiler<'_> {
                 self.assembler
                     .set_location(self.attribute_opcode_location(attribute));
                 self.emit(LOAD_ATTR, index << 1, 0)?;
+            }
+            Ok(())
+        })();
+        self.assembler.set_location(previous);
+        result
+    }
+
+    /// Emits nested ordinary attributes from their name base outwards, retaining each location.
+    fn compile_simple_attribute_chain(&mut self, expression: &Expr) -> Result<(), CompileError> {
+        if self
+            .control
+            .comprehensions
+            .defer_async_comprehension_restore
+        {
+            return self.compile_expression(expression);
+        }
+        let mut attributes = SmallVec::<[&ruff_python_ast::ExprAttribute; 4]>::new();
+        let mut base = expression;
+        while let Expr::Attribute(attribute) = base {
+            if attribute.ctx != ExprContext::Load {
+                return self.compile_expression(expression);
+            }
+            attributes.push(attribute);
+            base = &attribute.value;
+        }
+        let Expr::Name(name) = base else {
+            return self.compile_expression(expression);
+        };
+        if name.ctx != ExprContext::Load || name.id.as_str() == "__debug__" {
+            return self.compile_expression(expression);
+        }
+
+        let starting_depth = self.control.stack.depth;
+        let previous = self.assembler.location();
+        self.assembler
+            .set_location(self.source_location(name.range()));
+        let result = (|| {
+            self.load_name(name.id.as_str())?;
+            for attribute in attributes.into_iter().rev() {
+                let index = self.name_index(attribute.attr.as_str())?;
+                self.assembler
+                    .set_location(self.attribute_opcode_location(attribute));
+                self.emit(LOAD_ATTR, index << 1, 0)?;
+            }
+            if self.control.stack.depth != starting_depth + 1 {
+                return Err(CompileError::Internal(format!(
+                    "expression changed stack depth from {starting_depth} to {}",
+                    self.control.stack.depth
+                )));
             }
             Ok(())
         })();
@@ -10168,4 +10288,93 @@ fn match_case_has_nested_jump_predecessor(
                     // Cleanup and internal branches leave different original exit blocks.
                     .any(suite_has_linear_borrow_fallthrough)
         })
+}
+
+#[cfg(test)]
+mod simple_expression_tests {
+    use super::FORCE_GENERIC_SIMPLE_EXPRESSIONS;
+    use crate::{CompileOptions, PythonVersion, compile_with_options};
+
+    struct ResetGeneric(bool);
+
+    impl Drop for ResetGeneric {
+        fn drop(&mut self) {
+            FORCE_GENERIC_SIMPLE_EXPRESSIONS.set(self.0);
+        }
+    }
+
+    #[test]
+    fn direct_scalar_and_chained_attribute_operands_match_generic_for_all_targets() {
+        let sources = [
+            r"
+name = 12
+value = consume(None, False, True, ..., 0, 255, 256, 123456789012345678901234567890,
+                1.25, -0.0, 2.5j, 'normal', 'one.two', 'méthode', '\ud800', b'', b'value')
+def plain(root, name):
+    x = name + 5
+    y = root.outer.inner.leaf
+    z = consume(root.outer.inner.leaf, (root
+                .outer
+                .inner
+                .leaf), root.a.b.c.d.e.f, make().outer.inner, __debug__.outer.inner)
+    assert root.outer.inner == name
+    return y, z, x, True, None
+",
+            r"
+class Owner:
+    def method(self, root):
+        self.value = consume(self.__outer.__inner, root.normal.other, False, b'')
+        try:
+            assert (root
+                    .outer
+                    .inner) == self.__outer.__inner
+        except Error:
+            return consume(super().method.chain, super.attribute.chain, 'Owner.method')
+        return root.outer.inner
+def closure(value):
+    def inner():
+        return consume(value.outer.inner, value, 1, 'closure.inner')
+    return inner
+",
+            r"
+async def asynchronous(inputs, root):
+    result = ([item async for item in inputs], None, root.outer.inner)
+    other = consume([item async for item in inputs], root.outer.inner, 1, False)
+    return result, other, None
+def generator(inputs, root):
+    yield consume(root.outer.inner, 1, False)
+    yield from inputs
+",
+        ];
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let options = CompileOptions {
+                python_version,
+                ..CompileOptions::default()
+            };
+            for source in sources {
+                let fast = compile_with_options(source, "simple_operands.py", &options).unwrap();
+                let generic = {
+                    let _reset = ResetGeneric(FORCE_GENERIC_SIMPLE_EXPRESSIONS.replace(true));
+                    compile_with_options(source, "simple_operands.py", &options).unwrap()
+                };
+                assert_eq!(
+                    format!("{:?}", fast.code),
+                    format!("{:?}", generic.code),
+                    "{python_version:?}: {source}"
+                );
+                assert_eq!(fast.marshal(), generic.marshal(), "{python_version:?}");
+                let source_size = u32::try_from(source.len()).unwrap();
+                assert_eq!(
+                    fast.to_timestamp_pyc(17, source_size),
+                    generic.to_timestamp_pyc(17, source_size),
+                    "{python_version:?}"
+                );
+            }
+        }
+    }
 }

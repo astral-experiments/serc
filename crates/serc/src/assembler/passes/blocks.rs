@@ -1,4 +1,5 @@
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 use super::super::{
     ConstantTable, ExceptionExclusion, ExceptionPolicy, ExceptionRegion, Instruction, Item,
@@ -342,9 +343,10 @@ fn preserve_original_shared_jump_location(
 // handler. Restrictions on try/with exits therefore do not increase this exit's original size.
 // An omitted authored NOP means the optimized singleton does not certify the original size.
 fn block_is_bare_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>) -> bool {
-    if items
-        .iter()
-        .any(|item| matches!(item, Item::Label(label) if original_nop_targets.contains(label)))
+    if !original_nop_targets.is_empty()
+        && items
+            .iter()
+            .any(|item| matches!(item, Item::Label(label) if original_nop_targets.contains(label)))
     {
         return false;
     }
@@ -391,9 +393,10 @@ fn block_is_bare_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>) 
 /// One original converted `POP_BLOCK` may precede the two-record raise. Authored
 /// or folded-away NOPs do not certify that original array's size.
 fn block_is_local_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>) -> bool {
-    if items
-        .iter()
-        .any(|item| matches!(item, Item::Label(label) if original_nop_targets.contains(label)))
+    if !original_nop_targets.is_empty()
+        && items
+            .iter()
+            .any(|item| matches!(item, Item::Label(label) if original_nop_targets.contains(label)))
     {
         return false;
     }
@@ -796,6 +799,140 @@ struct ExitTargetAnalysis {
     shared_exit: bool,
 }
 
+/// Tests source and terminal prerequisites before inspecting a target's complete location data.
+#[inline]
+fn source_may_copy_exit(
+    graph: &BlockGraph,
+    order: &[BasicBlockId],
+    positions: &[usize],
+    predecessors: &[usize],
+    exception_regions: &[ExceptionRegion],
+    original_nop_targets: &FxHashSet<Label>,
+    source: BasicBlockId,
+) -> bool {
+    let Some(source_last) = graph[source].last_instruction() else {
+        return false;
+    };
+    let (Operand::Forward(label) | Operand::Backward(label)) = source_last.operand() else {
+        return false;
+    };
+    let Some(target) = graph.label_block(label) else {
+        return false;
+    };
+    let Some(target_last) = graph[target].last_instruction() else {
+        return false;
+    };
+    let source_falls =
+        !ends_scope(source_last.opcode) && !is_unconditional_jump(source_last.opcode);
+    let shared = predecessors[target.index()] > 1;
+
+    if (!source_falls && source_last.jump_policy.inline_small_exit())
+        || (source_falls && shared && source_last.no_location_policy.copies_split_return_exit())
+        || (shared && target_last.no_location_policy.is_artificial_eval_break())
+    {
+        return true;
+    }
+    if !source_falls
+        && target_last.opcode == RAISE_VARARGS
+        && (block_is_bare_raise(graph[target].items(), original_nop_targets)
+            || block_is_local_raise(graph[target].items(), original_nop_targets))
+    {
+        return true;
+    }
+
+    let target_falls =
+        !ends_scope(target_last.opcode) && !is_unconditional_jump(target_last.opcode);
+    let shared_unlocated =
+        shared && (ends_scope(target_last.opcode) || has_jump_eval_check(target_last));
+    let inline_unlocated = !target_falls
+        && target_last.no_location_policy.allows_block_inlining()
+        && (!source_falls || shared);
+    let can_split = !exception_regions.is_empty() && target_falls;
+    if !(shared_unlocated || inline_unlocated || can_split)
+        || graph[target].items().iter().any(
+            |item| matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0),
+        )
+    {
+        return false;
+    }
+    shared_unlocated
+        || inline_unlocated
+        || order
+            .get(positions[target.index()] + 1)
+            .is_some_and(|next| {
+                predecessors[next.index()] == 1
+                    && graph[*next].items().iter().any(|item| {
+                        matches!(item, Item::Label(label) if exception_regions.iter().any(|region| {
+                            region.start == *label || region.end == *label
+                        }))
+                    })
+            })
+}
+
+#[cfg(test)]
+fn source_may_copy_exit_original(
+    graph: &BlockGraph,
+    order: &[BasicBlockId],
+    positions: &[usize],
+    predecessors: &[usize],
+    exception_regions: &[ExceptionRegion],
+    original_nop_targets: &FxHashSet<Label>,
+    source: BasicBlockId,
+) -> bool {
+    let Some(target) =
+        block_jump_target(graph[source].items()).and_then(|label| graph.label_block(label))
+    else {
+        return false;
+    };
+    let Some(target_last) = graph[target].last_instruction() else {
+        return false;
+    };
+    let target_has_no_location = graph[target].items().iter().all(
+        |item| !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0),
+    );
+    let source_has_fallthrough = block_has_fallthrough(graph[source].items());
+    let shared_exit = predecessors[target.index()] > 1
+        && ((target_has_no_location
+            && (ends_scope(target_last.opcode) || has_jump_eval_check(target_last)))
+            || target_last.no_location_policy.is_artificial_eval_break());
+    let no_location_exit = target_has_no_location
+        && !block_has_fallthrough(graph[target].items())
+        && target_last.no_location_policy.allows_block_inlining()
+        && (!source_has_fallthrough || predecessors[target.index()] > 1);
+    let split_no_location_exit = !exception_regions.is_empty()
+        && target_has_no_location
+        && block_has_fallthrough(graph[target].items())
+        && order
+            .get(positions[target.index()] + 1)
+            .is_some_and(|next| {
+                predecessors[next.index()] == 1
+                    && graph[*next].items().iter().any(|item| {
+                        matches!(item, Item::Label(label) if exception_regions.iter().any(
+                            |region| {
+                                region.start == *label || region.end == *label
+                            }
+                        ))
+                    })
+            });
+    let small_exit_source = !source_has_fallthrough
+        && ((target_last.opcode == RAISE_VARARGS
+            && (block_is_bare_raise(graph[target].items(), original_nop_targets)
+                || block_is_local_raise(graph[target].items(), original_nop_targets)))
+            || graph[source]
+                .last_instruction()
+                .is_some_and(|instruction| instruction.jump_policy.inline_small_exit()));
+    let conditional_split_return_source = source_has_fallthrough
+        && predecessors[target.index()] > 1
+        && graph[source]
+            .last_instruction()
+            .is_some_and(|instruction| instruction.no_location_policy.copies_split_return_exit());
+    shared_exit
+        || no_location_exit
+        || split_no_location_exit
+        || small_exit_source
+        || conditional_split_return_source
+}
+
 // Most multi-block code objects reach this pass without an eligible exit copy. Returning an
 // analysis proves that the copy-producing loop below cannot run while retaining the location
 // propagation performed at the end of the full pass.
@@ -814,10 +951,6 @@ fn exit_block_analysis(
         .expect("exit-block analysis requires at least one block")
         + 1;
     let mut positions = vec![usize::MAX; vector_len];
-    for (position, block) in order.iter().copied().enumerate() {
-        positions[block.index()] = position;
-    }
-
     let mut exception_handler_blocks = vec![false; vector_len];
     for target in exception_regions
         .iter()
@@ -831,13 +964,12 @@ fn exit_block_analysis(
     let mut conditional_predecessors = vec![0; vector_len];
     predecessors[order[0].index()] = 1;
     for (position, block) in order.iter().copied().enumerate() {
-        let has_fallthrough = block_has_fallthrough(graph[block].items());
+        positions[block.index()] = position;
+        let (has_fallthrough, jump) = graph[block].successors();
         if has_fallthrough && let Some(next) = order.get(position + 1) {
             predecessors[next.index()] += 1;
         }
-        if let Some(target) =
-            block_jump_target(graph[block].items()).and_then(|label| graph.label_block(label))
-        {
+        if let Some(target) = jump.and_then(|label| graph.label_block(label)) {
             predecessors[target.index()] += 1;
             conditional_predecessors[target.index()] += usize::from(has_fallthrough);
             if jump_predecessors[target.index()].is_none() {
@@ -849,57 +981,31 @@ fn exit_block_analysis(
     // This cheap scan is a superset of the exact copy conditions. A false result is sufficient
     // to skip the exception-boundary and target-chain analysis.
     let possible_copy = order.iter().copied().any(|source| {
-        let Some(target) =
-            block_jump_target(graph[source].items()).and_then(|label| graph.label_block(label))
-        else {
-            return false;
-        };
-        let Some(target_last) = graph[target].last_instruction() else {
-            return false;
-        };
-        let target_has_no_location = graph[target].items().iter().all(|item| {
-            !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
-        });
-        let source_has_fallthrough = block_has_fallthrough(graph[source].items());
-        let shared_exit = predecessors[target.index()] > 1
-            && ((target_has_no_location
-                && (ends_scope(target_last.opcode) || has_jump_eval_check(target_last)))
-                || target_last.no_location_policy.is_artificial_eval_break());
-        let no_location_exit = target_has_no_location
-            && !block_has_fallthrough(graph[target].items())
-            && target_last.no_location_policy.allows_block_inlining()
-            && (!source_has_fallthrough || predecessors[target.index()] > 1);
-        let split_no_location_exit = target_has_no_location
-            && block_has_fallthrough(graph[target].items())
-            && order
-                .get(positions[target.index()] + 1)
-                .is_some_and(|next| {
-                    predecessors[next.index()] == 1
-                        && graph[*next].items().iter().any(|item| {
-                            matches!(item, Item::Label(label) if exception_regions.iter().any(
-                                |region| {
-                                    region.start == *label || region.end == *label
-                                }
-                            ))
-                        })
-                });
-        let small_exit_source = !source_has_fallthrough
-            && (block_is_bare_raise(graph[target].items(), original_nop_targets)
-                || block_is_local_raise(graph[target].items(), original_nop_targets)
-                || graph[source]
-                    .last_instruction()
-                    .is_some_and(|instruction| instruction.jump_policy.inline_small_exit()));
-        let conditional_split_return_source = source_has_fallthrough
-            && predecessors[target.index()] > 1
-            && graph[source].last_instruction().is_some_and(|instruction| {
-                instruction.no_location_policy.copies_split_return_exit()
-            });
-        shared_exit
-            || no_location_exit
-            || split_no_location_exit
-            || small_exit_source
-            || conditional_split_return_source
+        source_may_copy_exit(
+            graph,
+            order,
+            &positions,
+            &predecessors,
+            exception_regions,
+            original_nop_targets,
+            source,
+        )
     });
+    #[cfg(test)]
+    assert_eq!(
+        possible_copy,
+        order.iter().copied().any(|source| {
+            source_may_copy_exit_original(
+                graph,
+                order,
+                &positions,
+                &predecessors,
+                exception_regions,
+                original_nop_targets,
+                source,
+            )
+        })
+    );
     if !possible_copy {
         return ExitBlockAnalysis {
             positions,
@@ -921,9 +1027,13 @@ fn exit_block_analysis(
         .collect::<FxHashSet<_>>();
     let mut target_analyses = vec![None; vector_len];
     for source in order.iter().copied() {
-        let Some(target) =
-            block_jump_target(graph[source].items()).and_then(|label| graph.label_block(label))
-        else {
+        let Some(source_last) = graph[source].last_instruction() else {
+            continue;
+        };
+        let (Operand::Forward(label) | Operand::Backward(label)) = source_last.operand() else {
+            continue;
+        };
+        let Some(target) = graph.label_block(label) else {
             continue;
         };
         let analysis = target_analyses[target.index()].get_or_insert_with(|| {
@@ -940,42 +1050,56 @@ fn exit_block_analysis(
             let Some(target_last) = graph[target_exit].last_instruction() else {
                 return ExitTargetAnalysis::default();
             };
-            let represented_setups = represented_setup_nops(graph, target_blocks, provenance);
-            let mut at_target_entry = true;
-            let target_pre_fusion_size = target_blocks
-                .iter()
-                .flat_map(|block| graph[*block].items())
-                .map(|item| match item {
-                    Item::Instruction(instruction) => {
-                        at_target_entry = false;
-                        let fused_push_null = instruction.opcode == LOAD_GLOBAL
-                            && matches!(instruction.operand(), Operand::Value(argument) if argument & 1 != 0);
-                        1 + usize::from(fused_push_null)
-                            + usize::from(instruction.pre_fold_extra_instructions())
-                    }
-                    Item::Label(label) => usize::from(
-                        target_chain_end > target_position
-                            && exception_split_labels.contains(label)
-                            && !provenance.return_region_reentries.contains(label)
-                            && !represented_setups.labels.contains(label)
-                            && !(at_target_entry
-                                && is_metadata_range_entry(
-                                    *label,
-                                    exception_regions,
-                                    &provenance.setups,
-                                )),
-                    ),
-                })
-                .sum::<usize>();
-            let target_is_small_exit = target_pre_fusion_size <= 4
-                && ends_scope(target_last.opcode)
-                && (target_chain_end == target_position
-                    || matches!(target_last.opcode, RAISE_VARARGS | RETURN_VALUE));
             let target_has_no_location = target_blocks.iter().all(|block| {
                 graph[*block].items().iter().all(|item| {
                     !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
                 })
             });
+            if !ends_scope(target_last.opcode)
+                && !target_has_no_location
+                && !target_last.no_location_policy.is_artificial_eval_break()
+            {
+                return ExitTargetAnalysis::default();
+            }
+            let target_is_small_exit = if ends_scope(target_last.opcode)
+                && (target_chain_end == target_position
+                    || matches!(target_last.opcode, RAISE_VARARGS | RETURN_VALUE))
+            {
+                let represented_setups = represented_setup_nops(graph, target_blocks, provenance);
+                let mut at_target_entry = true;
+                target_blocks
+                    .iter()
+                    .flat_map(|block| graph[*block].items())
+                    .map(|item| match item {
+                        Item::Instruction(instruction) => {
+                            at_target_entry = false;
+                            let fused_push_null = instruction.opcode == LOAD_GLOBAL
+                                && matches!(instruction.operand(), Operand::Value(argument) if argument & 1 != 0);
+                            1 + usize::from(fused_push_null)
+                                + usize::from(instruction.pre_fold_extra_instructions())
+                        }
+                        Item::Label(label) => usize::from(
+                            target_chain_end > target_position
+                                && exception_split_labels.contains(label)
+                                && !provenance.return_region_reentries.contains(label)
+                                && !represented_setups.labels.contains(label)
+                                && !(at_target_entry
+                                    && is_metadata_range_entry(
+                                        *label,
+                                        exception_regions,
+                                        &provenance.setups,
+                                    )),
+                        ),
+                    })
+                    .try_fold(0, |size, width| {
+                        let size = size + width;
+                        if size >= 5 { Err(size) } else { Ok(size) }
+                    })
+                    .unwrap_or_else(std::convert::identity)
+                    <= 4
+            } else {
+                false
+            };
             ExitTargetAnalysis {
                 inline_small_exit: target_is_small_exit
                     && !exception_handler_blocks[target.index()]
@@ -986,6 +1110,7 @@ fn exit_block_analysis(
                     }),
                 implicit_small_raise: target_is_small_exit
                     && target_chain_end == target_position
+                    && target_last.opcode == RAISE_VARARGS
                     && (block_is_bare_raise(graph[target].items(), original_nop_targets)
                         || block_is_local_raise(graph[target].items(), original_nop_targets)),
                 copy_conditional_split_return: target_is_small_exit
@@ -1000,16 +1125,12 @@ fn exit_block_analysis(
                         || target_last.no_location_policy.is_artificial_eval_break()),
             }
         });
-        let source_copies_split_return = graph[source]
-            .last_instruction()
-            .is_some_and(|instruction| instruction.no_location_policy.copies_split_return_exit());
-        let source_has_fallthrough = block_has_fallthrough(graph[source].items());
+        let source_copies_split_return = source_last.no_location_policy.copies_split_return_exit();
+        let source_has_fallthrough =
+            !ends_scope(source_last.opcode) && !is_unconditional_jump(source_last.opcode);
         let inline_small_exit = !source_has_fallthrough
             && analysis.inline_small_exit
-            && (analysis.implicit_small_raise
-                || graph[source]
-                    .last_instruction()
-                    .is_some_and(|instruction| instruction.jump_policy.inline_small_exit()));
+            && (analysis.implicit_small_raise || source_last.jump_policy.inline_small_exit());
         let copy_conditional_split_return = source_has_fallthrough
             && source_copies_split_return
             && analysis.copy_conditional_split_return;
@@ -1913,8 +2034,73 @@ fn propagate_exit_block_locations(
     python_version: crate::PythonVersion,
     provenance: &ExceptionOwnerProvenance,
 ) {
+    #[cfg(test)]
+    let mut eager = graph.clone();
+
+    propagate_exit_block_locations_inner::<true>(
+        graph,
+        order,
+        analysis,
+        exception_regions,
+        original_boundaries,
+        original_location_absence,
+        comprehension_assignment_exits,
+        preserved_boundaries,
+        source_boundaries,
+        setups,
+        python_version,
+        provenance,
+    );
+
+    #[cfg(test)]
+    {
+        propagate_exit_block_locations_inner::<false>(
+            &mut eager,
+            order,
+            analysis,
+            exception_regions,
+            original_boundaries,
+            original_location_absence,
+            comprehension_assignment_exits,
+            preserved_boundaries,
+            source_boundaries,
+            setups,
+            python_version,
+            provenance,
+        );
+        assert_eq!(graph.copy_items(), eager.copy_items());
+    }
+}
+
+/// Resolves only source-less first instructions; later located records are never changed.
+fn propagate_exit_block_locations_inner<const SKIP_LOCATED: bool>(
+    graph: &mut BlockGraph,
+    order: &[BasicBlockId],
+    analysis: &ExitBlockAnalysis,
+    exception_regions: &[ExceptionRegion],
+    original_boundaries: &FxHashSet<Label>,
+    original_location_absence: &FxHashSet<Label>,
+    comprehension_assignment_exits: &FxHashMap<Label, (Vec<Label>, [Instruction; 3])>,
+    preserved_boundaries: &FxHashSet<Label>,
+    source_boundaries: &FxHashSet<Label>,
+    setups: &[(Label, Option<SourceLocation>)],
+    python_version: crate::PythonVersion,
+    provenance: &ExceptionOwnerProvenance,
+) {
     for target in order.iter().copied() {
         if analysis.exception_handler_blocks[target.index()] {
+            continue;
+        }
+        if SKIP_LOCATED
+            && graph[target]
+                .items()
+                .iter()
+                .find_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction),
+                    Item::Label(_) => None,
+                })
+                .is_none_or(|first| first.location.line >= 0)
+        {
             continue;
         }
         if preserve_original_shared_jump_location(
@@ -3259,17 +3445,95 @@ impl OptimizationPipeline {
     // can therefore retain a line inherited while it still had one predecessor. Capture the
     // original relation before threading, including omitted NOP and folded-slot evidence.
     pub(in crate::assembler) fn capture_original_location_absence(&self) -> FxHashSet<Label> {
-        // Without jumps, an instruction has at most its physical predecessor.
-        // No sole-predecessor chain can reach the shared entry that proves absence.
-        if !self.graph.features().has_jump()
-            || !self.graph.iter_items().any(|item| {
-                matches!(item, Item::Instruction(instruction)
-                    if instruction.location.line < 0
-                        && instruction.pre_fold_extra_instructions() == 0)
-            })
-        {
+        // A shared unlocated entry seeds each certified chain. Sharing requires a
+        // jump target, and any omitted NOP on its aliases is already a location donor.
+        if !self.graph.features().has_jump() {
             return FxHashSet::default();
         }
+        let mut saw_instruction = false;
+        let mut pending_label = false;
+        let mut pending_original_nop = false;
+        if !self.graph.iter_items().any(|item| match item {
+            Item::Label(label) => {
+                pending_label = true;
+                pending_original_nop |= self.original_nop_targets.contains(label);
+                false
+            }
+            Item::Instruction(instruction) => {
+                let candidate = saw_instruction
+                    && pending_label
+                    && !pending_original_nop
+                    && instruction.location.line < 0
+                    && instruction.pre_fold_extra_instructions() == 0;
+                saw_instruction = true;
+                pending_label = false;
+                pending_original_nop = false;
+                candidate
+            }
+        }) {
+            return FxHashSet::default();
+        }
+        if !self.has_shared_unlocated_original_entry() {
+            return FxHashSet::default();
+        }
+        self.capture_original_location_absence_unchecked()
+    }
+
+    /// Determines whether any chain can start without building per-instruction state.
+    fn has_shared_unlocated_original_entry(&self) -> bool {
+        let mut candidate_labels = FxHashMap::<Label, usize>::default();
+        let mut candidate_has_predecessor = Vec::new();
+        let mut pending_labels = smallvec::SmallVec::<[Label; 4]>::new();
+        let mut saw_instruction = false;
+        let mut previous_falls_through = false;
+        for item in self.graph.iter_items() {
+            match item {
+                Item::Label(label) => pending_labels.push(*label),
+                Item::Instruction(instruction) => {
+                    if saw_instruction
+                        && !pending_labels.is_empty()
+                        && instruction.location.line < 0
+                        && instruction.pre_fold_extra_instructions() == 0
+                        && pending_labels
+                            .iter()
+                            .all(|label| !self.original_nop_targets.contains(label))
+                    {
+                        let candidate = candidate_has_predecessor.len();
+                        candidate_has_predecessor.push(previous_falls_through);
+                        for label in pending_labels.drain(..) {
+                            candidate_labels.insert(label, candidate);
+                        }
+                    } else {
+                        pending_labels.clear();
+                    }
+                    saw_instruction = true;
+                    previous_falls_through = !ends_scope(instruction.opcode)
+                        && !is_unconditional_jump(instruction.opcode);
+                }
+            }
+        }
+        for item in self.graph.iter_items() {
+            if let Item::Instruction(instruction) = item
+                && let Operand::Forward(label) | Operand::Backward(label) = instruction.operand()
+                && let Some(&candidate) = candidate_labels.get(&label)
+            {
+                if candidate_has_predecessor[candidate] {
+                    return true;
+                }
+                candidate_has_predecessor[candidate] = true;
+            }
+        }
+        false
+    }
+
+    #[cfg(test)]
+    pub(in crate::assembler) fn capture_original_location_absence_unoptimized_for_test(
+        &self,
+    ) -> FxHashSet<Label> {
+        self.capture_original_location_absence_unchecked()
+    }
+
+    fn capture_original_location_absence_unchecked(&self) -> FxHashSet<Label> {
         let mut instructions = Vec::new();
         let mut label_entries = vec![None; usize::try_from(self.next_label).unwrap()];
         let mut pending_labels = Vec::new();
@@ -4048,9 +4312,7 @@ impl OptimizationPipeline {
             return Ok(Vec::new());
         }
 
-        if !graph.is_normalized(&self.preserved_block_boundaries) {
-            graph.normalize_blocks(&self.preserved_block_boundaries);
-        }
+        graph.normalize_blocks_if_needed(&self.preserved_block_boundaries);
         let active_internal_labels = self
             .exception_owner_provenance
             .normal_try_copy_internal_labels
@@ -4111,13 +4373,13 @@ impl OptimizationPipeline {
                     Item::Label(_) => None,
                 });
                 let first = instructions.next()?;
-                (instructions.next().is_none()
-                    && first.opcode == NOP
+                (first.opcode == NOP
                     && first.fusion_policy.is_converted_pop_block()
                     && first.location == SourceLocation::NONE
                     && !first.no_location_policy.preserves_location()
                     && !first.jump_policy.preserves_explicit_nop()
-                    && !first.jump_policy.borrow_empty_block())
+                    && !first.jump_policy.borrow_empty_block()
+                    && instructions.next().is_none())
                 .then_some((target, *label))
             })
             .collect::<Vec<_>>();
@@ -4327,7 +4589,9 @@ impl OptimizationPipeline {
         // Snapshot the original keyword-return seam before any exit is copied. A cleanup
         // elsewhere in the unit must not split two owned loads in this unprotected array.
         // Keep the complete item lists so a rewritten source, target, or alias cannot reuse it.
-        let original_keyword_return_seams = order
+        let order_if = |condition| if condition { order.as_slice() } else { &[] };
+        let keyword_order = order_if(!self.exception_owner_provenance.block_boundaries.is_empty());
+        let original_keyword_return_seams = keyword_order
             .iter()
             .filter_map(|&source| {
                 let source_items = graph[source].items();
@@ -4400,7 +4664,8 @@ impl OptimizationPipeline {
             .collect::<FxHashSet<_>>();
         // A protected expression exit can be one original array split at POP_BLOCK.
         // Snapshot its complete source, expression tail and return before any copy.
-        let original_protected_return_seams = order
+        let protected_order = order_if(!self.exception_regions.is_empty());
+        let original_protected_return_seams = protected_order
             .iter()
             .filter_map(|&source| {
                 let source_items = graph[source].items();
@@ -4491,7 +4756,13 @@ impl OptimizationPipeline {
         // A chained comparison reaches its protected value arm through a separate
         // NOT_TAKEN/jump array. Preserve the complete original arrays before copying
         // the unowned return; only that one earlier predecessor may revisit the copy.
-        let original_comparison_return_seams = order
+        let comparison_order = order_if(
+            !self
+                .exception_owner_provenance
+                .ordinary_try_setups
+                .is_empty(),
+        );
+        let original_comparison_return_seams = comparison_order
             .iter()
             .filter_map(|&source| {
                 let source_position = positions[source.index()];
@@ -4645,7 +4916,14 @@ impl OptimizationPipeline {
         // locations inherited by synthetic cleanup copies during this pass.
         let mut original_return_locations = FxHashMap::default();
         let mut return_labels = Vec::new();
-        for item in graph.iter_items() {
+        // An original located return only prevents inheritance across an exception split.
+        // Without such a split, no copied instruction can consult these locations.
+        let return_order = if exception_split_labels.is_empty() {
+            &[]
+        } else {
+            order.as_slice()
+        };
+        for item in return_order.iter().flat_map(|block| graph[*block].items()) {
             match item {
                 Item::Label(label) => return_labels.push(*label),
                 Item::Instruction(instruction) => {
@@ -4665,6 +4943,9 @@ impl OptimizationPipeline {
         }
         let mut exit_without_unique_predecessor = vec![false; positions.len()];
         for block in order.iter().copied() {
+            if predecessors[block.index()] <= 1 {
+                continue;
+            }
             // The 3.15 iterator cleanup can exceed the small-copy limit. Classify
             // its complete original array, as the early copy analysis does, even
             // when an outer try splits the cleanup from RETURN_VALUE.
@@ -4679,15 +4960,15 @@ impl OptimizationPipeline {
             } else {
                 std::slice::from_ref(&block)
             };
-            let unlocated_scope_exit = exit_blocks.iter().all(|block| {
-                graph[*block].items().iter().all(|item| {
-                    !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
-                })
-            }) && graph[*exit_blocks.last().expect("nonempty exit array")]
+            let unlocated_scope_exit = graph[*exit_blocks.last().expect("nonempty exit array")]
                 .last_instruction()
                 .is_some_and(|instruction| {
                     ends_scope(instruction.opcode) || has_jump_eval_check(instruction)
-                });
+                }) && exit_blocks.iter().all(|block| {
+                graph[*block].items().iter().all(|item| {
+                    !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
+                })
+            });
             let mut original_unlocated_discard = false;
             let artificial_eval_break =
                 graph[block].last_instruction().is_some_and(|instruction| {
@@ -4709,7 +4990,7 @@ impl OptimizationPipeline {
                     }
                 });
             exit_without_unique_predecessor[block.index()] =
-                predecessors[block.index()] > 1 && (unlocated_scope_exit || artificial_eval_break);
+                unlocated_scope_exit || artificial_eval_break;
         }
 
         let mut inline_copies = FxHashMap::<_, Vec<Vec<Item>>>::default();
@@ -4740,11 +5021,18 @@ impl OptimizationPipeline {
         // body (or another condition). Copying the certified normal-try cleanup
         // replaces that array's jump before conditional predecessors are visited.
         // Retain the original shared-array classification across that exact copy.
-        let shared_match_cleanup_heads = order
+        let shared_match_order = order_if(
+            generic_original_arrays
+                && !self
+                    .exception_owner_provenance
+                    .original_match_join_boundaries
+                    .is_empty(),
+        );
+        let shared_match_cleanup_heads = shared_match_order
             .iter()
             .copied()
             .filter_map(|source| {
-                if !generic_original_arrays || predecessors[source.index()] <= 1 {
+                if predecessors[source.index()] <= 1 {
                     return None;
                 }
                 let source_items = graph[source].items();
@@ -4822,7 +5110,7 @@ impl OptimizationPipeline {
         let mut shared_match_cleanup_copies = FxHashMap::<BasicBlockId, Vec<Item>>::default();
         let mut drop_blocks = vec![false; positions.len()];
         let mut remaining_predecessors = predecessors.clone();
-        let mut jump_sources = vec![Vec::<BasicBlockId>::new(); positions.len()];
+        let mut jump_sources = vec![SmallVec::<[BasicBlockId; 2]>::new(); positions.len()];
         for source in order.iter().copied() {
             if let Some(target) =
                 block_jump_target(graph[source].items()).and_then(|label| graph.label_block(label))
@@ -4954,9 +5242,35 @@ impl OptimizationPipeline {
             );
             let target_chain_end = target_position + target_blocks.len() - 1;
             let target_exit = *target_blocks.last().expect("target chain is nonempty");
+            let target_terminal_opcode = target_blocks
+                .iter()
+                .rev()
+                .flat_map(|block| graph[*block].items().iter().rev())
+                .find_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction.opcode),
+                    Item::Label(_) => None,
+                });
+            let target_has_no_location = target_blocks.iter().all(|block| {
+                graph[*block].items().iter().all(|item| {
+                    !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
+                })
+            });
+            // Only scope exits, wholly unlocated targets, or already-classified shared exits
+            // can produce a copy. The earlier loop-discard repair is wholly unlocated too.
+            // Scheduled copies still run every certification assertion below.
+            if !planned_copy
+                && !target_terminal_opcode.is_some_and(ends_scope)
+                && !target_has_no_location
+                && !exit_without_unique_predecessor[target.index()]
+            {
+                continue;
+            }
             let represented_setups =
                 represented_setup_nops(graph, target_blocks, &self.exception_owner_provenance);
             let mut at_target_entry = true;
+            // Ordinary checks only distinguish widths up to four. Scheduled copies must
+            // retain their exact width so their original-array assertion remains meaningful.
+            let size_limit = if planned_copy { usize::MAX } else { 5 };
             let target_pre_fusion_size = target_blocks
                 .iter()
                 .flat_map(|block| graph[*block].items())
@@ -4984,7 +5298,11 @@ impl OptimizationPipeline {
                                 )),
                     ),
                 })
-                .sum::<usize>();
+                .try_fold(0, |size, width| {
+                    let size = size + width;
+                    if size >= size_limit { Err(size) } else { Ok(size) }
+                })
+                .unwrap_or_else(std::convert::identity);
             if let Some(width) = planned_width {
                 assert_eq!(
                     target_chain_end, target_position,
@@ -4995,14 +5313,6 @@ impl OptimizationPipeline {
                     "original cleanup array changed before copy"
                 );
             }
-            let target_terminal_opcode = target_blocks
-                .iter()
-                .rev()
-                .flat_map(|block| graph[*block].items().iter().rev())
-                .find_map(|item| match item {
-                    Item::Instruction(instruction) => Some(instruction.opcode),
-                    Item::Label(_) => None,
-                });
             let source_copies_split_return =
                 graph[source].last_instruction().is_some_and(|instruction| {
                     instruction.no_location_policy.copies_split_return_exit()
@@ -5018,6 +5328,7 @@ impl OptimizationPipeline {
                             || matches!(opcode, RAISE_VARARGS | RETURN_VALUE))
                 });
             let source_allows_small_exit_inlining = (target_chain_end == target_position
+                && target_terminal_opcode == Some(RAISE_VARARGS)
                 && (block_is_bare_raise(graph[target].items(), &self.original_nop_targets)
                     || block_is_local_raise(graph[target].items(), &self.original_nop_targets)))
                 || graph[source]
@@ -5026,11 +5337,6 @@ impl OptimizationPipeline {
             let target_contains_end_send = target_blocks.iter().any(|block| {
                 graph[*block].items().iter().any(|item| {
                     matches!(item, Item::Instruction(instruction) if instruction.opcode == END_SEND)
-                })
-            });
-            let target_has_no_location = target_blocks.iter().all(|block| {
-                graph[*block].items().iter().all(|item| {
-                    !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
                 })
             });
             let target_has_artificial_eval_break = target_blocks.iter().any(|block| {
@@ -6232,14 +6538,18 @@ impl OptimizationPipeline {
                             }))
                         && !instruction.no_location_policy.preserves_location()
                 });
-            let copied_return_locations = copied_labels
-                .iter()
-                .filter_map(|(original, copied)| {
-                    original_return_locations
-                        .get(original)
-                        .map(|location| (*copied, *location))
-                })
-                .collect::<FxHashMap<_, _>>();
+            let copied_return_locations = if original_return_locations.is_empty() {
+                FxHashMap::default()
+            } else {
+                copied_labels
+                    .iter()
+                    .filter_map(|(original, copied)| {
+                        original_return_locations
+                            .get(original)
+                            .map(|location| (*copied, *location))
+                    })
+                    .collect::<FxHashMap<_, _>>()
+            };
             if inherit_copied_locations && !planned_copy {
                 // Exception boundaries split the IR into blocks after CPython has already treated
                 // the synthetic cleanup as one source-less exit. Every copied split therefore
@@ -7265,8 +7575,42 @@ impl OptimizationPipeline {
             })
             .collect::<Vec<_>>();
 
-        for target in order.iter().copied() {
+        #[cfg(test)]
+        let mut eager_location_graph = graph.clone();
+        let location_targets = order.iter().copied().map(|target| (true, target));
+        #[cfg(test)]
+        let location_targets =
+            location_targets.chain(order.iter().copied().map(|target| (false, target)));
+        for (skip_located, target) in location_targets {
+            #[cfg(test)]
+            let graph = if skip_located {
+                &mut *graph
+            } else {
+                &mut eager_location_graph
+            };
             if exception_handler_blocks[target.index()] {
+                continue;
+            }
+            if skip_located
+                && graph[target]
+                    .items()
+                    .iter()
+                    .find_map(|item| match item {
+                        Item::Instruction(instruction) => Some(instruction),
+                        Item::Label(_) => None,
+                    })
+                    .is_some_and(|first| {
+                        first.location.line >= 0
+                            && !planned_blocks.contains(&target)
+                            && !shared_match_cleanup_copies.contains_key(&target)
+                            && (remaining_predecessors[target.index()] != 1
+                                || predecessors[target.index()] <= 1
+                                || (!first.no_location_policy.copy_inherits_shared_predecessor()
+                                    && (!has_jump_eval_check(first)
+                                        || self.shared_jump_copy_location_blocks.is_empty())))
+                    })
+            {
+                // Located heads can only change through the explicitly tracked repairs above.
                 continue;
             }
             if preserve_original_shared_jump_location(
@@ -7635,6 +7979,8 @@ impl OptimizationPipeline {
                 }
             }
         }
+        #[cfg(test)]
+        assert_eq!(graph.copy_items(), eager_location_graph.copy_items());
 
         // A unique remaining predecessor can locate the first restored POP or
         // replaced jump only after copying. Carry that donation through its
@@ -7843,6 +8189,81 @@ mod copied_pop_block_location_tests {
         instruction.jump_policy.preserve_explicit_nop();
         instruction.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
         Item::Instruction(instruction)
+    }
+
+    #[test]
+    fn exit_location_propagation_skips_only_located_or_missing_first_instructions() {
+        let entry = Label::from_u32(0);
+        let target = Label::from_u32(1);
+        let alias = Label::from_u32(2);
+        let unlocated_load = instruction(LOAD_CONST, Operand::Value(0), -1);
+        for version in [
+            crate::PythonVersion::Py312,
+            crate::PythonVersion::Py313,
+            crate::PythonVersion::Py314,
+            crate::PythonVersion::Py315,
+        ] {
+            for first in [
+                None,
+                Some(located(19)),
+                Some(unlocated_load),
+                Some(head()),
+                Some(instruction(POP_TOP, Operand::Value(0), -1)),
+                Some(instruction(POP_TOP, Operand::Value(0), 19)),
+                Some(instruction(POP_EXCEPT, Operand::Value(0), -1)),
+            ] {
+                for tail in [
+                    None,
+                    Some(instruction(RETURN_VALUE, Operand::Value(0), -1)),
+                    Some(instruction(RETURN_VALUE, Operand::Value(0), 29)),
+                ] {
+                    let items = [
+                        Item::Label(entry),
+                        located(7),
+                        instruction(JUMP_FORWARD, Operand::Forward(target), 7),
+                        Item::Label(target),
+                        Item::Label(alias),
+                    ]
+                    .into_iter()
+                    .chain(first)
+                    .chain(tail)
+                    .collect();
+                    let empty = FxHashSet::default();
+                    let provenance = ExceptionOwnerProvenance::default();
+                    let mut graph = BlockGraph::from_items(items, &empty);
+                    let order = graph.order().to_vec();
+                    let analysis =
+                        exit_block_analysis(&graph, &order, &[], &empty, &empty, &provenance);
+                    propagate_exit_block_locations(
+                        &mut graph,
+                        &order,
+                        &analysis,
+                        &[],
+                        &empty,
+                        &empty,
+                        &FxHashMap::default(),
+                        &empty,
+                        &empty,
+                        &[],
+                        version,
+                        &provenance,
+                    );
+
+                    let target_block = graph.label_block(target).unwrap();
+                    let actual = graph.instructions_mut(target_block).next();
+                    if matches!(first, Some(Item::Instruction(instruction)) if instruction.location.line == 19)
+                    {
+                        assert_eq!(actual.unwrap().location.line, 19);
+                    } else if first == Some(unlocated_load)
+                        && tail.is_none_or(|item| matches!(item, Item::Instruction(instruction) if instruction.location.line < 0))
+                    {
+                        assert_eq!(actual.unwrap().location.line, 7);
+                    } else if first.is_none() && tail.is_none() {
+                        assert!(actual.is_none());
+                    }
+                }
+            }
+        }
     }
 
     fn check_retained(
@@ -8673,6 +9094,175 @@ mod represented_setup_nop_tests {
     }
 
     #[test]
+    fn source_preflight_matches_original_across_policies_and_graph_shapes() {
+        let source_label = Label::from_u32(0);
+        let other_label = Label::from_u32(1);
+        let target_label = Label::from_u32(2);
+        let boundary = Label::from_u32(3);
+        let end = Label::from_u32(4);
+        let unknown = Label::from_u32(99);
+        let located = SourceLocation::new(3, 3, 0, 3);
+        let mut source_count = 0;
+        let mut accepted = 0;
+        for source_opcode in [JUMP_FORWARD, POP_JUMP_IF_FALSE, NOP, RETURN_VALUE] {
+            for source_policy in 0..4 {
+                for target_opcode in [NOP, RETURN_VALUE, RAISE_VARARGS, JUMP_BACKWARD] {
+                    for target_policy in 0..4 {
+                        for target_shape in 0..4 {
+                            for structure in 0..6 {
+                                let operand = match structure {
+                                    4 => Operand::Value(0),
+                                    5 => Operand::Forward(unknown),
+                                    _ => Operand::Forward(target_label),
+                                };
+                                let mut source =
+                                    Instruction::new(source_opcode, operand, located, None);
+                                if source_policy & 1 != 0 {
+                                    source.jump_policy.prevent_small_exit_inlining();
+                                }
+                                if source_policy & 2 != 0 {
+                                    source.no_location_policy.allow_split_return_exit_copy();
+                                }
+                                let mut target = Instruction::new(
+                                    target_opcode,
+                                    if target_opcode == JUMP_BACKWARD {
+                                        Operand::Backward(source_label)
+                                    } else {
+                                        Operand::Value(0)
+                                    },
+                                    if target_shape == 1 {
+                                        located
+                                    } else {
+                                        SourceLocation::NONE
+                                    },
+                                    None,
+                                );
+                                if target_policy & 1 != 0 {
+                                    target.no_location_policy.allow_block_inlining();
+                                }
+                                if target_policy & 2 != 0 {
+                                    target.no_location_policy.mark_artificial_eval_break();
+                                }
+                                let mut items =
+                                    vec![Item::Label(source_label), Item::Instruction(source)];
+                                if structure != 3 {
+                                    items.extend([
+                                        Item::Label(other_label),
+                                        Item::Instruction(Instruction::new(
+                                            if structure == 1 {
+                                                JUMP_FORWARD
+                                            } else {
+                                                RETURN_VALUE
+                                            },
+                                            if structure == 1 {
+                                                Operand::Forward(target_label)
+                                            } else {
+                                                Operand::Value(0)
+                                            },
+                                            located,
+                                            None,
+                                        )),
+                                    ]);
+                                }
+                                if target_shape == 3 {
+                                    items.extend([
+                                        Item::Label(boundary),
+                                        Item::Instruction(Instruction::new(
+                                            RETURN_VALUE,
+                                            Operand::Value(0),
+                                            located,
+                                            None,
+                                        )),
+                                        Item::Label(end),
+                                        Item::Label(target_label),
+                                    ]);
+                                } else {
+                                    items.push(Item::Label(target_label));
+                                    if target_shape == 2 {
+                                        items.push(Item::Instruction(Instruction::new(
+                                            LOAD_FAST,
+                                            Operand::Value(0),
+                                            located,
+                                            None,
+                                        )));
+                                    }
+                                    items.extend([
+                                        Item::Instruction(target),
+                                        Item::Label(boundary),
+                                        Item::Instruction(Instruction::new(
+                                            RETURN_VALUE,
+                                            Operand::Value(0),
+                                            located,
+                                            None,
+                                        )),
+                                        Item::Label(end),
+                                    ]);
+                                }
+                                let regions = if structure == 2 || structure == 3 {
+                                    vec![ExceptionRegion {
+                                        start: boundary,
+                                        end,
+                                        target: end,
+                                        depth: 0,
+                                        preserve_lasti: false,
+                                        priority: ExceptionRegionPriority::OriginalRange(
+                                            boundary, end,
+                                        ),
+                                        is_scope_fallback: false,
+                                    }]
+                                } else {
+                                    Vec::new()
+                                };
+                                let nops = if target_policy == 3 {
+                                    FxHashSet::from_iter([target_label])
+                                } else {
+                                    FxHashSet::default()
+                                };
+                                let graph = BlockGraph::from_items(items, &FxHashSet::default());
+                                let analysis = exit_block_analysis(
+                                    &graph,
+                                    graph.order(),
+                                    &regions,
+                                    &FxHashSet::default(),
+                                    &nops,
+                                    &ExceptionOwnerProvenance::default(),
+                                );
+                                for &source in graph.order() {
+                                    let result = source_may_copy_exit(
+                                        &graph,
+                                        graph.order(),
+                                        &analysis.positions,
+                                        &analysis.predecessors,
+                                        &regions,
+                                        &nops,
+                                        source,
+                                    );
+                                    let original = source_may_copy_exit_original(
+                                        &graph,
+                                        graph.order(),
+                                        &analysis.positions,
+                                        &analysis.predecessors,
+                                        &regions,
+                                        &nops,
+                                        source,
+                                    );
+                                    assert_eq!(
+                                        result, original,
+                                        "{source_opcode:?} {source_policy} {target_opcode:?} {target_policy} {target_shape} {structure} {source:?}"
+                                    );
+                                    source_count += 1;
+                                    accepted += usize::from(result);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(accepted > 0 && accepted < source_count);
+    }
+
+    #[test]
     fn nested_setup_boundaries_preserve_four_slot_exit_limit() {
         for count in [2, 3] {
             let (graph, provenance, regions) = nested_raise(count);
@@ -8726,6 +9316,117 @@ mod represented_setup_nop_tests {
                 &ExceptionOwnerProvenance::default(),
             );
             assert_eq!(analysis.requires_copy, copy_source.is_some());
+        }
+    }
+
+    #[test]
+    fn exit_copy_preserves_located_loop_target_while_inlining_separate_raise() {
+        for width in [1, 4, 20] {
+            let entry = Label::from_u32(0);
+            let second = Label::from_u32(1);
+            let raise_source = Label::from_u32(2);
+            let continuation = Label::from_u32(3);
+            let raised = Label::from_u32(4);
+            let location = SourceLocation::new(2, 2, 0, 5);
+            let located = |opcode, operand| {
+                Item::Instruction(Instruction::new(opcode, operand, location, None))
+            };
+            let mut items = vec![
+                Item::Label(entry),
+                located(POP_JUMP_IF_FALSE, Operand::Forward(continuation)),
+                Item::Label(second),
+                located(POP_JUMP_IF_FALSE, Operand::Forward(continuation)),
+                Item::Label(raise_source),
+                located(JUMP_FORWARD, Operand::Forward(raised)),
+            ];
+            let mut original_continuation = vec![Item::Label(continuation)];
+            original_continuation.extend((0..width).map(|_| located(NOP, Operand::Value(0))));
+            original_continuation.push(located(
+                JUMP_BACKWARD_NO_INTERRUPT,
+                Operand::Backward(entry),
+            ));
+            items.extend_from_slice(&original_continuation);
+            items.extend([
+                Item::Label(raised),
+                located(RAISE_VARARGS, Operand::Value(0)),
+            ]);
+            let mut assembler = crate::assembler::Assembler::from_linear_items(items);
+            assembler.next_label = 5;
+            let mut pipeline = assembler.into_optimization_pipeline();
+            let analysis = exit_block_analysis(
+                &pipeline.graph,
+                pipeline.graph.order(),
+                &[],
+                &FxHashSet::default(),
+                &FxHashSet::default(),
+                &pipeline.exception_owner_provenance,
+            );
+            assert!(analysis.requires_copy, "width {width}");
+
+            let absence = pipeline.capture_original_location_absence();
+            pipeline.duplicate_exit_blocks(&absence, &mut Vec::new());
+            let continuation_block = pipeline.graph.label_block(continuation).unwrap();
+            assert_eq!(
+                pipeline.graph[continuation_block].items(),
+                original_continuation,
+                "width {width}"
+            );
+            let raise_source_block = pipeline.graph.label_block(raise_source).unwrap();
+            assert_eq!(
+                pipeline.graph[raise_source_block]
+                    .last_instruction()
+                    .unwrap()
+                    .opcode,
+                RAISE_VARARGS,
+                "width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn exit_copy_counts_folded_width_through_four_original_slots() {
+        for extra_width in [0, 1, 2, 3, 200] {
+            let source = Label::from_u32(0);
+            let target = Label::from_u32(1);
+            let location = SourceLocation::new(2, 2, 0, 5);
+            let mut value = Instruction::new(LOAD_FAST, Operand::Value(0), location, Some(1));
+            value.add_pre_fold_extra_instructions(extra_width);
+            let items = vec![
+                Item::Label(source),
+                Item::Instruction(Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(target),
+                    location,
+                    Some(0),
+                )),
+                Item::Label(target),
+                Item::Instruction(value),
+                Item::Instruction(Instruction::new(
+                    RETURN_VALUE,
+                    Operand::Value(0),
+                    location,
+                    Some(0),
+                )),
+            ];
+            let mut assembler = crate::assembler::Assembler::from_linear_items(items);
+            assembler.next_label = 2;
+            let mut pipeline = assembler.into_optimization_pipeline();
+            let analysis = exit_block_analysis(
+                &pipeline.graph,
+                pipeline.graph.order(),
+                &[],
+                &FxHashSet::default(),
+                &FxHashSet::default(),
+                &pipeline.exception_owner_provenance,
+            );
+            assert_eq!(analysis.requires_copy, extra_width <= 2);
+
+            let absence = pipeline.capture_original_location_absence();
+            pipeline.duplicate_exit_blocks(&absence, &mut Vec::new());
+            let source = pipeline.graph.label_block(source).unwrap();
+            let last = pipeline.graph[source].last_instruction().unwrap();
+            assert_eq!(last.opcode == RETURN_VALUE, extra_width <= 2);
+            assert_eq!(last.opcode == JUMP_FORWARD, extra_width > 2);
         }
     }
 

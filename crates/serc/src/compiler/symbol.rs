@@ -4,6 +4,7 @@ use std::rc::Rc;
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
 use ruff_python_ast::{Expr, ExprContext, Pattern, Stmt};
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 use super::expression::{InterpolatedStringComponent, format_spec_components, fstring_components};
 use super::scope::collect_target_names;
@@ -699,7 +700,7 @@ impl Compiler<'_> {
             let matches = if self.unit.header_symbol_names_are_final {
                 candidate == name
             } else {
-                self.mangled_name(self.resolve_name(candidate)) == spelling
+                self.mangled_name_cow(self.resolve_name(candidate)) == spelling
             };
             if matches
                 && (!self.symbols.hidden_names.contains(candidate)
@@ -715,7 +716,7 @@ impl Compiler<'_> {
                 if self.unit.free_names_are_final || self.unit.header_symbol_names_are_final {
                     *candidate == name
                 } else {
-                    self.mangled_name(self.resolve_name(*candidate)) == spelling
+                    self.mangled_name_cow(self.resolve_name(*candidate)) == spelling
                 };
             if matches {
                 return to_u32(start + index, "physical closure variable index").map(Some);
@@ -2074,7 +2075,7 @@ impl Compiler<'_> {
                         || free_indices.contains_key(&name_id)
                 );
             if force_name || !is_local_or_free {
-                self.name_index(&name)?;
+                self.name_index_with_id(&name, name_id)?;
             }
         }
         Ok(())
@@ -2085,11 +2086,11 @@ impl Compiler<'_> {
         expression: &Expr,
     ) -> Result<(), CompileError> {
         #[derive(Default)]
-        struct Collector {
-            names: Vec<(String, bool)>,
+        struct Collector<'ast> {
+            names: SmallVec<[(&'ast str, bool); 4]>,
         }
 
-        impl<'ast> Visitor<'ast> for Collector {
+        impl<'ast> Visitor<'ast> for Collector<'ast> {
             fn visit_expr(&mut self, expression: &'ast Expr) {
                 if crate::stack_growth_required() {
                     return crate::grow_stack(|| self.visit_expr(expression));
@@ -2098,10 +2099,10 @@ impl Compiler<'_> {
                 match expression {
                     Expr::Name(name)
                         if name.ctx == ExprContext::Load && name.id.as_str() == "__debug__" => {}
-                    Expr::Name(name) => self.names.push((name.id.as_str().to_string(), false)),
+                    Expr::Name(name) => self.names.push((name.id.as_str(), false)),
                     Expr::Attribute(attribute) => {
                         self.visit_expr(&attribute.value);
-                        self.names.push((attribute.attr.as_str().to_string(), true));
+                        self.names.push((attribute.attr.as_str(), true));
                         return;
                     }
                     Expr::Lambda(lambda) => {
@@ -2134,7 +2135,7 @@ impl Compiler<'_> {
         let mut collector = Collector::default();
         collector.visit_expr(expression);
         for (name, force_name) in collector.names {
-            let name_id = self.required_name_id(&name);
+            let name_id = self.required_name_id(name);
             let is_local_or_free = self.symbols.active_temporaries.contains(name_id)
                 || matches!(
                     &self.unit.scope,
@@ -2147,7 +2148,7 @@ impl Compiler<'_> {
                         || free_indices.contains_key(&name_id)
                 );
             if force_name || !is_local_or_free {
-                self.name_index(&name)?;
+                self.name_index_with_id(name, name_id)?;
             }
         }
         Ok(())
@@ -2802,15 +2803,16 @@ fn validate_compiler_stack_effect_for(
 }
 
 pub(super) fn mangle_name<'a>(name: &'a str, private_name: Option<&str>) -> Cow<'a, str> {
+    let Some(private_name) = private_name else {
+        return Cow::Borrowed(name);
+    };
     if !name.starts_with("__") || name.ends_with("__") || name.contains('.') {
         return Cow::Borrowed(name);
     }
-    let Some(class_name) = private_name
-        .map(|name| name.trim_start_matches('_'))
-        .filter(|name| !name.is_empty())
-    else {
+    let class_name = private_name.trim_start_matches('_');
+    if class_name.is_empty() {
         return Cow::Borrowed(name);
-    };
+    }
     Cow::Owned(format!("_{class_name}{name}"))
 }
 pub(super) fn to_u32(value: usize, what: &str) -> Result<u32, CompileError> {
