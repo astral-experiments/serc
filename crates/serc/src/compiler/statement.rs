@@ -3371,6 +3371,21 @@ impl<'source> Compiler<'source> {
         let has_else = branches.last().is_some_and(|(test, _)| test.is_none());
 
         for (branch_index, (test, body)) in branches.into_iter().enumerate() {
+            let terminal_312_assignment = self.context.python_version
+                == crate::PythonVersion::Py312
+                && (matches!(body.last(), Some(Stmt::Assign(_)))
+                    || matches!(
+                        body.iter().rev().skip_while(|statement| {
+                            matches!(statement, Stmt::Global(global) if global.names.is_empty())
+                                && matches!(
+                                    self.context.optimized_locations.get(&statement.range()),
+                                    Some(super::optimization::OptimizedLocation::Elided)
+                                )
+                        }).next(),
+                        Some(Stmt::Assign(assignment))
+                            if matches!(assignment.value.as_ref(),
+                                Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_))
+                    ));
             if let Some(test) = test {
                 let next = self.assembler.label();
                 if self.context.python_version == crate::PythonVersion::Py312
@@ -3504,11 +3519,9 @@ impl<'source> Compiler<'source> {
                     },
                 )?;
                 if !suite_terminates(body) && !emitted_fallthrough {
-                    if self.context.python_version == crate::PythonVersion::Py312
-                        && matches!(body.last(), Some(Stmt::Assign(_)))
-                    {
-                        // Native 3.12 resolves the implicit return after static swaps,
-                        // so its donor is the final emitted store after reordering.
+                    if terminal_312_assignment {
+                        // Resolve the return after 3.12's static swaps, even when an
+                        // elided assertion follows the comprehension assignment.
                         self.assembler.set_location(SourceLocation::NONE);
                     } else if suite_has_shared_terminal_condition_exit(body) {
                         self.assembler.set_location(SourceLocation::NONE);
@@ -3588,11 +3601,9 @@ impl<'source> Compiler<'source> {
                         // Declarations emit no native instructions. Keep the footer
                         // unlocated until its incoming condition supplies the span.
                         self.assembler.set_location(SourceLocation::NONE);
-                    } else if self.context.python_version == crate::PythonVersion::Py312
-                        && matches!(body.last(), Some(Stmt::Assign(_)))
-                    {
-                        // Native 3.12 resolves the implicit return after static swaps,
-                        // so its donor is the final emitted store after reordering.
+                    } else if terminal_312_assignment {
+                        // Resolve the return after 3.12's static swaps, even when an
+                        // elided assertion follows the comprehension assignment.
                         self.assembler.set_location(SourceLocation::NONE);
                     } else if suite_has_shared_terminal_condition_exit(body) {
                         self.assembler.set_location(SourceLocation::NONE);

@@ -1155,3 +1155,73 @@ fn elided_non_ascii_identifier_preserves_discarded_builders() {
         assert_matches_cpython(&format!("{PREFIX}{body}"), "case.py", &LEVELS);
     }
 }
+
+#[test]
+fn elided_assertions_preserve_terminal_branch_comprehension_returns() {
+    for source in [
+        r"def f(flag, xs):
+    if flag:
+        result = [x for x in xs]
+        assert result
+",
+        r"async def f(flag, xs):
+    if flag:
+        result = [x for x in xs]
+        assert result
+",
+        r"def f(flag, xs):
+    if flag:
+        result = {x for x in xs}
+        assert result
+",
+        r"def f(flag, xs):
+    if flag:
+        result = {x: x for x in xs}
+        assert result
+",
+        r"def f(flag, xs):
+    if flag:
+        result = [x for x in xs]
+        assert result
+    else:
+        assert flag
+",
+        r"def f(flag, xs):
+    if flag:
+        assert flag
+    else:
+        result = [x for x in xs]
+        assert result
+",
+        r"def f(flag, xs):
+    if flag:
+        result = [x for x in xs]
+        assert result
+        pass
+",
+        r"def f(flag, xs):
+    try:
+        if flag:
+            result = [x for x in xs]
+            assert result
+    except LookupError:
+        recover()
+",
+        r"def f(flag, xs):
+    try:
+        if flag:
+            result = [x for x in xs]
+            assert result
+    finally:
+        cleanup()
+",
+        r"def f(flag, xs, manager):
+    with manager:
+        if flag:
+            result = [x for x in xs]
+            assert result
+",
+    ] {
+        assert_matches_cpython(source, "terminal_comprehension_assert.py", &LEVELS);
+    }
+}
