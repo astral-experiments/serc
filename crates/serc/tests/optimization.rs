@@ -22,6 +22,28 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn discarded_star_imports_match_cpython() {
+    for (case, source) in [
+        "if False:\n    from package import *\nvalue = 1\n",
+        "if False:\n    from package.child import *\nvalue = 1\n",
+        "if False:\n    from . import *\nvalue = 1\n",
+        "if False:\n    from . import name\nvalue = 1\n",
+        "while False:\n    from package import *\nvalue = 1\n",
+        "if True:\n    value = 1\nelse:\n    from package import *\n",
+        "try:\n    if False:\n        from package.child import *\n    else:\n        value = 1\nexcept Exception:\n    value = 2\n",
+        "try:\n    if True:\n        value = 1\n    else:\n        from . import name\nexcept Exception:\n    value = 2\n",
+        "if enabled:\n    from package import *\nvalue = 1\n",
+        "from package import *\nvalue = 1\n",
+        "if False:\n    from package import name\nvalue = 1\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(source, &format!("star_import_{case}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn optimized_terminal_guards_locate_fallthrough_returns() {
     for source in [
         "def f(x):\n    if x == 1:\n        assert x\n",
