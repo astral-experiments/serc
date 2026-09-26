@@ -6,29 +6,29 @@ case "${1:-}" in
     3.12)
         expected_exact=2190
         expected_rejected=280
-        expected_matched_rejection=269
-        expected_rejection_mismatch=9
+        expected_matched_rejection=270
+        expected_rejection_mismatch=8
         expected_compiler_failure=2
         ;;
     3.13)
         expected_exact=2209
         expected_rejected=261
-        expected_matched_rejection=256
-        expected_rejection_mismatch=3
+        expected_matched_rejection=257
+        expected_rejection_mismatch=2
         expected_compiler_failure=2
         ;;
     3.14)
         expected_exact=2246
         expected_rejected=224
-        expected_matched_rejection=219
-        expected_rejection_mismatch=3
+        expected_matched_rejection=220
+        expected_rejection_mismatch=2
         expected_compiler_failure=2
         ;;
     3.15)
         expected_exact=2266
         expected_rejected=204
-        expected_matched_rejection=200
-        expected_rejection_mismatch=2
+        expected_matched_rejection=201
+        expected_rejection_mismatch=1
         expected_compiler_failure=2
         ;;
     *)
