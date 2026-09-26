@@ -1392,12 +1392,29 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
             // error only when the symbol-table walk actually reaches that expression.
             let deferred = {
                 let mut frames = self.deferred_comprehension_errors.borrow_mut();
-                frames.iter_mut().rev().find_map(|frame| {
-                    frame
-                        .remove(&named.range)
-                        .or_else(|| frame.remove(&named.target.range()))
-                        .and_then(|errors| errors.into_iter().next())
-                })
+                let mut found = None;
+                // CPython checks iterable restrictions, then iteration-variable conflicts in
+                // surrounding comprehensions, before it reaches a containing class scope.
+                'priority: for priority in 0..3 {
+                    for frame in frames.iter_mut().rev() {
+                        for range in [named.range, named.target.range()] {
+                            if let Some(errors) = frame.get_mut(&range)
+                                && let Some(index) = errors.iter().position(|error| {
+                                    matches!(
+                                        (&error.kind, priority),
+                                        (SemanticSyntaxErrorKind::NamedExpressionInComprehensionIterable, 0)
+                                            | (SemanticSyntaxErrorKind::ReboundComprehensionVariable, 1)
+                                            | (SemanticSyntaxErrorKind::NamedExpressionInClassBodyComprehension, 2)
+                                    )
+                                })
+                            {
+                                found = Some(errors.remove(index));
+                                break 'priority;
+                            }
+                        }
+                    }
+                }
+                found
             };
             if let Some(error) = deferred {
                 if matches!(error.kind, SemanticSyntaxErrorKind::ReboundComprehensionVariable)

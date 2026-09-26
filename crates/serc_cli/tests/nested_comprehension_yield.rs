@@ -25,6 +25,8 @@ fn nested_comprehension_yields_match_python() {
         "def f():\n    return [(yield {(yield k):(yield v) for k in ks}) for x in xs]\n",
         "def f():\n    return [(yield {(k := 1): (yield v) for k in ks}) for x in xs]\n",
         "def f():\n    return [(yield {(yield k): (k := 1) for k in ks}) for x in xs]\n",
+        "class C:\n    result = [(yield {(x := 1): 0 for x in xs}) for z in zs]\n",
+        "class C:\n    result = [(yield [[(b := 1) for c in cs] for b in bs]) for a in aa]\n",
         "def f():\n    return [(yield {0: (yield a), (yield b): 0}) for x in xs]\n",
         "def f():\n    return [(yield {(yield a): 0, 1: (yield b)}) for x in xs]\n",
         "def f():\n    return [(yield (lambda a=(yield x), a=1: 0)) for x in xs]\n",
