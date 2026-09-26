@@ -88,6 +88,64 @@ fn reserves_output_for_nested_code_and_shared_long_values() {
 }
 
 #[test]
+fn timestamp_pyc_reserves_header_and_graph_for_every_target() {
+    use super::writer::encode_pyc_code_with_options;
+    use crate::{CompileOptions, PythonVersion};
+
+    let source = format!(
+        "first = {:?}\ndef nested():\n    return first, {:?}\n",
+        "first value ".repeat(1_000),
+        "caf\u{e9} ".repeat(1_000),
+    );
+    let source_mtime = 0x1234_5678;
+    let source_size = 0x9abc_def0;
+    for python_version in [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
+    ] {
+        let options = CompileOptions {
+            python_version,
+            ..CompileOptions::default()
+        };
+        let module = crate::compile_with_options(&source, "reservation.py", &options).unwrap();
+        let estimated = ObjectGraph::for_code_with_options(
+            &module.code,
+            python_version,
+            &module.initial_intern_state,
+        )
+        .estimated_wire_size();
+        let bare = module.marshal();
+        let pyc = module.to_timestamp_pyc(source_mtime, source_size);
+        let mut header = [0; 16];
+        header[..4].copy_from_slice(&python_version.target().magic_number);
+        header[8..12].copy_from_slice(&source_mtime.to_le_bytes());
+        header[12..].copy_from_slice(&source_size.to_le_bytes());
+        assert_eq!(&pyc[..16], &header);
+        assert!(estimated > module.bytecode().len());
+        assert!(pyc.capacity() >= header.len() + estimated);
+        assert!(bare.capacity() >= estimated);
+
+        let custom_header = [0xab; 16];
+        let with_custom_header = encode_pyc_code_with_options(
+            &module.code,
+            python_version,
+            &module.initial_intern_state,
+            &custom_header,
+        );
+        assert_eq!(&with_custom_header[..16], &custom_header);
+        assert_eq!(&with_custom_header[16..], &pyc[16..]);
+        if python_version == PythonVersion::Py315 {
+            assert_eq!(pyc[16] | super::v5::FLAG_REF, bare[0]);
+            assert_ne!(&pyc[16..], bare);
+        } else {
+            assert_eq!(&pyc[16..], bare);
+        }
+    }
+}
+
+#[test]
 #[should_panic(expected = "marshal occurrence 0 mismatch")]
 fn occurrence_cursor_rejects_a_mismatched_kind() {
     let code = code_object(Vec::new());
@@ -1274,6 +1332,139 @@ fn python_312_dynamic_code_names_keep_per_definition_identity() {
                 .filter(|bytes| *bytes == name.as_bytes())
                 .count(),
             expected,
+        );
+    }
+}
+
+#[test]
+fn metadata_string_tags_and_legacy_exceptions_match_each_target() {
+    use super::v5::{
+        FLAG_REF, TYPE_ASCII, TYPE_ASCII_INTERNED, TYPE_INTERNED, TYPE_SHORT_ASCII,
+        TYPE_SHORT_ASCII_INTERNED, TYPE_UNICODE,
+    };
+    use super::writer::encode_code_with_options;
+    use crate::code_object::CodeFilename;
+    use crate::{InitialInternState, PythonVersion};
+
+    fn assert_tag(bytes: &[u8], value: &[u8], header_size: usize, tag: u8) {
+        let mut matches = bytes
+            .windows(value.len())
+            .enumerate()
+            .filter_map(|(offset, bytes)| (bytes == value).then_some(offset));
+        let offset = matches.next().expect("string must be serialized");
+        assert!(matches.next().is_none(), "string must only be emitted once");
+        assert_eq!(bytes[offset - header_size], tag, "{value:?}");
+    }
+
+    let ordinary = "ordinary marker!";
+    let unicode_ordinary = "ordinary café!";
+    let long_ordinary = "ordinary!".repeat(35);
+    let name = "normal_code_name";
+    let qualified_name = "Different.Qualified";
+    let metadata = "short_metadata";
+    let unicode_metadata = "méthode";
+    let long_metadata = "long_metadata_".repeat(24);
+    let filename = "répertoire-metadata.py";
+    let generic_name = "<generic parameters of marker>";
+    let surrogate_filename = b"surro\xed\xa0\x80gate.py";
+    let state = InitialInternState::default();
+
+    let mut code = code_object(vec![
+        Constant::String(ordinary.to_string()),
+        Constant::String(unicode_ordinary.to_string()),
+        Constant::String(long_ordinary.clone()),
+    ]);
+    code.name = name.to_string();
+    code.qualified_name = qualified_name.to_string();
+    code.filename = filename.into();
+    code.names = vec![
+        metadata.into(),
+        unicode_metadata.into(),
+        long_metadata.as_str().into(),
+    ];
+    code.locals = vec![unicode_metadata.into()];
+    code.local_kinds = vec![1];
+    code.marshal_provenance.metadata_ids.domain_len = 5;
+    code.marshal_provenance.metadata_ids.names = vec![
+        MetadataId::from_u32(0),
+        MetadataId::from_u32(2),
+        MetadataId::from_u32(3),
+    ];
+    code.marshal_provenance.metadata_ids.locals = vec![MetadataId::from_u32(2)];
+
+    let mut generic = code_object(Vec::new());
+    generic.name = generic_name.to_string();
+    generic.qualified_name = generic_name.to_string();
+    generic.filename = CodeFilename::Surrogate(surrogate_filename.as_slice().into());
+
+    for version in [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
+    ] {
+        let old = version == PythonVersion::Py312;
+        let bytes = encode_code_with_options(&code, version, &state);
+        assert_tag(&bytes, ordinary.as_bytes(), 2, TYPE_SHORT_ASCII);
+        assert_tag(&bytes, unicode_ordinary.as_bytes(), 5, TYPE_UNICODE);
+        assert_tag(&bytes, long_ordinary.as_bytes(), 5, TYPE_ASCII);
+        assert_tag(
+            &bytes,
+            metadata.as_bytes(),
+            2,
+            TYPE_SHORT_ASCII_INTERNED | FLAG_REF,
+        );
+        assert_tag(
+            &bytes,
+            unicode_metadata.as_bytes(),
+            5,
+            TYPE_INTERNED | FLAG_REF,
+        );
+        assert_tag(
+            &bytes,
+            long_metadata.as_bytes(),
+            5,
+            TYPE_ASCII_INTERNED | FLAG_REF,
+        );
+        assert_tag(
+            &bytes,
+            name.as_bytes(),
+            2,
+            TYPE_SHORT_ASCII_INTERNED | FLAG_REF,
+        );
+        assert_tag(
+            &bytes,
+            qualified_name.as_bytes(),
+            2,
+            if old {
+                TYPE_SHORT_ASCII
+            } else {
+                TYPE_SHORT_ASCII_INTERNED | FLAG_REF
+            },
+        );
+        assert_tag(
+            &bytes,
+            filename.as_bytes(),
+            5,
+            (if old { TYPE_UNICODE } else { TYPE_INTERNED }) | FLAG_REF,
+        );
+
+        let bytes = encode_code_with_options(&generic, version, &state);
+        assert_tag(
+            &bytes,
+            generic_name.as_bytes(),
+            2,
+            if old {
+                TYPE_SHORT_ASCII | FLAG_REF
+            } else {
+                TYPE_SHORT_ASCII_INTERNED | FLAG_REF
+            },
+        );
+        assert_tag(
+            &bytes,
+            surrogate_filename,
+            5,
+            (if old { TYPE_UNICODE } else { TYPE_INTERNED }) | FLAG_REF,
         );
     }
 }

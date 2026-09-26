@@ -1622,9 +1622,7 @@ impl<'source> Compiler<'source> {
                 .control
                 .comprehensions
                 .direct_comprehension_assignment_results
-                .iter_unordered()
-                .next()
-                .is_none()
+                .is_empty()
             && self.control.generators.generator_region_start.is_none()
             && !inherited_statement_has_following
             && !self
@@ -11008,6 +11006,10 @@ impl<'source> Compiler<'source> {
     }
 
     fn compile_if(&mut self, statement: &ruff_python_ast::StmtIf) -> Result<(), CompileError> {
+        let module_can_suspend = self.context.module_plan().has_suspension_expressions();
+        let expression_suspends_current_scope = |expression: &Expr| {
+            module_can_suspend && super::expression::expression_suspends_current_scope(expression)
+        };
         if let Expr::Compare(comparison) = statement.test.as_ref()
             && comparison.ops.len() > 1
             && suite_terminates(&statement.body)
@@ -14971,6 +14973,10 @@ impl<'source> Compiler<'source> {
         restart: Label,
         non_final_branch: bool,
     ) -> Result<(), CompileError> {
+        let module_can_suspend = self.context.module_plan().has_suspension_expressions();
+        let expression_suspends_current_scope = |expression: &Expr| {
+            module_can_suspend && super::expression::expression_suspends_current_scope(expression)
+        };
         let base_depth = self.control.stack.depth;
         if let Expr::Compare(comparison) = statement.test.as_ref()
             && comparison.ops.len() > 1
@@ -15255,6 +15261,10 @@ impl<'source> Compiler<'source> {
         mode: LoopTailMode,
         leading: &[Stmt],
     ) -> Result<LoopBackedge, CompileError> {
+        let module_can_suspend = self.context.module_plan().has_suspension_expressions();
+        let expression_suspends_current_scope = |expression: &Expr| {
+            module_can_suspend && super::expression::expression_suspends_current_scope(expression)
+        };
         let LoopTailMode {
             non_final_branch,
             try_body_normal_exit,
@@ -16665,6 +16675,10 @@ impl<'source> Compiler<'source> {
         &mut self,
         statement: &ruff_python_ast::StmtWhile,
     ) -> Result<(), CompileError> {
+        let module_can_suspend = self.context.module_plan().has_suspension_expressions();
+        let expression_suspends_current_scope = |expression: &Expr| {
+            module_can_suspend && super::expression::expression_suspends_current_scope(expression)
+        };
         let base_depth = self.control.stack.depth;
         // A split prefix or conditional arm can end at this loop while its
         // source successor remains inside the same enclosing protected region.
@@ -18267,6 +18281,10 @@ impl<'source> Compiler<'source> {
         statement: &ruff_python_ast::StmtAssert,
         split_success_return: bool,
     ) -> Result<(), CompileError> {
+        let module_can_suspend = self.context.module_plan().has_suspension_expressions();
+        let expression_suspends_current_scope = |expression: &Expr| {
+            module_can_suspend && super::expression::expression_suspends_current_scope(expression)
+        };
         let condition_truthiness = early_condition_truthiness(&statement.test);
         let retained_chained_comparison_exit =
             final_chained_comparison(&statement.test).map(|comparison| comparison.range);
@@ -18663,6 +18681,11 @@ impl<'source> Compiler<'source> {
         options: TryCompileOptions,
     ) -> Result<(), CompileError> {
         use super::legacy_native_labels::NativeRole;
+
+        let module_can_suspend = self.context.module_plan().has_suspension_expressions();
+        let expression_suspends_current_scope = |expression: &Expr| {
+            module_can_suspend && super::expression::expression_suspends_current_scope(expression)
+        };
 
         let TryCompileOptions {
             terminal,
@@ -24943,6 +24966,10 @@ impl<'source> Compiler<'source> {
         name: &str,
         handler_depth: i32,
     ) -> Result<Vec<(Label, Label)>, CompileError> {
+        let module_can_suspend = self.context.module_plan().has_suspension_expressions();
+        let expression_suspends_current_scope = |expression: &Expr| {
+            module_can_suspend && super::expression::expression_suspends_current_scope(expression)
+        };
         let mut branches: Vec<(Option<&Expr>, &[Stmt])> =
             vec![(Some(&statement.test), statement.body.as_slice())];
         branches.extend(
@@ -25317,6 +25344,11 @@ impl<'source> Compiler<'source> {
         terminal: bool,
     ) -> Result<(), CompileError> {
         use super::legacy_native_labels::{FinallyCopy, NativeRole};
+
+        let module_can_suspend = self.context.module_plan().has_suspension_expressions();
+        let expression_suspends_current_scope = |expression: &Expr| {
+            module_can_suspend && super::expression::expression_suspends_current_scope(expression)
+        };
 
         let preserve_exit_nop =
             std::mem::take(&mut self.control.finally.preserve_next_finally_exit_nop);
@@ -29877,6 +29909,10 @@ impl<'source> Compiler<'source> {
         body: &[Stmt],
         following_return: Option<&ruff_python_ast::StmtReturn>,
     ) -> Result<Option<WithBodyExitNoop>, CompileError> {
+        let module_can_suspend = self.context.module_plan().has_suspension_expressions();
+        let expression_suspends_current_scope = |expression: &Expr| {
+            module_can_suspend && super::expression::expression_suspends_current_scope(expression)
+        };
         let mut body_noop = None;
         if remaining.is_empty() {
             let body_start = self.assembler.instruction_count();

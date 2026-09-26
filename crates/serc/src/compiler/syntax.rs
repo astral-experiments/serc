@@ -88,7 +88,10 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         return result;
     }
     result?;
-    validate_declarations(source, body, python_version)
+    if validator.has_declarations {
+        declarations::validate(body, python_version)?;
+    }
+    Ok(())
 }
 
 fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>(
@@ -104,6 +107,7 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
         lowering_pattern_error: false,
         bare_starred: None,
         check_bare_starred: true,
+        has_declarations: false,
         pre_lowering_only: false,
         source,
         body,
@@ -308,6 +312,7 @@ struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
     lowering_pattern_error: bool,
     bare_starred: Option<(TextRange, BareStarredKind)>,
     check_bare_starred: bool,
+    has_declarations: bool,
     source: &'source str,
     body: &'ast [Stmt],
     python_version: ast::PythonVersion,
@@ -1076,6 +1081,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                     self.record_bare_starred(&statement.target, BareStarredKind::AssignmentTarget);
                 }
             }
+            Stmt::Global(_) | Stmt::Nonlocal(_) => self.has_declarations = true,
             _ => {}
         }
         // This precedes return-value checks and except* transfer checks, as in CPython.
@@ -1720,6 +1726,44 @@ mod tests {
         PythonVersion::Py314,
         PythonVersion::Py315,
     ];
+
+    #[test]
+    fn declaration_checks_find_nested_statements_and_win_over_lowering_errors() {
+        let valid = "'global nonlocal'\n# global value; nonlocal missing\nclass C:\n def method(self):\n  return 'nonglobal', 'nonlocal'\n";
+        let parsed = parse_module(valid).unwrap();
+        for python_version in TARGETS {
+            validate(valid, &parsed.syntax().body, python_version).unwrap();
+        }
+
+        for (source, message) in [
+            (
+                "if True:\n class C:\n  def method(self):\n   if True:\n    nonlocal missing\n",
+                "no binding for nonlocal 'missing' found",
+            ),
+            (
+                "*unpacked\nnonlocal missing\n",
+                "nonlocal declaration not allowed at module level",
+            ),
+            (
+                "match subject:\n case _: pass\n case 1: pass\nnonlocal missing\n",
+                "nonlocal declaration not allowed at module level",
+            ),
+        ] {
+            let parsed = parse_module(source).unwrap();
+            for python_version in TARGETS {
+                let error = validate(source, &parsed.syntax().body, python_version).unwrap_err();
+                let CompileError::InvalidSyntax {
+                    message: actual,
+                    range,
+                } = error
+                else {
+                    panic!("unexpected error for {python_version}: {source:?}: {error}");
+                };
+                assert_eq!(actual, message, "{python_version}: {source:?}");
+                assert_eq!(&source[range], "nonlocal missing");
+            }
+        }
+    }
 
     #[test]
     fn bare_starred_errors_keep_cpython_validation_phase_order() {
