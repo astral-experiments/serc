@@ -2370,6 +2370,40 @@ fn elided_non_ascii_identifier_preserves_discarded_builders() {
 }
 
 #[test]
+fn elided_assertions_after_conditional_comprehension_keep_return_locations() {
+    for source in [
+        "def f(x, y):\n    a = [v for v in x] if y else []\n    assert x\n",
+        "def f(x, y):\n    a = {v for v in x} if y else y\n    assert x\n    assert y\n",
+        "def f(x, y):\n    a = {v: v for v in x} if check(y) else []\n    assert x\n    assert y\n",
+        "def f(x, y):\n    a = [v for v in x if v] if y else []\n    assert x\n",
+        "def f(x, y):\n    a = [v + w for v in x for w in x] if y else []\n    assert x\n    assert y\n",
+        "def f(x, y):\n    a = [(z := v) for v in x] if y else []\n    assert x\n",
+        "def f(x, y):\n    a = [v for v in x] if y else [str(y)]\n    assert x\n",
+        "def f(x, y):\n    a = [v for v in x] if y else []\n    assert (z := y)\n",
+        "def f(x, y):\n    a = [(z := v) for v in x] if y else []\n    assert (z := y)\n",
+        "def outer():\n    a = z = w = None\n    def f(x, y):\n        nonlocal a, z, w\n        a = [v for v in x] if y else []\n        assert (z := y)\n    return f\n",
+        "def f(x, y, callback, manager):\n    with manager:\n        if x:\n            assert x\n        else:\n            assert y\n        callback(x)\n    a = [v for v in x] if y else []\n    assert x\n",
+        "def f(x, y):\n    global a, z\n    a = [v for v in x] if y else []\n    assert x\n    assert y\n",
+        "def f(x, y):\n    def inner():\n        return a, z\n    a = [(z := v) for v in x] if y else []\n    assert x\n    assert y\n",
+        "def outer():\n    a = z = None\n    def f(x, y):\n        nonlocal a, z\n        a = [(z := v) for v in x] if y else []\n        assert x\n        assert y\n    return f\n",
+        "def f(x, y):\n    try:\n        a = [v for v in x] if y else []\n        assert x\n    finally:\n        clean()\n",
+        "def f(x, y, obj):\n    obj.a = [v for v in x] if y else []\n    assert x\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "sub/conditional_comprehension_assert.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+}
+
+#[test]
 fn elided_assertions_after_terminal_comprehension_branches_match_cpython() {
     for source in [
         "def f(x, y, z, cm):\n    if x:\n        a = [i for i in y]\n    assert x\n",

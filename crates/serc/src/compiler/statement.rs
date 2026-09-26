@@ -1846,7 +1846,34 @@ impl<'source> Compiler<'source> {
                 || terminal_comprehension_before_elided
                 || terminal_nested_before_elided
                 || protected_terminal_comprehension_before_elided;
-            if (is_final || terminal_if_before_elided) && final_expression_becomes_return {
+            // An assignment with an inlined comprehension becomes terminal when
+            // only removed assertions follow it; retain its target's return span.
+            let terminal_assignment_before_elided = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && !is_final
+                && final_expression_becomes_return
+                && plain_function_suite
+                && !self.has_active_control_flow_region()
+                && !self.control.in_exception_handler()
+                && self.control.finally.is_inactive_for_return_unwind()
+                && matches!(statement, Stmt::Assign(assignment)
+                    if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                        && matches!(assignment.value.as_ref(), Expr::If(expression)
+                            if matches!(expression.body.as_ref(), Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_))
+                                && condition_has_linear_runtime_leaves(&expression.test)
+                                && !expression_contains_inline_branch(&expression.orelse)
+                                && !expression_suspends_current_scope(&expression.test)
+                                && !expression_suspends_current_scope(&expression.body)
+                                && !expression_suspends_current_scope(&expression.orelse)))
+                && body[index + 1..].iter().all(|statement| {
+                    matches!(
+                        self.context.optimized_locations.get(&statement.range()),
+                        Some(super::optimization::OptimizedLocation::Elided)
+                    )
+                });
+            if (is_final || terminal_if_before_elided || terminal_assignment_before_elided)
+                && final_expression_becomes_return
+            {
                 match statement {
                     Stmt::While(statement)
                         if self.context.python_version >= crate::PythonVersion::Py314
