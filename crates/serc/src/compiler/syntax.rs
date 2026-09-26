@@ -383,6 +383,25 @@ impl BareStarredKind {
 }
 
 #[derive(Clone, Copy)]
+enum ComprehensionKind {
+    List,
+    Set,
+    Dict,
+    Generator,
+}
+
+impl ComprehensionKind {
+    fn yield_error(self) -> &'static str {
+        match self {
+            Self::List => "'yield' inside list comprehension",
+            Self::Set => "'yield' inside set comprehension",
+            Self::Dict => "'yield' inside dict comprehension",
+            Self::Generator => "'yield' inside generator expression",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 enum ScopeKind<'ast> {
     Module,
     Class,
@@ -392,7 +411,7 @@ enum ScopeKind<'ast> {
         parameters: Option<&'ast ast::Parameters>,
     },
     Comprehension {
-        generator: bool,
+        kind: ComprehensionKind,
         is_async: bool,
     },
 }
@@ -1374,7 +1393,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
     fn comprehension(
         &mut self,
         generators: &'ast [ast::Comprehension],
-        generator: bool,
+        kind: ComprehensionKind,
         visit_result: impl FnOnce(&mut Self),
     ) {
         let Some((first, rest)) = generators.split_first() else {
@@ -1384,7 +1403,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
         self.visit_expr(&first.iter);
         self.with_scope(
             ScopeKind::Comprehension {
-                generator,
+                kind,
                 is_async: generators.iter().any(|clause| clause.is_async),
             },
             |visitor| {
@@ -1935,16 +1954,24 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
             }
             Expr::ListComp(ast::ExprListComp {
                 elt, generators, ..
-            })
-            | Expr::SetComp(ast::ExprSetComp {
+            }) => {
+                self.comprehension(generators, ComprehensionKind::List, |visitor| {
+                    visitor.visit_expr(elt);
+                });
+            }
+            Expr::SetComp(ast::ExprSetComp {
                 elt, generators, ..
             }) => {
-                self.comprehension(generators, false, |visitor| visitor.visit_expr(elt));
+                self.comprehension(generators, ComprehensionKind::Set, |visitor| {
+                    visitor.visit_expr(elt);
+                });
             }
             Expr::Generator(ast::ExprGenerator {
                 elt, generators, ..
             }) => {
-                self.comprehension(generators, true, |visitor| visitor.visit_expr(elt));
+                self.comprehension(generators, ComprehensionKind::Generator, |visitor| {
+                    visitor.visit_expr(elt);
+                });
             }
             Expr::DictComp(ast::ExprDictComp {
                 key,
@@ -1952,7 +1979,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                 generators,
                 ..
             }) => {
-                self.comprehension(generators, false, |visitor| {
+                self.comprehension(generators, ComprehensionKind::Dict, |visitor| {
                     if let Some(key) = key {
                         visitor.visit_expr(key);
                     }
@@ -2110,11 +2137,10 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
         for scope in self.scopes.iter().rev() {
             match scope.kind {
                 ScopeKind::Comprehension {
-                    generator: true, ..
+                    kind: ComprehensionKind::Generator,
+                    ..
                 } => return true,
-                ScopeKind::Comprehension {
-                    generator: false, ..
-                } => {}
+                ScopeKind::Comprehension { .. } => {}
                 _ => break,
             }
         }
@@ -2287,7 +2313,15 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             Kind::BreakOutsideLoop => "'break' outside loop".to_owned(),
             Kind::ContinueOutsideLoop => "'continue' not properly in loop".to_owned(),
             Kind::ReturnOutsideFunction => "'return' outside function".to_owned(),
-            Kind::YieldOutsideFunction(kind) => format!("'{kind}' outside function"),
+            Kind::YieldOutsideFunction(kind) => {
+                if !kind.is_await()
+                    && let ScopeKind::Comprehension { kind, .. } = self.scope().kind
+                {
+                    kind.yield_error().to_owned()
+                } else {
+                    format!("'{kind}' outside function")
+                }
+            }
             Kind::YieldFromInAsyncFunction => "'yield from' inside async function".to_owned(),
             Kind::AwaitOutsideAsyncFunction(AwaitOutsideAsyncFunctionKind::Await) => {
                 "'await' outside function".to_owned()
