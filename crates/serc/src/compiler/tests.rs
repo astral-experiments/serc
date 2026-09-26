@@ -1438,6 +1438,54 @@ class Container:
 }
 
 #[test]
+fn definition_locations_preserve_crlf_comments_and_continuations() {
+    let source = concat!(
+        "@decorate(\"class def async\")\r\n",
+        "async def fast():\r\n",
+        "    pass; # comment\r\n",
+        "class Fast:\r\n",
+        "    pass  # ; not a boundary\r\n",
+        "def  continued():\r\n",
+        "    pass \\\r\n",
+        "        ;\r\n",
+        "def at_eof(): pass",
+    );
+    let parsed = parse_module(source).unwrap();
+    let compiler = module_compiler(source, &parsed);
+    let [
+        Stmt::FunctionDef(asynchronous),
+        Stmt::ClassDef(class),
+        Stmt::FunctionDef(continued),
+        Stmt::FunctionDef(at_eof),
+    ] = parsed.suite().as_slice()
+    else {
+        panic!("expected three functions and a class");
+    };
+
+    let function_location = |function: &ruff_python_ast::StmtFunctionDef| {
+        compiler.definition_location(
+            function.range,
+            function.name.range(),
+            TokenKind::Def,
+            function.is_async,
+        )
+    };
+    assert_eq!(
+        function_location(asynchronous),
+        SourceLocation::new(2, 3, 0, 9)
+    );
+    assert_eq!(
+        compiler.definition_location(class.range, class.name.range(), TokenKind::Class, false),
+        SourceLocation::new(4, 5, 0, 8),
+    );
+    assert_eq!(
+        function_location(continued),
+        SourceLocation::new(6, 8, 0, 9)
+    );
+    assert_eq!(function_location(at_eof), SourceLocation::new(9, 9, 0, 18));
+}
+
+#[test]
 fn trailing_semicolon_locations_follow_token_boundaries() {
     let source = r#"first = "not; boundary"; second = 2
 continued = 1 \

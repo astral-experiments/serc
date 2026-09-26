@@ -143,17 +143,16 @@ impl CompiledModule {
     }
 
     fn to_pyc(&self, flags: u32, metadata: [u8; 8]) -> Vec<u8> {
-        let mut output = Vec::with_capacity(16 + self.code.bytecode.len());
-        output.extend_from_slice(&self.target().magic_number);
-        output.extend_from_slice(&flags.to_le_bytes());
-        output.extend_from_slice(&metadata);
-        marshal::encode_pyc_code_into_with_options(
+        let mut header = [0; 16];
+        header[..4].copy_from_slice(&self.target().magic_number);
+        header[4..8].copy_from_slice(&flags.to_le_bytes());
+        header[8..].copy_from_slice(&metadata);
+        marshal::encode_pyc_code_with_options(
             &self.code,
             self.python_version,
             &self.initial_intern_state,
-            &mut output,
-        );
-        output
+            &header,
+        )
     }
 }
 

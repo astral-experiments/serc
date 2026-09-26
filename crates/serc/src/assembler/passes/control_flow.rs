@@ -1,4 +1,5 @@
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 use super::super::{
     BorrowFallthrough, COMPARE_OP, CONTAINS_OP, COPY, ExceptionExclusion, ExceptionPolicy, IS_OP,
@@ -17,6 +18,55 @@ use crate::target::opcodes::{
     POP_JUMP_IF_NOT_NONE, RAISE_VARARGS, RERAISE, RETURN_VALUE, SWAP,
 };
 use crate::target::operands::ComparisonOperation;
+
+/// The late consumers that can observe a scoped NOP cleanup.
+pub(in crate::assembler) struct NopCleanup {
+    pub(super) has_forward_jump: bool,
+    pub(super) may_have_changed: bool,
+}
+
+/// Dense emitted-label offsets with a fallback for independently constructed graphs.
+struct ThreadLabelOffsets {
+    dense: Vec<usize>,
+    sparse: FxHashMap<Label, usize>,
+}
+
+impl ThreadLabelOffsets {
+    fn new(label_count: u32) -> Self {
+        Self {
+            dense: vec![
+                usize::MAX;
+                usize::try_from(label_count).expect("label count fits in usize")
+            ],
+            sparse: FxHashMap::default(),
+        }
+    }
+
+    fn insert(&mut self, label: Label, offset: usize) {
+        // An instruction position originates in a non-ZST Vec, so it cannot be usize::MAX.
+        debug_assert_ne!(offset, usize::MAX);
+        if let Some(slot) = self.dense.get_mut(label.index()) {
+            *slot = offset;
+        } else {
+            self.sparse.insert(label, offset);
+        }
+    }
+
+    fn get(&self, label: Label) -> Option<&usize> {
+        match self.dense.get(label.index()) {
+            Some(slot) => (*slot != usize::MAX).then_some(slot),
+            None => self.sparse.get(&label),
+        }
+    }
+}
+
+impl std::ops::Index<&Label> for ThreadLabelOffsets {
+    type Output = usize;
+
+    fn index(&self, label: &Label) -> &Self::Output {
+        self.get(*label).expect("no entry found for key")
+    }
+}
 
 /// Replaces the earlier of two same-line stores to the same local with a stack pop.
 pub(super) fn optimize_redundant_store_pair(first: &mut Instruction, second: &Instruction) -> bool {
@@ -219,17 +269,24 @@ pub(super) fn is_original_constant_return(graph: &BlockGraph, target: Label) -> 
         return false;
     };
     let mut started = false;
-    let mut instructions = Vec::new();
+    let mut instructions = [None; 3];
+    let mut count = 0;
     for item in graph[block].items() {
         match item {
             Item::Label(label) if !started => started = *label == target,
-            Item::Label(_) if instructions.is_empty() => {}
+            Item::Label(_) if count == 0 => {}
             Item::Label(_) => return false,
-            Item::Instruction(instruction) if started => instructions.push(instruction),
+            Item::Instruction(instruction) if started => {
+                let Some(slot) = instructions.get_mut(count) else {
+                    return false;
+                };
+                *slot = Some(instruction);
+                count += 1;
+            }
             Item::Instruction(_) => {}
         }
     }
-    let [marker, value, ret] = instructions.as_slice() else {
+    let [Some(marker), Some(value), Some(ret)] = instructions else {
         return false;
     };
     marker.opcode == NOP
@@ -242,7 +299,7 @@ pub(super) fn is_original_constant_return(graph: &BlockGraph, target: Label) -> 
         && marker.location.line >= 0
         && marker.location == value.location
         && marker.location == ret.location
-        && instructions.iter().all(|instruction| {
+        && [marker, value, ret].into_iter().all(|instruction| {
             matches!(instruction.operand(), Operand::Value(_))
                 && instruction.pre_fold_extra_instructions() == 0
         })
@@ -349,12 +406,10 @@ impl OptimizationPipeline {
     /// `duplicate_exit_blocks` performs this repair even when it creates no copies. The assertion
     /// fast path has one jump predecessor per continuation, so no predecessor table is needed.
     pub(in crate::assembler) fn propagate_assertion_exit_locations(&mut self) {
-        let order = self.graph.order().to_vec();
-        for blocks in order.windows(3) {
-            let [source, _, target] = blocks else {
-                unreachable!();
-            };
-            let Some(jump) = self.graph[*source].last_instruction() else {
+        for index in 0..self.graph.len().saturating_sub(2) {
+            let source = self.graph.block_at(index);
+            let target = self.graph.block_at(index + 2);
+            let Some(jump) = self.graph[source].last_instruction() else {
                 continue;
             };
             if !matches!(
@@ -363,13 +418,13 @@ impl OptimizationPipeline {
             ) {
                 continue;
             }
-            if self.graph[*target].items().iter().any(
+            if self.graph[target].items().iter().any(
                 |item| matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0),
             ) {
                 continue;
             }
             let location = jump.location;
-            if let Some(first) = self.graph.instructions_mut(*target).next()
+            if let Some(first) = self.graph.instructions_mut(target).next()
                 && !first.no_location_policy.preserves_location()
             {
                 first.location = location;
@@ -453,27 +508,56 @@ impl OptimizationPipeline {
                 instruction.add_pre_fold_extra_instructions(folds);
             }
         }
-        let mut removed_max_depth = None;
-        for position in redundant.into_iter().rev() {
-            if let Item::Instruction(instruction) = self.graph.remove_item(position)
-                && let Some(depth) = instruction.depth_after()
-            {
-                removed_max_depth =
-                    Some(removed_max_depth.map_or(depth, |current: u32| current.max(depth)));
-            }
-        }
+        let removed_max_depth = redundant
+            .iter()
+            .filter_map(|position| match self.graph.item(*position) {
+                Item::Instruction(instruction) => instruction.depth_after(),
+                Item::Label(_) => unreachable!("a redundant copy/pop is an instruction"),
+            })
+            .max();
+        self.graph.remove_ordered_instructions(&redundant);
         removed_max_depth
     }
 
     pub(in crate::assembler) fn remove_unreachable_instructions(&mut self) -> Option<u32> {
+        self.remove_unreachable_instructions_with_proof::<true>()
+    }
+
+    fn remove_unreachable_instructions_with_proof<const PROVE_ALL_REACHABLE: bool>(
+        &mut self,
+    ) -> Option<u32> {
         let graph = &mut self.graph;
         if self.exception_regions.is_empty() && graph.len() == 1 {
             return None;
         }
-        let reachable = self
-            .initial_reachable
-            .take()
-            .unwrap_or_else(|| graph.reachable_blocks(&self.exception_regions));
+        let reachable = match self.initial_reachable.take() {
+            Some(reachable) => reachable,
+            None if PROVE_ALL_REACHABLE
+                && self.exception_regions.is_empty()
+                && graph
+                    .order()
+                    .iter()
+                    .take(graph.len().saturating_sub(1))
+                    .all(|block| super::super::block_has_fallthrough(graph[*block].items())) =>
+            {
+                // The entry reaches every ordered block through physical fallthrough,
+                // regardless of additional forward or backward edges.
+                return None;
+            }
+            None => graph.reachable_blocks(&self.exception_regions),
+        };
+        if PROVE_ALL_REACHABLE
+            && graph.order().iter().all(|block| reachable[block.index()])
+            && self.exception_regions.iter().all(|region| {
+                graph
+                    .label_block(region.target)
+                    .is_none_or(|target| reachable[target.index()])
+            })
+        {
+            // Reachable blocks alone cannot create discarded admissions, retire handlers,
+            // remove instructions, or contribute a removed stack depth.
+            return None;
+        }
         // CPython clears handler status when erasing an unreachable block. Keep that
         // decision on its original labels before normalization can attach them to a
         // live ordinary exit; the exception regions themselves retain their identity.
@@ -483,10 +567,10 @@ impl OptimizationPipeline {
                 (!reachable[target.index()]).then_some(region.target)
             }));
         let mut removed_max_depth = None;
-        let order = graph.order().to_vec();
         let mut empty = FxHashSet::default();
         let mut discarded_admissions = Vec::new();
-        for block in order {
+        for block_index in 0..graph.len() {
+            let block = graph.block_at(block_index);
             if reachable[block.index()] {
                 if !discarded_admissions.is_empty()
                     && let Some(label) = graph[block].first_label()
@@ -619,7 +703,8 @@ impl OptimizationPipeline {
         if graph.features().has_identity_comparison()
             && let Some(constants) = constants
         {
-            for block in graph.order().to_vec() {
+            for block_index in 0..graph.len() {
+                let block = graph.block_at(block_index);
                 remove_none_comparison_boolean_conversions(graph.iter_items_mut(block), constants);
             }
         }
@@ -627,7 +712,8 @@ impl OptimizationPipeline {
             optimize_boolean_pair(current, next, retain_contains);
         });
         let mut was_boolean_conversion = was_boolean_conversion.into_iter();
-        for block in graph.order().to_vec() {
+        for block_index in 0..graph.len() {
+            let block = graph.block_at(block_index);
             let mut previous_line = None;
             for instruction in graph.instructions_mut(block) {
                 clear_redundant_boolean_nop_location(
@@ -642,6 +728,16 @@ impl OptimizationPipeline {
     }
 
     pub(in crate::assembler) fn thread_forward_jumps(&mut self) -> bool {
+        self.thread_forward_jumps_with_head_gate::<true>()
+    }
+
+    fn thread_forward_jumps_with_head_gate<const GATE_HEADS: bool>(&mut self) -> bool {
+        self.thread_forward_jumps_with_source_gates::<GATE_HEADS, true>()
+    }
+
+    fn thread_forward_jumps_with_source_gates<const GATE_HEADS: bool, const SOURCE_GATES: bool>(
+        &mut self,
+    ) -> bool {
         #[derive(Clone, Copy)]
         struct ConditionalTarget {
             opcode: Opcode,
@@ -696,8 +792,7 @@ impl OptimizationPipeline {
 
         if has_forward_conditional && features.has_boolean_conversion() && features.has_copy_top() {
             let mut positions = graph.item_positions();
-            let mut conditional_targets =
-                vec![None; usize::try_from(self.next_label).expect("label count fits in usize")];
+            let mut conditional_targets = Vec::new();
             let mut conditional_target_count = 0;
             for (index, position) in positions.iter().copied().enumerate() {
                 let Item::Label(label) = *graph.item(position) else {
@@ -745,6 +840,12 @@ impl OptimizationPipeline {
                 if pop.opcode != POP_TOP {
                     continue;
                 }
+                if conditional_targets.is_empty() {
+                    conditional_targets.resize(
+                        usize::try_from(self.next_label).expect("label count fits in usize"),
+                        None,
+                    );
+                }
                 let target = &mut conditional_targets[label.index()];
                 conditional_target_count += usize::from(
                     target
@@ -777,15 +878,30 @@ impl OptimizationPipeline {
                 fallthrough_indices.sort_unstable();
                 fallthrough_indices.dedup();
                 let fallthrough_labels = fallthrough_indices
-                    .iter()
-                    .map(|index| (*index, self.label()))
-                    .collect::<FxHashMap<_, _>>();
-                if !fallthrough_indices.is_empty() {
+                    .into_iter()
+                    .map(|index| (index, self.label()))
+                    .collect::<SmallVec<[_; 4]>>();
+                let fallthrough_label = |index| {
+                    fallthrough_labels
+                        .binary_search_by_key(&index, |(index, _)| *index)
+                        .ok()
+                        .map(|index| &fallthrough_labels[index].1)
+                };
+                #[cfg(test)]
+                {
+                    let reference = fallthrough_labels
+                        .iter()
+                        .copied()
+                        .collect::<FxHashMap<_, _>>();
+                    for index in 0..positions.len() {
+                        assert_eq!(fallthrough_label(index), reference.get(&index));
+                    }
+                }
+                if !fallthrough_labels.is_empty() {
                     changed = true;
                     let graph = &mut self.graph;
-                    for index in fallthrough_indices.iter().rev().copied() {
-                        graph
-                            .insert_item(positions[index], Item::Label(fallthrough_labels[&index]));
+                    for &(index, label) in fallthrough_labels.iter().rev() {
+                        graph.insert_item(positions[index], Item::Label(label));
                     }
                     positions = graph.item_positions();
                 }
@@ -822,7 +938,7 @@ impl OptimizationPipeline {
                             changed = true;
                             target = next_target;
                         } else {
-                            let Some(fallthrough) = fallthrough_labels.get(&next.fallthrough_index)
+                            let Some(fallthrough) = fallthrough_label(next.fallthrough_index)
                             else {
                                 break;
                             };
@@ -868,9 +984,11 @@ impl OptimizationPipeline {
         }
 
         let graph = &self.graph;
-        let mut label_offsets = FxHashMap::default();
+        let mut label_offsets = ThreadLabelOffsets::new(self.next_label);
         let mut instruction_positions = Vec::new();
         let mut forward_jump_positions = Vec::new();
+        let mut has_authored_forward_break = false;
+        let mut has_retained_forward_nop = false;
         for (block, contents) in graph.iter() {
             for (offset, item) in contents.items().iter().enumerate() {
                 match item {
@@ -881,6 +999,12 @@ impl OptimizationPipeline {
                         if instruction.opcode == JUMP_FORWARD
                             && matches!(instruction.operand(), Operand::Forward(_))
                         {
+                            if SOURCE_GATES {
+                                has_authored_forward_break |=
+                                    instruction.fusion_policy.is_authored_break();
+                                has_retained_forward_nop |=
+                                    instruction.jump_policy.always_retains_nop();
+                            }
                             forward_jump_positions
                                 .push((instruction_positions.len(), (block, offset)));
                         }
@@ -889,6 +1013,18 @@ impl OptimizationPipeline {
                 }
             }
         }
+        let authored_forward_jump_positions = if !SOURCE_GATES || has_authored_forward_break {
+            forward_jump_positions.as_slice()
+        } else {
+            &[]
+        };
+        let has_original_boundaries = !self.exception_owner_provenance.source_boundaries.is_empty()
+            && !self.exception_owner_provenance.block_boundaries.is_empty();
+        let original_authored_forward_jump_positions = if !SOURCE_GATES || has_original_boundaries {
+            authored_forward_jump_positions
+        } else {
+            &[]
+        };
         // The compiler certified both incoming paths to this iterator discard.
         // Preserve its copy permission only while the complete original array,
         // including every label and instruction field, still survives unchanged.
@@ -919,7 +1055,7 @@ impl OptimizationPipeline {
                         return None;
                     };
                     let jump_index = label_offsets
-                        .get(&join)?
+                        .get(join)?
                         .checked_add(1 + iterator_extra_slot)?;
                     let &(block, offset) = instruction_positions.get(jump_index)?;
                     let Item::Instruction(current) = graph[block].items()[offset] else {
@@ -994,7 +1130,7 @@ impl OptimizationPipeline {
                 continue;
             };
             let Some(jump_index) = label_offsets
-                .get(&join)
+                .get(join)
                 .and_then(|index| index.checked_add(1 + iterator_extra_slot))
             else {
                 continue;
@@ -1037,7 +1173,7 @@ impl OptimizationPipeline {
                 continue;
             };
             let Some(jump_index) = label_offsets
-                .get(&join)
+                .get(join)
                 .and_then(|index| index.checked_add(1 + iterator_extra_slot))
             else {
                 continue;
@@ -1080,7 +1216,7 @@ impl OptimizationPipeline {
         let mut nested_join_blocks: Vec<_> = nested_join_blocks.into_iter().collect();
         nested_join_blocks.sort_unstable_by_key(|label| label.as_u32());
         for entry in nested_join_blocks {
-            let Some(&index) = label_offsets.get(&entry) else {
+            let Some(&index) = label_offsets.get(entry) else {
                 continue;
             };
             let Some(&(block, offset)) = instruction_positions.get(index) else {
@@ -1161,8 +1297,8 @@ impl OptimizationPipeline {
             .normal_try_exits
             .iter()
             .filter_map(|(entry, target)| {
-                let entry_index = *label_offsets.get(entry)?;
-                let target_index = *label_offsets.get(target)?;
+                let entry_index = *label_offsets.get(*entry)?;
+                let target_index = *label_offsets.get(*target)?;
                 let (block, offset) = *instruction_positions.get(entry_index)?;
                 let Item::Instruction(instruction) = graph[block].items()[offset] else {
                     return None;
@@ -1240,8 +1376,8 @@ impl OptimizationPipeline {
             .compound_try_owner_exits
             .iter()
             .filter_map(|(entry, target)| {
-                let entry_index = *label_offsets.get(entry)?;
-                let target_index = *label_offsets.get(target)?;
+                let entry_index = *label_offsets.get(*entry)?;
+                let target_index = *label_offsets.get(*target)?;
                 let (block, offset) = *instruction_positions.get(entry_index)?;
                 let Item::Instruction(instruction) = graph[block].items()[offset] else {
                     return None;
@@ -1263,7 +1399,7 @@ impl OptimizationPipeline {
             .synthetic_manager_join_exits
             .iter()
             .filter_map(|(entry, original)| {
-                let index = *label_offsets.get(entry)?;
+                let index = *label_offsets.get(*entry)?;
                 let &(block, offset) = instruction_positions.get(index)?;
                 let items = graph[block].items();
                 let Item::Instruction(jump) = items[offset] else {
@@ -1319,6 +1455,20 @@ impl OptimizationPipeline {
                         let Some(&instruction) = next_instruction else {
                             continue;
                         };
+                        // Only an eligible unconditional jump can populate this label's
+                        // target slot. The original-loop and Pass certificates below are
+                        // pure rejection checks, so ordinary heads need none of their lookups.
+                        if GATE_HEADS
+                            && (!is_unconditional_jump(instruction.opcode)
+                                || !matches!(
+                                    instruction.operand(),
+                                    Operand::Forward(_) | Operand::Backward(_)
+                                )
+                                || !instruction.jump_policy.allows_threading_target()
+                                || instruction.jump_policy.always_retains_nop())
+                        {
+                            continue;
+                        }
                         // CPython still sees the authored NOP before this loop backedge
                         // when it threads jumps. Lowering removed that boundary early.
                         let original_loop_tail_nop = (|| {
@@ -1552,7 +1702,12 @@ impl OptimizationPipeline {
         let mut nop_targets = FxHashMap::<_, Vec<_>>::default();
         let mut dependent_heads = FxHashMap::<_, Vec<_>>::default();
         let mut surviving_heads = Vec::new();
-        for (block, contents) in graph.iter() {
+        let original_head_limit = if !SOURCE_GATES || !original_head_blocks.is_empty() {
+            usize::MAX
+        } else {
+            0
+        };
+        for (block, contents) in graph.iter().take(original_head_limit) {
             if !original_head_blocks.contains(&block) {
                 continue;
             }
@@ -1595,8 +1750,16 @@ impl OptimizationPipeline {
         // retaining the authored break line across both copies. Our earlier threading
         // must not discard that direct-copy request. Validate the original loop end
         // and complete small return; arbitrary retargeted breaks remain unchanged.
-        let folded_loop_return_heads = self
-            .folded_predecessor_sources
+        let folded_return_sources = if !SOURCE_GATES
+            || (has_authored_forward_break
+                && has_original_boundaries
+                && self.exception_regions.is_empty())
+        {
+            self.folded_predecessor_sources.as_slice()
+        } else {
+            &[]
+        };
+        let folded_loop_return_heads = folded_return_sources
             .iter()
             .filter_map(|(source, entry, location)| {
                 if !self.exception_regions.is_empty()
@@ -1672,7 +1835,13 @@ impl OptimizationPipeline {
         // its small return. Threading through that join must keep the break's
         // own replaced-jump NOP, even though the return has a different location.
         let mut unlocated_return_join_heads = FxHashSet::default();
-        for (_, block) in graph.iter() {
+        let original_join_limit =
+            if !SOURCE_GATES || (has_authored_forward_break && has_original_boundaries) {
+                usize::MAX
+            } else {
+                0
+            };
+        for (_, block) in graph.iter().take(original_join_limit) {
             let Some((Item::Instruction(jump), labels)) = block.items().split_last() else {
                 continue;
             };
@@ -1759,7 +1928,7 @@ impl OptimizationPipeline {
         // A cleanup-free break first copies its original loop-exit bridge, then
         // the small constant, local or tuple return. Keep that break's requested NOP through
         // our earlier threading only when all three original arrays still match.
-        let original_break_return_bridges = forward_jump_positions
+        let original_break_return_bridges = original_authored_forward_jump_positions
             .iter()
             .filter_map(|&(source_index, (block, offset))| {
                 let source_items = graph[block].items();
@@ -1910,7 +2079,12 @@ impl OptimizationPipeline {
         // break and its handler's bare raise. CPython copies the bridge first,
         // preserving the break marker before copying the raise. Keep that request
         // only while all three original arrays have the same exception coverage.
-        let folded_loop_raise_breaks = forward_jump_positions
+        let folded_break_sources = if !SOURCE_GATES || !self.folded_predecessor_sources.is_empty() {
+            original_authored_forward_jump_positions
+        } else {
+            &[]
+        };
+        let folded_loop_raise_breaks = folded_break_sources
             .iter()
             .filter_map(|&(source_index, (block, offset))| {
                 let source_items = graph[block].items();
@@ -2004,7 +2178,7 @@ impl OptimizationPipeline {
         let mut retained_break_policy = super::super::ir::JumpPolicy::default();
         retained_break_policy.retain_nop();
         retained_break_policy.prevent_threading_target();
-        let retained_break_backedges = forward_jump_positions
+        let retained_break_backedges = original_authored_forward_jump_positions
             .iter()
             .filter_map(|&(source_index, (block, offset))| {
                 let items = graph[block].items();
@@ -2029,7 +2203,7 @@ impl OptimizationPipeline {
                 let Operand::Forward(entry) = jump.operand() else {
                     return None;
                 };
-                let entry_index = *label_offsets.get(&entry)?;
+                let entry_index = *label_offsets.get(entry)?;
                 let target_block = graph.label_block(entry)?;
                 let [Item::Label(label), Item::Instruction(backedge)] = graph[target_block].items()
                 else {
@@ -2038,7 +2212,7 @@ impl OptimizationPipeline {
                 let Operand::Backward(target) = backedge.operand() else {
                     return None;
                 };
-                let target_index = *label_offsets.get(&target)?;
+                let target_index = *label_offsets.get(target)?;
                 (*label == entry
                     && target_index < source_index
                     && source_index < entry_index
@@ -2081,7 +2255,16 @@ impl OptimizationPipeline {
         // Prove the source's authored break slot or conditional false entry, then
         // require a clean single-jump target with the same original exception owner.
         // The usual threading path keeps the source line and accounts for the copied slot.
-        let retained_located_backedges = forward_jump_positions
+        let retained_backedge_sources = if !SOURCE_GATES
+            || (has_retained_forward_nop
+                && has_original_boundaries
+                && !self.conditional_threading_targets.is_empty())
+        {
+            forward_jump_positions.as_slice()
+        } else {
+            &[]
+        };
+        let retained_located_backedges = retained_backedge_sources
             .iter()
             .filter_map(|&(source_index, (block, offset))| {
                 let items = graph[block].items();
@@ -2140,8 +2323,8 @@ impl OptimizationPipeline {
                 let Operand::Backward(target) = backedge.operand() else {
                     return None;
                 };
-                let entry_index = *label_offsets.get(&entry)?;
-                let target_index = *label_offsets.get(&target)?;
+                let entry_index = *label_offsets.get(entry)?;
+                let target_index = *label_offsets.get(target)?;
                 if !(target_index < source_index && source_index < entry_index)
                     || backedge.location.line < 0
                     || backedge.location == jump.location
@@ -2194,7 +2377,12 @@ impl OptimizationPipeline {
         // authored break enters it. Keep that edge on the certified empty array:
         // bypassing it would both strand the break's line and enter its cold
         // borrowed-load continuation. Other jumps keep their existing threading.
-        let original_break_empty_try_exits = forward_jump_positions
+        let original_try_break_sources = if !SOURCE_GATES || !normal_try_exits.is_empty() {
+            original_authored_forward_jump_positions
+        } else {
+            &[]
+        };
+        let original_break_empty_try_exits = original_try_break_sources
             .iter()
             .filter_map(|&(source_index, (block, offset))| {
                 let items = graph[block].items();
@@ -2222,7 +2410,7 @@ impl OptimizationPipeline {
                 {
                     return None;
                 }
-                let entry_index = *label_offsets.get(&entry)?;
+                let entry_index = *label_offsets.get(entry)?;
                 if entry_index != source_index + 1 || !normal_try_exits.contains(&entry_index) {
                     return None;
                 }
@@ -2244,7 +2432,7 @@ impl OptimizationPipeline {
                     .no_location_policy
                     .set_borrow_fallthrough(BorrowFallthrough::Barrier);
                 if *exit != original_exit
-                    || *label_offsets.get(&target)? <= entry_index
+                    || *label_offsets.get(target)? <= entry_index
                     || labels.len() < 2
                     || !labels.iter().all(|item| matches!(item, Item::Label(label)
                         if !self.original_nop_targets.contains(label)
@@ -2267,7 +2455,15 @@ impl OptimizationPipeline {
         // normal try's POP_BLOCK/JUMP array copied onto that edge. Certify the
         // original sole entry before reusing the existing owner-transfer path;
         // keep the break's target, NOP retention, and copying policies unchanged.
-        let retained_break_try_owners = forward_jump_positions
+        let try_owner_break_sources = if !SOURCE_GATES
+            || (self.exception_regions.len() >= 2
+                && !(normal_try_exits.is_empty() && compound_try_owner_exits.is_empty()))
+        {
+            authored_forward_jump_positions
+        } else {
+            &[]
+        };
+        let retained_break_try_owners = try_owner_break_sources
             .iter()
             .filter_map(|&(source_index, (block, offset))| {
                 let source_items = graph[block].items();
@@ -2292,7 +2488,7 @@ impl OptimizationPipeline {
                 {
                     return None;
                 }
-                let target_index = *label_offsets.get(&entry)?;
+                let target_index = *label_offsets.get(entry)?;
                 if target_index <= source_index
                     || !(normal_try_exits.contains(&target_index)
                         || compound_try_owner_exits.contains(&target_index))
@@ -2318,7 +2514,7 @@ impl OptimizationPipeline {
                             && !self.borrow_block_aliases.contains(label)
                             && !self.exception_owner_provenance.omitted_nop_counts.contains_key(label)
                             && !self.exception_owner_provenance.omitted_nop_locations.contains_key(label)))
-                    || *label_offsets.get(&target)? <= target_index
+                    || *label_offsets.get(target)? <= target_index
                     || self.exception_regions.iter().any(|region| {
                         graph.label_block(region.target) == Some(target_block)
                     })
@@ -2376,7 +2572,19 @@ impl OptimizationPipeline {
         // The named-handler clear sequence can enter an original outer try's
         // unlocated normal-exit jump. That exact copy drops the source's ordinary
         // owner and inherits the target's sole scope fallback, including its policy.
-        let named_handler_scope_fallbacks = forward_jump_positions
+        let scope_fallback_sources = if !SOURCE_GATES
+            || (!normal_try_exits.is_empty()
+                && self.exception_regions.len() >= 2
+                && self
+                    .exception_regions
+                    .iter()
+                    .any(|region| region.is_scope_fallback))
+        {
+            forward_jump_positions.as_slice()
+        } else {
+            &[]
+        };
+        let named_handler_scope_fallbacks = scope_fallback_sources
             .iter()
             .filter_map(|&(source_index, (block, offset))| {
                 let items = graph[block].items();
@@ -2438,7 +2646,7 @@ impl OptimizationPipeline {
                 {
                     return None;
                 }
-                let target_index = *label_offsets.get(&entry)?;
+                let target_index = *label_offsets.get(entry)?;
                 let (Item::Instruction(exit), target_labels) =
                     graph[graph.label_block(entry)?].items().split_last()?
                 else {
@@ -2598,7 +2806,7 @@ impl OptimizationPipeline {
                         == super::super::ir::RetainedJumpNop::DirectTarget
                     && next_original_nop
                     && label_offsets
-                        .get(&target)
+                        .get(target)
                         .is_some_and(|target| source_index < *target)
                 {
                     // The earlier assertion-success edge still sees the authored NOP
@@ -2979,11 +3187,50 @@ impl OptimizationPipeline {
 
     /// Preserves original empty jump-head boundaries for the final borrowing traversal.
     pub(in crate::assembler) fn record_borrow_empty_jump_heads(&mut self) -> bool {
+        self.record_borrow_empty_jump_heads_with_preflight::<true>()
+    }
+
+    fn borrow_empty_jump_head_target(&self, items: &[Item]) -> Option<Label> {
+        let (Item::Instruction(jump), labels) = items.split_last()? else {
+            return None;
+        };
+        if jump.opcode != JUMP_FORWARD
+            || jump.location.line >= 0
+            || jump.pre_fold_extra_instructions() != 0
+            || !jump.jump_policy.allows_threading_target()
+            || jump.jump_policy.always_retains_nop()
+            || jump.jump_policy.preserves_nop_after_threading()
+            || jump.jump_policy.is_interruptible()
+            || jump.jump_policy.borrow_empty_block()
+        {
+            return None;
+        }
+        let Operand::Forward(target) = jump.operand() else {
+            return None;
+        };
+        labels
+            .iter()
+            .all(|item| {
+                matches!(item, Item::Label(label)
+                    if !self.original_nop_targets.contains(label)
+                        && !self.preserved_block_boundaries.contains(label))
+            })
+            .then_some(target)
+    }
+
+    fn record_borrow_empty_jump_heads_with_preflight<const PREFLIGHT: bool>(&mut self) -> bool {
         // Every admitted original array ends in a forward unconditional jump.
         if !self.graph.features().has_forward_jump() {
             return false;
         }
         let graph = &self.graph;
+        if PREFLIGHT
+            && !graph
+                .iter()
+                .any(|(_, block)| self.borrow_empty_jump_head_target(block.items()).is_some())
+        {
+            return false;
+        }
         let order = graph.order();
         let positions = order
             .iter()
@@ -3062,27 +3309,7 @@ impl OptimizationPipeline {
             })
             .filter_map(|block| {
                 let items = graph[block].items();
-                let (Item::Instruction(jump), labels) = items.split_last()? else {
-                    return None;
-                };
-                if !labels.iter().all(|item| {
-                    matches!(item, Item::Label(label)
-                        if !self.original_nop_targets.contains(label)
-                            && !self.preserved_block_boundaries.contains(label))
-                }) || jump.opcode != JUMP_FORWARD
-                    || jump.location.line >= 0
-                    || jump.pre_fold_extra_instructions() != 0
-                    || !jump.jump_policy.allows_threading_target()
-                    || jump.jump_policy.always_retains_nop()
-                    || jump.jump_policy.preserves_nop_after_threading()
-                    || jump.jump_policy.is_interruptible()
-                    || jump.jump_policy.borrow_empty_block()
-                {
-                    return None;
-                }
-                let Operand::Forward(label) = jump.operand() else {
-                    return None;
-                };
+                let label = self.borrow_empty_jump_head_target(items)?;
                 let target = graph.label_block(label)?;
                 (positions[&block] < positions[&target])
                     .then_some(ItemPosition::new(block, items.len() - 1))
@@ -3205,6 +3432,16 @@ impl OptimizationPipeline {
 
     /// Records physical original JUMP heads before early copying can replace them with NOPs.
     pub(in crate::assembler) fn record_original_jump_heads(&mut self) {
+        self.record_original_jump_heads_with_preflight::<true>();
+    }
+
+    fn is_original_jump_head(instruction: &Instruction) -> bool {
+        (instruction.opcode == JUMP_BACKWARD
+            || (instruction.opcode == JUMP_FORWARD && instruction.jump_policy.is_interruptible()))
+            && instruction.pre_fold_extra_instructions() == 0
+    }
+
+    fn record_original_jump_heads_with_preflight<const PREFLIGHT: bool>(&mut self) {
         // Reject original incoming entries before threading can erase their edges.
         // Copied labels never inherit this original-array certificate.
         let constant_pass_starts = self
@@ -3215,7 +3452,19 @@ impl OptimizationPipeline {
         self.exception_owner_provenance
             .constant_pass_clusters
             .retain(|cluster| constant_pass_starts.contains(&cluster.start));
-        if !self.graph.features().has_pop_conditional() {
+        if !self.graph.features().has_pop_conditional()
+            || (PREFLIGHT
+                && !self.graph.iter().any(|(_, block)| {
+                    block
+                        .items()
+                        .iter()
+                        .find_map(|item| match item {
+                            Item::Instruction(instruction) => Some(instruction),
+                            Item::Label(_) => None,
+                        })
+                        .is_some_and(Self::is_original_jump_head)
+                }))
+        {
             return;
         }
         let conditional_targets = self
@@ -3250,11 +3499,7 @@ impl OptimizationPipeline {
                     Item::Instruction(instruction) => {
                         // Only the compiler's common loop backedge can certify a
                         // backward head. Per-arm and copied backedges have no such entry.
-                        if (instruction.opcode == JUMP_BACKWARD
-                            || (instruction.opcode == JUMP_FORWARD
-                                && instruction.jump_policy.is_interruptible()))
-                            && instruction.pre_fold_extra_instructions() == 0
-                        {
+                        if Self::is_original_jump_head(instruction) {
                             let original_cleanup_copy = match instruction.operand() {
                                 Operand::Forward(target) => {
                                     self.original_unlocated_cleanup_targets.contains(&target)
@@ -3609,7 +3854,35 @@ impl OptimizationPipeline {
     }
 
     /// Threads an original Pass-handler exit through its copied-finally break head.
-    fn thread_copied_finally_pass_breaks(&mut self) -> Vec<(Label, Instruction)> {
+    fn thread_copied_finally_pass_breaks<const PREFLIGHT: bool>(
+        &mut self,
+    ) -> Vec<(Label, Instruction)> {
+        if PREFLIGHT
+            && (self.exception_regions.is_empty()
+                || self.original_nop_targets.is_empty()
+                || self
+                    .exception_owner_provenance
+                    .omitted_nop_counts
+                    .is_empty()
+                || self
+                    .exception_owner_provenance
+                    .omitted_nop_locations
+                    .is_empty()
+                || !self
+                    .conditional_threading_targets
+                    .values()
+                    .any(|location| *location == SourceLocation::NONE)
+                || !self
+                    .exception_regions
+                    .iter()
+                    .any(|region| region.preserve_lasti))
+        {
+            // An original Pass source, an unlocated copied-break head, and a lasti
+            // handler ending at the source are all required by the checks below.
+            #[cfg(test)]
+            assert!(self.thread_copied_finally_pass_breaks::<false>().is_empty());
+            return Vec::new();
+        }
         let graph = &self.graph;
         let positions = graph
             .order()
@@ -3718,6 +3991,12 @@ impl OptimizationPipeline {
 
     /// Threads conditionals only through original ordinary jumps that survived exit copying.
     pub(in crate::assembler) fn thread_original_conditional_jump_targets(&mut self) -> bool {
+        self.thread_original_conditional_jump_targets_with_preflight::<true>()
+    }
+
+    fn thread_original_conditional_jump_targets_with_preflight<const PREFLIGHT: bool>(
+        &mut self,
+    ) -> bool {
         if self.conditional_threading_targets.is_empty()
             && self.original_jump_head_targets.is_empty()
         {
@@ -3751,7 +4030,10 @@ impl OptimizationPipeline {
                     .then_some((*label, first.operand()))
             })
             .collect::<FxHashMap<_, _>>();
-        let pass_break_heads = self.thread_copied_finally_pass_breaks();
+        let pass_break_heads = self.thread_copied_finally_pass_breaks::<PREFLIGHT>();
+        if PREFLIGHT && targets.is_empty() && pass_break_heads.is_empty() {
+            return false;
+        }
         let mut changed = !pass_break_heads.is_empty();
         let mut threaded_condition = None;
         let origins = &mut self.exception_owner_provenance.threaded_condition_origins;
@@ -3870,8 +4152,10 @@ impl OptimizationPipeline {
 
     /// Captures shared original jump arrays before threading or copying can merge their entries.
     pub(in crate::assembler) fn record_shared_unlocated_jump_entries(&mut self) {
-        // Every admitted original array ends in a forward unconditional jump.
-        if !self.graph.features().has_forward_jump() {
+        // Every admitted original array ends in a forward unconditional jump and
+        // has multiple incoming POP_JUMP conditionals.
+        if !self.graph.features().has_forward_jump() || !self.graph.features().has_pop_conditional()
+        {
             return;
         }
         let reachable = self.graph.reachable_blocks(&self.exception_regions);
@@ -4071,6 +4355,49 @@ impl OptimizationPipeline {
         if !features.has_jump() || (!finalize_borrow_empty_blocks && !features.has_forward_jump()) {
             return;
         }
+        // These borrow markers disappear after local analysis if their policy
+        // stays unchanged. Keep them in the graph for borrowing, while excluding
+        // them from physical adjacency when no later jump can change that policy.
+        let is_removable_borrow_marker = |instruction: &Instruction| {
+            finalize_borrow_empty_blocks
+                && instruction.opcode == NOP
+                && instruction.jump_policy.borrow_empty_block()
+                && (instruction.location.line < 0
+                    || instruction.no_location_policy.borrow_fallthrough()
+                        == BorrowFallthrough::BarrierIfRemoved)
+        };
+        let mut target = None;
+        let mut has_work = false;
+        for item in self.graph.iter_items() {
+            match item {
+                Item::Label(label) if target == Some(*label) => {
+                    has_work = true;
+                    break;
+                }
+                Item::Label(_) => {}
+                Item::Instruction(instruction) if is_removable_borrow_marker(instruction) => {}
+                Item::Instruction(instruction) => {
+                    target = None;
+                    if instruction.opcode != JUMP_FORWARD {
+                        continue;
+                    }
+                    let Operand::Forward(jump_target) = instruction.operand() else {
+                        continue;
+                    };
+                    if instruction.jump_policy.defers_redundant_removal() {
+                        has_work = true;
+                        break;
+                    }
+                    if !instruction.jump_policy.borrow_empty_block() || finalize_borrow_empty_blocks
+                    {
+                        target = Some(jump_target);
+                    }
+                }
+            }
+        }
+        if !has_work {
+            return;
+        }
         let named_match_cleanup_jumps = if finalize_borrow_empty_blocks {
             FxHashSet::default()
         } else {
@@ -4241,49 +4568,6 @@ impl OptimizationPipeline {
                     }
                 }
             }
-        }
-        // These borrow markers disappear after local analysis if their policy
-        // stays unchanged. Keep them in the graph for borrowing, while excluding
-        // them from physical adjacency when no later jump can change that policy.
-        let is_removable_borrow_marker = |instruction: &Instruction| {
-            finalize_borrow_empty_blocks
-                && instruction.opcode == NOP
-                && instruction.jump_policy.borrow_empty_block()
-                && (instruction.location.line < 0
-                    || instruction.no_location_policy.borrow_fallthrough()
-                        == BorrowFallthrough::BarrierIfRemoved)
-        };
-        let mut target = None;
-        let mut has_work = false;
-        for item in graph.iter_items() {
-            match item {
-                Item::Label(label) if target == Some(*label) => {
-                    has_work = true;
-                    break;
-                }
-                Item::Label(_) => {}
-                Item::Instruction(instruction) if is_removable_borrow_marker(instruction) => {}
-                Item::Instruction(instruction) => {
-                    target = None;
-                    if instruction.opcode != JUMP_FORWARD {
-                        continue;
-                    }
-                    let Operand::Forward(jump_target) = instruction.operand() else {
-                        continue;
-                    };
-                    if instruction.jump_policy.defers_redundant_removal() {
-                        has_work = true;
-                        break;
-                    }
-                    if !instruction.jump_policy.borrow_empty_block() || finalize_borrow_empty_blocks
-                    {
-                        target = Some(jump_target);
-                    }
-                }
-            }
-        }
-        if !has_work {
-            return;
         }
         let exception_boundaries = self
             .exception_regions
@@ -4898,6 +5182,9 @@ impl OptimizationPipeline {
             first_scan = false;
         }
 
+        if redundant.is_empty() {
+            return;
+        }
         // Positions stay stable during retries. Remove in physical reverse order,
         // since a later retry can enqueue a jump before an earlier deletion.
         for block in order.into_iter().rev() {
@@ -5038,8 +5325,8 @@ impl OptimizationPipeline {
     pub(in crate::assembler) fn propagate_locations_within_blocks(&mut self) {
         self.propagate_original_normal_finally_entry_locations();
         let graph = &mut self.graph;
-        let order = graph.order().to_vec();
-        for block in order {
+        for block_index in 0..graph.len() {
+            let block = graph.block_at(block_index);
             let mut previous = None;
             let mut block_has_instruction = false;
             for item in graph.iter_items_mut(block) {
@@ -5171,8 +5458,9 @@ impl OptimizationPipeline {
         }
     }
 
-    pub(in crate::assembler) fn remove_redundant_nops(&mut self) {
-        self.remove_redundant_nops_scoped(false);
+    /// Removes NOPs and reports possible edits and remaining physical forward jumps.
+    pub(in crate::assembler) fn remove_redundant_nops(&mut self) -> NopCleanup {
+        self.remove_redundant_nops_scoped(false)
     }
 
     /// Returns whether manager cleanup ran and may have changed the graph or its provenance.
@@ -5184,17 +5472,38 @@ impl OptimizationPipeline {
         {
             return false;
         }
-        self.remove_redundant_nops_scoped(true);
-        true
+        self.remove_redundant_nops_scoped(true).may_have_changed
     }
 
-    fn remove_redundant_nops_scoped(&mut self, with_exits_only: bool) {
-        if !self
-            .graph
-            .iter_items()
-            .any(|item| matches!(item, Item::Instruction(instruction) if instruction.opcode == NOP))
-        {
-            return;
+    fn remove_redundant_nops_scoped(&mut self, with_exits_only: bool) -> NopCleanup {
+        let is_forward_jump = |instruction: &Instruction| {
+            instruction.opcode == JUMP_FORWARD
+                && matches!(instruction.operand(), Operand::Forward(_))
+        };
+        // Late cleanup already returns when the graph has never summarized any jump.
+        let track_forward_jumps = !with_exits_only && self.graph.features().has_jump();
+        let mut has_forward_jump = false;
+        if !self.graph.iter_items().any(|item| {
+            let Item::Instruction(instruction) = item else {
+                return false;
+            };
+            if track_forward_jumps && !has_forward_jump {
+                has_forward_jump = is_forward_jump(instruction);
+            }
+            instruction.opcode == NOP
+                && (!with_exits_only
+                    || (instruction.fusion_policy.is_converted_pop_block()
+                        && !instruction.jump_policy.borrow_empty_block()
+                        && self
+                            .exception_owner_provenance
+                            .with_context_locations
+                            .contains(&instruction.location)))
+        }) {
+            // Without a matching NOP the candidate walk already visited every instruction.
+            return NopCleanup {
+                has_forward_jump,
+                may_have_changed: false,
+            };
         }
         if !with_exits_only
             && !self
@@ -5496,6 +5805,18 @@ impl OptimizationPipeline {
                     continue;
                 }
             };
+            // The lookahead consumes labels only, so this sees every instruction. The
+            // pass edits NOPs, locations and metadata, but cannot remove or create a jump.
+            if track_forward_jumps && !has_forward_jump {
+                has_forward_jump = is_forward_jump(instruction);
+            }
+            if !track_exception_owners && instruction.opcode != NOP {
+                previous = Some(instruction);
+                previous_graph_block = Some(graph_block);
+                previous_position = Some(position);
+                removed_unpack_line_block = None;
+                continue;
+            }
             let block = history_block;
             if track_exception_owners
                 && (instruction.opcode == NOT_TAKEN
@@ -5769,6 +6090,10 @@ impl OptimizationPipeline {
                 .add_hidden_exception_owner_slots(slots);
         }
         graph.remove_ordered_instructions(&redundant);
+        NopCleanup {
+            has_forward_jump,
+            may_have_changed: true,
+        }
     }
 }
 
@@ -5776,6 +6101,723 @@ impl OptimizationPipeline {
 mod tests {
     use super::*;
     use crate::assembler::{Assembler, ExceptionRegion, ExceptionRegionPriority};
+
+    #[test]
+    fn forward_threading_source_gates_match_unconditional_candidate_scans() {
+        let [start, loop_head, source, entry, destination, handler] =
+            [0, 1, 2, 3, 4, 5].map(Label::from_u32);
+        let located = SourceLocation::new(5, 5, 1, 2);
+        let returned = SourceLocation::new(9, 9, 1, 2);
+        let make = |variation: &str| {
+            let ordinary = |opcode, operand, location, depth| {
+                Item::Instruction(Instruction::new(opcode, operand, location, Some(depth)))
+            };
+            let mut candidate =
+                Instruction::new(JUMP_FORWARD, Operand::Forward(entry), located, Some(0));
+            if variation.starts_with("authored") {
+                candidate.fusion_policy.mark_authored_break();
+                candidate.jump_policy.prevent_threading_target();
+                if variation == "authored-retained" {
+                    candidate.jump_policy.retain_nop();
+                } else {
+                    candidate.jump_policy.retain_nop_for_direct_target();
+                    candidate.add_pre_fold_extra_instructions(1);
+                }
+            } else if variation == "retained-conditional" {
+                candidate.jump_policy.retain_nop();
+            }
+            let backward = matches!(variation, "authored-retained" | "retained-conditional");
+            let mut bridge = if backward {
+                Instruction::new(
+                    JUMP_BACKWARD,
+                    Operand::Backward(loop_head),
+                    returned,
+                    Some(0),
+                )
+            } else {
+                Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(destination),
+                    SourceLocation::NONE,
+                    Some(0),
+                )
+            };
+            if !backward && variation != "plain" {
+                bridge.no_location_policy.preserve_location();
+            }
+            let mut assembler = Assembler::from_linear_items(vec![
+                Item::Label(start),
+                ordinary(LOAD_CONST, Operand::Value(0), located, 1),
+                ordinary(POP_JUMP_IF_FALSE, Operand::Forward(source), located, 0),
+                Item::Label(loop_head),
+                ordinary(NOP, Operand::Value(0), located, 0),
+                ordinary(JUMP_FORWARD, Operand::Forward(entry), located, 0),
+                Item::Label(source),
+                Item::Instruction(candidate),
+                Item::Label(entry),
+                Item::Instruction(bridge),
+                Item::Label(destination),
+                ordinary(
+                    crate::target::opcodes::LOAD_FAST,
+                    Operand::Value(0),
+                    returned,
+                    1,
+                ),
+                ordinary(RETURN_VALUE, Operand::Value(0), returned, 0),
+                Item::Label(handler),
+                ordinary(RAISE_VARARGS, Operand::Value(0), returned, 0),
+            ]);
+            assembler.next_label = 6;
+            let mut pipeline = assembler.into_optimization_pipeline();
+            if variation != "plain" {
+                let boundaries = [loop_head, source, entry, destination];
+                if variation != "no-source-boundaries" {
+                    pipeline
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .extend(boundaries);
+                }
+                if variation != "no-block-boundaries" {
+                    pipeline
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .extend(boundaries);
+                }
+                if variation != "no-original-heads" {
+                    pipeline.original_jump_head_targets.insert(entry);
+                }
+                if variation != "no-folded-sources" {
+                    pipeline
+                        .folded_predecessor_sources
+                        .push((source, entry, SourceLocation::NONE));
+                }
+                if variation != "no-conditional-targets" {
+                    pipeline
+                        .conditional_threading_targets
+                        .insert(entry, returned);
+                }
+                if variation != "no-normal-exits" {
+                    pipeline
+                        .exception_owner_provenance
+                        .normal_try_exits
+                        .push((entry, destination));
+                    pipeline
+                        .exception_owner_provenance
+                        .compound_try_owner_exits
+                        .push((entry, destination));
+                }
+            }
+            if matches!(variation, "two-regions" | "fallback-regions") {
+                for (range_start, range_end, is_scope_fallback) in [
+                    (start, destination, variation == "fallback-regions"),
+                    (source, entry, false),
+                ] {
+                    pipeline.exception_regions.push(ExceptionRegion {
+                        start: range_start,
+                        end: range_end,
+                        target: handler,
+                        depth: 0,
+                        preserve_lasti: is_scope_fallback,
+                        is_scope_fallback,
+                        priority: ExceptionRegionPriority::OriginalRange(range_start, range_end),
+                    });
+                }
+            }
+            pipeline
+        };
+
+        for variation in [
+            "plain",
+            "ordinary",
+            "authored-return",
+            "authored-retained",
+            "retained-conditional",
+            "no-source-boundaries",
+            "no-block-boundaries",
+            "no-original-heads",
+            "no-folded-sources",
+            "no-conditional-targets",
+            "no-normal-exits",
+            "two-regions",
+            "fallback-regions",
+        ] {
+            let mut gated = make(variation);
+            let mut reference = make(variation);
+            let changed = gated.thread_forward_jumps();
+            assert_eq!(
+                changed,
+                reference.thread_forward_jumps_with_source_gates::<true, false>(),
+                "{variation}"
+            );
+            if variation == "plain" {
+                assert!(changed, "the generic jump-threading pass still runs");
+            }
+            assert_eq!(
+                gated.graph.copy_items(),
+                reference.graph.copy_items(),
+                "{variation}"
+            );
+            assert_eq!(
+                format!("{gated:?}"),
+                format!("{reference:?}"),
+                "{variation}"
+            );
+        }
+    }
+
+    #[test]
+    fn original_conditional_threading_preflight_matches_handler_and_empty_target_scans() {
+        let [start, source, entry, destination] = [0, 1, 2, 3].map(Label::from_u32);
+        let located = SourceLocation::new(5, 5, 1, 2);
+        let make = |variation: &str| {
+            let ordinary = |opcode, operand, depth| {
+                Item::Instruction(Instruction::new(opcode, operand, located, Some(depth)))
+            };
+            let mut bridge = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(destination),
+                SourceLocation::NONE,
+                Some(1),
+            );
+            bridge.fusion_policy.mark_authored_break();
+            bridge.jump_policy.prevent_threading_target();
+            if variation == "changed-bridge" {
+                bridge.add_pre_fold_extra_instructions(1);
+            }
+            let mut assembler = Assembler::from_linear_items(vec![
+                Item::Label(start),
+                ordinary(LOAD_CONST, Operand::Value(0), 1),
+                ordinary(POP_JUMP_IF_FALSE, Operand::Forward(entry), 0),
+                ordinary(NOT_TAKEN, Operand::Value(0), 0),
+                ordinary(JUMP_FORWARD, Operand::Forward(source), 0),
+                Item::Label(source),
+                ordinary(POP_EXCEPT, Operand::Value(0), 1),
+                ordinary(JUMP_FORWARD, Operand::Forward(entry), 1),
+                Item::Label(entry),
+                Item::Instruction(bridge),
+                Item::Label(destination),
+                ordinary(LOAD_CONST, Operand::Value(0), 1),
+                ordinary(RETURN_VALUE, Operand::Value(0), 0),
+            ]);
+            assembler.next_label = 4;
+            let mut pipeline = assembler.into_optimization_pipeline();
+            if variation != "no-regions" {
+                pipeline.exception_regions.push(ExceptionRegion {
+                    start,
+                    end: source,
+                    target: destination,
+                    depth: 2,
+                    preserve_lasti: variation != "no-lasti",
+                    is_scope_fallback: false,
+                    priority: ExceptionRegionPriority::OriginalRange(start, source),
+                });
+            }
+            if variation != "no-original-nop" {
+                pipeline.original_nop_targets.insert(source);
+            }
+            if variation != "no-nop-count" {
+                pipeline
+                    .exception_owner_provenance
+                    .omitted_nop_counts
+                    .insert(source, 1);
+            }
+            if variation != "no-nop-location" {
+                pipeline
+                    .exception_owner_provenance
+                    .omitted_nop_locations
+                    .insert(source, located);
+            }
+            pipeline
+                .exception_owner_provenance
+                .block_boundaries
+                .insert(entry);
+            pipeline
+                .exception_owner_provenance
+                .source_boundaries
+                .insert(entry);
+            if variation != "no-conditional-target" && variation != "no-bound-target" {
+                pipeline.conditional_threading_targets.insert(
+                    entry,
+                    if variation == "located-target" {
+                        located
+                    } else {
+                        SourceLocation::NONE
+                    },
+                );
+            } else if variation == "no-bound-target" {
+                // This set enters the pass but its block does not begin with a jump.
+                pipeline.original_jump_head_targets.insert(source);
+            }
+            pipeline
+        };
+        for variation in [
+            "ordinary",
+            "no-regions",
+            "no-lasti",
+            "no-original-nop",
+            "no-nop-count",
+            "no-nop-location",
+            "no-conditional-target",
+            "located-target",
+            "changed-bridge",
+            "no-bound-target",
+        ] {
+            let mut gated = make(variation);
+            let mut original = make(variation);
+            let heads = gated.thread_copied_finally_pass_breaks::<true>();
+            assert_eq!(
+                heads,
+                original.thread_copied_finally_pass_breaks::<false>(),
+                "{variation}"
+            );
+            assert_eq!(
+                heads.len(),
+                usize::from(variation == "ordinary"),
+                "{variation}"
+            );
+            assert_eq!(
+                gated.graph.copy_items(),
+                original.graph.copy_items(),
+                "{variation}"
+            );
+
+            let mut gated = make(variation);
+            let mut original = make(variation);
+            let changed = gated.thread_original_conditional_jump_targets();
+            assert_eq!(
+                changed,
+                original.thread_original_conditional_jump_targets_with_preflight::<false>(),
+                "{variation}"
+            );
+            assert_eq!(
+                changed,
+                !matches!(variation, "no-conditional-target" | "no-bound-target"),
+                "{variation}"
+            );
+            assert_eq!(
+                gated.graph.copy_items(),
+                original.graph.copy_items(),
+                "{variation}"
+            );
+            assert_eq!(
+                gated.graph.features(),
+                original.graph.features(),
+                "{variation}"
+            );
+            assert_eq!(
+                gated.exception_owner_provenance.threaded_condition_origins,
+                original
+                    .exception_owner_provenance
+                    .threaded_condition_origins,
+                "{variation}"
+            );
+        }
+    }
+
+    #[test]
+    fn borrow_empty_jump_head_preflight_matches_full_incoming_analysis() {
+        let source = Label::from_u32(0);
+        let head = Label::from_u32(1);
+        let alias = Label::from_u32(2);
+        let exit = Label::from_u32(3);
+        let missing = Label::from_u32(4);
+        let located = SourceLocation::new(4, 4, 0, 1);
+        let make = |variation: &str| {
+            let mut jump = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(if variation == "unbound" {
+                    missing
+                } else {
+                    exit
+                }),
+                if variation == "located" {
+                    located
+                } else {
+                    SourceLocation::NONE
+                },
+                None,
+            );
+            match variation {
+                "folded" => jump.add_pre_fold_extra_instructions(1),
+                "interruptible" => jump.jump_policy.mark_interruptible(),
+                "retained" => jump.jump_policy.retain_nop(),
+                "direct-retained" => jump.jump_policy.retain_nop_for_direct_target(),
+                "already-marked" => jump.jump_policy.mark_borrow_empty_block(),
+                _ => {}
+            }
+            let mut items = vec![
+                Item::Label(source),
+                Item::Instruction(Instruction::new(NOP, Operand::Value(0), located, None)),
+                Item::Instruction(Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(head),
+                    located,
+                    None,
+                )),
+                Item::Label(head),
+                Item::Label(alias),
+            ];
+            if variation == "prefix" {
+                items.push(Item::Instruction(Instruction::new(
+                    NOP,
+                    Operand::Value(0),
+                    located,
+                    None,
+                )));
+            }
+            items.extend([
+                Item::Instruction(jump),
+                Item::Label(exit),
+                Item::Instruction(Instruction::new(
+                    RETURN_VALUE,
+                    Operand::Value(0),
+                    located,
+                    None,
+                )),
+            ]);
+            let mut assembler = Assembler::from_linear_items(items);
+            assembler.next_label = 5;
+            let mut pipeline = assembler.into_optimization_pipeline();
+            if variation == "original-nop" {
+                pipeline.original_nop_targets.insert(alias);
+            }
+            if variation == "preserved" {
+                pipeline.preserved_block_boundaries.insert(alias);
+            }
+            pipeline
+        };
+
+        for (variation, expected) in [
+            ("ordinary", true),
+            ("direct-retained", true),
+            ("located", false),
+            ("folded", false),
+            ("interruptible", false),
+            ("retained", false),
+            ("already-marked", false),
+            ("original-nop", false),
+            ("preserved", false),
+            ("prefix", false),
+            ("unbound", false),
+        ] {
+            let mut gated = make(variation);
+            let mut full = make(variation);
+            assert_eq!(
+                gated.record_borrow_empty_jump_heads(),
+                expected,
+                "{variation}"
+            );
+            assert_eq!(
+                full.record_borrow_empty_jump_heads_with_preflight::<false>(),
+                expected,
+                "{variation}",
+            );
+            assert_eq!(
+                gated.graph.copy_items(),
+                full.graph.copy_items(),
+                "{variation}"
+            );
+            assert_eq!(gated.graph.features(), full.graph.features(), "{variation}");
+        }
+    }
+
+    #[test]
+    fn original_jump_head_preflight_matches_full_conditional_target_analysis() {
+        let source = Label::from_u32(0);
+        let head = Label::from_u32(1);
+        let alias = Label::from_u32(2);
+        let exit = Label::from_u32(3);
+        let missing = Label::from_u32(4);
+        let located = SourceLocation::new(4, 4, 0, 1);
+        let other = SourceLocation::new(5, 5, 0, 1);
+        let make = |variation: &str| {
+            let backward = variation.starts_with("backward");
+            let mut jump = Instruction::new(
+                if backward {
+                    JUMP_BACKWARD
+                } else {
+                    JUMP_FORWARD
+                },
+                if backward {
+                    Operand::Backward(source)
+                } else {
+                    Operand::Forward(exit)
+                },
+                located,
+                None,
+            );
+            if !backward && variation != "ordinary-forward" {
+                jump.jump_policy.mark_interruptible();
+            }
+            if variation == "folded" {
+                jump.add_pre_fold_extra_instructions(1);
+            }
+            let plain = |opcode, operand| {
+                Item::Instruction(Instruction::new(opcode, operand, located, None))
+            };
+            let mut items = vec![
+                Item::Label(source),
+                plain(NOP, Operand::Value(0)),
+                if variation == "no-conditional" {
+                    plain(NOP, Operand::Value(0))
+                } else {
+                    plain(POP_JUMP_IF_TRUE, Operand::Forward(head))
+                },
+                plain(NOP, Operand::Value(0)),
+                plain(RETURN_VALUE, Operand::Value(0)),
+                Item::Label(head),
+                Item::Label(alias),
+            ];
+            if variation == "prefix" {
+                items.push(plain(NOP, Operand::Value(0)));
+            }
+            items.extend([
+                Item::Instruction(jump),
+                Item::Label(exit),
+                plain(RETURN_VALUE, Operand::Value(0)),
+            ]);
+            let mut assembler = Assembler::from_linear_items(items);
+            assembler.next_label = 5;
+            let mut pipeline = assembler.into_optimization_pipeline();
+            if variation == "backward" {
+                pipeline.conditional_threading_targets.insert(head, located);
+            } else if variation == "backward-mismatch" || variation == "forward-already-tracked" {
+                pipeline.conditional_threading_targets.insert(head, other);
+            }
+            if variation == "original-nop" {
+                pipeline.original_nop_targets.insert(head);
+            }
+            if variation == "original-cleanup" {
+                pipeline.original_unlocated_cleanup_targets.insert(exit);
+            }
+            pipeline
+                .exception_owner_provenance
+                .constant_pass_clusters
+                .push(crate::assembler::exception_owners::ConstantPassCluster {
+                    start: missing,
+                    end: missing,
+                    constant_location: located,
+                    pass_location: located,
+                });
+            pipeline
+        };
+
+        for (variation, expected) in [
+            ("interruptible-forward", true),
+            ("backward", true),
+            ("ordinary-forward", false),
+            ("backward-untracked", false),
+            ("backward-mismatch", false),
+            ("folded", false),
+            ("original-nop", false),
+            ("original-cleanup", false),
+            ("forward-already-tracked", false),
+            ("prefix", false),
+            ("no-conditional", false),
+        ] {
+            let mut gated = make(variation);
+            let mut full = make(variation);
+            gated.record_original_jump_heads();
+            full.record_original_jump_heads_with_preflight::<false>();
+            assert_eq!(
+                gated.original_jump_head_targets.contains(&head),
+                expected,
+                "{variation}"
+            );
+            assert_eq!(
+                gated.original_jump_head_targets, full.original_jump_head_targets,
+                "{variation}"
+            );
+            assert!(
+                gated
+                    .exception_owner_provenance
+                    .constant_pass_clusters
+                    .is_empty(),
+                "{variation}"
+            );
+            assert!(
+                full.exception_owner_provenance
+                    .constant_pass_clusters
+                    .is_empty(),
+                "{variation}"
+            );
+            assert_eq!(
+                gated.graph.copy_items(),
+                full.graph.copy_items(),
+                "{variation}"
+            );
+        }
+    }
+
+    #[test]
+    fn thread_label_offsets_match_hash_lookup_across_dense_and_sparse_labels() {
+        let labels = [0, 1, 3, 7, 11, 97, 8192].map(Label::from_u32);
+        for label_count in [0, 1, 4, 12, 100] {
+            let mut actual = ThreadLabelOffsets::new(label_count);
+            let mut expected = FxHashMap::default();
+            for label in labels {
+                assert_eq!(actual.get(label), expected.get(&label));
+            }
+            for (label, offset) in [
+                (labels[0], 0),
+                (labels[3], 16),
+                (labels[6], 900),
+                (labels[2], 16),
+                (labels[1], 0),
+                (labels[4], 85),
+                (labels[0], 42),
+                (labels[6], 0),
+            ] {
+                actual.insert(label, offset);
+                expected.insert(label, offset);
+                for label in labels {
+                    assert_eq!(actual.get(label), expected.get(&label));
+                    if expected.contains_key(&label) {
+                        assert_eq!(actual[&label], expected[&label]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn original_constant_return_matches_unbounded_scan() {
+        fn original(graph: &BlockGraph, target: Label) -> bool {
+            let Some(block) = graph.label_block(target) else {
+                return false;
+            };
+            let mut started = false;
+            let mut instructions = Vec::new();
+            for item in graph[block].items() {
+                match item {
+                    Item::Label(label) if !started => started = *label == target,
+                    Item::Label(_) if instructions.is_empty() => {}
+                    Item::Label(_) => return false,
+                    Item::Instruction(instruction) if started => instructions.push(instruction),
+                    Item::Instruction(_) => {}
+                }
+            }
+            let [marker, value, ret] = instructions.as_slice() else {
+                return false;
+            };
+            marker.opcode == NOP
+                && (value.opcode == LOAD_CONST
+                    || (value.opcode == crate::target::opcodes::LOAD_SMALL_INT
+                        && matches!(value.operand(), Operand::Value(0..=255))))
+                && ret.opcode == RETURN_VALUE
+                && marker.location.line >= 0
+                && marker.location == value.location
+                && marker.location == ret.location
+                && instructions.iter().all(|instruction| {
+                    matches!(instruction.operand(), Operand::Value(_))
+                        && instruction.pre_fold_extra_instructions() == 0
+                })
+        }
+
+        let target = Label::from_u32(0);
+        let preceding = Label::from_u32(1);
+        let alias = Label::from_u32(2);
+        let trailing = Label::from_u32(3);
+        let missing = Label::from_u32(4);
+        let location = SourceLocation::new(7, 7, 2, 10);
+        let instructions = [NOP, LOAD_CONST, RETURN_VALUE]
+            .map(|opcode| Instruction::new(opcode, Operand::Value(0), location, None));
+        let items = |instructions: &[Instruction]| {
+            [
+                Item::Label(preceding),
+                Item::Instruction(instructions[0]),
+                Item::Label(target),
+                Item::Label(alias),
+            ]
+            .into_iter()
+            .chain(instructions.iter().copied().map(Item::Instruction))
+            .collect::<Vec<_>>()
+        };
+        let mut cases = vec![(items(&instructions), true)];
+        for boundary in 1..=3 {
+            let mut inline = items(&instructions);
+            inline.insert(4 + boundary, Item::Label(trailing));
+            cases.push((inline, false));
+        }
+        for count in 0..=8 {
+            let mut inline = items(&instructions);
+            if count < 3 {
+                inline.truncate(4 + count);
+            } else {
+                inline.extend(std::iter::repeat_n(
+                    Item::Instruction(instructions[0]),
+                    count - 3,
+                ));
+            }
+            cases.push((inline, count == 3));
+        }
+        for value in [0, 255, 256] {
+            let mut changed = instructions;
+            changed[1].opcode = crate::target::opcodes::LOAD_SMALL_INT;
+            changed[1].set_operand(Operand::Value(value));
+            cases.push((items(&changed), value <= 255));
+        }
+        for index in 0..3 {
+            let mut changed = instructions;
+            changed[index].location = SourceLocation::new(7, 7, 3, 10);
+            cases.push((items(&changed), false));
+            let mut changed = instructions;
+            changed[index].add_pre_fold_extra_instructions(1);
+            cases.push((items(&changed), false));
+            let mut changed = instructions;
+            changed[index].set_operand(Operand::Forward(missing));
+            cases.push((items(&changed), false));
+        }
+        let unlocated = instructions.map(|mut instruction| {
+            instruction.location = SourceLocation::NONE;
+            instruction
+        });
+        cases.push((items(&unlocated), false));
+
+        for (items, expected) in cases {
+            // Bypass normalization to retain inline aliases and items after RETURN_VALUE.
+            let mut graph = BlockGraph::from_items(Vec::new(), &FxHashSet::default());
+            graph.push_block(items);
+            assert_eq!(original(&graph, target), expected);
+            assert_eq!(is_original_constant_return(&graph, target), expected);
+            assert!(!is_original_constant_return(&graph, missing));
+        }
+    }
+
+    #[test]
+    fn shared_unlocated_forward_jump_requires_pop_conditionals_including_none_tests() {
+        let first = Label::from_u32(0);
+        let second = Label::from_u32(1);
+        let shared = Label::from_u32(2);
+        let exit = Label::from_u32(3);
+        let instruction = |opcode, operand, location| {
+            Item::Instruction(Instruction::new(opcode, operand, location, None))
+        };
+        let located = SourceLocation::new(1, 1, 0, 1);
+
+        for (first_opcode, second_opcode, expected) in [
+            (JUMP_FORWARD, JUMP_FORWARD, false),
+            (POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, true),
+        ] {
+            let mut assembler = Assembler::from_linear_items(vec![
+                Item::Label(first),
+                instruction(first_opcode, Operand::Forward(shared), located),
+                Item::Label(second),
+                instruction(second_opcode, Operand::Forward(shared), located),
+                Item::Label(shared),
+                instruction(JUMP_FORWARD, Operand::Forward(exit), SourceLocation::NONE),
+                Item::Label(exit),
+                instruction(RETURN_VALUE, Operand::Value(0), located),
+            ]);
+            assembler.next_label = 4;
+            let mut pipeline = assembler.into_optimization_pipeline();
+            pipeline.record_shared_unlocated_jump_entries();
+            assert_eq!(
+                pipeline.original_shared_unlocated_jump_entries.get(&shared),
+                expected.then_some(&shared),
+            );
+        }
+    }
 
     #[test]
     fn small_scope_exit_follows_aliases_and_unlabeled_physical_blocks() {
@@ -5823,6 +6865,516 @@ mod tests {
             assert!(!targets_small_scope_exit(&graph, target));
             assert!(!targets_small_scope_exit(&graph, alias));
             assert!(targets_small_scope_exit(&graph, separator));
+        }
+    }
+
+    #[test]
+    fn all_reachable_cleanup_matches_full_scan_and_respects_cached_reachability() {
+        let labels = [0, 1, 2, 3, 4, 5].map(Label::from_u32);
+        let [start, middle, target, end, dormant_handler, stale] = labels;
+        let instruction = |opcode, operand, depth| {
+            Item::Instruction(Instruction::new(
+                opcode,
+                operand,
+                SourceLocation::new(1, 1, 0, 1),
+                Some(depth),
+            ))
+        };
+        let region = |handler| ExceptionRegion {
+            start,
+            end,
+            target: handler,
+            depth: 0,
+            preserve_lasti: false,
+            is_scope_fallback: false,
+            priority: ExceptionRegionPriority::OriginalRange(start, end),
+        };
+        let mut folded = Instruction::new(
+            LOAD_CONST,
+            Operand::Value(3),
+            SourceLocation::new(2, 2, 0, 1),
+            Some(13),
+        );
+        folded.add_pre_fold_extra_instructions(1);
+        let fixtures = [
+            (
+                vec![
+                    vec![
+                        Item::Label(start),
+                        instruction(POP_JUMP_IF_TRUE, Operand::Forward(target), 1),
+                    ],
+                    vec![Item::Label(middle)],
+                    vec![Item::Label(target), instruction(NOP, Operand::Value(0), 2)],
+                    vec![
+                        Item::Label(end),
+                        instruction(RETURN_VALUE, Operand::Value(0), 3),
+                    ],
+                ],
+                vec![],
+                None,
+                false,
+                None,
+            ),
+            (
+                vec![
+                    vec![
+                        Item::Label(start),
+                        instruction(POP_JUMP_IF_TRUE, Operand::Forward(target), 1),
+                    ],
+                    vec![Item::Label(middle), Item::Instruction(folded)],
+                    vec![Item::Label(target), instruction(NOP, Operand::Value(0), 2)],
+                    vec![
+                        Item::Label(end),
+                        instruction(RETURN_VALUE, Operand::Value(0), 3),
+                    ],
+                ],
+                vec![],
+                Some(vec![true, false, true, true]),
+                false,
+                Some(13),
+            ),
+            (
+                vec![
+                    vec![
+                        Item::Label(start),
+                        instruction(POP_JUMP_IF_TRUE, Operand::Forward(target), 1),
+                    ],
+                    vec![
+                        Item::Label(middle),
+                        instruction(RETURN_VALUE, Operand::Value(0), 4),
+                    ],
+                    vec![Item::Label(target), instruction(NOP, Operand::Value(0), 2)],
+                    vec![
+                        Item::Label(end),
+                        instruction(RETURN_VALUE, Operand::Value(0), 3),
+                    ],
+                ],
+                vec![],
+                None,
+                false,
+                None,
+            ),
+            (
+                vec![
+                    vec![
+                        Item::Label(start),
+                        instruction(RETURN_VALUE, Operand::Value(0), 1),
+                    ],
+                    vec![Item::Label(middle), Item::Instruction(folded)],
+                    vec![
+                        Item::Label(end),
+                        instruction(RETURN_VALUE, Operand::Value(0), 3),
+                    ],
+                ],
+                vec![],
+                None,
+                false,
+                Some(13),
+            ),
+            (
+                vec![
+                    vec![Item::Label(start), instruction(NOP, Operand::Value(0), 1)],
+                    vec![Item::Label(middle), instruction(NOP, Operand::Value(0), 2)],
+                    vec![
+                        Item::Label(end),
+                        instruction(RETURN_VALUE, Operand::Value(0), 3),
+                    ],
+                ],
+                vec![region(dormant_handler)],
+                Some(vec![true, true, true, false]),
+                true,
+                None,
+            ),
+            (
+                vec![
+                    vec![Item::Label(start), instruction(NOP, Operand::Value(0), 1)],
+                    vec![Item::Label(middle), instruction(NOP, Operand::Value(0), 2)],
+                    vec![
+                        Item::Label(end),
+                        instruction(RETURN_VALUE, Operand::Value(0), 3),
+                    ],
+                ],
+                vec![region(middle)],
+                Some(vec![true, true, true]),
+                false,
+                None,
+            ),
+        ];
+        for (blocks, regions, initial_reachable, dormant, expected_depth) in fixtures {
+            let make_pipeline = || {
+                let mut pipeline =
+                    Assembler::from_linear_items(Vec::new()).into_optimization_pipeline();
+                pipeline.graph = BlockGraph::from_items(Vec::new(), &FxHashSet::default());
+                for items in &blocks {
+                    pipeline.graph.push_block(items.clone());
+                }
+                if dormant {
+                    pipeline
+                        .graph
+                        .allocate_block(vec![Item::Label(dormant_handler)]);
+                }
+                pipeline.exception_regions = regions.clone();
+                pipeline.initial_reachable = initial_reachable.clone();
+                pipeline.discarded_fold_admissions.insert(middle, vec![7]);
+                pipeline.retired_exception_handler_targets.insert(stale);
+                pipeline
+            };
+            let mut optimized = make_pipeline();
+            let mut full = make_pipeline();
+            let actual = optimized.remove_unreachable_instructions_with_proof::<true>();
+            let expected = full.remove_unreachable_instructions_with_proof::<false>();
+            assert_eq!(actual, expected_depth);
+            assert_eq!(actual, expected);
+            assert_eq!(optimized.graph.copy_items(), full.graph.copy_items());
+            assert_eq!(optimized.graph.order(), full.graph.order());
+            assert_eq!(optimized.initial_reachable, full.initial_reachable);
+            assert_eq!(
+                optimized.discarded_fold_admissions,
+                full.discarded_fold_admissions
+            );
+            assert_eq!(
+                optimized.retired_exception_handler_targets,
+                full.retired_exception_handler_targets
+            );
+            if dormant {
+                assert!(
+                    optimized
+                        .retired_exception_handler_targets
+                        .contains(&dormant_handler)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nop_pass_forward_jump_summary_matches_exact_late_cleanup_with_stale_features() {
+        let [source, fallthrough, target] = [0, 1, 2].map(Label::from_u32);
+        let located = SourceLocation::new(1, 1, 0, 1);
+        let item = |opcode, operand, location| {
+            Item::Instruction(Instruction::new(opcode, operand, location, None))
+        };
+        let actual_forward_jump = |pipeline: &OptimizationPipeline| {
+            pipeline.graph.iter_items().any(|item| {
+                matches!(item, Item::Instruction(instruction)
+                    if instruction.opcode == JUMP_FORWARD
+                        && matches!(instruction.operand(), Operand::Forward(_)))
+            })
+        };
+        for nops in [0, 1, 2, 3] {
+            for protected in [false, true] {
+                for jump_kind in 0..5 {
+                    let make_pipeline = || {
+                        let mut items = vec![
+                            Item::Label(source),
+                            item(LOAD_CONST, Operand::Value(0), located),
+                            item(POP_JUMP_IF_FALSE, Operand::Forward(target), located),
+                            Item::Label(fallthrough),
+                            item(LOAD_CONST, Operand::Value(0), located),
+                            Item::Label(target),
+                            item(RETURN_VALUE, Operand::Value(0), located),
+                        ];
+                        if nops & 1 != 0 {
+                            items.insert(1, item(NOP, Operand::Value(0), located));
+                        }
+                        if nops & 2 != 0 {
+                            items.insert(items.len() - 1, item(NOP, Operand::Value(0), located));
+                        }
+                        let mut assembler = Assembler::from_linear_items(items);
+                        assembler.next_label = 3;
+                        let mut pipeline = assembler.into_optimization_pipeline();
+                        assert!(pipeline.graph.features().has_jump());
+                        assert!(!pipeline.graph.features().has_forward_jump());
+                        if protected {
+                            pipeline.exception_regions.push(ExceptionRegion {
+                                start: source,
+                                end: target,
+                                target,
+                                depth: 0,
+                                preserve_lasti: false,
+                                is_scope_fallback: false,
+                                priority: ExceptionRegionPriority::OriginalRange(source, target),
+                            });
+                        }
+                        let jump = match jump_kind {
+                            0 => None,
+                            1 => Some((JUMP_FORWARD, Operand::Forward(target))),
+                            2 => Some((JUMP_BACKWARD, Operand::Forward(target))),
+                            3 => Some((JUMP_FORWARD, Operand::Backward(source))),
+                            4 => Some((POP_JUMP_IF_NONE, Operand::Forward(target))),
+                            _ => unreachable!(),
+                        };
+                        if let Some((opcode, operand)) = jump {
+                            let block = pipeline.graph.label_block(fallthrough).unwrap();
+                            pipeline.graph.append_to_block(
+                                block,
+                                [item(opcode, operand, SourceLocation::NONE)],
+                            );
+                            assert!(!pipeline.graph.features().has_forward_jump());
+                        }
+                        pipeline
+                    };
+                    let mut optimized = make_pipeline();
+                    let mut reference = make_pipeline();
+                    let summary = optimized.remove_redundant_nops();
+                    reference.remove_redundant_nops();
+                    assert_eq!(summary.has_forward_jump, jump_kind == 1);
+                    assert_eq!(summary.has_forward_jump, actual_forward_jump(&optimized));
+                    assert_eq!(summary.may_have_changed, nops != 0);
+                    assert_eq!(optimized.graph.copy_items(), reference.graph.copy_items());
+                    if summary.has_forward_jump {
+                        optimized.remove_redundant_forward_jumps(true);
+                    }
+                    reference.remove_redundant_forward_jumps(true);
+                    assert_eq!(optimized.graph.copy_items(), reference.graph.copy_items());
+                    assert_eq!(optimized.graph.order(), reference.graph.order());
+                    if jump_kind == 1 && !protected && nops == 0 {
+                        assert!(!actual_forward_jump(&optimized));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nop_summary_preserves_borrow_marker_jump_retries() {
+        let [start, first_target, second_target] = [0, 1, 2].map(Label::from_u32);
+        let located = SourceLocation::new(1, 1, 0, 1);
+        for marker_location in [SourceLocation::NONE, SourceLocation::new(2, 2, 0, 1)] {
+            for marker_fallthrough in [
+                BorrowFallthrough::Reachable,
+                BorrowFallthrough::BarrierIfRemoved,
+                BorrowFallthrough::Barrier,
+            ] {
+                for retain_marker in [false, true] {
+                    for second_policy in [
+                        "none", "ordinary", "deferred", "borrowed", "retained", "barrier",
+                    ] {
+                        let make_pipeline = || {
+                            let mut marker =
+                                Instruction::new(NOP, Operand::Value(0), marker_location, None);
+                            marker.jump_policy.mark_borrow_empty_block();
+                            if retain_marker {
+                                marker.jump_policy.retain_nop();
+                            }
+                            marker
+                                .no_location_policy
+                                .set_borrow_fallthrough(marker_fallthrough);
+                            let mut items = vec![
+                                Item::Label(start),
+                                Item::Instruction(Instruction::new(
+                                    LOAD_CONST,
+                                    Operand::Value(0),
+                                    located,
+                                    None,
+                                )),
+                                Item::Instruction(Instruction::new(
+                                    JUMP_FORWARD,
+                                    Operand::Forward(first_target),
+                                    located,
+                                    None,
+                                )),
+                                Item::Instruction(marker),
+                                Item::Label(first_target),
+                            ];
+                            if second_policy != "none" {
+                                let mut jump = Instruction::new(
+                                    JUMP_FORWARD,
+                                    Operand::Forward(second_target),
+                                    SourceLocation::new(3, 3, 0, 1),
+                                    None,
+                                );
+                                match second_policy {
+                                    "deferred" => jump.jump_policy.defer_removal(),
+                                    "borrowed" => jump.jump_policy.mark_borrow_empty_block(),
+                                    "retained" => jump.jump_policy.retain_nop(),
+                                    "barrier" => jump
+                                        .no_location_policy
+                                        .set_borrow_fallthrough(BorrowFallthrough::Barrier),
+                                    "ordinary" => {}
+                                    _ => unreachable!(),
+                                }
+                                items.push(Item::Instruction(jump));
+                            }
+                            items.extend([
+                                Item::Label(second_target),
+                                Item::Instruction(Instruction::new(
+                                    RETURN_VALUE,
+                                    Operand::Value(0),
+                                    SourceLocation::new(3, 3, 0, 1),
+                                    None,
+                                )),
+                            ]);
+                            let mut assembler = Assembler::from_linear_items(items);
+                            assembler.next_label = 3;
+                            assembler.into_optimization_pipeline()
+                        };
+                        let mut gated = make_pipeline();
+                        let mut reference = make_pipeline();
+                        let summary = gated.remove_redundant_nops();
+                        reference.remove_redundant_nops();
+                        let actual_forward_jump = gated.graph.iter_items().any(|item| {
+                            matches!(item, Item::Instruction(instruction)
+                                if instruction.opcode == JUMP_FORWARD
+                                    && matches!(instruction.operand(), Operand::Forward(_)))
+                        });
+                        assert_eq!(summary.has_forward_jump, actual_forward_jump);
+                        if summary.has_forward_jump {
+                            gated.remove_redundant_forward_jumps(true);
+                        }
+                        reference.remove_redundant_forward_jumps(true);
+                        assert_eq!(gated.graph.copy_items(), reference.graph.copy_items());
+                        assert_eq!(gated.graph.order(), reference.graph.order());
+
+                        if marker_location.line >= 0
+                            && marker_fallthrough == BorrowFallthrough::BarrierIfRemoved
+                            && retain_marker
+                            && second_policy == "barrier"
+                        {
+                            let mut items = gated.graph.into_items();
+                            OptimizationPipeline::remove_borrow_empty_block_markers(&mut items);
+                            let first_jump_survives = items.iter().any(|item| {
+                                matches!(item, Item::Instruction(instruction)
+                                    if instruction.opcode == JUMP_FORWARD
+                                        && instruction.operand() == Operand::Forward(first_target))
+                            });
+                            let marker_survives = items.iter().any(|item| {
+                                matches!(item, Item::Instruction(instruction)
+                                    if instruction.opcode == NOP
+                                        && instruction.location == marker_location)
+                            });
+                            assert!(first_jump_survives || !marker_survives);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn manager_nop_reports_edits_only_when_its_candidate_walk_can_mutate() {
+        let location = SourceLocation::new(4, 4, 0, 1);
+        let other = SourceLocation::new(5, 5, 0, 1);
+        let value = |opcode, location| Instruction::new(opcode, Operand::Value(0), location, None);
+        for has_nop in [false, true] {
+            for converted in [false, true] {
+                for borrow_empty in [false, true] {
+                    for tracked in [None, Some(location), Some(other)] {
+                        let mut items = vec![Item::Instruction(value(POP_TOP, location))];
+                        if has_nop {
+                            let mut nop = value(NOP, location);
+                            if converted {
+                                nop.fusion_policy.mark_converted_pop_block();
+                            }
+                            if borrow_empty {
+                                nop.jump_policy.mark_borrow_empty_block();
+                            }
+                            items.push(Item::Instruction(nop));
+                        }
+                        items.push(Item::Instruction(value(RETURN_VALUE, location)));
+                        let mut pipeline =
+                            Assembler::from_linear_items(items).into_optimization_pipeline();
+                        pipeline
+                            .exception_owner_provenance
+                            .with_context_locations
+                            .extend(tracked);
+                        let before = pipeline.graph.copy_items();
+                        let may_have_changed = pipeline.remove_redundant_with_exit_nops();
+                        let expected =
+                            has_nop && converted && !borrow_empty && tracked == Some(location);
+                        assert_eq!(may_have_changed, expected);
+                        if expected {
+                            assert_ne!(pipeline.graph.copy_items(), before);
+                        } else {
+                            assert_eq!(pipeline.graph.copy_items(), before);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn threaded_target_head_gate_matches_literal_unfiltered_pipeline() {
+        let [entry, head, alias, exit, tail] = [0, 1, 2, 3, 4].map(Label::from_u32);
+        let location = SourceLocation::new(1, 1, 0, 2);
+        let ordinary = |opcode, operand| {
+            Item::Instruction(Instruction::new(opcode, operand, location, Some(0)))
+        };
+        let cases = [
+            (NOP, Operand::Value(0)),
+            (LOAD_CONST, Operand::Value(0)),
+            (RETURN_VALUE, Operand::Value(0)),
+            (POP_JUMP_IF_FALSE, Operand::Forward(exit)),
+            (POP_JUMP_IF_NONE, Operand::Forward(exit)),
+            (JUMP_FORWARD, Operand::Forward(exit)),
+            (JUMP_BACKWARD, Operand::Backward(entry)),
+            (JUMP_BACKWARD_NO_INTERRUPT, Operand::Backward(entry)),
+            (JUMP_BACKWARD, Operand::Forward(exit)),
+            (JUMP_FORWARD, Operand::Value(0)),
+        ];
+        for (case, (opcode, operand)) in cases.into_iter().enumerate() {
+            for policy in 0..3 {
+                for source_provenance in [false, true] {
+                    let make = || {
+                        let mut target = Instruction::new(opcode, operand, location, Some(0));
+                        if policy == 1 {
+                            target.jump_policy.prevent_threading_target();
+                        } else if policy == 2 {
+                            target.jump_policy.retain_nop();
+                        }
+                        let mut assembler = Assembler::from_linear_items(vec![
+                            Item::Label(entry),
+                            ordinary(LOAD_CONST, Operand::Value(0)),
+                            ordinary(JUMP_FORWARD, Operand::Forward(head)),
+                            Item::Label(head),
+                            Item::Label(alias),
+                            Item::Instruction(target),
+                            Item::Label(exit),
+                            ordinary(LOAD_CONST, Operand::Value(0)),
+                            ordinary(RETURN_VALUE, Operand::Value(0)),
+                            Item::Label(tail),
+                        ]);
+                        assembler.next_label = 5;
+                        let mut pipeline = assembler.into_optimization_pipeline();
+                        if source_provenance {
+                            pipeline.original_nop_targets.insert(alias);
+                            pipeline
+                                .exception_owner_provenance
+                                .block_boundaries
+                                .insert(alias);
+                            pipeline
+                                .exception_owner_provenance
+                                .source_boundaries
+                                .insert(alias);
+                        }
+                        pipeline
+                    };
+                    let mut gated = make();
+                    let mut original = make();
+                    let actual = gated.thread_forward_jumps_with_head_gate::<true>();
+                    let expected = original.thread_forward_jumps_with_head_gate::<false>();
+                    assert_eq!(actual, expected, "{case}/{policy}/{source_provenance}");
+                    assert_eq!(
+                        gated.graph.copy_items(),
+                        original.graph.copy_items(),
+                        "{case}/{policy}/{source_provenance}"
+                    );
+                    assert_eq!(gated.graph.order(), original.graph.order());
+                    assert_eq!(gated.next_label, original.next_label);
+                    assert_eq!(
+                        gated.borrow_threaded_jump_targets,
+                        original.borrow_threaded_jump_targets
+                    );
+                    assert_eq!(gated.original_nop_targets, original.original_nop_targets);
+                    if opcode == JUMP_FORWARD
+                        && operand == Operand::Forward(exit)
+                        && policy == 0
+                        && !source_provenance
+                    {
+                        assert!(actual);
+                    }
+                }
+            }
         }
     }
 

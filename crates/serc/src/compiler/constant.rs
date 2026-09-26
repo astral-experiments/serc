@@ -30,6 +30,7 @@ pub(super) struct ConstantPool {
 }
 
 const CONSTANT_INDEX_THRESHOLD: usize = 12;
+const NAME_INDEX_THRESHOLD: usize = 12;
 
 #[cfg(test)]
 thread_local! {
@@ -270,7 +271,7 @@ pub(super) struct OutputState {
     pub(super) deferred_names: Vec<(OperandPatchId, String)>,
     pub(super) names: Vec<MetadataName>,
     pub(super) name_ids: Vec<MetadataId>,
-    name_indices: FxHashMap<NameId, u32>,
+    name_indices: FxHashMap<MetadataId, u32>,
     pub(super) interned_constant_strings: FxHashSet<String>,
     pub(super) qualified_name_constant_index: Option<u32>,
     pub(super) qualified_name_is_canonical: Option<bool>,
@@ -842,6 +843,41 @@ impl Compiler<'_> {
 }
 
 impl OutputState {
+    /// Admits an emitted name in first-use order, building an index only for larger tables.
+    #[inline]
+    fn name_index(&mut self, name_id: MetadataId, name: Cow<'_, str>) -> Result<u32, CompileError> {
+        if self.name_indices.is_empty() {
+            if let Some(index) = self
+                .name_ids
+                .iter()
+                .position(|&existing| existing == name_id)
+            {
+                return to_u32(index, "name count");
+            }
+            let index = to_u32(self.names.len(), "name count")?;
+            if self.name_ids.len() == NAME_INDEX_THRESHOLD {
+                self.name_indices.reserve(NAME_INDEX_THRESHOLD + 1);
+                self.name_indices
+                    .extend(self.name_ids.iter().copied().zip(0..));
+                self.name_indices.insert(name_id, index);
+            }
+            self.names.push(MetadataName::from(name));
+            self.name_ids.push(name_id);
+            return Ok(index);
+        }
+
+        match self.name_indices.entry(name_id) {
+            Entry::Occupied(entry) => Ok(*entry.get()),
+            Entry::Vacant(entry) => {
+                let index = to_u32(self.names.len(), "name count")?;
+                self.names.push(MetadataName::from(name));
+                self.name_ids.push(name_id);
+                entry.insert(index);
+                Ok(index)
+            }
+        }
+    }
+
     /// Keeps each fold result and its construction dependencies in one allocation event.
     fn reallocate_non_reflexive_value(
         &mut self,
@@ -1079,16 +1115,7 @@ impl Compiler<'_> {
             Cow::Borrowed(_) => name_id,
             Cow::Owned(name) => self.required_name_id(name),
         };
-        match self.output.name_indices.entry(name_id) {
-            Entry::Occupied(entry) => Ok(*entry.get()),
-            Entry::Vacant(entry) => {
-                let index = to_u32(self.output.names.len(), "name count")?;
-                self.output.names.push(MetadataName::from(name));
-                self.output.name_ids.push(MetadataId::from(name_id));
-                entry.insert(index);
-                Ok(index)
-            }
-        }
+        self.output.name_index(MetadataId::from(name_id), name)
     }
 
     pub(super) fn emit_unsigned_constant(&mut self, value: u32) -> Result<(), CompileError> {
@@ -4482,16 +4509,101 @@ pub(super) fn big_integer_digits(token: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use ruff_python_ast::Operator;
 
     use super::{
         CONSTANT_INDEX_THRESHOLD, ConstantEquality, ConstantIndices, ConstantPool,
-        FORCE_GENERIC_CONSTANT_ADMISSION, constant_pool_fingerprint, fold_complex_arithmetic,
+        FORCE_GENERIC_CONSTANT_ADMISSION, NAME_INDEX_THRESHOLD, OutputState,
+        constant_pool_fingerprint, fold_complex_arithmetic,
     };
     use crate::code_object::{
         CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance, MetadataId,
     };
     use crate::{CompileOptions, PythonVersion, compile_with_options};
+
+    #[test]
+    fn emitted_names_preserve_order_and_first_spelling_across_index_creation() {
+        let mut state = OutputState::default();
+        let ids: Vec<_> = (0..NAME_INDEX_THRESHOLD + 8)
+            .map(|index| MetadataId::from_u32(u32::try_from(4_007 - index * 29).unwrap()))
+            .collect();
+        for (index, &id) in ids.iter().enumerate() {
+            let spelling = format!("name_{index}");
+            assert_eq!(
+                state.name_index(id, Cow::Owned(spelling)).unwrap(),
+                u32::try_from(index).unwrap()
+            );
+            for previous in (0..=index).rev() {
+                assert_eq!(
+                    state
+                        .name_index(ids[previous], Cow::Borrowed("unchanged"))
+                        .unwrap(),
+                    u32::try_from(previous).unwrap()
+                );
+            }
+            assert_eq!(state.name_indices.is_empty(), index < NAME_INDEX_THRESHOLD);
+        }
+        assert_eq!(state.name_ids, ids);
+        assert_eq!(
+            state.names,
+            (0..ids.len())
+                .map(|index| format!("name_{index}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn emitted_private_aliases_share_indices_across_small_and_large_name_tables() {
+        fn child<'a>(code: &'a CodeObject, name: &str) -> &'a CodeObject {
+            code.constants
+                .iter()
+                .find_map(|constant| match constant {
+                    Constant::Code(child) if child.name == name => Some(child.as_ref()),
+                    _ => None,
+                })
+                .unwrap()
+        }
+
+        let globals: Vec<_> = (0..NAME_INDEX_THRESHOLD + 6)
+            .map(|index| format!("global_{index}"))
+            .collect();
+        let source = format!(
+            "class Class:\n    def small(self):\n        return self.__private, self._Class__private, self.__other\n    def large(self):\n        return self.__private, {}, self._Class__private, self.__other, {}\n",
+            globals.join(", "),
+            globals[0],
+        );
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let module = compile_with_options(
+                &source,
+                "name_tables.py",
+                &CompileOptions {
+                    python_version,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap();
+            let class = child(&module.code, "Class");
+            let small = child(class, "small");
+            let large = child(class, "large");
+            assert_eq!(small.names, ["_Class__private", "_Class__other"]);
+            let expected = std::iter::once("_Class__private")
+                .chain(globals.iter().map(String::as_str))
+                .chain(std::iter::once("_Class__other"))
+                .collect::<Vec<_>>();
+            assert_eq!(large.names, expected);
+            let small_ids = &small.marshal_provenance.metadata_ids.names;
+            let large_ids = &large.marshal_provenance.metadata_ids.names;
+            assert_eq!(small_ids[0], large_ids[0]);
+            assert_eq!(small_ids[1], *large_ids.last().unwrap());
+        }
+    }
 
     #[test]
     fn complex_multiplication_recovery_follows_the_target() {
