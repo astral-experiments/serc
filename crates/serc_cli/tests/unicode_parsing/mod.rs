@@ -77,7 +77,7 @@ fn default_cli_preserves_native_unicode_parsing_identity() {
 
 #[test]
 fn unicode_retry_hash_modes_preserve_raw_source_and_native_identity() {
-    let source = b"\xef\xbb\xbfclass UnitBase:\r\n    class EquivalentUnitsList:\r\n        pass\r\nmicro = '\\N{MICRO SIGN}'\r\n";
+    let source = b"\xef\xbb\xbflabel = '\\N{LATIN CAPITAL LETTER A}'\r\ndef first(value):\r\n    return value in {'normalize', 'is_normalized'}\r\ndef second(value):\r\n    'Distinct constants tuple.'\r\n    return value in {'normalize', 'is_normalized'}\r\n";
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("unicode_hash.py");
     let native_path = directory.path().join("native.pyc");
