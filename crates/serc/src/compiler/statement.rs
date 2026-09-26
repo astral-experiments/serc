@@ -13117,11 +13117,15 @@ impl<'source> Compiler<'source> {
                                     || self.control.statements.context.followed_by_name_assignment_or_deletion)
                                 && self.control.exceptions.direct_try_body_statements.contains(&statement.range)
                                 && !direct_try_body_exit)
-                            // Coroutine and with-region joins have separate exception
-                            // ownership; loop and try-region joins need their own rules.
                             || (self.context.python_version == crate::PythonVersion::Py315
                                 && self.control.loops.contexts.is_empty()
                                 && self.control.exceptions.active_exception_region_exclusions.is_empty())
+                            // Retain the join inside the generator's exception wrapper.
+                            || (self.context.python_version == crate::PythonVersion::Py314
+                                && matches!(self.unit.scope, Scope::Function { .. })
+                                && self.control.loops.contexts.is_empty()
+                                && self.control.exceptions.active_exception_region_exclusions.is_empty()
+                                && self.control.generators.generator_region_start.is_some())
                             // The manager-region join also survives inside a try body.
                             || (matches!(self.unit.scope, Scope::Function { .. })
                                 && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0

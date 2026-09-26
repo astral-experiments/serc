@@ -1282,19 +1282,19 @@ for name, injected, expected in [
         sys.settrace(None)
     assert events == expected, (events, expected)
 ";
-    for level in [OptimizationLevel::One, OptimizationLevel::Two] {
-        let native = oracle(
-            SOURCE.as_bytes(),
-            "optimized_join.py",
-            PythonVersion::Py315,
-            level,
-        );
+    for (version, level) in [
+        (PythonVersion::Py314, OptimizationLevel::One),
+        (PythonVersion::Py314, OptimizationLevel::Two),
+        (PythonVersion::Py315, OptimizationLevel::One),
+        (PythonVersion::Py315, OptimizationLevel::Two),
+    ] {
+        let native = oracle(SOURCE.as_bytes(), "optimized_join.py", version, level);
         assert!(native.status.success());
         let actual = compile_with_options(
             SOURCE,
             "optimized_join.py",
             &CompileOptions {
-                python_version: PythonVersion::Py315,
+                python_version: version,
                 optimization_level: level,
                 ..CompileOptions::default()
             },
@@ -1304,7 +1304,7 @@ for name, injected, expected in [
         assert_eq!(actual, native.stdout);
         let index = VERSIONS
             .iter()
-            .position(|(version, _, _)| *version == PythonVersion::Py315)
+            .position(|(target, _, _)| *target == version)
             .unwrap();
         for (label, payload) in [
             ("native", native.stdout.as_slice()),
@@ -3934,6 +3934,25 @@ fn elided_match_case_assertions_keep_success_locations() {
                 PythonVersion::Py314,
                 PythonVersion::Py315,
             ],
+        );
+    }
+}
+
+#[test]
+fn optimized_generator_assertion_joins_match_cpython() {
+    for source in [
+        "async def f(x, y):\n    if x:\n        assert x\n    else:\n        assert y\n    await work()\n",
+        "async def f(x, y, manager):\n    async with manager:\n        if x:\n            assert x\n        else:\n            assert y\n        await work()\n",
+        "def f(x, y):\n    if x and y:\n        assert x\n    else:\n        assert y\n    work()\n    yield 1\n",
+        "async def f(x, y, manager, other):\n    async with manager:\n        with other:\n            if x:\n                assert x\n            else:\n                assert y\n            await work()\n    yield 1\n",
+        "async def f(x, y, manager):\n    async with manager:\n        if x: assert x\n        else: assert y\n        work()\n",
+        "async def f(x, y, manager):\n    async with manager:\n        if x or y:\n            assert x\n        else:\n            assert y\n        work()\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "optimized_generator_join.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
         );
     }
 }
