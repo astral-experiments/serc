@@ -141,7 +141,8 @@ fn check_indentation_error_order() {
     let deep = nested_source(100, " ");
     let indentation_start = deep.find(&" ".repeat(100)).unwrap();
     let delimiters = format!("value = {}1{}\n", "(".repeat(201), ")".repeat(201));
-    let cases = [
+    let deep_delimiters = format!("{}{delimiters}", deep.strip_suffix("pass\n").unwrap());
+    let mut cases = vec![
         (
             format!("{deep}bad =\n"),
             "too many levels of indentation",
@@ -163,17 +164,25 @@ fn check_indentation_error_order() {
             indentation_start,
         ),
         (format!("bad =\n{deep}"), "invalid syntax", 5),
-        (
-            format!("bad =\n{deep}{delimiters}"),
-            "invalid syntax",
-            5,
-        ),
+        (format!("bad =\n{deep}{delimiters}"), "invalid syntax", 5),
         (
             format!("{delimiters}{deep}"),
             "too many nested parentheses",
             "value = ".len() + 200,
         ),
     ];
+    for token in ["?", "$", "`"] {
+        cases.push((
+            format!("value = {token}\n{deep_delimiters}"),
+            "invalid syntax",
+            "value = ".len(),
+        ));
+        cases.push((
+            format!("{deep_delimiters}value = {token}\n"),
+            "too many levels of indentation",
+            indentation_start,
+        ));
+    }
     let oracle = r"
 import sys
 source = sys.argv[1]
@@ -206,7 +215,10 @@ else:
                 };
                 let native = python.args(["-c", oracle, source, mode]).output().unwrap();
                 assert!(native.status.success(), "{version} {mode}: {native:?}");
-                assert_eq!(String::from_utf8_lossy(&native.stdout).trim(), *expected_message);
+                assert_eq!(
+                    String::from_utf8_lossy(&native.stdout).trim(),
+                    *expected_message
+                );
                 let result = if mode == "bytes" {
                     compile_bytes_with_options(source.as_bytes(), "indentation.py", &options)
                 } else {
