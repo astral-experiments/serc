@@ -689,6 +689,19 @@ fn compile_normalized(
         ) {
             return Err(yield_error);
         }
+        if parsed.errors().len() == 1
+            && parsed.unsupported_syntax_errors().is_empty()
+            && matches!(
+                error.error,
+                ruff_python_parser::ParseErrorType::InvalidNamedAssignmentTarget
+            )
+            && is_attribute_named_expression_target(parsed.suite(), error.location)
+        {
+            return Err(CompileError::invalid_syntax(
+                "cannot use assignment expressions with attribute",
+                error.location,
+            ));
+        }
         return Err(CompileError::Parse(error.clone()));
     }
     if let Some(error) = yield_syntax::earlier_unsupported(
@@ -782,6 +795,57 @@ fn compile_normalized(
         python_version: options.python_version,
         initial_intern_state: options.initial_intern_state.clone(),
     })
+}
+
+/// Identify the target in Ruff's recovered AST, retaining its original source range.
+fn is_attribute_named_expression_target(
+    suite: &[ruff_python_ast::Stmt],
+    target_range: TextRange,
+) -> bool {
+    use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
+    use ruff_python_ast::{Expr, Stmt};
+    use ruff_text_size::Ranged;
+
+    struct Finder {
+        target_range: TextRange,
+        found: bool,
+    }
+
+    impl<'a> Visitor<'a> for Finder {
+        fn visit_stmt(&mut self, statement: &'a Stmt) {
+            if self.found {
+                return;
+            }
+            if stack_growth_required() {
+                return grow_stack(|| self.visit_stmt(statement));
+            }
+            walk_stmt(self, statement);
+        }
+
+        fn visit_expr(&mut self, expression: &'a Expr) {
+            if self.found {
+                return;
+            }
+            if stack_growth_required() {
+                return grow_stack(|| self.visit_expr(expression));
+            }
+            if let Expr::Named(named) = expression
+                && named.target.range() == self.target_range
+                && matches!(named.target.as_ref(), Expr::Attribute(_))
+            {
+                self.found = true;
+            } else {
+                walk_expr(self, expression);
+            }
+        }
+    }
+
+    let mut finder = Finder {
+        target_range,
+        found: false,
+    };
+    finder.visit_body(suite);
+    finder.found
 }
 
 /// Compile Python source bytes directly to a CPython 3.14.5 `.pyc` file.
