@@ -61,10 +61,18 @@ fn existing_parse_and_earlier_unsupported_errors_keep_their_priority() {
     ));
     let earlier_default = "type Alias[T = int, **P = ...] = int\n";
     let error = compile_with_options(earlier_default, "paramspec.py", &options).unwrap_err();
+    // Python 3.12 reports the first default as an invalid assignment before
+    // reaching the unsupported ParamSpec default.
+    let CompileError::InvalidSyntax { message, range } = error else {
+        panic!("expected an invalid syntax diagnostic for {earlier_default:?}");
+    };
     assert_eq!(
-        usize::from(error.range().unwrap().start()),
-        earlier_default.find('=').unwrap()
+        message,
+        "invalid syntax. Maybe you meant '==' or ':=' instead of '='?"
     );
+    assert_eq!(&earlier_default[range], "T = int");
+    assert_eq!(usize::from(range.start()), 11);
+    assert_eq!(usize::from(range.end()), 18);
 }
 
 #[test]

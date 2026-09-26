@@ -143,6 +143,18 @@ pub(crate) fn before_parse_error(
         return None;
     }
 
+    if tokenizer_error_takes_priority(source, tokens, errors) {
+        return None;
+    }
+    Some(bare_yield_error(source, tokens, comma, version))
+}
+
+/// Retain tokenizer failures that CPython reports before grammar diagnostics.
+pub(crate) fn tokenizer_error_takes_priority(
+    source: &str,
+    tokens: &Tokens,
+    errors: &[ParseError],
+) -> bool {
     let mut stack = Vec::new();
     for token in tokens {
         match token.kind() {
@@ -155,18 +167,18 @@ pub(crate) fn before_parse_error(
                     _ => unreachable!(),
                 };
                 if stack.pop() != Some(expected) {
-                    return None;
+                    return true;
                 }
             }
             TokenKind::Int | TokenKind::Float | TokenKind::Complex
                 if crate::delimiter_nesting::invalid_number_suffix(source, token.range()) =>
             {
-                return None;
+                return true;
             }
             _ => {}
         }
     }
-    if errors.iter().any(|error| match &error.error {
+    errors.iter().any(|error| match &error.error {
         // CPython treats these as grammar tokens, and an open delimiter at EOF
         // need not preempt an earlier grammar error.
         ParseErrorType::Lexical(LexicalErrorType::UnrecognizedToken {
@@ -175,10 +187,7 @@ pub(crate) fn before_parse_error(
         ParseErrorType::Lexical(LexicalErrorType::Eof) if !stack.is_empty() => false,
         ParseErrorType::Lexical(_) => true,
         _ => false,
-    }) {
-        return None;
-    }
-    Some(bare_yield_error(source, tokens, comma, version))
+    })
 }
 
 /// Recover the first invalid pair's context only after the allocation-free token scan rejects it.
