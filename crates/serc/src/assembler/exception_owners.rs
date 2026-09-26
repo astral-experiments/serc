@@ -25,6 +25,8 @@ thread_local! {
 /// Original CFG facts that cannot be recovered from split exception ranges or optimized jumps.
 #[derive(Debug, Default)]
 pub(super) struct ExceptionOwnerProvenance {
+    // The first folded condition can share the module annotation setup's source line.
+    pub(super) module_annotation_nop_pairs: Vec<(Instruction, Instruction)>,
     pub(super) setups: Vec<(Label, Option<SourceLocation>)>,
     // Authored ordinary-try SETUP and its original handler, independently of split ranges.
     pub(super) ordinary_try_setups: FxHashMap<Label, Label>,

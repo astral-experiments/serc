@@ -206,6 +206,10 @@ impl Assembler {
         // Keep ordinary blocks with more locals on the graph path, which also preserves
         // initialization for locals above CPython's 64-bit dataflow mask.
         if self.python_version == crate::PythonVersion::Py314
+            && self
+                .exception_owner_provenance
+                .module_annotation_nop_pairs
+                .is_empty()
             && !(self.early_boolean_admissions_certified && self.has_early_boolean_admissions)
             && (self.has_only_linear_assertion_side_exits()
                 || self.has_only_linear_constant_return()
