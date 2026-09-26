@@ -15454,18 +15454,47 @@ impl<'source> Compiler<'source> {
                 if matches!(assignment.targets.as_slice(), [Expr::Name(target)]
                     if target.id.as_str() == test.id.as_str())
         );
-        let optimized_empty_else = self.context.python_version >= crate::PythonVersion::Py314
+        let elided_else = matches!(statement.elif_else_clauses.last(), Some(clause)
+        if clause.test.is_none()
+            && !clause.body.is_empty()
+            && clause.body.iter().all(|statement| matches!(
+                self.context.optimized_locations.get(&statement.range()),
+                Some(super::optimization::OptimizedLocation::Elided)
+            )));
+        let eligible_else = self.context.python_version >= crate::PythonVersion::Py314
             && !non_final_branch
             && !try_body_normal_exit
-            && !self.has_active_control_flow_region()
-            && matches!(statement.elif_else_clauses.as_slice(), [clause]
-            if clause.test.is_none()
-                && !clause.body.is_empty()
-                && clause.body.iter().all(|statement| matches!(
-                    self.context.optimized_locations.get(&statement.range()),
-                    Some(super::optimization::OptimizedLocation::Elided)
-                )));
-        if statement.elif_else_clauses.is_empty() || optimized_empty_else {
+            && elided_else;
+        let original_optimized_empty_else = eligible_else
+            && statement.elif_else_clauses.len() == 1
+            && !self.has_active_control_flow_region();
+        let optimized_empty_else = eligible_else
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && !self.control.in_exception_handler()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_overriding_finally_returns == 0
+            // A suspended scope's final chained condition can own a cleanup
+            // backedge inside its implicit exception wrapper.
+            && (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                || (!expression_contains_chained_comparison(&statement.test)
+                    && statement.elif_else_clauses.iter().all(|clause| {
+                        clause.test.as_ref().is_none_or(|test| {
+                            !expression_contains_chained_comparison(test)
+                        })
+                    })));
+        if statement.elif_else_clauses.is_empty()
+            || original_optimized_empty_else
+            || (optimized_empty_else && statement.elif_else_clauses.len() == 1)
+        {
             let protected_try_normal_exit = try_body_normal_exit
                 && self.control.generators.generator_region_start.is_none()
                 && self.control.withs.active_with_region_exclusions.is_empty()
@@ -15692,7 +15721,13 @@ impl<'source> Compiler<'source> {
                 let nested_tail = self.compile_with_strict_owned_loads(
                     matches!(statement.test.as_ref(), Expr::If(conditional)
                         if early_condition_truthiness(&conditional.test).is_some()),
-                    |compiler| compiler.compile_loop_tail_suite(body, restart, split_short_circuit),
+                    |compiler| {
+                        if optimized_empty_else {
+                            compiler.compile_non_final_branch_loop_tail_suite(body, restart, false)
+                        } else {
+                            compiler.compile_loop_tail_suite(body, restart, split_short_circuit)
+                        }
+                    },
                 )?;
                 if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
                     let original_shared_tail =
@@ -15732,6 +15767,9 @@ impl<'source> Compiler<'source> {
                 .iter()
                 .map(|clause| (clause.test.as_ref(), clause.body.as_slice())),
         );
+        if optimized_empty_else {
+            branches.pop();
+        }
         let branch_count = branches.len();
         let has_else = branches.last().is_some_and(|(test, _)| test.is_none());
         let mut original_backedge_has_fallthrough = has_else;
@@ -15877,7 +15915,17 @@ impl<'source> Compiler<'source> {
                             |control| &mut control.loops.loop_tail_final_elif_nested_condition,
                             final_elif_nested_condition,
                             |compiler| {
-                                compiler.compile_loop_tail_suite(body, restart, split_short_circuit)
+                                if optimized_empty_else {
+                                    compiler.compile_non_final_branch_loop_tail_suite(
+                                        body, restart, false,
+                                    )
+                                } else {
+                                    compiler.compile_loop_tail_suite(
+                                        body,
+                                        restart,
+                                        split_short_circuit,
+                                    )
+                                }
                             },
                         )
                     },

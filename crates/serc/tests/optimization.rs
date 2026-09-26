@@ -76,6 +76,42 @@ def f(xs):
 }
 
 #[test]
+fn elided_loop_tail_else_preserves_nested_and_suspended_branches() {
+    for source in [
+        r"
+def f(xs, flag):
+    for x in xs:
+        if x:
+            if flag:
+                work(x)
+        else:
+            assert x
+",
+        r"
+def f(xs, flag):
+    for x in xs:
+        if x:
+            work(x)
+        elif flag:
+            if x > 1:
+                work_else(x)
+        else:
+            assert x
+",
+        r"
+def f(xs):
+    for x in xs:
+        if x:
+            yield x
+        else:
+            assert x
+",
+    ] {
+        assert_matches_cpython(source, "nested_elided_loop_else.py", &LEVELS);
+    }
+}
+
+#[test]
 fn protected_loop_tail_controls_match_cpython() {
     for source in [
         r"
@@ -1617,4 +1653,90 @@ fn nested_conditional_except_before_finally_matches_cpython() {
     ] {
         assert_matches_cpython(source, "case.py", &LEVELS);
     }
+}
+
+#[test]
+fn chained_generator_loop_tail_preserves_stop_iteration_wrapper() {
+    const SOURCE: &str = "def test(xs, y, z):\n    yield 0\n    for x in xs:\n        if x:\n            h()\n        elif x < y < z:\n            yield x\n        else:\n            assert z\n";
+    const TRACE_ORACLE: &str = r"
+import dis, marshal, sys
+namespace = {'h': lambda: None}
+exec(marshal.loads(sys.stdin.buffer.read()), namespace)
+function = namespace['test']
+instructions = list(dis.get_instructions(function))
+targets = [instructions[i].offset for i in range(1, len(instructions))
+           if instructions[i].opname == 'JUMP_BACKWARD'
+           and instructions[i - 1].opname == 'POP_TOP'
+           and instructions[i].positions.lineno == 6]
+assert len(targets) == 1, targets
+generator = function([0], -1, 3)
+assert next(generator) == 0
+
+def trace(frame, event, arg):
+    if frame.f_code is function.__code__:
+        frame.f_trace_opcodes = True
+        if event == 'opcode' and frame.f_lasti == targets[0]:
+            raise StopIteration('trace interruption')
+    return trace
+
+sys.settrace(trace)
+try:
+    next(generator)
+except RuntimeError as exc:
+    assert isinstance(exc.__cause__, StopIteration), exc.__cause__
+else:
+    raise AssertionError('exception was not propagated')
+finally:
+    sys.settrace(None)
+";
+    for version in [PythonVersion::Py314, PythonVersion::Py315] {
+        for level in [OptimizationLevel::One, OptimizationLevel::Two] {
+            let expected = oracle(SOURCE.as_bytes(), "generator_chain.py", version, level);
+            assert!(expected.status.success(), "{version}, {level:?}");
+            let actual = compile_with_options(
+                SOURCE,
+                "generator_chain.py",
+                &CompileOptions {
+                    python_version: version,
+                    optimization_level: level,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .marshal();
+            let index = VERSIONS
+                .iter()
+                .position(|(candidate, _, _)| *candidate == version)
+                .unwrap();
+            for (label, payload) in [
+                ("native", expected.stdout.as_slice()),
+                ("serc", actual.as_slice()),
+            ] {
+                let mut child = Command::new(ORACLES[index].get().unwrap())
+                    .args(["-I", "-S", "-X", "utf8", "-c", TRACE_ORACLE])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child.stdin.take().unwrap().write_all(payload).unwrap();
+                let result = child.wait_with_output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{version}, {level:?}, {label}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_chained_condition_in_generator_loop_tail_matches_cpython() {
+    assert_matches_cpython_versions(
+        "def test(xs, y, z):\n    yield 0\n    for x in xs:\n        if x:\n            if x < y < z:\n                yield x\n        else:\n            assert z\n",
+        "tests/nested_generator_chain.py",
+        &[OptimizationLevel::One, OptimizationLevel::Two],
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
 }
