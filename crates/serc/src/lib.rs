@@ -24,6 +24,7 @@ use compiler::Compiler;
 pub use config::{CompileOptions, NativeBuildProfile, ParsePythonVersionError, PythonVersion};
 pub use initial_intern_state::InitialInternState;
 use ruff_text_size::{TextRange, TextSize};
+use siphasher::sip::SipHasher13;
 pub use source::{SourceDecodeError, decode_source};
 
 /// The exact CPython implementation targeted by this compiler backend.
@@ -110,11 +111,34 @@ impl CompiledModule {
     /// required by CPython's cache format. Root-object references follow `py_compile`,
     /// which can differ from serializing a retained code object with [`Self::marshal`].
     pub fn to_timestamp_pyc(&self, source_mtime: u32, source_size: u32) -> Vec<u8> {
+        let mut metadata = [0; 8];
+        metadata[..4].copy_from_slice(&source_mtime.to_le_bytes());
+        metadata[4..].copy_from_slice(&source_size.to_le_bytes());
+        self.to_pyc(0, metadata)
+    }
+
+    /// Build a hash-invalidated `.pyc` file for the selected CPython target.
+    ///
+    /// `source` must be the original source bytes used to compile the module, before
+    /// decoding or newline normalization. If `checked` is true, CPython normally
+    /// verifies the hash against the source on import. Otherwise, it normally trusts
+    /// an external system to keep the cache current. Python's `--check-hash-based-pycs`
+    /// option can override this behavior.
+    ///
+    /// Root-object references follow `py_compile`, as in [`Self::to_timestamp_pyc`].
+    pub fn to_hash_pyc(&self, source: &[u8], checked: bool) -> Vec<u8> {
+        // CPython's _imp.source_hash uses SipHash-1-3 keyed by the target's magic
+        // number and serializes the resulting hash in little-endian order.
+        let key = u64::from(u32::from_le_bytes(self.target().magic_number));
+        let hash = SipHasher13::new_with_keys(key, 0).hash(source);
+        self.to_pyc(1 | (u32::from(checked) << 1), hash.to_le_bytes())
+    }
+
+    fn to_pyc(&self, flags: u32, metadata: [u8; 8]) -> Vec<u8> {
         let mut output = Vec::with_capacity(16 + self.code.bytecode.len());
         output.extend_from_slice(&self.target().magic_number);
-        output.extend_from_slice(&0_u32.to_le_bytes());
-        output.extend_from_slice(&source_mtime.to_le_bytes());
-        output.extend_from_slice(&source_size.to_le_bytes());
+        output.extend_from_slice(&flags.to_le_bytes());
+        output.extend_from_slice(&metadata);
         marshal::encode_pyc_code_into_with_options(
             &self.code,
             self.python_version,

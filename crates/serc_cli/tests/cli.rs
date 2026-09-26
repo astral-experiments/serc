@@ -163,6 +163,128 @@ fn compile_writes_a_timestamp_pyc() {
     assert_eq!(fs_err::read(pyc_path).unwrap(), expected);
 }
 
+#[test]
+fn compile_invalidation_modes_match_cpython() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("module.py");
+    let oracle_path = directory.path().join("oracle.pyc");
+
+    for version in [
+        serc::PythonVersion::Py312,
+        serc::PythonVersion::Py313,
+        serc::PythonVersion::Py314,
+        serc::PythonVersion::Py315,
+    ] {
+        let (_, minor, _) = version.target().version;
+        let pyc_path = directory
+            .path()
+            .join(format!("__pycache__/module.cpython-3{minor}.pyc"));
+
+        for (source_name, source) in [
+            ("plain", b"answer = 42\n".as_slice()),
+            (
+                "bom-crlf",
+                b"\xef\xbb\xbf# coding: utf-8\r\nvalue = '\xc3\xa9'\r\n".as_slice(),
+            ),
+        ] {
+            fs_err::write(&source_path, source).unwrap();
+            for (mode, oracle_mode) in [
+                ("timestamp", "TIMESTAMP"),
+                ("checked-hash", "CHECKED_HASH"),
+                ("unchecked-hash", "UNCHECKED_HASH"),
+            ] {
+                let mut oracle = match version {
+                    serc::PythonVersion::Py312 => common::python_312_command(),
+                    serc::PythonVersion::Py313 => common::python_313_command(),
+                    serc::PythonVersion::Py314 => common::python_3145_command(),
+                    serc::PythonVersion::Py315 => common::python_315_command(),
+                };
+                let native = oracle
+                    .args([
+                        "-c",
+                        "import py_compile, sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True, optimize=0, invalidation_mode=py_compile.PycInvalidationMode[sys.argv[3]])",
+                    ])
+                    .arg(&source_path)
+                    .arg(&oracle_path)
+                    .arg(oracle_mode)
+                    .output()
+                    .unwrap();
+                assert!(
+                    native.status.success(),
+                    "{version}, {source_name}, {mode}: {native:?}"
+                );
+
+                let output = serc()
+                    .args([
+                        "compile",
+                        "--quiet",
+                        "--python-version",
+                        &version.to_string(),
+                        "--invalidation-mode",
+                        mode,
+                    ])
+                    .arg(&source_path)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{version}, {source_name}, {mode}: {output:?}"
+                );
+                assert_eq!(
+                    fs_err::read(&pyc_path).unwrap(),
+                    fs_err::read(&oracle_path).unwrap(),
+                    "Python {version}, {source_name}, {mode}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn compile_rejects_invalid_invalidation_mode() {
+    let output = serc()
+        .args(["compile", "--invalidation-mode", "unknown", "--check"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalidation-mode"), "{stderr}");
+    assert!(stderr.contains("unknown"), "{stderr}");
+}
+
+#[test]
+fn hash_invalidation_modes_control_stale_cache_imports() {
+    for (mode, expected) in [("checked-hash", "2\n"), ("unchecked-hash", "1\n")] {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("module.py");
+        fs_err::write(&source_path, "value = 1\n").unwrap();
+
+        let output = serc()
+            .args(["compile", "--quiet", "--invalidation-mode", mode])
+            .arg(&source_path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{mode}: {output:?}");
+
+        fs_err::write(&source_path, "value = 2\n").unwrap();
+        let imported = common::python_3145_command()
+            .args([
+                "-B",
+                "-c",
+                "import sys; sys.path.insert(0, sys.argv[1]); import module; print(module.value)",
+            ])
+            .arg(directory.path())
+            .output()
+            .unwrap();
+        assert!(imported.status.success(), "{mode}: {imported:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&imported.stdout).replace("\r\n", "\n"),
+            expected,
+            "{mode}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn compile_matches_cpython_for_rounded_timestamps() {
@@ -1356,15 +1478,25 @@ fn check_compiles_a_directory_without_writing() {
     fs_err::write(nested.join("__init__.py"), "from module import value\n").unwrap();
 
     for jobs in ["1", "4"] {
-        let output = serc()
-            .args(["compile", "--check", "--quiet", "--jobs", jobs])
-            .arg(directory.path())
-            .output()
-            .unwrap();
+        for mode in ["timestamp", "checked-hash", "unchecked-hash"] {
+            let output = serc()
+                .args([
+                    "compile",
+                    "--check",
+                    "--quiet",
+                    "--jobs",
+                    jobs,
+                    "--invalidation-mode",
+                    mode,
+                ])
+                .arg(directory.path())
+                .output()
+                .unwrap();
 
-        assert!(output.status.success(), "{output:?}");
-        assert!(!directory.path().join("__pycache__").exists());
-        assert!(!nested.join("__pycache__").exists());
+            assert!(output.status.success(), "{mode}: {output:?}");
+            assert!(!directory.path().join("__pycache__").exists());
+            assert!(!nested.join("__pycache__").exists());
+        }
     }
 }
 
