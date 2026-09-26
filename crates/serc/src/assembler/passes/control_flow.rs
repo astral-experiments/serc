@@ -5911,6 +5911,12 @@ impl OptimizationPipeline {
                         && next.location.line >= 0
                         && next.location.line != instruction.location.line
                 });
+            let module_annotation_predecessor = previous_graph_block == Some(graph_block)
+                && previous.is_some_and(|previous| {
+                    self.exception_owner_provenance
+                        .module_annotation_nop_pairs
+                        .contains(&(*previous, *instruction))
+                });
             let remove = instruction.opcode == NOP
                 && (!with_exits_only
                     || (instruction.fusion_policy.is_converted_pop_block()
@@ -5940,6 +5946,7 @@ impl OptimizationPipeline {
                                     || is_unconditional_jump(previous.opcode))
                         }))
                     || setup_nop_predecessor
+                    || module_annotation_predecessor
                     || (constant_pass_predecessors.get(&position).is_some_and(|expected| {
                         previous_position == Some(*expected)
                     }) && previous.is_some_and(|previous: &Instruction| {
