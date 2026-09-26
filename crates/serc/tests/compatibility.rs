@@ -966,6 +966,219 @@ sys.stdout.buffer.write(marshal.dumps(code))
     }
 
     #[test]
+    fn python_312_rejects_starred_type_parameter_defaults() {
+        use serc::{CompileOptions, PythonVersion, compile_with_options};
+
+        let options = CompileOptions {
+            python_version: PythonVersion::Py312,
+            ..CompileOptions::default()
+        };
+        for (source, expected_message, expected_range) in [
+            (
+                "type Alias[*Ts = tuple[int]] = int",
+                "cannot assign to iterable argument unpacking",
+                "*Ts = tuple[int]",
+            ),
+            (
+                "type Café[*Ts = (int)] = int",
+                "cannot assign to iterable argument unpacking",
+                "*Ts = (int",
+            ),
+            (
+                "type Alias[T, *Ts = (int, str),] = int",
+                "cannot assign to iterable argument unpacking",
+                "*Ts = (int, str)",
+            ),
+            (
+                "type Alias[T: int, *Ts = int] = int",
+                "cannot assign to iterable argument unpacking",
+                "*Ts = int",
+            ),
+            (
+                "type Alias[*Ts = int, T = int] = int",
+                "cannot assign to iterable argument unpacking",
+                "*Ts = int",
+            ),
+            (
+                "type Alias[*Ts # = ignored\n = int] = int",
+                "cannot assign to iterable argument unpacking",
+                "*Ts # = ignored\n = int",
+            ),
+            (
+                "if False:\n    type Alias[*Ts = factory()] = int",
+                "cannot assign to iterable argument unpacking",
+                "*Ts = factory()",
+            ),
+            (
+                "value = 1; type Alias[*Ts = int] = int",
+                "cannot assign to iterable argument unpacking",
+                "*Ts = int",
+            ),
+            ("type Alias[*Ts = *tuple[int]] = int", "invalid syntax", "="),
+            (
+                "type Alias[*Ts # = ignored\n = *int] = int",
+                "invalid syntax",
+                "=",
+            ),
+            ("def f[*Ts = int](): pass", "expected '('", "["),
+            ("class C[*Ts = int]: pass", "invalid syntax", "="),
+            (
+                "break\ntype Alias[*Ts = int] = int",
+                "cannot assign to iterable argument unpacking",
+                "*Ts = int",
+            ),
+        ] {
+            let error = compile_with_options(source, "type_defaults.py", &options).unwrap_err();
+            let CompileError::InvalidSyntax { message, range } = error else {
+                panic!("expected invalid syntax for {source:?}, got {error:?}");
+            };
+            assert_eq!(message, expected_message, "{source:?}");
+            assert_eq!(&source[range], expected_range, "{source:?}");
+        }
+
+        // A syntax error in an incomplete default must not be replaced by the later
+        // invalid-unpacking diagnostic.
+        for source in [
+            "type Alias[*Ts = (1 + )] = int",
+            "type Alias[*Ts = x + ] = int",
+            "type Alias[*Ts = x if cond] = int",
+            "if:\ntype Alias[*Ts = int] = int",
+            "type Alias[*Ts = int] = int\nif:",
+            "type Alias[*Ts = int] = int\nx = 'unterminated\n",
+            "type Alias[*Ts = int] = int\nx = )",
+            "type Alias[*Ts = int] = int\nx = 1__2",
+            "type Alias[*Ts = int] = int\nx = 0123",
+        ] {
+            let error = compile_with_options(source, "type_defaults.py", &options).unwrap_err();
+            assert!(
+                matches!(error, CompileError::Parse(_)),
+                "{source:?}: {error:?}"
+            );
+        }
+        let source = "type Alias[T = int, *Ts = int] = int";
+        let error = compile_with_options(source, "type_defaults.py", &options).unwrap_err();
+        assert!(!error.to_string().contains("iterable argument unpacking"));
+    }
+
+    #[test]
+    fn python_312_prefers_the_first_type_parameter_default_error() {
+        use serc::{CompileOptions, PythonVersion, compile_with_options};
+
+        let options = CompileOptions {
+            python_version: PythonVersion::Py312,
+            ..CompileOptions::default()
+        };
+        for (source, expected_message, expected_range) in [
+            (
+                "type A[*Ts = int, **P = ...] = int",
+                "cannot assign to iterable argument unpacking",
+                "*Ts = int",
+            ),
+            ("type A[**P = ..., *Ts = int] = int", "invalid syntax", "="),
+            ("class A[*Ts = int, **P = ...]: pass", "invalid syntax", "="),
+            ("class A[**P = ..., *Ts = int]: pass", "invalid syntax", "="),
+            ("def f[*Ts = int, **P = ...](): pass", "expected '('", "["),
+            ("def f[**P = ..., *Ts = int](): pass", "expected '('", "["),
+            (
+                "type A[**P = ...] = int\ntype B[*Ts = int] = int",
+                "invalid syntax",
+                "=",
+            ),
+            (
+                "type A[*Ts = int] = int\ntype B[**P = ...] = int",
+                "cannot assign to iterable argument unpacking",
+                "*Ts = int",
+            ),
+            (
+                "type A[**P = ...] = int; type B[*Ts = int] = int",
+                "invalid syntax",
+                "=",
+            ),
+            (
+                "type A[*Ts = int] = int; type B[**P = ...] = int",
+                "cannot assign to iterable argument unpacking",
+                "*Ts = int",
+            ),
+            (
+                "class A[**P = ...]: pass\ntype B[*Ts = int] = int",
+                "invalid syntax",
+                "=",
+            ),
+            (
+                "def f[**P = ...](): pass\ntype B[*Ts = int] = int",
+                "expected '('",
+                "[",
+            ),
+            (
+                "class A[*Ts = int]: pass\ntype B[**P = ...] = int",
+                "invalid syntax",
+                "=",
+            ),
+            (
+                "if True:\n    type A[**P = ...] = int\n    type B[*Ts = int] = int",
+                "invalid syntax",
+                "=",
+            ),
+        ] {
+            let error = compile_with_options(source, "type_defaults.py", &options).unwrap_err();
+            let CompileError::InvalidSyntax { message, range } = error else {
+                panic!("expected invalid syntax for {source:?}, got {error:?}");
+            };
+            assert_eq!(message, expected_message, "{source:?}");
+            assert_eq!(&source[range], expected_range, "{source:?}");
+            assert_eq!(
+                usize::from(range.start()),
+                source.find(expected_range).unwrap()
+            );
+        }
+
+        for source in [
+            "type A[**P = ...] = int\nif:",
+            "if:\ntype A[**P = ...] = int\ntype B[*Ts = int] = int",
+            "type A[**P = ...] = int\ntype B[*Ts = int] = int\nif:",
+            "type A[*Ts = int] = int\ntype B[**P = ...] = int\nx = 'unterminated\n",
+        ] {
+            assert!(matches!(
+                compile_with_options(source, "type_defaults.py", &options),
+                Err(CompileError::Parse(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn starred_type_parameters_and_later_defaults_remain_supported() {
+        use serc::{CompileOptions, PythonVersion, compile_with_options};
+
+        let options = CompileOptions {
+            python_version: PythonVersion::Py312,
+            ..CompileOptions::default()
+        };
+        for source in ["type Alias[*Ts] = int", "type = 1; values = [*items]"] {
+            compile_with_options(source, "type_defaults.py", &options).unwrap();
+        }
+
+        for python_version in [
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let options = CompileOptions {
+                python_version,
+                ..CompileOptions::default()
+            };
+            for source in [
+                "type Alias[*Ts = tuple[int]] = int",
+                "type Alias[*Ts = *tuple[int]] = int",
+                "def f[*Ts = int](): pass",
+                "class C[*Ts = int]: pass",
+            ] {
+                compile_with_options(source, "type_defaults.py", &options)
+                    .unwrap_or_else(|error| panic!("{python_version:?}: {source:?}: {error}"));
+            }
+        }
+    }
+
+    #[test]
     fn rejects_lazy_imports_for_the_pinned_python_target() {
         for source in [
             "lazy import module\n",
