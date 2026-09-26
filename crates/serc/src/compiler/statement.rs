@@ -1596,7 +1596,8 @@ impl<'source> Compiler<'source> {
     // conditional supplies the normal exits of the terminal try body. Folded
     // conditions retain their original protected markers on the existing path.
     fn protected_terminal_if_before_elided(&self, statement: &Stmt, following: &[Stmt]) -> bool {
-        !following.is_empty()
+        matches!(statement, Stmt::If(_))
+            && !following.is_empty()
             && following.iter().all(|statement| {
                 matches!(
                     self.context.optimized_locations.get(&statement.range()),
@@ -1872,6 +1873,7 @@ impl<'source> Compiler<'source> {
                                 ))))
                         && !suite_contains_yield(&conditional.body));
             let protected_terminal_if_before_elided = final_expression_becomes_return
+                && matches!(statement, Stmt::If(_))
                 && self.supports_protected_terminal_if()
                 && self
                     .control
