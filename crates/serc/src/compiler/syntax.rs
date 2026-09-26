@@ -62,7 +62,7 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315)
             && validator.may_have_debug_patterns
             && pattern_debug::body_has_debug_pattern(body);
-    let numeric_symbol_replay = validator.lowering_numeric_error
+    let mut numeric_symbol_replay = validator.lowering_numeric_error
         && matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315);
     let lowering_error = lowering_keyword_error
         || validator.lowering_debug_error
@@ -75,15 +75,23 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         let mut replay = new_validator::<PRUNE_STATEMENTS, false>(source, body, python_version);
         replay.class_lowering_target = Some(*range);
         replay.visit_scope_body(body);
-        error = replay
+        let replay_numeric_error = replay.lowering_numeric_error;
+        let replay_error = replay
             .error
             .into_inner()
             .or_else(|| {
                 replay
                     .bare_starred
                     .map(|(range, kind)| CompileError::invalid_syntax(kind.message(), range))
-            })
-            .or(error);
+            });
+        // A numeric duplicate found in the class body needs the same ordered symbol replay
+        // as one found by the initial walk.
+        if replay_error.is_some()
+            && matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315)
+        {
+            numeric_symbol_replay |= replay_numeric_error;
+        }
+        error = replay_error.or(error);
     }
     if matches!(&error, Some(CompileError::InvalidDocstring { .. })) || lowering_error {
         // Revisit these error paths for diagnostics from earlier compiler phases.
