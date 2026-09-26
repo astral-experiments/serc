@@ -29745,6 +29745,15 @@ impl<'source> Compiler<'source> {
                             // CPython leaves the shared exceptional exit unlocated. Each incoming
                             // branch, including a loop break, supplies the copied exit's location.
                             compiler.assembler.set_location(SourceLocation::NONE);
+                        } else if compiler.context.python_version == crate::PythonVersion::Py312
+                            && matches!(statement.finalbody.last(), Some(Stmt::Assert(assertion))
+                                if assertion_has_only_runtime_tests(&assertion.test)
+                                    && original_condition_has_unique_jump_target(&assertion.test, true))
+                            && let Some(range) = suite_assert_success_fallthrough_range(&statement.finalbody)
+                        {
+                            // The sole assertion-success edge supplies the 3.12 exceptional
+                            // finalizer's RERAISE location, not the failure RAISE's whole test.
+                            compiler.assembler.set_location(compiler.source_location(range));
                         } else if let Some(range) = suite_unary_not_fallthrough_range(&statement.finalbody)
                         {
                             compiler.assembler.set_location(compiler.source_location(range));
