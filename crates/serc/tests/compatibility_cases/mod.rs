@@ -115,6 +115,7 @@ mod empty_finally_join_locations;
 mod empty_try_else_donors;
 mod empty_try_setup;
 mod entry_and_cleanup_owner_slots;
+mod exceptional_finally_assert_success_locations;
 mod exceptional_finally_conditional_prefix_exits;
 mod exceptional_finally_handler_copy_locations;
 mod exceptional_finally_shared_reraise_compatibility;
