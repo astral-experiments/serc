@@ -576,6 +576,10 @@ impl<'a> Visitor<'a> for Validator<'a> {
     }
 
     fn visit_alias(&mut self, alias: &'a ast::Alias) {
+        if self.stop_node == Some(alias.range) {
+            self.stopped = true;
+            return;
+        }
         let name = alias.asname.as_ref().map_or_else(
             || alias.name.as_str().split('.').next().unwrap(),
             ast::Identifier::as_str,
