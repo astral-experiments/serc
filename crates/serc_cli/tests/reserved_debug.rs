@@ -20,6 +20,9 @@ fn reserved_debug_writes_match_target_rules() {
         ("f(__debug__=1, x=1, x=2)\n", "store"),
         ("f(__debug__=1, __debug__=2)\n", "store"),
         ("f(x=1, x=2, __debug__=1)\n", "duplicate-first"),
+        ("f(x=1, __debug__=1, x=2)\n", "duplicate-first"),
+        ("f(__debug__=1)\nx=1\nglobal x\n", "declaration-first"),
+        ("obj.__debug__=1\nx=1\nglobal x\n", "declaration-first"),
         ("f(g(x=1, x=2), __debug__=1)\n", "store"),
         ("g(x=1, x=2)(__debug__=1)\n", "store"),
         ("f(x=g(y=1, y=2), __debug__=1)\n", "store"),
@@ -36,6 +39,23 @@ fn reserved_debug_writes_match_target_rules() {
         ),
         ("class C(__debug__=1):\n    break\n", "body-break"),
         ("class C(g(y=1, y=2), __debug__=1): pass\n", "store"),
+        ("@f(y=1,y=2)\nclass C(x=1,x=2): pass\n", "repeated-y"),
+        ("class C[T: f(y=1,y=2)](x=1,x=2): pass\n", "repeated-y"),
+        ("class C(f(y=1,y=2),x=1,x=2): pass\n", "repeated-x"),
+        ("class C(x=1,x=2): f(y=1,y=2)\n", "repeated-y"),
+        ("class C(x=1,x=2): pass\nf(y=1,y=2)\n", "repeated-x"),
+        ("f(y=1,y=2)\nclass C(x=1,x=2): pass\n", "repeated-y"),
+        (
+            "class C[T: f(y=1,y=2)](x=1,x=2): f(z=1,z=2)\n",
+            "repeated-y",
+        ),
+        ("class C(f(y=1,y=2),x=1,x=2): f(z=1,z=2)\n", "repeated-z"),
+        (
+            "class C(__debug__=1,x=1,x=2): f(y=1,y=2)\n",
+            "body-duplicate",
+        ),
+        ("class C(x=1,x=2): pass\nx=1\nglobal x\n", "declaration"),
+        ("class C[T,T](x=1,x=2): pass\n", "duplicate-type"),
         ("f(**values, __debug__=1)\n", "store"),
         ("class C(__debug__=1): pass\n", "store"),
         ("class C[T](__debug__=1): pass\n", "store"),
@@ -84,12 +104,22 @@ sys.stdout.buffer.write(marshal.dumps(code))
             let modern = matches!(version, PythonVersion::Py314 | PythonVersion::Py315);
             let expected = match kind {
                 "store" => Some("cannot assign to __debug__"),
-                "modern" | "duplicate-first" | "body-duplicate" | "body-break" if modern => {
+                "modern" | "duplicate-first" | "body-duplicate" | "body-break"
+                | "declaration-first"
+                    if modern =>
+                {
                     Some("cannot assign to __debug__")
                 }
                 "duplicate-first" => Some("keyword argument repeated: x"),
                 "body-duplicate" => Some("keyword argument repeated: y"),
                 "body-break" => Some("'break' outside loop"),
+                "repeated-x" => Some("keyword argument repeated: x"),
+                "repeated-y" => Some("keyword argument repeated: y"),
+                "repeated-z" => Some("keyword argument repeated: z"),
+                "declaration" | "declaration-first" => {
+                    Some("name 'x' is assigned to before global declaration")
+                }
+                "duplicate-type" => Some("duplicate type parameter 'T'"),
                 "delete" if modern => Some("cannot delete __debug__"),
                 _ => None,
             };
@@ -115,9 +145,15 @@ sys.stdout.buffer.write(marshal.dumps(code))
             ] {
                 if let Some(expected) = expected {
                     assert_eq!(String::from_utf8_lossy(&native.stdout).trim(), expected);
+                    // The type-parameter wording is handled by a separate diagnostic fix.
+                    let expected_serc = if kind == "duplicate-type" {
+                        "duplicate type parameter"
+                    } else {
+                        expected
+                    };
                     let error = compiled.unwrap_err();
                     assert!(
-                        error.to_string().ends_with(expected),
+                        error.to_string().ends_with(expected_serc),
                         "{version}: {source}: {error}"
                     );
                 } else {
@@ -146,8 +182,13 @@ sys.stdout.buffer.write(marshal.dumps(code))
                 "{version}: {source}: {output:?}"
             );
             if let Some(expected) = expected {
+                let expected_serc = if kind == "duplicate-type" {
+                    "duplicate type parameter"
+                } else {
+                    expected
+                };
                 assert!(
-                    String::from_utf8_lossy(&output.stderr).contains(expected),
+                    String::from_utf8_lossy(&output.stderr).contains(expected_serc),
                     "{output:?}"
                 );
             }
