@@ -1604,6 +1604,30 @@ def f(a):
  except Fault:
   events.append('handler')
 ";
+    const FOLDED_SOURCE: &str = r"events = []
+class Fault(Exception): pass
+class M:
+ def __enter__(self): events.append('enter'); return self
+ def __exit__(self, typ, value, tb): events.append('exit:' + (typ.__name__ if typ else 'none')); return False
+def step(): events.append('step')
+def other(): events.append('other')
+def f(a):
+ try:
+  if True:
+   if a:
+    with M():
+     try:
+      step()
+     except KeyError:
+      other()
+   else:
+    other()
+  else:
+   other()
+  assert a
+ except Fault:
+  events.append('handler')
+";
     const TRACE: &str = r"
 import dis, marshal, sys
 scope = {}
@@ -1633,52 +1657,70 @@ for prefix, line, argument, expected in cases:
     if hits != [target] or result is not None or events != expected:
         raise RuntimeError((prefix, hits, result, events, expected))
 ";
-    let lines = ["if a:", "step()"].map(|needle| {
-        (SOURCE
-            .lines()
-            .position(|line| line.trim() == needle)
-            .unwrap()
-            + 1)
-        .to_string()
-    });
-    for version in [PythonVersion::Py314, PythonVersion::Py315] {
-        for level in [OptimizationLevel::One, OptimizationLevel::Two] {
-            let native = oracle(SOURCE.as_bytes(), "protected_owner.py", version, level);
-            assert!(native.status.success());
-            let actual = compile_with_options(
-                SOURCE,
-                "protected_owner.py",
-                &CompileOptions {
-                    python_version: version,
-                    optimization_level: level,
-                    ..CompileOptions::default()
-                },
-            )
-            .unwrap()
-            .marshal();
-            assert_eq!(actual, native.stdout, "{version}, {level:?}");
-            let index = VERSIONS
-                .iter()
-                .position(|(candidate, _, _)| *candidate == version)
-                .unwrap();
-            for (label, payload) in [("native", &native.stdout), ("serc", &actual)] {
-                let mut child = Command::new(ORACLES[index].get().unwrap())
-                    .args(["-I", "-S", "-B", "-c", TRACE])
-                    .args(&lines)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
+    for source in [SOURCE, FOLDED_SOURCE] {
+        let lines = ["if a:", "step()"].map(|needle| {
+            (source
+                .lines()
+                .position(|line| line.trim() == needle)
+                .unwrap()
+                + 1)
+            .to_string()
+        });
+        for version in [PythonVersion::Py314, PythonVersion::Py315] {
+            for level in [OptimizationLevel::One, OptimizationLevel::Two] {
+                let native = oracle(source.as_bytes(), "protected_owner.py", version, level);
+                assert!(native.status.success());
+                let actual = compile_with_options(
+                    source,
+                    "protected_owner.py",
+                    &CompileOptions {
+                        python_version: version,
+                        optimization_level: level,
+                        ..CompileOptions::default()
+                    },
+                )
+                .unwrap()
+                .marshal();
+                assert_eq!(actual, native.stdout, "{version}, {level:?}");
+                let index = VERSIONS
+                    .iter()
+                    .position(|(candidate, _, _)| *candidate == version)
                     .unwrap();
-                child.stdin.take().unwrap().write_all(payload).unwrap();
-                let result = child.wait_with_output().unwrap();
-                assert!(
-                    result.status.success(),
-                    "{version}, {level:?}, {label}: {}",
-                    String::from_utf8_lossy(&result.stderr)
-                );
+                for (label, payload) in [("native", &native.stdout), ("serc", &actual)] {
+                    let mut child = Command::new(ORACLES[index].get().unwrap())
+                        .args(["-I", "-S", "-B", "-c", TRACE])
+                        .args(&lines)
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    child.stdin.take().unwrap().write_all(payload).unwrap();
+                    let result = child.wait_with_output().unwrap();
+                    assert!(
+                        result.status.success(),
+                        "{version}, {level:?}, {label}: {}",
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                }
             }
         }
+    }
+}
+
+#[test]
+fn folded_protected_nested_terminal_joins_match_cpython() {
+    for (index, source) in [
+        "def f(a, b):\n try:\n  if True:\n   if b:\n    work()\n  else:\n   other()\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a, b):\n try:\n  if True:\n   if b:\n    work()\n   else:\n    other()\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a, b):\n try:\n  if True:\n   while b:\n    break\n  else:\n   other()\n  assert a\n except ValueError:\n  work()\n",
+    ].into_iter().enumerate() {
+        assert_matches_cpython_versions(
+            source,
+            &format!("sub/folded_protected_nested_{index}.py"),
+            &LEVELS[1..],
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
     }
 }
 

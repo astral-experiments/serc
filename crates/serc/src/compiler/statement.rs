@@ -1593,8 +1593,8 @@ impl<'source> Compiler<'source> {
     }
 
     // Optimized-away statements emit no instructions, so the preceding
-    // conditional supplies the normal exits of the terminal try body. Folded
-    // conditions retain their original protected markers on the existing path.
+    // conditional supplies the normal exits of the terminal try body. A folded
+    // true branch can also carry a nested runtime conditional or breaking loop.
     fn protected_terminal_if_before_elided(&self, statement: &Stmt, following: &[Stmt]) -> bool {
         matches!(statement, Stmt::If(_))
             && !following.is_empty()
@@ -1605,7 +1605,13 @@ impl<'source> Compiler<'source> {
                 )
             })
             && matches!(statement, Stmt::If(conditional)
-                if early_condition_truthiness(&conditional.test).is_none())
+                if early_condition_truthiness(&conditional.test).is_none()
+                    || (early_condition_truthiness(&conditional.test) == Some(true)
+                        && (matches!(conditional.body.last(), Some(Stmt::If(nested))
+                                if early_condition_truthiness(&nested.test).is_none())
+                            || matches!(conditional.body.last(), Some(Stmt::While(loop_statement))
+                                if loop_statement.orelse.is_empty()
+                                    && suite_contains_loop_break(&loop_statement.body)))))
     }
 
     fn supports_protected_terminal_if(&self) -> bool {
@@ -1964,7 +1970,7 @@ impl<'source> Compiler<'source> {
                         continue;
                     }
                     Stmt::If(statement) => {
-                        self.compile_terminal_if(statement)?;
+                        self.compile_terminal_if(statement, protected_terminal_if_before_elided)?;
                         self.control.statements.emitted_fallthrough_return = true;
                         continue;
                     }
@@ -3533,6 +3539,7 @@ impl<'source> Compiler<'source> {
     fn compile_terminal_if(
         &mut self,
         statement: &ruff_python_ast::StmtIf,
+        preserve_protected_folded_nop: bool,
     ) -> Result<(), CompileError> {
         if self.context.python_version >= crate::PythonVersion::Py313
             && self.optimized_conditional_join(statement)
@@ -3653,6 +3660,9 @@ impl<'source> Compiler<'source> {
             self.assembler
                 .set_location(self.source_location(statement.test.range()));
             self.emit(NOP, 0, 0)?;
+            if preserve_protected_folded_nop {
+                self.assembler.preserve_last_nop();
+            }
             if !truthiness {
                 // The discarded true branch remains an empty original CFG block,
                 // stopping CPython's borrowing traversal before the selected else.
