@@ -30519,14 +30519,8 @@ impl<'source> Compiler<'source> {
             }) && self.take_trailing_nop_location().is_some();
             if !trailing_nop_is_covered
                 && self.assembler.instruction_count() == body_start
-                && let Some(statement) = body.last()
-                // A suite of declarations emits no line event, including synthetic
-                // declarations left by optimized-away assertions. Other suites may
-                // contain an authored pass whose location still needs this fallback.
-                && !(self.context.python_version >= crate::PythonVersion::Py314
-                    && body
-                        .iter()
-                        .all(|statement| matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))))
+                && let Some(statement) =
+                    with_body_fallback_statement(body, self.context.python_version)
                 // A same-line `as` target store already carries the pass line event.
                 && body_previous_location.is_none_or(|previous| {
                     previous.line != self.source_location(statement.range()).line
@@ -31274,11 +31268,8 @@ impl<'source> Compiler<'source> {
                     )?;
                     if remaining.is_empty()
                         && compiler.assembler.instruction_count() == body_start
-                        && let Some(statement) = body.last()
-                        && !(compiler.context.python_version >= crate::PythonVersion::Py314
-                            && body.iter().all(|statement| {
-                                matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))
-                            }))
+                        && let Some(statement) =
+                            with_body_fallback_statement(body, compiler.context.python_version)
                     {
                         compiler
                             .assembler
@@ -32675,6 +32666,28 @@ enum WithBodyNormalExit {
     Terminated,
     While(TextRange),
     Other,
+}
+
+// Declarations emit no instructions or line events. For one authored pass with
+// trailing declarations, use the pass location for the empty-body fallback.
+fn with_body_fallback_statement(
+    body: &[Stmt],
+    python_version: crate::PythonVersion,
+) -> Option<&Stmt> {
+    let last = body.last()?;
+    if python_version >= crate::PythonVersion::Py314
+        && matches!(last, Stmt::Global(_) | Stmt::Nonlocal(_))
+    {
+        let mut effective = body
+            .iter()
+            .filter(|statement| !matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_)));
+        return match (effective.next(), effective.next()) {
+            (None, _) => None,
+            (Some(pass @ Stmt::Pass(_)), None) => Some(pass),
+            _ => Some(last),
+        };
+    }
+    Some(last)
 }
 
 // Classify the paths reaching the manager's POP_BLOCK before constant folding. A local

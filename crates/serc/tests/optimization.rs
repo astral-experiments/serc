@@ -910,6 +910,23 @@ fn optimized_empty_manager_bodies_match_cpython() {
 }
 
 #[test]
+fn modern_manager_pass_before_declarations_matches_cpython() {
+    let versions = [PythonVersion::Py314, PythonVersion::Py315];
+    for source in [
+        "def f(manager):\n    try:\n        with manager as value:\n            pass\n            global marker\n    finally:\n        cleanup()\n",
+        "def f(manager):\n    try:\n        with manager as value:\n            global marker\n            pass\n            global spare_marker\n    finally:\n        cleanup()\n",
+    ] {
+        assert_matches_cpython_versions(source, "case.py", &LEVELS, &versions);
+    }
+    for source in [
+        "def f(manager):\n    try:\n        with manager as value:\n            pass\n            assert predicate()\n            global marker\n    finally:\n        cleanup()\n",
+        "def f(manager):\n    try:\n        with manager as value:\n            assert predicate()\n            pass\n            global marker\n    finally:\n        cleanup()\n",
+    ] {
+        assert_matches_cpython_versions(source, "case.py", &LEVELS[1..], &versions);
+    }
+}
+
+#[test]
 fn nested_continue_with_elided_assertion_matches_cpython() {
     for source in [
         "def f(xs, a, cm):\n    for x in xs:\n        if a:\n            if x:\n                continue\n            global g\n            assert x\n",
