@@ -187,6 +187,8 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
         collected_match_errors: RefCell::new(None),
         symbol_pattern_debug_range: None,
         pending_pattern: None,
+        checked_match: None,
+        surrogate_mapping_keys: RefCell::new(FxHashMap::default()),
         lowering_pattern_error: false,
         lowering_keyword_error: Cell::new(false),
         checking_class_header: Cell::new(false),
@@ -409,6 +411,8 @@ struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
     collected_match_errors: RefCell<Option<Vec<SemanticSyntaxError>>>,
     symbol_pattern_debug_range: Option<TextRange>,
     pending_pattern: Option<PendingPattern<'ast>>,
+    checked_match: Option<&'ast ast::StmtMatch>,
+    surrogate_mapping_keys: RefCell<FxHashMap<TextRange, bool>>,
     lowering_pattern_error: bool,
     lowering_keyword_error: Cell<bool>,
     checking_class_header: Cell<bool>,
@@ -429,6 +433,92 @@ struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
     private_name: Option<&'ast str>,
     mangled_names: Option<FxHashSet<&'ast str>>,
     scopes: Vec<Scope<'ast>>,
+}
+
+/// Ruff represents escaped lone surrogates as U+FFFD in its AST. Compare the original
+/// decoded strings when its mapping-pattern duplicate check encounters such a value.
+fn surrogate_mapping_key_outcomes(
+    statement: &ast::StmtMatch,
+    source: &str,
+    range: TextRange,
+) -> Option<Vec<(TextRange, bool)>> {
+    fn string_bytes(source: &str, string: &ast::ExprStringLiteral) -> Vec<u8> {
+        let mut result = Vec::new();
+        for part in &string.value {
+            if !part.flags.prefix().is_raw()
+                && let Some(restored) =
+                    explicit_surrogate_string(part.as_str(), &source[part.range])
+            {
+                result.extend(restored);
+            } else {
+                result.extend_from_slice(part.as_str().as_bytes());
+            }
+        }
+        result
+    }
+
+    struct Finder<'a> {
+        source: &'a str,
+        range: TextRange,
+        outcomes: Option<Vec<(TextRange, bool)>>,
+    }
+    impl<'ast> Visitor<'ast> for Finder<'_> {
+        fn visit_pattern(&mut self, pattern: &'ast Pattern) {
+            if self.outcomes.is_some() {
+                return;
+            }
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_pattern(pattern));
+            }
+            if !pattern.range().contains_range(self.range) {
+                return;
+            }
+            if let Pattern::MatchMapping(mapping) = pattern
+                && let Some(index) = mapping
+                    .keys
+                    .iter()
+                    .position(|key| key.range() == self.range)
+                && let Expr::StringLiteral(string) = &mapping.keys[index]
+            {
+                if string.value.to_str().contains('\u{fffd}') {
+                    let mut seen = FxHashSet::default();
+                    self.outcomes = Some(
+                        mapping
+                            .keys
+                            .iter()
+                            .filter_map(|key| {
+                                let Expr::StringLiteral(string) = key else {
+                                    return None;
+                                };
+                                // A first occurrence is not a duplicate even if Ruff's lossy
+                                // representation collides with a different earlier string.
+                                let unique = seen.insert(string_bytes(self.source, string));
+                                Some((
+                                    key.range(),
+                                    unique && string.value.to_str().contains('\u{fffd}'),
+                                ))
+                            })
+                            .collect(),
+                    );
+                }
+                return;
+            }
+            walk_pattern(self, pattern);
+        }
+    }
+
+    let mut finder = Finder {
+        source,
+        range,
+        outcomes: None,
+    };
+    let index = statement
+        .cases
+        .partition_point(|case| case.pattern.range().end() <= range.start());
+    if let Some(case) = statement.cases.get(index) {
+        finder.visit_pattern(&case.pattern);
+    }
+    finder.outcomes
 }
 
 struct PendingPattern<'ast> {
@@ -581,6 +671,21 @@ fn pattern_capture_names(pattern: &Pattern) -> FxHashSet<&str> {
 impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
     Validator<'_, 'ast, PRUNE_STATEMENTS, FUTURE_ONLY>
 {
+    fn false_surrogate_mapping_duplicate(&self, range: TextRange) -> bool {
+        if let Some(&unique) = self.surrogate_mapping_keys.borrow().get(&range) {
+            return unique;
+        }
+        let Some(outcomes) = self
+            .checked_match
+            .and_then(|statement| surrogate_mapping_key_outcomes(statement, self.source, range))
+        else {
+            return false;
+        };
+        let mut cache = self.surrogate_mapping_keys.borrow_mut();
+        cache.extend(outcomes);
+        cache.get(&range).copied().unwrap_or(false)
+    }
+
     fn record_bare_starred(&mut self, expression: &Expr, kind: BareStarredKind) {
         if !self.pre_lowering_only
             && self.check_bare_starred
@@ -1432,7 +1537,13 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
         // Relative imports of a module named __future__ are ordinary imports. The shared
         // checker identifies directives by their module spelling, so hide that spelling here.
         if self.statement_needs_checker(statement) {
+            let previous_match = self.checked_match;
+            self.checked_match = match statement {
+                Stmt::Match(statement) => Some(statement),
+                _ => None,
+            };
             self.check_statement(statement);
+            self.checked_match = previous_match;
         }
         self.checking_class_header.set(previous_class_header);
         self.suppress_class_keyword.set(previous_suppression);
@@ -2018,6 +2129,12 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
                 return;
             }
         }
+        if matches!(error.kind, Kind::DuplicateMatchKey(_))
+            && self.error.borrow().is_none()
+            && self.false_surrogate_mapping_duplicate(error.range)
+        {
+            return;
+        }
         let mut reported = self.error.borrow_mut();
         // In the modern future-only replay, the shared checker reports an unknown
         // feature before it reports that the same import is misplaced. Native
@@ -2393,6 +2510,45 @@ mod tests {
                 assert_eq!(actual, message, "{python_version}: {source:?}");
                 assert_eq!(&source[range], "nonlocal missing");
             }
+        }
+    }
+
+    #[test]
+    fn many_distinct_surrogate_mapping_keys_remain_distinct() {
+        let keys = (0..1024)
+            .map(|index| {
+                format!(
+                    "'\\u{:04x}\\u{:04x}': _",
+                    0xd800 + index / 32,
+                    0xd800 + index % 32
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        for (suffix, duplicate) in [("", false), (", '\\ud800\\ud800': _", true)] {
+            let source = format!("match subject:\n    case {{{keys}{suffix}}}: pass\n");
+            let parsed = parse_module(&source).unwrap();
+            for version in TARGETS {
+                let result = validate(&source, &parsed.syntax().body, version);
+                if duplicate {
+                    assert!(result.unwrap_err().to_string().contains("duplicate key"));
+                } else {
+                    assert!(result.is_ok(), "{version}: {result:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn surrogate_mapping_keys_in_many_cases_remain_independent() {
+        let cases = (0..512)
+            .map(|_| "    case {'\\ud800': _, '\\ud801': _}: pass\n")
+            .collect::<String>();
+        let source = format!("match subject:\n{cases}");
+        let parsed = parse_module(&source).unwrap();
+        for version in TARGETS {
+            let result = validate(&source, &parsed.syntax().body, version);
+            assert!(result.is_ok(), "{version}: {result:?}");
         }
     }
 

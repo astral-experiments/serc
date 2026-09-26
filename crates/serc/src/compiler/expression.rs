@@ -2049,7 +2049,10 @@ impl Compiler<'_> {
             && let Some(keys) = pattern
                 .keys
                 .iter()
-                .map(|value| self.context.fold_constant(value))
+                .map(|value| match value {
+                    Expr::StringLiteral(string) => Some(self.string_literal_constant(string)),
+                    _ => self.context.fold_constant(value),
+                })
                 .collect::<Option<Vec<_>>>()
         {
             // Pattern literals are folded by AST optimization before code generation.
