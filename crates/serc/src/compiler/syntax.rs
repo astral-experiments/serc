@@ -1427,6 +1427,14 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                         ),
                         error.range,
                     ));
+                } else if matches!(
+                    error.kind,
+                    SemanticSyntaxErrorKind::NamedExpressionInClassBodyComprehension
+                ) {
+                    *self.error.borrow_mut() = Some(CompileError::invalid_syntax(
+                        error.to_string(),
+                        named.target.range(),
+                    ));
                 } else {
                     self.report_semantic_error(error);
                 }
