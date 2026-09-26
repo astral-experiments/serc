@@ -8,6 +8,7 @@ mod assembler;
 mod code_object;
 mod compiler;
 mod config;
+mod decimal_literals;
 mod delimiter_nesting;
 mod indentation;
 mod initial_intern_state;
@@ -531,6 +532,12 @@ fn compile_normalized(
         return Err(error);
     }
     yield_syntax::validate(source, parsed.tokens(), options.python_version)?;
+    decimal_literals::validate(
+        source,
+        parsed.tokens(),
+        parsed.suite(),
+        parsed.unsupported_syntax_errors(),
+    )?;
     if let Some(error) = parsed.unsupported_syntax_errors().first() {
         return Err(CompileError::invalid_syntax(error.to_string(), error.range));
     }
