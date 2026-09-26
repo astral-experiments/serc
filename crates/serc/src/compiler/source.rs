@@ -335,7 +335,7 @@ impl<'source> CompilationContext<'source> {
         if codegen_warnings {
             match super::warning_schedule::WarningSchedule::plan(
                 body,
-                self.source,
+                &self.line_index,
                 self.python_version,
             ) {
                 Ok(schedule) => {

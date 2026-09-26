@@ -207,6 +207,127 @@ fn warning_callbacks_preserve_annotation_assembly_order() {
 }
 
 #[test]
+fn warning_callbacks_preserve_assembly_lines_with_mixed_newlines() {
+    let source =
+        "@decorator\r\ndef outer():\r    def inner():\n        return 1 is x\r\n    return inner\r\n";
+    for version in [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
+    ] {
+        compare_in_context_for(source, "mixed_newline_marker_796", false, version);
+        compare_in_context_for(source, "mixed_newline_marker_796", true, version);
+    }
+}
+
+#[test]
+fn warning_callbacks_preserve_lines_for_text_and_bytes_sources() {
+    for newline in ["\n", "\r\n", "\r"] {
+        let source = [
+            "# π",
+            "@decorator",
+            "def outer():",
+            "    def inner():",
+            "        return 1 is x",
+            "    return inner",
+        ]
+        .join(newline);
+        for version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let expected = compare_in_context_for(&source, "line_marker_796", false, version);
+            let options = CompileOptions {
+                python_version: version,
+                ..CompileOptions::default()
+            };
+            for prepared in [
+                PreparedCompilation::text(&source, "warning_effects_context.py", &options),
+                PreparedCompilation::bytes(source.as_bytes(), "warning_effects_context.py", &options),
+            ] {
+                let prepared = prepared.unwrap();
+                let mut effects = prepared.effects();
+                for warning in prepared.warnings() {
+                    effects
+                        .record(
+                            warning.ordinal(),
+                            CompilationWarningEffect::NoRetainedAdditions,
+                        )
+                        .unwrap();
+                }
+                assert_eq!(prepared.finish(&effects).unwrap().marshal(), expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn unknown_warning_callbacks_preserve_shared_frozenset_owners() {
+    let marker = "warning_shared_owner_796";
+    let first = "def first(value):\n    return value in {'warning_shared_owner_796', 'warning_shared_companion_796'}\n";
+    let second = "def second(value):\n    return value in {'warning_shared_owner_796', 'warning_shared_companion_796'}\n";
+    let warning = "if 1 is 1: pass\n";
+    for source in [
+        format!("{warning}{first}{second}"),
+        format!("{first}{warning}{second}"),
+        format!("{first}{second}{warning}"),
+    ] {
+        let quiet = compare_in_context_for(&source, marker, false, PythonVersion::Py315);
+        let retained = compare_in_context_for(&source, marker, true, PythonVersion::Py315);
+        assert_eq!(quiet, retained, "{source}");
+
+        let options = CompileOptions {
+            python_version: PythonVersion::Py315,
+            ..CompileOptions::default()
+        };
+        let prepared =
+            PreparedCompilation::bytes(source.as_bytes(), "warning_effects_context.py", &options)
+                .unwrap();
+        assert_eq!(prepared.warnings().len(), 1);
+        let mut effects = prepared.effects();
+        effects
+            .record(
+                prepared.warnings()[0].ordinal(),
+                CompilationWarningEffect::PartialRetainedStrings(vec![]),
+            )
+            .unwrap();
+        assert_eq!(
+            prepared.finish(&effects).unwrap().marshal(),
+            quiet,
+            "{source}"
+        );
+    }
+
+    let second_distinct = "def second(value):\n    'different tuple'\n    return value in {'warning_shared_owner_796', 'warning_shared_companion_796'}\n";
+    let source = format!("{warning}{first}{second_distinct}");
+    let quiet = compare_in_context_for(&source, marker, false, PythonVersion::Py315);
+    let retained = compare_in_context_for(&source, marker, true, PythonVersion::Py315);
+    assert_ne!(quiet, retained);
+    let options = CompileOptions {
+        python_version: PythonVersion::Py315,
+        ..CompileOptions::default()
+    };
+    let prepared =
+        PreparedCompilation::bytes(source.as_bytes(), "warning_effects_context.py", &options)
+            .unwrap();
+    assert_eq!(prepared.warnings().len(), 1);
+    let mut effects = prepared.effects();
+    effects
+        .record(
+            prepared.warnings()[0].ordinal(),
+            CompilationWarningEffect::PartialRetainedStrings(vec![]),
+        )
+        .unwrap();
+    assert!(matches!(
+        prepared.finish(&effects),
+        Err(serc::CompileError::UnresolvedInternState { .. })
+    ));
+}
+
+#[test]
 fn warning_callbacks_preserve_discarded_class_scalar_origins() {
     let source = "if 1 is 1: pass\nif False:\n    class WarningOuter796:\n        class Inner: pass\nvalue = 'WarningOuter796.Inner'\n";
     let quiet = compare_in_context(source, "WarningOuter796.Inner", false);

@@ -10,6 +10,7 @@ use std::fmt;
 
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
 use ruff_python_ast::{Expr, Parameters, Stmt, StmtFunctionDef, UnaryOp};
+use ruff_source_file::LineIndex;
 use ruff_text_size::{Ranged, TextRange, TextSize};
 
 use crate::code_object::CodeObject;
@@ -67,7 +68,7 @@ impl WarningSchedule {
     /// Consumers must match every assembly and reject any unconsumed event.
     pub(super) fn plan(
         body: &[Stmt],
-        source: &str,
+        line_index: &LineIndex,
         version: PythonVersion,
     ) -> Result<Self, UnsupportedWarningSchedule> {
         if let Some(range) = warnings::legacy_boolean_inversion(body, version) {
@@ -77,7 +78,7 @@ impl WarningSchedule {
             });
         }
         let mut planner = Planner {
-            source,
+            line_index,
             version,
             events: warnings::preprocessing(body, version)
                 .into_iter()
@@ -131,7 +132,7 @@ enum Frame<'ast> {
 }
 
 struct Planner<'source, 'ast> {
-    source: &'source str,
+    line_index: &'source LineIndex,
     version: PythonVersion,
     events: Vec<ScheduleEvent>,
     scope: Scope,
@@ -162,16 +163,9 @@ impl<'ast> Planner<'_, 'ast> {
         }
     }
 
-    /// Count physical source lines, including lone CR and CRLF newlines.
+    /// Look up physical source lines using the compiler's existing index.
     fn line(&self, offset: TextSize) -> u32 {
-        let bytes = &self.source.as_bytes()[..usize::from(offset)];
-        let mut line = 1;
-        for (index, byte) in bytes.iter().enumerate() {
-            if *byte == b'\r' || (*byte == b'\n' && (index == 0 || bytes[index - 1] != b'\r')) {
-                line += 1;
-            }
-        }
-        line
+        u32::try_from(self.line_index.line_index(offset).get()).unwrap_or(u32::MAX)
     }
 
     /// Assemble a child after visiting its complete body, then restore its parent.
@@ -599,6 +593,7 @@ impl<'ast> Visitor<'ast> for Planner<'_, 'ast> {
 mod tests {
     use super::{ScheduleEvent, WarningSchedule};
     use crate::PythonVersion;
+    use ruff_source_file::LineIndex;
 
     const VERSIONS: [PythonVersion; 4] = [
         PythonVersion::Py312,
@@ -609,7 +604,7 @@ mod tests {
 
     fn events(source: &str, version: PythonVersion) -> Vec<ScheduleEvent> {
         let parsed = ruff_python_parser::parse_module(source).unwrap();
-        WarningSchedule::plan(parsed.suite(), source, version)
+        WarningSchedule::plan(parsed.suite(), &LineIndex::from_source_text(source), version)
             .unwrap()
             .events
     }
@@ -639,6 +634,23 @@ mod tests {
                     "assembly:Outer.method:2",
                     "assembly:Outer:1",
                     "warning:non_callable",
+                    "assembly:<module>:1",
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn assembly_lines_follow_mixed_newlines() {
+        let source =
+            "@decorator\r\ndef outer():\r    def inner():\n        return 1 is x\r\n    return inner\r\n";
+        for version in VERSIONS {
+            assert_eq!(
+                summary(source, version),
+                [
+                    "warning:identity_comparison",
+                    "assembly:outer.<locals>.inner:3",
+                    "assembly:outer:1",
                     "assembly:<module>:1",
                 ]
             );
@@ -983,7 +995,12 @@ mod tests {
             for version in VERSIONS {
                 let parsed = ruff_python_parser::parse_module(source).unwrap();
                 assert!(
-                    WarningSchedule::plan(parsed.suite(), source, version).is_err(),
+                    WarningSchedule::plan(
+                        parsed.suite(),
+                        &LineIndex::from_source_text(source),
+                        version,
+                    )
+                    .is_err(),
                     "{version:?}: {source}"
                 );
             }
