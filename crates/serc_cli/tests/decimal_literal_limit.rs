@@ -103,3 +103,68 @@ sys.stdout.buffer.write(marshal.dumps(code))
         }
     }
 }
+
+#[test]
+fn decimal_limit_respects_earlier_version_errors() {
+    let digits = "1".repeat(4301);
+    let large = format!("value = {digits}\n");
+    let template = "t'hello'\n";
+    let default = "def f[T = int]():\n    pass\n";
+    let lazy = "lazy import math\n";
+    let unpack = "value = [*v for v in ()]\n";
+    let exception = "try:\n    pass\nexcept TypeError, ValueError:\n    pass\n";
+    let pattern = "match 1:\n    case +1:\n        pass\n";
+    let mut cases = Vec::new();
+    for unsupported in [template, default, lazy, unpack, exception, pattern] {
+        cases.push(format!("{unsupported}{large}"));
+        cases.push(format!("{large}{unsupported}"));
+    }
+    cases.extend([
+        format!("t'{{{digits}}}'\n"),
+        format!("def f[T = {digits}]():\n    pass\n"),
+        format!("def f[T: {digits} = int]():\n    pass\n"),
+        format!("value = [*{digits} for v in ()]\n"),
+        format!("try:\n    pass\nexcept TypeError, {digits}:\n    pass\n"),
+        format!("match 1:\n    case +{digits}:\n        pass\n"),
+    ]);
+    let oracle = r"
+import sys
+try:
+    compile(sys.argv[1], 'ordering.py', 'exec', dont_inherit=True, optimize=0)
+except SyntaxError as error:
+    print('decimal' if error.msg.startswith('Exceeds the limit (4300 digits)') else 'other')
+else:
+    print('accepted')
+";
+    for version in [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
+    ] {
+        let options = CompileOptions {
+            python_version: version,
+            ..CompileOptions::default()
+        };
+        for source in &cases {
+            let mut python = match version {
+                PythonVersion::Py312 => common::python_312_command(),
+                PythonVersion::Py313 => common::python_313_command(),
+                PythonVersion::Py314 => common::python_3145_command(),
+                PythonVersion::Py315 => common::python_315_command(),
+            };
+            let native = python.args(["-c", oracle, source]).output().unwrap();
+            assert!(native.status.success(), "{version}: {native:?}");
+            let expected = String::from_utf8(native.stdout).unwrap();
+            assert!(matches!(expected.trim(), "decimal" | "other"), "{version}");
+            let error = compile_with_options(source, "ordering.py", &options).unwrap_err();
+            assert_eq!(
+                error
+                    .to_string()
+                    .contains("Exceeds the limit (4300 digits)"),
+                expected.trim() == "decimal",
+                "{version}: {error}"
+            );
+        }
+    }
+}
