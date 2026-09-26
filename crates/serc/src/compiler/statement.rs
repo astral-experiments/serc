@@ -3227,11 +3227,16 @@ impl<'source> Compiler<'source> {
                                 || matches!(body.last(), Some(Stmt::Expr(expression))
                                     if matches!(expression.value.as_ref(), Expr::Await(_)))
                                 || suite_has_cold_only_terminal_if_continuation(body)
-                                || body.iter().any(|statement| {
-                                    matches!(statement, Stmt::Assign(assignment)
-                                    if super::expression::expression_defers_async_comprehension_restore(
-                                        &assignment.value,
-                                    ))
+                                || body.iter().any(|statement| match statement {
+                                    Stmt::Assign(assignment) => {
+                                        super::expression::expression_defers_async_comprehension_restore(
+                                            &assignment.value,
+                                        )
+                                    }
+                                    Stmt::Assert(assertion) => {
+                                        assertion_defers_async_comprehension_restore(&assertion.test)
+                                    }
+                                    _ => false,
                                 })))
                 })
         {
@@ -37249,6 +37254,21 @@ fn suite_unary_not_fallthrough_range(body: &[Stmt]) -> Option<TextRange> {
             terminating_if_fallthrough_test(statement).and_then(unary_not_condition_exit_range)
         }
         _ => None,
+    }
+}
+
+// Short-circuit and negated assertions can still defer the comprehension's
+// restoration into a cold block, even though the comprehension is not the root test.
+fn assertion_defers_async_comprehension_restore(expression: &Expr) -> bool {
+    match expression {
+        Expr::BoolOp(boolean) => boolean
+            .values
+            .iter()
+            .any(assertion_defers_async_comprehension_restore),
+        Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => {
+            assertion_defers_async_comprehension_restore(&unary.operand)
+        }
+        _ => super::expression::expression_defers_async_comprehension_restore(expression),
     }
 }
 
