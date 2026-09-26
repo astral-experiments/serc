@@ -135,7 +135,7 @@ struct ViewTables {
     labels: LabelPositions,
     boundaries: FxHashSet<Label>,
     markers: FxHashMap<Key, SmallVec<[(usize, usize); 1]>>,
-    instruction_positions: Vec<usize>,
+    label_item_indices: Vec<usize>,
 }
 
 impl ViewTables {
@@ -143,7 +143,7 @@ impl ViewTables {
         self.labels.clear();
         self.boundaries.clear();
         self.markers.clear();
-        self.instruction_positions.clear();
+        self.label_item_indices.clear();
     }
 }
 
@@ -161,7 +161,7 @@ struct View<'a> {
     boundaries: FxHashSet<Label>,
     supplementary_references: OnceCell<FxHashSet<Label>>,
     markers: FxHashMap<Key, SmallVec<[(usize, usize); 1]>>,
-    instruction_positions: Vec<usize>,
+    label_item_indices: Vec<usize>,
 }
 impl<'a> View<'a> {
     fn new(
@@ -184,21 +184,21 @@ impl<'a> View<'a> {
             mut labels,
             mut boundaries,
             mut markers,
-            mut instruction_positions,
+            mut label_item_indices,
         } = tables;
         labels.prepare(items.len());
         boundaries.clear();
         markers.clear();
-        instruction_positions.clear();
-        instruction_positions.reserve(items.len() + 1);
+        label_item_indices.clear();
+        label_item_indices.reserve(items.len().div_ceil(4));
         boundaries.extend(&provenance.block_boundaries);
         boundaries.extend(preserved);
         let mut previous = None;
         let mut n = 0;
         for (i, item) in items.iter().enumerate() {
-            instruction_positions.push(n);
             match item {
                 Item::Label(l) => {
+                    label_item_indices.push(i);
                     if labels.insert(*l, (i, n)).is_some() {
                         return None;
                     }
@@ -219,7 +219,6 @@ impl<'a> View<'a> {
                 }
             }
         }
-        instruction_positions.push(n);
         for region in regions {
             boundaries.insert(region.target);
         }
@@ -231,7 +230,7 @@ impl<'a> View<'a> {
             boundaries,
             supplementary_references: OnceCell::new(),
             markers,
-            instruction_positions,
+            label_item_indices,
         })
     }
 
@@ -282,7 +281,7 @@ impl<'a> View<'a> {
             labels: self.labels,
             boundaries: self.boundaries,
             markers: self.markers,
-            instruction_positions: self.instruction_positions,
+            label_item_indices: self.label_item_indices,
         }
     }
 
@@ -296,7 +295,11 @@ impl<'a> View<'a> {
 
     /// Returns the number of instructions before an item or the end of the view.
     fn instruction_position(&self, item_index: usize) -> usize {
-        self.instruction_positions[item_index]
+        debug_assert!(item_index <= self.items.len());
+        item_index
+            - self
+                .label_item_indices
+                .partition_point(|index| *index < item_index)
     }
 
     fn endpoint(&self, condition: Instruction, marker: Instruction) -> Option<(usize, usize)> {
@@ -1998,12 +2001,21 @@ pub(super) struct FusionOwnerCertificates {
 impl FusionOwnerCertificates {
     /// Captures authored arrays before any CFG pass can reuse their owner slots.
     pub(super) fn capture_original_owners(p: &OptimizationPipeline) -> Self {
-        if p.exception_regions.is_empty() || (p.exception_owner_provenance.handler_dispatch_arrays.is_empty() && !p.graph.iter_items().any(|item| {
-            matches!(item, Item::Instruction(instruction)
-                if (instruction.opcode == NOT_TAKEN && matches!(instruction.exception_policy(), ExceptionPolicy::NoneUnchangedBooleanSingleton | ExceptionPolicy::NonePresent | ExceptionPolicy::NoneAbsent))
-                    || (instruction.opcode == NOP && instruction.pre_fold_extra_instructions() == 2
-                        && instruction.no_location_policy.borrow_fallthrough() == super::BorrowFallthrough::Barrier))
-        })) {
+        if p.exception_regions.is_empty()
+            || (p.exception_owner_provenance.handler_dispatch_arrays.is_empty()
+                && (!p.graph.features().has_original_fusion_owner_candidate()
+                    || !p.graph.iter_items().any(|item| {
+                        matches!(item, Item::Instruction(instruction)
+                            if (instruction.opcode == NOT_TAKEN
+                                && matches!(instruction.exception_policy(),
+                                    ExceptionPolicy::NoneUnchangedBooleanSingleton
+                                        | ExceptionPolicy::NonePresent | ExceptionPolicy::NoneAbsent))
+                                || (instruction.opcode == NOP
+                                    && instruction.pre_fold_extra_instructions() == 2
+                                    && instruction.no_location_policy.borrow_fallthrough()
+                                        == super::BorrowFallthrough::Barrier))
+                    })))
+        {
             return Self::default();
         }
         let items = p.graph.copy_items();
@@ -2111,6 +2123,7 @@ impl FusionOwnerCertificates {
 
     pub(super) fn snapshot(p: &OptimizationPipeline) -> Vec<Item> {
         if p.exception_regions.is_empty()
+            || !p.graph.features().has_not_taken()
             || !p
                 .graph
                 .iter_items()
@@ -2814,6 +2827,36 @@ mod tests {
                 .instruction_position(0),
             0
         );
+    }
+
+    #[test]
+    fn sparse_instruction_positions_match_prefix_counts_across_reused_tables() {
+        let provenance = ExceptionOwnerProvenance::default();
+        let preserved = FxHashSet::default();
+        let mut tables = ViewTables::default();
+        for mask in 0_u32..1024 {
+            let items = (0..10)
+                .map(|index| {
+                    if mask & (1 << index) == 0 {
+                        Item::Instruction(instruction(NOP, Operand::Value(0)))
+                    } else {
+                        Item::Label(Label::from_u32(index))
+                    }
+                })
+                .collect::<Vec<_>>();
+            let view = View::with_tables(&items, &[], &provenance, &preserved, tables).unwrap();
+            let mut instruction_count = 0;
+            for (index, item) in items.iter().enumerate() {
+                assert_eq!(view.instruction_position(index), instruction_count);
+                if matches!(item, Item::Instruction(_)) {
+                    instruction_count += 1;
+                }
+            }
+            assert_eq!(view.instruction_position(items.len()), instruction_count);
+            tables = view.into_tables();
+        }
+        let empty = View::with_tables(&[], &[], &provenance, &preserved, tables).unwrap();
+        assert_eq!(empty.instruction_position(0), 0);
     }
 
     #[test]

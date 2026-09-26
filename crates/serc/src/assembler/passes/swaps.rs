@@ -152,45 +152,68 @@ impl OptimizationPipeline {
         if !graph.features().has_swap() {
             return false;
         }
-        let positions = graph.item_positions();
-        let mut instructions = Vec::with_capacity(positions.len());
-        instructions.extend(positions.into_iter().filter_map(|position| {
-            let Item::Instruction(instruction) = *graph.item(position) else {
-                return None;
-            };
-            Some((position, instruction))
-        }));
-        let mut previous = None;
+        let mut instructions = graph.order().iter().copied().flat_map(|block| {
+            graph[block]
+                .items()
+                .iter()
+                .enumerate()
+                .filter_map(move |(offset, item)| match item {
+                    Item::Label(_) => None,
+                    Item::Instruction(instruction) => {
+                        Some((ItemPosition::new(block, offset), instruction))
+                    }
+                })
+        });
+        let mut previous_was_swap = false;
         let mut redundant = Vec::new();
         let mut pop_location_swaps = Vec::new();
-        for (index, (position, instruction)) in instructions.iter().copied().enumerate() {
-            let removable_pops = if instruction.opcode == SWAP
-                && let Operand::Value(depth) = instruction.operand()
-                && previous.is_some_and(|previous: Instruction| previous.opcode == SWAP)
-            {
-                instructions[index + 1..]
-                    .get(..usize::try_from(depth).unwrap_or(usize::MAX))
-                    .filter(|following| {
-                        // CPython cannot fold a rotation across distinct line events.
-                        let line = following
-                            .first()
-                            .map_or(-1, |(_, instruction)| instruction.location.line);
-                        following.iter().all(|(_, instruction)| {
-                            instruction.opcode == POP_TOP
-                                && (line < 0 || instruction.location.line == line)
-                        })
-                    })
-            } else {
-                None
-            };
-            if let Some(pops) = removable_pops {
-                redundant.push(position);
-                if let Some((first, last)) = pops.first().zip(pops.last()) {
-                    pop_location_swaps.push((first.0, last.0));
-                }
-            } else {
-                previous = Some(instruction);
+        while let Some((position, instruction)) = instructions.next() {
+            // A removed swap still follows a swap, so it leaves this state unchanged.
+            let previous_was_swap =
+                std::mem::replace(&mut previous_was_swap, instruction.opcode == SWAP);
+            if !previous_was_swap || instruction.opcode != SWAP {
+                continue;
             }
+            let Operand::Value(depth) = instruction.operand() else {
+                continue;
+            };
+            if depth == 0 {
+                redundant.push(position);
+                continue;
+            }
+
+            let mut following = instructions.clone();
+            let Some((first, first_instruction)) = following.next() else {
+                continue;
+            };
+            if first_instruction.opcode != POP_TOP {
+                continue;
+            }
+            let line = first_instruction.location.line;
+            let mut last = first;
+            let mut pops = 1;
+            // CPython cannot fold a rotation across distinct line events. An unlocated
+            // first pop permits later locations, just as in the static swap pass.
+            for (position, instruction) in
+                following.take(usize::try_from(depth - 1).unwrap_or(usize::MAX))
+            {
+                if instruction.opcode != POP_TOP || (line >= 0 && instruction.location.line != line)
+                {
+                    break;
+                }
+                last = position;
+                pops += 1;
+            }
+            if pops == depth {
+                redundant.push(position);
+                pop_location_swaps.push((first, last));
+            }
+        }
+        #[cfg(test)]
+        {
+            let (expected_redundant, expected_swaps) = tests::redundant_swap_discoveries(graph);
+            assert_eq!(redundant, expected_redundant);
+            assert_eq!(pop_location_swaps, expected_swaps);
         }
 
         let graph = &mut self.graph;
@@ -470,36 +493,43 @@ impl OptimizationPipeline {
         let mut store_gaps = Vec::new();
         let join_origins =
             std::mem::take(&mut self.exception_owner_provenance.normal_try_copy_join_origins);
+        if blocks.is_empty() {
+            return store_gaps;
+        }
         let retired_labels = &self
             .exception_owner_provenance
             .retired_normal_try_copy_labels;
         let graph = &mut self.graph;
         // Resolve original labels only within this pass. A saved item offset could
         // otherwise name a different store after earlier graph rewrites.
-        let join_stores = graph
-            .order()
-            .windows(2)
-            .filter_map(|pair| {
-                let label = graph[pair[1]].first_label()?;
-                if retired_labels.contains(&label) {
-                    return None;
-                }
-                let origin = *join_origins.get(&label)?;
-                if retired_labels.contains(&origin.predecessor)
-                    || graph[pair[0]].first_label() != Some(origin.predecessor)
-                    || graph[pair[0]].last_instruction() != Some(&origin.store)
-                    || !matches!(graph[pair[1]].items(), [Item::Label(head), Item::Instruction(jump)]
-                        if *head == label && *jump == origin.jump)
-                {
-                    return None;
-                }
-                let offset = graph[pair[0]]
-                    .items()
-                    .iter()
-                    .rposition(|item| matches!(item, Item::Instruction(_)))?;
-                Some((ItemPosition::new(pair[0], offset), (label, origin)))
-            })
-            .collect::<FxHashMap<_, _>>();
+        let join_stores = if join_origins.is_empty() {
+            FxHashMap::default()
+        } else {
+            graph
+                .order()
+                .windows(2)
+                .filter_map(|pair| {
+                    let label = graph[pair[1]].first_label()?;
+                    if retired_labels.contains(&label) {
+                        return None;
+                    }
+                    let origin = *join_origins.get(&label)?;
+                    if retired_labels.contains(&origin.predecessor)
+                        || graph[pair[0]].first_label() != Some(origin.predecessor)
+                        || graph[pair[0]].last_instruction() != Some(&origin.store)
+                        || !matches!(graph[pair[1]].items(), [Item::Label(head), Item::Instruction(jump)]
+                            if *head == label && *jump == origin.jump)
+                    {
+                        return None;
+                    }
+                    let offset = graph[pair[0]]
+                        .items()
+                        .iter()
+                        .rposition(|item| matches!(item, Item::Instruction(_)))?;
+                    Some((ItemPosition::new(pair[0], offset), (label, origin)))
+                })
+                .collect()
+        };
         for SwapBlock {
             positions,
             rewritten_nops: mut rewritten,
@@ -851,7 +881,157 @@ impl OptimizationPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assembler::Label;
+    use crate::assembler::exception_owners::TupleJoinLocationOrigin;
+    use crate::assembler::{Assembler, Label};
+    use crate::target::opcodes::JUMP_FORWARD;
+
+    pub(super) fn redundant_swap_discoveries(
+        graph: &BlockGraph,
+    ) -> (Vec<ItemPosition>, Vec<(ItemPosition, ItemPosition)>) {
+        let positions = graph.item_positions();
+        let mut instructions = Vec::with_capacity(positions.len());
+        instructions.extend(positions.into_iter().filter_map(|position| {
+            let Item::Instruction(instruction) = *graph.item(position) else {
+                return None;
+            };
+            Some((position, instruction))
+        }));
+        let mut previous = None;
+        let mut redundant = Vec::new();
+        let mut pop_location_swaps = Vec::new();
+        for (index, (position, instruction)) in instructions.iter().copied().enumerate() {
+            let removable_pops = if instruction.opcode == SWAP
+                && let Operand::Value(depth) = instruction.operand()
+                && previous.is_some_and(|previous: Instruction| previous.opcode == SWAP)
+            {
+                instructions[index + 1..]
+                    .get(..usize::try_from(depth).unwrap_or(usize::MAX))
+                    .filter(|following| {
+                        // CPython cannot fold a rotation across distinct line events.
+                        let line = following
+                            .first()
+                            .map_or(-1, |(_, instruction)| instruction.location.line);
+                        following.iter().all(|(_, instruction)| {
+                            instruction.opcode == POP_TOP
+                                && (line < 0 || instruction.location.line == line)
+                        })
+                    })
+            } else {
+                None
+            };
+            if let Some(pops) = removable_pops {
+                redundant.push(position);
+                if let Some((first, last)) = pops.first().zip(pops.last()) {
+                    pop_location_swaps.push((first.0, last.0));
+                }
+            } else {
+                previous = Some(instruction);
+            }
+        }
+
+        (redundant, pop_location_swaps)
+    }
+
+    #[test]
+    fn streamed_redundant_swaps_match_snapshot_with_labels_lines_and_nop_breaks() {
+        let instruction = |opcode, argument, line, column| {
+            Item::Instruction(Instruction::new(
+                opcode,
+                Operand::Value(argument),
+                SourceLocation::new(line, line, column, column + 1),
+                None,
+            ))
+        };
+        for first_depth in [0, 1, 2, 3, u32::MAX] {
+            for second_depth in [0, 1, 2, 3, u32::MAX] {
+                for (first_pop_line, last_pop_line) in [(4, 4), (4, 5), (-1, 5), (4, -1)] {
+                    for separator in [None, Some(NOP), Some(POP_TOP)] {
+                        let mut items = vec![
+                            instruction(SWAP, 2, 4, 0),
+                            Item::Label(Label::from_u32(0)),
+                            instruction(SWAP, first_depth, 4, 1),
+                        ];
+                        if let Some(separator) = separator {
+                            items.push(instruction(separator, 0, 4, 2));
+                        }
+                        items.extend([
+                            Item::Label(Label::from_u32(1)),
+                            instruction(SWAP, second_depth, 4, 3),
+                            instruction(POP_TOP, 0, first_pop_line, 4),
+                            Item::Label(Label::from_u32(2)),
+                            instruction(POP_TOP, 0, last_pop_line, 5),
+                            instruction(POP_TOP, 0, last_pop_line, 6),
+                            instruction(STORE_FAST, 0, 4, 7),
+                        ]);
+                        let mut assembler = Assembler::from_linear_items(items);
+                        assembler.next_label = 3;
+                        let mut pipeline = assembler.into_optimization_pipeline();
+                        let (redundant, swaps) = redundant_swap_discoveries(&pipeline.graph);
+                        let mut expected = pipeline.graph.clone();
+                        for (first, last) in swaps.into_iter().rev() {
+                            let first_location = expected.instruction_mut(first).unwrap().location;
+                            let last_location = expected.instruction_mut(last).unwrap().location;
+                            expected.instruction_mut(first).unwrap().location = last_location;
+                            expected.instruction_mut(last).unwrap().location = first_location;
+                        }
+                        expected.remove_ordered_instructions(&redundant);
+                        assert_eq!(
+                            pipeline.remove_redundant_swaps_before_pops(),
+                            !redundant.is_empty()
+                        );
+                        assert_eq!(pipeline.graph.copy_items(), expected.copy_items());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_static_swaps_still_retire_join_origins() {
+        let mut pipeline = Assembler::default().into_optimization_pipeline();
+        let predecessor = pipeline.label();
+        let join = pipeline.label();
+        let target = pipeline.label();
+        let store = Instruction::new(STORE_FAST, Operand::Value(0), SourceLocation::NONE, None);
+        let jump = Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(target),
+            SourceLocation::NONE,
+            None,
+        );
+        pipeline
+            .exception_owner_provenance
+            .normal_try_copy_join_origins
+            .insert(
+                join,
+                TupleJoinLocationOrigin {
+                    predecessor,
+                    store,
+                    jump,
+                },
+            );
+
+        let (blocks, capture_swaps, changed) = pipeline.optimize_swap_runs();
+        assert!(blocks.is_empty());
+        assert!(!changed);
+        assert!(
+            pipeline
+                .apply_static_swaps((blocks, capture_swaps))
+                .is_empty()
+        );
+        assert!(
+            pipeline
+                .exception_owner_provenance
+                .normal_try_copy_join_origins
+                .is_empty()
+        );
+        assert!(
+            pipeline
+                .exception_owner_provenance
+                .normal_try_copy_join_donors
+                .is_empty()
+        );
+    }
 
     #[test]
     fn rewritten_swap_line_rejects_a_replaced_donor() {

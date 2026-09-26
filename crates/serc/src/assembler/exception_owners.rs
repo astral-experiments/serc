@@ -1213,6 +1213,27 @@ impl OwnerDecisionIndices {
             && pending_threaded_append != Some(index)
             && !self.positions.get(index).copied().unwrap_or(false)
     }
+
+    /// The complete common history for these ordinary records is independent of
+    /// source certificates other than a completed comprehension restore.
+    fn can_replay_ordinary_history(
+        &self,
+        instruction: &Instruction,
+        index: usize,
+        pending_threaded_append: Option<usize>,
+    ) -> bool {
+        !matches!(instruction.opcode, NOP | POP_TOP)
+            && matches!(
+                instruction.exception_policy(),
+                super::ExceptionPolicy::NoneUnchanged
+                    | super::ExceptionPolicy::NoneUnchangedBooleanSingleton
+            )
+            && instruction.no_location_policy.borrow_fallthrough()
+                != super::BorrowFallthrough::Barrier
+            && instruction.local_policy.hidden_exception_owner_slots() == 0
+            && instruction.pre_fold_extra_instructions() == 0
+            && self.can_finish_ordinary(instruction, index, pending_threaded_append)
+    }
 }
 
 /// A complete original array through one value Boolean, captured before CFG rewrites.
@@ -1542,6 +1563,109 @@ impl UniqueLabelPositions {
     }
 }
 
+/// Candidate source positions narrowed by opcode and location, then checked in full.
+#[derive(Default)]
+struct OwnerInstructionPositions {
+    candidates: FxHashSet<OwnerInstructionSignature>,
+    positions: OnceCell<FxHashMap<OwnerInstructionSignature, SmallVec<[usize; 1]>>>,
+}
+
+type OwnerInstructionSignature = (crate::target::Opcode, i32, i32, i32, i32);
+
+impl OwnerInstructionPositions {
+    fn for_sources<'a>(
+        instruction_count: usize,
+        source_count: usize,
+        sources: impl IntoIterator<Item = &'a Instruction>,
+    ) -> Self {
+        // One-off source certificates are cheaper to look up directly. For larger input,
+        // retain only the signatures actually queried, rather than indexing all records.
+        if instruction_count < 32 || source_count < 4 {
+            return Self::default();
+        }
+        Self {
+            candidates: sources.into_iter().map(Self::signature).collect(),
+            positions: OnceCell::new(),
+        }
+    }
+
+    fn signature(instruction: &Instruction) -> OwnerInstructionSignature {
+        let location = instruction.location;
+        (
+            instruction.opcode,
+            location.line,
+            location.end_line,
+            location.column,
+            location.end_column,
+        )
+    }
+
+    fn positions(&self, instructions: &[&Instruction], original: &Instruction) -> Option<&[usize]> {
+        if self.candidates.is_empty() {
+            return None;
+        }
+        let key = Self::signature(original);
+        if !self.candidates.contains(&key) {
+            return None;
+        }
+        let positions = self.positions.get_or_init(|| {
+            let mut positions: FxHashMap<_, SmallVec<[usize; 1]>> = self
+                .candidates
+                .iter()
+                .map(|key| (*key, SmallVec::new()))
+                .collect();
+            for (position, instruction) in instructions.iter().enumerate() {
+                if let Some(matches) = positions.get_mut(&Self::signature(instruction)) {
+                    matches.push(position);
+                }
+            }
+            positions
+        });
+        positions.get(&key).map(SmallVec::as_slice)
+    }
+
+    fn unique(&self, instructions: &[&Instruction], original: &Instruction) -> Option<usize> {
+        if let Some(candidates) = self.positions(instructions, original) {
+            let mut matches = candidates
+                .iter()
+                .copied()
+                .filter(|&position| *instructions[position] == *original);
+            let position = matches.next()?;
+            return matches.next().is_none().then_some(position);
+        }
+        let mut matches = instructions
+            .iter()
+            .enumerate()
+            .filter(|(_, instruction)| ***instruction == *original);
+        let (position, _) = matches.next()?;
+        matches.next().is_none().then_some(position)
+    }
+
+    fn unique_pair(
+        &self,
+        instructions: &[&Instruction],
+        first: &Instruction,
+        second: &Instruction,
+    ) -> Option<usize> {
+        if let Some(candidates) = self.positions(instructions, first) {
+            let mut matches = candidates.iter().copied().filter(|&position| {
+                *instructions[position] == *first
+                    && instructions
+                        .get(position + 1)
+                        .is_some_and(|instruction| **instruction == *second)
+            });
+            let position = matches.next()?;
+            return matches.next().is_none().then_some(position);
+        }
+        let mut matches = instructions
+            .windows(2)
+            .enumerate()
+            .filter(|(_, pair)| *pair[0] == *first && *pair[1] == *second);
+        let (position, _) = matches.next()?;
+        matches.next().is_none().then_some(position)
+    }
+}
+
 impl ExceptionOwnerProvenance {
     /// Checks labels belonging to a captured normal-try copy, including its endpoints.
     fn is_normal_try_copy_label(&self, label: Label) -> bool {
@@ -1717,6 +1841,17 @@ impl ExceptionOwnerProvenance {
 
     /// Finds a unique unchanged survivor whose literal-fold witness has not retired.
     fn original_uniform_fold_positions(&self, instructions: &[&Instruction]) -> FxHashSet<usize> {
+        self.original_uniform_fold_positions_with_index::<false>(
+            instructions,
+            &OwnerInstructionPositions::default(),
+        )
+    }
+
+    fn original_uniform_fold_positions_with_index<const INDEX_ORIGINS: bool>(
+        &self,
+        instructions: &[&Instruction],
+        instruction_positions: &OwnerInstructionPositions,
+    ) -> FxHashSet<usize> {
         self.original_uniform_folds
             .iter()
             .filter_map(|original| {
@@ -1730,12 +1865,16 @@ impl ExceptionOwnerProvenance {
                 {
                     return None;
                 }
-                let mut matches = instructions
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, instruction)| ***instruction == *original);
-                let (index, _) = matches.next()?;
-                matches.next().is_none().then_some(index)
+                if INDEX_ORIGINS {
+                    instruction_positions.unique(instructions, original)
+                } else {
+                    let mut matches = instructions
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, instruction)| ***instruction == *original);
+                    let (index, _) = matches.next()?;
+                    matches.next().is_none().then_some(index)
+                }
             })
             .collect()
     }
@@ -2628,17 +2767,18 @@ impl LayoutAssembler {
     }
 
     /// Maps a proven virgin append cell to its unchanged conditional and marker.
-    fn uncompacted_conditional_null_markers(
+    fn uncompacted_conditional_null_markers<const INDEX_ORIGINS: bool>(
         &self,
         jump_targets: &FxHashSet<Label>,
+        unique_labels: &OnceCell<UniqueLabelPositions>,
     ) -> FxHashSet<usize> {
         use crate::target::opcodes::{LOAD_FAST, LOAD_FAST_BORROW, LOAD_FAST_CHECK};
 
         let mut result = FxHashSet::default();
-        for origin in &self
+        let origins = &self
             .exception_owner_provenance
-            .uncompacted_conditional_arrays
-        {
+            .uncompacted_conditional_arrays;
+        for origin in origins {
             let Some(first) = origin.prefix.first() else {
                 continue;
             };
@@ -2689,13 +2829,44 @@ impl LayoutAssembler {
             {
                 continue;
             }
-            let starts = self
-                .items
-                .iter()
-                .enumerate()
-                .filter_map(|(index, item)| (item == first).then_some(index))
-                .collect::<Vec<_>>();
-            let [start] = starts.as_slice() else { continue };
+            let (start, mut instruction_position) = if INDEX_ORIGINS {
+                if let Some(entry) = entry
+                    && (origins.len() > 1 || unique_labels.get().is_some())
+                {
+                    let Some(position) = unique_labels
+                        .get_or_init(|| UniqueLabelPositions::new(&self.items))
+                        .get(entry)
+                    else {
+                        continue;
+                    };
+                    position
+                } else {
+                    // A single origin needs no index allocation. The sole non-label origin
+                    // is an empty class pattern; it still requires exact item uniqueness.
+                    let mut instruction_position = 0;
+                    let mut matches = self.items.iter().enumerate().filter_map(|(index, item)| {
+                        let position = instruction_position;
+                        instruction_position += usize::from(matches!(item, Item::Instruction(_)));
+                        (item == first).then_some((index, position))
+                    });
+                    let Some(position) = matches.next() else {
+                        continue;
+                    };
+                    if matches.next().is_some() {
+                        continue;
+                    }
+                    position
+                }
+            } else {
+                let starts = self
+                    .items
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, item)| (item == first).then_some(index))
+                    .collect::<Vec<_>>();
+                let [start] = starts.as_slice() else { continue };
+                (*start, 0)
+            };
             let original_labels = origin
                 .prefix
                 .iter()
@@ -2707,7 +2878,7 @@ impl LayoutAssembler {
                     }
                 })
                 .collect::<FxHashSet<_>>();
-            let mut cursor = *start;
+            let mut cursor = start;
             let mut valid = true;
             for (original_index, expected) in origin.prefix.iter().enumerate() {
                 while let Some(Item::Label(label)) = self.items.get(cursor)
@@ -2768,16 +2939,23 @@ impl LayoutAssembler {
                     valid = false;
                     break;
                 }
+                if INDEX_ORIGINS {
+                    // Any additional accepted range aliases above are labels only.
+                    instruction_position += usize::from(matches!(expected, Item::Instruction(_)));
+                }
                 cursor += 1;
             }
             if valid {
-                result.insert(
+                let marker = if INDEX_ORIGINS {
+                    instruction_position - 1
+                } else {
                     self.items[..cursor]
                         .iter()
                         .filter(|item| matches!(item, Item::Instruction(_)))
                         .count()
-                        - 1,
-                );
+                        - 1
+                };
+                result.insert(marker);
             }
         }
         result
@@ -5051,6 +5229,76 @@ impl LayoutAssembler {
         }
     }
 
+    /// Returns the entry-prologue fact only when some original owner can be replayed.
+    fn dynamic_owner_replay_entry(&self) -> Option<bool> {
+        let provenance = &self.exception_owner_provenance;
+        let entry_prologue = || {
+            self.items
+                .iter()
+                .find_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction.opcode),
+                    Item::Label(_) => None,
+                })
+                .is_some_and(|opcode| {
+                    matches!(opcode, COPY_FREE_VARS | MAKE_CELL | RETURN_GENERATOR)
+                })
+        };
+        let dynamic = |instruction: &Instruction| {
+            matches!(
+                instruction.exception_policy().owner(),
+                NormalizedExceptionOwner::Dynamic
+                    | NormalizedExceptionOwner::DynamicCondition
+                    | NormalizedExceptionOwner::DynamicConditionStrict
+            )
+        };
+        if provenance.synchronous_with_setups.is_empty()
+            && provenance.source_boundaries.is_empty()
+            && provenance.normal_try_break_pop_owners.is_empty()
+            && provenance.named_handler_truth_prefixes.is_empty()
+        {
+            let has_entry_prologue = entry_prologue();
+            let has_retained_setup = provenance
+                .setups
+                .iter()
+                .any(|(_, location)| location.is_some());
+            // This is stricter than the general marker test: a passing instruction is
+            // either dynamic or itself NOT_TAKEN, so the general test cannot reject it.
+            self.items
+                .iter()
+                .any(|item| {
+                    let Item::Instruction(instruction) = item else {
+                        return false;
+                    };
+                    dynamic(instruction)
+                        || (has_retained_setup
+                            && instruction.opcode == NOT_TAKEN
+                            && (matches!(
+                                instruction.exception_policy().owner(),
+                                NormalizedExceptionOwner::Present
+                                    | NormalizedExceptionOwner::Absent
+                            ) || (has_entry_prologue
+                                && instruction.exception_policy()
+                                    == super::ExceptionPolicy::NoneUnchanged)))
+                })
+                .then_some(has_entry_prologue)
+        } else {
+            // With independent strict provenance, only the general marker/captured-array
+            // gate can reject this unit. Avoid scanning when captured arrays satisfy it.
+            if provenance.normal_try_break_pop_owners.is_empty()
+                && provenance.named_handler_truth_prefixes.is_empty()
+                && provenance.copied_conjunction_break_prefixes.is_empty()
+                && provenance.uncompacted_conditional_arrays.is_empty()
+                && !self.items.iter().any(|item| {
+                    matches!(item, Item::Instruction(instruction)
+                        if instruction.opcode == NOT_TAKEN || dynamic(instruction))
+                })
+            {
+                return None;
+            }
+            Some(entry_prologue())
+        }
+    }
+
     fn dynamic_exception_owners_with_replay<const GATE_DECISIONS: bool>(
         &self,
         bound_replay: bool,
@@ -5060,68 +5308,9 @@ impl LayoutAssembler {
         }
         // Only markers, dynamic policies, or captured arrays can change owners.
         let provenance = &self.exception_owner_provenance;
-        if provenance.normal_try_break_pop_owners.is_empty()
-            && provenance.named_handler_truth_prefixes.is_empty()
-            && provenance.copied_conjunction_break_prefixes.is_empty()
-            && provenance.uncompacted_conditional_arrays.is_empty()
-            && !self.items.iter().any(|item| {
-                matches!(item, Item::Instruction(instruction)
-                    if instruction.opcode == NOT_TAKEN
-                        || matches!(instruction.exception_policy().owner(),
-                            NormalizedExceptionOwner::Dynamic
-                                | NormalizedExceptionOwner::DynamicCondition
-                                | NormalizedExceptionOwner::DynamicConditionStrict))
-            })
-        {
+        let Some(has_entry_prologue) = self.dynamic_owner_replay_entry() else {
             return DynamicExceptionOwners::default();
-        }
-        let has_retained_setup = self
-            .exception_owner_provenance
-            .setups
-            .iter()
-            .any(|(_, location)| location.is_some());
-        let has_entry_prologue = self
-            .items
-            .iter()
-            .find_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction.opcode),
-                Item::Label(_) => None,
-            })
-            .is_some_and(|opcode| matches!(opcode, COPY_FREE_VARS | MAKE_CELL | RETURN_GENERATOR));
-        if self
-            .exception_owner_provenance
-            .synchronous_with_setups
-            .is_empty()
-            && self.exception_owner_provenance.source_boundaries.is_empty()
-            && self
-                .exception_owner_provenance
-                .normal_try_break_pop_owners
-                .is_empty()
-            && self
-                .exception_owner_provenance
-                .named_handler_truth_prefixes
-                .is_empty()
-            && !self.items.iter().any(|item| {
-                let Item::Instruction(instruction) = item else {
-                    return false;
-                };
-                matches!(
-                    instruction.exception_policy().owner(),
-                    NormalizedExceptionOwner::Dynamic
-                        | NormalizedExceptionOwner::DynamicCondition
-                        | NormalizedExceptionOwner::DynamicConditionStrict
-                ) || (has_retained_setup
-                    && instruction.opcode == NOT_TAKEN
-                    && (matches!(
-                        instruction.exception_policy().owner(),
-                        NormalizedExceptionOwner::Present | NormalizedExceptionOwner::Absent
-                    ) || (has_entry_prologue
-                        && instruction.exception_policy()
-                            == super::ExceptionPolicy::NoneUnchanged)))
-            })
-        {
-            return DynamicExceptionOwners::default();
-        }
+        };
         let unique_labels = OnceCell::new();
         let original_value_jump_positions = self
             .exception_owner_provenance
@@ -5153,10 +5342,41 @@ impl LayoutAssembler {
                 }
             }
         }
-        let threaded_conditions = self.threaded_condition_positions(&indexed_instructions);
+        let instruction_positions = if GATE_DECISIONS {
+            OwnerInstructionPositions::for_sources(
+                indexed_instructions.len(),
+                provenance.original_uniform_folds.len()
+                    + provenance.comprehension_restore_owner_prefixes.len()
+                    + provenance.threaded_condition_origins.len(),
+                provenance
+                    .original_uniform_folds
+                    .iter()
+                    .chain(
+                        provenance
+                            .comprehension_restore_owner_prefixes
+                            .iter()
+                            .map(|(_, instruction)| instruction),
+                    )
+                    .chain(
+                        provenance
+                            .threaded_condition_origins
+                            .iter()
+                            .map(|(first, _)| first),
+                    ),
+            )
+        } else {
+            OwnerInstructionPositions::default()
+        };
+        let threaded_conditions = self.threaded_condition_positions_with_index::<GATE_DECISIONS>(
+            &indexed_instructions,
+            &instruction_positions,
+        );
         let original_uniform_folds = self
             .exception_owner_provenance
-            .original_uniform_fold_positions(&indexed_instructions);
+            .original_uniform_fold_positions_with_index::<GATE_DECISIONS>(
+                &indexed_instructions,
+                &instruction_positions,
+            );
         let comprehension_restore_prefixes = self
             .exception_owner_provenance
             .comprehension_restore_owner_prefixes
@@ -5177,12 +5397,20 @@ impl LayoutAssembler {
                     return None;
                 }
                 let start = *label_positions.get(entry)?;
-                let mut matches = indexed_instructions
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, instruction)| ***instruction == *restore);
-                let (index, _) = matches.next()?;
-                (index >= start && matches.next().is_none()).then_some((index, start))
+                let index = if GATE_DECISIONS {
+                    instruction_positions.unique(&indexed_instructions, restore)?
+                } else {
+                    let mut matches = indexed_instructions
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, instruction)| ***instruction == *restore);
+                    let (index, _) = matches.next()?;
+                    if index < start || matches.next().is_some() {
+                        return None;
+                    }
+                    index
+                };
+                (index >= start).then_some((index, start))
             })
             .collect::<FxHashMap<_, _>>();
         let for_target_prefixes = self
@@ -6034,6 +6262,54 @@ impl LayoutAssembler {
                     }
                 }
                 Item::Instruction(instruction) => {
+                    if GATE_DECISIONS
+                        && decision_indices.can_replay_ordinary_history(
+                            instruction,
+                            instruction_index,
+                            pending_threaded_null_append,
+                        )
+                    {
+                        // Ordinary records consume one-instruction certificates and retain
+                        // exact owner history; NOPs, POPs, barriers, and erased cells still
+                        // take the complete source replay below.
+                        transferred_pop_setup = None;
+                        pending_compacted_append = None;
+                        pending_threaded_null_append = None;
+                        pending_retained_prefix = None;
+                        pending_null_append = None;
+                        pending_fresh_null_append = None;
+                        pending_await_null_append = None;
+                        pending_normal_pop_null_append = None;
+                        if ended_uniform_with_suffix {
+                            if ended_owned_suffix != Some(instruction_index) {
+                                ended_owned_suffix = None;
+                            }
+                            uniform_with_suffix = None;
+                            retained_owned_suffix = None;
+                        }
+                        ended_uniform_with_suffix = false;
+                        if ended_owned_suffix == Some(instruction_index) {
+                            ended_pop_slot = ended_pop_slot.filter(|(start, _, width)| {
+                                *start == instruction_index && *width == 0
+                            });
+                        }
+                        let previous_fusions = tail.post_compaction_fusions;
+                        tail.instruction(instruction, previous);
+                        if tail.post_compaction_fusions > previous_fusions {
+                            has_uninterrupted_fusion = true;
+                        }
+                        if owner_history_exact
+                            && source_owned_prefix.is_none()
+                            && comprehension_restore_prefixes.get(&instruction_index)
+                                == Some(&original_array_start)
+                        {
+                            source_owned_prefix = Some((instruction_index + 1, tail));
+                        }
+                        instruction_index += 1;
+                        has_instruction = true;
+                        previous = Some(instruction);
+                        continue;
+                    }
                     // Capture the single original POP before the NOP consumes its
                     // transferred slot. Only the immediately adjacent authored SETUP
                     // may use this proof; another instruction or boundary retires it.
@@ -9577,7 +9853,8 @@ impl LayoutAssembler {
                 }
             }
         }
-        let certified = self.uncompacted_conditional_null_markers(&jump_targets);
+        let certified = self
+            .uncompacted_conditional_null_markers::<GATE_DECISIONS>(&jump_targets, &unique_labels);
         #[expect(
             clippy::iter_over_hash_type,
             reason = "Each distinct marker overwrites only its own owner."
@@ -11665,9 +11942,21 @@ impl LayoutAssembler {
     }
 
     /// Finds unchanged, unambiguous terminal pairs from the actual threading pass.
+    #[cfg(test)]
     fn threaded_condition_positions(
         &self,
         instructions: &[&Instruction],
+    ) -> FxHashMap<usize, NormalizedExceptionOwner> {
+        self.threaded_condition_positions_with_index::<false>(
+            instructions,
+            &OwnerInstructionPositions::default(),
+        )
+    }
+
+    fn threaded_condition_positions_with_index<const INDEX_ORIGINS: bool>(
+        &self,
+        instructions: &[&Instruction],
+        instruction_positions: &OwnerInstructionPositions,
     ) -> FxHashMap<usize, NormalizedExceptionOwner> {
         let origins = &self.exception_owner_provenance.threaded_condition_origins;
         if origins.is_empty() {
@@ -11692,14 +11981,19 @@ impl LayoutAssembler {
                 if origins.iter().filter(|other| *other == origin).count() != 1 {
                     return None;
                 }
-                let mut matches = instructions
-                    .windows(2)
-                    .enumerate()
-                    .filter(|(_, pair)| *pair[0] == origin.0 && *pair[1] == origin.1);
-                let (position, _) = matches.next()?;
-                if matches.next().is_some() {
-                    return None;
-                }
+                let position = if INDEX_ORIGINS {
+                    instruction_positions.unique_pair(instructions, &origin.0, &origin.1)?
+                } else {
+                    let mut matches = instructions
+                        .windows(2)
+                        .enumerate()
+                        .filter(|(_, pair)| *pair[0] == origin.0 && *pair[1] == origin.1);
+                    let (position, _) = matches.next()?;
+                    if matches.next().is_some() {
+                        return None;
+                    }
+                    position
+                };
                 let owner = origin.1.exception_policy().owner();
                 if owner == NormalizedExceptionOwner::Dynamic {
                     let start = position.checked_sub(2)?;
@@ -11783,6 +12077,171 @@ impl LayoutAssembler {
 mod tests {
     use super::ExceptionOwnerTail;
 
+    #[test]
+    fn single_dynamic_owner_admission_scan_matches_both_original_gates() {
+        use super::{
+            ExceptionOwnerProvenance, NamedHandlerTruthPrefix, UncompactedConditionalArray,
+        };
+        use crate::assembler::{
+            ExceptionPolicy, Instruction, Item, Label, LayoutAssembler, NormalizedExceptionOwner,
+            Operand, SourceLocation,
+        };
+        use crate::target::opcodes::{
+            COPY_FREE_VARS, LOAD_CONST, MAKE_CELL, NOT_TAKEN, RETURN_GENERATOR,
+        };
+
+        fn original(assembler: &LayoutAssembler) -> Option<bool> {
+            let provenance = &assembler.exception_owner_provenance;
+            let dynamic = |instruction: &Instruction| {
+                matches!(
+                    instruction.exception_policy().owner(),
+                    NormalizedExceptionOwner::Dynamic
+                        | NormalizedExceptionOwner::DynamicCondition
+                        | NormalizedExceptionOwner::DynamicConditionStrict
+                )
+            };
+            if provenance.normal_try_break_pop_owners.is_empty()
+                && provenance.named_handler_truth_prefixes.is_empty()
+                && provenance.copied_conjunction_break_prefixes.is_empty()
+                && provenance.uncompacted_conditional_arrays.is_empty()
+                && !assembler.items.iter().any(|item| {
+                    matches!(item, Item::Instruction(instruction)
+                        if instruction.opcode == NOT_TAKEN || dynamic(instruction))
+                })
+            {
+                return None;
+            }
+            let retained = provenance
+                .setups
+                .iter()
+                .any(|(_, location)| location.is_some());
+            let prologue = assembler
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction.opcode),
+                    Item::Label(_) => None,
+                })
+                .is_some_and(|opcode| {
+                    matches!(opcode, COPY_FREE_VARS | MAKE_CELL | RETURN_GENERATOR)
+                });
+            if provenance.synchronous_with_setups.is_empty()
+                && provenance.source_boundaries.is_empty()
+                && provenance.normal_try_break_pop_owners.is_empty()
+                && provenance.named_handler_truth_prefixes.is_empty()
+                && !assembler.items.iter().any(|item| {
+                    let Item::Instruction(instruction) = item else {
+                        return false;
+                    };
+                    dynamic(instruction)
+                        || (retained
+                            && instruction.opcode == NOT_TAKEN
+                            && (matches!(
+                                instruction.exception_policy().owner(),
+                                NormalizedExceptionOwner::Present
+                                    | NormalizedExceptionOwner::Absent
+                            ) || (prologue
+                                && instruction.exception_policy()
+                                    == ExceptionPolicy::NoneUnchanged)))
+                })
+            {
+                return None;
+            }
+            Some(prologue)
+        }
+
+        let label = Label::from_u32(0);
+        let location = SourceLocation::new(1, 1, 0, 2);
+        for mask in 0..32 {
+            for retained in [false, true] {
+                for prologue in [LOAD_CONST, COPY_FREE_VARS, MAKE_CELL, RETURN_GENERATOR] {
+                    for opcode in [LOAD_CONST, NOT_TAKEN] {
+                        for policy in [
+                            ExceptionPolicy::NoneUnchanged,
+                            ExceptionPolicy::NoneUnchangedBooleanSingleton,
+                            ExceptionPolicy::NonePresent,
+                            ExceptionPolicy::NoneAbsent,
+                            ExceptionPolicy::AlwaysUnchanged,
+                        ] {
+                            for dynamic in [
+                                None,
+                                Some(NormalizedExceptionOwner::Dynamic),
+                                Some(NormalizedExceptionOwner::DynamicCondition),
+                                Some(NormalizedExceptionOwner::DynamicConditionStrict),
+                            ] {
+                                let mut provenance = ExceptionOwnerProvenance::default();
+                                if mask & 1 != 0 {
+                                    provenance.source_boundaries.insert(label);
+                                }
+                                if mask & 2 != 0 {
+                                    provenance.synchronous_with_setups.insert(label);
+                                }
+                                if mask & 4 != 0 {
+                                    provenance
+                                        .copied_conjunction_break_prefixes
+                                        .push(Vec::new());
+                                }
+                                if mask & 8 != 0 {
+                                    provenance.uncompacted_conditional_arrays.push(
+                                        UncompactedConditionalArray {
+                                            prefix: Vec::new(),
+                                            comprehension_entry: None,
+                                            source_entry: None,
+                                        },
+                                    );
+                                }
+                                if mask & 16 != 0 {
+                                    provenance.named_handler_truth_prefixes.push(
+                                        NamedHandlerTruthPrefix {
+                                            entry: label,
+                                            setup: label,
+                                            target: label,
+                                            items: Vec::new(),
+                                        },
+                                    );
+                                }
+                                provenance
+                                    .setups
+                                    .push((label, retained.then_some(location)));
+                                let mut candidate =
+                                    Instruction::new(opcode, Operand::Value(0), location, None);
+                                candidate.set_exception_policy(policy);
+                                if let Some(dynamic) = dynamic {
+                                    candidate.set_exception_owner(dynamic);
+                                }
+                                let assembler = LayoutAssembler {
+                                    python_version: crate::PythonVersion::Py314,
+                                    legacy_uniform_jump_seed: false,
+                                    items: vec![
+                                        Item::Label(label),
+                                        Item::Instruction(Instruction::new(
+                                            prologue,
+                                            Operand::Value(0),
+                                            location,
+                                            None,
+                                        )),
+                                        Item::Instruction(candidate),
+                                    ],
+                                    exception_regions: Vec::new(),
+                                    exception_owner_provenance: Box::new(provenance),
+                                    preserved_block_boundaries: rustc_hash::FxHashSet::default(),
+                                    removed_max_depth: None,
+                                    next_label: 1,
+                                    has_next_location: false,
+                                };
+                                assert_eq!(
+                                    assembler.dynamic_owner_replay_entry(),
+                                    original(&assembler),
+                                    "mask={mask}, retained={retained}, prologue={prologue:?}, opcode={opcode:?}, policy={policy:?}, dynamic={dynamic:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn with_owner_replay_mode<T>(
         force: bool,
         force_all_decisions: bool,
@@ -11803,6 +12262,132 @@ mod tests {
             super::VERIFY_COMPLETE_OWNER_REPLAY.replace(verify),
         );
         operation()
+    }
+
+    #[test]
+    fn owner_instruction_signature_index_checks_full_identity_and_adjacent_pairs() {
+        use super::OwnerInstructionPositions;
+        use crate::assembler::{ExceptionPolicy, Instruction, Operand, SourceLocation};
+        use crate::target::opcodes::{LOAD_CONST, LOAD_FAST, NOT_TAKEN};
+
+        let instruction = |opcode, argument, line| {
+            Instruction::new(
+                opcode,
+                Operand::Value(argument),
+                SourceLocation::new(line, line, 1, 5),
+                None,
+            )
+        };
+        let original = instruction(LOAD_FAST, 0, 2);
+        let changed_operand = instruction(LOAD_FAST, 1, 2);
+        let mut changed_policy = original;
+        changed_policy.set_exception_policy(ExceptionPolicy::NonePresent);
+        let next = instruction(NOT_TAKEN, 0, 2);
+        let missing = instruction(LOAD_FAST, 3, 2);
+        let filler = instruction(LOAD_CONST, 9, 10);
+        let unregistered = instruction(LOAD_FAST, 4, 12);
+        let mut records = vec![filler; 48];
+        records[4] = original;
+        records[5] = next;
+        records[10] = changed_operand;
+        records[15] = original;
+        records[20] = changed_policy;
+        records[21] = next;
+        records[28] = unregistered;
+        records[29] = next;
+        records[47] = original;
+        for (case, records) in [
+            ("unique pair", records.clone()),
+            ("repeated pair", {
+                records[16] = next;
+                records
+            }),
+        ] {
+            let instructions = records.iter().collect::<Vec<_>>();
+            let sources = [
+                &original,
+                &changed_operand,
+                &changed_policy,
+                &next,
+                &missing,
+                &filler,
+            ];
+            let indexed =
+                OwnerInstructionPositions::for_sources(instructions.len(), sources.len(), sources);
+            let direct = OwnerInstructionPositions::default();
+            assert!(indexed.positions.get().is_none());
+            for source in sources {
+                assert_eq!(
+                    indexed.unique(&instructions, source),
+                    direct.unique(&instructions, source),
+                    "{case}: {source:?}"
+                );
+            }
+            assert_eq!(indexed.unique(&instructions, &original), None);
+            assert_eq!(indexed.unique(&instructions, &changed_operand), Some(10));
+            assert_eq!(indexed.unique(&instructions, &changed_policy), Some(20));
+            assert_eq!(indexed.unique(&instructions, &missing), None);
+            assert_eq!(indexed.unique(&instructions, &unregistered), Some(28));
+            for (first, second) in [
+                (original, next),
+                (changed_policy, next),
+                (missing, next),
+                (original, missing),
+                (unregistered, next),
+            ] {
+                assert_eq!(
+                    indexed.unique_pair(&instructions, &first, &second),
+                    direct.unique_pair(&instructions, &first, &second),
+                    "{case}: {first:?}, {second:?}"
+                );
+            }
+            assert_eq!(
+                indexed.unique_pair(&instructions, &original, &next),
+                (case == "unique pair").then_some(4)
+            );
+            assert_eq!(
+                indexed.unique_pair(&instructions, &changed_policy, &next),
+                Some(20)
+            );
+            assert!(indexed.positions.get().is_some());
+            assert!(direct.positions.get().is_none());
+            let short = OwnerInstructionPositions::for_sources(31, sources.len(), sources);
+            assert!(short.candidates.is_empty());
+            let scarce = OwnerInstructionPositions::for_sources(48, 3, sources);
+            assert!(scarce.candidates.is_empty());
+        }
+    }
+
+    #[test]
+    fn owner_instruction_signature_index_matches_full_replay_with_many_certificates() {
+        use std::fmt::Write;
+
+        let mut source = String::from("def run(value, rows):\n    try:\n");
+        for index in 0..8 {
+            writeln!(
+                source,
+                "        result{index} = [item{index} for item{index} in rows if item{index} and value]"
+            )
+            .unwrap();
+            writeln!(
+                source,
+                "        if value in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9) and result{index}:\n            value += len(result{index})"
+            )
+            .unwrap();
+        }
+        source.push_str(
+            "        return value or rows\n    except ValueError as error:\n        return error if value else rows\n",
+        );
+        let compile = || {
+            crate::compile(&source, "owner_instruction_signature_index.py")
+                .expect("owner source-index example compiles")
+                .marshal()
+        };
+        let gated = with_owner_replay_mode(false, false, true, compile);
+        let direct = with_owner_replay_mode(false, true, false, compile);
+        let complete = with_owner_replay_mode(true, true, false, compile);
+        assert_eq!(gated, direct);
+        assert_eq!(gated, complete);
     }
 
     #[test]
@@ -11945,6 +12530,68 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_history_gate_keeps_source_sensitive_instructions_on_full_replay() {
+        use super::OwnerDecisionIndices;
+        use crate::assembler::{BorrowFallthrough, ExceptionPolicy, Instruction, Operand};
+        use crate::target::opcodes::{
+            COMPARE_OP, COPY_FREE_VARS, LOAD_CONST, LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, MAKE_CELL,
+            NOP, NOT_TAKEN, POP_TOP, RETURN_GENERATOR, RETURN_VALUE, SWAP,
+        };
+
+        let value =
+            |opcode| Instruction::new(opcode, Operand::Value(0), super::SourceLocation::NONE, None);
+        let indices = OwnerDecisionIndices::new(3, [1].iter());
+        for opcode in [
+            LOAD_CONST,
+            LOAD_FAST_LOAD_FAST,
+            LOAD_GLOBAL,
+            COMPARE_OP,
+            COPY_FREE_VARS,
+            MAKE_CELL,
+            RETURN_GENERATOR,
+            SWAP,
+        ] {
+            let instruction = value(opcode);
+            assert!(indices.can_replay_ordinary_history(&instruction, 0, Some(2)));
+            assert!(!indices.can_replay_ordinary_history(&instruction, 1, None));
+            assert!(!indices.can_replay_ordinary_history(&instruction, 2, Some(2)));
+        }
+        for opcode in [NOP, POP_TOP, NOT_TAKEN, RETURN_VALUE] {
+            assert!(!indices.can_replay_ordinary_history(&value(opcode), 0, None));
+        }
+        for policy in [
+            ExceptionPolicy::NoneUnchanged,
+            ExceptionPolicy::NoneUnchangedBooleanSingleton,
+            ExceptionPolicy::NonePresent,
+            ExceptionPolicy::NoneAbsent,
+            ExceptionPolicy::NoneDynamic,
+            ExceptionPolicy::IfExtendedUnchanged,
+            ExceptionPolicy::AlwaysUnchanged,
+        ] {
+            let mut instruction = value(LOAD_CONST);
+            instruction.set_exception_policy(policy);
+            assert_eq!(
+                indices.can_replay_ordinary_history(&instruction, 0, None),
+                matches!(
+                    policy,
+                    ExceptionPolicy::NoneUnchanged | ExceptionPolicy::NoneUnchangedBooleanSingleton
+                ),
+            );
+        }
+        let mut hidden = value(LOAD_CONST);
+        hidden.local_policy.add_hidden_exception_owner_slots(1);
+        assert!(!indices.can_replay_ordinary_history(&hidden, 0, None));
+        let mut folded = value(LOAD_CONST);
+        folded.add_pre_fold_extra_instructions(1);
+        assert!(!indices.can_replay_ordinary_history(&folded, 0, None));
+        let mut barrier = value(LOAD_CONST);
+        barrier
+            .no_location_policy
+            .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+        assert!(!indices.can_replay_ordinary_history(&barrier, 0, None));
+    }
+
+    #[test]
     fn bounded_owner_replay_matches_full_decisions_and_marshaled_nested_code() {
         let tail = "    value += 1\n".repeat(160);
         for template in [
@@ -12001,6 +12648,62 @@ mod tests {
             let complete = with_owner_replay_mode(true, true, false, compile);
             assert_eq!(gated, ungated, "{template}");
             assert_eq!(gated, complete, "{template}");
+        }
+    }
+
+    #[test]
+    fn ordinary_history_gate_matches_full_replay_for_fusion_and_comprehension_restores() {
+        for source in [
+            "def outer(value, manager, rows):\n    def run(flag):\n        nonlocal value\n        try:\n            with manager:\n                left, right = value, flag\n                value = left + right\n                if len(rows) > value:\n                    value = str(value)\n                return value if flag else len(rows)\n        except ValueError as error:\n            return value if error else flag\n        finally:\n            manager(value)\n    return run\n",
+            "def run(flag, manager, rows):\n    try:\n        with manager:\n            values = [left + right for left, right in rows if left and flag]\n            pairs = {item: len(str(item)) for item in values if item is not None}\n            if len(pairs) > len(values):\n                return pairs if flag else values\n            return values or pairs\n    except ValueError as error:\n        return error if flag else rows\n    finally:\n        manager(rows)\n",
+            "def run(value, manager, rows):\n    try:\n        with manager:\n            left, right = value, len(rows)\n            if left < right:\n                yield value\n            yield from (item for item in rows if item and value)\n            if len(rows) > right:\n                yield left if value else right\n    except ValueError as error:\n        yield error if value else manager\n    finally:\n        manager(value)\n",
+            "async def run(value, manager, rows):\n    try:\n        async with manager:\n            left, right = value, len(rows)\n            result = [item for item in rows if item and value]\n            if left < right:\n                await manager(result)\n            if len(result) > right:\n                return result if value else rows\n    except ValueError as error:\n        return error if value else manager\n    finally:\n        await manager(value)\n",
+        ] {
+            let compile = || {
+                crate::compile(source, "owner_history_gate.py")
+                    .expect("owner history example compiles")
+                    .marshal()
+            };
+            let gated = with_owner_replay_mode(false, false, true, compile);
+            let ungated = with_owner_replay_mode(false, true, false, compile);
+            let complete = with_owner_replay_mode(true, true, false, compile);
+            assert_eq!(gated, ungated, "{source}");
+            assert_eq!(gated, complete, "{source}");
+        }
+    }
+
+    #[test]
+    fn ordinary_history_gate_preserves_nested_finally_marker_owners() {
+        use crate::{CompileOptions, PythonVersion};
+
+        for source in [
+            "def run(flag):\n    for _ in range(2):\n        try:\n            try:\n                consume('body')\n            finally:\n                try:\n                    consume('finally')\n                    break\n                finally:\n                    flag and consume(1)\n        except Exception:\n            consume('except')\n",
+            "def run(flag):\n    for _ in range(2):\n        try:\n            try:\n                consume('body')\n            finally:\n                try:\n                    consume('finally')\n                    consume(flag)\n                    break\n                finally:\n                    if consume(flag):\n                        consume(1)\n        except Exception:\n            consume('except')\n",
+        ] {
+            for python_version in [
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ] {
+                let compile = || {
+                    crate::compile_with_options(
+                        source,
+                        "owner_history_cleanup.py",
+                        &CompileOptions {
+                            python_version,
+                            ..CompileOptions::default()
+                        },
+                    )
+                    .expect("nested finally example compiles")
+                    .marshal()
+                };
+                let gated = with_owner_replay_mode(false, false, true, compile);
+                let ungated = with_owner_replay_mode(false, true, false, compile);
+                let complete = with_owner_replay_mode(true, true, false, compile);
+                assert_eq!(gated, ungated, "{python_version:?}: {source}");
+                assert_eq!(gated, complete, "{python_version:?}: {source}");
+            }
         }
     }
 
@@ -13922,11 +14625,115 @@ mod tests {
             } else {
                 rustc_hash::FxHashSet::default()
             };
+            let unique = super::OnceCell::new();
+            let markers = assembler.uncompacted_conditional_null_markers::<true>(&targets, &unique);
+            assert_eq!(markers, expected, "{opcode:?}: {case}");
             assert_eq!(
-                assembler.uncompacted_conditional_null_markers(&targets),
-                expected,
+                markers,
+                assembler.uncompacted_conditional_null_markers::<false>(&targets, &unique),
                 "{opcode:?}: {case}"
             );
+        }
+    }
+
+    #[test]
+    fn uncompacted_marker_index_matches_full_scans_across_aliases_and_duplicate_origins() {
+        use super::{ExceptionOwnerProvenance, UncompactedConditionalArray};
+        use crate::assembler::{
+            Instruction, Item, Label, LayoutAssembler, Operand, SourceLocation,
+        };
+        use crate::target::opcodes::{LOAD_CONST, NOT_TAKEN, UNPACK_SEQUENCE};
+
+        let first = Label::from_u32(0);
+        let second = Label::from_u32(1);
+        let aliases = [Label::from_u32(2), Label::from_u32(3), Label::from_u32(4)];
+        let instruction = |opcode, argument, line| {
+            Item::Instruction(Instruction::new(
+                opcode,
+                Operand::Value(argument),
+                SourceLocation::new(line, line, 0, 4),
+                None,
+            ))
+        };
+        for case in [
+            "all",
+            "single",
+            "duplicate label",
+            "duplicate instruction",
+            "entered alias",
+        ] {
+            let mut items = vec![
+                instruction(LOAD_CONST, 0, 1),
+                instruction(LOAD_CONST, 1, 1),
+                Item::Label(first),
+                Item::Label(aliases[0]),
+                instruction(LOAD_CONST, 2, 2),
+                instruction(NOT_TAKEN, 0, 2),
+                Item::Label(second),
+                instruction(LOAD_CONST, 3, 3),
+                Item::Label(aliases[1]),
+                instruction(NOT_TAKEN, 0, 3),
+                instruction(UNPACK_SEQUENCE, 0, 4),
+                Item::Label(aliases[2]),
+                instruction(NOT_TAKEN, 0, 4),
+                instruction(LOAD_CONST, 4, 5),
+            ];
+            let mut origins = vec![
+                vec![items[2], items[4], items[5]],
+                vec![items[6], items[7], items[9]],
+                vec![items[10], items[12]],
+            ];
+            let mut targets = rustc_hash::FxHashSet::default();
+            let expected: &[_] = match case {
+                "single" => {
+                    origins.truncate(1);
+                    &[3]
+                }
+                "duplicate label" => {
+                    items.push(Item::Label(first));
+                    &[5, 7]
+                }
+                "duplicate instruction" => {
+                    items.push(items[10]);
+                    &[3, 5]
+                }
+                "entered alias" => {
+                    targets.insert(aliases[0]);
+                    &[5, 7]
+                }
+                _ => &[3, 5, 7],
+            };
+            let provenance = ExceptionOwnerProvenance {
+                uncompacted_conditional_arrays: origins
+                    .into_iter()
+                    .map(|prefix| UncompactedConditionalArray {
+                        prefix,
+                        comprehension_entry: None,
+                        source_entry: None,
+                    })
+                    .collect(),
+                ..ExceptionOwnerProvenance::default()
+            };
+            let assembler = LayoutAssembler {
+                python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
+                items,
+                exception_owner_provenance: Box::new(provenance),
+                exception_regions: vec![],
+                preserved_block_boundaries: rustc_hash::FxHashSet::default(),
+                removed_max_depth: None,
+                next_label: 5,
+                has_next_location: false,
+            };
+            let unique = super::OnceCell::new();
+            let markers = assembler.uncompacted_conditional_null_markers::<true>(&targets, &unique);
+            assert_eq!(markers, expected.iter().copied().collect(), "{case}");
+            assert_eq!(
+                markers,
+                assembler.uncompacted_conditional_null_markers::<false>(&targets, &unique),
+                "{case}"
+            );
+            assert_eq!(unique.get().is_some(), case != "single", "{case}");
         }
     }
 
@@ -14118,9 +14925,12 @@ mod tests {
             } else {
                 rustc_hash::FxHashSet::default()
             };
+            let unique = super::OnceCell::new();
+            let markers = assembler.uncompacted_conditional_null_markers::<true>(&targets, &unique);
+            assert_eq!(markers, expected, "{case}");
             assert_eq!(
-                assembler.uncompacted_conditional_null_markers(&targets),
-                expected,
+                markers,
+                assembler.uncompacted_conditional_null_markers::<false>(&targets, &unique),
                 "{case}"
             );
         }
@@ -14223,11 +15033,13 @@ mod tests {
             } else {
                 rustc_hash::FxHashSet::default()
             };
+            let targets = [Label::from_u32(4)].into_iter().collect();
+            let unique = super::OnceCell::new();
+            let markers = assembler.uncompacted_conditional_null_markers::<true>(&targets, &unique);
+            assert_eq!(markers, expected, "{case}");
             assert_eq!(
-                assembler.uncompacted_conditional_null_markers(
-                    &[Label::from_u32(4)].into_iter().collect()
-                ),
-                expected,
+                markers,
+                assembler.uncompacted_conditional_null_markers::<false>(&targets, &unique),
                 "{case}"
             );
         }

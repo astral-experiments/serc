@@ -810,6 +810,112 @@ fn terminal_guard_constant_indices(items: &[Item], used: &mut [bool]) -> Option<
     )
 }
 
+/// Recognizes one guard with an extra physical alias immediately after its `NOT_TAKEN` marker.
+///
+/// The marker alias begins an existing borrowing block. Other non-target aliases may only
+/// precede an empty-stack constant return or follow the final exit; physical items stay intact.
+fn single_marker_alias_guard_constant_indices(items: &[Item], used: &mut [bool]) -> Option<bool> {
+    let mut condition = None;
+    let mut last_exit = None;
+    for (index, item) in items.iter().enumerate() {
+        let Item::Instruction(instruction) = item else {
+            continue;
+        };
+        if ends_scope(instruction.opcode) {
+            last_exit = Some(index);
+        }
+        match instruction.operand() {
+            Operand::Forward(target)
+                if condition.is_none()
+                    && matches!(
+                        instruction.opcode,
+                        POP_JUMP_IF_FALSE
+                            | POP_JUMP_IF_TRUE
+                            | POP_JUMP_IF_NONE
+                            | POP_JUMP_IF_NOT_NONE
+                    ) =>
+            {
+                condition = Some((index, target));
+            }
+            Operand::Value(_) => {}
+            Operand::Forward(_) | Operand::Backward(_) | Operand::Deferred(_) => return None,
+        }
+    }
+    let (condition_index, target) = condition?;
+    let last_exit = last_exit?;
+    let [Item::Instruction(marker), Item::Label(alias)] =
+        items.get(condition_index + 1..condition_index + 3)?
+    else {
+        return None;
+    };
+    let alias_index = condition_index + 2;
+    if marker.opcode != NOT_TAKEN || marker.operand() != Operand::Value(0) || *alias == target {
+        return None;
+    }
+    let mut aliases = [None; 3];
+    aliases[0] = Some((alias_index, *alias));
+    let mut alias_count = 1;
+    let mut target_count = 0;
+    for (index, item) in items.iter().enumerate() {
+        let Item::Label(label) = item else {
+            continue;
+        };
+        if *label == target {
+            target_count += 1;
+            continue;
+        }
+        if index == alias_index {
+            continue;
+        }
+        if aliases
+            .iter()
+            .flatten()
+            .any(|(_, previous)| previous == label)
+        {
+            return None;
+        }
+        if index >= last_exit {
+            continue;
+        }
+        if index < alias_index {
+            return None;
+        }
+        let [
+            Item::Instruction(previous),
+            Item::Label(_),
+            Item::Instruction(load),
+            Item::Instruction(ret),
+        ] = items.get(index - 1..index + 3)?
+        else {
+            return None;
+        };
+        if previous.depth_after() != Some(0)
+            || previous.location.line < 0
+            || previous.location != load.location
+            || load.location != ret.location
+            || load.opcode != LOAD_CONST
+            || !matches!(load.operand(), Operand::Value(_))
+            || *load != Instruction::new(LOAD_CONST, load.operand(), load.location, Some(1))
+            || *ret != Instruction::new(RETURN_VALUE, Operand::Value(0), ret.location, Some(0))
+        {
+            return None;
+        }
+        *aliases.get_mut(alias_count)? = Some((index, *label));
+        alias_count += 1;
+    }
+    if target_count != 1 {
+        return None;
+    }
+    let mut canonical = Vec::with_capacity(items.len() - alias_count);
+    let mut start = 0;
+    for (index, _) in aliases.into_iter().flatten() {
+        canonical.extend_from_slice(&items[start..index]);
+        start = index + 1;
+    }
+    canonical.extend_from_slice(&items[start..]);
+    terminal_guard_constant_indices(&canonical, used)
+}
+
 impl Assembler {
     /// Creates an emitter whose stack analysis and final layout use the selected target.
     pub(crate) fn with_python_version(python_version: crate::PythonVersion) -> Self {
@@ -909,7 +1015,16 @@ impl Assembler {
             return false;
         };
         self.has_terminal_guard_metadata()
-            && terminal_guard_constant_indices(items, &mut []).unwrap_or(false)
+            && (self.has_proven_linear_terminal_guards
+                || terminal_guard_constant_indices(items, &mut [])
+                    .or_else(|| {
+                        if self.next_label <= 4 {
+                            single_marker_alias_guard_constant_indices(items, &mut [])
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(false))
     }
 
     fn has_terminal_guard_metadata(&self) -> bool {
@@ -1060,85 +1175,108 @@ impl Assembler {
 
         let mut has_unpack = false;
         let mut may_have_nops = false;
+        let mut has_swap = false;
+        let mut cell_initializers = 0_u64;
+        let mut ordinary_local_loads = 0_u64;
         let ordinary = middle.iter().all(|item| {
             let Item::Instruction(instruction) = item else {
                 return false;
             };
+            let Operand::Value(argument) = instruction.operand() else {
+                return false;
+            };
             has_unpack |= instruction.opcode == UNPACK_SEQUENCE;
             may_have_nops |= matches!(instruction.opcode, NOP | TO_BOOL | UNARY_NOT);
-            if !matches!(instruction.operand(), Operand::Value(_))
-                // Cell stores can remove checked loads in the graph's later local pass.
-                // Zero-local scopes never create checked loads in either pipeline.
-                || (instruction.opcode == STORE_DEREF && local_count != 0)
-                || !matches!(
-                    instruction.opcode,
-                    BINARY_OP
-                        | BINARY_SLICE
-                        | BUILD_LIST
-                        | BUILD_MAP
-                        | BUILD_SET
-                        | BUILD_SLICE
-                        | BUILD_STRING
-                        | BUILD_TUPLE
-                        | CALL
-                        | CALL_FUNCTION_EX
-                        | CALL_INTRINSIC_1
-                        | CALL_KW
-                        | COMPARE_OP
-                        | CONTAINS_OP
-                        | CONVERT_VALUE
-                        | COPY
-                        | DELETE_ATTR
-                        | DELETE_FAST
-                        | DELETE_GLOBAL
-                        | DELETE_NAME
-                        | DELETE_SUBSCR
-                        | DICT_MERGE
-                        | DICT_UPDATE
-                        | FORMAT_SIMPLE
-                        | FORMAT_WITH_SPEC
-                        | GET_ITER
-                        | IMPORT_FROM
-                        | IMPORT_NAME
-                        | IS_OP
-                        | LIST_APPEND
-                        | LIST_EXTEND
-                        | LOAD_ATTR
-                        | LOAD_BUILD_CLASS
-                        | LOAD_CONST
-                        | LOAD_DEREF
-                        | LOAD_FAST
-                        | LOAD_GLOBAL
-                        | LOAD_LOCALS
-                        | LOAD_NAME
-                        | LOAD_SMALL_INT
-                        | LOAD_SUPER_ATTR
-                        | MAKE_FUNCTION
-                        | MAP_ADD
-                        | NOP
-                        | POP_TOP
-                        | PUSH_NULL
-                        | SET_ADD
-                        | SET_FUNCTION_ATTRIBUTE
-                        | SET_UPDATE
-                        | SETUP_ANNOTATIONS
-                        | STORE_ATTR
-                        | STORE_DEREF
-                        | STORE_FAST
-                        | STORE_GLOBAL
-                        | STORE_NAME
-                        | STORE_SLICE
-                        | STORE_SUBSCR
-                        | TO_BOOL
-                        | UNARY_INVERT
-                        | UNARY_NEGATIVE
-                        | UNARY_NOT
-                        | UNPACK_EX
-                        | UNPACK_SEQUENCE
-                )
-                || (instruction.opcode == NOP && instruction.location.line < 0)
+            if instruction.opcode == SWAP {
+                if has_swap || argument < 2 {
+                    return false;
+                }
+                has_swap = true;
+            }
+            if !matches!(
+                instruction.opcode,
+                BINARY_OP
+                    | BINARY_SLICE
+                    | BUILD_LIST
+                    | BUILD_MAP
+                    | BUILD_SET
+                    | BUILD_SLICE
+                    | BUILD_STRING
+                    | BUILD_TUPLE
+                    | CALL
+                    | CALL_FUNCTION_EX
+                    | CALL_INTRINSIC_1
+                    | CALL_KW
+                    | COMPARE_OP
+                    | CONTAINS_OP
+                    | CONVERT_VALUE
+                    | COPY
+                    | DELETE_ATTR
+                    | DELETE_FAST
+                    | DELETE_GLOBAL
+                    | DELETE_NAME
+                    | DELETE_SUBSCR
+                    | DICT_MERGE
+                    | DICT_UPDATE
+                    | FORMAT_SIMPLE
+                    | FORMAT_WITH_SPEC
+                    | GET_ITER
+                    | IMPORT_FROM
+                    | IMPORT_NAME
+                    | IS_OP
+                    | LIST_APPEND
+                    | LIST_EXTEND
+                    | LOAD_ATTR
+                    | LOAD_BUILD_CLASS
+                    | LOAD_CONST
+                    | LOAD_DEREF
+                    | LOAD_FAST
+                    | LOAD_GLOBAL
+                    | LOAD_LOCALS
+                    | LOAD_NAME
+                    | LOAD_SMALL_INT
+                    | LOAD_SUPER_ATTR
+                    | MAKE_FUNCTION
+                    | MAP_ADD
+                    | NOP
+                    | POP_TOP
+                    | PUSH_NULL
+                    | SET_ADD
+                    | SET_FUNCTION_ATTRIBUTE
+                    | SET_UPDATE
+                    | SETUP_ANNOTATIONS
+                    | STORE_ATTR
+                    | STORE_DEREF
+                    | STORE_FAST
+                    | STORE_GLOBAL
+                    | STORE_NAME
+                    | STORE_SLICE
+                    | STORE_SUBSCR
+                    | SWAP
+                    | TO_BOOL
+                    | UNARY_INVERT
+                    | UNARY_NEGATIVE
+                    | UNARY_NOT
+                    | UNPACK_EX
+                    | UNPACK_SEQUENCE
+            ) || (instruction.opcode == NOP && instruction.location.line < 0)
             {
                 return false;
+            }
+            let local_bit = if matches!(instruction.opcode, LOAD_FAST | STORE_DEREF)
+                && usize::try_from(argument).is_ok_and(|index| index < local_count)
+            {
+                1_u64.checked_shl(argument)
+            } else {
+                None
+            };
+            if instruction.opcode == STORE_DEREF && local_count != 0 {
+                if local_count > 64 {
+                    return false;
+                }
+                if let Some(bit) = local_bit {
+                    cell_initializers |= bit;
+                }
             }
             let mut ordinary = Instruction::new(
                 instruction.opcode,
@@ -1155,15 +1293,16 @@ impl Assembler {
                     ordinary.local_policy.mark_force_borrowed_load();
                 }
                 if instruction.local_policy.is_post_analysis_closure_load() {
-                    // A later ordinary load of a fast-local cell can lose its check in
-                    // the graph's second local pass. Keep those cells on the graph path.
-                    if matches!(instruction.operand(), Operand::Value(argument)
-                        if usize::try_from(argument).is_ok_and(|index| index < local_count))
-                    {
-                        return false;
+                    if usize::try_from(argument).is_ok_and(|index| index < local_count) {
+                        if local_count > 64 {
+                            return false;
+                        }
+                        cell_initializers |= local_bit.expect("a fast-local cell fits the mask");
                     }
                     ordinary.local_policy.mark_post_analysis_closure_load();
                     ordinary.fusion_policy.prevent_with_previous();
+                } else if let Some(bit) = local_bit {
+                    ordinary_local_loads |= bit;
                 }
             }
             if matches!(
@@ -1182,9 +1321,35 @@ impl Assembler {
             }
             *instruction == ordinary
         });
-        // The graph preserves distinct unpack/capture NOP line events. Boolean rewrites
+        // A cell store or closure load can remove a check only on another load of the same
+        // fast-local slot in the graph's second local pass. Keep overlapping slots on that path.
+        // The graph also preserves distinct unpack/capture NOP line events. Boolean rewrites
         // can create NOPs, and later compaction can expose them beside an unpack.
-        ordinary && !(has_unpack && may_have_nops)
+        ordinary
+            && cell_initializers & ordinary_local_loads == 0
+            && !(has_unpack && may_have_nops)
+            && (!has_swap
+                || {
+                    // A sole swap cannot form a swap run or a redundant swap pair. Static
+                    // swapping also leaves it intact when a permanent instruction blocks the
+                    // first swappable store/pop, or an import blocks the required second one.
+                    let index = middle
+                    .iter()
+                    .position(|item| matches!(item, Item::Instruction(instruction) if instruction.opcode == SWAP))
+                    .expect("an ordinary swap was found");
+                    match middle.get(index + 1) {
+                        Some(Item::Instruction(next)) => match next.opcode {
+                            IMPORT_FROM | LOAD_FAST | STORE_ATTR | STORE_DEREF | STORE_GLOBAL
+                            | STORE_NAME | STORE_SLICE | STORE_SUBSCR => true,
+                            POP_TOP => {
+                                matches!(middle.get(index + 2), Some(Item::Instruction(after))
+                            if after.opcode == IMPORT_FROM)
+                            }
+                            _ => false,
+                        },
+                        _ => false,
+                    }
+                })
     }
 
     fn has_no_linear_control_flow_metadata(&self) -> bool {
@@ -16016,8 +16181,18 @@ impl Assembler {
             return used;
         }
         if self.has_terminal_guard_metadata()
-            && terminal_guard_constant_indices(self.linear_items(), &mut used).is_some()
+            && let Some(linear_eligible) =
+                terminal_guard_constant_indices(self.linear_items(), &mut used).or_else(|| {
+                    if self.next_label <= 4 {
+                        single_marker_alias_guard_constant_indices(self.linear_items(), &mut used)
+                    } else {
+                        None
+                    }
+                })
         {
+            // The grammar visits every constant instruction; subsequent pruning only
+            // renumbers surviving operands and cannot change an accepted guard's shape.
+            self.has_proven_linear_terminal_guards = linear_eligible;
             return used;
         }
 

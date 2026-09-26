@@ -86,6 +86,7 @@ large_stack_arrays = "allow"
 [profile.release]
 strip = true
 lto = "fat"
+codegen-units = 1
 
 [profile.profiling]
 inherits = "release"
