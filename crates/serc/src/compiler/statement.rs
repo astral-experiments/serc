@@ -32976,15 +32976,15 @@ fn with_body_fallback_statement(
     python_version: crate::PythonVersion,
 ) -> Option<&Stmt> {
     let last = body.last()?;
-    if python_version >= crate::PythonVersion::Py314
-        && matches!(last, Stmt::Global(_) | Stmt::Nonlocal(_))
-    {
+    if matches!(last, Stmt::Global(_) | Stmt::Nonlocal(_)) {
         let mut effective = body
             .iter()
             .filter(|statement| !matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_)));
         return match (effective.next(), effective.next()) {
             (None, _) => None,
-            (Some(pass @ Stmt::Pass(_)), None) => Some(pass),
+            (Some(pass @ Stmt::Pass(_)), None) if python_version >= crate::PythonVersion::Py314 => {
+                Some(pass)
+            }
             _ => Some(last),
         };
     }
