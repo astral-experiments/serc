@@ -684,12 +684,33 @@ impl Compiler<'_> {
                         let redundant_false_join = self.context.python_version
                             >= PythonVersion::Py314
                             && !truthiness
-                            && match_has_following
-                            && !has_default
                             && !copied_subject
-                            && (matches!(case.pattern, Pattern::MatchOr(_))
-                                || (irrefutable_pattern
-                                    && matches!(case.pattern, Pattern::MatchAs(_))))
+                            && ((match_has_following
+                                && !has_default
+                                && (matches!(case.pattern, Pattern::MatchOr(_))
+                                    || (irrefutable_pattern
+                                        && matches!(case.pattern, Pattern::MatchAs(_)))))
+                                || (has_default
+                                    && irrefutable_pattern
+                                    && matches!(case.pattern, Pattern::MatchAs(_))
+                                    && self.source_location(case.pattern.range()).line
+                                        == self.source_location(guard.range()).line
+                                    && statement.cases.last().is_some_and(|default| {
+                                        default.guard.is_none()
+                                            && matches!(
+                                                default.body.as_slice(),
+                                                [Stmt::Return(_) | Stmt::Raise(_)]
+                                            )
+                                    })
+                                    && self.control.exceptions.active_exception_group_handlers
+                                        == 0
+                                    && !self.control.in_exception_handler()
+                                    && self.control.active_with_count() == 0
+                                    && self
+                                        .assembler
+                                        .current_block_last_instruction_location()
+                                        .is_some_and(|previous| previous.line == location.line)
+                                    && self.match_guard_subject_return_is_unprotected()))
                             && self
                                 .assembler
                                 .last_instruction_location()

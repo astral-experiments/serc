@@ -392,6 +392,10 @@ fn optimized_assertion_syntax_matches_the_target_version() {
     for source in [
         "assert (await value)\n",
         "assert (__debug__ := False)\n",
+        "assert func(__debug__=1)\n",
+        "assert func(x=1, x=2)\n",
+        "assert [0 for x.__debug__ in []]\n",
+        "assert (yield, 1)\n",
         "def f():\n    assert (value := 1)\n    global value\n",
     ] {
         for (python_version, _, _) in VERSIONS {
@@ -415,14 +419,18 @@ fn optimized_assertion_syntax_matches_the_target_version() {
                         "{python_version}, {optimization_level:?}, {source:?}"
                     );
                 } else {
+                    let stderr = String::from_utf8_lossy(&expected.stderr);
+                    let expected_message = stderr
+                        .lines()
+                        .find_map(|line| line.strip_prefix("SyntaxError: "))
+                        .unwrap_or_else(|| {
+                            panic!("the pinned oracle failed unexpectedly: {stderr}")
+                        });
+                    let error = actual.unwrap_err();
                     assert!(
-                        String::from_utf8_lossy(&expected.stderr).contains("SyntaxError"),
-                        "the pinned oracle failed unexpectedly: {}",
-                        String::from_utf8_lossy(&expected.stderr)
-                    );
-                    assert!(
-                        actual.is_err(),
-                        "{python_version}, {optimization_level:?} accepted {source:?}"
+                        error.to_string().ends_with(expected_message),
+                        "{python_version}, {optimization_level:?}, {source:?}: \
+                         expected {expected_message:?}, got {error}"
                     );
                 }
             }
@@ -522,4 +530,472 @@ fn optimized_deep_expression_traversal_and_cleanup() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn optimized_conditional_joins_match_cpython() {
+    for source in [
+        "def f(xs, a, b, c):\n    for x in xs:\n        if x == a:\n            assert x\n        elif x == b or x == c:\n            assert x\n",
+        "def f(xs, a, b):\n    for x in xs:\n        if x == a or x == b:\n            assert x\n",
+        "def f(x, a, b, c):\n    if x == a:\n        assert x\n    elif x == b or x == c:\n        assert x\n",
+        "def f(xs, a, b, c):\n    for x in xs:\n        if x == a:\n            work(x)\n        elif x == b and x == c:\n            work(x)\n        else:\n            assert x\n    else:\n        fallback()\n",
+        "def f(xs, a, b, c, gate):\n    if gate:\n        for x in xs:\n            if x == a:\n                work(x)\n            elif x == b and x == c:\n                work(x)\n            else:\n                assert x\n    else:\n        fallback()\n",
+        "def f(xs, a, b, c):\n    for x in xs:\n        if x == a:\n            pass\n        elif x == b or x == c:\n            pass\n",
+        "def f(xs, a, b, c):\n    for x in xs:\n        if x == a:\n            assert x\n        elif x == b or x == c:\n            assert x\n        work(x)\n",
+        "events = []\na = True\nb = False\nc = True\nif b:\n    assert a\nelif a or c:\n    assert a\n",
+        "events = []\na = True\nb = False\nc = True\nif b:\n    events.append('first')\nelif a or c:\n    assert a\n",
+    ] {
+        assert_matches_cpython(source, "case.py", &LEVELS);
+    }
+}
+
+#[test]
+fn optimized_conditional_join_in_exception_group_matches_cpython() {
+    for source in [
+        "def f(xs, a, b):\n    try:\n        work()\n    except* ValueError:\n        for x in xs:\n            if a or b:\n                assert x\n            else:\n                assert x\n",
+        "def f(xs, a, b):\n    try:\n        work()\n    except* ValueError as err:\n        for x in xs:\n            if a or b:\n                assert x\n            else:\n                assert x\n",
+    ] {
+        assert_matches_cpython(source, "case.py", &LEVELS[1..]);
+    }
+}
+
+#[test]
+fn optimized_nested_else_join_locations_match_cpython() {
+    for source in [
+        "def f(x, obj, flag, other, items):\n    if flag:\n        if x == 0:\n            obj.channel = 0\n        else:\n            assert False, \"unknown\"\n    elif other:\n        obj.x = 42\n    obj.result = 3\n",
+        "def f(x, y, z, obj, flag, items, manager):\n    try:\n        obj.before = 0\n        if flag:\n            if not (x < y < z):\n                obj.channel = 1\n            else:\n                pass\n        elif y:\n            obj.other = 2\n        obj.after = 3\n    finally:\n        obj.cleaned = True\n",
+        "def f(x, y, z, obj, flag, items, manager):\n    obj.before = 0\n    if flag:\n        if x < y < z and flag:\n            try:\n                obj.channel = 1\n            finally:\n                obj.done = True\n        else:\n            assert y\n    elif y:\n        obj.other = 2\n    obj.after = 3\n",
+        "def f(x, y, z, obj, flag, items, manager):\n    obj.before = 0\n    if flag:\n        if probe(x) and (y or z):\n            obj.channel = 1\n        else:\n            assert y\n    elif y:\n        obj.other = 2\n    obj.after = 3\n",
+    ] {
+        assert_matches_cpython(source, "case.py", &LEVELS);
+    }
+}
+
+#[test]
+fn optimized_nested_else_with_declarations_matches_cpython() {
+    for source in [
+        "def f(flag, x, y, obj):\n    if flag:\n        if x:\n            obj.value = 1\n        elif y:\n            obj.value = 2\n        else:\n            global g\n            assert x\n    elif y:\n        obj.value = 3\n    obj.done = True\n",
+        "def f(flag, x, y, obj):\n    if flag:\n        if x:\n            obj.value = 1\n        else:\n            assert x\n            global g\n    elif y:\n        obj.value = 2\n    obj.done = True\n",
+        "def outer():\n    captured = None\n    def f(flag, x, y, obj):\n        if flag:\n            if x:\n                obj.value = 1\n            else:\n                nonlocal captured\n                assert x\n        elif y:\n            obj.value = 2\n        obj.done = True\n    return f\n",
+        "def f(flag, x, y, obj):\n    if flag:\n        if x:\n            obj.value = 1\n        else:\n            global g\n            assert x\n            pass\n    elif y:\n        obj.value = 2\n    obj.done = True\n",
+    ] {
+        assert_matches_cpython(source, "case.py", &LEVELS);
+    }
+}
+
+#[test]
+fn nested_continue_with_elided_assertion_matches_cpython() {
+    for source in [
+        "def f(xs, a, cm):\n    for x in xs:\n        if a:\n            if x:\n                continue\n            global g\n            assert x\n",
+        "def outer():\n    g = None\n    def f(xs, a, cm):\n        for x in xs:\n            if a:\n                if x:\n                    continue\n                nonlocal g\n                assert x\n    return f\n",
+        "def f(xs, a, b):\n    for x in xs:\n        if a:\n            if b:\n                continue\n            assert x\n",
+        "def f(a, b):\n    while a:\n        if a:\n            if b:\n                continue\n            assert False\n",
+        "def f(xs, a, b):\n    for x in xs:\n        if a:\n            if b:\n                continue\n            assert x\n    else:\n        cleanup()\n",
+        "def f(xs, a, b):\n    for x in xs:\n        if a:\n            if b:\n                continue\n            pass\n",
+        "def f(xs, a, b):\n    for x in xs:\n        if a:\n            if b:\n                continue\n            assert x\n            cleanup()\n",
+        "def f(xs, a, b, cm):\n    with cm:\n        for x in xs:\n            if a:\n                if b:\n                    continue\n                assert x\n",
+    ] {
+        assert_matches_cpython(source, "case.py", &LEVELS);
+    }
+}
+
+#[test]
+fn elided_assertion_with_nested_finally_matches_cpython() {
+    for source in [
+        "def f(flag):\n    try:\n        operation()\n        assert flag\n    except ValueError:\n        raise\n    finally:\n        try:\n            cleanup()\n        except TypeError:\n            pass\n",
+        "def f(flag):\n    try:\n        operation()\n    except ValueError:\n        raise\n    finally:\n        try:\n            cleanup()\n        except TypeError:\n            pass\n",
+        "def f(flag):\n    try:\n        operation()\n        global declared\n        assert flag\n    except ValueError:\n        raise\n    finally:\n        try:\n            cleanup()\n        except TypeError:\n            pass\n",
+        "def outer(flag):\n    declared = None\n    def f():\n        try:\n            operation()\n            nonlocal declared\n            assert flag\n        except ValueError:\n            raise\n        finally:\n            try:\n                cleanup()\n            except TypeError:\n                pass\n    return f\n",
+        "def f():\n    try:\n        operation()\n        global g\n    except ValueError:\n        raise\n    finally:\n        try:\n            cleanup()\n        except TypeError:\n            pass\n",
+        "def outer():\n    x = None\n    def f():\n        try:\n            operation()\n            nonlocal x\n        except ValueError:\n            raise\n        finally:\n            try:\n                cleanup()\n            except TypeError:\n                pass\n    return f\n",
+    ] {
+        assert_matches_cpython(source, "case.py", &LEVELS);
+    }
+}
+
+#[test]
+fn optimized_empty_try_loop_keeps_enclosing_exception_owner() {
+    const TRACE_BACKEDGE: &str = r"
+import dis, json, marshal, sys
+
+events = []
+def recover():
+    events.append('recover')
+def cleanup():
+    events.append('cleanup')
+def log():
+    events.append('log')
+scope = dict(recover=recover, cleanup=cleanup, log=log)
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+f = scope['f']
+backedge = next(i.offset for i in dis.get_instructions(f) if i.opname == 'JUMP_BACKWARD')
+fired = [False]
+def trace(frame, event, arg):
+    if frame.f_code is f.__code__:
+        if event == 'call':
+            frame.f_trace_opcodes = True
+        elif event == 'opcode' and frame.f_lasti == backedge:
+            fired[0] = True
+            raise ValueError('injected')
+    return trace
+sys.settrace(trace)
+# Prime opcode tracing, then reset it before the execution under test.
+f([])
+sys.settrace(None)
+events.clear()
+sys.settrace(trace)
+try:
+    f([1])
+except ValueError:
+    events.append('escaped')
+finally:
+    sys.settrace(None)
+assert fired[0]
+print(json.dumps(events))
+";
+    assert_matches_cpython(
+        "async def f(xs):\n    for x in xs:\n        try:\n            assert x\n        except:\n            log()\n",
+        "case.py",
+        &LEVELS,
+    );
+    let cases = [
+        (
+            "def f(xs):\n    try:\n        for x in xs:\n            try:\n                assert x\n            except:\n                log()\n    except Exception:\n        recover()\n",
+            &b"[\"recover\"]\n"[..],
+        ),
+        (
+            "def f(xs):\n    try:\n        for x in xs:\n            try:\n                assert x\n            except:\n                log()\n    finally:\n        cleanup()\n",
+            &b"[\"cleanup\", \"escaped\"]\n"[..],
+        ),
+    ];
+    for (source, expected_events) in cases {
+        for (index, (python_version, _, _)) in VERSIONS.iter().copied().enumerate() {
+            for optimization_level in LEVELS {
+                let native = oracle(
+                    source.as_bytes(),
+                    "case.py",
+                    python_version,
+                    optimization_level,
+                );
+                assert!(
+                    native.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&native.stderr)
+                );
+                let options = CompileOptions {
+                    python_version,
+                    optimization_level,
+                    ..CompileOptions::default()
+                };
+                let actual = compile_with_options(source, "case.py", &options)
+                    .unwrap()
+                    .marshal();
+                let execute = |bytes: &[u8]| {
+                    let mut child = Command::new(ORACLES[index].get().unwrap())
+                        .args(["-I", "-S", "-c", TRACE_BACKEDGE])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    child.stdin.take().unwrap().write_all(bytes).unwrap();
+                    child.wait_with_output().unwrap()
+                };
+                let expected_run = execute(&native.stdout);
+                let actual_run = execute(&actual);
+                for result in [&expected_run, &actual_run] {
+                    assert!(
+                        result.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                }
+                assert_eq!(
+                    expected_run.stdout, expected_events,
+                    "{python_version}, {optimization_level:?}"
+                );
+                assert_eq!(
+                    actual_run.stdout, expected_run.stdout,
+                    "{python_version}, {optimization_level:?}"
+                );
+                assert_eq!(
+                    actual, native.stdout,
+                    "{python_version}, {optimization_level:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn optimized_match_guards_preserve_default_locations() {
+    for (pattern, guard) in [("y", "__debug__"), ("_", "__debug__"), ("y", "False")] {
+        let source = format!(
+            "def f(x):\n    match x:\n        case {pattern} if {guard}:\n            return 1\n        case _:\n            return 2\n"
+        );
+        assert_matches_cpython(&source, "match_guard.py", &LEVELS);
+    }
+
+    for source in [
+        r#"def f(x, flag, other):
+    match x:
+        case y if (
+            __debug__
+        ):
+            raise RuntimeError("guard")
+        case _:
+            raise ValueError("default")
+"#,
+        r#"def f(x, manager, extra):
+    try:
+        trigger()
+    except* ValueError as e:
+        match x:
+            case y if (
+                __debug__
+            ):
+                raise RuntimeError("guard")
+            case _:
+                raise ValueError("default")
+    return 9
+"#,
+        r#"def f(x, manager, extra):
+    with manager:
+        try:
+            trigger()
+        finally:
+            match x:
+                case y if (
+                    __debug__
+                ):
+                    raise RuntimeError("guard")
+                case _:
+                    raise ValueError("default")
+    return 9
+"#,
+    ] {
+        assert_matches_cpython(source, "match_guard_control.py", &LEVELS);
+    }
+}
+
+#[test]
+fn elided_assertions_preserve_async_comprehension_return_location() {
+    for source in [
+        r"async def f(xs):
+    result = [item async for item in xs]
+    assert result
+",
+        r"async def f(xs):
+    result = [
+        item
+        async for item in xs
+    ]
+    assert result
+    assert len(result)
+",
+        r"async def f(xs):
+    result = [item async for item in xs]
+    assert result
+    pass
+",
+        r"async def f(xs):
+    assert xs
+    result = [item async for item in xs]
+",
+        r"async def f(xs):
+    result = [item for item in xs]
+    assert result
+",
+        r"async def f(xs):
+    result = await collect(xs)
+    assert result
+",
+    ] {
+        assert_matches_cpython(source, "implicit_return.py", &LEVELS);
+    }
+}
+
+#[test]
+fn elided_assertions_preserve_async_set_and_dict_return_locations() {
+    for source in [
+        r"async def f(xs):
+    result = {item async for item in xs}
+    assert result
+",
+        r"async def f(xs):
+    result = {item: item async for item in xs}
+    assert result
+",
+    ] {
+        assert_matches_cpython(source, "implicit_return_comp.py", &LEVELS);
+    }
+}
+
+#[test]
+fn elided_assertions_preserve_sync_comprehension_return_locations() {
+    for source in [
+        r"def f(xs):
+    result = [
+        item
+        for item in xs
+        if item
+    ]
+    assert result
+",
+        r"def f(xs):
+    result = {
+        item: item
+        for item in xs
+    }
+    assert result
+",
+        r"def f(xs):
+    result = {
+        item
+        for item in xs
+    }
+    assert result
+",
+        r"def f(xs):
+    result = [item for item in xs]
+    assert result
+",
+    ] {
+        assert_matches_cpython(source, "implicit_return_sync.py", &LEVELS);
+    }
+}
+
+#[test]
+fn elided_assertions_preserve_nested_generator_return_locations() {
+    for source in [
+        r"def f(xs):
+    result = [x for x in xs if any(test(x, y) for y in xs)]
+    assert result
+",
+        r"def f(xs):
+    result = {
+        x: sum(test(x, y) for y in xs)
+        for x in xs
+    }
+    assert result
+",
+        r"def f(xs):
+    result = [x for x in xs if any(test(y) for y in xs)]
+    assert result
+",
+        r"def f(xs):
+    result = [x for x in xs if any(test(x, y) for y in xs)]
+    assert result
+    pass
+",
+    ] {
+        assert_matches_cpython(source, "implicit_return_nested_gen.py", &LEVELS);
+    }
+}
+
+#[test]
+fn async_comprehension_preserves_conditional_exception_owner() {
+    const TRACE_CONDITION: &str = r"
+import dis, marshal, sys
+
+scope = {}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+f = scope['f']
+targets = [i.offset for i in dis.get_instructions(f)
+           if i.opname == 'NOT_TAKEN' and i.positions.lineno == 4]
+assert len(targets) == 1, targets
+target = targets[0]
+hits = []
+def trace(frame, event, arg):
+    if frame.f_code is f.__code__:
+        frame.f_trace_opcodes = True
+        if event == 'opcode' and frame.f_lasti == target:
+            hits.append(frame.f_lasti)
+            raise ValueError('injected')
+    return trace
+def drive(x):
+    try:
+        f(x, [('k', 1), ('j', 2)], {}).send(None)
+    except StopIteration:
+        return 'completed'
+    except ValueError:
+        return 'escaped'
+    return 'suspended'
+sys.settrace(trace)
+warm = drive(False)
+sys.settrace(None)
+hits.clear()
+sys.settrace(trace)
+try:
+    outcome = drive(True)
+finally:
+    sys.settrace(None)
+assert warm == 'completed', warm
+assert hits == [target], hits
+print(outcome)
+";
+    let cases = [
+        ("{**{k: 1 for k in xs}}", false),
+        ("[{k: 1 for k in xs}]", false),
+        ("{**dict(xs)}", true),
+    ];
+    for (expression, protected_314) in cases {
+        let source = format!(
+            "async def f(x, xs, d):\n    v = {expression}\n    try:\n        if x:\n            pass\n    except Exception:\n        pass\n"
+        );
+        for (index, (python_version, _, _)) in VERSIONS.iter().copied().enumerate() {
+            for optimization_level in LEVELS {
+                let native = oracle(
+                    source.as_bytes(),
+                    "case.py",
+                    python_version,
+                    optimization_level,
+                );
+                assert!(
+                    native.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&native.stderr)
+                );
+                let options = CompileOptions {
+                    python_version,
+                    optimization_level,
+                    ..CompileOptions::default()
+                };
+                let actual = compile_with_options(&source, "case.py", &options)
+                    .unwrap()
+                    .marshal();
+                assert_eq!(
+                    actual, native.stdout,
+                    "{python_version}, {optimization_level:?}, {expression}"
+                );
+                if matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315) {
+                    let expected = if protected_314 && python_version == PythonVersion::Py314 {
+                        &b"completed\n"[..]
+                    } else {
+                        &b"escaped\n"[..]
+                    };
+                    for code in [&native.stdout, &actual] {
+                        let mut child = Command::new(ORACLES[index].get().unwrap())
+                            .args(["-I", "-S", "-B", "-c", TRACE_CONDITION])
+                            .stdin(Stdio::piped())
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped())
+                            .spawn()
+                            .unwrap();
+                        child.stdin.take().unwrap().write_all(code).unwrap();
+                        let result = child.wait_with_output().unwrap();
+                        assert!(
+                            result.status.success(),
+                            "{}",
+                            String::from_utf8_lossy(&result.stderr)
+                        );
+                        assert_eq!(
+                            result.stdout, expected,
+                            "{python_version}, {optimization_level:?}, {expression}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

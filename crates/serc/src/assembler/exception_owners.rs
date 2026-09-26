@@ -1953,7 +1953,8 @@ impl ExceptionOwnerProvenance {
         all: &[Item],
     ) -> Option<(Label, &'a [Item], usize)> {
         use crate::target::opcodes::{
-            CALL, LOAD_ATTR, LOAD_FAST, STORE_DEREF, STORE_FAST, STORE_NAME, SWAP,
+            BUILD_LIST, BUILD_MAP, CALL, DICT_UPDATE, LOAD_ATTR, LOAD_FAST, STORE_DEREF,
+            STORE_FAST, STORE_NAME, SWAP,
         };
 
         let leading = prefix
@@ -2024,14 +2025,20 @@ impl ExceptionOwnerProvenance {
                 .collect::<Vec<_>>();
             // All authored restores are STORE_FAST_MAYBE_NULL in CPython,
             // including cells. They remain distinct through superinstruction
-            // insertion. CALL, LOAD_ATTR, LOAD_FAST, STORE_DEREF, and STORE_NAME
-            // prevent static elimination of SWAP(n + 1): CPython only swaps local stores and POP_TOP,
-            // so only n swappable restores precede the next operation.
+            // insertion. The following operation is not swappable, so only n
+            // swappable restores precede it and SWAP(n + 1) cannot be eliminated.
             if instructions.starts_with(original)
                 && instructions.get(original.len()).is_some_and(|next| {
                     matches!(
                         next.opcode,
-                        CALL | LOAD_ATTR | LOAD_FAST | STORE_DEREF | STORE_NAME
+                        BUILD_LIST
+                            | BUILD_MAP
+                            | CALL
+                            | DICT_UPDATE
+                            | LOAD_ATTR
+                            | LOAD_FAST
+                            | STORE_DEREF
+                            | STORE_NAME
                     )
                 })
             {
@@ -2148,10 +2155,10 @@ impl ExceptionOwnerProvenance {
     ) -> bool {
         use crate::target::opcodes::{
             BINARY_OP, BUILD_LIST, BUILD_MAP, BUILD_STRING, BUILD_TUPLE, CALL, CALL_KW,
-            CONTAINS_OP, FORMAT_SIMPLE, GET_ITER, IMPORT_FROM, IMPORT_NAME, LOAD_ATTR, LOAD_CONST,
-            LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL, LOAD_NAME, LOAD_SMALL_INT, MAKE_FUNCTION,
-            POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, PUSH_NULL, SET_FUNCTION_ATTRIBUTE, STORE_DEREF,
-            STORE_FAST, STORE_NAME, TO_BOOL,
+            CONTAINS_OP, DICT_UPDATE, FORMAT_SIMPLE, GET_ITER, IMPORT_FROM, IMPORT_NAME, LOAD_ATTR,
+            LOAD_CONST, LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL, LOAD_NAME, LOAD_SMALL_INT,
+            MAKE_FUNCTION, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, PUSH_NULL, SET_FUNCTION_ATTRIBUTE,
+            STORE_DEREF, STORE_FAST, STORE_NAME, TO_BOOL,
         };
 
         let empty_class_success = Self::empty_class_success_prefix(prefix, all);
@@ -2479,15 +2486,21 @@ impl ExceptionOwnerProvenance {
                     }
                 }
                 BUILD_MAP => {
-                    // The certified restore is followed by CALL, whose runtime
-                    // result is the last value of this nonempty dictionary. Both
-                    // records survive without constant folding or compaction.
+                    // CPython does not fold BUILD_MAP; after the certified restore
+                    // the comprehension supplies a runtime value to this array.
                     if comprehension_restore_count == 0
-                        || index != comprehension_restore_count + 2
+                        || index <= comprehension_restore_count
                         || !matches!(instruction.operand(), Operand::Value(1..))
-                        || instructions
-                            .get(index.wrapping_sub(1))
-                            .is_none_or(|previous| previous.opcode != CALL)
+                    {
+                        return false;
+                    }
+                }
+                DICT_UPDATE => {
+                    // The update is a standalone, non-swappable record. Restrict
+                    // it to the authenticated comprehension continuation.
+                    if comprehension_restore_count == 0
+                        || index <= comprehension_restore_count
+                        || !matches!(instruction.operand(), Operand::Value(1..))
                     {
                         return false;
                     }
@@ -2655,7 +2668,7 @@ impl ExceptionOwnerProvenance {
             }
         }
         // Retained SETUPs need an authored NOP proof. A certified comprehension
-        // restore followed by CALL already establishes the original array head,
+        // restore followed by a non-swappable operation establishes its array head,
         // including a condition reached without crossing a new SETUP.
         (setup_count > 0 || comprehension_restore_count > 0)
             // With no folds, the append is fresh. Certified membership/global

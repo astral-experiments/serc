@@ -3187,6 +3187,24 @@ impl<'source> Compiler<'source> {
         &mut self,
         statement: &ruff_python_ast::StmtIf,
     ) -> Result<(), CompileError> {
+        if self.context.python_version >= crate::PythonVersion::Py313
+            && self.optimized_conditional_join(statement)
+            && self.control.loops.contexts.is_empty()
+            && !self.has_active_control_flow_region()
+            && self.control.withs.active_with_exits.is_empty()
+            && !self.control.in_exception_handler()
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+        {
+            // Native copies the shared implicit return after constructing the
+            // original conditional and short-circuit joins.
+            self.compile_if(statement)?;
+            self.assembler.set_location(SourceLocation::NONE);
+            return self.emit_deferred_implicit_return();
+        }
         if statement.elif_else_clauses.is_empty()
             && matches!(statement.body.last(), Some(Stmt::Expr(expression))
                 if matches!(expression.value.as_ref(), Expr::If(conditional)
@@ -12461,7 +12479,55 @@ impl<'source> Compiler<'source> {
                         Stmt::If(statement) => nested_if_exit_location(
                             statement,
                             self.control.statements.context.has_following,
-                        ),
+                        )
+                        .or_else(|| {
+                            // An optimizer-elided else still owns the original false-edge
+                            // join. Declarations also emit no instructions, so they do not
+                            // add a fallthrough donor alongside an elided statement.
+                            if self.context.python_version < crate::PythonVersion::Py314
+                                || !condition_has_only_runtime_tests(&statement.test)
+                                || expression_suspends_current_scope(&statement.test)
+                            {
+                                return None;
+                            }
+                            let (final_clause, earlier) =
+                                statement.elif_else_clauses.split_last()?;
+                            if final_clause.test.is_some()
+                                || final_clause.body.is_empty()
+                                || !final_clause.body.iter().any(|stmt| {
+                                    matches!(
+                                        self.context.optimized_locations.get(&stmt.range()),
+                                        Some(super::optimization::OptimizedLocation::Elided)
+                                    )
+                                })
+                                || !final_clause.body.iter().all(|stmt| {
+                                    matches!(stmt, Stmt::Global(_) | Stmt::Nonlocal(_))
+                                        || matches!(
+                                            self.context.optimized_locations.get(&stmt.range()),
+                                            Some(super::optimization::OptimizedLocation::Elided)
+                                        )
+                                })
+                                || earlier.iter().any(|clause| {
+                                    clause.test.as_ref().is_none_or(|test| {
+                                        !condition_has_only_runtime_tests(test)
+                                            || expression_suspends_current_scope(test)
+                                    })
+                                })
+                            {
+                                return None;
+                            }
+                            let test = earlier
+                                .last()
+                                .and_then(|clause| clause.test.as_ref())
+                                .unwrap_or(statement.test.as_ref());
+                            if !matches!(test, Expr::Compare(_))
+                                && condition_jump_target_count(test, false) > 1
+                            {
+                                Some(NestedIfExitLocation::Unlocated)
+                            } else {
+                                Some(NestedIfExitLocation::Located(test))
+                            }
+                        }),
                         // The loop's else can leave its own shared partial-if join.
                         // Break edges bypass that original join during exit copying.
                         Stmt::For(loop_statement) if !loop_statement.is_async => {
@@ -12596,6 +12662,12 @@ impl<'source> Compiler<'source> {
                     // later copy of the continuation after the try POP_BLOCK.
                     let exclude_direct_try_body_exit = direct_try_body_exit
                         && self.context.python_version >= crate::PythonVersion::Py314;
+                    let native_elided_loop_exit = self.control.loops.uncopied_loop_tail_statement
+                        == Some(statement.range)
+                        && self.optimized_conditional_join(statement);
+                    if native_elided_loop_exit {
+                        self.assembler.set_location(SourceLocation::NONE);
+                    }
                     let branch_exit = if exclude_direct_try_body_exit
                         && self.control.in_iterator_loop()
                         && self
@@ -13292,6 +13364,39 @@ impl<'source> Compiler<'source> {
         split_short_circuit: bool,
         mode: LoopTailMode,
     ) -> Result<LoopBackedge, CompileError> {
+        if self.context.python_version >= crate::PythonVersion::Py314
+            && let Some(end) = body.iter().rposition(|statement| {
+                !matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))
+                    && !matches!(
+                        self.context.optimized_locations.get(&statement.range()),
+                        Some(super::optimization::OptimizedLocation::Elided)
+                    )
+            })
+            && body[end + 1..].iter().any(|statement| {
+                matches!(
+                    self.context.optimized_locations.get(&statement.range()),
+                    Some(super::optimization::OptimizedLocation::Elided)
+                )
+            })
+            && matches!(&body[end], Stmt::If(statement)
+                if statement.elif_else_clauses.is_empty()
+                    && matches!(statement.body.as_slice(), [Stmt::Continue(_)])
+                    && condition_has_only_runtime_tests(&statement.test)
+                    && !expression_suspends_current_scope(&statement.test))
+        {
+            // Native emits no instructions for the optimized suffix, leaving the
+            // conditional continue as the original loop-tail statement.
+            let tail = self.compile_loop_tail_suite_inner(
+                &body[..=end],
+                restart,
+                split_short_circuit,
+                mode,
+            )?;
+            let previous_location = self.assembler.location();
+            self.compile_suite(&body[end + 1..])?;
+            self.assembler.set_location(previous_location);
+            return Ok(tail);
+        }
         match body.split_last() {
             Some((Stmt::If(statement), leading)) => {
                 self.with_control_override(
@@ -17505,6 +17610,67 @@ impl<'source> Compiler<'source> {
         Ok(())
     }
 
+    // A removed assertion can leave an original empty conditional join. Its
+    // Boolean edges must be copied from that join, not synthesized at codegen.
+    fn optimized_conditional_join(&self, branch: &ruff_python_ast::StmtIf) -> bool {
+        let is_elided = |body: &[Stmt]| {
+            !body.is_empty()
+                && body.iter().all(|stmt| {
+                    matches!(
+                        self.context.optimized_locations.get(&stmt.range()),
+                        Some(super::optimization::OptimizedLocation::Elided),
+                    )
+                })
+        };
+        let linear = |body: &[Stmt]| {
+            is_elided(body)
+                || (suite_has_linear_borrow_fallthrough(body)
+                    && body.iter().all(|stmt| !matches!(stmt, Stmt::Pass(_))))
+        };
+        let valid_test = |test: &Expr| {
+            condition_has_linear_runtime_leaves(test) && !expression_suspends_current_scope(test)
+        };
+        let clauses = &branch.elif_else_clauses;
+        let has_elided =
+            is_elided(&branch.body) || clauses.iter().any(|clause| is_elided(&clause.body));
+        let has_boolean = matches!(branch.test.as_ref(), Expr::BoolOp(_))
+            || clauses
+                .iter()
+                .any(|clause| matches!(clause.test.as_ref(), Some(Expr::BoolOp(_))));
+        has_elided
+            && has_boolean
+            && valid_test(&branch.test)
+            && linear(&branch.body)
+            && clauses
+                .iter()
+                .all(|clause| clause.test.as_ref().is_none_or(valid_test) && linear(&clause.body))
+    }
+
+    fn optimized_iterator_if_join(
+        &self,
+        statement: &ruff_python_ast::StmtFor,
+    ) -> Option<TextRange> {
+        if self.context.python_version < crate::PythonVersion::Py314
+            || !matches!(self.unit.scope, Scope::Function { .. })
+            || self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+            || !self.control.loops.contexts.is_empty()
+            || self.has_active_control_flow_region()
+            || !self.control.withs.active_with_exits.is_empty()
+            || self.control.in_exception_handler()
+            || self.control.finally.active_finally_try_bodies != 0
+            || self.control.finally.active_normal_finally_bodies != 0
+            || self.control.finally.active_copied_finally_bodies != 0
+            || self.control.finally.active_finally_end_blocks != 0
+        {
+            return None;
+        }
+        let [Stmt::If(branch)] = statement.body.as_slice() else {
+            return None;
+        };
+        self.optimized_conditional_join(branch)
+            .then_some(branch.range)
+    }
+
     fn compile_for(&mut self, statement: &ruff_python_ast::StmtFor) -> Result<(), CompileError> {
         use super::legacy_native_labels::NativeRole;
 
@@ -17591,6 +17757,7 @@ impl<'source> Compiler<'source> {
                 .then(|| first_coroutine_iterator_assignment_condition(&statement.body))
                 .flatten()
             });
+        let native_elided_loop_if = self.optimized_iterator_if_join(statement);
         let tail_jumps = self.with_loop_context(context, |compiler| {
             compiler.with_control_override(
                 |control| &mut control.loops.first_iterator_assignment_condition,
@@ -17599,7 +17766,18 @@ impl<'source> Compiler<'source> {
                     compiler.with_control_override(
                         |control| &mut control.loops.first_iterator_loop_assertion,
                         first_iterator_loop_assertion,
-                        |compiler| compiler.compile_loop_tail_suite(&statement.body, start, true),
+                        |compiler| {
+                            if native_elided_loop_if.is_some() {
+                                compiler.with_control_override(
+                                    |control| &mut control.loops.uncopied_loop_tail_statement,
+                                    native_elided_loop_if,
+                                    |compiler| compiler.compile_suite(&statement.body),
+                                )?;
+                                Ok(LoopBackedge::Required)
+                            } else {
+                                compiler.compile_loop_tail_suite(&statement.body, start, true)
+                            }
+                        },
                     )
                 },
             )
@@ -17612,7 +17790,9 @@ impl<'source> Compiler<'source> {
                     && !self
                         .assembler
                         .current_join_has_located_compacted_predecessor();
-            if self.context.python_version == crate::PythonVersion::Py312
+            if native_elided_loop_if.is_some() {
+                self.assembler.set_location(SourceLocation::NONE);
+            } else if self.context.python_version == crate::PythonVersion::Py312
                 && self.assembler.last_instruction_is_nop()
             {
                 // Keep the real body NOP until native 3.12 removes same-line NOPs
@@ -18735,6 +18915,14 @@ impl<'source> Compiler<'source> {
                 Some(super::optimization::OptimizedLocation::Elided)
             )
         });
+        // A no-op protected body at the loop tail donates its setup location to
+        // the loop backedge, so that backedge can replace the original setup NOP.
+        let empty_try_falls_through_to_loop_backedge = self.context.python_version
+            >= crate::PythonVersion::Py314
+            && body_has_elided_assertion
+            && statement.orelse.is_empty()
+            && self.control.loops.uncopied_loop_tail_statement == Some(statement.range)
+            && self.control.in_loop_tail_without_nested_cleanup();
         // CPython folds every successful arm of a trailing nested conversion chain directly onto
         // the iterator backedge. Restrict that layout to recursive one-call try/except/else arms
         // so ordinary nested handlers keep their shared joins.
@@ -20150,7 +20338,10 @@ impl<'source> Compiler<'source> {
             location
         };
         if (preserve_empty_try_setup
-            || (body_has_elided_assertion && !terminal && emit_statement_nop))
+            || (body_has_elided_assertion
+                && !terminal
+                && emit_statement_nop
+                && !empty_try_falls_through_to_loop_backedge))
             && body_noop_location.is_some()
         {
             // SETUP survives native reachability for same-line Pass and erased assertions.
@@ -21095,7 +21286,10 @@ impl<'source> Compiler<'source> {
             // retain the normal jump's exception owner.
             // Legacy passes retain the original empty-body exit jump's owner
             // until actual copying replaces it with the owner's donor record.
-            let exception_policy = if !coroutine_nested_pass_exit
+            let loop_tail_inherits_outer_owner =
+                empty_try_falls_through_to_loop_backedge && body_noop_location.is_some();
+            let exception_policy = if !loop_tail_inherits_outer_owner
+                && !coroutine_nested_pass_exit
                 && (exclude_nested_normal_exit
                     || (body_has_elided_assertion
                         && body_noop_location.is_some()
@@ -21116,11 +21310,12 @@ impl<'source> Compiler<'source> {
             } else {
                 ExceptionPolicy::default()
             };
-            let exit_exclusion_start = if !self
-                .control
-                .exceptions
-                .active_exception_region_exclusions
-                .is_empty()
+            let exit_exclusion_start = if !loop_tail_inherits_outer_owner
+                && !self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
                 && (body_ends_with_overridden_return
                     || (body_noop_location.is_some()
                         && self.context.python_version >= crate::PythonVersion::Py314
@@ -28341,7 +28536,15 @@ impl<'source> Compiler<'source> {
                 } else {
                     &statement.orelse
                 })
-                .last()
+                .iter()
+                .rev()
+                .find(|statement| {
+                    !matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))
+                        && !matches!(
+                            self.context.optimized_locations.get(&statement.range()),
+                            Some(super::optimization::OptimizedLocation::Elided)
+                        )
+                })
                 .is_some_and(|last| match last {
                     Stmt::Expr(expression) => {
                         self.context.fold_constant(&expression.value).is_none()

@@ -928,8 +928,37 @@ impl<'source> Compiler<'source> {
         self.compile_scope_suite(body, add_implicit_return, has_docstring)?;
         let add_implicit_return =
             add_implicit_return && !self.control.statements.emitted_fallthrough_return;
+        // Elided statements must not hide the comprehension assignment that
+        // owns the implicit-return location.
+        let terminal_statement = body.last();
+        let is_elided_statement = |statement: &Stmt| {
+            matches!(statement, Stmt::Global(global) if global.names.is_empty())
+                && matches!(
+                    self.context.optimized_locations.get(&statement.range()),
+                    Some(super::optimization::OptimizedLocation::Elided)
+                )
+        };
+        let return_location_statement = if self.context.python_version >= PythonVersion::Py314
+            && terminal_statement.is_some_and(is_elided_statement)
+        {
+            body.iter()
+                .rev()
+                .find(|statement| !is_elided_statement(statement))
+                .filter(|statement| {
+                    let Stmt::Assign(assignment) = statement else {
+                        return false;
+                    };
+                    matches!(
+                        assignment.value.as_ref(),
+                        Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)
+                    )
+                })
+                .or(terminal_statement)
+        } else {
+            terminal_statement
+        };
         if add_implicit_return
-            && body.last().is_some_and(|statement| {
+            && let Some(statement) = return_location_statement.filter(|statement| {
                 terminal_statement_uses_implicit_return_location(
                     statement,
                     self.context.python_version,
@@ -937,9 +966,8 @@ impl<'source> Compiler<'source> {
                 )
             })
         {
-            self.assembler.set_location(
-                self.source_location(implicit_return_range(&self, body.last().unwrap())),
-            );
+            self.assembler
+                .set_location(self.source_location(implicit_return_range(&self, statement)));
         } else if self.assembler.instruction_count() > body_start {
             self.assembler.set_location(SourceLocation::NONE);
         } else if let Some(statement @ Stmt::Pass(_)) = body.last() {
