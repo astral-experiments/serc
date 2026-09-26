@@ -1551,6 +1551,22 @@ pub(super) fn python_constant_values_equal(left: &Constant, right: &Constant) ->
     ConstantEquality::PythonValue.equal(left, right)
 }
 
+/// Return a canonical integer value for numeric constants that compare equal to an integer.
+pub(super) fn python_integer_value_key(value: &Constant) -> Option<(bool, Vec<u16>)> {
+    let (real, imaginary) = numeric_parts(value)?;
+    if imaginary.to_bits() & 0x7fff_ffff_ffff_ffff != 0 {
+        return None;
+    }
+    let real = match real {
+        NumericReal::Float(value) => float_integer_numeric_real(value)?,
+        integer => integer,
+    };
+    match real {
+        NumericReal::Integer { negative, digits } => Some((negative, digits)),
+        NumericReal::Float(_) => None,
+    }
+}
+
 /// Preserve the first representative of each Python-equal frozenset member.
 pub(super) fn unique_frozenset_constants<T: Borrow<Constant>>(
     constants: impl IntoIterator<Item = T>,
