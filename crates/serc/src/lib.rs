@@ -521,6 +521,7 @@ fn compile_normalized(
             parsed.suite(),
             parsed.tokens(),
             error.location,
+            &parsed.errors()[1..],
         ) {
             return Err(CompileError::ParseDiagnostic {
                 error: error.clone(),

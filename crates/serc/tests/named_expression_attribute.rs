@@ -31,6 +31,8 @@ fn assignment_expression_attribute_diagnostic() {
             ("[obj.attr := 1]", "obj.attr"),
             ("{obj.attr := 1}", "obj.attr"),
             ("obj[obj.attr := 1]", "obj.attr"),
+            ("obj[obj.attr := 1, 2]", "obj.attr"),
+            ("match obj.attr := 1, 2:\n case _: pass", "obj.attr"),
             ("(obj.attr := 1)", "obj.attr"),
         ] {
             let error = compile_with_options(source, "attribute.py", &options).unwrap_err();
@@ -62,6 +64,8 @@ fn assignment_expression_attribute_diagnostic() {
             "f(k=obj.attr := 1)",
             "{0: obj.attr := 1}",
             "x = obj.attr := 1",
+            "x = first, obj.attr := 1",
+            "def f():\n return first, obj.attr := 1",
             "x: int = obj.attr := 1",
             "x += obj.attr := 1",
             "def f():\n return obj.attr := 1",
@@ -69,6 +73,10 @@ fn assignment_expression_attribute_diagnostic() {
             "assert obj.attr := 1",
             "for x in obj.attr := 1: pass",
             "with obj.attr := 1: pass",
+            "(obj.attr := (other[0] := 1))",
+            "(obj.attr := ((1 + 2) := 1))",
+            "f((obj.attr := 1), [)",
+            "(obj.attr := 1)\n\"unterminated",
         ] {
             let error = compile_with_options(source, "other.py", &options).unwrap_err();
             assert!(matches!(error, CompileError::Parse(_)), "{source}: {error}");
