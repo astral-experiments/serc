@@ -184,7 +184,7 @@ fn invalid_return_expressions_precede_except_star_transfer_errors() {
             (
                 "await value",
                 "'await' outside async function",
-                "'await' outside function",
+                "'await' outside async function",
             ),
         ] {
             let source =
