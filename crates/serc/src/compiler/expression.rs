@@ -779,9 +779,36 @@ impl Compiler<'_> {
                 }
             }
             if !guard_always_false {
+                // A terminal class or OR case with an erased body keeps its
+                // copied-subject pop and success return unlocated in a plain function.
+                let elided_case_body = self.context.python_version >= PythonVersion::Py314
+                    && terminal
+                    && copied_subject
+                    && matches!(case.pattern, Pattern::MatchClass(_) | Pattern::MatchOr(_))
+                    && case.guard.is_none()
+                    && matches!(self.unit.scope, Scope::Function { .. })
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && !self.control.in_loop()
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty()
+                    && self.control.withs.active_with_region_exclusions.is_empty()
+                    && !self.control.in_exception_handler()
+                    && self.control.finally.is_inactive_for_return_unwind()
+                    && !case.body.is_empty()
+                    && case.body.iter().all(|statement| {
+                        matches!(
+                            self.context.optimized_locations.get(&statement.range()),
+                            Some(super::optimization::OptimizedLocation::Elided)
+                        )
+                    });
                 if copied_subject {
                     let location = if self.context.python_version <= PythonVersion::Py313 {
                         self.source_location(case.pattern.range())
+                    } else if elided_case_body {
+                        SourceLocation::NONE
                     } else {
                         case.body.first().map_or(SourceLocation::NONE, |statement| {
                             self.source_location(statement_execution_range(
@@ -792,6 +819,9 @@ impl Compiler<'_> {
                     };
                     self.assembler.set_location(location);
                     self.emit(POP_TOP, 0, -1)?;
+                    if elided_case_body {
+                        self.assembler.preserve_last_no_location();
+                    }
                     if self.context.python_version >= PythonVersion::Py314 {
                         self.assembler.use_next_location_for_last_instruction();
                     }
@@ -943,6 +973,9 @@ impl Compiler<'_> {
                         self.set_branch_end_location(&case.body, body_start);
                     }
                     self.set_match_case_backedge_location(&case.body);
+                    if elided_case_body {
+                        self.assembler.set_location(SourceLocation::NONE);
+                    }
                     if self.context.python_version <= crate::PythonVersion::Py313
                         || (terminal && terminal_for_break_exit_inherits_predecessor(&case.body))
                     {
@@ -952,6 +985,9 @@ impl Compiler<'_> {
                     }
                     if terminal {
                         self.emit_deferred_implicit_return()?;
+                        if elided_case_body {
+                            self.assembler.preserve_last_no_location();
+                        }
                         // CPython copies the implicit return onto the original case-success
                         // jump before considering copies onto an OR pattern's success edges.
                         self.assembler.add_last_inlined_jump_slot();

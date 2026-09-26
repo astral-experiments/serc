@@ -528,7 +528,7 @@ pub(super) struct FinallyState<'ast> {
 
 impl FinallyState<'_> {
     /// No finally cleanup or preserved return value must be interleaved with this unwind.
-    fn is_inactive_for_return_unwind(&self) -> bool {
+    pub(super) fn is_inactive_for_return_unwind(&self) -> bool {
         self.active_return_finally_contexts.is_empty()
             && self.active_loop_finally_contexts.is_empty()
             && self.active_pass_finally_locations.is_empty()

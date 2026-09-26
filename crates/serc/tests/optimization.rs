@@ -2818,3 +2818,88 @@ print(outcome, events)
         }
     }
 }
+
+#[test]
+fn elided_match_case_assertions_keep_success_locations() {
+    for source in [
+        r"def f(x, y):
+    match x:
+        case False:
+            work()
+        case str():
+            assert x
+        case True:
+            work()
+",
+        r"def f(x, y):
+    match x:
+        case False:
+            work()
+        case str(v):
+            assert x
+            assert y
+        case True:
+            work()
+",
+        r"def f(x, y):
+    match x:
+        case [1] | [2]:
+            assert x
+        case False:
+            work()
+        case True:
+            work()
+",
+        r"def f(x, y):
+    match x:
+        case False:
+            work()
+        case 1:
+            assert x
+        case True:
+            work()
+",
+        r"def f(x, y):
+    match x:
+        case False:
+            work()
+        case str():
+            assert x
+            pass
+        case True:
+            work()
+",
+        r"def f(x, y):
+    match x:
+        case False:
+            work()
+        case str() if y:
+            assert (v := x)
+        case True:
+            work()
+",
+        r"def f(x, y):
+    global v
+    match x:
+        case False:
+            work()
+        case str():
+            assert (v := x)
+            assert y
+        case True:
+            work()
+",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "sub/elided_match.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+}
