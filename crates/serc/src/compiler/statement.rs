@@ -1775,7 +1775,14 @@ impl<'source> Compiler<'source> {
                     )
                 })
                 && matches!(statement, Stmt::If(conditional)
-                    if conditional.elif_else_clauses.is_empty()
+                    if (conditional.elif_else_clauses.is_empty()
+                        || matches!(conditional.elif_else_clauses.as_slice(), [clause]
+                            if clause.test.is_none()
+                                && !clause.body.is_empty()
+                                && clause.body.iter().all(|statement| matches!(
+                                    self.context.optimized_locations.get(&statement.range()),
+                                    Some(super::optimization::OptimizedLocation::Elided)
+                                ))))
                         && condition_has_linear_runtime_leaves(&conditional.test)
                         && !expression_suspends_current_scope(&conditional.test)
                         && (suite_has_linear_borrow_fallthrough(&conditional.body)
