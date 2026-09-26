@@ -62,7 +62,7 @@ fn compare_in_context_for(
         };
         let executable = std::env::var_os(variable).unwrap_or_else(|| fallback.into());
         let identity = Command::new(&executable)
-            .args(["-I", "-S", "-c", "import importlib.util, sys; print(sys.implementation.name, sys.version.split()[0], importlib.util.MAGIC_NUMBER.hex())"])
+            .args(["-I", "-S", "-c", "import importlib.util, sys; sys.stdout.buffer.write((sys.implementation.name + ' ' + sys.version.split()[0] + ' ' + importlib.util.MAGIC_NUMBER.hex() + '\\n').encode('ascii'))"])
             .output().unwrap();
         let target = version.target();
         let expected = format!(
