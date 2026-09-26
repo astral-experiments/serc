@@ -239,10 +239,6 @@ fn declarations_precede_unreachable_pattern_lowering_but_not_existing_symbol_err
             "match subject:\n    case [x | x]: pass\nvalue = 1\nglobal value\n",
             "name 'value' is assigned to before global declaration",
         ),
-        (
-            "def f():\n    match subject:\n        case [x | x, __debug__]: pass\n    value = 1\n    global value\n",
-            "cannot assign to",
-        ),
     ] {
         let expected = python_3145_command()
             .args([
@@ -271,6 +267,76 @@ fn declarations_precede_unreachable_pattern_lowering_but_not_existing_symbol_err
             assert!(
                 message.contains(diagnostic),
                 "{python_version:?}: {source}: {message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn reserved_pattern_capture_and_declarations_follow_target_phase_order() {
+    for (source, legacy_message, modern_message, legacy_span, modern_span) in [
+        (
+            "def f():\n    match subject:\n        case [x | x, __debug__]: pass\n    value = 1\n    global value\n",
+            "name 'value' is assigned to before global declaration",
+            "cannot assign to __debug__",
+            "global value",
+            "__debug__",
+        ),
+        (
+            "def f():\n    value = 1\n    global value\n    match subject:\n        case [x | x, __debug__]: pass\n",
+            "name 'value' is assigned to before global declaration",
+            "name 'value' is assigned to before global declaration",
+            "global value",
+            "global value",
+        ),
+        (
+            "def f():\n    match subject:\n        case [x | x, __debug__]: pass\n    nonlocal value\n",
+            "no binding for nonlocal 'value' found",
+            "cannot assign to __debug__",
+            "nonlocal value",
+            "__debug__",
+        ),
+        (
+            "def f():\n    nonlocal value\n    match subject:\n        case [x | x, __debug__]: pass\n",
+            "no binding for nonlocal 'value' found",
+            "cannot assign to __debug__",
+            "nonlocal value",
+            "__debug__",
+        ),
+    ] {
+        let expected = python_3145_command()
+            .args([
+                "-c",
+                "import sys; compile(sys.argv[1], 'semantic.py', 'exec')",
+                source,
+            ])
+            .output()
+            .unwrap();
+        assert!(!expected.status.success(), "CPython accepted {source}");
+        assert!(String::from_utf8_lossy(&expected.stderr).contains(modern_message));
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let options = CompileOptions {
+                python_version,
+                ..CompileOptions::default()
+            };
+            let error = compile_with_options(source, "semantic.py", &options).unwrap_err();
+            let CompileError::InvalidSyntax { message, range } = error else {
+                panic!("expected a symbol diagnostic for {source:?}, got {error:?}");
+            };
+            let (expected_message, expected_span) = if python_version < PythonVersion::Py314 {
+                (legacy_message, legacy_span)
+            } else {
+                (modern_message, modern_span)
+            };
+            assert_eq!(message, expected_message, "{python_version:?}: {source}");
+            assert_eq!(
+                &source[range], expected_span,
+                "{python_version:?}: {source}"
             );
         }
     }
