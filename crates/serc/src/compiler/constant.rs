@@ -1597,11 +1597,7 @@ pub(super) fn python_numeric_value_key(value: &Constant) -> Option<PythonNumeric
 
 fn normalized_float_zero(value: f64) -> u64 {
     let bits = value.to_bits();
-    if bits.trailing_zeros() >= 63 {
-        0
-    } else {
-        bits
-    }
+    if bits.trailing_zeros() >= 63 { 0 } else { bits }
 }
 
 /// Preserve the first representative of each Python-equal frozenset member.
