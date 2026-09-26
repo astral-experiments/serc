@@ -6,6 +6,7 @@
 
 mod assembler;
 mod code_object;
+mod compilation_effects;
 mod compiler;
 mod config;
 mod delimiter_nesting;
@@ -18,8 +19,14 @@ mod target;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
+use std::rc::Rc;
 
 use code_object::{CodeFilename, CodeObject};
+use compilation_effects::WarningRun;
+pub use compilation_effects::{
+    CompilationWarning, CompilationWarningEffect, CompilationWarningEffects,
+    CompilationWarningPhase, PreparedCompilation,
+};
 use compiler::Compiler;
 pub use config::{CompileOptions, NativeBuildProfile, ParsePythonVersionError, PythonVersion};
 pub use initial_intern_state::InitialInternState;
@@ -181,7 +188,9 @@ pub enum CompileError {
     },
     /// The source uses valid Python syntax that this backend does not support yet.
     Unsupported(String),
-    /// Initial intern-state uncertainty can affect serialized object identity.
+    /// The supplied warning effects do not match their immutable compilation plan.
+    InvalidCompilationEffects(String),
+    /// Intern-state uncertainty can affect serialized object identity.
     UnresolvedInternState {
         /// The string whose prior canonical identity is unknown.
         value: String,
@@ -201,6 +210,7 @@ impl CompileError {
             Self::InvalidFilename
             | Self::Decode(_)
             | Self::Unsupported(_)
+            | Self::InvalidCompilationEffects(_)
             | Self::UnresolvedInternState { .. }
             | Self::Internal(_) => None,
         }
@@ -224,9 +234,11 @@ impl fmt::Display for CompileError {
                 write!(formatter, "failed to parse Python source: {message}")
             }
             Self::InvalidDocstring { message, .. } => formatter.write_str(message),
-            Self::Unsupported(message) => formatter.write_str(message),
+            Self::Unsupported(message) | Self::InvalidCompilationEffects(message) => {
+                formatter.write_str(message)
+            }
             Self::UnresolvedInternState { value } => {
-                write!(formatter, "unresolved initial intern state for {value:?}")
+                write!(formatter, "unresolved string intern state for {value:?}")
             }
             Self::Internal(message) => write!(formatter, "internal compiler error: {message}"),
         }
@@ -243,6 +255,7 @@ impl Error for CompileError {
             | Self::InvalidSyntax { .. }
             | Self::InvalidDocstring { .. }
             | Self::Unsupported(_)
+            | Self::InvalidCompilationEffects(_)
             | Self::UnresolvedInternState { .. }
             | Self::Internal(_) => None,
         }
@@ -274,12 +287,26 @@ pub fn compile_with_intern_state(
 }
 
 /// Compile a Python module using the selected target and initial string intern state.
+///
+/// Native warning callbacks can change canonical string ownership during compilation.
+/// If unknown callback effects can change serialized bytes, this returns
+/// [`CompileError::UnresolvedInternState`]. Use [`PreparedCompilation`] to supply
+/// explicit effects for the exact source, filename, target, and warning sequence.
 pub fn compile_with_options(
     source: &str,
     filename: &str,
     options: &CompileOptions,
 ) -> Result<CompiledModule, CompileError> {
     validate_filename(filename)?;
+    compile_text_source(source, filename.into(), options, None)
+}
+
+fn compile_text_source(
+    source: &str,
+    filename: CodeFilename,
+    options: &CompileOptions,
+    warnings: Option<Rc<WarningRun>>,
+) -> Result<CompiledModule, CompileError> {
     if source.contains('\0') {
         return Err(CompileError::Decode(SourceDecodeError::NullByte));
     }
@@ -292,7 +319,7 @@ pub fn compile_with_options(
         ));
     }
     let source = source::normalize_source(source);
-    compile_normalized(&source, filename.into(), options)
+    compile_normalized(&source, filename, options, warnings)
 }
 
 /// Decode and compile Python source bytes for CPython 3.14.5.
@@ -327,6 +354,8 @@ pub fn compile_bytes_with_intern_state(
 /// This function performs no filesystem I/O. See [`decode_source`] for source encoding behavior.
 /// The initial intern state describes the state before byte-source decoding; by default,
 /// standard codec imports and successful codec lookups contribute retained strings.
+/// Warning effects have the same contract as [`compile_with_options`];
+/// [`PreparedCompilation::bytes`] binds supplied effects to the original raw bytes.
 pub fn compile_bytes_with_options(
     source: &[u8],
     filename: &str,
@@ -357,18 +386,27 @@ fn compile_byte_source(
     filename: CodeFilename,
     options: &CompileOptions,
 ) -> Result<CompiledModule, CompileError> {
+    compile_byte_source_with_warnings(source, filename, options, None)
+}
+
+fn compile_byte_source_with_warnings(
+    source: &[u8],
+    filename: CodeFilename,
+    options: &CompileOptions,
+    warnings: Option<Rc<WarningRun>>,
+) -> Result<CompiledModule, CompileError> {
     let decoded = source::decode_source_with_codec(source).map_err(CompileError::Decode)?;
     if !options
         .initial_intern_state
         .models_standard_source_codec_effects()
     {
-        return compile_normalized(&decoded.source, filename, options);
+        return compile_normalized(&decoded.source, filename, options, warnings);
     }
     let strings = decoded.codec.map_or(&[][..], |codec| {
         target::source_codec_strings(options.python_version, codec)
     });
     if strings.is_empty() && decoded.registry_name.is_none() {
-        return compile_normalized(&decoded.source, filename, options);
+        return compile_normalized(&decoded.source, filename, options, warnings);
     }
     let state = options.initial_intern_state.with_additional_strings(
         strings
@@ -383,6 +421,7 @@ fn compile_byte_source(
             initial_intern_state: state,
             ..options.clone()
         },
+        warnings,
     )
 }
 
@@ -473,9 +512,10 @@ fn compile_normalized(
     source: &str,
     filename: CodeFilename,
     options: &CompileOptions,
+    warnings: Option<Rc<WarningRun>>,
 ) -> Result<CompiledModule, CompileError> {
     if stack_growth_required() {
-        return grow_stack(|| compile_normalized(source, filename, options));
+        return grow_stack(|| compile_normalized(source, filename, options, warnings));
     }
     options
         .native_build_profile
@@ -501,20 +541,24 @@ fn compile_normalized(
         return Err(CompileError::invalid_syntax(error.to_string(), error.range));
     }
     compiler::syntax::validate(source, parsed.suite(), options.python_version)?;
-    let code = Compiler::module_with_profile(
+    let validate_effects = warnings.as_ref().is_none_or(|run| !run.is_discovery());
+    let code = Compiler::module_with_warning_effects(
         filename,
         source,
         parsed.tokens(),
         parsed.suite(),
         options.python_version,
         options.native_build_profile,
+        warnings,
     )
     .compile_module(parsed.suite())?;
-    marshal::validate_initial_intern_state(
-        &code,
-        options.python_version,
-        &options.initial_intern_state,
-    )?;
+    if validate_effects {
+        marshal::validate_initial_intern_state(
+            &code,
+            options.python_version,
+            &options.initial_intern_state,
+        )?;
+    }
     Ok(CompiledModule {
         code,
         python_version: options.python_version,

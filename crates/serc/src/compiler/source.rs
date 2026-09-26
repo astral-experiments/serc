@@ -17,6 +17,7 @@ use ruff_source_file::{LineEnding, LineIndex};
 use ruff_text_size::{Ranged, TextLen, TextRange, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::CompileError;
 use crate::assembler::SourceLocation;
 use crate::code_object::{
     CodeFilename, CodeInterningSummary, CodeObject, CompilationInterningEvent, Constant,
@@ -146,6 +147,11 @@ pub(super) struct CompilationContext<'source> {
     pub(super) requires_empty_bytes_cache_trace: bool,
     empty_bytes_origin: Cell<EmptyBytesOrigin>,
     interning_events: RefCell<Vec<CompilationInterningEvent>>,
+    warning_run: Option<Rc<crate::compilation_effects::WarningRun>>,
+    warning_schedule: RefCell<std::collections::VecDeque<super::warning_schedule::ScheduleEvent>>,
+    unknown_warning_schedule: bool,
+    warning_plan_active: bool,
+    warning_candidates: WarningCandidates,
 }
 
 pub(super) struct CallShape<'a> {
@@ -220,6 +226,7 @@ impl<'source> CompilationContext<'source> {
         };
         let mut source_analysis = SourceAnalysis::new(python_version, name_capacity);
         let scopes = ScopeArena::analyze_with_source(body, python_version, &mut source_analysis);
+        let warning_candidates = std::mem::take(&mut source_analysis.warning_candidates);
         let mut generated_mangled_strings = FxHashSet::default();
         let mut requires_interning_trace = false;
         let mut static_attribute_names = FxHashSet::default();
@@ -268,6 +275,134 @@ impl<'source> CompilationContext<'source> {
             requires_empty_bytes_cache_trace,
             empty_bytes_origin: Cell::default(),
             interning_events: RefCell::new(Vec::new()),
+            warning_run: None,
+            warning_schedule: RefCell::default(),
+            unknown_warning_schedule: false,
+            warning_plan_active: false,
+            warning_candidates,
+        }
+    }
+
+    /// Enable complete assembly provenance only when native warnings can affect this input.
+    pub(super) fn enable_warning_effects(
+        &mut self,
+        warnings: Option<Rc<crate::compilation_effects::WarningRun>>,
+        body: &[Stmt],
+    ) {
+        let relative_lazy_warning =
+            self.warning_candidates
+                .relative_lazy_imports
+                .iter()
+                .any(|start| {
+                    self.source
+                        .as_bytes()
+                        .get(usize::from(*start).saturating_sub(1))
+                        != Some(&b'.')
+                });
+        let parser = super::parser_warnings::analyze(
+            self.source,
+            self.tokens,
+            self.python_version,
+            relative_lazy_warning,
+        );
+        // Eligibility is collected during the existing scope/source traversal. Ordinary
+        // inputs need neither another AST walk nor a warning plan or effects allocation.
+        let codegen_warnings = self.warning_candidates.codegen
+            || (!self.finally_bodies.is_empty()
+                && !super::warnings::preprocessing(body, self.python_version).is_empty())
+            || (self.warning_candidates.legacy_inversion
+                && super::warnings::legacy_boolean_inversion(body, self.python_version).is_some());
+        if parser.complete && parser.warnings.is_empty() && !codegen_warnings {
+            return;
+        }
+        self.warning_run = Some(warnings.unwrap_or_default());
+        let warnings = self.warning_run.as_ref().unwrap();
+        self.requires_interning_trace = true;
+        self.constant_origins
+            .get_or_insert_with(RefCell::default)
+            .get_mut()
+            .all_strings = true;
+        if parser.complete {
+            for warning in parser.warnings {
+                self.record_warning(warning);
+            }
+        } else {
+            warnings.invalidate_plan(
+                "tokenizer/parser warning invocation order is not modeled for this input",
+            );
+            self.record_interning_event(CompilationInterningEvent::UnknownExternalAdditions);
+        }
+        if codegen_warnings {
+            match super::warning_schedule::WarningSchedule::plan(
+                body,
+                self.source,
+                self.python_version,
+            ) {
+                Ok(schedule) => {
+                    *self.warning_schedule.get_mut() = schedule.events.into();
+                    self.warning_plan_active = true;
+                }
+                Err(error) => {
+                    warnings.invalidate_plan(error.to_string());
+                    self.unknown_warning_schedule = true;
+                }
+            }
+        }
+    }
+
+    /// Apply successful callback additions before the next native interning boundary.
+    fn record_warning_boundary(&self, code: &CodeObject) -> Result<(), CompileError> {
+        if self.unknown_warning_schedule {
+            self.record_interning_event(CompilationInterningEvent::UnknownExternalAdditions);
+            return Ok(());
+        }
+        if !self.warning_plan_active {
+            return Ok(());
+        }
+        let mut schedule = self.warning_schedule.borrow_mut();
+        if schedule.is_empty() {
+            return Err(CompileError::InvalidCompilationEffects(
+                "code assembly after warning plan was exhausted".to_string(),
+            ));
+        }
+        while let Some(event) = schedule.pop_front() {
+            match event {
+                super::warning_schedule::ScheduleEvent::Warning { phase, warning } => {
+                    self.record_warning(crate::CompilationWarning {
+                        ordinal: 0,
+                        phase,
+                        kind: warning.kind.as_str(),
+                        category: "SyntaxWarning",
+                        message: warning.message,
+                        range: warning.range,
+                    });
+                }
+                super::warning_schedule::ScheduleEvent::Assembly(boundary) => {
+                    if !boundary.matches(code) {
+                        return Err(CompileError::InvalidCompilationEffects(format!(
+                            "warning assembly plan expected {} at line {}, received {} at line {}",
+                            boundary.qualname,
+                            boundary.firstlineno,
+                            code.qualified_name,
+                            code.first_line_number,
+                        )));
+                    }
+                    if code.name == "<module>" && !schedule.is_empty() {
+                        return Err(CompileError::InvalidCompilationEffects(
+                            "unconsumed warning assembly plan".to_string(),
+                        ));
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Record one native warning invocation at its compilation boundary.
+    pub(super) fn record_warning(&self, warning: crate::CompilationWarning) {
+        if let Some(run) = &self.warning_run {
+            self.record_interning_event(run.record(warning));
         }
     }
 
@@ -476,7 +611,11 @@ impl<'source> CompilationContext<'source> {
         order
     }
 
-    pub(super) fn record_code_assembly(&self, code: &CodeObject) -> Option<usize> {
+    pub(super) fn record_code_assembly(
+        &self,
+        code: &CodeObject,
+    ) -> Result<Option<usize>, CompileError> {
+        self.record_warning_boundary(code)?;
         if let Some(tuples) = &self.interned_metadata_tuples {
             let mut tuples = tuples.borrow_mut();
             if code.names.iter().any(|name| !name.is_ascii()) {
@@ -517,13 +656,11 @@ impl<'source> CompilationContext<'source> {
             );
         }
         if !self.requires_interning_trace {
-            return None;
+            return Ok(None);
         }
-        Some(
-            self.record_interning_event(CompilationInterningEvent::CodeAssembly(
-                CodeInterningSummary::from_code(code),
-            )),
-        )
+        Ok(Some(self.record_interning_event(
+            CompilationInterningEvent::CodeAssembly(CodeInterningSummary::from_code(code)),
+        )))
     }
 
     pub(super) fn take_interning_events(&self) -> Vec<CompilationInterningEvent> {
@@ -606,6 +743,7 @@ impl<'source> CompilationContext<'source> {
     ) -> (FxHashSet<String>, FxHashSet<String>) {
         let context = Rc::get_mut(context)
             .expect("completed module should exclusively own its compilation context");
+        let has_frozenset_constants = has_frozenset_constants || context.warning_run.is_some();
         let origins = std::mem::take(&mut context.constant_string_origins);
         let mut identifiers = FxHashSet::default();
         if has_frozenset_constants {
@@ -653,6 +791,14 @@ fn can_fold_bytes(expression: &Expr) -> bool {
     }
 }
 
+/// Cheap warning eligibility gathered by the existing source analysis.
+#[derive(Debug, Default)]
+struct WarningCandidates {
+    codegen: bool,
+    legacy_inversion: bool,
+    relative_lazy_imports: Vec<TextSize>,
+}
+
 #[derive(Default)]
 pub(super) struct SourceAnalysis<'ast> {
     python_version: crate::PythonVersion,
@@ -668,6 +814,7 @@ pub(super) struct SourceAnalysis<'ast> {
     static_attribute_names: FxHashSet<String>,
     has_percent_replacement: bool,
     requires_empty_bytes_cache_trace: bool,
+    warning_candidates: WarningCandidates,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -760,6 +907,8 @@ impl<'ast> SourceAnalysis<'ast> {
     }
 
     pub(super) fn observe_stmt(&mut self, statement: &'ast Stmt) {
+        self.warning_candidates.codegen = self.warning_candidates.codegen
+            || super::warnings::statement_has_codegen_warning(statement, self.python_version);
         if let Stmt::Try(statement) = statement
             && !statement.finalbody.is_empty()
         {
@@ -783,6 +932,15 @@ impl<'ast> SourceAnalysis<'ast> {
             }
             Stmt::ImportFrom(import) => {
                 if let Some(module) = &import.module {
+                    if self.python_version == crate::PythonVersion::Py315
+                        && import.level > 0
+                        && !import.is_lazy
+                        && module.as_str() == "lazy"
+                    {
+                        self.warning_candidates
+                            .relative_lazy_imports
+                            .push(module.start());
+                    }
                     for component in module.as_str().split('.') {
                         self.record_raw_name(component);
                     }
@@ -861,6 +1019,11 @@ impl<'ast> SourceAnalysis<'ast> {
     }
 
     pub(super) fn observe_expr(&mut self, expression: &'ast Expr) {
+        self.warning_candidates.codegen = self.warning_candidates.codegen
+            || super::warnings::expression_has_codegen_warning(expression, self.python_version);
+        self.warning_candidates.legacy_inversion |= self.python_version
+            <= crate::PythonVersion::Py313
+            && matches!(expression, Expr::UnaryOp(unary) if unary.op == ruff_python_ast::UnaryOp::Invert);
         match expression {
             Expr::Name(name) => {
                 self.record_raw_name(name.id.as_str());
@@ -2794,6 +2957,82 @@ mod tests {
                     "{version:?} {source}: {actual:?}",
                 );
             }
+        }
+    }
+
+    #[test]
+    fn ordinary_sources_keep_sparse_provenance_without_warning_allocations() {
+        for source in [
+            "def f(value):\n    return value.method(1) + value.items[0]\n",
+            "try:\n    run()\nfinally:\n    cleanup()\n",
+            "value = ~mask\ntext = r'\\z'\n",
+        ] {
+            let parsed = ruff_python_parser::parse_module(source).unwrap();
+            for version in [
+                crate::PythonVersion::Py312,
+                crate::PythonVersion::Py313,
+                crate::PythonVersion::Py314,
+                crate::PythonVersion::Py315,
+            ] {
+                let mut context = CompilationContext::with_python_version(
+                    "ordinary.py".into(),
+                    source,
+                    parsed.tokens(),
+                    parsed.suite(),
+                    version,
+                );
+                context.enable_warning_effects(None, parsed.suite());
+                assert!(context.warning_run.is_none(), "{version:?}: {source}");
+                assert!(!context.warning_plan_active);
+                assert!(!context.requires_interning_trace);
+                assert!(context.constant_origins.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn source_warning_gate_covers_nested_and_discarded_suites() {
+        for source in [
+            "def f():\n    return\n    assert (1, 2)\n",
+            "class C:\n    def f(self):\n        return (1 is 1)\n",
+            "value: (1())\n",
+            "if False:\n    value = 1[0]\n",
+            "value = (item for item in things if 1 is 1)\n",
+        ] {
+            let parsed = ruff_python_parser::parse_module(source).unwrap();
+            for version in [
+                crate::PythonVersion::Py312,
+                crate::PythonVersion::Py313,
+                crate::PythonVersion::Py314,
+                crate::PythonVersion::Py315,
+            ] {
+                let mut context = CompilationContext::with_python_version(
+                    "nested.py".into(),
+                    source,
+                    parsed.tokens(),
+                    parsed.suite(),
+                    version,
+                );
+                context.enable_warning_effects(None, parsed.suite());
+                assert!(context.warning_run.is_some(), "{version:?}: {source}");
+                assert!(context.requires_interning_trace);
+            }
+        }
+        for source in [
+            "from . lazy import item\n",
+            "if True:\n    from . ｌａｚｙ import item\n",
+        ] {
+            assert!(matches!(
+                crate::PreparedCompilation::text(
+                    source,
+                    "lazy.py",
+                    &crate::CompileOptions {
+                        python_version: crate::PythonVersion::Py315,
+                        ..crate::CompileOptions::default()
+                    }
+                ),
+                Err(crate::CompileError::InvalidCompilationEffects(_))
+            ));
         }
     }
 

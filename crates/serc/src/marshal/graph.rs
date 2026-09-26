@@ -16,7 +16,7 @@ use super::key::{
     FrozenSetMembers, HashedObjectKey, ObjectKey, code_bytes_key, code_key, constant_key,
     constants_tuple_key, frozen_set_members_in_wire_order, frozen_set_members_with_properties,
     is_cached_character, local_kinds_key, locals_tuple_key, names_tuple_key, should_intern,
-    strings_tuple_key,
+    slice_member_uses_identity_for, strings_tuple_key,
 };
 use super::plan::{MarshalVisitor, ObjectId, ReferenceId, ReferenceMode, traverse_code};
 
@@ -271,6 +271,7 @@ impl<'a> GraphPreprocessing<'a> {
             python_version,
             initial_intern_state,
             &mut recreated_frozensets,
+            &mut explicitly_interned,
         )
         .expect("compiled module must have resolved byte-relevant intern state");
         let aliases = GraphAliases {
@@ -928,7 +929,7 @@ fn collect_explicitly_interned<'a>(
             &mut qualified_names,
         )
     };
-    if qualified_names.origins.is_empty() {
+    if qualified_names.origins.is_empty() || has_external_interning_events(code) {
         return frozenset_recreation_need;
     }
 
@@ -1300,9 +1301,12 @@ struct InternedStrings<'code, 'state> {
     python_version: PythonVersion,
     added: FxHashSet<&'code str>,
     possibly_added: FxHashSet<&'code str>,
+    unknown_additions_seen: bool,
+    conservative_replay: bool,
     partial: Option<PartialInternDependencies<'code>>,
     uncertain_origins: FxHashSet<&'code str>,
     unresolved_frozenset: Option<&'code str>,
+    qualified_name_origins: FxHashMap<&'code str, Option<bool>>,
 }
 
 impl<'code, 'state> InternedStrings<'code, 'state> {
@@ -1316,9 +1320,12 @@ impl<'code, 'state> InternedStrings<'code, 'state> {
             python_version,
             added: FxHashSet::default(),
             possibly_added: FxHashSet::default(),
+            unknown_additions_seen: false,
+            conservative_replay: initial.has_unknown_entries() || partial.is_some(),
             partial,
             uncertain_origins: FxHashSet::default(),
             unresolved_frozenset: None,
+            qualified_name_origins: FxHashMap::default(),
         }
     }
 
@@ -1327,7 +1334,11 @@ impl<'code, 'state> InternedStrings<'code, 'state> {
             Some(true)
         } else {
             match self.initial.membership_for(self.python_version, value) {
-                Some(false) if self.possibly_added.contains(value) => None,
+                Some(false)
+                    if self.unknown_additions_seen || self.possibly_added.contains(value) =>
+                {
+                    None
+                }
                 membership => membership,
             }
         }
@@ -1337,6 +1348,29 @@ impl<'code, 'state> InternedStrings<'code, 'state> {
         self.partial
             .as_ref()
             .is_none_or(|partial| partial.strings.contains(value))
+    }
+
+    fn models_uncertainty(&self) -> bool {
+        // Lossy summaries cannot establish retained ownership, even before a later
+        // unknown event. Membership itself remains phase-local in `contains`.
+        self.conservative_replay
+    }
+
+    /// Resolve the cached class scalar when metadata first attempts to intern that object.
+    fn intern_qualified_name(&mut self, value: &'code str, candidate: Option<bool>) {
+        if !should_intern(value)
+            && let Some(candidate) = candidate
+            && !self.qualified_name_origins.contains_key(value)
+        {
+            let canonical = if candidate {
+                self.contains(value).map(|present| !present)
+            } else {
+                Some(false)
+            };
+            // Later retained additions establish membership, not which object won earlier.
+            self.qualified_name_origins.insert(value, canonical);
+        }
+        self.insert(value);
     }
 
     fn record_unresolved_frozenset(&mut self, constant: &Constant, value: &'code str) {
@@ -1367,10 +1401,10 @@ pub(crate) fn validate_initial_intern_state(
     python_version: PythonVersion,
     initial_intern_state: &InitialInternState,
 ) -> Result<(), CompileError> {
-    if !initial_intern_state.has_unknown_entries() {
+    if !initial_intern_state.has_unknown_entries() && !has_external_interning_events(code) {
         return Ok(());
     }
-    if python_version != PythonVersion::Py312 {
+    if python_version != PythonVersion::Py312 && !has_external_interning_events(code) {
         validate_qualified_name_intern_state(code, python_version, initial_intern_state)?;
     }
     collect_recreated_frozensets(
@@ -1378,6 +1412,7 @@ pub(crate) fn validate_initial_intern_state(
         frozenset_recreation_need(code, python_version),
         python_version,
         initial_intern_state,
+        &mut FxHashSet::default(),
         &mut FxHashSet::default(),
     )
 }
@@ -1601,13 +1636,17 @@ fn frozenset_intern_dependencies(
     dependencies
 }
 
-fn collect_recreated_frozensets(
-    code: &CodeObject,
+fn collect_recreated_frozensets<'a>(
+    code: &'a CodeObject,
     need: FrozensetRecreationNeed,
     python_version: PythonVersion,
     initial_intern_state: &InitialInternState,
     values: &mut FxHashSet<usize>,
+    qualified_name_constants: &mut FxHashSet<&'a str>,
 ) -> Result<(), CompileError> {
+    let replay_qualified_names = python_version != PythonVersion::Py312
+        && has_external_interning_events(code)
+        && has_qualified_name_interning_dependencies(code);
     // A complete state may omit built-in entries whose later identifier interning
     // still matters. Keep the existing shortcuts for supplemental states.
     let need =
@@ -1617,7 +1656,7 @@ fn collect_recreated_frozensets(
             need
         };
     match need {
-        FrozensetRecreationNeed::None => return Ok(()),
+        FrozensetRecreationNeed::None if !replay_qualified_names => return Ok(()),
         FrozensetRecreationNeed::PreinternedOnly
             if code.marshal_provenance.interning_events.is_empty()
                 && !has_explicit_interns(code)
@@ -1634,8 +1673,9 @@ fn collect_recreated_frozensets(
             );
             return Ok(());
         }
-        FrozensetRecreationNeed::PreinternedOnly | FrozensetRecreationNeed::IdentifierDependent => {
-        }
+        FrozensetRecreationNeed::None
+        | FrozensetRecreationNeed::PreinternedOnly
+        | FrozensetRecreationNeed::IdentifierDependent => {}
     }
 
     if need == FrozensetRecreationNeed::IdentifierDependent
@@ -1656,9 +1696,9 @@ fn collect_recreated_frozensets(
         return Ok(());
     }
 
-    let partial = initial_intern_state
-        .has_unknown_entries()
-        .then(|| frozenset_intern_dependencies(code, python_version));
+    let partial = (initial_intern_state.has_unknown_entries()
+        || has_unknown_interning_events(code))
+    .then(|| frozenset_intern_dependencies(code, python_version));
     let mut interned_strings = InternedStrings::new(initial_intern_state, python_version, partial);
     let mut interned_constant_strings = code
         .marshal_provenance
@@ -1666,7 +1706,7 @@ fn collect_recreated_frozensets(
         .iter()
         .map(String::as_str)
         .collect();
-    if need == FrozensetRecreationNeed::IdentifierDependent {
+    if need == FrozensetRecreationNeed::IdentifierDependent || replay_qualified_names {
         collect_identifier_strings(
             code,
             &code.marshal_provenance.generated_mangled_strings,
@@ -1689,6 +1729,21 @@ fn collect_recreated_frozensets(
             &mut interned_constant_strings,
         );
     }
+    if replay_qualified_names {
+        validate_replayed_qualified_names(code, &interned_strings.qualified_name_origins)?;
+        validate_replayed_scalar_aliases(
+            code,
+            &interned_strings.qualified_name_origins,
+            python_version,
+            initial_intern_state,
+        )?;
+        qualified_name_constants.extend(
+            interned_strings
+                .qualified_name_origins
+                .iter()
+                .filter_map(|(value, canonical)| (*canonical == Some(true)).then_some(*value)),
+        );
+    }
     if let Some(value) = interned_strings.unresolved_frozenset {
         Err(CompileError::UnresolvedInternState {
             value: value.to_string(),
@@ -1696,6 +1751,192 @@ fn collect_recreated_frozensets(
     } else {
         Ok(())
     }
+}
+
+fn has_external_interning_events(code: &CodeObject) -> bool {
+    code.marshal_provenance
+        .interning_events
+        .iter()
+        .any(|event| {
+            matches!(
+                event,
+                CompilationInterningEvent::ExternalRetain(_)
+                    | CompilationInterningEvent::PartialExternalRetain(_)
+                    | CompilationInterningEvent::UnknownExternalAdditions
+            )
+        })
+}
+
+fn has_unknown_interning_events(code: &CodeObject) -> bool {
+    code.marshal_provenance
+        .interning_events
+        .iter()
+        .any(|event| {
+            matches!(
+                event,
+                CompilationInterningEvent::UnknownExternalAdditions
+                    | CompilationInterningEvent::PartialExternalRetain(_)
+            )
+        })
+}
+
+/// Discarded class bodies can leave their scalar in the compiler's constant cache.
+fn has_qualified_name_interning_dependencies(code: &CodeObject) -> bool {
+    fn surviving_class(code: &CodeObject) -> bool {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| surviving_class(code));
+        }
+        qualified_name_constant_requiring_origin(code).is_some()
+            || code
+                .constants
+                .iter()
+                .any(|constant| matches!(constant, Constant::Code(child) if surviving_class(child)))
+    }
+
+    surviving_class(code)
+        || code
+            .marshal_provenance
+            .interning_events
+            .iter()
+            .any(|event| {
+                matches!(
+                    event,
+                    CompilationInterningEvent::CodeAssembly(summary)
+                        if summary.qualified_name_is_canonical.is_some()
+                            && !should_intern(&summary.qualified_name)
+                )
+            })
+}
+
+/// Surviving class scalars also require provenance when the replay omitted their origin.
+fn validate_replayed_qualified_names(
+    code: &CodeObject,
+    origins: &FxHashMap<&str, Option<bool>>,
+) -> Result<(), CompileError> {
+    if let Some((_, value)) = qualified_name_constant_requiring_origin(code)
+        && origins.get(value).is_none_or(Option::is_none)
+    {
+        return Err(CompileError::UnresolvedInternState {
+            value: value.to_string(),
+        });
+    }
+    for constant in &code.constants {
+        if let Constant::Code(child) = constant {
+            validate_replayed_qualified_names(child, origins)?;
+        }
+    }
+    Ok(())
+}
+
+/// An ordinary literal can reuse a discarded class's cached scalar. Reject an unknown
+/// origin only when that literal's wire identity still depends on the class interning.
+fn validate_replayed_scalar_aliases(
+    code: &CodeObject,
+    origins: &FxHashMap<&str, Option<bool>>,
+    python_version: PythonVersion,
+    initial_intern_state: &InitialInternState,
+) -> Result<(), CompileError> {
+    fn constant(
+        value: &Constant,
+        origins: &FxHashMap<&str, Option<bool>>,
+        explicitly_interned: &FxHashSet<&str>,
+        metadata_aliased: &FxHashSet<usize>,
+        python_version: PythonVersion,
+    ) -> Result<(), CompileError> {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| {
+                constant(
+                    value,
+                    origins,
+                    explicitly_interned,
+                    metadata_aliased,
+                    python_version,
+                )
+            });
+        }
+        match value {
+            Constant::String(value)
+                if origins.get(value.as_str()).is_some_and(Option::is_none)
+                    && !should_intern(value)
+                    && !explicitly_interned.contains(value.as_str())
+                    && !metadata_aliased.contains(&std::ptr::from_ref(value).addr()) =>
+            {
+                return Err(CompileError::UnresolvedInternState {
+                    value: value.clone(),
+                });
+            }
+            Constant::Tuple(values) | Constant::FrozenSet(values) => {
+                for value in values {
+                    constant(
+                        value,
+                        origins,
+                        explicitly_interned,
+                        metadata_aliased,
+                        python_version,
+                    )?;
+                }
+            }
+            Constant::Code(child) => {
+                for value in &child.constants {
+                    constant(
+                        value,
+                        origins,
+                        explicitly_interned,
+                        metadata_aliased,
+                        python_version,
+                    )?;
+                }
+            }
+            Constant::Slice { lower, upper, step } => {
+                for value in [lower.as_ref(), upper.as_ref(), step.as_ref()] {
+                    // These fields bypass the scalar cache and the explicit-intern set.
+                    if !slice_member_uses_identity_for(value, python_version) {
+                        constant(
+                            value,
+                            origins,
+                            explicitly_interned,
+                            metadata_aliased,
+                            python_version,
+                        )?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    if !origins.values().any(Option::is_none) {
+        return Ok(());
+    }
+
+    let mut explicitly_interned = FxHashSet::default();
+    let mut metadata_tuples = FxHashSet::default();
+    let needs_metadata_alias_scan = !code.marshal_provenance.metadata_alias_scan_unnecessary;
+    if needs_metadata_alias_scan {
+        for values in &code.marshal_provenance.interned_metadata_tuples {
+            metadata_tuples.insert(strings_tuple_key(values).into());
+        }
+    }
+    collect_explicitly_interned(
+        code,
+        python_version,
+        initial_intern_state,
+        &mut explicitly_interned,
+        &mut metadata_tuples,
+        needs_metadata_alias_scan,
+    );
+    let metadata_aliased = collect_metadata_aliased_constants(code, &metadata_tuples);
+    for value in &code.constants {
+        constant(
+            value,
+            origins,
+            &explicitly_interned,
+            &metadata_aliased,
+            python_version,
+        )?;
+    }
+    Ok(())
 }
 
 fn has_explicit_interns(code: &CodeObject) -> bool {
@@ -2148,6 +2389,16 @@ fn collect_compilation_interning<'a>(
     let mut tuple_origins = FxHashMap::default();
     for (order, event) in code.marshal_provenance.interning_events.iter().enumerate() {
         match event {
+            CompilationInterningEvent::ExternalRetain(values) => {
+                interned_strings.extend(values.iter().map(String::as_str));
+            }
+            CompilationInterningEvent::PartialExternalRetain(values) => {
+                interned_strings.unknown_additions_seen = true;
+                interned_strings.extend(values.iter().map(String::as_str));
+            }
+            CompilationInterningEvent::UnknownExternalAdditions => {
+                interned_strings.unknown_additions_seen = true;
+            }
             CompilationInterningEvent::CachedTuple(values) => {
                 tuple_origins
                     .entry(values.iter().map(String::as_str).collect())
@@ -2184,7 +2435,7 @@ fn intern_explicit_constants<'a>(
     interned_strings: &mut InternedStrings<'a, '_>,
     interned_constant_strings: &mut FxHashSet<&'a str>,
 ) {
-    if interned_strings.initial.has_unknown_entries() {
+    if interned_strings.models_uncertainty() {
         let mut values: Vec<_> = explicitly_interned.iter().collect();
         values.sort_unstable();
         for value in values {
@@ -2276,7 +2527,10 @@ fn intern_code_object<'a>(
             interned_strings.insert(filename);
         }
         interned_strings.insert(&code.name);
-        interned_strings.insert(&code.qualified_name);
+        interned_strings.intern_qualified_name(
+            &code.qualified_name,
+            code.marshal_provenance.qualified_name_is_canonical,
+        );
     }
 }
 
@@ -2315,15 +2569,31 @@ fn intern_code_summary<'a>(
             .filename
             .as_utf8()
             .into_iter()
-            .chain([summary.name.as_str(), summary.qualified_name.as_str()])
+            .chain([summary.name.as_str()])
         {
-            if interned_strings.initial.has_unknown_entries() {
+            if interned_strings.models_uncertainty() {
                 if interned_strings.tracks_origin(value) {
                     interned_strings.possibly_added.insert(value);
                 }
             } else {
                 interned_strings.insert(value);
             }
+        }
+        // A winning class scalar is retained by the compilation-wide constant cache even
+        // when its code object is discarded. Other metadata may lose its last owner.
+        if summary.qualified_name_is_canonical == Some(true) {
+            interned_strings.intern_qualified_name(
+                &summary.qualified_name,
+                summary.qualified_name_is_canonical,
+            );
+        } else if interned_strings.models_uncertainty() {
+            if interned_strings.tracks_origin(&summary.qualified_name) {
+                interned_strings
+                    .possibly_added
+                    .insert(&summary.qualified_name);
+            }
+        } else {
+            interned_strings.insert(&summary.qualified_name);
         }
     }
 }
@@ -2818,6 +3088,430 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
 
 #[cfg(test)]
 mod snapshots;
+
+#[cfg(test)]
+mod external_interning_tests {
+    use rustc_hash::FxHashSet;
+
+    use super::{
+        FrozensetRecreationNeed, collect_recreated_frozensets, frozenset_recreation_need,
+        has_external_interning_events, has_qualified_name_interning_dependencies,
+        validate_initial_intern_state,
+    };
+    use crate::code_object::{
+        CodeInterningSummary, CodeObject, CompilationInterningEvent, Constant, MarshalProvenance,
+    };
+    use crate::{CompileError, InitialInternState, PythonVersion};
+
+    fn code(constants: Vec<Constant>) -> CodeObject {
+        CodeObject {
+            arg_count: 0,
+            positional_only_arg_count: 0,
+            keyword_only_arg_count: 0,
+            stack_size: 1,
+            flags: 0,
+            bytecode: Vec::new(),
+            constants,
+            names: Vec::new(),
+            locals: Vec::new(),
+            local_kinds: Vec::new(),
+            filename: "warnings.py".into(),
+            name: "module".to_string(),
+            qualified_name: "module".to_string(),
+            first_line_number: 1,
+            line_table: Vec::new(),
+            exception_table: Vec::new(),
+            marshal_provenance: MarshalProvenance {
+                subtree_has_frozenset_constants: true,
+                ..MarshalProvenance::default()
+            },
+        }
+    }
+
+    fn assembly(code: &CodeObject) -> CompilationInterningEvent {
+        CompilationInterningEvent::CodeAssembly(CodeInterningSummary::from_code(code))
+    }
+
+    fn retained(value: &str) -> CompilationInterningEvent {
+        CompilationInterningEvent::ExternalRetain(vec![value.to_string()])
+    }
+
+    fn replay<'a>(
+        code: &'a CodeObject,
+        initial: &InitialInternState,
+    ) -> Result<(FxHashSet<usize>, FxHashSet<&'a str>), CompileError> {
+        let mut recreated = FxHashSet::default();
+        let mut qualified = FxHashSet::default();
+        collect_recreated_frozensets(
+            code,
+            frozenset_recreation_need(code, PythonVersion::Py314),
+            PythonVersion::Py314,
+            initial,
+            &mut recreated,
+            &mut qualified,
+        )?;
+        Ok((recreated, qualified))
+    }
+
+    #[test]
+    fn external_retention_before_assembly_changes_frozenset_identity() {
+        let value = "warning_retention_marker";
+        let member = Constant::FrozenSet(vec![Constant::String(value.to_string())]);
+        let initial = InitialInternState::from_complete([] as [&str; 0]);
+        for before in [true, false] {
+            let mut code = code(vec![member.clone(), member.clone()]);
+            let assembly = assembly(&code);
+            code.marshal_provenance.assembly_order = Some(usize::from(before));
+            code.marshal_provenance.interning_events = if before {
+                vec![retained(value), assembly]
+            } else {
+                vec![assembly, retained(value)]
+            };
+            let (recreated, _) = replay(&code, &initial).unwrap();
+            assert_eq!(recreated.len(), if before { 2 } else { 0 });
+        }
+    }
+
+    #[test]
+    fn partial_retention_keeps_unlisted_frozenset_origins_unknown() {
+        let initial = InitialInternState::from_complete([] as [&str; 0]);
+        let known = "known_warning_retention_marker";
+        let unknown = "unknown_warning_retention_marker";
+        for include_unknown in [false, true] {
+            let known_member = Constant::FrozenSet(vec![Constant::String(known.to_string())]);
+            let mut members = vec![known_member.clone(), known_member];
+            if include_unknown {
+                let unknown_member =
+                    Constant::FrozenSet(vec![Constant::String(unknown.to_string())]);
+                members.extend([unknown_member.clone(), unknown_member]);
+            }
+            let mut code = code(members);
+            let assembly = assembly(&code);
+            code.marshal_provenance.assembly_order = Some(1);
+            code.marshal_provenance.interning_events = vec![
+                CompilationInterningEvent::PartialExternalRetain(vec![known.to_string()]),
+                assembly,
+            ];
+            let result = replay(&code, &initial);
+            if include_unknown {
+                assert!(
+                    matches!(result, Err(CompileError::UnresolvedInternState { value }) if value == unknown)
+                );
+            } else {
+                assert_eq!(result.unwrap().0.len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_additions_do_not_taint_prior_canonicalization() {
+        let value = "warning_uncertainty_marker";
+        let member = Constant::FrozenSet(vec![Constant::String(value.to_string())]);
+        let initial = InitialInternState::from_complete([] as [&str; 0]);
+        for before in [true, false] {
+            let mut code = code(vec![member.clone(), member.clone()]);
+            let assembly = assembly(&code);
+            code.marshal_provenance.assembly_order = Some(usize::from(before));
+            code.marshal_provenance.interning_events = if before {
+                vec![
+                    CompilationInterningEvent::UnknownExternalAdditions,
+                    assembly,
+                ]
+            } else {
+                vec![
+                    assembly,
+                    CompilationInterningEvent::UnknownExternalAdditions,
+                ]
+            };
+            let result = validate_initial_intern_state(&code, PythonVersion::Py314, &initial);
+            if before {
+                assert!(
+                    matches!(result, Err(CompileError::UnresolvedInternState { value: unresolved }) if unresolved == value)
+                );
+            } else {
+                result.unwrap();
+                assert!(replay(&code, &initial).unwrap().0.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn later_retention_does_not_repair_an_unknown_constant_origin() {
+        let value = "warning_sticky_marker";
+        let member = Constant::FrozenSet(vec![Constant::String(value.to_string())]);
+        let mut code = code(vec![member.clone(), member]);
+        let first = assembly(&code);
+        let last = assembly(&code);
+        code.marshal_provenance.assembly_order = Some(3);
+        code.marshal_provenance.interning_events = vec![
+            CompilationInterningEvent::UnknownExternalAdditions,
+            first,
+            retained(value),
+            last,
+        ];
+        let initial = InitialInternState::from_complete([] as [&str; 0]);
+        assert!(
+            matches!(replay(&code, &initial), Err(CompileError::UnresolvedInternState { value: unresolved }) if unresolved == value)
+        );
+        let retained_initial = InitialInternState::from_complete([value]);
+        assert_eq!(replay(&code, &retained_initial).unwrap().0.len(), 2);
+    }
+
+    #[test]
+    fn discarded_metadata_does_not_mask_later_unknown_additions() {
+        let value = "warning_discarded_metadata_marker";
+        let initial = InitialInternState::from_complete([] as [&str; 0]);
+        for field in ["filename", "name", "qualified_name", "explicit"] {
+            let mut discarded = code(Vec::new());
+            match field {
+                "filename" => discarded.filename = value.into(),
+                "name" => discarded.name = value.to_string(),
+                "qualified_name" => discarded.qualified_name = value.to_string(),
+                "explicit" => {
+                    discarded
+                        .marshal_provenance
+                        .explicitly_interned_strings
+                        .insert(value.to_string());
+                }
+                _ => unreachable!(),
+            }
+            let member = Constant::FrozenSet(vec![Constant::String(value.to_string())]);
+            let mut code = code(vec![member.clone(), member]);
+            code.marshal_provenance.assembly_order = Some(2);
+            code.marshal_provenance.interning_events = vec![
+                assembly(&discarded),
+                CompilationInterningEvent::UnknownExternalAdditions,
+                assembly(&code),
+            ];
+            assert!(
+                matches!(replay(&code, &initial), Err(CompileError::UnresolvedInternState { value: unresolved }) if unresolved == value),
+                "discarded {field} must not prove retained membership",
+            );
+        }
+    }
+
+    #[test]
+    fn compiler_owned_scalar_survives_later_unknown_additions() {
+        let value = "warning_compiler_owned_marker";
+        let discarded = code(vec![Constant::String(value.to_string())]);
+        let member = Constant::FrozenSet(vec![Constant::String(value.to_string())]);
+        let mut code = code(vec![member.clone(), member]);
+        code.marshal_provenance.assembly_order = Some(2);
+        code.marshal_provenance.interning_events = vec![
+            assembly(&discarded),
+            CompilationInterningEvent::UnknownExternalAdditions,
+            assembly(&code),
+        ];
+        let initial = InitialInternState::from_complete([] as [&str; 0]);
+        assert!(replay(&code, &initial).unwrap().0.is_empty());
+    }
+
+    fn class_code() -> CodeObject {
+        let qualified = "outer.<locals>.WarningClass";
+        let mut code = code(vec![Constant::String(qualified.to_string())]);
+        code.name = "WarningClass".to_string();
+        code.qualified_name = qualified.to_string();
+        code.marshal_provenance.qualified_name_constant_index = Some(0);
+        code.marshal_provenance.qualified_name_is_canonical = Some(true);
+        code.marshal_provenance.subtree_has_frozenset_constants = false;
+        code
+    }
+
+    #[test]
+    fn class_alias_is_resolved_at_assembly_even_without_frozensets() {
+        let initial = InitialInternState::from_complete([] as [&str; 0]);
+        for before in [true, false] {
+            let mut code = class_code();
+            let assembly = assembly(&code);
+            code.marshal_provenance.assembly_order = Some(usize::from(before));
+            code.marshal_provenance.interning_events = if before {
+                vec![retained(&code.qualified_name), assembly]
+            } else {
+                vec![assembly, retained(&code.qualified_name)]
+            };
+            let (_, qualified) = replay(&code, &initial).unwrap();
+            assert_eq!(qualified.contains(code.qualified_name.as_str()), !before);
+        }
+    }
+
+    #[test]
+    fn unknown_class_origin_is_sticky_across_discarded_assembly() {
+        let initial = InitialInternState::from_complete([] as [&str; 0]);
+        for before in [true, false] {
+            let mut code = class_code();
+            let first = assembly(&code);
+            let last = assembly(&code);
+            let unknown = CompilationInterningEvent::UnknownExternalAdditions;
+            code.marshal_provenance.assembly_order = Some(3);
+            code.marshal_provenance.interning_events = if before {
+                vec![unknown, first, retained(&code.qualified_name), last]
+            } else {
+                vec![first, unknown, retained(&code.qualified_name), last]
+            };
+            let result = replay(&code, &initial);
+            if before {
+                assert!(
+                    matches!(result, Err(CompileError::UnresolvedInternState { value }) if value == code.qualified_name)
+                );
+            } else {
+                assert!(result.unwrap().1.contains(code.qualified_name.as_str()));
+            }
+        }
+    }
+
+    #[test]
+    fn warning_without_sensitive_constants_needs_no_interning_replay() {
+        let mut module = crate::compile(
+            include_str!("../../../serc_fixtures/resources/loop_async_edges.py"),
+            "loop_async_edges.py",
+        )
+        .unwrap();
+        assert!(has_external_interning_events(&module.code));
+        assert!(!has_qualified_name_interning_dependencies(&module.code));
+        assert_eq!(
+            frozenset_recreation_need(&module.code, PythonVersion::Py314),
+            FrozensetRecreationNeed::None,
+        );
+        let expected = module.marshal();
+        module.code.marshal_provenance.interning_events.clear();
+        assert_eq!(module.marshal(), expected);
+    }
+
+    #[test]
+    fn surviving_class_without_summary_origin_still_requires_validation() {
+        let mut child = class_code();
+        child.marshal_provenance.qualified_name_is_canonical = None;
+        let qualified = child.qualified_name.clone();
+        let mut root = code(vec![Constant::Code(Box::new(child))]);
+        root.marshal_provenance.assembly_order = Some(1);
+        root.marshal_provenance.interning_events = vec![
+            CompilationInterningEvent::UnknownExternalAdditions,
+            assembly(&root),
+        ];
+        let initial = InitialInternState::from_complete([] as [&str; 0]);
+        assert!(has_qualified_name_interning_dependencies(&root));
+        assert!(matches!(
+            replay(&root, &initial),
+            Err(CompileError::UnresolvedInternState { value }) if value == qualified
+        ));
+    }
+
+    #[test]
+    fn discarded_class_origin_controls_a_surviving_plain_literal() {
+        let discarded = class_code();
+        let qualified = discarded.qualified_name.as_str();
+        let initial = InitialInternState::from_complete([] as [&str; 0]);
+        for before in [true, false] {
+            let mut root = code(vec![Constant::String(qualified.to_string())]);
+            root.marshal_provenance.assembly_order = Some(2);
+            root.marshal_provenance.interning_events = if before {
+                vec![retained(qualified), assembly(&discarded), assembly(&root)]
+            } else {
+                vec![assembly(&discarded), retained(qualified), assembly(&root)]
+            };
+            assert!(has_qualified_name_interning_dependencies(&root));
+            let (recreated, interned) = replay(&root, &initial).unwrap();
+            assert!(recreated.is_empty());
+            assert_eq!(interned.contains(qualified), !before);
+        }
+    }
+
+    #[test]
+    fn unknown_discarded_class_origin_rejects_surviving_scalar_aliases() {
+        let discarded = class_code();
+        let qualified = discarded.qualified_name.as_str();
+        let initial = InitialInternState::from_complete([] as [&str; 0]);
+        let scalar = Constant::String(qualified.to_string());
+        for value in [
+            scalar.clone(),
+            Constant::Tuple(vec![scalar.clone()]),
+            Constant::FrozenSet(vec![scalar.clone()]),
+            Constant::Code(Box::new(code(vec![scalar]))),
+        ] {
+            let mut root = code(vec![value]);
+            root.marshal_provenance.assembly_order = Some(3);
+            root.marshal_provenance.interning_events = vec![
+                CompilationInterningEvent::UnknownExternalAdditions,
+                assembly(&discarded),
+                retained(qualified),
+                assembly(&root),
+            ];
+            assert!(matches!(
+                replay(&root, &initial),
+                Err(CompileError::UnresolvedInternState { value }) if value == qualified
+            ));
+        }
+    }
+
+    #[test]
+    fn unknown_discarded_class_origin_does_not_taint_independent_constants() {
+        let discarded = class_code();
+        let qualified = discarded.qualified_name.as_str();
+        let initial = InitialInternState::from_complete([] as [&str; 0]);
+        let mut cases = vec![
+            code(Vec::new()),
+            code(vec![Constant::String("unrelated literal".to_string())]),
+            code(vec![Constant::Slice {
+                lower: Box::new(Constant::String(qualified.to_string())),
+                upper: Box::new(Constant::None),
+                step: Box::new(Constant::None),
+            }]),
+        ];
+        let mut canonical = code(vec![Constant::String(qualified.to_string())]);
+        canonical
+            .marshal_provenance
+            .canonical_constant_strings
+            .insert(qualified.to_string());
+        cases.push(canonical);
+        let mut metadata_alias = code(vec![Constant::String(qualified.to_string())]);
+        metadata_alias.names.push(qualified.into());
+        cases.push(metadata_alias);
+        for mut root in cases {
+            root.marshal_provenance.assembly_order = Some(2);
+            root.marshal_provenance.interning_events = vec![
+                CompilationInterningEvent::UnknownExternalAdditions,
+                assembly(&discarded),
+                assembly(&root),
+            ];
+            replay(&root, &initial).unwrap();
+        }
+    }
+
+    #[test]
+    fn verified_no_effect_preserves_compiled_class_aliases() {
+        fn record_assemblies(code: &mut CodeObject, events: &mut Vec<CompilationInterningEvent>) {
+            for constant in &mut code.constants {
+                if let Constant::Code(child) = constant {
+                    record_assemblies(child, events);
+                }
+            }
+            code.marshal_provenance.assembly_order = Some(events.len());
+            events.push(assembly(code));
+        }
+
+        for source in [
+            "class Outer:\n    class Inner: pass\n",
+            "literal = 'Outer.Inner'\nclass Outer:\n    class Inner: pass\n",
+            "import Outer.Inner\nclass Outer:\n    class Inner: pass\n",
+            "class Outer:\n    class Inner: pass\n    class Inner: pass\n",
+            "def factory():\n    class Local: pass\n    return Local\n",
+        ] {
+            let mut module = crate::compile(source, "class_aliases.py").unwrap();
+            let expected = module.marshal();
+            if module.code.marshal_provenance.interning_events.is_empty() {
+                let mut events = Vec::new();
+                record_assemblies(&mut module.code, &mut events);
+                module.code.marshal_provenance.interning_events = events;
+            }
+            module
+                .code
+                .marshal_provenance
+                .interning_events
+                .push(CompilationInterningEvent::ExternalRetain(Vec::new()));
+            assert_eq!(module.marshal(), expected, "{source}");
+        }
+    }
+}
 
 #[cfg(test)]
 mod wire_reference_tests {
