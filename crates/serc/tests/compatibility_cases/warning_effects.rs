@@ -51,31 +51,30 @@ fn compare_in_context_for(
         effects.record(warning.ordinal(), effect).unwrap();
     }
     let actual = prepared.finish(&effects).unwrap().marshal();
-    let mut python = match version {
-        PythonVersion::Py314 => common::python_3145_command(),
-        _ => {
-            let (variable, fallback) = match version {
-                PythonVersion::Py312 => ("SERC_TEST_PYTHON_312", "python3.12"),
-                PythonVersion::Py313 => ("SERC_TEST_PYTHON_313", "python3.13"),
-                PythonVersion::Py315 => ("SERC_TEST_PYTHON_315", "python3.15"),
-                PythonVersion::Py314 => unreachable!(),
-            };
-            let executable = std::env::var_os(variable).unwrap_or_else(|| fallback.into());
-            let identity = Command::new(&executable)
-                .args(["-I", "-S", "-c", "import importlib.util, sys; print(sys.implementation.name, sys.version.split()[0], importlib.util.MAGIC_NUMBER.hex())"])
-                .output().unwrap();
-            let target = version.target();
-            let expected = format!(
-                "cpython {} {}\n",
-                target.tag.strip_prefix('v').unwrap(),
-                target.magic_hex()
-            );
-            assert!(identity.status.success());
-            assert_eq!(String::from_utf8(identity.stdout).unwrap(), expected);
-            let mut command = Command::new(executable);
-            command.args(["-I", "-S", "-X", "utf8"]);
-            command
-        }
+    let mut python = if version == PythonVersion::Py314 {
+        common::python_3145_command()
+    } else {
+        let (variable, fallback) = match version {
+            PythonVersion::Py312 => ("SERC_TEST_PYTHON_312", "python3.12"),
+            PythonVersion::Py313 => ("SERC_TEST_PYTHON_313", "python3.13"),
+            PythonVersion::Py315 => ("SERC_TEST_PYTHON_315", "python3.15"),
+            PythonVersion::Py314 => unreachable!(),
+        };
+        let executable = std::env::var_os(variable).unwrap_or_else(|| fallback.into());
+        let identity = Command::new(&executable)
+            .args(["-I", "-S", "-c", "import importlib.util, sys; print(sys.implementation.name, sys.version.split()[0], importlib.util.MAGIC_NUMBER.hex())"])
+            .output().unwrap();
+        let target = version.target();
+        let expected = format!(
+            "cpython {} {}\n",
+            target.tag.strip_prefix('v').unwrap(),
+            target.magic_hex()
+        );
+        assert!(identity.status.success());
+        assert_eq!(String::from_utf8(identity.stdout).unwrap(), expected);
+        let mut command = Command::new(executable);
+        command.args(["-I", "-S", "-X", "utf8"]);
+        command
     };
     let mut child = python
         .arg("-B")
