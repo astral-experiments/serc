@@ -902,7 +902,7 @@ scope = {}
 exec(marshal.loads(sys.stdin.buffer.read()), scope)
 f = scope['f']
 targets = [i.offset for i in dis.get_instructions(f)
-           if i.opname == 'NOT_TAKEN' and i.positions.lineno == 4]
+           if i.opname == 'NOT_TAKEN' and i.positions.lineno == int(sys.argv[1])]
 assert len(targets) == 1, targets
 target = targets[0]
 hits = []
@@ -935,13 +935,15 @@ assert hits == [target], hits
 print(outcome)
 ";
     let cases = [
-        ("{**{k: 1 for k in xs}}", false),
-        ("[{k: 1 for k in xs}]", false),
-        ("{**dict(xs)}", true),
+        ("{**{k: 1 for k in xs}}", false, false),
+        ("[{k: 1 for k in xs}]", false, false),
+        ("{**dict(xs)}", true, false),
+        ("{**{k: 1 for k in xs}}", false, true),
     ];
-    for (expression, protected_314) in cases {
+    for (expression, protected_314, authored_pass) in cases {
+        let pass = if authored_pass { "    pass\n" } else { "" };
         let source = format!(
-            "async def f(x, xs, d):\n    v = {expression}\n    try:\n        if x:\n            pass\n    except Exception:\n        pass\n"
+            "async def f(x, xs, d):\n    v = {expression}\n{pass}    try:\n        if x:\n            pass\n    except Exception:\n        pass\n"
         );
         for (index, (python_version, _, _)) in VERSIONS.iter().copied().enumerate() {
             for optimization_level in LEVELS {
@@ -977,6 +979,7 @@ print(outcome)
                     for code in [&native.stdout, &actual] {
                         let mut child = Command::new(ORACLES[index].get().unwrap())
                             .args(["-I", "-S", "-B", "-c", TRACE_CONDITION])
+                            .arg(if authored_pass { "5" } else { "4" })
                             .stdin(Stdio::piped())
                             .stdout(Stdio::piped())
                             .stderr(Stdio::piped())

@@ -117,6 +117,8 @@ pub(super) struct ExceptionOwnerProvenance {
     // Authored normal exits and their immediate, fully emitted restore records.
     pub(super) original_comprehension_normal_exits: Vec<(Label, Instruction)>,
     pub(super) original_comprehension_normal_restores: FxHashMap<Label, Vec<Instruction>>,
+    // Exact NOPs emitted for authored Pass statements, before graph rewrites.
+    pub(super) original_pass_nops: Vec<Instruction>,
     // Original simple For target stores, before their tracing NOP is compacted.
     pub(super) for_target_owner_prefixes: Vec<(Label, Instruction)>,
     // Exact final normal restore, after its fusion policies are complete.
@@ -667,6 +669,9 @@ impl ExceptionOwnerProvenance {
                     visit(instruction);
                 }
             }
+        }
+        for instruction in &mut self.original_pass_nops {
+            visit(instruction);
         }
         for instruction in &mut self.original_primitive_condition_boundaries {
             visit(instruction);
@@ -1320,6 +1325,10 @@ struct UncompactedPrefixIndexes {
     forward_jumps: FxHashMap<Label, smallvec::SmallVec<[usize; 1]>>,
     targets: FxHashSet<Label>,
     authored_break_targets: FxHashSet<Label>,
+    pass_positions: OnceCell<(
+        FxHashMap<OwnerInstructionSignature, SmallVec<[usize; 1]>>,
+        FxHashMap<OwnerInstructionSignature, SmallVec<[usize; 1]>>,
+    )>,
 }
 
 impl UncompactedPrefixIndexes {
@@ -1357,6 +1366,7 @@ impl UncompactedPrefixIndexes {
             forward_jumps,
             targets,
             authored_break_targets,
+            pass_positions: OnceCell::new(),
         }
     }
 
@@ -1373,6 +1383,49 @@ impl UncompactedPrefixIndexes {
                 .iter()
                 .filter(|&&position| all[position] == Item::Instruction(instruction));
             matches.next().is_some() && matches.next().is_none()
+        })
+    }
+
+    fn has_unique_authored_pass(
+        &self,
+        all: &[Item],
+        original: &[Instruction],
+        instruction: &Instruction,
+    ) -> bool {
+        let (authored, emitted) = self.pass_positions.get_or_init(|| {
+            let mut authored: FxHashMap<_, SmallVec<[usize; 1]>> = FxHashMap::default();
+            for (index, instruction) in original.iter().enumerate() {
+                authored
+                    .entry(OwnerInstructionPositions::signature(instruction))
+                    .or_default()
+                    .push(index);
+            }
+            let mut emitted: FxHashMap<_, SmallVec<[usize; 1]>> = FxHashMap::default();
+            for (index, item) in all.iter().enumerate() {
+                if let Item::Instruction(instruction) = item {
+                    let signature = OwnerInstructionPositions::signature(instruction);
+                    if authored.contains_key(&signature) {
+                        emitted.entry(signature).or_default().push(index);
+                    }
+                }
+            }
+            (authored, emitted)
+        });
+        let signature = OwnerInstructionPositions::signature(instruction);
+        authored.get(&signature).is_some_and(|positions| {
+            positions
+                .iter()
+                .filter(|&&index| original[index] == *instruction)
+                .take(2)
+                .count()
+                == 1
+        }) && emitted.get(&signature).is_some_and(|positions| {
+            positions
+                .iter()
+                .filter(|&&index| all[index] == Item::Instruction(*instruction))
+                .take(2)
+                .count()
+                == 1
         })
     }
 }
@@ -2430,7 +2483,15 @@ impl ExceptionOwnerProvenance {
                                     })
                             })
                     });
-                    if !paired
+                    let authored_pass = !paired
+                        && comprehension_restore_count > 0
+                        && index > comprehension_restore_count
+                        && indexes().has_unique_authored_pass(
+                            all,
+                            &self.original_pass_nops,
+                            instruction,
+                        );
+                    if (!paired && !authored_pass)
                         || instruction.fusion_policy.is_converted_pop_block()
                         || instructions
                             .get(index.wrapping_sub(1))
@@ -2443,8 +2504,10 @@ impl ExceptionOwnerProvenance {
                     {
                         return false;
                     }
-                    null_setup_cells.insert(index + folded_slots);
-                    setup_count += 1;
+                    if paired {
+                        null_setup_cells.insert(index + folded_slots);
+                        setup_count += 1;
+                    }
                 }
                 LOAD_FAST => {
                     // CP's superinstruction operands each occupy four bits.

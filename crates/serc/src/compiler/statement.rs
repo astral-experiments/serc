@@ -1930,6 +1930,7 @@ impl<'source> Compiler<'source> {
                 // predecessor and the Pass's full source span can decide compaction.
                 self.assembler.set_location(location);
                 self.emit(NOP, 0, 0)?;
+                self.assembler.record_original_pass_nop();
             } else if let Stmt::Pass(statement) = statement
                 // An authored continuation keeps this Pass in its protected original array.
                 // At a true suite end, normal cleanup can still absorb the omitted marker.
@@ -1980,6 +1981,7 @@ impl<'source> Compiler<'source> {
                     start
                 });
                 self.emit(NOP, 0, 0)?;
+                self.assembler.record_original_pass_nop();
                 if let Some(noop_start) = noop_start {
                     let noop_end = self.assembler.label();
                     self.assembler.mark(noop_end);
