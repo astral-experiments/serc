@@ -108,6 +108,10 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) copied_manager_return_compactions: Vec<CopiedManagerReturnCompaction>,
     pub(super) uncompacted_conditional_arrays: Vec<UncompactedConditionalArray>,
     pub(super) original_primitive_condition_boundaries: Vec<Instruction>,
+    // Authored if-tests that begin by directly evaluating this name.
+    pub(super) original_initial_name_if_locations: FxHashSet<SourceLocation>,
+    // Authored while-tests that are a direct name.
+    pub(super) original_name_while_locations: FxHashSet<SourceLocation>,
     // Exact comparison failure/fallthrough/cleanup records; no synthetic head label.
     pub(super) original_comparison_fallthroughs: Vec<(Label, Label, [Instruction; 6])>,
     // Source-authored match ends establish original arrays independently of case exits.
@@ -1316,6 +1320,7 @@ pub(super) struct UncompactedConditionalArray {
     pub(super) prefix: Vec<Item>,
     comprehension_entry: Option<Label>,
     source_entry: Option<Label>,
+    fallthrough: Option<[Instruction; 2]>,
 }
 
 type OwnerSignaturePositions = FxHashMap<OwnerInstructionSignature, SmallVec<[usize; 1]>>;
@@ -1328,6 +1333,7 @@ struct UncompactedPrefixIndexes {
     targets: FxHashSet<Label>,
     authored_break_targets: FxHashSet<Label>,
     pass_positions: OnceCell<(OwnerSignaturePositions, OwnerSignaturePositions)>,
+    fallthrough_setup_pairs: OnceCell<FxHashMap<(Label, Instruction), FxHashSet<Label>>>,
 }
 
 impl UncompactedPrefixIndexes {
@@ -1366,7 +1372,84 @@ impl UncompactedPrefixIndexes {
             targets,
             authored_break_targets,
             pass_positions: OnceCell::new(),
+            fallthrough_setup_pairs: OnceCell::new(),
         }
+    }
+
+    /// Finds the same recorded SETUP/NOP pair without rescanning all prior SETUPs.
+    fn has_fallthrough_setup_pair(
+        &self,
+        provenance: &ExceptionOwnerProvenance,
+        all: &[Item],
+        labels: &FxHashSet<Label>,
+        instruction: Instruction,
+    ) -> bool {
+        let pairs = self.fallthrough_setup_pairs.get_or_init(|| {
+            let instructions: Vec<_> = all
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| matches!(item, Item::Instruction(_)).then_some(index))
+                .collect();
+            let mut setups = FxHashMap::<SourceLocation, Vec<usize>>::default();
+            let mut setup_locations = Vec::new();
+            for (label, location) in &provenance.setups {
+                if let (Some(location), Some(&position)) = (location, self.positions.get(label)) {
+                    setups
+                        .entry(*location)
+                        .or_insert_with(|| {
+                            setup_locations.push(*location);
+                            Vec::new()
+                        })
+                        .push(position);
+                }
+            }
+            for location in setup_locations {
+                setups
+                    .get_mut(&location)
+                    .expect("recorded setup location")
+                    .sort_unstable();
+            }
+
+            let mut pairs = FxHashMap::<(Label, Instruction), FxHashSet<Label>>::default();
+            for &(start, end) in &provenance.setup_nop_ranges {
+                let (Some(&start_at), Some(&end_at)) =
+                    (self.positions.get(&start), self.positions.get(&end))
+                else {
+                    continue;
+                };
+                if start_at >= end_at
+                    || !self.has_unique_label(start)
+                    || !self.has_unique_label(end)
+                {
+                    continue;
+                }
+                let first = instructions.partition_point(|&index| index < start_at);
+                let after = instructions.partition_point(|&index| index < end_at);
+                if after != first + 1 {
+                    continue;
+                }
+                let Item::Instruction(value) = all[instructions[first]] else {
+                    unreachable!();
+                };
+                let Some(positions) = setups.get(&value.location) else {
+                    continue;
+                };
+                let setup = positions.partition_point(|&index| index < end_at);
+                let next_instruction = instructions.get(after).copied().unwrap_or(all.len());
+                if positions
+                    .get(setup)
+                    .is_some_and(|&index| index < next_instruction)
+                {
+                    pairs.entry((start, value)).or_default().insert(end);
+                }
+            }
+            pairs
+        });
+        labels.iter().any(|&start| {
+            pairs
+                .get(&(start, instruction))
+                .is_some_and(|ends| ends.iter().any(|end| labels.contains(end)))
+        })
     }
 
     fn has_unique_label(&self, label: Label) -> bool {
@@ -1939,11 +2022,16 @@ impl ExceptionOwnerProvenance {
     }
 
     /// Retains whole original arrays, before optimization can remove their live records.
-    pub(super) fn capture_uncompacted_conditional_arrays(&mut self, items: &[Item]) {
+    pub(super) fn capture_uncompacted_conditional_arrays(
+        &mut self,
+        items: &[Item],
+        allow_fallthrough: bool,
+    ) {
         use crate::target::opcodes::{POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE};
 
         self.capture_retained_setup_value_arrays(items);
         let indexes = OnceCell::new();
+        let original_boundary_counts = OnceCell::new();
         let mut begin = 0;
         for (index, item) in items.iter().enumerate() {
             let Item::Instruction(instruction) = item else {
@@ -1961,25 +2049,38 @@ impl ExceptionOwnerProvenance {
                 {
                     let prefix = &items[begin..=end];
                     let certified = if self.uncompacted_prefix(prefix, items, &indexes, 0, false) {
-                        Some((prefix, None, None))
+                        Some((prefix, None, None, None))
                     } else if let Some((entry, prefix, restore_count)) =
                         self.comprehension_normal_prefix(prefix, items)
                         && self.uncompacted_prefix(prefix, items, &indexes, restore_count, false)
                     {
-                        Some((prefix, Some(entry), None))
+                        Some((prefix, Some(entry), None, None))
                     } else if let Some((entry, prefix)) = self.original_source_prefix(prefix)
                         && self.uncompacted_prefix(prefix, items, &indexes, 0, true)
                     {
-                        Some((prefix, None, Some(entry)))
+                        Some((prefix, None, Some(entry), None))
+                    } else if allow_fallthrough
+                        && let Some(anchor) = self.uncompacted_nested_try_fallthrough(
+                            prefix,
+                            &items[..begin],
+                            items,
+                            &indexes,
+                            &original_boundary_counts,
+                        )
+                    {
+                        Some((prefix, None, None, Some(anchor)))
                     } else {
                         None
                     };
-                    if let Some((prefix, comprehension_entry, source_entry)) = certified {
+                    if let Some((prefix, comprehension_entry, source_entry, fallthrough)) =
+                        certified
+                    {
                         self.uncompacted_conditional_arrays
                             .push(UncompactedConditionalArray {
                                 prefix: prefix.to_vec(),
                                 comprehension_entry,
                                 source_entry,
+                                fallthrough,
                             });
                     }
                 }
@@ -1996,6 +2097,82 @@ impl ExceptionOwnerProvenance {
                 begin = index + 1;
             }
         }
+    }
+
+    /// Authenticates a primitive condition falling directly into two nested tries.
+    fn uncompacted_nested_try_fallthrough(
+        &self,
+        prefix: &[Item],
+        preceding: &[Item],
+        all: &[Item],
+        indexes: &OnceCell<UncompactedPrefixIndexes>,
+        original_boundary_counts: &OnceCell<FxHashMap<Instruction, usize>>,
+    ) -> Option<[Instruction; 2]> {
+        use crate::target::opcodes::{LOAD_FAST, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, TO_BOOL};
+
+        let [.., Item::Instruction(condition), Item::Instruction(marker)] = preceding else {
+            return None;
+        };
+        let records = prefix
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let [outer, inner, load, to_bool, jump, next_marker] = records.as_slice() else {
+            return None;
+        };
+        let unique_original = |instruction: &Instruction| {
+            original_boundary_counts
+                .get_or_init(|| {
+                    let mut counts = FxHashMap::default();
+                    for original in &self.original_primitive_condition_boundaries {
+                        *counts.entry(*original).or_insert(0) += 1;
+                    }
+                    counts
+                })
+                .get(instruction)
+                == Some(&1)
+        };
+        // Consecutive authored header lines leave no place for an omitted
+        // statement between the original fallthrough, two SETUPs and test.
+        if !matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+            || !self
+                .original_name_while_locations
+                .contains(&condition.location)
+            || marker.opcode != NOT_TAKEN
+            || marker.location != condition.location
+            || marker.depth_after() != condition.depth_after()
+            || outer.opcode != NOP
+            || inner.opcode != NOP
+            || load.opcode != LOAD_FAST
+            || to_bool.opcode != TO_BOOL
+            || !matches!(jump.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+            || !self
+                .original_initial_name_if_locations
+                .contains(&jump.location)
+            || !unique_original(jump)
+            || !indexes
+                .get_or_init(|| UncompactedPrefixIndexes::new(all))
+                .has_unique_forward_jump(all, *jump)
+            || next_marker.opcode != NOT_TAKEN
+            || condition.location.line < 0
+            || condition.location.line.checked_add(1) != Some(outer.location.line)
+            || outer.location.line.checked_add(1) != Some(inner.location.line)
+            || inner.location.line.checked_add(1) != Some(load.location.line)
+            || load.location != to_bool.location
+            || load.location != jump.location
+            || load.location != next_marker.location
+            || !unique_original(condition)
+            || !indexes
+                .get_or_init(|| UncompactedPrefixIndexes::new(all))
+                .has_unique_forward_jump(all, *condition)
+            || !self.uncompacted_prefix_inner(prefix, all, indexes, 0, false, true)
+        {
+            return None;
+        }
+        Some([*condition, *marker])
     }
 
     /// Selects the exact normal restore entry, excluding preceding cleanup aliases.
@@ -2215,6 +2392,25 @@ impl ExceptionOwnerProvenance {
         comprehension_restore_count: usize,
         source_head: bool,
     ) -> bool {
+        self.uncompacted_prefix_inner(
+            prefix,
+            all,
+            indexes,
+            comprehension_restore_count,
+            source_head,
+            false,
+        )
+    }
+
+    fn uncompacted_prefix_inner(
+        &self,
+        prefix: &[Item],
+        all: &[Item],
+        indexes: &OnceCell<UncompactedPrefixIndexes>,
+        comprehension_restore_count: usize,
+        source_head: bool,
+        fallthrough_head: bool,
+    ) -> bool {
         use crate::target::opcodes::{
             BINARY_OP, BUILD_LIST, BUILD_MAP, BUILD_STRING, BUILD_TUPLE, CALL, CALL_INTRINSIC_1,
             CALL_KW, CONTAINS_OP, DICT_UPDATE, FORMAT_SIMPLE, GET_ITER, IMPORT_FROM, IMPORT_NAME,
@@ -2287,6 +2483,17 @@ impl ExceptionOwnerProvenance {
                     return false;
                 }
             }
+        } else if fallthrough_head {
+            // No other control-flow edge may enter this predecessor fallthrough.
+            if leading_labels.is_empty()
+                || leading_labels.iter().any(|label| {
+                    indexes().targets.contains(label)
+                        || self.block_boundaries.contains(label)
+                        || self.source_boundaries.contains(label)
+                })
+            {
+                return false;
+            }
         } else if comprehension_restore_count == 0
             && !empty_class_success
             && (leading_labels.is_empty() || !has_original_target())
@@ -2308,6 +2515,10 @@ impl ExceptionOwnerProvenance {
                         || (source_head
                             && !instructions.is_empty()
                             && self.block_boundaries.contains(label))
+                        || (fallthrough_head
+                            && !instructions.is_empty()
+                            && (self.block_boundaries.contains(label)
+                                || self.source_boundaries.contains(label)))
                         || self.removed_pop_block_boundaries.contains(label)
                         || self.omitted_nop_counts.contains_key(label)
                         || self.omitted_nop_locations.contains_key(label)
@@ -2429,8 +2640,13 @@ impl ExceptionOwnerProvenance {
             })
             .flatten()
             .collect::<FxHashSet<_>>();
-        let original_folds =
-            self.original_uniform_fold_positions(&instructions.iter().collect::<Vec<_>>());
+        let original_folds = if fallthrough_head {
+            // This certificate already requires exactly SETUP, SETUP, LOAD_FAST,
+            // TO_BOOL, jump, marker. It cannot contain a constant-fold witness.
+            FxHashSet::default()
+        } else {
+            self.original_uniform_fold_positions(&instructions.iter().collect::<Vec<_>>())
+        };
         let mut setup_count = 0;
         let mut folded_slots = 0usize;
         let mut membership_folds = 0;
@@ -2481,41 +2697,45 @@ impl ExceptionOwnerProvenance {
                 NOP => {
                     // SETUP becomes NOP only after peephole optimization. Count
                     // its existing record once, using the exact authored range.
-                    let paired = self.setup_nop_ranges.iter().any(|(start, end)| {
-                        let (Some(&start_at), Some(&end_at)) =
-                            (positions.get(start), positions.get(end))
-                        else {
-                            return false;
-                        };
-                        if start_at >= end_at
-                            || !indexes().has_unique_label(*start)
-                            || !indexes().has_unique_label(*end)
-                        {
-                            return false;
-                        }
-                        let range = &all[start_at..end_at];
-                        labels.contains(start)
-                            && labels.contains(end)
-                            && range
-                                .iter()
-                                .filter_map(|item| {
-                                    if let Item::Instruction(value) = item {
-                                        Some(value)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .eq([instruction])
-                            && self.setups.iter().any(|(label, location)| {
-                                *location == Some(instruction.location)
-                                    && positions.get(label).is_some_and(|&position| {
-                                        position >= end_at
-                                            && all[end_at..position]
-                                                .iter()
-                                                .all(|item| matches!(item, Item::Label(_)))
+                    let paired = if fallthrough_head {
+                        indexes().has_fallthrough_setup_pair(self, all, &labels, *instruction)
+                    } else {
+                        self.setup_nop_ranges.iter().any(|(start, end)| {
+                            let (Some(&start_at), Some(&end_at)) =
+                                (positions.get(start), positions.get(end))
+                            else {
+                                return false;
+                            };
+                            if start_at >= end_at
+                                || !indexes().has_unique_label(*start)
+                                || !indexes().has_unique_label(*end)
+                            {
+                                return false;
+                            }
+                            let range = &all[start_at..end_at];
+                            labels.contains(start)
+                                && labels.contains(end)
+                                && range
+                                    .iter()
+                                    .filter_map(|item| {
+                                        if let Item::Instruction(value) = item {
+                                            Some(value)
+                                        } else {
+                                            None
+                                        }
                                     })
-                            })
-                    });
+                                    .eq([instruction])
+                                && self.setups.iter().any(|(label, location)| {
+                                    *location == Some(instruction.location)
+                                        && positions.get(label).is_some_and(|&position| {
+                                            position >= end_at
+                                                && all[end_at..position]
+                                                    .iter()
+                                                    .all(|item| matches!(item, Item::Label(_)))
+                                        })
+                                })
+                        })
+                    };
                     let authored_pass = !paired
                         && comprehension_restore_count > 0
                         && index > comprehension_restore_count
@@ -3063,6 +3283,9 @@ impl LayoutAssembler {
         use crate::target::opcodes::{LOAD_FAST, LOAD_FAST_BORROW, LOAD_FAST_CHECK};
 
         let mut result = FxHashSet::default();
+        let fallthrough_setup_labels = OnceCell::<FxHashSet<Label>>::new();
+        let fallthrough_handler_labels = OnceCell::<FxHashSet<Label>>::new();
+        let fallthrough_copy_internal_labels = OnceCell::<FxHashSet<Label>>::new();
         let origins = &self
             .exception_owner_provenance
             .uncompacted_conditional_arrays;
@@ -3155,6 +3378,99 @@ impl LayoutAssembler {
                 let [start] = starts.as_slice() else { continue };
                 (*start, 0)
             };
+            let fallthrough_unsafe_alias = |label: &Label| {
+                let provenance = &self.exception_owner_provenance;
+                provenance.removed_pop_block_boundaries.contains(label)
+                    || provenance.omitted_nop_counts.contains_key(label)
+                    || provenance.omitted_nop_locations.contains_key(label)
+                    || provenance.fusion_boundaries.contains(label)
+                    || provenance.normal_try_copy_blocks.contains(label)
+                    || provenance.normal_try_copy_inline_labels.contains(label)
+                    || fallthrough_copy_internal_labels
+                        .get_or_init(|| {
+                            provenance
+                                .normal_try_copy_internal_labels
+                                .iter()
+                                .copied()
+                                .collect()
+                        })
+                        .contains(label)
+                    || provenance
+                        .normal_try_copy_jump_nop_successors
+                        .contains(label)
+            };
+            let is_setup_boundary = |label: &Label| {
+                if origin.fallthrough.is_some() {
+                    fallthrough_setup_labels
+                        .get_or_init(|| {
+                            self.exception_owner_provenance
+                                .setups
+                                .iter()
+                                .map(|(setup, _)| *setup)
+                                .collect()
+                        })
+                        .contains(label)
+                } else {
+                    self.exception_owner_provenance
+                        .setups
+                        .iter()
+                        .any(|(setup, _)| setup == label)
+                }
+            };
+            let is_handler_boundary = |label: &Label| {
+                if origin.fallthrough.is_some() {
+                    fallthrough_handler_labels
+                        .get_or_init(|| {
+                            self.exception_regions
+                                .iter()
+                                .map(|region| region.target)
+                                .collect()
+                        })
+                        .contains(label)
+                } else {
+                    self.exception_regions
+                        .iter()
+                        .any(|region| region.target == *label)
+                }
+            };
+            if let Some([condition, marker]) = origin.fallthrough {
+                if start == 0
+                    || self.items[start - 1] != Item::Instruction(marker)
+                    || leading_labels.iter().any(
+                        |item| matches!(item, Item::Label(label) if jump_targets.contains(label)),
+                    )
+                {
+                    continue;
+                }
+                let mut before_marker = start - 1;
+                while let Some(Item::Label(label)) = before_marker
+                    .checked_sub(1)
+                    .and_then(|index| self.items.get(index))
+                {
+                    if jump_targets.contains(label)
+                        || (origin.fallthrough.is_some() && fallthrough_unsafe_alias(label))
+                        || self
+                            .exception_owner_provenance
+                            .block_boundaries
+                            .contains(label)
+                        || self
+                            .exception_owner_provenance
+                            .source_boundaries
+                            .contains(label)
+                        || self.preserved_block_boundaries.contains(label)
+                        || is_setup_boundary(label)
+                        || is_handler_boundary(label)
+                    {
+                        break;
+                    }
+                    before_marker -= 1;
+                }
+                if before_marker == 0
+                    || self.items[before_marker - 1] != Item::Instruction(condition)
+                {
+                    continue;
+                }
+            }
             let original_labels = origin
                 .prefix
                 .iter()
@@ -3174,6 +3490,7 @@ impl LayoutAssembler {
                 {
                     // Range-only aliases carry no original instruction cells.
                     if jump_targets.contains(label)
+                        || (origin.fallthrough.is_some() && fallthrough_unsafe_alias(label))
                         || self
                             .exception_owner_provenance
                             .block_boundaries
@@ -3183,15 +3500,8 @@ impl LayoutAssembler {
                             .source_boundaries
                             .contains(label)
                         || self.preserved_block_boundaries.contains(label)
-                        || self
-                            .exception_owner_provenance
-                            .setups
-                            .iter()
-                            .any(|(setup, _)| setup == label)
-                        || self
-                            .exception_regions
-                            .iter()
-                            .any(|region| region.target == *label)
+                        || is_setup_boundary(label)
+                        || is_handler_boundary(label)
                     {
                         valid = false;
                         break;
@@ -12598,6 +12908,7 @@ mod tests {
                                             prefix: Vec::new(),
                                             comprehension_entry: None,
                                             source_entry: None,
+                                            fallthrough: None,
                                         },
                                     );
                                 }
@@ -15005,7 +15316,7 @@ mod tests {
                 // Even a non-target label splits the originally sealed array.
                 items.insert(3, Item::Label(Label::from_u32(3)));
             }
-            provenance.capture_uncompacted_conditional_arrays(&items);
+            provenance.capture_uncompacted_conditional_arrays(&items, false);
             assert_eq!(
                 provenance.uncompacted_conditional_arrays.len(),
                 usize::from(!matches!(case, "unsealed" | "split restore")),
@@ -15285,6 +15596,7 @@ mod tests {
                         prefix,
                         comprehension_entry: None,
                         source_entry: None,
+                        fallthrough: None,
                     })
                     .collect(),
                 ..ExceptionOwnerProvenance::default()
@@ -15449,7 +15761,7 @@ mod tests {
                 ))),
                 _ => {}
             }
-            provenance.capture_uncompacted_conditional_arrays(&items);
+            provenance.capture_uncompacted_conditional_arrays(&items, false);
             let mut assembler = LayoutAssembler {
                 python_version: crate::PythonVersion::Py314,
                 legacy_uniform_jump_seed: false,
@@ -15585,7 +15897,7 @@ mod tests {
                 }
                 _ => {}
             }
-            provenance.capture_uncompacted_conditional_arrays(&items);
+            provenance.capture_uncompacted_conditional_arrays(&items, false);
             match case {
                 "copied entry" => items[1] = Item::Label(Label::from_u32(6)),
                 "retired source" => provenance.source_boundaries.clear(),
@@ -16352,6 +16664,305 @@ mod tests {
                     .no_location_policy
                     .set_borrow_fallthrough(BorrowFallthrough::Barrier);
             });
+        }
+    }
+
+    #[test]
+    fn fallthrough_marker_requires_direct_name_statement_tests() {
+        use super::ExceptionOwnerProvenance;
+        use crate::assembler::{Instruction, Item, Label, Operand, SourceLocation};
+        use crate::target::opcodes::{LOAD_FAST, NOP, NOT_TAKEN, POP_JUMP_IF_FALSE, TO_BOOL};
+
+        let location = |line| SourceLocation::new(line, line, 0, 4);
+        let plain = |opcode, operand, line| Instruction::new(opcode, operand, location(line), None);
+        let predecessor = plain(POP_JUMP_IF_FALSE, Operand::Forward(Label::from_u32(9)), 1);
+        let target = plain(POP_JUMP_IF_FALSE, Operand::Forward(Label::from_u32(10)), 4);
+        let items = vec![
+            Item::Instruction(predecessor),
+            Item::Instruction(plain(NOT_TAKEN, Operand::Value(0), 1)),
+            Item::Label(Label::from_u32(1)),
+            Item::Label(Label::from_u32(2)),
+            Item::Instruction(plain(NOP, Operand::Value(0), 2)),
+            Item::Label(Label::from_u32(3)),
+            Item::Label(Label::from_u32(4)),
+            Item::Instruction(plain(NOP, Operand::Value(0), 3)),
+            Item::Label(Label::from_u32(5)),
+            Item::Label(Label::from_u32(6)),
+            Item::Instruction(plain(LOAD_FAST, Operand::Value(0), 4)),
+            Item::Instruction(plain(TO_BOOL, Operand::Value(0), 4)),
+            Item::Instruction(target),
+            Item::Instruction(plain(NOT_TAKEN, Operand::Value(0), 4)),
+            Item::Label(Label::from_u32(9)),
+            Item::Label(Label::from_u32(10)),
+        ];
+        for (while_witness, if_witness, duplicate_boundary) in [
+            (true, true, false),
+            (false, true, false),
+            (true, false, false),
+            (false, false, false),
+            (true, true, true),
+        ] {
+            let mut provenance = ExceptionOwnerProvenance {
+                original_primitive_condition_boundaries: vec![predecessor, target],
+                setups: vec![
+                    (Label::from_u32(3), Some(location(2))),
+                    (Label::from_u32(5), Some(location(3))),
+                ],
+                setup_nop_ranges: vec![
+                    (Label::from_u32(2), Label::from_u32(3)),
+                    (Label::from_u32(4), Label::from_u32(5)),
+                ],
+                original_name_while_locations: while_witness
+                    .then_some(location(1))
+                    .into_iter()
+                    .collect(),
+                original_initial_name_if_locations: if_witness
+                    .then_some(location(4))
+                    .into_iter()
+                    .collect(),
+                ..ExceptionOwnerProvenance::default()
+            };
+            if duplicate_boundary {
+                provenance
+                    .original_primitive_condition_boundaries
+                    .push(target);
+            }
+            provenance.capture_uncompacted_conditional_arrays(&items, true);
+            assert_eq!(
+                provenance.uncompacted_conditional_arrays.len(),
+                usize::from(while_witness && if_witness && !duplicate_boundary),
+                "while={while_witness}, if={if_witness}, duplicate={duplicate_boundary}"
+            );
+        }
+    }
+
+    #[test]
+    fn fallthrough_setup_index_matches_original_pair_predicate() {
+        use rustc_hash::FxHashSet;
+
+        use super::{ExceptionOwnerProvenance, UncompactedPrefixIndexes};
+        use crate::assembler::{Instruction, Item, Label, Operand, SourceLocation};
+        use crate::target::opcodes::{NOP, POP_TOP};
+
+        let label = Label::from_u32;
+        let location = SourceLocation::new(1, 1, 0, 4);
+        let nop = Instruction::new(NOP, Operand::Value(0), location, None);
+        let other = Instruction::new(POP_TOP, Operand::Value(0), location, None);
+        for flags in 0..256 {
+            let mut all = vec![Item::Label(label(1)), Item::Instruction(nop)];
+            if flags & 1 != 0 {
+                all.push(Item::Instruction(other));
+            }
+            if flags & 2 != 0 {
+                all.push(Item::Label(label(3)));
+            }
+            all.push(Item::Label(label(2)));
+            if flags & 4 != 0 {
+                all.push(Item::Instruction(other));
+            }
+            if flags & 2 == 0 {
+                all.push(Item::Label(label(3)));
+            }
+            if flags & 8 != 0 {
+                all.push(Item::Label(label(1)));
+            }
+            if flags & 16 != 0 {
+                all.push(Item::Label(label(2)));
+            }
+            all.push(Item::Label(label(4)));
+            let mut labels = [label(1), label(2), label(3), label(4)]
+                .into_iter()
+                .collect::<FxHashSet<_>>();
+            if flags & 32 != 0 {
+                labels.remove(&label(1));
+            }
+            if flags & 64 != 0 {
+                labels.remove(&label(2));
+            }
+            let setup_location = (flags & 128 == 0).then_some(location);
+            let provenance = ExceptionOwnerProvenance {
+                setup_nop_ranges: vec![(label(1), label(2)), (label(1), label(4))],
+                setups: vec![(label(3), setup_location)],
+                ..ExceptionOwnerProvenance::default()
+            };
+            let indexes = UncompactedPrefixIndexes::new(&all);
+            for instruction in [nop, other] {
+                let original = provenance.setup_nop_ranges.iter().any(|(start, end)| {
+                    let (Some(&start_at), Some(&end_at)) =
+                        (indexes.positions.get(start), indexes.positions.get(end))
+                    else {
+                        return false;
+                    };
+                    start_at < end_at
+                        && indexes.has_unique_label(*start)
+                        && indexes.has_unique_label(*end)
+                        && labels.contains(start)
+                        && labels.contains(end)
+                        && all[start_at..end_at]
+                            .iter()
+                            .filter_map(|item| match item {
+                                Item::Instruction(value) => Some(value),
+                                Item::Label(_) => None,
+                            })
+                            .eq([&instruction])
+                        && provenance.setups.iter().any(|(label, location)| {
+                            *location == Some(instruction.location)
+                                && indexes.positions.get(label).is_some_and(|&position| {
+                                    position >= end_at
+                                        && all[end_at..position]
+                                            .iter()
+                                            .all(|item| matches!(item, Item::Label(_)))
+                                })
+                        })
+                });
+                assert_eq!(
+                    indexes.has_fallthrough_setup_pair(&provenance, &all, &labels, instruction),
+                    original,
+                    "flags={flags}, instruction={instruction:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fallthrough_marker_rejects_inserted_provenance_boundaries() {
+        use super::{ExceptionOwnerProvenance, UncompactedConditionalArray};
+        use crate::assembler::ir::{ExceptionRegion, ExceptionRegionPriority};
+        use crate::assembler::{
+            Instruction, Item, Label, LayoutAssembler, Operand, SourceLocation,
+        };
+        use crate::target::opcodes::{LOAD_FAST, NOP, NOT_TAKEN, POP_JUMP_IF_FALSE, TO_BOOL};
+
+        let location = |line| SourceLocation::new(line, line, 0, 4);
+        let plain = |opcode, operand, line| Instruction::new(opcode, operand, location(line), None);
+        let condition = plain(POP_JUMP_IF_FALSE, Operand::Forward(Label::from_u32(9)), 1);
+        let marker = plain(NOT_TAKEN, Operand::Value(0), 1);
+        let prefix = vec![
+            Item::Label(Label::from_u32(1)),
+            Item::Instruction(plain(NOP, Operand::Value(0), 2)),
+            Item::Label(Label::from_u32(2)),
+            Item::Instruction(plain(NOP, Operand::Value(0), 3)),
+            Item::Instruction(plain(LOAD_FAST, Operand::Value(0), 4)),
+            Item::Instruction(plain(TO_BOOL, Operand::Value(0), 4)),
+            Item::Instruction(plain(
+                POP_JUMP_IF_FALSE,
+                Operand::Forward(Label::from_u32(10)),
+                4,
+            )),
+            Item::Instruction(plain(NOT_TAKEN, Operand::Value(0), 4)),
+        ];
+        let alias = Label::from_u32(5);
+        for position in ["predecessor", "prefix"] {
+            for boundary in [
+                "range",
+                "unrelated setup and handler",
+                "setup",
+                "handler",
+                "omitted count",
+                "omitted location",
+                "removed pop",
+                "fusion",
+                "copied block",
+                "copied inline",
+                "copied internal",
+                "copied successor",
+            ] {
+                let mut items = vec![Item::Instruction(condition), Item::Instruction(marker)];
+                items.extend(prefix.iter().copied());
+                let insert_at = if position == "predecessor" { 1 } else { 4 };
+                items.insert(insert_at, Item::Label(alias));
+                let mut provenance = ExceptionOwnerProvenance {
+                    uncompacted_conditional_arrays: vec![UncompactedConditionalArray {
+                        prefix: prefix.clone(),
+                        comprehension_entry: None,
+                        source_entry: None,
+                        fallthrough: Some([condition, marker]),
+                    }],
+                    ..ExceptionOwnerProvenance::default()
+                };
+                match boundary {
+                    "setup" => {
+                        provenance
+                            .setups
+                            .extend([(alias, None), (alias, Some(location(1)))]);
+                    }
+                    "unrelated setup and handler" => {
+                        provenance.setups.push((Label::from_u32(8), None));
+                    }
+                    "omitted count" => {
+                        provenance.omitted_nop_counts.insert(alias, 1);
+                    }
+                    "omitted location" => {
+                        provenance.omitted_nop_locations.insert(alias, location(1));
+                    }
+                    "removed pop" => {
+                        provenance.removed_pop_block_boundaries.insert(alias);
+                    }
+                    "fusion" => {
+                        provenance.fusion_boundaries.insert(alias);
+                    }
+                    "copied block" => {
+                        provenance.normal_try_copy_blocks.insert(alias);
+                    }
+                    "copied inline" => {
+                        provenance.normal_try_copy_inline_labels.insert(alias);
+                    }
+                    "copied internal" => {
+                        provenance.normal_try_copy_internal_labels.push(alias);
+                    }
+                    "copied successor" => {
+                        provenance.normal_try_copy_jump_nop_successors.insert(alias);
+                    }
+                    _ => {}
+                }
+                let exception_regions =
+                    if boundary == "handler" || boundary == "unrelated setup and handler" {
+                        let target = if boundary == "handler" {
+                            alias
+                        } else {
+                            Label::from_u32(8)
+                        };
+                        vec![ExceptionRegion {
+                            is_scope_fallback: false,
+                            priority: ExceptionRegionPriority::OriginalRange(
+                                Label::from_u32(1),
+                                Label::from_u32(2),
+                            ),
+                            start: Label::from_u32(1),
+                            end: Label::from_u32(2),
+                            target,
+                            depth: 0,
+                            preserve_lasti: false,
+                        }]
+                    } else {
+                        vec![]
+                    };
+                let assembler = LayoutAssembler {
+                    python_version: crate::PythonVersion::Py314,
+                    legacy_uniform_jump_seed: false,
+                    items,
+                    exception_owner_provenance: Box::new(provenance),
+                    exception_regions,
+                    preserved_block_boundaries: rustc_hash::FxHashSet::default(),
+                    removed_max_depth: None,
+                    next_label: 11,
+                    has_next_location: false,
+                };
+                let targets = rustc_hash::FxHashSet::default();
+                let unique = super::OnceCell::new();
+                let markers =
+                    assembler.uncompacted_conditional_null_markers::<true>(&targets, &unique);
+                let expected = if boundary == "range" || boundary == "unrelated setup and handler" {
+                    [7].into_iter().collect()
+                } else {
+                    rustc_hash::FxHashSet::default()
+                };
+                assert_eq!(markers, expected, "{position}: {boundary}");
+                assert_eq!(
+                    markers,
+                    assembler.uncompacted_conditional_null_markers::<false>(&targets, &unique)
+                );
+            }
         }
     }
 }

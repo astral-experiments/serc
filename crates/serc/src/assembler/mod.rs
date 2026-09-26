@@ -15511,6 +15511,20 @@ impl Assembler {
             .insert(label);
     }
 
+    /// Records the first directly evaluated name in an authored if-test.
+    pub(crate) fn record_original_initial_name_if_location(&mut self, location: SourceLocation) {
+        self.exception_owner_provenance
+            .original_initial_name_if_locations
+            .insert(location);
+    }
+
+    /// Records a direct authored while-name test.
+    pub(crate) fn record_original_name_while_location(&mut self, location: SourceLocation) {
+        self.exception_owner_provenance
+            .original_name_while_locations
+            .insert(location);
+    }
+
     /// Records an original array boundary reached by a primitive source condition.
     pub(crate) fn record_original_primitive_condition_boundary(&mut self, target: Label) {
         let condition = *self.last_jump_instruction_mut("recording an original condition boundary");

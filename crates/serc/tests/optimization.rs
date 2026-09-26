@@ -2722,3 +2722,99 @@ fn elided_assert_after_nested_while_keeps_backedge_location() {
         );
     }
 }
+
+#[test]
+fn nested_try_fallthrough_preserves_conditional_exception_owners() {
+    const EXACT: &str = "def f(a,b,c,d):\n    while c:\n        try:\n            try:\n                if a:\n                    pass\n            except Exception:\n                pass\n        finally:\n            x = 0\n        break\n";
+    const FRESH: &str = "def f(a,b,c,d):\n    while c:\n        try:\n            try:\n                if a:\n                    pass\n            except Exception:\n                pass\n        finally:\n            d.clear()\n        break\n";
+    const RETAINED: &str = "def f(a,b,c,d):\n    while c:\n        try:\n            try:\n                pass; pass\n                if a:\n                    pass\n            except Exception:\n                pass\n        finally:\n            d.clear()\n        break\n";
+    const TRACE_CONDITION: &str = r"
+import dis, marshal, sys
+
+events = []
+class Injected(Exception):
+    pass
+class Clean:
+    def clear(self):
+        events.append('cleanup')
+scope = {}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+f = scope['f']
+targets = [i.offset for i in dis.get_instructions(f)
+           if i.opname == 'NOT_TAKEN' and i.positions.lineno == int(sys.argv[1])]
+assert len(targets) == 1, targets
+target = targets[0]
+hits = []
+monitor = sys.monitoring
+monitor.use_tool_id(5, 'conditional-owner')
+def inject(code, offset):
+    if offset == target:
+        hits.append(offset)
+        raise Injected()
+monitor.register_callback(5, monitor.events.INSTRUCTION, inject)
+monitor.set_local_events(5, f.__code__, monitor.events.INSTRUCTION)
+try:
+    f(True, False, True, Clean())
+    outcome = 'returned'
+except Injected:
+    outcome = 'escaped'
+finally:
+    monitor.set_local_events(5, f.__code__, 0)
+    monitor.register_callback(5, monitor.events.INSTRUCTION, None)
+    monitor.free_tool_id(5)
+assert hits == [target], hits
+print(outcome, events)
+";
+
+    assert_matches_cpython(EXACT, "fallthrough_nested_try.py", &LEVELS);
+    for (source, line, expected) in [
+        (FRESH, 5, &b"escaped []\n"[..]),
+        (RETAINED, 6, &b"returned ['cleanup']\n"[..]),
+    ] {
+        for optimization_level in LEVELS {
+            let native = oracle(
+                source.as_bytes(),
+                "fallthrough_nested_try.py",
+                PythonVersion::Py314,
+                optimization_level,
+            );
+            assert!(
+                native.status.success(),
+                "{}",
+                String::from_utf8_lossy(&native.stderr)
+            );
+            let actual = compile_with_options(
+                source,
+                "fallthrough_nested_try.py",
+                &CompileOptions {
+                    python_version: PythonVersion::Py314,
+                    optimization_level,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .marshal();
+            for code in [&native.stdout, &actual] {
+                let mut child = Command::new(ORACLES[2].get().unwrap())
+                    .args(["-I", "-S", "-B", "-c", TRACE_CONDITION])
+                    .arg(line.to_string())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child.stdin.take().unwrap().write_all(code).unwrap();
+                let result = child.wait_with_output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                assert_eq!(
+                    result.stdout, expected,
+                    "{optimization_level:?}, line {line}"
+                );
+            }
+        }
+    }
+}

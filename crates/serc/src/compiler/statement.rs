@@ -2975,6 +2975,12 @@ impl<'source> Compiler<'source> {
         &mut self,
         statement: &ruff_python_ast::StmtWhile,
     ) -> Result<(), CompileError> {
+        if self.context.python_version == crate::PythonVersion::Py314
+            && matches!(statement.test.as_ref(), Expr::Name(_))
+        {
+            self.assembler
+                .record_original_name_while_location(self.source_location(statement.test.range()));
+        }
         let base_depth = self.control.stack.depth;
         let start = self.assembler.label();
         let condition_false = self.assembler.label();
@@ -11156,6 +11162,29 @@ impl<'source> Compiler<'source> {
     }
 
     fn compile_if(&mut self, statement: &ruff_python_ast::StmtIf) -> Result<(), CompileError> {
+        if self.context.python_version == crate::PythonVersion::Py314 {
+            // Only names evaluated before any other part of the authored test.
+            // A name selected by a folded conditional expression is not enough.
+            let initial_name = match statement.test.as_ref() {
+                Expr::Name(_) => Some(statement.test.as_ref()),
+                Expr::UnaryOp(unary)
+                    if unary.op == UnaryOp::Not
+                        && matches!(unary.operand.as_ref(), Expr::Name(_)) =>
+                {
+                    Some(unary.operand.as_ref())
+                }
+                Expr::BoolOp(boolean) => boolean
+                    .values
+                    .first()
+                    .filter(|first| matches!(first, Expr::Name(_))),
+                _ => None,
+            };
+            if let Some(initial_name) = initial_name {
+                self.assembler.record_original_initial_name_if_location(
+                    self.source_location(initial_name.range()),
+                );
+            }
+        }
         let module_can_suspend = self.context.module_plan().has_suspension_expressions();
         let expression_suspends_current_scope = |expression: &Expr| {
             module_can_suspend && super::expression::expression_suspends_current_scope(expression)
@@ -17127,6 +17156,12 @@ impl<'source> Compiler<'source> {
         &mut self,
         statement: &ruff_python_ast::StmtWhile,
     ) -> Result<(), CompileError> {
+        if self.context.python_version == crate::PythonVersion::Py314
+            && matches!(statement.test.as_ref(), Expr::Name(_))
+        {
+            self.assembler
+                .record_original_name_while_location(self.source_location(statement.test.range()));
+        }
         let module_can_suspend = self.context.module_plan().has_suspension_expressions();
         let expression_suspends_current_scope = |expression: &Expr| {
             module_can_suspend && super::expression::expression_suspends_current_scope(expression)

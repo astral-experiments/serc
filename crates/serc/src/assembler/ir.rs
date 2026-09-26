@@ -133,7 +133,7 @@ pub(super) struct OperandPatch {
     pub(super) argument: Option<u32>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub(super) struct LocalPolicy(u16);
 
 impl LocalPolicy {
@@ -236,7 +236,7 @@ impl LocalPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 struct NoLocationBlockPolicy(u8);
 
 impl NoLocationBlockPolicy {
@@ -272,7 +272,7 @@ impl NoLocationBlockPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub(super) struct NoLocationPolicy {
     /// Whether an unlocated block ending at this instruction may be inlined.
     block_policy: NoLocationBlockPolicy,
@@ -403,7 +403,7 @@ impl NoLocationPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub(super) struct FusionPolicy(u8);
 
 impl FusionPolicy {
@@ -533,7 +533,7 @@ pub(super) enum RetainedJumpNop {
     Always,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq, Hash)]
 pub(super) struct JumpPolicy(u16);
 
 impl JumpPolicy {
@@ -1052,7 +1052,7 @@ impl ExceptionPolicy {
 }
 
 /// Packs independent instruction metadata with zero reserved.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 struct InstructionMetadata(NonZeroU16);
 
 impl InstructionMetadata {
@@ -1198,7 +1198,7 @@ impl Default for InstructionMetadata {
 }
 
 /// First occurrences of the two Boolean objects in one original instruction owner.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub(super) enum EarlyBooleanAdmissions {
     #[default]
     None,
@@ -1237,7 +1237,7 @@ impl EarlyBooleanAdmissions {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(super) struct Instruction {
     pub(super) opcode: Opcode,
     operand_payload: u32,
@@ -1845,7 +1845,7 @@ pub(super) struct ExceptionRegion {
     pub(super) preserve_lasti: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub(crate) struct SourceLocation {
     pub(crate) line: i32,
     pub(crate) end_line: i32,

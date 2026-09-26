@@ -529,7 +529,10 @@ impl Assembler {
                     .is_empty())
         {
             self.exception_owner_provenance
-                .capture_uncompacted_conditional_arrays(&graph.copy_items());
+                .capture_uncompacted_conditional_arrays(
+                    &graph.copy_items(),
+                    self.python_version == crate::PythonVersion::Py314,
+                );
         }
         Self::restore_legacy_return_pop_blocks(&mut graph, &self.legacy_return_pop_blocks);
         OptimizationPipeline {
