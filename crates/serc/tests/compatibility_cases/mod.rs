@@ -330,6 +330,7 @@ mod tuple_unpack_owner_slots;
 mod typed_handler_entry_owner_boundary;
 mod unary_positive_compatibility;
 mod unfiltered_comprehension_none_condition_owner_compatibility;
+mod unicode_effects;
 mod unlocated_handler_join;
 mod unreachable_literal_order;
 mod unreachable_plain_call_kw_constant_compatibility;

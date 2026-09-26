@@ -498,7 +498,7 @@ impl ScopedAbsence {
 }
 
 /// Match only the source-audited ASCII domain, never general Unicode identifiers.
-fn ascii_dotted_name(value: &str) -> bool {
+pub(super) fn ascii_dotted_name(value: &str) -> bool {
     fn identifier(value: &str) -> bool {
         value.as_bytes().split_first().is_some_and(|(first, rest)| {
             (first.is_ascii_alphabetic() || *first == b'_')

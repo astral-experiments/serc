@@ -8,6 +8,7 @@ mod cpython_3_14_5;
 mod cpython_3_14_5_source_codecs;
 pub(crate) mod cpython_3_15_0rc2;
 mod cpython_3_15_0rc2_source_codecs;
+pub(crate) mod isolated_unicode;
 mod legacy_opcodes;
 
 use crate::PythonVersion;

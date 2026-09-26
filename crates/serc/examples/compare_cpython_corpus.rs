@@ -23,6 +23,8 @@ mod native_output_cache;
 mod native_output_reader;
 #[path = "support/standard_caller_profile.rs"]
 mod standard_caller_profile;
+#[path = "support/unicode_effects_profile.rs"]
+mod unicode_effects_profile;
 #[path = "support/warning_effects_profile.rs"]
 mod warning_effects_profile;
 use rayon::prelude::*;

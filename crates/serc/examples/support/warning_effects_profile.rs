@@ -38,6 +38,7 @@ fn admitted_proof(version: PythonVersion) -> (&'static [u8], &'static str) {
 pub(super) struct WarningContext {
     python_version: PythonVersion,
     retained_strings: Vec<String>,
+    unicode: Option<super::unicode_effects_profile::UnicodeContext>,
 }
 
 #[derive(Deserialize)]
@@ -116,13 +117,21 @@ impl WarningContext {
         python_version: PythonVersion,
     ) -> Result<Self, String> {
         let (bytes, admitted_sha256) = admitted_proof(python_version);
-        Self::from_proof(
+        let mut context = Self::from_proof(
             bytes,
             admitted_sha256,
             initial_proof_sha256,
             runtime_admission_sha256,
             python_version,
-        )
+        )?;
+        context.unicode = Some(
+            super::unicode_effects_profile::UnicodeContext::for_qualified_caller(
+                initial_proof_sha256,
+                runtime_admission_sha256,
+                python_version,
+            )?,
+        );
+        Ok(context)
     }
 
     fn from_proof(
@@ -256,6 +265,7 @@ impl WarningContext {
         Ok(Self {
             python_version,
             retained_strings: proof.retained_strings,
+            unicode: None,
         })
     }
 
@@ -286,6 +296,9 @@ impl WarningContext {
                 warning.ordinal(),
                 CompilationWarningEffect::PartialRetainedStrings(self.retained_strings.clone()),
             )?;
+        }
+        if let Some(unicode) = &self.unicode {
+            unicode.record(&prepared, &mut effects)?;
         }
         prepared.finish(&effects)
     }

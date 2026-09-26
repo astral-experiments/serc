@@ -1302,6 +1302,7 @@ struct InternedStrings<'code, 'state> {
     added: FxHashSet<&'code str>,
     possibly_added: FxHashSet<&'code str>,
     unknown_additions_seen: bool,
+    unchanged_by_unknown_additions: FxHashSet<&'code str>,
     conservative_replay: bool,
     partial: Option<PartialInternDependencies<'code>>,
     uncertain_origins: FxHashSet<&'code str>,
@@ -1321,6 +1322,7 @@ impl<'code, 'state> InternedStrings<'code, 'state> {
             added: FxHashSet::default(),
             possibly_added: FxHashSet::default(),
             unknown_additions_seen: false,
+            unchanged_by_unknown_additions: FxHashSet::default(),
             conservative_replay: initial.has_unknown_entries() || partial.is_some(),
             partial,
             uncertain_origins: FxHashSet::default(),
@@ -1335,13 +1337,31 @@ impl<'code, 'state> InternedStrings<'code, 'state> {
         } else {
             match self.initial.membership_for(self.python_version, value) {
                 Some(false)
-                    if self.unknown_additions_seen || self.possibly_added.contains(value) =>
+                    if (self.unknown_additions_seen
+                        && !self.unchanged_by_unknown_additions.contains(value))
+                        || self.possibly_added.contains(value) =>
                 {
                     None
                 }
                 membership => membership,
             }
         }
+    }
+
+    /// Preserve only absence facts unchanged by every unknown external event so far.
+    fn record_unknown_additions(&mut self, unchanged: Option<&'code [String]>) {
+        match unchanged {
+            Some(values) if !self.unknown_additions_seen => self
+                .unchanged_by_unknown_additions
+                .extend(values.iter().map(String::as_str)),
+            Some(values) => {
+                let values: FxHashSet<_> = values.iter().map(String::as_str).collect();
+                self.unchanged_by_unknown_additions
+                    .retain(|value| values.contains(value));
+            }
+            None => self.unchanged_by_unknown_additions.clear(),
+        }
+        self.unknown_additions_seen = true;
     }
 
     fn tracks_origin(&self, value: &str) -> bool {
@@ -1393,6 +1413,33 @@ impl<'code, 'state> InternedStrings<'code, 'state> {
     fn extend(&mut self, values: impl IntoIterator<Item = &'code str>) {
         self.added.extend(values);
     }
+}
+
+/// Candidate spellings for input-bound external-effect proofs, without membership claims.
+pub(crate) fn intern_state_candidates(
+    code: &CodeObject,
+    python_version: PythonVersion,
+) -> Vec<String> {
+    let mut candidates: Vec<_> = frozenset_intern_dependencies(code, python_version)
+        .strings
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    candidates.extend(
+        code.marshal_provenance
+            .interning_events
+            .iter()
+            .filter_map(|event| {
+                if let CompilationInterningEvent::CodeAssembly(summary) = event {
+                    Some(summary.qualified_name.clone())
+                } else {
+                    None
+                }
+            }),
+    );
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
 }
 
 /// Reject unresolved canonical origins before exposing an infallibly serializable module.
@@ -1763,6 +1810,7 @@ fn has_external_interning_events(code: &CodeObject) -> bool {
                 event,
                 CompilationInterningEvent::ExternalRetain(_)
                     | CompilationInterningEvent::PartialExternalRetain(_)
+                    | CompilationInterningEvent::PartialExternalRetainWithUnchanged { .. }
                     | CompilationInterningEvent::UnknownExternalAdditions
             )
         })
@@ -1777,6 +1825,7 @@ fn has_unknown_interning_events(code: &CodeObject) -> bool {
                 event,
                 CompilationInterningEvent::UnknownExternalAdditions
                     | CompilationInterningEvent::PartialExternalRetain(_)
+                    | CompilationInterningEvent::PartialExternalRetainWithUnchanged { .. }
             )
         })
 }
@@ -2394,11 +2443,18 @@ fn collect_compilation_interning<'a>(
                 interned_strings.extend(values.iter().map(String::as_str));
             }
             CompilationInterningEvent::PartialExternalRetain(values) => {
-                interned_strings.unknown_additions_seen = true;
+                interned_strings.record_unknown_additions(None);
                 interned_strings.extend(values.iter().map(String::as_str));
             }
+            CompilationInterningEvent::PartialExternalRetainWithUnchanged {
+                retained_strings,
+                unchanged_strings,
+            } => {
+                interned_strings.record_unknown_additions(Some(unchanged_strings));
+                interned_strings.extend(retained_strings.iter().map(String::as_str));
+            }
             CompilationInterningEvent::UnknownExternalAdditions => {
-                interned_strings.unknown_additions_seen = true;
+                interned_strings.record_unknown_additions(None);
             }
             CompilationInterningEvent::CachedTuple(values) => {
                 tuple_origins
@@ -3095,9 +3151,9 @@ mod external_interning_tests {
     use rustc_hash::FxHashSet;
 
     use super::{
-        FrozensetRecreationNeed, collect_recreated_frozensets, frozenset_recreation_need,
-        has_external_interning_events, has_qualified_name_interning_dependencies,
-        validate_initial_intern_state,
+        FrozensetRecreationNeed, InternedStrings, collect_recreated_frozensets,
+        frozenset_recreation_need, has_external_interning_events,
+        has_qualified_name_interning_dependencies, validate_initial_intern_state,
     };
     use crate::code_object::{
         CodeInterningSummary, CodeObject, CompilationInterningEvent, Constant, MarshalProvenance,
@@ -3171,6 +3227,61 @@ mod external_interning_tests {
             let (recreated, _) = replay(&code, &initial).unwrap();
             assert_eq!(recreated.len(), if before { 2 } else { 0 });
         }
+    }
+
+    #[test]
+    fn scoped_external_effects_preserve_only_incoming_absence() {
+        let values = ["first_marker".to_string(), "second_marker".to_string()];
+        let complete = InitialInternState::from_complete([] as [&str; 0]);
+        let unknown = InitialInternState::from_partial([] as [&str; 0]);
+        for initial in [&complete, &unknown] {
+            let mut strings = InternedStrings::new(initial, PythonVersion::Py314, None);
+            strings.record_unknown_additions(Some(&values));
+            assert_eq!(
+                strings.contains(&values[0]),
+                initial.membership_for(PythonVersion::Py314, &values[0])
+            );
+            strings.record_unknown_additions(Some(&values[1..]));
+            assert_eq!(strings.contains(&values[0]), None);
+            assert_eq!(
+                strings.contains(&values[1]),
+                initial.membership_for(PythonVersion::Py314, &values[1])
+            );
+            strings.record_unknown_additions(Some(&values));
+            assert_eq!(strings.contains(&values[0]), None);
+            strings.record_unknown_additions(None);
+            strings.record_unknown_additions(Some(&values));
+            assert_eq!(strings.contains(&values[1]), None);
+            strings.insert(&values[0]);
+            strings.record_unknown_additions(None);
+            assert_eq!(strings.contains(&values[0]), Some(true));
+        }
+    }
+
+    #[test]
+    fn scoped_external_effects_keep_origins_and_possible_additions_sticky() {
+        let value = "Owner.Inner".to_string();
+        let unchanged = [value.clone()];
+        let initial = InitialInternState::from_complete([] as [&str; 0]);
+        for unknown_first in [false, true] {
+            let mut strings = InternedStrings::new(&initial, PythonVersion::Py314, None);
+            if unknown_first {
+                strings.record_unknown_additions(None);
+            }
+            strings.record_unknown_additions(Some(&unchanged));
+            strings.intern_qualified_name(&value, Some(true));
+            strings.record_unknown_additions(None);
+            strings.record_unknown_additions(Some(&unchanged));
+            strings.intern_qualified_name(&value, Some(true));
+            assert_eq!(
+                strings.qualified_name_origins[&*value],
+                (!unknown_first).then_some(true)
+            );
+        }
+        let mut strings = InternedStrings::new(&initial, PythonVersion::Py314, None);
+        strings.possibly_added.insert(&value);
+        strings.record_unknown_additions(Some(&unchanged));
+        assert_eq!(strings.contains(&value), None);
     }
 
     #[test]

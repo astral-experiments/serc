@@ -213,6 +213,11 @@ pub(crate) enum CompilationInterningEvent {
     ExternalRetain(Vec<String>),
     /// These canonical owners remain retained; other additions are unknown.
     PartialExternalRetain(Vec<String>),
+    /// Partial positives and spellings this event cannot add; preserve only incoming facts.
+    PartialExternalRetainWithUnchanged {
+        retained_strings: Vec<String>,
+        unchanged_strings: Vec<String>,
+    },
     /// Additional retained canonical strings may have appeared at this boundary.
     UnknownExternalAdditions,
     CodeAssembly(CodeInterningSummary),
