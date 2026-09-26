@@ -28817,6 +28817,39 @@ impl<'source> Compiler<'source> {
             });
         let outer_name_return_borrow_exit =
             self.control.finally.pending_name_return_borrow_exit.take();
+        let nested_function_pass_tail = self.context.python_version >= crate::PythonVersion::Py314
+            && terminal
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && matches!(statement.finalbody.as_slice(), [Stmt::Expr(cleanup)]
+                if matches!(cleanup.value.as_ref(), Expr::Call(_))
+                    && !expression_contains_inline_branch(&cleanup.value)
+                    && !expression_suspends_current_scope(&cleanup.value))
+            && matches!(statement.body.as_slice(), [Stmt::FunctionDef(function), Stmt::Assign(assignment), Stmt::Pass(pass)]
+                if !function.is_async
+                    && function.decorator_list.is_empty()
+                    && function.type_params.is_none()
+                    && function.returns.is_none()
+                    && function.parameters.iter().next().is_none()
+                    && matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                    && matches!(assignment.value.as_ref(), Expr::Name(_))
+                    && self.source_location(assignment.range).line != self.source_location(pass.range).line);
         let protected_result = self.with_finally_protected_context(
             pass_finally_location,
             overriding_return && !self.control.finally.copies_terminating_finally_returns,
@@ -28902,6 +28935,7 @@ impl<'source> Compiler<'source> {
                     if has_instructions
                         && let Some(Stmt::Pass(pass)) = statement.body.last()
                         && (suite_has_linear_borrow_fallthrough(&statement.body)
+                            || nested_function_pass_tail
                             || (compiler.context.python_version >= crate::PythonVersion::Py314
                                 && compiler.assembler.has_single_omitted_pass_at_source_join(
                                     compiler.source_location(pass.range),

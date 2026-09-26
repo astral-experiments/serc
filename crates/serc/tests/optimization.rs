@@ -69,7 +69,36 @@ monitor.free_tool_id(5)
 ";
 
     let versions = [PythonVersion::Py312, PythonVersion::Py313];
-    assert_matches_cpython_versions(TERMINAL, "legacy_finally.py", &LEVELS, &versions);
+    for source in [
+        TERMINAL,
+        r"def f(work,cleanup,flag):
+    try:
+        try:
+            work()
+        finally:
+            pass
+        global marker
+        assert flag
+    finally:
+        cleanup()
+",
+        r"def outer():
+    marker = 0
+    def f(work,cleanup,flag):
+        try:
+            try:
+                work()
+            finally:
+                pass
+            nonlocal marker
+            1
+        finally:
+            cleanup()
+    return f
+",
+    ] {
+        assert_matches_cpython_versions(source, "legacy_finally.py", &LEVELS, &versions);
+    }
     for (index, python_version) in versions.into_iter().enumerate() {
         for optimization_level in LEVELS {
             let native = oracle(
@@ -164,6 +193,107 @@ fn terminal_conditional_comprehension_pass_keeps_return_location() {
                 PythonVersion::Py315,
             ],
         );
+    }
+}
+
+#[test]
+fn terminal_finally_pass_after_nested_function_matches_cpython() {
+    for source in [
+        "def f(flag):\n    try:\n        def inner():\n            pass\n        result = flag\n        pass\n    finally:\n        cleanup()\n",
+        "def f(flag):\n    try:\n        def inner():\n            return flag\n        result = flag\n        pass\n    finally:\n        cleanup(flag)\n",
+        "def f(flag):\n    try:\n        def inner():\n            pass\n        result = flag; pass\n    finally:\n        cleanup()\n",
+        "def f(flag):\n    try:\n        def inner():\n            'doc'\n            return flag\n        result = (\n            flag); pass\n    finally:\n        cleanup(\n            flag\n        )\n",
+        "def f(flag):\n    if False:\n        missing = 1\n    try:\n        def inner():\n            pass\n        result = missing\n        pass\n    finally:\n        cleanup()\n",
+        "def f(flag, xs, obj, manager):\n    try:\n        def inner():\n            try:\n                item = [v for v in xs] if flag else []\n                pass\n            except ValueError:\n                work()\n        result = flag\n        pass\n    finally:\n        cleanup()\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "terminal_finally_pass.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
+fn terminal_finally_pass_is_outside_its_cleanup_handler() {
+    const SOURCE: &str = "def f(flag):\n    try:\n        def inner():\n            return flag\n        result = flag\n        pass\n    finally:\n        cleanup()\n";
+    const TRACE: &str = r"
+import dis, json, marshal, sys
+events = []
+class Fault(Exception): pass
+def cleanup(): events.append('cleanup')
+scope = {'cleanup': cleanup}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+f = scope['f']
+for opcode, line, expected in [('MAKE_FUNCTION', 3, ['cleanup', 'escaped']),
+                               ('LOAD_DEREF', 5, ['cleanup', 'escaped']),
+                               ('NOP', 6, ['escaped'])]:
+    targets = [i.offset for i in dis.get_instructions(f)
+               if i.opname == opcode and i.positions.lineno == line]
+    assert len(targets) == 1, (opcode, line, targets)
+    hits = []
+    def trace(frame, event, arg):
+        if frame.f_code is f.__code__:
+            frame.f_trace_opcodes = True
+            if event == 'opcode' and frame.f_lasti == targets[0]:
+                hits.append(frame.f_lasti)
+                raise Fault()
+        return trace
+    events.clear()
+    sys.settrace(trace)
+    try:
+        f(True)
+    except Fault:
+        events.append('escaped')
+    finally:
+        sys.settrace(None)
+    assert len(hits) == 1, (opcode, hits)
+    assert events == expected, (opcode, events, expected)
+print(json.dumps('ok'))
+";
+    for (index, (version, _, _)) in VERSIONS.iter().copied().enumerate().skip(2) {
+        for optimization_level in LEVELS {
+            let native = oracle(
+                SOURCE.as_bytes(),
+                "terminal_finally_pass.py",
+                version,
+                optimization_level,
+            );
+            assert!(
+                native.status.success(),
+                "{}",
+                String::from_utf8_lossy(&native.stderr)
+            );
+            let actual = compile_with_options(
+                SOURCE,
+                "terminal_finally_pass.py",
+                &CompileOptions {
+                    python_version: version,
+                    optimization_level,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .marshal();
+            for bytes in [&native.stdout[..], &actual] {
+                let mut child = Command::new(ORACLES[index].get().unwrap())
+                    .args(["-I", "-S", "-c", TRACE])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child.stdin.take().unwrap().write_all(bytes).unwrap();
+                let output = child.wait_with_output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(output.stdout, b"\"ok\"\n");
+            }
+        }
     }
 }
 
