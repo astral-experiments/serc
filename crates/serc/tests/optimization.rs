@@ -1071,7 +1071,7 @@ assert (sets[0] is sets[1]) == (sys.argv[1] == 'shared')
         (SOURCE.replace("    assert context.shared_member", "    pass"), true),
         (SOURCE.replace("    assert context.shared_member", "    context.shared_member"), false),
         (SOURCE.replace("extra=None, ", ""), true),
-        (SOURCE.replace("\"shared_member\"", "\"Key_member\"").replace("context.shared_member", "context.Key_member"), false),
+        (SOURCE.replace("\"shared_member\"", "\"Key_member\"").replace("context.shared_member", "context.\u{212a}ey_member"), false),
         (SOURCE.replace("assert context.shared_member", "assert (lambda: context.shared_member)()"), false),
         (SOURCE.replace("shared_member", "_Box__member").replace("def discarded_assert():\n    assert context._Box__member", "class Box:\n    def f(self):\n        return self.__member\n\n    def discarded_assert(self):\n        assert context._Box__member"), false),
         (SOURCE.replace("def discarded_assert():\n    assert context.shared_member", "assert context.shared_member"), false),
