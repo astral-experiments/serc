@@ -568,6 +568,29 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
         });
     }
 
+    /// Call keyword names are checked before the callable or any argument is lowered.
+    fn check_call_keywords(&mut self, arguments: &ast::Arguments) {
+        if FUTURE_ONLY
+            || !self.check_bare_starred
+            || self.pre_lowering_only
+            || self.bare_starred.is_some()
+        {
+            return;
+        }
+        let legacy = self.python_version < ast::PythonVersion::PY314;
+        if let Some((name, range)) = invalid_call_keyword(arguments, legacy) {
+            // Legacy compilation checks each forbidden name before its later duplicates.
+            // Modern forbidden-name checks belong to the earlier symbol-table pass.
+            self.lowering_keyword_error = true;
+            let message = if legacy && name == "__debug__" {
+                "cannot assign to __debug__".to_owned()
+            } else {
+                format!("keyword argument repeated: {name}")
+            };
+            *self.error.borrow_mut() = Some(CompileError::invalid_syntax(message, range));
+        }
+    }
+
     fn defer_pattern_reachability(&mut self, statement: &'ast ast::StmtMatch) {
         for (index, case) in statement.cases.iter().enumerate() {
             let allow_irrefutable = case.guard.is_some() || index + 1 == statement.cases.len();
@@ -1036,19 +1059,29 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
     }
 }
 
-/// Find the duplicate belonging to the earliest authored keyword, as CPython does.
-fn repeated_call_keyword(arguments: &ast::Arguments) -> Option<(&str, TextRange)> {
+/// Find the first keyword-name error in CPython's outer-to-inner validation order.
+fn invalid_call_keyword(
+    arguments: &ast::Arguments,
+    forbid_debug: bool,
+) -> Option<(&str, TextRange)> {
     if arguments.keywords.len() < 2 {
-        return None;
+        return arguments.keywords.first().and_then(|keyword| {
+            keyword.arg.as_ref().and_then(|name| {
+                (forbid_debug && name == "__debug__").then_some((name.as_str(), keyword.range))
+            })
+        });
     }
     let mut seen = FxHashMap::default();
     let mut repeated = None;
     // Reverse traversal preserves the next occurrence of each name without a quadratic scan.
     for keyword in arguments.keywords.iter().rev() {
-        if let Some(name) = &keyword.arg
-            && let Some(range) = seen.insert(name.as_str(), keyword.range)
-        {
-            repeated = Some((name.as_str(), range));
+        if let Some(name) = &keyword.arg {
+            let next = seen.insert(name.as_str(), keyword.range);
+            if forbid_debug && name == "__debug__" {
+                repeated = Some((name.as_str(), keyword.range));
+            } else if let Some(range) = next {
+                repeated = Some((name.as_str(), range));
+            }
         }
     }
     repeated
@@ -1214,6 +1247,45 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
             self.pre_lowering_only = previous;
             if self.error.borrow().is_none() {
                 *self.error.borrow_mut() = Some(error);
+            }
+            return;
+        }
+        if !self.pre_lowering_only
+            && self.check_bare_starred
+            && self.bare_starred.is_none()
+            && let Stmt::ClassDef(class) = statement
+            && let Some(arguments) = &class.arguments
+            && invalid_call_keyword(arguments, self.python_version < ast::PythonVersion::PY314)
+                .is_some()
+        {
+            self.lowering_keyword_error = true;
+            if self.python_version < ast::PythonVersion::PY314 {
+                // Legacy class code generation compiles decorators, type parameters and the
+                // body before validating the class call's keyword names or base expressions.
+                // Only this failing path needs the extra walk; normal traversal is unchanged.
+                for decorator in &class.decorator_list {
+                    self.visit_decorator(decorator);
+                }
+                self.with_private_context(class.name.as_str(), None, |visitor| {
+                    if let Some(params) = &class.type_params {
+                        visitor.mangled_names = Some(FxHashSet::default());
+                        for parameter in params.iter() {
+                            visitor
+                                .mangled_names
+                                .as_mut()
+                                .expect("generic headers have restricted name mangling")
+                                .insert(parameter.name().as_str());
+                            visitor.visit_type_param(parameter);
+                        }
+                        visitor.mangled_names = None;
+                    }
+                    visitor.with_scope(ScopeKind::Class, |visitor| {
+                        visitor.visit_scope_body(&class.body);
+                    });
+                });
+            }
+            if self.error.borrow().is_none() {
+                self.check_call_keywords(arguments);
             }
             return;
         }
@@ -1443,21 +1515,11 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
         if self.error.borrow().is_some() {
             return;
         }
-        if self.check_bare_starred
-            && !self.pre_lowering_only
-            && self.bare_starred.is_none()
-            && let Expr::Call(call) = expression
-            && let Some((name, range)) = repeated_call_keyword(&call.arguments)
-        {
-            // CPython checks call keywords before lowering the callable or its arguments.
-            // Stringized and unevaluated annotations do not reach this phase. Revisit the
-            // module for symbol-table errors before returning this lowering diagnostic.
-            self.lowering_keyword_error = true;
-            *self.error.borrow_mut() = Some(CompileError::invalid_syntax(
-                format!("keyword argument repeated: {name}"),
-                range,
-            ));
-            return;
+        if let Expr::Call(call) = expression {
+            self.check_call_keywords(&call.arguments);
+            if self.error.borrow().is_some() {
+                return;
+            }
         }
         let check_expression = match expression {
             // These are the only remaining variants checked by the pinned Ruff visitor. Its
