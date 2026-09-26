@@ -31,6 +31,7 @@ const WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
 struct OracleInvocation<'a> {
     python: &'a str,
     qualified: Option<&'a standard_caller_profile::QualifiedOracle>,
+    fresh_caller: bool,
 }
 
 impl OracleInvocation<'_> {
@@ -51,6 +52,22 @@ path = pathlib.Path(sys.argv[1])
 source = path.read_bytes()
 try:
     code = compile(source, str(path), "exec", dont_inherit=True, optimize=0)
+except Exception as error:
+    print(f"{type(error).__name__}: {error}", file=sys.stderr)
+    raise SystemExit(2)
+sys.stdout.buffer.write(marshal.dumps(code))
+"#;
+
+// This caller is a separate empirical comparison contract. It does not
+// establish the intern state of the historical pathlib caller above.
+const FRESH_ORACLE: &str = r#"
+import marshal
+import sys
+
+path = sys.argv[1]
+source = open(path, "rb").read()
+try:
+    code = compile(source, path, "exec", dont_inherit=True, optimize=0)
 except Exception as error:
     print(f"{type(error).__name__}: {error}", file=sys.stderr)
     raise SystemExit(2)
@@ -191,6 +208,9 @@ struct Options {
     source_bytes: bool,
     #[arg(long, value_name = "PROFILE.json")]
     initial_intern_state: Option<PathBuf>,
+    /// Compare the default compiler API against the distinct minimal fresh caller.
+    #[arg(long, conflicts_with_all = ["initial_intern_state", "caller_intern_model", "diagnostic_assume_startup_intern_state", "caller_intern_assume_absent"])]
+    fresh_caller_default: bool,
     /// Diagnostic only: substitute the compiler's neutral startup model for caller state.
     #[arg(long, conflicts_with_all = ["initial_intern_state", "caller_intern_model"])]
     diagnostic_assume_startup_intern_state: bool,
@@ -204,7 +224,20 @@ struct Options {
 
 impl Options {
     fn validate_intern_contract(&self, cache_read: bool, cache_write: bool) -> Result<(), String> {
-        if self.diagnostic_assume_startup_intern_state {
+        if self.fresh_caller_default {
+            if cache_read
+                || cache_write
+                || !self.source_bytes
+                || self.expected_files.is_none_or(|count| count == 0)
+                || self.limit.is_some()
+                || self.initial_intern_state.is_some()
+                || self.caller_intern_model.is_some()
+                || self.caller_intern_assume_absent
+                || self.diagnostic_assume_startup_intern_state
+            {
+                return Err("fresh caller comparison requires byte sources and a nonzero expected file count, and cannot use limits, profiles, caller models, diagnostic assumptions, or native caches".to_string());
+            }
+        } else if self.diagnostic_assume_startup_intern_state {
             if cache_read
                 || cache_write
                 || self.require_all
@@ -299,6 +332,7 @@ fn main() -> ExitCode {
     let inherited_oracle = OracleInvocation {
         python: &options.python,
         qualified: None,
+        fresh_caller: options.fresh_caller_default,
     };
     if let Err(message) = verify_python(&inherited_oracle, options.python_version) {
         eprintln!("{message}");
@@ -338,6 +372,7 @@ fn main() -> ExitCode {
     let oracle = OracleInvocation {
         python: &options.python,
         qualified: qualified.as_ref(),
+        fresh_caller: options.fresh_caller_default,
     };
     if qualified.is_some()
         && let Err(message) = verify_python(&oracle, options.python_version)
@@ -380,16 +415,20 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let compile_options = CompileOptions {
+    let mut compile_options = CompileOptions {
         python_version: options.python_version,
-        initial_intern_state: if let Some(profile) = profile {
-            profile.state
-        } else {
-            assert!(options.diagnostic_assume_startup_intern_state);
-            serc::InitialInternState::default()
-        },
         ..CompileOptions::default()
     };
+    if let Some(profile) = profile {
+        compile_options.initial_intern_state = profile.state;
+    } else {
+        assert!(options.diagnostic_assume_startup_intern_state || options.fresh_caller_default);
+    }
+    if options.fresh_caller_default {
+        println!(
+            "Native caller: minimal fresh caller; comparing the default compiler API empirically"
+        );
+    }
     let mut paths = match discover(&options.roots, &options.extensions) {
         Ok(paths) => paths,
         Err(message) => {
@@ -412,6 +451,10 @@ fn main() -> ExitCode {
     }
     if let Some(limit) = options.limit {
         paths.truncate(limit);
+    }
+    if options.fresh_caller_default && paths.iter().any(|path| path.to_str().is_none()) {
+        eprintln!("fresh caller comparison requires UTF-8 filenames");
+        return ExitCode::from(2);
     }
     if caller_model.is_some() || qualified.is_some() {
         for path in &paths {
@@ -645,8 +688,8 @@ fn main() -> ExitCode {
             .count(),
         &expected_outcomes,
         options.expected_cpython_rejected,
-        options.require_all,
-        options.require_rejection_parity,
+        options.require_all || options.fresh_caller_default,
+        options.require_rejection_parity || options.fresh_caller_default,
     );
     for failure in &gate_failures {
         eprintln!("compatibility gate failed: {failure}");
@@ -909,17 +952,24 @@ fn compare(
     retain_mismatch_bytes: bool,
 ) -> Outcome {
     let standard_caller = oracle.qualified.is_some();
+    let fresh_caller = oracle.fresh_caller;
+    let script = if fresh_caller { FRESH_ORACLE } else { ORACLE };
     let output = oracle
         .command()
-        .args(["-I", "-S", "-c", ORACLE])
+        .args(["-I", "-S", "-c", script])
         .arg(path)
         .output();
     if let Some(observation) = &mut observation {
         observation.native(&output);
     }
     let oracle = match output {
-        Ok(output) if output.status.success() => OracleOutcome::Compiled(output.stdout),
-        Ok(output) if output.status.code() == Some(2) => {
+        Ok(output) if output.status.success() && (!fresh_caller || !output.stdout.is_empty()) => {
+            OracleOutcome::Compiled(output.stdout)
+        }
+        Ok(output)
+            if output.status.code() == Some(2)
+                && (!fresh_caller || (output.stdout.is_empty() && !output.stderr.is_empty())) =>
+        {
             OracleOutcome::Rejected(one_line(&output.stderr))
         }
         Ok(output) => {
@@ -995,7 +1045,7 @@ fn compare(
         observation.compiled(&source, &compiled);
     }
 
-    classify_with_mismatch_bytes(path, oracle, compiled, retain_mismatch_bytes)
+    classify_with_mismatch_bytes(path, oracle, compiled, retain_mismatch_bytes, fresh_caller)
 }
 
 /// Consume an optional file encoding signature before passing decoded text to the compiler.
@@ -1071,7 +1121,7 @@ fn capture_compiler(compile: impl FnOnce() -> Result<Vec<u8>, CompileError>) -> 
 }
 
 fn classify(path: &Path, oracle: OracleOutcome, compiled: CompilerOutcome) -> Outcome {
-    classify_with_mismatch_bytes(path, oracle, compiled, false)
+    classify_with_mismatch_bytes(path, oracle, compiled, false, false)
 }
 
 fn classify_with_mismatch_bytes(
@@ -1079,6 +1129,7 @@ fn classify_with_mismatch_bytes(
     oracle: OracleOutcome,
     compiled: CompilerOutcome,
     retain_mismatch_bytes: bool,
+    fresh_caller: bool,
 ) -> Outcome {
     let oracle_rejected = matches!(&oracle, OracleOutcome::Rejected(_));
     let mut mismatch_bytes = None;
@@ -1124,6 +1175,9 @@ fn classify_with_mismatch_bytes(
                 ours.len()
             ),
         ),
+        (OracleOutcome::Rejected(_), CompilerOutcome::Unsupported(serc)) if fresh_caller => {
+            (OutcomeKind::Unsupported, serc)
+        }
         (
             OracleOutcome::Rejected(cpython),
             CompilerOutcome::Unsupported(serc) | CompilerOutcome::Rejected(serc),
@@ -1243,6 +1297,169 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn fresh_caller_is_explicit_byte_only_and_disallows_other_caller_contracts() {
+        let valid = [
+            "compare_cpython_corpus",
+            "--fresh-caller-default",
+            "--source-bytes",
+            "--expected-files",
+            "2",
+        ];
+        let options = Options::try_parse_from(valid).unwrap();
+        assert!(options.validate_intern_contract(false, false).is_ok());
+        assert!(options.validate_intern_contract(true, false).is_err());
+        assert!(options.validate_intern_contract(false, true).is_err());
+        for invalid in [
+            vec!["--fresh-caller-default", "--expected-files", "2"],
+            vec!["--fresh-caller-default", "--source-bytes"],
+            vec![
+                "--fresh-caller-default",
+                "--source-bytes",
+                "--expected-files",
+                "0",
+            ],
+            vec![
+                "--fresh-caller-default",
+                "--source-bytes",
+                "--expected-files",
+                "2",
+                "--limit",
+                "1",
+            ],
+        ] {
+            let args = std::iter::once("compare_cpython_corpus").chain(invalid);
+            assert!(
+                Options::try_parse_from(args)
+                    .unwrap()
+                    .validate_intern_contract(false, false)
+                    .is_err()
+            );
+        }
+        for conflicting in [
+            vec!["--initial-intern-state", "profile.json"],
+            vec!["--caller-intern-model", "model.json"],
+            vec!["--diagnostic-assume-startup-intern-state"],
+            vec![
+                "--caller-intern-model",
+                "model.json",
+                "--caller-intern-assume-absent",
+            ],
+        ] {
+            assert!(Options::try_parse_from(valid.into_iter().chain(conflicting)).is_err());
+        }
+    }
+
+    #[test]
+    fn fresh_caller_matches_the_documented_minimal_script() {
+        let expected = ORACLE
+            .replace("import pathlib\n", "")
+            .replace("path = pathlib.Path(sys.argv[1])\n", "path = sys.argv[1]\n")
+            .replace(
+                "source = path.read_bytes()\n",
+                "source = open(path, \"rb\").read()\n",
+            )
+            .replace(
+                "    code = compile(source, str(path), \"exec\", dont_inherit=True, optimize=0)\n",
+                "    code = compile(source, path, \"exec\", dont_inherit=True, optimize=0)\n",
+            );
+        assert_eq!(super::FRESH_ORACLE, expected);
+    }
+
+    #[test]
+    fn fresh_caller_does_not_count_unsupported_as_a_matched_rejection() {
+        let outcome = super::classify_with_mismatch_bytes(
+            Path::new("invalid.py"),
+            OracleOutcome::Rejected("SyntaxError".into()),
+            CompilerOutcome::Unsupported("unsupported".into()),
+            false,
+            true,
+        );
+        assert_eq!(outcome.kind, OutcomeKind::Unsupported);
+        assert!(outcome.kind.is_failure());
+        assert!(outcome.oracle_rejected);
+        let historical = classify(
+            Path::new("invalid.py"),
+            OracleOutcome::Rejected("SyntaxError".into()),
+            CompilerOutcome::Unsupported("unsupported".into()),
+        );
+        assert_eq!(historical.kind, OutcomeKind::MatchedRejection);
+    }
+
+    #[test]
+    fn fresh_caller_compares_default_bytes_and_distinguishes_io_failures() {
+        let python = std::env::var("SERC_TEST_PYTHON").unwrap_or_else(|_| "python3.14".to_string());
+        let oracle = super::OracleInvocation {
+            python: &python,
+            qualified: None,
+            fresh_caller: true,
+        };
+        verify_python(&oracle, PythonVersion::Py314).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        for (name, source, kind) in [
+            ("valid.py", Some("pass\n"), OutcomeKind::Exact),
+            ("invalid.py", Some("if:\n"), OutcomeKind::MatchedRejection),
+            ("missing.py", None, OutcomeKind::OracleFailure),
+        ] {
+            let path = directory.path().join(name);
+            if let Some(source) = source {
+                fs::write(&path, source).unwrap();
+            }
+            let outcome = super::compare(
+                &path,
+                &oracle,
+                true,
+                &CompileOptions::default(),
+                None,
+                None,
+                false,
+            );
+            assert_eq!(outcome.kind, kind, "{}", outcome.detail);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_caller_rejects_malformed_native_streams() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.py");
+        fs::write(&source, "pass\n").unwrap();
+        for (index, script) in [
+            "printf 'unexpected'; printf 'SyntaxError: bad\\n' >&2; exit 2",
+            "exit 2",
+            "exit 0",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let python = directory.path().join(format!("python-{index}"));
+            fs::write(&python, format!("#!/bin/sh\n{script}\n")).unwrap();
+            fs::set_permissions(&python, fs::Permissions::from_mode(0o700)).unwrap();
+            let oracle = super::OracleInvocation {
+                python: python.to_str().unwrap(),
+                qualified: None,
+                fresh_caller: true,
+            };
+            let outcome = super::compare(
+                &source,
+                &oracle,
+                true,
+                &CompileOptions::default(),
+                None,
+                None,
+                false,
+            );
+            assert_eq!(
+                outcome.kind,
+                OutcomeKind::OracleFailure,
+                "{}",
+                outcome.detail
+            );
+        }
     }
 
     #[test]
@@ -1515,6 +1732,7 @@ mod tests {
                 &super::OracleInvocation {
                     python: oracle.to_str().unwrap(),
                     qualified: None,
+                    fresh_caller: false,
                 },
                 source_bytes,
                 &options,
@@ -1529,6 +1747,7 @@ mod tests {
                 &super::OracleInvocation {
                     python: oracle.to_str().unwrap(),
                     qualified: None,
+                    fresh_caller: false,
                 },
                 source_bytes,
                 &options,
@@ -1543,6 +1762,7 @@ mod tests {
                 &super::OracleInvocation {
                     python: oracle.to_str().unwrap(),
                     qualified: None,
+                    fresh_caller: false,
                 },
                 source_bytes,
                 &options,
@@ -1609,6 +1829,7 @@ mod tests {
             super::OracleOutcome::Compiled(b"oracle".to_vec()),
             super::CompilerOutcome::Compiled(b"serc".to_vec()),
             true,
+            false,
         );
         assert_eq!(outcome.kind, OutcomeKind::ByteMismatch);
         assert!(super::stage_mismatch(&mut outcome, &not_a_directory, 0).is_err());
@@ -1672,6 +1893,7 @@ mod tests {
             &super::OracleInvocation {
                 python: &python,
                 qualified: None,
+                fresh_caller: false,
             },
             PythonVersion::Py314,
         )
