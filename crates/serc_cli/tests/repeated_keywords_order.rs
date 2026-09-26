@@ -22,9 +22,29 @@ fn repeated_keywords_preserve_native_diagnostic_order() {
             (LATE_FUTURE, "from __future__ import imaginary"),
         ),
         (
+            "f(x=1, x=2)\nfrom __future__ import braces\n",
+            (REPEAT_X, "x=2"),
+            (LATE_FUTURE, "from __future__ import braces"),
+        ),
+        (
+            "f(x=1, x=2)\nfrom __future__ import annotations, imaginary\n",
+            (REPEAT_X, "x=2"),
+            (LATE_FUTURE, "from __future__ import annotations, imaginary"),
+        ),
+        (
             "from __future__ import imaginary\nf(x=1, x=2)\n",
             (UNKNOWN_FUTURE, "imaginary"),
             (UNKNOWN_FUTURE, "imaginary"),
+        ),
+        (
+            "from __future__ import imaginary\nf(x=1, x=2)\nfrom __future__ import annotations\n",
+            (UNKNOWN_FUTURE, "imaginary"),
+            (UNKNOWN_FUTURE, "imaginary"),
+        ),
+        (
+            "from __future__ import annotations\nf(x=1, x=2)\nfrom __future__ import imaginary\n",
+            (REPEAT_X, "x=2"),
+            (LATE_FUTURE, "from __future__ import imaginary"),
         ),
         (
             "f(x=1, x=2)\nclass C[T, T]: pass\n",

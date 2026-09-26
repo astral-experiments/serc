@@ -1,7 +1,7 @@
 //! Source validation runs before lowering can discard unreachable statements.
 
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use ruff_python_ast::visitor::{
     Visitor, walk_expr, walk_interpolated_string_element, walk_parameters, walk_pattern, walk_stmt,
@@ -107,6 +107,7 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
         checked_type_params: None,
         checker_prefix: CheckerPrefix::Initial,
         error: RefCell::new(None),
+        reported_future_feature: Cell::new(None),
         pending_pattern: None,
         lowering_pattern_error: false,
         lowering_keyword_error: false,
@@ -315,6 +316,7 @@ struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
     checked_type_params: Option<&'ast ast::TypeParams>,
     checker_prefix: CheckerPrefix,
     error: RefCell<Option<CompileError>>,
+    reported_future_feature: Cell<Option<TextRange>>,
     pending_pattern: Option<PendingPattern<'ast>>,
     lowering_pattern_error: bool,
     lowering_keyword_error: bool,
@@ -1734,12 +1736,27 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             }
         }
         let mut reported = self.error.borrow_mut();
+        // In the modern future-only replay, the shared checker reports an unknown
+        // feature before it reports that the same import is misplaced. Native
+        // compilation checks the placement first, but an earlier import's error
+        // must still retain its priority.
+        let later_future_in_same_statement = FUTURE_ONLY
+            && self.python_version >= ast::PythonVersion::PY314
+            && matches!(error.kind, Kind::LateFutureImport)
+            && self
+                .reported_future_feature
+                .get()
+                .is_some_and(|range| error.range.contains_range(range));
         if reported.is_some()
+            && !later_future_in_same_statement
             && !(self.pending_pattern.is_some()
                 && matches!(error.kind, Kind::WriteToDebug(_))
                 && !matches!(*reported, Some(CompileError::InvalidSyntax { .. })))
         {
             return;
+        }
+        if FUTURE_ONLY && matches!(error.kind, Kind::FutureFeatureNotDefined(_)) {
+            self.reported_future_feature.set(Some(error.range));
         }
         // Preserve the existing public diagnostics for checks previously performed in lowering.
         let message = match &error.kind {
