@@ -378,6 +378,200 @@ fn protected_elided_if_else_preserves_assignment_and_delete_join() {
     }
 }
 
+#[test]
+fn elided_if_else_in_coroutines_and_with_matches_cpython_315() {
+    for source in [
+        "async def f(flag):\n if flag is not False:\n  assert flag\n else:\n  assert not flag\n await work()\n",
+        "def f(flag):\n with manager():\n  if flag == 'v1':\n   assert flag\n  else:\n   assert not flag\n",
+        "def f(flag):\n with manager():\n  if flag:\n   assert flag\n  else:\n   assert not flag\n  work()\n",
+        "async def f(flag):\n async with manager():\n  if flag:\n   assert flag\n  else:\n   assert not flag\n  await work()\n",
+        "def f(flag):\n if flag:\n  assert flag\n else:\n  assert not flag\n yield flag\n",
+        "def f(a,b):\n with manager():\n  if a and b:\n   assert a\n  else:\n   assert b\n  work()\n",
+        "with manager():\n if flag:\n  assert flag\n else:\n  assert not flag\n work()\n",
+        "class C:\n with manager():\n  if flag:\n   assert flag\n  else:\n   assert not flag\n  work()\n",
+        "def f(flag):\n with manager():\n  if flag:\n   assert flag\n  else:\n   assert not flag\n  yield 1\n  raise StopIteration()\n",
+        "async def f(flag):\n async with manager():\n  if flag:\n   assert flag\n  else:\n   assert not flag\n  yield 1\n  raise StopAsyncIteration()\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "protected_elided_if_else.py",
+            &LEVELS,
+            &[PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
+fn optimized_elided_join_preserves_exception_owners() {
+    const SOURCE: &str = r"
+def sync(flag):
+    with manager('outer'):
+        with manager('inner'):
+            if flag:
+                assert flag
+            else:
+                assert not flag
+            return 1
+
+def terminal(flag):
+    with manager('terminal'):
+        if flag:
+            assert flag
+        else:
+            assert not flag
+
+async def async_terminal(flag):
+    async with manager('async'):
+        if flag:
+            assert flag
+        else:
+            assert not flag
+
+def same_line(flag):
+    with manager('same-line'):
+        if flag: assert flag
+        else: assert not flag
+
+def multiple(flag):
+    with manager('left'), manager('right'):
+        if flag:
+            assert flag
+        else:
+            assert not flag
+
+def gen(flag):
+    with manager('generator'):
+        if flag:
+            assert flag
+        else:
+            assert not flag
+        yield 1
+";
+    const TRACE_JOIN: &str = r"
+import asyncio, dis, marshal, sys
+
+events = []
+class Manager:
+    def __init__(self, name):
+        self.name = name
+    def __enter__(self):
+        events.append((self.name, 'enter'))
+    def __exit__(self, typ, value, tb):
+        events.append((self.name, 'exit', typ.__name__ if typ else None))
+        return False
+    async def __aenter__(self):
+        events.append((self.name, 'enter'))
+    async def __aexit__(self, typ, value, tb):
+        events.append((self.name, 'exit', typ.__name__ if typ else None))
+        return False
+
+scope = {'manager': Manager}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+
+def trace_join(fn, injected):
+    instructions = list(dis.get_instructions(fn))
+    offsets = [b.offset for a, b in zip(instructions, instructions[1:])
+               if a.opname == 'NOT_TAKEN' and b.opname == 'NOP']
+    assert len(offsets) == 1, offsets
+    def trace(frame, event, arg):
+        if frame.f_code is not fn.__code__:
+            return None
+        if event == 'call':
+            frame.f_trace_opcodes = True
+        elif event == 'opcode' and frame.f_lasti == offsets[0] and injected:
+            events.append('hit')
+            raise injected('injected')
+        return trace
+    return trace
+
+for name, injected, expected in [
+    ('sync', ValueError, [('outer', 'enter'), ('inner', 'enter'), 'hit',
+                          ('inner', 'exit', 'ValueError'), ('outer', 'exit', 'ValueError'),
+                          ('caught', 'ValueError', None)]),
+    ('terminal', ValueError, [('terminal', 'enter'), 'hit',
+                              ('terminal', 'exit', 'ValueError'), ('caught', 'ValueError', None)]),
+    ('async_terminal', ValueError, [('async', 'enter'), 'hit',
+                                    ('async', 'exit', 'ValueError'), ('caught', 'ValueError', None)]),
+    ('same_line', ValueError, [('same-line', 'enter'), 'hit',
+                               ('same-line', 'exit', 'ValueError'), ('caught', 'ValueError', None)]),
+    ('multiple', ValueError, [('left', 'enter'), ('right', 'enter'), 'hit',
+                              ('right', 'exit', 'ValueError'), ('left', 'exit', 'ValueError'),
+                              ('caught', 'ValueError', None)]),
+    ('gen', StopIteration, [('generator', 'enter'), 'hit',
+                            ('generator', 'exit', 'StopIteration'),
+                            ('caught', 'RuntimeError', 'StopIteration')]),
+]:
+    fn = scope[name]
+    def invoke():
+        result = fn(True)
+        if name == 'gen':
+            return next(result)
+        if name == 'async_terminal':
+            return asyncio.run(result)
+        return result
+    # Initialize opcode tracing for this code object before injecting an exception.
+    sys.settrace(trace_join(fn, None))
+    try:
+        invoke()
+    finally:
+        sys.settrace(None)
+    events.clear()
+    sys.settrace(trace_join(fn, injected))
+    try:
+        invoke()
+    except BaseException as error:
+        events.append(('caught', type(error).__name__,
+                       type(error.__cause__).__name__ if error.__cause__ else None))
+    finally:
+        sys.settrace(None)
+    assert events == expected, (events, expected)
+";
+    for level in [OptimizationLevel::One, OptimizationLevel::Two] {
+        let native = oracle(
+            SOURCE.as_bytes(),
+            "optimized_join.py",
+            PythonVersion::Py315,
+            level,
+        );
+        assert!(native.status.success());
+        let actual = compile_with_options(
+            SOURCE,
+            "optimized_join.py",
+            &CompileOptions {
+                python_version: PythonVersion::Py315,
+                optimization_level: level,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap()
+        .marshal();
+        assert_eq!(actual, native.stdout);
+        let index = VERSIONS
+            .iter()
+            .position(|(version, _, _)| *version == PythonVersion::Py315)
+            .unwrap();
+        for (label, payload) in [
+            ("native", native.stdout.as_slice()),
+            ("serc", actual.as_slice()),
+        ] {
+            let mut child = Command::new(ORACLES[index].get().unwrap())
+                .args(["-I", "-S", "-X", "utf8", "-c", TRACE_JOIN])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(payload).unwrap();
+            let result = child.wait_with_output().unwrap();
+            assert!(
+                result.status.success(),
+                "{level:?}, {label}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+}
+
 const ORACLE_IDENTITY: &str = r"
 import importlib.util, sys
 assert sys.implementation.name == 'cpython'

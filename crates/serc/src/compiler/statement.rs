@@ -12914,7 +12914,12 @@ impl<'source> Compiler<'source> {
                                 && (self.control.statements.context.followed_by_call_expression
                                     || self.control.statements.context.followed_by_name_assignment_or_deletion)
                                 && self.control.exceptions.direct_try_body_statements.contains(&statement.range)
-                                && !direct_try_body_exit))
+                                && !direct_try_body_exit)
+                            // Coroutine and with-region joins have separate exception
+                            // ownership; loop and try-region joins need their own rules.
+                            || (self.context.python_version == crate::PythonVersion::Py315
+                                && self.control.loops.contexts.is_empty()
+                                && self.control.exceptions.active_exception_region_exclusions.is_empty()))
                         && !self.control.in_exception_handler()
                         && self.control.exceptions.active_exception_group_handlers == 0
                         && self.control.finally.active_finally_try_bodies == 0
