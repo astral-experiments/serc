@@ -8,6 +8,7 @@ fn repeated_keywords_preserve_native_diagnostic_order() {
     const REPEAT_Y: &str = "keyword argument repeated: y";
     const REPEAT_A: &str = "keyword argument repeated: a";
     const REPEAT_B: &str = "keyword argument repeated: b";
+    const REPEAT_C: &str = "keyword argument repeated: c";
     const STAR: &str = "can't use starred expression here";
     const DUPLICATE_TYPE: &str = "duplicate type parameter 'T'";
     const LATE_FUTURE: &str = "from __future__ imports must occur at the beginning of the file";
@@ -158,6 +159,26 @@ fn repeated_keywords_preserve_native_diagnostic_order() {
             "class Outer:\n    class Inner(g(__a=1,__a=2)):\n        h(b=1,b=2)\n",
             (REPEAT_B, "b=2"),
             (REPEAT_B, "b=2"),
+        ),
+        (
+            "class Outer(f(a=1,a=2)):\n    def m(self):\n        class Inner(c=1,c=2):\n            g(b=1,b=2)\n",
+            (REPEAT_B, "b=2"),
+            (REPEAT_B, "b=2"),
+        ),
+        (
+            "class C[T: g(a=1,a=2)](x=1,x=2):\n    h(b=1,b=2)\n",
+            (REPEAT_A, "a=2"),
+            (REPEAT_A, "a=2"),
+        ),
+        (
+            "class C(x=1,x=2):\n    try:\n        value: g(b=1,b=2)\n    finally:\n        h(c=1,c=2)\n",
+            (REPEAT_B, "b=2"),
+            (REPEAT_C, "c=2"),
+        ),
+        (
+            "class C(x=1,x=2):\n    *value\nx=1\nglobal x\n",
+            (GLOBAL, "global x"),
+            (GLOBAL, "global x"),
         ),
     ];
     let oracle = r"
