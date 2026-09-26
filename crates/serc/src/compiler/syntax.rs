@@ -76,14 +76,11 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         replay.class_lowering_target = Some(*range);
         replay.visit_scope_body(body);
         let replay_numeric_error = replay.lowering_numeric_error;
-        let replay_error = replay
-            .error
-            .into_inner()
-            .or_else(|| {
-                replay
-                    .bare_starred
-                    .map(|(range, kind)| CompileError::invalid_syntax(kind.message(), range))
-            });
+        let replay_error = replay.error.into_inner().or_else(|| {
+            replay
+                .bare_starred
+                .map(|(range, kind)| CompileError::invalid_syntax(kind.message(), range))
+        });
         // A numeric duplicate found in the class body needs the same ordered symbol replay
         // as one found by the initial walk.
         if replay_error.is_some()
