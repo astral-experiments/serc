@@ -23,47 +23,32 @@ pub(crate) fn validate(
         return Ok(());
     }
     let mut bare_yield = false;
+    let invalid_comma = tokens.iter().enumerate().find_map(|(index, token)| {
+        let kind = token.kind();
+        if kind.is_trivia() {
+            return None;
+        }
+        let invalid = bare_yield && kind == TokenKind::Comma;
+        bare_yield = kind == TokenKind::Yield;
+        invalid.then_some(index)
+    });
+    let Some(comma) = invalid_comma else {
+        return Ok(());
+    };
+    // Valid programs need neither a context stack nor replacement-field prefix parsing.
+    Err(bare_yield_error(source, tokens, comma, python_version))
+}
+
+/// Recover the first invalid pair's context only after the allocation-free token scan rejects it.
+fn bare_yield_error(
+    source: &str,
+    tokens: &Tokens,
+    comma: usize,
+    python_version: PythonVersion,
+) -> CompileError {
     let mut contexts = Vec::new();
-    for (index, token) in tokens.iter().enumerate() {
+    for (index, token) in tokens.iter().enumerate().take(comma) {
         match token.kind() {
-            TokenKind::Comment | TokenKind::NonLogicalNewline => continue,
-            TokenKind::Comma if bare_yield => {
-                // Before 3.14, t/tr is a name followed by an ordinary string. Its contents
-                // cannot introduce a replacement field; diagnose its surrounding context.
-                let unsupported_template = (python_version < PythonVersion::Py314)
-                    .then(|| {
-                        contexts.iter().enumerate().find_map(|(position, context)| {
-                            if let Context::Literal { kind: "t", start } = context {
-                                Some((position, *start))
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .flatten();
-                let (active_contexts, end) = unsupported_template
-                    .map_or((contexts.as_slice(), index), |(position, start)| {
-                        (&contexts[..position], start)
-                    });
-                if let Some((kind, start)) = active_contexts.iter().rev().find_map(|context| {
-                    if let Context::Field { kind, start } = context {
-                        Some((*kind, *start))
-                    } else {
-                        None
-                    }
-                }) {
-                    return Err(interpolation_error(
-                        source,
-                        &tokens[start..=end],
-                        kind,
-                        unsupported_template.is_some(),
-                    ));
-                }
-                return Err(CompileError::invalid_syntax(
-                    "invalid syntax",
-                    token.range(),
-                ));
-            }
             TokenKind::FStringStart => contexts.push(Context::Literal {
                 kind: "f",
                 start: index,
@@ -101,9 +86,56 @@ pub(crate) fn validate(
             }
             _ => {}
         }
-        bare_yield = token.kind() == TokenKind::Yield;
     }
-    Ok(())
+    // Before 3.14, t/tr is a name followed by an ordinary string. Its contents
+    // cannot introduce a replacement field; diagnose its surrounding context.
+    let unsupported_template = if python_version < PythonVersion::Py314 {
+        contexts.iter().enumerate().find_map(|(position, context)| {
+            if let Context::Literal { kind: "t", start } = context {
+                Some((position, *start))
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+    let (active_contexts, end) = unsupported_template
+        .map_or((contexts.as_slice(), comma), |(position, start)| {
+            (&contexts[..position], start)
+        });
+    if let Some((kind, start)) = active_contexts.iter().rev().find_map(|context| {
+        if let Context::Field { kind, start } = context {
+            Some((*kind, *start))
+        } else {
+            None
+        }
+    }) {
+        return interpolation_error(
+            source,
+            &tokens[start..=end],
+            kind,
+            unsupported_template.is_some(),
+        );
+    }
+    let range = unsupported_template.map_or_else(
+        || tokens[comma].range(),
+        |(_, start)| {
+            TextRange::at(
+                template_opening_quote(source, &tokens[start]),
+                TextSize::new(1),
+            )
+        },
+    );
+    CompileError::invalid_syntax("invalid syntax", range)
+}
+
+/// Locate the quote following the t/tr name used by targets without template-string syntax.
+fn template_opening_quote(source: &str, template: &Token) -> TextSize {
+    let offset = source[template.range()]
+        .find(['\'', '"'])
+        .expect("a template opener contains a quote");
+    template.start() + TextSize::try_from(offset).expect("token offset fits in TextSize")
 }
 
 /// Follow the native invalid replacement-field alternatives on this otherwise accepted token path.
@@ -115,10 +147,7 @@ fn interpolation_error(
 ) -> CompileError {
     let template_quote = unsupported_template.then(|| {
         let template = tokens.last().expect("the template opener is present");
-        let offset = source[template.range()]
-            .find(['\'', '"'])
-            .expect("a template opener contains a quote");
-        template.start() + TextSize::try_from(offset).expect("token offset fits in TextSize")
+        template_opening_quote(source, template)
     });
     if let Some(quote) = template_quote
         && let Some(error) = adjacent_template_error(source, tokens, quote)

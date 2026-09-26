@@ -101,6 +101,9 @@ fn bare_yield_commas_match_native_grammar() {
     ];
     let legacy_template_cases = [
         ("def f():\n    t'{yield, 1}'\n", Some("invalid syntax")),
+        ("def f():\n    tr'{yield, 1}'\n", Some("invalid syntax")),
+        ("def f():\n    T'''{yield, 1}'''\n", Some("invalid syntax")),
+        ("def f():\n    Rt'''{yield, 1}'''\n", Some("invalid syntax")),
         ("def f():\n    f\"{t'{yield, 1}'}\"\n", Some(F_DELIMITER)),
         ("def f():\n    f\"{tr'{yield, 1}'}\"\n", Some(F_DELIMITER)),
         ("def f():\n    f\"{(t'{yield, 1}')}\"\n", Some(F_EXPRESSION)),
@@ -225,6 +228,7 @@ sys.stdout.buffer.write(marshal.dumps(code))
                     if expected.starts_with("f-string:")
                         || expected.starts_with("t-string:")
                         || expected.ends_with("Perhaps you forgot a comma?")
+                        || legacy_template_cases.contains(&(source, Some(expected)))
                     {
                         assert_eq!(
                             error.range().unwrap().start().to_usize(),
