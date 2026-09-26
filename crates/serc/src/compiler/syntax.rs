@@ -105,6 +105,8 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
         bare_starred: None,
         check_bare_starred: true,
         pre_lowering_only: false,
+        comprehension_yield_operand: false,
+        checking_comprehension_yield: false,
         source,
         body,
         python_version: match python_version {
@@ -320,6 +322,8 @@ fn simple_function_checker_view(function: &ast::StmtFunctionDef) -> Option<Stmt>
 
 struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> {
     pre_lowering_only: bool,
+    comprehension_yield_operand: bool,
+    checking_comprehension_yield: bool,
     checker: SemanticSyntaxChecker,
     checker_prefix: CheckerPrefix,
     error: RefCell<Option<CompileError>>,
@@ -1377,6 +1381,28 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
         if self.error.borrow().is_some() {
             return;
         }
+        let comprehension_yield = matches!(self.scope().kind, ScopeKind::Comprehension { .. })
+            && matches!(expression, Expr::Yield(_) | Expr::YieldFrom(_));
+        if comprehension_yield {
+            let value = match expression {
+                Expr::Yield(yield_) => yield_.value.as_deref(),
+                Expr::YieldFrom(yield_from) => Some(yield_from.value.as_ref()),
+                _ => unreachable!(),
+            };
+            if let Some(value) = value {
+                // Symbol-table checks inside the operand precede the enclosing yield error.
+                // Suppress later lowering errors while visiting the operand in that order.
+                let previous_pre_lowering = std::mem::replace(&mut self.pre_lowering_only, true);
+                let previous_operand =
+                    std::mem::replace(&mut self.comprehension_yield_operand, true);
+                self.visit_expr(value);
+                self.comprehension_yield_operand = previous_operand;
+                self.pre_lowering_only = previous_pre_lowering;
+                if self.error.borrow().is_some() {
+                    return;
+                }
+            }
+        }
         let check_expression = match expression {
             // These are the only remaining variants checked by the pinned Ruff visitor. Its
             // tuple/list check applies only to assignment targets; a lambda without parameters
@@ -1428,8 +1454,16 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                     });
                 });
             } else {
+                let previous = std::mem::replace(
+                    &mut self.checking_comprehension_yield,
+                    comprehension_yield,
+                );
                 self.with_checker(|checker, context| checker.visit_expr(expression, context));
+                self.checking_comprehension_yield = previous;
             }
+        }
+        if comprehension_yield {
+            return;
         }
         match expression {
             Expr::Lambda(lambda) => {
@@ -1473,10 +1507,17 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                 ..
             }) => {
                 self.comprehension(generators, ComprehensionKind::Dict, |visitor| {
-                    if let Some(key) = key {
-                        visitor.visit_expr(key);
+                    if visitor.comprehension_yield_operand {
+                        visitor.visit_expr(value);
+                        if let Some(key) = key {
+                            visitor.visit_expr(key);
+                        }
+                    } else {
+                        if let Some(key) = key {
+                            visitor.visit_expr(key);
+                        }
+                        visitor.visit_expr(value);
                     }
-                    visitor.visit_expr(value);
                 });
             }
             _ => walk_expr(self, expression),
@@ -1622,6 +1663,16 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
 
     fn report_semantic_error(&self, error: SemanticSyntaxError) {
         use SemanticSyntaxErrorKind as Kind;
+        if self.checking_comprehension_yield && matches!(error.kind, Kind::InvalidStarExpression) {
+            return;
+        }
+        if self.comprehension_yield_operand
+            && matches!(self.scope().kind, ScopeKind::Comprehension { .. })
+            && (matches!(&error.kind, Kind::YieldOutsideFunction(kind) if kind.is_await())
+                || matches!(error.kind, Kind::AwaitOutsideAsyncFunction(_)))
+        {
+            return;
+        }
         if FUTURE_ONLY
             && !matches!(
                 &error.kind,
@@ -1672,7 +1723,9 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
                 | Kind::DuplicateMatchKey(_)
                 | Kind::DuplicateMatchClassAttribute(_) => true,
                 Kind::YieldOutsideFunction(kind) => {
-                    !kind.is_await() || self.python_version < ast::PythonVersion::PY314
+                    (!self.comprehension_yield_operand
+                        || !matches!(self.scope().kind, ScopeKind::Comprehension { .. }))
+                        && (!kind.is_await() || self.python_version < ast::PythonVersion::PY314)
                 }
                 Kind::AwaitOutsideAsyncFunction(_) | Kind::WriteToDebug(_) => {
                     self.python_version < ast::PythonVersion::PY314
