@@ -83,6 +83,12 @@ pub(super) fn diagnostic(
             })
         }
         _ => {
+            // Avoid unbounded big-integer conversion before applying the decimal-size guard.
+            if matches!(key, Expr::NumberLiteral(_) | Expr::UnaryOp(_) | Expr::BinOp(_))
+                && source[key.range()].len() > 8192
+            {
+                return None;
+            }
             let version = match version {
                 ast::PythonVersion::PY312 => PythonVersion::Py312,
                 ast::PythonVersion::PY313 => PythonVersion::Py313,
