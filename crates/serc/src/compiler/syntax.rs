@@ -2115,8 +2115,7 @@ mod tests {
                     panic!("unexpected {python_version} error for {source:?}: {error}");
                 };
                 assert_eq!(
-                    message,
-                    "from __future__ imports must occur at the beginning of the file",
+                    message, "from __future__ imports must occur at the beginning of the file",
                     "{python_version}: {source:?}"
                 );
                 assert_eq!(&source[range], span, "{python_version}: {source:?}");
