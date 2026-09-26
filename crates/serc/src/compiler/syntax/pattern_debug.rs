@@ -356,7 +356,12 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
                                 self.python_version,
                             )
                             .map_or_else(
-                                || format!("mapping pattern checks duplicate key `{}`", &self.source[key.range()]),
+                                || {
+                                    format!(
+                                        "mapping pattern checks duplicate key `{}`",
+                                        &self.source[key.range()]
+                                    )
+                                },
                                 |(message, _)| message,
                             );
                             self.pattern_error(message, pattern.range());
