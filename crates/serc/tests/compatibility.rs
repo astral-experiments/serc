@@ -8247,6 +8247,86 @@ for failing in (False, True):
     }
 
     #[test]
+    fn nonterminal_pass_finally_preserves_enclosing_handler() {
+        for (function, trailer) in [
+            ("def", ""),
+            ("async def", ""),
+            ("def", "    yield 1\n"),
+            ("async def", "    yield 1\n"),
+        ] {
+            for handler in ["", " ValueError", " ValueError as error"] {
+                for successor in [
+                    "after()",
+                    "pass\n        after()",
+                    "return",
+                    "raise ValueError",
+                ] {
+                    let source = format!(
+                        "{function} f():\n    try:\n        try:\n            work()\n        finally:\n            pass\n        {successor}\n    except{handler}:\n        recover()\n{trailer}"
+                    );
+                    assert_matches_cpython_marshal(&source, "nonterminal_pass_finally.py");
+                    assert_matches_cpython_marshal_bytes(
+                        source.as_bytes(),
+                        "nonterminal_pass_finally.py",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trace_error_in_nonterminal_pass_finally_enters_enclosing_handler() {
+        let source = r"import sys
+
+events = []
+failing = False
+injected = RuntimeError
+
+def work():
+    events.append('work')
+    if failing:
+        raise ValueError('work failed')
+
+def after():
+    events.append('after')
+
+def recover():
+    events.append('recover')
+
+def f():
+    try:
+        try:
+            work()
+        finally:
+            pass
+        after()
+    except:
+        recover()
+    yield 1
+
+def trace(frame, event, arg):
+    if frame.f_code is f.__code__ and event == 'line' and frame.f_lineno == f.__code__.co_firstlineno + 5:
+        events.append('trace')
+        raise injected('trace failed')
+    return trace
+
+for failing in (False, True):
+    for injected in (RuntimeError, StopIteration):
+        events = []
+        try:
+            sys.settrace(trace)
+            events.append(('yield', next(f())))
+        finally:
+            sys.settrace(None)
+        print(events)
+";
+        assert_executes(
+            source,
+            &"['work', 'trace', 'recover', ('yield', 1)]\n".repeat(4),
+        );
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_folded_expressions_in_protected_regions() {
         let source = "def try_except():\n    try:\n        'try'\n        body()\n    except:\n        'except'\n        recover()\n\ndef except_only():\n    try:\n        body()\n    except:\n        'except'\n\ndef nested_handlers():\n    try:\n        try:\n            body()\n        except ValueError:\n            recover()\n        except TypeError:\n            recover()\n    finally:\n        cleanup()\n\ndef with_body(manager):\n    with manager:\n        'with'\n        body()\n\ndef with_only(manager):\n    with manager:\n        'with'\n\nasync def protected_condition():\n    await source\n    if test:\n        await other\n\ntry:\n    pass\nexcept (ValueError if True else TypeError):\n    pass\n\ntry:\n    pass\nexcept* (ValueError if True else TypeError):\n    pass\n\ndef protected_conditions(manager, first, second):\n    with manager:\n        if first:\n            body()\n        if second:\n            body()\n\ndef generator_try():\n    yield 1\n    try:\n        pass\n    except Exception:\n        pass\n\nif condition:\n    try:\n        with manager:\n            body()\n    except Error:\n        pass\n";
         assert_matches_cpython_marshal(source, "protected_nop.py");
