@@ -22,6 +22,25 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn optimized_terminal_guards_locate_fallthrough_returns() {
+    for source in [
+        "def f(x):\n    if x == 1:\n        assert x\n",
+        "def f(x):\n    if not x:\n        assert x\n    else:\n        assert not x\n",
+        "def f(x):\n    if x:\n        assert x\n    else:\n        pass\n",
+        "if x == 1:\n    assert x\n",
+        "def f(x):\n    if x == 1:\n        assert x\n    return None\n",
+        "def f(x):\n    if x == 1:\n        pass\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "sub/terminal_guard_fallthrough.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn legacy_nested_finally_pass_keeps_outer_owner() {
     const SOURCE: &str = "def f(work, cleanup, after):\n    try:\n        try:\n            work()\n        finally:\n            pass\n        after()\n    finally:\n        cleanup()\n";
     const TERMINAL: &str = "def f(work, cleanup):\n    try:\n        try:\n            work()\n        finally:\n            pass\n    finally:\n        cleanup()\n";
