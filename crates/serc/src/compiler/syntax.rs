@@ -9,7 +9,7 @@ use ruff_python_ast::visitor::{
 use ruff_python_ast::{self as ast, Expr, Pattern, Stmt};
 use ruff_python_parser::semantic_errors::{
     AwaitOutsideAsyncFunctionKind, InvalidExpressionKind, LazyImportContext, SemanticSyntaxChecker,
-    SemanticSyntaxContext, SemanticSyntaxError, SemanticSyntaxErrorKind,
+    SemanticSyntaxContext, SemanticSyntaxError, SemanticSyntaxErrorKind, WriteToDebugKind,
 };
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -107,6 +107,8 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
         pre_lowering_only: false,
         comprehension_yield_operand: false,
         checking_comprehension_yield: false,
+        collecting_comprehension_errors: false,
+        deferred_comprehension_errors: RefCell::new(Vec::new()),
         source,
         body,
         python_version: match python_version {
@@ -324,6 +326,8 @@ struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
     pre_lowering_only: bool,
     comprehension_yield_operand: bool,
     checking_comprehension_yield: bool,
+    collecting_comprehension_errors: bool,
+    deferred_comprehension_errors: RefCell<Vec<FxHashMap<TextRange, Vec<SemanticSyntaxError>>>>,
     checker: SemanticSyntaxChecker,
     checker_prefix: CheckerPrefix,
     error: RefCell<Option<CompileError>>,
@@ -1381,6 +1385,39 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
         if self.error.borrow().is_some() {
             return;
         }
+        if self.comprehension_yield_operand
+            && let Expr::Named(named) = expression
+        {
+            // Ruff scans a whole comprehension at entry. Release an observed named-expression
+            // error only when the symbol-table walk actually reaches that expression.
+            let deferred = {
+                let mut frames = self.deferred_comprehension_errors.borrow_mut();
+                frames.iter_mut().rev().find_map(|frame| {
+                    frame
+                        .remove(&named.range)
+                        .or_else(|| frame.remove(&named.target.range()))
+                        .and_then(|errors| errors.into_iter().next())
+                })
+            };
+            if let Some(error) = deferred {
+                if matches!(error.kind, SemanticSyntaxErrorKind::ReboundComprehensionVariable)
+                    && let Expr::Name(name) = named.target.as_ref()
+                {
+                    *self.error.borrow_mut() = Some(CompileError::invalid_syntax(
+                        format!(
+                            "assignment expression cannot rebind comprehension iteration variable '{}'",
+                            name.id
+                        ),
+                        error.range,
+                    ));
+                } else {
+                    self.report_semantic_error(error);
+                }
+                if self.error.borrow().is_some() {
+                    return;
+                }
+            }
+        }
         let comprehension_yield = matches!(self.scope().kind, ScopeKind::Comprehension { .. })
             && matches!(expression, Expr::Yield(_) | Expr::YieldFrom(_));
         if comprehension_yield {
@@ -1451,6 +1488,16 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
             | Expr::Slice(_)
             | Expr::IpyEscapeCommand(_) => false,
         };
+        let deferred_frame = self.comprehension_yield_operand
+            && matches!(
+                expression,
+                Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_) | Expr::Generator(_)
+            );
+        if deferred_frame {
+            self.deferred_comprehension_errors
+                .borrow_mut()
+                .push(FxHashMap::default());
+        }
         if check_expression {
             if matches!(
                 expression,
@@ -1458,11 +1505,16 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
             ) {
                 let mut depth = crate::stack::ExpressionDepth::default();
                 depth.visit_expr(expression);
+                let previous = std::mem::replace(
+                    &mut self.collecting_comprehension_errors,
+                    deferred_frame,
+                );
                 self.with_checker(|checker, context| {
                     crate::stack::with_depth(depth.maximum(), || {
                         checker.visit_expr(expression, context);
                     });
                 });
+                self.collecting_comprehension_errors = previous;
             } else {
                 let previous = std::mem::replace(
                     &mut self.checking_comprehension_yield,
@@ -1546,6 +1598,9 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                 });
             }
             _ => walk_expr(self, expression),
+        }
+        if deferred_frame {
+            self.deferred_comprehension_errors.borrow_mut().pop();
         }
     }
 
@@ -1706,6 +1761,23 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
         {
             return;
         }
+        if self.collecting_comprehension_errors
+            && matches!(
+                error.kind,
+                Kind::ReboundComprehensionVariable
+                    | Kind::NamedExpressionInComprehensionIterable
+                    | Kind::NamedExpressionInClassBodyComprehension
+            )
+        {
+            self.deferred_comprehension_errors
+                .borrow_mut()
+                .last_mut()
+                .expect("comprehension error frame")
+                .entry(error.range)
+                .or_default()
+                .push(error);
+            return;
+        }
         // The declaration pass checks complete symbol histories and places errors on the full
         // CPython statement, including parameters and module-level nonlocals.
         if matches!(
@@ -1785,7 +1857,22 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             }
             Kind::YieldFromInAsyncFunction => "'yield from' inside async function".to_owned(),
             Kind::AwaitOutsideAsyncFunction(AwaitOutsideAsyncFunctionKind::Await) => {
-                "'await' outside function".to_owned()
+                if self.comprehension_yield_operand {
+                    "'await' outside async function".to_owned()
+                } else {
+                    "'await' outside function".to_owned()
+                }
+            }
+            Kind::DuplicateParameter(name) if self.comprehension_yield_operand => {
+                let kind = if self.python_version >= ast::PythonVersion::PY315 {
+                    "parameter"
+                } else {
+                    "argument"
+                };
+                format!("duplicate {kind} '{name}' in function definition")
+            }
+            Kind::WriteToDebug(WriteToDebugKind::Store) if self.comprehension_yield_operand => {
+                "cannot assign to __debug__".to_owned()
             }
             Kind::AwaitOutsideAsyncFunction(AwaitOutsideAsyncFunctionKind::AsyncFor) => {
                 "'async for' outside async function".to_owned()
