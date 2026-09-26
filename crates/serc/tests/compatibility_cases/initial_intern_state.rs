@@ -138,3 +138,23 @@ fn class_qualified_name_constants_respect_initial_canonical_objects() {
         Err(serc::CompileError::UnresolvedInternState { value }) if value == marker
     ));
 }
+
+#[test]
+fn partial_unicode_class_state_matches_cpython() {
+    let source = "class Δ:\n    pass\n";
+    let filename = "tests/initial_unicode_class.py";
+    let state = InitialInternState::from_partial(["Δ"]);
+    let expected = cpython_in_context(source, filename, &["Δ"]);
+    assert_eq!(
+        compile_with_intern_state(source, filename, &state)
+            .unwrap()
+            .marshal(),
+        expected,
+    );
+    assert_eq!(
+        compile_bytes_with_intern_state(source.as_bytes(), filename, &state)
+            .unwrap()
+            .marshal(),
+        expected,
+    );
+}

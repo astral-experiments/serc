@@ -43,6 +43,105 @@ fn code_object(constants: Vec<Constant>) -> CodeObject {
 }
 
 #[test]
+fn partial_intern_state_checks_unrecorded_class_qualified_names() {
+    use crate::{
+        CompileError, CompileOptions, InitialInternState, OptimizationLevel, PythonVersion,
+        compile_bytes_with_options, compile_with_options,
+    };
+
+    for python_version in [PythonVersion::Py314, PythonVersion::Py315] {
+        for optimization_level in [
+            OptimizationLevel::Zero,
+            OptimizationLevel::One,
+            OptimizationLevel::Two,
+        ] {
+            for model_codec in [true, false] {
+                let options = |state: InitialInternState| CompileOptions {
+                    python_version,
+                    optimization_level,
+                    initial_intern_state: if model_codec {
+                        state
+                    } else {
+                        state.without_standard_source_codec_effects()
+                    },
+                    ..CompileOptions::default()
+                };
+                let unknown = options(InitialInternState::from_partial([] as [&str; 0]));
+                for (source, name) in [
+                    ("class Δ:\n pass\n", "Δ"),
+                    ("class 変数:\n pass\n", "変数"),
+                    ("class A:\n class Δ:\n  pass\n", "A.Δ"),
+                ] {
+                    assert_eq!(
+                        compile_with_options(source, "tests/class.py", &unknown).unwrap_err(),
+                        CompileError::UnresolvedInternState {
+                            value: name.to_string(),
+                        },
+                    );
+                }
+                for (source, name) in [
+                    (b"# coding: utf-8\nclass \xce\x94:\n pass\n".as_slice(), "Δ"),
+                    (b"# coding: cp1251\nclass \xd4:\n pass\n".as_slice(), "Ф"),
+                ] {
+                    assert_eq!(
+                        compile_bytes_with_options(source, "tests/class.py", &unknown).unwrap_err(),
+                        CompileError::UnresolvedInternState {
+                            value: name.to_string(),
+                        },
+                    );
+                }
+
+                for (partial, complete) in [
+                    (
+                        InitialInternState::from_partial(["Δ"]),
+                        InitialInternState::from_complete(["Δ"]),
+                    ),
+                    (
+                        InitialInternState::from_partial_with_absence(
+                            [] as [&str; 0],
+                            |_, value| value == "Δ",
+                        ),
+                        InitialInternState::from_complete([] as [&str; 0]),
+                    ),
+                ] {
+                    let partial = compile_with_options(
+                        "class Δ:\n pass\n",
+                        "tests/class.py",
+                        &options(partial),
+                    )
+                    .unwrap()
+                    .marshal();
+                    let complete = compile_with_options(
+                        "class Δ:\n pass\n",
+                        "tests/class.py",
+                        &options(complete),
+                    )
+                    .unwrap()
+                    .marshal();
+                    assert_eq!(partial, complete);
+                }
+
+                // An earlier ordinary constant leaves the class constant distinct,
+                // so its initial canonical state is not queried by the serializer.
+                let source = "value = 'Δ'\nclass Δ:\n pass\n";
+                let partial = compile_with_options(source, "tests/class.py", &unknown)
+                    .unwrap()
+                    .marshal();
+                for state in [
+                    InitialInternState::from_complete([] as [&str; 0]),
+                    InitialInternState::from_complete(["Δ"]),
+                ] {
+                    let complete = compile_with_options(source, "tests/class.py", &options(state))
+                        .unwrap()
+                        .marshal();
+                    assert_eq!(partial, complete);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn optional_marshal_ids_remain_four_bytes() {
     assert_eq!(std::mem::size_of::<Option<MetadataId>>(), 4);
     assert_eq!(std::mem::size_of::<Option<ObjectId>>(), 4);

@@ -1366,6 +1366,58 @@ fn validate_qualified_name_intern_state(
     python_version: PythonVersion,
     initial_intern_state: &InitialInternState,
 ) -> Result<(), CompileError> {
+    let mut qualified_names = QualifiedNameConstants {
+        track: true,
+        ..QualifiedNameConstants::default()
+    };
+    validate_recorded_qualified_name_intern_state(
+        code,
+        python_version,
+        initial_intern_state,
+        &mut qualified_names,
+    )?;
+    if qualified_names.origins.values().all(Option::is_some) {
+        return Ok(());
+    }
+
+    // Match the serializer's fallback for names whose origin was not recorded.
+    // An earlier ordinary constant means that the serializer never queries the
+    // initial state for that spelling.
+    let mut ordinary_first = FxHashSet::default();
+    collect_qualified_name_origins(
+        code,
+        &qualified_names.constants.into_iter().collect(),
+        &qualified_names.origins,
+        &mut FxHashSet::default(),
+        &mut ordinary_first,
+    );
+    let unresolved = qualified_names
+        .origins
+        .into_iter()
+        .filter(|(value, origin)| {
+            origin.is_none()
+                && !ordinary_first.contains(value)
+                && initial_intern_state
+                    .membership_for(python_version, value)
+                    .is_none()
+        })
+        .map(|(value, _)| value)
+        .min();
+    if let Some(value) = unresolved {
+        return Err(CompileError::UnresolvedInternState {
+            value: value.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_recorded_qualified_name_intern_state<'a>(
+    code: &'a CodeObject,
+    python_version: PythonVersion,
+    initial_intern_state: &InitialInternState,
+    qualified_names: &mut QualifiedNameConstants<'a>,
+) -> Result<(), CompileError> {
+    qualified_names.record(code);
     if code.marshal_provenance.qualified_name_is_canonical == Some(true)
         && !should_intern(&code.qualified_name)
         && initial_intern_state
@@ -1378,7 +1430,12 @@ fn validate_qualified_name_intern_state(
     }
     for constant in &code.constants {
         if let Constant::Code(child) = constant {
-            validate_qualified_name_intern_state(child, python_version, initial_intern_state)?;
+            validate_recorded_qualified_name_intern_state(
+                child,
+                python_version,
+                initial_intern_state,
+                qualified_names,
+            )?;
         }
     }
     Ok(())
