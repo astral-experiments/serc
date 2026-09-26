@@ -311,6 +311,177 @@ async def coroutine():
 }
 
 #[test]
+fn optimized_legacy_await_assertions_preserve_coroutine_symbols() {
+    let sources = [
+        "def f():\n    assert await g()\n",
+        "def f():\n    assert condition, (await g())\n",
+        "def f():\n    assert 1 and (await g())\n",
+        "def f():\n    assert [await g() for x in xs]\n",
+        "def f():\n    assert [x for x in await g()]\n",
+        "def f():\n    assert [x async for x in xs]\n",
+        "def f():\n    assert {x async for x in xs}\n",
+        "def f():\n    assert {x: x async for x in xs}\n",
+        "def f():\n    assert (x for x in await g())\n",
+        "def f():\n    assert (await g() for x in xs)\n",
+        "def f():\n    assert (x async for x in xs)\n",
+        "def f():\n    assert [x for x in (x async for x in xs)]\n",
+        "def f():\n    assert (lambda: (await g()))\n",
+        "def f():\n    assert (lambda x=(await g()): x)\n",
+        "def f():\n    assert [(lambda: (await g())) for x in xs]\n",
+        "def f():\n    assert (lambda x=[y async for y in ys]: x)\n",
+        "def f():\n    assert (yield 1), (await g())\n",
+        "def f():\n    assert (yield from (await g()))\n",
+        "def f():\n    assert (await (yield from g()))\n",
+        "def f():\n    assert (x async for x in await g())\n",
+        "def f():\n    assert [await x async for x in xs]\n",
+        "def f():\n    assert (lambda x=(await g()): (yield 1))\n",
+        "def f():\n    if condition:\n        assert await g()\n    return 1\n",
+        "def f():\n    if False:\n        assert await g()\n    return 1\n",
+        "def outer():\n    def inner():\n        assert await g()\n    return inner\n",
+        "class C:\n    def method(self):\n        assert await g()\n",
+        "def f():\n    assert condition\n",
+        "def f():\n    assert (lambda: (await g()))\n    yield 1\n",
+        "def f():\n    assert await g()\n    def inner(): yield 1\n    return 3\n",
+        "def f():\n    assert await g()\n    yield 1\n    return\n",
+        "def f():\n    assert await g()\n    yield from xs\n",
+    ];
+    for version in [PythonVersion::Py312, PythonVersion::Py313] {
+        for level in [OptimizationLevel::One, OptimizationLevel::Two] {
+            for source in sources {
+                let filename = "legacy_assert_await.py";
+                let expected = oracle(source.as_bytes(), filename, version, level);
+                assert!(
+                    expected.status.success(),
+                    "{version} {level:?}: {source}: {expected:?}"
+                );
+                let actual = compile_with_options(
+                    source,
+                    filename,
+                    &CompileOptions {
+                        python_version: version,
+                        optimization_level: level,
+                        ..CompileOptions::default()
+                    },
+                )
+                .unwrap()
+                .marshal();
+                assert_eq!(actual, expected.stdout, "{version} {level:?}: {source}");
+            }
+        }
+    }
+}
+
+#[test]
+fn optimized_legacy_await_and_yield_reject_value_returns() {
+    for source in [
+        "def f():\n    assert await g()\n    yield 1\n    return 3\n",
+        "def f():\n    assert await g()\n    return (yield 1)\n",
+        "def f():\n    assert await g()\n    yield 1\n    if False:\n        return 3\n",
+        "def f():\n    assert await g()\n    def inner(x=(yield 1)): pass\n    return 3\n",
+    ] {
+        for version in [PythonVersion::Py312, PythonVersion::Py313] {
+            for level in [OptimizationLevel::One, OptimizationLevel::Two] {
+                let expected = oracle(source.as_bytes(), "legacy_assert_await.py", version, level);
+                assert!(!expected.status.success());
+                assert!(
+                    String::from_utf8_lossy(&expected.stderr)
+                        .contains("'return' with value in async generator")
+                );
+                let error = compile_with_options(
+                    source,
+                    "legacy_assert_await.py",
+                    &CompileOptions {
+                        python_version: version,
+                        optimization_level: level,
+                        ..CompileOptions::default()
+                    },
+                )
+                .unwrap_err();
+                let serc::CompileError::InvalidSyntax { message, range } = error else {
+                    panic!("{version} {level:?}: {error:?}");
+                };
+                assert_eq!(message, "`return` with value in async generator");
+                assert_eq!(range.start().to_usize(), source.rfind("return ").unwrap());
+                assert_eq!(range.end().to_usize(), source.trim_end().len());
+            }
+        }
+    }
+}
+
+#[test]
+fn optimized_legacy_await_return_preserves_symbol_error_precedence() {
+    for (source, messages) in [
+        (
+            "def f():\n    assert await g()\n    yield 1\n    return 3\n    global x\n    x = 2\n    global x\n",
+            None,
+        ),
+        (
+            "def f():\n    assert await g()\n    yield 1\n    return 3\n    print(x)\n    global x\n",
+            None,
+        ),
+        (
+            "def f():\n    assert await g()\n    yield 1\n    return 3\n    nonlocal x\n",
+            None,
+        ),
+        (
+            "def f():\n    assert await g()\n    yield 1\n    return 3\n    [(yield x) for x in xs]\n",
+            None,
+        ),
+        (
+            "def f():\n    assert await g()\n    yield 1\n    return 3\n    [x for x in (x := xs)]\n",
+            None,
+        ),
+        (
+            "def f():\n    assert await g()\n    yield 1\n    return 3\n    [(x := 2) for x in xs]\n",
+            Some((
+                "assignment expression cannot rebind comprehension iteration variable 'x'",
+                "assignment expression cannot rebind comprehension variable",
+            )),
+        ),
+        (
+            "def f():\n    assert await g()\n    yield 1\n    return 3\n    x = 2\n    global x\n    [(yield y) for y in ys]\n",
+            None,
+        ),
+        (
+            "def f():\n    assert await g()\n    yield 1\n    return 3\n    [(yield y) for y in ys]\n    x = 2\n    global x\n",
+            None,
+        ),
+    ] {
+        for version in [PythonVersion::Py312, PythonVersion::Py313] {
+            for level in [OptimizationLevel::One, OptimizationLevel::Two] {
+                let expected = oracle(source.as_bytes(), "legacy_assert_await.py", version, level);
+                let stderr = String::from_utf8_lossy(&expected.stderr);
+                let expected_message = stderr
+                    .lines()
+                    .find_map(|line| line.strip_prefix("SyntaxError: "))
+                    .unwrap_or_else(|| panic!("the pinned oracle failed unexpectedly: {stderr}"));
+                let serc_message = if let Some((native, serc)) = messages {
+                    // Preserve Serc's existing wording while checking both diagnostics.
+                    assert_eq!(expected_message, native);
+                    serc
+                } else {
+                    expected_message
+                };
+                let error = compile_with_options(
+                    source,
+                    "legacy_assert_await.py",
+                    &CompileOptions {
+                        python_version: version,
+                        optimization_level: level,
+                        ..CompileOptions::default()
+                    },
+                )
+                .unwrap_err();
+                assert!(
+                    error.to_string().ends_with(serc_message),
+                    "{version} {level:?}: {source}: expected {serc_message:?}, got {error}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn debug_constants_match_cpython_through_nested_expressions_and_scopes() {
     assert_matches_cpython(
         r"
@@ -515,6 +686,7 @@ class C:
 fn optimized_assertion_syntax_matches_the_target_version() {
     for source in [
         "assert (await value)\n",
+        "def f():\n    assert (await g())\n",
         "assert (__debug__ := False)\n",
         "assert func(__debug__=1)\n",
         "assert func(x=1, x=2)\n",

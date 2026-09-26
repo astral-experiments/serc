@@ -193,6 +193,7 @@ pub(super) struct CodeUnit {
     positional_only_arg_count: u32,
     keyword_only_arg_count: u32,
     pub(super) flags: u32,
+    pub(super) legacy_sync_coroutine: bool,
     pub(super) first_line_number: u32,
     pub(super) annotation_thunk: bool,
 }
@@ -1656,6 +1657,7 @@ impl CodeUnit {
             positional_only_arg_count: spec.positional_only_arg_count,
             keyword_only_arg_count: spec.keyword_only_arg_count,
             flags: spec.flags,
+            legacy_sync_coroutine: false,
             first_line_number: spec.first_line_number,
             annotation_thunk: false,
         }

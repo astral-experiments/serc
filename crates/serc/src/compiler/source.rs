@@ -24,10 +24,79 @@ use super::constant::{
     constant_slice_with_literals, explicit_surrogate_string, fold_constant,
     fold_constant_for_version, fold_constant_with_profile, is_literal_constant, literal_constant,
 };
+use super::scope::parameter_default_expressions;
 use super::scope::{ModulePlan, NameId, ScopeArena};
 use super::statement::function_body_contains_yield;
 use super::symbol::mangle_name;
 use super::{CachedSourceLine, Compiler};
+
+/// Find legacy coroutine symbols in removed assertions without crossing nested scopes.
+pub(super) fn function_has_elided_coroutine_assertion(body: &[Stmt]) -> bool {
+    #[derive(Default)]
+    struct Detector {
+        found: bool,
+        in_assertion: bool,
+    }
+
+    impl<'ast> Visitor<'ast> for Detector {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if self.found {
+                return;
+            }
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_stmt(statement));
+            }
+            match statement {
+                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => (),
+                Stmt::Assert(_) => {
+                    self.in_assertion = true;
+                    walk_stmt(self, statement);
+                    self.in_assertion = false;
+                }
+                _ => walk_stmt(self, statement),
+            }
+        }
+
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if !self.in_assertion || self.found {
+                return;
+            }
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_expr(expression));
+            }
+            match expression {
+                Expr::Await(_) => self.found = true,
+                Expr::ListComp(comp) if comp.generators.iter().any(|item| item.is_async) => {
+                    self.found = true;
+                }
+                Expr::SetComp(comp) if comp.generators.iter().any(|item| item.is_async) => {
+                    self.found = true;
+                }
+                Expr::DictComp(comp) if comp.generators.iter().any(|item| item.is_async) => {
+                    self.found = true;
+                }
+                Expr::Generator(comp) => {
+                    // Only the first iterable belongs to the enclosing scope.
+                    if let Some(generator) = comp.generators.first() {
+                        self.visit_expr(&generator.iter);
+                    }
+                }
+                Expr::Lambda(lambda) => {
+                    if let Some(parameters) = &lambda.parameters {
+                        for default in parameter_default_expressions(parameters) {
+                            self.visit_expr(default);
+                        }
+                    }
+                }
+                _ => walk_expr(self, expression),
+            }
+        }
+    }
+
+    let mut detector = Detector::default();
+    detector.visit_body(body);
+    detector.found
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum StringConstantOrigin {
@@ -130,6 +199,7 @@ pub(super) struct CompilationContext<'source> {
     pub(super) optimized_locations: FxHashMap<TextRange, super::optimization::OptimizedLocation>,
     pub(super) scopes: ScopeArena,
     original_generator_functions: Option<FxHashSet<TextRange>>,
+    original_legacy_coroutine_functions: FxHashSet<TextRange>,
     pub(super) module_contains_yield: bool,
     finally_bodies: FxHashMap<TextRange, &'source [Stmt]>,
     constant_string_origins: FxHashMap<Cow<'source, str>, Cell<StringConstantOrigin>>,
@@ -260,6 +330,7 @@ impl<'source> CompilationContext<'source> {
             optimized_locations: FxHashMap::default(),
             scopes,
             original_generator_functions: None,
+            original_legacy_coroutine_functions: FxHashSet::default(),
             module_contains_yield: false,
             finally_bodies,
             constant_string_origins,
@@ -280,15 +351,23 @@ impl<'source> CompilationContext<'source> {
     pub(super) fn preserve_unoptimized_scopes(&mut self, body: &Suite) {
         struct GeneratorCollector {
             ranges: FxHashSet<TextRange>,
+            coroutines: FxHashSet<TextRange>,
             eager_annotations: bool,
+            legacy_coroutines: bool,
         }
 
         impl<'ast> Visitor<'ast> for GeneratorCollector {
             fn visit_stmt(&mut self, statement: &'ast Stmt) {
-                if let Stmt::FunctionDef(function) = statement
-                    && function_body_contains_yield(&function.body, self.eager_annotations)
-                {
-                    self.ranges.insert(function.range);
+                if let Stmt::FunctionDef(function) = statement {
+                    if function_body_contains_yield(&function.body, self.eager_annotations) {
+                        self.ranges.insert(function.range);
+                    }
+                    if self.legacy_coroutines
+                        && !function.is_async
+                        && function_has_elided_coroutine_assertion(&function.body)
+                    {
+                        self.coroutines.insert(function.range);
+                    }
                 }
                 walk_stmt(self, statement);
             }
@@ -342,10 +421,20 @@ impl<'source> CompilationContext<'source> {
         self.module_contains_yield = function_body_contains_yield(body, eager_annotations);
         let mut collector = GeneratorCollector {
             ranges: FxHashSet::default(),
+            coroutines: FxHashSet::default(),
             eager_annotations,
+            legacy_coroutines: self.python_version <= crate::PythonVersion::Py313
+                && (self.source.contains("await") || self.source.contains("async")),
         };
         collector.visit_body(body);
         self.original_generator_functions = Some(collector.ranges);
+        self.original_legacy_coroutine_functions = collector.coroutines;
+    }
+
+    /// Legacy symbol tables retain coroutine flags from assertions removed by optimization.
+    pub(super) fn function_has_elided_coroutine(&self, definition: &StmtFunctionDef) -> bool {
+        self.original_legacy_coroutine_functions
+            .contains(&definition.range)
     }
 
     /// Use the original function body when optimization has removed a suspension expression.

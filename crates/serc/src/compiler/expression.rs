@@ -2579,7 +2579,7 @@ impl Compiler<'_> {
                 self.emit_resume(ResumeLocation::AFTER_YIELD, resume_depth)?;
             }
             Expr::YieldFrom(expression) => {
-                if self.unit.flags & CO_GENERATOR == 0 {
+                if self.unit.flags & CO_GENERATOR == 0 && !self.unit.legacy_sync_coroutine {
                     let message = if self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) != 0 {
                         "'yield from' inside async function"
                     } else {

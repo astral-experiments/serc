@@ -595,9 +595,11 @@ impl Compiler<'_> {
             0
         }) | (self.unit.flags & SUPPORTED_FUTURE_FLAGS);
         let contains_yield = self.context.function_contains_yield(definition);
-        if definition.is_async && contains_yield {
+        let is_coroutine =
+            definition.is_async || self.context.function_has_elided_coroutine(definition);
+        if is_coroutine && contains_yield {
             parameter_flags |= CO_ASYNC_GENERATOR;
-        } else if definition.is_async {
+        } else if is_coroutine {
             parameter_flags |= CO_COROUTINE;
         } else if contains_yield {
             parameter_flags |= CO_GENERATOR;
@@ -630,6 +632,7 @@ impl Compiler<'_> {
             keyword_only_arg_count,
             parameter_flags,
         )?;
+        child.unit.legacy_sync_coroutine = !definition.is_async && is_coroutine;
         child.inherit_lexical_context(self);
         let child = child.compile_function_body(&definition.body)?;
 
