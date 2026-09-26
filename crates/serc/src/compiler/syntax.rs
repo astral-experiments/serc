@@ -1917,6 +1917,22 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             })
             .flatten();
         let message = match &error.kind {
+            Kind::FutureFeatureNotDefined(name) => {
+                if name == "braces" {
+                    "not a chance".to_owned()
+                } else {
+                    // CPython limits the UTF-8 representation to 100 bytes. Incomplete
+                    // characters at the limit are replaced before 3.14 and omitted afterward.
+                    let mut end = name.len().min(100);
+                    if self.python_version >= ast::PythonVersion::PY314 {
+                        while !name.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                    }
+                    let feature = String::from_utf8_lossy(&name.as_bytes()[..end]);
+                    format!("future feature {feature} is not defined")
+                }
+            }
             Kind::WriteToDebug(WriteToDebugKind::Store) => "cannot assign to __debug__".to_owned(),
             Kind::WriteToDebug(WriteToDebugKind::Delete(_)) => "cannot delete __debug__".to_owned(),
             Kind::BreakOutsideLoop => "'break' outside loop".to_owned(),
@@ -1981,6 +1997,97 @@ mod tests {
         PythonVersion::Py314,
         PythonVersion::Py315,
     ];
+
+    #[test]
+    fn unknown_future_feature_reports_native_message() {
+        for (source, expected, span) in [
+            (
+                "from __future__ import undefined_feature\n",
+                "future feature undefined_feature is not defined",
+                "undefined_feature",
+            ),
+            (
+                "from __future__ import annotations, undefined_feature\n",
+                "future feature undefined_feature is not defined",
+                "undefined_feature",
+            ),
+            (
+                "from __future__ import undefined_feature, another_feature\n",
+                "future feature undefined_feature is not defined",
+                "undefined_feature",
+            ),
+            (
+                "from __future__ import undefined_feature as alias\n",
+                "future feature undefined_feature is not defined",
+                "undefined_feature as alias",
+            ),
+            ("from __future__ import braces\n", "not a chance", "braces"),
+            (
+                "from __future__ import braces as alias\n",
+                "not a chance",
+                "braces as alias",
+            ),
+            (
+                "from __future__ import ｂｒａｃｅｓ\n",
+                "not a chance",
+                "ｂｒａｃｅｓ",
+            ),
+        ] {
+            let parsed = parse_module(source).unwrap();
+            for python_version in TARGETS {
+                let error = validate(source, &parsed.syntax().body, python_version).unwrap_err();
+                let CompileError::InvalidSyntax { message, range } = error else {
+                    panic!("unexpected {python_version} error for {source:?}: {error}");
+                };
+                assert_eq!(message, expected, "{python_version}: {source:?}");
+                assert_eq!(&source[range], span, "{python_version}: {source:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_future_feature_names_are_truncated_as_utf8() {
+        for (name, legacy_prefix, modern_prefix) in [
+            ("a".repeat(101), "a".repeat(100), "a".repeat(100)),
+            ("é".repeat(101), "é".repeat(50), "é".repeat(50)),
+            (
+                format!("{}ézzz", "a".repeat(99)),
+                format!("{}�", "a".repeat(99)),
+                "a".repeat(99),
+            ),
+            (
+                format!("{}𐐀zzz", "a".repeat(98)),
+                format!("{}�", "a".repeat(98)),
+                "a".repeat(98),
+            ),
+            (
+                format!("{}ﬃzzz", "a".repeat(99)),
+                format!("{}f", "a".repeat(99)),
+                format!("{}f", "a".repeat(99)),
+            ),
+        ] {
+            let source = format!("from __future__ import {name}\n");
+            let parsed = parse_module(&source).unwrap();
+            for python_version in TARGETS {
+                let error = validate(&source, &parsed.syntax().body, python_version).unwrap_err();
+                let CompileError::InvalidSyntax { message, range } = error else {
+                    panic!("unexpected {python_version} error for {source:?}: {error}");
+                };
+                let prefix =
+                    if matches!(python_version, PythonVersion::Py312 | PythonVersion::Py313) {
+                        &legacy_prefix
+                    } else {
+                        &modern_prefix
+                    };
+                assert_eq!(
+                    message,
+                    format!("future feature {prefix} is not defined"),
+                    "{python_version}: {source:?}"
+                );
+                assert_eq!(&source[range], name, "{python_version}: {source:?}");
+            }
+        }
+    }
 
     #[test]
     fn declaration_checks_find_nested_statements_and_win_over_lowering_errors() {
