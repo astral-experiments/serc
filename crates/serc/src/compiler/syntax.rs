@@ -141,7 +141,30 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         || validator.lowering_numeric_error
         || debug_pattern_replay;
     let mut error = validator.error.into_inner();
-    if lowering_keyword_error && let Some(CompileError::InvalidSyntax { range, .. }) = &error {
+    if error
+        .as_ref()
+        .is_some_and(|error| error.is_async_generator_return)
+        && simple_comprehension_module(body)
+    {
+        // The admitted forms have no competing symbol-table diagnostics. In that subset,
+        // check the module for comprehension yields before the lowering-only return.
+        let mut replay = new_validator::<false, false>(
+            source,
+            body,
+            python_version,
+            optimization_level,
+            mapping_key_int_max_str_digits,
+        );
+        replay.pre_lowering_only = true;
+        replay.visit_body(body);
+        if let Some(priority_error) = replay.error.into_inner() {
+            return Err(priority_error.error);
+        }
+    }
+    if lowering_keyword_error
+        && let Some(CompileError::InvalidSyntax { range, .. }) =
+            error.as_ref().map(|error| &error.error)
+    {
         // A class body is compiled before its bases and class-call keywords. Revisit only
         // classes containing the lowering error, leaving the ordinary symbol walk unchanged.
         let mut replay = new_validator::<PRUNE_STATEMENTS, false>(
@@ -157,7 +180,7 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         let replay_error = replay.error.into_inner().or_else(|| {
             replay
                 .bare_starred
-                .map(|(range, kind)| CompileError::invalid_syntax(kind.message(), range))
+                .map(|(range, kind)| CompileError::invalid_syntax(kind.message(), range).into())
         });
         // A numeric duplicate found in the class body needs the same ordered symbol replay
         // as one found by the initial walk.
@@ -168,6 +191,7 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         }
         error = replay_error.or(error);
     }
+    let error = error.map(|error| error.error);
     if matches!(&error, Some(CompileError::InvalidDocstring { .. })) || lowering_error {
         // Revisit these error paths for diagnostics from earlier compiler phases.
         // Future directives moved ahead of call lowering in Python 3.14.
@@ -185,7 +209,7 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
             );
             validator.visit_body(body);
             if let Some(future_error) = validator.error.into_inner() {
-                return Err(future_error);
+                return Err(future_error.error);
             }
         }
         // Symbol-table diagnostics precede docstring cleanup too, including declarations in
@@ -202,6 +226,7 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         validator.visit_body(body);
         let pattern_debug_range = validator.symbol_pattern_debug_range;
         if let Some(priority_error) = validator.error.into_inner() {
+            let priority_error = priority_error.error;
             if source.contains("global") || source.contains("nonlocal") {
                 let prior_declaration = if let Some(range) = pattern_debug_range {
                     declarations::immediate_before_pattern_debug(body, python_version, range)
@@ -240,6 +265,103 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         declarations::validate(body, python_version)?;
     }
     Ok(())
+}
+
+/// Recognize a small grammar whose symbol-table walk has the same order as the replay visitor.
+fn simple_comprehension_module(body: &[Stmt]) -> bool {
+    body.iter().all(|statement| match statement {
+        Stmt::FunctionDef(function) => simple_comprehension_function(function),
+        Stmt::Assign(_) | Stmt::Expr(_) | Stmt::Pass(_) => {
+            simple_comprehension_statement(statement)
+        }
+        _ => false,
+    })
+}
+
+fn simple_comprehension_function(function: &ast::StmtFunctionDef) -> bool {
+    if function.name.as_str() == "__debug__"
+        || !function.decorator_list.is_empty()
+        || function.type_params.is_some()
+        || function.returns.is_some()
+    {
+        return false;
+    }
+    let mut names = FxHashSet::default();
+    if !function.parameters.iter().all(|parameter| {
+        let name = parameter.name().as_str();
+        name != "__debug__"
+            && names.insert(name)
+            && parameter.annotation().is_none()
+            && parameter.default().is_none_or(simple_atom)
+    }) {
+        return false;
+    }
+    function.body.iter().all(simple_comprehension_statement)
+}
+
+fn simple_comprehension_statement(statement: &Stmt) -> bool {
+    match statement {
+        Stmt::Pass(_) => true,
+        Stmt::Assign(statement) => {
+            statement
+                .targets
+                .iter()
+                .all(|target| matches!(target, Expr::Name(name) if name.id.as_str() != "__debug__"))
+                && simple_comprehension_expression(&statement.value)
+        }
+        Stmt::Return(statement) => statement
+            .value
+            .as_deref()
+            .is_none_or(simple_comprehension_expression),
+        Stmt::Expr(statement) => simple_comprehension_expression(&statement.value),
+        _ => false,
+    }
+}
+
+fn simple_comprehension_expression(expression: &Expr) -> bool {
+    if simple_atom_or_yield(expression) {
+        return true;
+    }
+    let (generators, result): (&[ast::Comprehension], bool) = match expression {
+        Expr::ListComp(comp) => (&comp.generators, simple_atom_or_yield(&comp.elt)),
+        Expr::SetComp(comp) => (&comp.generators, simple_atom_or_yield(&comp.elt)),
+        Expr::Generator(comp) => (&comp.generators, simple_atom_or_yield(&comp.elt)),
+        Expr::DictComp(comp) => (
+            &comp.generators,
+            comp.key.as_deref().is_some_and(simple_atom_or_yield)
+                && simple_atom_or_yield(&comp.value),
+        ),
+        _ => return false,
+    };
+    result
+        && !generators.is_empty()
+        && generators.iter().all(|generator| {
+            !generator.is_async
+                && generator.ifs.is_empty()
+                && matches!(&generator.target, Expr::Name(name) if name.id.as_str() != "__debug__")
+                && matches!(generator.iter, Expr::Name(_))
+        })
+}
+
+fn simple_atom_or_yield(expression: &Expr) -> bool {
+    match expression {
+        Expr::Yield(yield_) => yield_.value.as_deref().is_none_or(simple_atom),
+        Expr::YieldFrom(yield_from) => simple_atom(&yield_from.value),
+        _ => simple_atom(expression),
+    }
+}
+
+fn simple_atom(expression: &Expr) -> bool {
+    matches!(
+        expression,
+        Expr::Name(_)
+            | Expr::StringLiteral(_)
+            | Expr::BytesLiteral(_)
+            | Expr::NumberLiteral(_)
+            | Expr::BooleanLiteral(_)
+            | Expr::NoneLiteral(_)
+            | Expr::EllipsisLiteral(_)
+    )
 }
 
 fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>(
@@ -511,7 +633,7 @@ struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
     checker: SemanticSyntaxChecker,
     checked_type_params: Option<&'ast ast::TypeParams>,
     checker_prefix: CheckerPrefix,
-    error: RefCell<Option<CompileError>>,
+    error: RefCell<Option<ValidationError>>,
     reported_future_feature: Cell<Option<TextRange>>,
     collected_match_errors: RefCell<Option<Vec<SemanticSyntaxError>>>,
     symbol_pattern_debug_range: Option<TextRange>,
@@ -625,6 +747,20 @@ fn surrogate_mapping_key_outcomes(
         finder.visit_pattern(&case.pattern);
     }
     finder.outcomes
+}
+
+struct ValidationError {
+    error: CompileError,
+    is_async_generator_return: bool,
+}
+
+impl From<CompileError> for ValidationError {
+    fn from(error: CompileError) -> Self {
+        Self {
+            error,
+            is_async_generator_return: false,
+        }
+    }
 }
 
 struct PendingPattern<'ast> {
@@ -819,10 +955,13 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
             && let Expr::StringLiteral(string) = statement.value.as_ref()
             && let Some(message) = surrogate_docstring_error(self.source, string)
         {
-            *self.error.borrow_mut() = Some(CompileError::InvalidDocstring {
-                message,
-                range: string.range,
-            });
+            *self.error.borrow_mut() = Some(
+                CompileError::InvalidDocstring {
+                    message,
+                    range: string.range,
+                }
+                .into(),
+            );
         }
         self.visit_body(body);
         // Modern module and class annotations are lowered after the enclosing body.
@@ -850,10 +989,13 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
         }
         let mut error = self.error.borrow_mut();
         if error.is_none() {
-            *error = Some(CompileError::invalid_syntax(
-                "'break', 'continue' and 'return' cannot appear in an except* block",
-                statement.range(),
-            ));
+            *error = Some(
+                CompileError::invalid_syntax(
+                    "'break', 'continue' and 'return' cannot appear in an except* block",
+                    statement.range(),
+                )
+                .into(),
+            );
         }
     }
 
@@ -906,7 +1048,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
             } else {
                 format!("keyword argument repeated: {name}")
             };
-            *self.error.borrow_mut() = Some(CompileError::invalid_syntax(message, range));
+            *self.error.borrow_mut() = Some(CompileError::invalid_syntax(message, range).into());
         }
     }
 
@@ -1076,10 +1218,13 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
                 } else {
                     "argument"
                 };
-                *self.error.borrow_mut() = Some(CompileError::invalid_syntax(
-                    format!("duplicate {kind} '{spelling}' in function definition"),
-                    parameter.name.range(),
-                ));
+                *self.error.borrow_mut() = Some(
+                    CompileError::invalid_syntax(
+                        format!("duplicate {kind} '{spelling}' in function definition"),
+                        parameter.name.range(),
+                    )
+                    .into(),
+                );
                 return;
             }
         }
@@ -1627,7 +1772,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
             }
             self.pre_lowering_only = previous;
             if self.error.borrow().is_none() {
-                *self.error.borrow_mut() = Some(error);
+                *self.error.borrow_mut() = Some(error.into());
             }
             return;
         }
@@ -1664,10 +1809,13 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                         "wildcard makes remaining patterns unreachable".to_owned()
                     }
                 };
-                *self.error.borrow_mut() = Some(CompileError::InvalidPattern {
-                    message,
-                    range: pending.pattern.range,
-                });
+                *self.error.borrow_mut() = Some(
+                    CompileError::InvalidPattern {
+                        message,
+                        range: pending.pattern.range,
+                    }
+                    .into(),
+                );
             }
             if self.error.borrow().is_some() {
                 return;
@@ -1929,21 +2077,24 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                     SemanticSyntaxErrorKind::ReboundComprehensionVariable
                 ) && let Expr::Name(name) = named.target.as_ref()
                 {
-                    *self.error.borrow_mut() = Some(CompileError::invalid_syntax(
-                        format!(
-                            "assignment expression cannot rebind comprehension iteration variable '{}'",
-                            name.id
-                        ),
-                        error.range,
-                    ));
+                    *self.error.borrow_mut() = Some(
+                        CompileError::invalid_syntax(
+                            format!(
+                                "assignment expression cannot rebind comprehension iteration variable '{}'",
+                                name.id
+                            ),
+                            error.range,
+                        )
+                        .into(),
+                    );
                 } else if matches!(
                     error.kind,
                     SemanticSyntaxErrorKind::NamedExpressionInClassBodyComprehension
                 ) {
-                    *self.error.borrow_mut() = Some(CompileError::invalid_syntax(
-                        error.to_string(),
-                        named.target.range(),
-                    ));
+                    *self.error.borrow_mut() = Some(
+                        CompileError::invalid_syntax(error.to_string(), named.target.range())
+                            .into(),
+                    );
                 } else {
                     self.report_semantic_error(error);
                 }
@@ -2459,11 +2610,14 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             && matches!(error.kind, Kind::LateFutureImport)
             && reported
                 .as_ref()
-                .and_then(CompileError::range)
+                .and_then(|error| error.error.range())
                 .is_some_and(|range| range != error.range && error.range.contains_range(range));
         let replaces_pending_debug = self.pending_pattern.is_some()
             && matches!(error.kind, Kind::WriteToDebug(_))
-            && !matches!(*reported, Some(CompileError::InvalidSyntax { .. }));
+            && !matches!(
+                reported.as_ref().map(|error| &error.error),
+                Some(CompileError::InvalidSyntax { .. })
+            );
         if reported.is_some()
             && !(later_future_in_same_statement
                 || replaces_unknown_future
@@ -2489,7 +2643,7 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
                 self.mapping_key_int_max_str_digits,
             )
         {
-            *reported = Some(diagnostic);
+            *reported = Some(diagnostic.into());
             return;
         }
         let message = match &error.kind {
@@ -2560,8 +2714,9 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             }
             _ => error.to_string(),
         };
-        *reported = Some(
-            if matches!(
+        let is_async_generator_return = matches!(error.kind, Kind::ReturnInGenerator);
+        *reported = Some(ValidationError {
+            error: if matches!(
                 error.kind,
                 Kind::DifferentMatchPatternBindings
                     | Kind::MultipleCaseAssignment(_)
@@ -2577,7 +2732,8 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             } else {
                 CompileError::invalid_syntax(message, error.range)
             },
-        );
+            is_async_generator_return,
+        });
     }
 }
 
@@ -2585,7 +2741,10 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
 mod tests {
     use ruff_python_parser::parse_module;
 
-    use super::{validate, validate_with_optimization, validate_without_statement_pruning};
+    use super::{
+        simple_comprehension_module, validate, validate_with_optimization,
+        validate_without_statement_pruning,
+    };
     use crate::{
         CompileError, CompileOptions, OptimizationLevel, PythonVersion, compile_with_options,
     };
@@ -2880,6 +3039,27 @@ mod tests {
         for version in TARGETS {
             let result = validate(&source, &parsed.syntax().body, version);
             assert!(result.is_ok(), "{version}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn comprehension_replay_rejects_uncertified_module_shapes() {
+        for source in [
+            "async def f(x, x):\n pass\n",
+            "async def f(K, \u{212A}):\n pass\n",
+            "async def f(__debug__):\n pass\n",
+            "async def f(x: int):\n pass\n",
+            "async def f(x=call()):\n pass\n",
+            "async def f():\n __debug__ = 1\n",
+            "async def f():\n obj.attr = 1\n",
+            "async def f():\n obj[0] = 1\n",
+            "return 1\n",
+        ] {
+            let parsed = parse_module(source).unwrap();
+            assert!(
+                !simple_comprehension_module(&parsed.syntax().body),
+                "{source}"
+            );
         }
     }
 

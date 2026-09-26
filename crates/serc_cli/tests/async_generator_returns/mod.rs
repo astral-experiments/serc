@@ -21,6 +21,7 @@ const VERSIONS: [PythonVersion; 4] = [
 #[test]
 fn rejects_async_generator_value_returns_from_eager_nested_headers() {
     let header_cases = [
+        "async def f(x, /, y=1, *args, z=None, **kwargs):\n    value = x\n    yield y\n    return z\n",
         "async def f():\n    class C((yield 1)): pass\n    return 1\n",
         "async def f():\n    class C(metaclass=(yield 1)): pass\n    return None\n",
         "async def f():\n    @(yield 1)\n    class C: pass\n    return 1\n",
