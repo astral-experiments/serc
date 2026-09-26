@@ -22,6 +22,103 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn legacy_nested_finally_pass_keeps_outer_owner() {
+    const SOURCE: &str = "def f(work, cleanup, after):\n    try:\n        try:\n            work()\n        finally:\n            pass\n        after()\n    finally:\n        cleanup()\n";
+    const TERMINAL: &str = "def f(work, cleanup):\n    try:\n        try:\n            work()\n        finally:\n            pass\n    finally:\n        cleanup()\n";
+    const TRACE: &str = r"
+import dis, marshal, sys
+scope = {}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+f = scope['f']
+targets = [instruction.offset for instruction in dis.get_instructions(f)
+           if instruction.opname == 'NOP' and instruction.positions.lineno == 6]
+if not targets:
+    raise RuntimeError('missing pass marker')
+target = min(targets)
+monitor = sys.monitoring
+monitor.use_tool_id(5, 'legacy-finally-owner')
+for exception in (ValueError, StopIteration):
+    for cleanup_raises in (False, True):
+        events, hits = [], []
+        def work():
+            events.append('work')
+        def after():
+            events.append('after')
+        def cleanup():
+            events.append('cleanup')
+            if cleanup_raises:
+                raise RuntimeError('cleanup')
+        def inject(code, offset):
+            if offset == target:
+                hits.append(offset)
+                raise exception('injected')
+        monitor.register_callback(5, monitor.events.INSTRUCTION, inject)
+        monitor.set_local_events(5, f.__code__, monitor.events.INSTRUCTION)
+        try:
+            f(work, cleanup, after)
+            result = None
+        except BaseException as error:
+            result = type(error)
+        finally:
+            monitor.set_local_events(5, f.__code__, 0)
+            monitor.register_callback(5, monitor.events.INSTRUCTION, None)
+        expected = RuntimeError if cleanup_raises else exception
+        if hits != [target] or events != ['work', 'cleanup'] or result is not expected:
+            raise RuntimeError((hits, events, result, expected))
+monitor.free_tool_id(5)
+";
+
+    let versions = [PythonVersion::Py312, PythonVersion::Py313];
+    assert_matches_cpython_versions(TERMINAL, "legacy_finally.py", &LEVELS, &versions);
+    for (index, python_version) in versions.into_iter().enumerate() {
+        for optimization_level in LEVELS {
+            let native = oracle(
+                SOURCE.as_bytes(),
+                "legacy_finally.py",
+                python_version,
+                optimization_level,
+            );
+            assert!(
+                native.status.success(),
+                "{}",
+                String::from_utf8_lossy(&native.stderr)
+            );
+            let actual = compile_with_options(
+                SOURCE,
+                "legacy_finally.py",
+                &CompileOptions {
+                    python_version,
+                    optimization_level,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .marshal();
+            assert_eq!(
+                actual, native.stdout,
+                "{python_version}, {optimization_level:?}"
+            );
+            for code in [&native.stdout, &actual] {
+                let mut child = Command::new(ORACLES[index].get().unwrap())
+                    .args(["-I", "-S", "-B", "-c", TRACE])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child.stdin.take().unwrap().write_all(code).unwrap();
+                let result = child.wait_with_output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{python_version}, {optimization_level:?}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn terminal_try_pass_preserves_implicit_return_location() {
     for source in [
         "def f(x):\n    try:\n        x = x + 1\n        pass\n    except ValueError:\n        recover()\n",

@@ -28666,9 +28666,49 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_copied_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0;
+        // A direct no-op finalizer followed by another statement remains inside
+        // its enclosing finally's protected try body on legacy targets.
+        let pass_exit_legacy_finally_owner = matches!(
+            self.context.python_version,
+            crate::PythonVersion::Py312 | crate::PythonVersion::Py313
+        ) && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && pass_finally_location.is_some()
+            && !pass_finally_leaves_manager
+            && !statement.is_star
+            && statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && self.control.statements.context.has_following
+            && self
+                .control
+                .exceptions
+                .direct_try_body_statements
+                .contains(&statement.range)
+            && self.control.exceptions.active_try_body_tail != Some(statement.range)
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .len()
+                == 1
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self.control.loops.contexts.is_empty()
+            && self.control.finally.active_finally_try_bodies == 1
+            && self
+                .control
+                .finally
+                .innermost_finally_exception_exclusion_depth
+                == Some(1)
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0;
         let pass_exit_exception_depth = pass_exit_enclosing_finally_depth
             .or(pass_exit_generator_owner.then_some(0))
-            .or(pass_exit_try_body_owner.then_some(1));
+            .or(pass_exit_try_body_owner.then_some(1))
+            .or(pass_exit_legacy_finally_owner.then_some(1));
         let overriding_return = matches!(statement.finalbody.last(), Some(Stmt::Return(_)));
         if overriding_return
             && self.control.withs.active_with_region_exclusions.is_empty()
