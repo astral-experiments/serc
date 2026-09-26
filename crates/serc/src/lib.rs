@@ -18,6 +18,7 @@ mod python_312_starred_defaults;
 mod source;
 mod stack;
 mod target;
+mod yield_from_syntax;
 mod yield_syntax;
 
 use std::error::Error;
@@ -701,6 +702,9 @@ fn compile_normalized(
                 "cannot use assignment expressions with attribute",
                 error.location,
             ));
+        }
+        if let Some((message, range)) = yield_from_syntax::invalid_tuple_diagnostic(parsed) {
+            return Err(CompileError::invalid_syntax(message, range));
         }
         return Err(CompileError::Parse(error.clone()));
     }
