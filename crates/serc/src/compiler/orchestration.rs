@@ -1276,6 +1276,8 @@ impl<'source> Compiler<'source> {
         if let Some(start) = self.control.generators.generator_region_start {
             self.assembler.record_exception_setup(start, false);
             let handler = self.assembler.label();
+            self.assembler
+                .record_legacy_native_setup_target(start, handler);
             self.bind_native_source_label(
                 super::legacy_native_labels::NativeRole::StopIterationHandler,
                 handler,

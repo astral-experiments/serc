@@ -763,6 +763,115 @@ monitor.free_tool_id(5)
 }
 
 #[test]
+fn generator_backedge_after_exception_setup_has_no_line() {
+    const SOURCE: &str = "def f(xs, work, recover):\n try:\n  work()\n except ValueError:\n  recover()\n for x in xs:\n  if x:\n   assert False\n  if x:\n   assert False\n yield 1\n";
+    const TRACE: &str = r"
+import dis, marshal, sys
+scope = {}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+f = scope['f']
+targets = [i.offset for i in dis.get_instructions(f)
+           if i.opname == 'JUMP_BACKWARD' and i.positions.lineno is None]
+if len(targets) != 1:
+    raise RuntimeError(('backedges', targets))
+target = targets[0]
+class Fault(Exception): pass
+monitor = sys.monitoring
+monitor.use_tool_id(5, 'generator-backedge')
+for fail in (False, True):
+    for exception in (Fault, StopIteration):
+        events, hits, traces = [], [], []
+        def work():
+            events.append('work')
+            if fail:
+                raise ValueError()
+        def recover():
+            events.append('recover')
+        def inject(code, offset):
+            if code is f.__code__ and offset == target:
+                hits.append(offset)
+                raise exception('injected')
+        def tracer(frame, event, arg):
+            if frame.f_code is f.__code__ and event in ('exception', 'return'):
+                traces.append((event, frame.f_lineno))
+            return tracer
+        monitor.register_callback(5, monitor.events.INSTRUCTION, inject)
+        monitor.set_local_events(5, f.__code__, monitor.events.INSTRUCTION)
+        sys.settrace(tracer)
+        try:
+            try:
+                list(f([True, True], work, recover))
+                raise RuntimeError('backedge was not reached')
+            except Fault:
+                if exception is not Fault:
+                    raise
+            except RuntimeError as e:
+                if exception is not StopIteration or not isinstance(e.__cause__, StopIteration):
+                    raise
+        finally:
+            sys.settrace(None)
+            monitor.set_local_events(5, f.__code__, 0)
+            monitor.register_callback(5, monitor.events.INSTRUCTION, None)
+        expected = ['work', 'recover'] if fail else ['work']
+        if events != expected or hits != [target] or traces[-2:] != [('exception', None), ('return', None)]:
+            raise RuntimeError((events, hits, traces, expected))
+monitor.free_tool_id(5)
+";
+    for level in [OptimizationLevel::One, OptimizationLevel::Two] {
+        let native = oracle(
+            SOURCE.as_bytes(),
+            "generator_backedge.py",
+            PythonVersion::Py312,
+            level,
+        );
+        assert!(native.status.success());
+        let actual = compile_with_options(
+            SOURCE,
+            "generator_backedge.py",
+            &CompileOptions {
+                python_version: PythonVersion::Py312,
+                optimization_level: level,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap()
+        .marshal();
+        assert_eq!(actual, native.stdout);
+        for payload in [&native.stdout, &actual] {
+            let mut child = Command::new(ORACLES[0].get().unwrap())
+                .args(["-I", "-S", "-B", "-c", TRACE])
+                .stdin(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(payload).unwrap();
+            let result = child.wait_with_output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+}
+
+#[test]
+fn generator_backedge_prologues_match_cpython_312() {
+    for source in [
+        "def enclosing():\n value = 1\n def f(xs, work, recover):\n  try:\n   work()\n  except ValueError:\n   recover()\n  for x in xs:\n   if x:\n    assert False\n   if x:\n    assert False\n  yield value\n return f\n",
+        "def f(xs, work, recover):\n value = 1\n def g():\n  return value\n try:\n  work()\n except ValueError:\n  recover()\n for x in xs:\n  if x:\n   assert False\n  if x:\n   assert False\n yield g\n",
+        "def f(xs):\n return (x for x in xs if x)\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "generator_prologue.py",
+            &LEVELS,
+            &[PythonVersion::Py312],
+        );
+    }
+}
+
+#[test]
 fn terminating_if_before_elided_assert_preserves_branch_location() {
     for source in [
         "def f(a,b,c):\n if a:\n  if b:\n   raise ValueError()\n  assert a\n else:\n  other()\n after()\n",

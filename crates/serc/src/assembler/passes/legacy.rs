@@ -9,8 +9,9 @@ use super::super::{
     block_jump_target,
 };
 use crate::target::opcodes::{
-    COMPARE_OP, CONTAINS_OP, COPY, IS_OP, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD,
-    LOAD_CLOSURE, LOAD_CONST, LOAD_FAST, LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, NOP, POP_TOP, PUSH_NULL,
+    CALL_INTRINSIC_1, COMPARE_OP, CONTAINS_OP, COPY, COPY_FREE_VARS, IS_OP, JUMP_BACKWARD,
+    JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, LOAD_CLOSURE, LOAD_CONST, LOAD_FAST,
+    LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, MAKE_CELL, NOP, POP_TOP, PUSH_NULL, RERAISE, RESUME,
     RETURN_GENERATOR, RETURN_VALUE, STORE_FAST, STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST,
     TO_BOOL, UNARY_NOT, YIELD_VALUE,
 };
@@ -1536,6 +1537,26 @@ impl OptimizationPipeline {
             .map(|(entry, _)| *entry)
             .collect::<FxHashSet<_>>();
         let handlers = targets.values().copied().collect::<FxHashSet<_>>();
+        // Native 3.12 inserts one implicit generator SETUP before the entry RESUME.
+        let fallback_handlers = self
+            .exception_regions
+            .iter()
+            .filter(|region| region.is_scope_fallback)
+            .map(|region| region.target)
+            .collect::<FxHashSet<_>>();
+        if fallback_handlers.len() > 1 {
+            return None;
+        }
+        let wrapper = if let Some(&handler) = fallback_handlers.iter().next() {
+            let mut matches = captured.iter().filter(|(_, target)| *target == handler);
+            let (entry, _) = *matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            Some(entry)
+        } else {
+            None
+        };
         if setups.is_empty()
             || targets.len() != captured.len()
             || entries.len() != setups.len()
@@ -1544,7 +1565,7 @@ impl OptimizationPipeline {
             || self
                 .exception_regions
                 .iter()
-                .any(|region| region.is_scope_fallback || !handlers.contains(&region.target))
+                .any(|region| !handlers.contains(&region.target))
         {
             return None;
         }
@@ -1599,6 +1620,69 @@ impl OptimizationPipeline {
             .iter()
             .map(|&label| label_group(label))
             .collect::<Option<FxHashSet<_>>>()?;
+        if let Some(entry) = wrapper {
+            let handler = targets[&entry];
+            let entry_group = label_group(entry)?;
+            let handler_group = label_group(handler)?;
+            // Serc emits the startup instructions early, whereas native 3.12
+            // inserts them only after reachability. The original SETUP and
+            // RESUME must therefore map to the immediately following array.
+            if entry_group != 1
+                || handler_groups.contains(&0)
+                || handler_groups.contains(&entry_group)
+                || !self.exception_regions.iter().any(|region| {
+                    region.is_scope_fallback && region.start == entry && region.target == handler
+                })
+            {
+                return None;
+            }
+            let instructions = |index: usize| {
+                groups[index]
+                    .iter()
+                    .flat_map(|block| self.graph[*block].items())
+                    .filter_map(|item| match item {
+                        Item::Instruction(instruction) => Some(instruction),
+                        Item::Label(_) => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let prefix = instructions(0);
+            let [before @ .., generator, pop] = prefix.as_slice() else {
+                return None;
+            };
+            if generator.opcode != RETURN_GENERATOR
+                || pop.opcode != POP_TOP
+                || generator.operand() != Operand::Value(0)
+                || pop.operand() != Operand::Value(0)
+                || before.iter().enumerate().any(|(index, instruction)| {
+                    instruction.opcode != MAKE_CELL
+                        && !(index == 0 && instruction.opcode == COPY_FREE_VARS)
+                })
+                || !instructions(entry_group)
+                    .first()
+                    .is_some_and(|instruction| {
+                        instruction.opcode == RESUME && instruction.operand() == Operand::Value(0)
+                    })
+            {
+                return None;
+            }
+            let cleanup = instructions(handler_group);
+            if !matches!(cleanup.as_slice(), [call, reraise]
+                if call.opcode == CALL_INTRINSIC_1 && call.operand() == Operand::Value(3)
+                    && reraise.opcode == RERAISE && reraise.operand() == Operand::Value(1))
+                || self.graph.iter_items().any(|item| {
+                    let Item::Instruction(instruction) = item else { return false; };
+                    match instruction.operand() {
+                        Operand::Forward(label) | Operand::Backward(label) => {
+                            matches!(label_group(label), Some(group) if group == 0 || group == entry_group || group == handler_group)
+                        }
+                        _ => false,
+                    }
+                })
+            {
+                return None;
+            }
+        }
         let mut setup_edges = vec![Vec::new(); groups.len()];
         let mut entry_groups = FxHashSet::default();
         for &(entry, _) in setups {
@@ -1609,7 +1693,7 @@ impl OptimizationPipeline {
             let target = label_group(targets[&entry])?;
             // The handler's cleanup SETUP is its first instruction. A body
             // SETUP instead precedes its entry label in the preceding array.
-            let owner = if handler_groups.contains(&position) {
+            let owner = if Some(entry) == wrapper || handler_groups.contains(&position) {
                 position
             } else {
                 let owner = position.checked_sub(1)?;
@@ -1629,7 +1713,11 @@ impl OptimizationPipeline {
                 }
                 owner
             };
-            setup_edges[owner].push(target);
+            if Some(entry) == wrapper {
+                setup_edges[owner].insert(0, target);
+            } else {
+                setup_edges[owner].push(target);
+            }
         }
 
         let mut edges = vec![Vec::new(); groups.len()];
@@ -3694,6 +3782,149 @@ mod protected_repeated_backedge_tests {
     use super::*;
     use crate::assembler::Assembler;
     use crate::target::opcodes::{POP_JUMP_IF_FALSE, RERAISE};
+
+    #[test]
+    fn generator_backedge_requires_original_wrapper_and_prologue() {
+        for case in 0..9 {
+            let label = Label::from_u32;
+            let (
+                entry,
+                body,
+                handler,
+                failed,
+                cleanup,
+                loop_head,
+                second,
+                backedge,
+                exit,
+                handler_success,
+                wrapper,
+                stop_handler,
+            ) = (
+                label(0),
+                label(1),
+                label(2),
+                label(3),
+                label(4),
+                label(5),
+                label(6),
+                label(7),
+                label(8),
+                label(9),
+                label(10),
+                label(11),
+            );
+            let normal = |opcode, argument| {
+                Instruction::new(
+                    opcode,
+                    Operand::Value(argument),
+                    SourceLocation::NONE,
+                    Some(0),
+                )
+            };
+            let branch = |target| {
+                Instruction::new(
+                    POP_JUMP_IF_FALSE,
+                    Operand::Forward(target),
+                    SourceLocation::NONE,
+                    Some(0),
+                )
+            };
+            let jump = |target| {
+                Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(target),
+                    SourceLocation::NONE,
+                    Some(0),
+                )
+            };
+            let mut items = Vec::new();
+            if case == 7 {
+                items.extend([
+                    Item::Instruction(normal(COPY_FREE_VARS, 1)),
+                    Item::Instruction(normal(MAKE_CELL, 0)),
+                ]);
+            }
+            items.extend([
+                Item::Instruction(normal(if case == 3 { NOP } else { RETURN_GENERATOR }, 0)),
+                Item::Instruction(normal(POP_TOP, 0)),
+                Item::Label(wrapper),
+                Item::Instruction(normal(if case == 4 { NOP } else { RESUME }, 0)),
+                Item::Label(entry),
+                Item::Instruction(normal(NOP, 0)),
+                Item::Label(body),
+                Item::Instruction(normal(NOP, 0)),
+                Item::Instruction(jump(loop_head)),
+                Item::Label(handler),
+                Item::Instruction(branch(failed)),
+                Item::Label(handler_success),
+                Item::Instruction(jump(loop_head)),
+                Item::Label(failed),
+                Item::Instruction(normal(RERAISE, 0)),
+                Item::Label(cleanup),
+                Item::Instruction(normal(RERAISE, 0)),
+                Item::Label(loop_head),
+                Item::Instruction(branch(second)),
+                Item::Label(second),
+                Item::Instruction(Instruction::new(
+                    POP_JUMP_IF_FALSE,
+                    Operand::Backward(loop_head),
+                    SourceLocation::NONE,
+                    Some(0),
+                )),
+                Item::Label(backedge),
+                Item::Instruction(Instruction::new(
+                    JUMP_BACKWARD,
+                    Operand::Backward(loop_head),
+                    SourceLocation::NONE,
+                    Some(0),
+                )),
+                Item::Label(exit),
+                Item::Instruction(if case == 5 {
+                    jump(stop_handler)
+                } else {
+                    normal(RETURN_VALUE, 0)
+                }),
+                Item::Label(stop_handler),
+                Item::Instruction(normal(CALL_INTRINSIC_1, if case == 2 { 5 } else { 3 })),
+                Item::Instruction(normal(RERAISE, 1)),
+            ]);
+            let mut assembler = Assembler::from_linear_items(items);
+            assembler.python_version = PythonVersion::Py312;
+            assembler.next_label = 12;
+            assembler.add_exception_region(body, handler, handler, 0, false);
+            assembler.add_exception_region(handler, failed, cleanup, 1, true);
+            assembler.add_stopiteration_exception_region_with_depth(
+                if case == 8 { entry } else { wrapper },
+                stop_handler,
+                stop_handler,
+                0,
+            );
+            assembler.record_exception_setup(body, false);
+            assembler.record_legacy_native_setup_target(body, handler);
+            assembler.record_exception_setup(handler, false);
+            assembler.record_legacy_native_setup_target(handler, cleanup);
+            assembler.record_exception_setup(wrapper, false);
+            if case != 1 {
+                assembler.record_legacy_native_setup_target(wrapper, stop_handler);
+            }
+            if case == 6 {
+                assembler.record_legacy_native_setup_target(wrapper, stop_handler);
+            }
+            let pipeline = assembler.into_optimization_pipeline();
+            let arrays = pipeline.legacy_instruction_arrays();
+            let result = pipeline.legacy_repeated_backedges_with_setups(&arrays);
+            if case == 0 || case == 7 {
+                assert_eq!(
+                    result.unwrap()[0].0,
+                    pipeline.graph.label_block(backedge).unwrap(),
+                    "case {case}"
+                );
+            } else {
+                assert!(result.is_none(), "case {case}");
+            }
+        }
+    }
 
     #[test]
     fn repeated_visits_follow_body_and_handler_setup_edges() {
