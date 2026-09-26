@@ -625,6 +625,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
             || !self.check_bare_starred
             || self.pre_lowering_only
             || self.bare_starred.is_some()
+            || self.error.borrow().is_some()
         {
             return;
         }
@@ -632,7 +633,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
         if let Some((name, range)) = invalid_call_keyword(arguments, legacy) {
             // Legacy compilation checks each forbidden name before its later duplicates.
             // Modern forbidden-name checks belong to the earlier symbol-table pass.
-            self.lowering_keyword_error = true;
+            self.lowering_keyword_error.set(true);
             let message = if legacy && name == "__debug__" {
                 "cannot assign to __debug__".to_owned()
             } else {
@@ -725,17 +726,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
     }
 
     fn visit_class_arguments_in_lowering_order(&mut self, arguments: &'ast ast::Arguments) {
-        if self.check_bare_starred
-            && self.bare_starred.is_none()
-            && self.error.borrow().is_none()
-            && let Some((name, range)) = repeated_call_keyword(arguments)
-        {
-            self.lowering_keyword_error.set(true);
-            *self.error.borrow_mut() = Some(CompileError::invalid_syntax(
-                format!("keyword argument repeated: {name}"),
-                range,
-            ));
-        }
+        self.check_call_keywords(arguments);
         self.visit_arguments(arguments);
     }
 
@@ -1734,6 +1725,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
     }
 
     fn visit_arguments(&mut self, arguments: &'ast ast::Arguments) {
+        self.check_call_keywords(arguments);
         for argument in &arguments.args {
             self.visit_expr(argument);
         }
