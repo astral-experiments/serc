@@ -27662,6 +27662,34 @@ impl<'source> Compiler<'source> {
                         .active_exception_region_exclusions
                         .len()
             });
+        // A direct nested no-op finalizer in a generator has left its ordinary
+        // handler, but the generator's StopIteration conversion remains active.
+        let pass_exit_generator_owner = self.context.python_version >= crate::PythonVersion::Py314
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_GENERATOR
+            && self.control.generators.generator_region_start.is_some()
+            && pass_finally_location.is_some()
+            && !pass_finally_leaves_manager
+            && !statement.is_star
+            && statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && self.control.exceptions.active_try_body_tail == Some(statement.range)
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .len()
+                == 1
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self.control.loops.contexts.is_empty()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0;
+        let pass_exit_exception_depth =
+            pass_exit_enclosing_finally_depth.or(pass_exit_generator_owner.then_some(0));
         let overriding_return = matches!(statement.finalbody.last(), Some(Stmt::Return(_)));
         if overriding_return
             && self.control.withs.active_with_region_exclusions.is_empty()
@@ -28313,9 +28341,9 @@ impl<'source> Compiler<'source> {
             |compiler| compiler.with_fallthrough_tracking(|compiler| {
             if let Some(location) = pass_finally_location {
                 compiler.assembler.set_location(location);
-                if let Some(depth) = pass_exit_enclosing_finally_depth {
+                if let Some(depth) = pass_exit_exception_depth {
                     // The inner handler no longer owns its finalizer's normal exit,
-                    // but an outer finally remains active around that exit.
+                    // but an enclosing cleanup remains active around that exit.
                     let pass_start = compiler.assembler.label();
                     compiler.assembler.mark(pass_start);
                     compiler.emit(NOP, 0, 0)?;
@@ -28789,7 +28817,7 @@ impl<'source> Compiler<'source> {
                 && !drop_shared_manager_exit_nop
                 && conditional_exit.is_none();
             let exception_policy = if !original_nested_pass_exit
-                && pass_exit_enclosing_finally_depth.is_none()
+                && pass_exit_exception_depth.is_none()
                 && pass_finally_location.is_some()
                 && (pass_finally_leaves_manager
                     || !self
@@ -29089,7 +29117,7 @@ impl<'source> Compiler<'source> {
                 // assigns locations before shared continuations are threaded.
                 self.assembler.set_location(SourceLocation::NONE);
             }
-            let pass_exit_start = pass_exit_enclosing_finally_depth.map(|_| {
+            let pass_exit_start = pass_exit_exception_depth.map(|_| {
                 let start = self.assembler.label();
                 self.assembler.mark(start);
                 start
@@ -29112,8 +29140,7 @@ impl<'source> Compiler<'source> {
                     exception_policy,
                 )?
             };
-            if let (Some(depth), Some(start)) = (pass_exit_enclosing_finally_depth, pass_exit_start)
-            {
+            if let (Some(depth), Some(start)) = (pass_exit_exception_depth, pass_exit_start) {
                 let end = self.assembler.label();
                 self.assembler.mark(end);
                 for exclusions in
@@ -29525,14 +29552,16 @@ impl<'source> Compiler<'source> {
                             exclusions.push((exit_exclusion_start, exit_exclusion_end));
                         }
                     }
-                    let exclusion_start = pass_exit_enclosing_finally_depth.unwrap_or(0);
+                    let exclusion_start = pass_exit_exception_depth.unwrap_or(0);
                     for exclusions in
                         &mut self.control.exceptions.active_exception_region_exclusions
                             [exclusion_start..]
                     {
                         exclusions.push((exit_exclusion_start, exit_exclusion_end));
                     }
-                    if self.control.generators.generator_region_start.is_some() {
+                    if self.control.generators.generator_region_start.is_some()
+                        && !pass_exit_generator_owner
+                    {
                         self.control
                             .generators
                             .generator_region_exclusions
