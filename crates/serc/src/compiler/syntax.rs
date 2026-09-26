@@ -62,6 +62,8 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315)
             && validator.may_have_debug_patterns
             && pattern_debug::body_has_debug_pattern(body);
+    let numeric_symbol_replay = validator.lowering_numeric_error
+        && matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315);
     let lowering_error = lowering_keyword_error
         || validator.lowering_debug_error
         || validator.lowering_numeric_error
@@ -87,6 +89,7 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         // Revisit these error paths for diagnostics from earlier compiler phases.
         // Future directives moved ahead of call lowering in Python 3.14.
         if !debug_pattern_replay
+            && !numeric_symbol_replay
             && (!lowering_error
                 || matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315))
         {
@@ -103,12 +106,19 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         validator.visit_body(body);
         let pattern_debug_range = validator.symbol_pattern_debug_range;
         if let Some(priority_error) = validator.error.into_inner() {
-            if let Some(range) = pattern_debug_range
-                && (source.contains("global") || source.contains("nonlocal"))
-                && let Some(declaration_error) =
+            if source.contains("global") || source.contains("nonlocal") {
+                let prior_declaration = if let Some(range) = pattern_debug_range {
                     declarations::immediate_before_pattern_debug(body, python_version, range)
-            {
-                return Err(declaration_error);
+                } else if numeric_symbol_replay {
+                    priority_error.range().and_then(|range| {
+                        declarations::immediate_before_node(body, python_version, range)
+                    })
+                } else {
+                    None
+                };
+                if let Some(declaration_error) = prior_declaration {
+                    return Err(declaration_error);
+                }
             }
             return Err(priority_error);
         }
