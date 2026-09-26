@@ -9,6 +9,7 @@ fn repeated_keywords_preserve_native_diagnostic_order() {
     const REPEAT_A: &str = "keyword argument repeated: a";
     const REPEAT_B: &str = "keyword argument repeated: b";
     const REPEAT_C: &str = "keyword argument repeated: c";
+    const REPEAT_Z: &str = "keyword argument repeated: z";
     const STAR: &str = "can't use starred expression here";
     const DUPLICATE_TYPE: &str = "duplicate type parameter 'T'";
     const LATE_FUTURE: &str = "from __future__ imports must occur at the beginning of the file";
@@ -179,6 +180,21 @@ fn repeated_keywords_preserve_native_diagnostic_order() {
             "class C(x=1,x=2):\n    *value\nx=1\nglobal x\n",
             (GLOBAL, "global x"),
             (GLOBAL, "global x"),
+        ),
+        (
+            "class C(a=1,b=1,b=2,a=2): pass\n",
+            (REPEAT_A, "a=2"),
+            (REPEAT_A, "a=2"),
+        ),
+        (
+            "@g(a=1,b=1,b=2,a=2)\nclass C(z=1,z=2): pass\n",
+            (REPEAT_A, "a=2"),
+            (REPEAT_A, "a=2"),
+        ),
+        (
+            "class C(g(a=1,b=1,b=2,a=2), z=1,z=2): pass\n",
+            (REPEAT_Z, "z=2"),
+            (REPEAT_Z, "z=2"),
         ),
     ];
     let oracle = r"
