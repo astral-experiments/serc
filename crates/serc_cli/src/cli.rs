@@ -73,8 +73,8 @@ struct CompileCommand {
     invalidation_mode: InvalidationMode,
 
     /// Remove assertions and set __debug__ to false; repeat to also remove docstrings.
-    #[arg(short = 'O', action = clap::ArgAction::Count, conflicts_with = "optimize")]
-    optimization_count: u8,
+    #[arg(short = 'O', action = clap::ArgAction::Append, num_args = 0, default_missing_value = "true", conflicts_with = "optimize")]
+    optimization_flags: Vec<bool>,
 
     /// Python optimization level: 0 (default), 1 (-O), or 2 (-OO).
     #[arg(long, value_name = "LEVEL")]
@@ -117,31 +117,41 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
     };
     let paths = discover(&roots)?;
     let mut failures = 0_usize;
+    // Code generation has three levels, but Python keeps every `-O` in the cache tag.
+    let cache_optimization = command
+        .optimize
+        .map_or(command.optimization_flags.len(), |level| match level {
+            OptimizationLevel::Zero => 0,
+            OptimizationLevel::One => 1,
+            OptimizationLevel::Two => 2,
+        });
     let options = CompileOptions {
         python_version: command.python_version,
         native_build_profile: command.native_build_profile,
-        optimization_level: command
-            .optimize
-            .unwrap_or(match command.optimization_count {
-                0 => OptimizationLevel::Zero,
-                1 => OptimizationLevel::One,
-                _ => OptimizationLevel::Two,
-            }),
+        optimization_level: match cache_optimization {
+            0 => OptimizationLevel::Zero,
+            1 => OptimizationLevel::One,
+            _ => OptimizationLevel::Two,
+        },
         ..CompileOptions::default()
     };
 
     let (jobs, output_groups) = prepare_compilation(
         &paths,
         options.python_version,
-        options.optimization_level,
+        cache_optimization,
         command.check,
         jobs_for_inputs(command.jobs, paths.len()),
     );
     if jobs <= 1 {
         for path in &paths {
-            if let Err(message) =
-                compile_path(path, command.check, command.invalidation_mode, &options)
-            {
+            if let Err(message) = compile_path(
+                path,
+                command.check,
+                command.invalidation_mode,
+                &options,
+                cache_optimization,
+            ) {
                 failures += 1;
                 write_error(&message);
             }
@@ -172,9 +182,15 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
                     std::iter::from_fn(|| groups.get(next_group.fetch_add(1, Ordering::Relaxed)))
                         .flatten()
                         .filter_map(|&(index, path)| {
-                            compile_path(path, command.check, command.invalidation_mode, &options)
-                                .err()
-                                .map(|message| (index, message))
+                            compile_path(
+                                path,
+                                command.check,
+                                command.invalidation_mode,
+                                &options,
+                                cache_optimization,
+                            )
+                            .err()
+                            .map(|message| (index, message))
                         })
                 })
                 .collect()
@@ -243,14 +259,14 @@ type CompilationGroup<'a> = Vec<(usize, &'a Path)>;
 fn prepare_compilation(
     paths: &[PathBuf],
     python_version: PythonVersion,
-    optimization_level: OptimizationLevel,
+    cache_optimization: usize,
     check: bool,
     jobs: usize,
 ) -> (usize, Option<Vec<CompilationGroup<'_>>>) {
     if check || jobs <= 1 {
         return (jobs, None);
     }
-    let groups = compilation_groups(paths, python_version, optimization_level);
+    let groups = compilation_groups(paths, python_version, cache_optimization);
     (jobs.min(groups.len()), Some(groups))
 }
 
@@ -274,7 +290,7 @@ fn prioritize_compilation_groups(
 fn compilation_groups(
     paths: &[PathBuf],
     python_version: PythonVersion,
-    optimization_level: OptimizationLevel,
+    cache_optimization: usize,
 ) -> Vec<CompilationGroup<'_>> {
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -284,7 +300,7 @@ fn compilation_groups(
     let mut unknown_directory = false;
     let mut identities = Vec::with_capacity(paths.len());
     for path in paths {
-        let output = cache_path(path, python_version, optimization_level)
+        let output = cache_path(path, python_version, cache_optimization)
             .ok()
             .and_then(|output| {
                 let parent = output.parent()?;
@@ -423,10 +439,16 @@ fn compile_path(
     check: bool,
     invalidation_mode: InvalidationMode,
     options: &CompileOptions,
+    cache_optimization: usize,
 ) -> Result<(), String> {
-    compile_path_with_metadata(path, check, invalidation_mode, options, |path| {
-        fs_err::metadata(path)
-    })
+    compile_path_with_metadata(
+        path,
+        check,
+        invalidation_mode,
+        options,
+        cache_optimization,
+        |path| fs_err::metadata(path),
+    )
 }
 
 /// Compiles a source file, optionally replacing its cache.
@@ -437,6 +459,7 @@ fn compile_path_with_metadata(
     check: bool,
     invalidation_mode: InvalidationMode,
     options: &CompileOptions,
+    cache_optimization: usize,
     load_metadata: impl FnOnce(&Path) -> io::Result<std::fs::Metadata>,
 ) -> Result<(), String> {
     // Snapshot timestamp-cache metadata before reading. If the path changes during compilation,
@@ -474,7 +497,7 @@ fn compile_path_with_metadata(
         InvalidationMode::CheckedHash => module.to_hash_pyc(&source_bytes, true),
         InvalidationMode::UncheckedHash => module.to_hash_pyc(&source_bytes, false),
     };
-    let output = cache_path(path, options.python_version, options.optimization_level)?;
+    let output = cache_path(path, options.python_version, cache_optimization)?;
 
     let parent = output.parent().ok_or_else(|| {
         format!(
@@ -585,7 +608,7 @@ fn temporary_cache_file(
 fn cache_path(
     path: &Path,
     python_version: PythonVersion,
-    optimization_level: OptimizationLevel,
+    cache_optimization: usize,
 ) -> Result<PathBuf, String> {
     let filename = path
         .file_name()
@@ -614,10 +637,11 @@ fn cache_path(
         filename.push(".");
     }
     filename.push(cache_tag(python_version));
-    match optimization_level {
-        OptimizationLevel::Zero => {}
-        OptimizationLevel::One => filename.push(".opt-1"),
-        OptimizationLevel::Two => filename.push(".opt-2"),
+    match cache_optimization {
+        0 => {}
+        1 => filename.push(".opt-1"),
+        2 => filename.push(".opt-2"),
+        count => filename.push(format!(".opt-{count}")),
     }
     filename.push(".pyc");
     let parent = path
@@ -645,7 +669,7 @@ mod tests {
         prioritize_compilation_groups,
     };
     use super::{default_jobs, jobs_for_inputs};
-    use serc::{CompileOptions, OptimizationLevel, PythonVersion};
+    use serc::{CompileOptions, PythonVersion};
     use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, UNIX_EPOCH};
@@ -677,23 +701,11 @@ mod tests {
             directory.path().join("caf\u{e9}.py"),
         ];
 
-        let (jobs, groups) = prepare_compilation(
-            &paths[..3],
-            PythonVersion::Py314,
-            OptimizationLevel::Zero,
-            false,
-            3,
-        );
+        let (jobs, groups) = prepare_compilation(&paths[..3], PythonVersion::Py314, 0, false, 3);
         assert_eq!(jobs, 2);
         assert_eq!(groups.unwrap().len(), 2);
 
-        let (jobs, groups) = prepare_compilation(
-            &paths,
-            PythonVersion::Py314,
-            OptimizationLevel::Zero,
-            false,
-            4,
-        );
+        let (jobs, groups) = prepare_compilation(&paths, PythonVersion::Py314, 0, false, 4);
         assert_eq!(jobs, 1);
         assert_eq!(
             groups.unwrap()[0]
@@ -703,30 +715,18 @@ mod tests {
             [0, 1, 2, 3]
         );
         assert_eq!(
-            prepare_compilation(
-                &paths,
-                PythonVersion::Py314,
-                OptimizationLevel::Zero,
-                true,
-                4
-            ),
+            prepare_compilation(&paths, PythonVersion::Py314, 0, true, 4),
             (4, None)
         );
         assert_eq!(
-            prepare_compilation(
-                &paths,
-                PythonVersion::Py314,
-                OptimizationLevel::Zero,
-                false,
-                1
-            ),
+            prepare_compilation(&paths, PythonVersion::Py314, 0, false, 1),
             (1, None)
         );
         assert_eq!(
             prepare_compilation(
                 &paths[..1],
                 PythonVersion::Py314,
-                OptimizationLevel::Zero,
+                0,
                 false,
                 jobs_for_inputs(None, 1)
             ),
@@ -763,7 +763,7 @@ mod tests {
             other.join("a.py"),
         ];
         let indices = || {
-            compilation_groups(&paths, PythonVersion::Py314, OptimizationLevel::Zero)
+            compilation_groups(&paths, PythonVersion::Py314, 0)
                 .into_iter()
                 .map(|group| {
                     group
@@ -792,7 +792,7 @@ mod tests {
             missing.join("\u{212a}.py"),
         ];
         let indices = |paths: &[PathBuf]| {
-            compilation_groups(paths, PythonVersion::Py314, OptimizationLevel::Zero)
+            compilation_groups(paths, PythonVersion::Py314, 0)
                 .into_iter()
                 .map(|group| {
                     group
@@ -845,39 +845,19 @@ mod tests {
     #[test]
     fn builds_cache_path() {
         assert_eq!(
-            cache_path(
-                Path::new("package/module.py"),
-                PythonVersion::Py314,
-                OptimizationLevel::Zero
-            )
-            .unwrap(),
+            cache_path(Path::new("package/module.py"), PythonVersion::Py314, 0).unwrap(),
             PathBuf::from("package/__pycache__/module.cpython-314.pyc")
         );
         assert_eq!(
-            cache_path(
-                Path::new("package/.py"),
-                PythonVersion::Py314,
-                OptimizationLevel::Zero
-            )
-            .unwrap(),
+            cache_path(Path::new("package/.py"), PythonVersion::Py314, 0).unwrap(),
             PathBuf::from("package/__pycache__/py.cpython-314.pyc")
         );
         assert_eq!(
-            cache_path(
-                Path::new("package/module.py"),
-                PythonVersion::Py315,
-                OptimizationLevel::Zero
-            )
-            .unwrap(),
+            cache_path(Path::new("package/module.py"), PythonVersion::Py315, 0).unwrap(),
             PathBuf::from("package/__pycache__/module.cpython-315.pyc")
         );
         assert_eq!(
-            cache_path(
-                Path::new("package/module"),
-                PythonVersion::Py315,
-                OptimizationLevel::Zero
-            )
-            .unwrap(),
+            cache_path(Path::new("package/module"), PythonVersion::Py315, 0).unwrap(),
             PathBuf::from("package/__pycache__/modulecpython-315.pyc")
         );
         for (version, tag) in [
@@ -885,21 +865,11 @@ mod tests {
             (PythonVersion::Py313, "cpython-313"),
         ] {
             assert_eq!(
-                cache_path(
-                    Path::new("package/module.py"),
-                    version,
-                    OptimizationLevel::Zero
-                )
-                .unwrap(),
+                cache_path(Path::new("package/module.py"), version, 0).unwrap(),
                 PathBuf::from(format!("package/__pycache__/module.{tag}.pyc")),
             );
             assert_eq!(
-                cache_path(
-                    Path::new("package/module"),
-                    version,
-                    OptimizationLevel::Zero
-                )
-                .unwrap(),
+                cache_path(Path::new("package/module"), version, 0).unwrap(),
                 PathBuf::from(format!("package/__pycache__/module{tag}.pyc")),
             );
         }
@@ -918,12 +888,7 @@ mod tests {
             (b"\xff", b"\xffcpython-314.pyc"),
         ] {
             assert_eq!(
-                cache_path(
-                    Path::new(OsStr::from_bytes(name)),
-                    PythonVersion::Py314,
-                    OptimizationLevel::Zero
-                )
-                .unwrap(),
+                cache_path(Path::new(OsStr::from_bytes(name)), PythonVersion::Py314, 0).unwrap(),
                 Path::new("__pycache__").join(OsStr::from_bytes(expected))
             );
         }
@@ -972,6 +937,7 @@ mod tests {
             false,
             InvalidationMode::Timestamp,
             &CompileOptions::default(),
+            0,
             |path| {
                 fs_err::write(path, replacement)?;
                 let file = std::fs::OpenOptions::new().write(true).open(path)?;
@@ -985,10 +951,7 @@ mod tests {
             .unwrap()
             .to_timestamp_pyc(1_700_000_000, u32::try_from(replacement.len()).unwrap());
         assert_eq!(
-            fs_err::read(
-                cache_path(&source_path, PythonVersion::Py314, OptimizationLevel::Zero).unwrap()
-            )
-            .unwrap(),
+            fs_err::read(cache_path(&source_path, PythonVersion::Py314, 0).unwrap()).unwrap(),
             expected
         );
     }
@@ -1014,6 +977,7 @@ mod tests {
                 false,
                 InvalidationMode::Timestamp,
                 &CompileOptions::default(),
+                0,
                 |path| {
                     let metadata = fs_err::metadata(path)?;
                     let replacement_path = directory.path().join("replacement.py");
@@ -1029,11 +993,7 @@ mod tests {
                     .unwrap()
                     .to_timestamp_pyc(1_700_000_000, u32::try_from(original.len()).unwrap());
             assert_eq!(
-                fs_err::read(
-                    cache_path(&source_path, PythonVersion::Py314, OptimizationLevel::Zero)
-                        .unwrap()
-                )
-                .unwrap(),
+                fs_err::read(cache_path(&source_path, PythonVersion::Py314, 0).unwrap()).unwrap(),
                 expected
             );
         }
@@ -1052,6 +1012,7 @@ mod tests {
             false,
             InvalidationMode::Timestamp,
             &CompileOptions::default(),
+            0,
             |path| fs_err::metadata(path),
         )
         .unwrap_err();
