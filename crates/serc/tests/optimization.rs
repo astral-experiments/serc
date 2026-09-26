@@ -185,6 +185,23 @@ fn elided_if_else_preserves_conditional_join() {
     }
 }
 
+#[test]
+fn protected_elided_if_else_preserves_conditional_join() {
+    for source in [
+        "def f(a):\n try:\n  if a:\n   assert a\n  else:\n   assert not a\n  work(a)\n except ValueError:\n  recover()\n",
+        "def f(a):\n try:\n  if a is None:\n   assert a\n  else:\n   assert not a\n  work(a)\n except ValueError:\n  recover()\n else:\n  finish()\n",
+        "def f(a, b):\n try:\n  if a:\n   assert a\n  else:\n   assert b\n  assert b\n except ValueError:\n  recover()\n",
+        "def f(a, b):\n try:\n  if a or b:\n   assert a\n  else:\n   assert b\n  work(a)\n except ValueError:\n  recover()\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "sub/protected_elided_if_else.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
 const ORACLE_IDENTITY: &str = r"
 import importlib.util, sys
 assert sys.implementation.name == 'cpython'

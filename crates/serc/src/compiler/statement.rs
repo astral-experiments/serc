@@ -696,6 +696,8 @@ pub(super) struct StatementContext {
     pub(super) follows_sync_with_nonterminal_join: bool,
     branch_join_successor: Option<TextRange>,
     copied_nested_handler_join_successor: bool,
+    // Whether the next statement evaluates a call expression in this suite.
+    followed_by_call_expression: bool,
     // Whether that successor is a direct loop break.
     followed_by_break: bool,
     // Whether that successor is a direct return of one local. CPython copies this tiny exit
@@ -2479,6 +2481,8 @@ impl<'source> Compiler<'source> {
                         && matches!(self.unit.scope, Scope::Function { .. })
                         && !self.control.statements.terminal_if_branch_has_siblings,
                     followed_by_break,
+                    followed_by_call_expression: matches!(body.get(index + 1),
+                        Some(Stmt::Expr(expression)) if matches!(expression.value.as_ref(), Expr::Call(_))),
                     followed_by_name_return,
                     followed_by_literal_return,
                     followed_by_global_attribute_return,
@@ -12818,7 +12822,21 @@ impl<'source> Compiler<'source> {
                     let optimized_empty_both = self.context.python_version
                         >= crate::PythonVersion::Py314
                         && branch_index == 0
-                        && !self.has_active_control_flow_region()
+                        && (!self.has_active_control_flow_region()
+                            || (self.unit.flags
+                                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                == 0
+                                && matches!(self.unit.scope, Scope::Function { .. })
+                                && self.control.loops.contexts.is_empty()
+                                && self.control.generators.generator_region_start.is_none()
+                                && self.control.withs.active_with_region_exclusions.is_empty()
+                                && self.control.exceptions.active_try_marker_slots.len() == 1
+                                && self.control.exceptions.active_exception_region_exclusions.len() == 1
+                                // A call expression survives optimization, so this try body
+                                // has a real successor after the original conditional join.
+                                && self.control.statements.context.followed_by_call_expression
+                                && self.control.exceptions.direct_try_body_statements.contains(&statement.range)
+                                && !direct_try_body_exit))
                         && !self.control.in_exception_handler()
                         && self.control.exceptions.active_exception_group_handlers == 0
                         && self.control.finally.active_finally_try_bodies == 0
