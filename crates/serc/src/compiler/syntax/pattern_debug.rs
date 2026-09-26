@@ -260,7 +260,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
     fn pattern_diagnostic(&mut self, diagnostic: CompileError) {
         if self.error.borrow().is_none() && self.bare_starred.is_none() {
             self.lowering_pattern_error = true;
-            *self.error.borrow_mut() = Some(diagnostic);
+            *self.error.borrow_mut() = Some(diagnostic.into());
         }
     }
 
