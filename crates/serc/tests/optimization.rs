@@ -960,6 +960,208 @@ fn optimized_empty_manager_bodies_match_cpython() {
 }
 
 #[test]
+fn protected_manager_multiple_passes_match_cpython() {
+    let versions = [PythonVersion::Py314, PythonVersion::Py315];
+    for source in [
+        r"def f(manager, other):
+    try:
+        with manager as value:
+            pass
+            pass
+            global marker
+    finally:
+        cleanup()
+    return value
+",
+        r"def f(manager, other):
+    try:
+        with manager as value:
+            pass
+            global marker
+            pass
+    finally:
+        cleanup()
+    return value
+",
+        r"def f(manager, other):
+    try:
+        with manager as value: pass; pass; global marker
+    finally:
+        cleanup()
+    return value
+",
+        r"def f(manager, other):
+    with other:
+        with manager as value: pass; pass; global marker
+    return value
+",
+        r"def f(manager, other):
+    try:
+        with manager as value:
+            pass
+            global marker
+            pass
+            global spare_marker
+    finally:
+        cleanup()
+    return value
+",
+        r"def f(manager, other):
+    try:
+        with manager as value:
+            pass
+            pass
+            pass
+    finally:
+        cleanup()
+    return value
+",
+        r"def f(manager, other):
+    try:
+        with manager:
+            pass
+            pass
+            global marker
+    finally:
+        cleanup()
+    return 42
+",
+        r"def f(manager, other):
+    try:
+        with manager: pass; pass; global marker
+    finally:
+        cleanup()
+    return 42
+",
+    ] {
+        assert_matches_cpython_versions(source, "case.py", &LEVELS, &versions);
+    }
+    for source in [
+        r"def f(manager, other):
+    try:
+        with manager as value:
+            pass
+            assert predicate()
+            pass
+            global marker
+    finally:
+        cleanup()
+    return value
+",
+        r"def f(manager, other):
+    try:
+        with manager:
+            pass
+            assert predicate()
+            pass
+            global marker
+    finally:
+        cleanup()
+    return 42
+",
+    ] {
+        assert_matches_cpython_versions(source, "case.py", &LEVELS[1..], &versions);
+    }
+}
+
+#[test]
+fn protected_manager_multiple_passes_with_nonlocal_match_cpython() {
+    let versions = [PythonVersion::Py314, PythonVersion::Py315];
+    for source in [
+        r"def outer(manager, other):
+    marker = 0
+    def inner():
+        try:
+            with manager:
+                pass
+                pass
+                nonlocal marker
+        finally:
+            cleanup()
+    return inner
+",
+        r"def outer(manager, other):
+    marker = 0
+    def inner():
+        try:
+            with manager as value:
+                pass
+                nonlocal marker
+                pass
+        finally:
+            cleanup()
+    return inner
+",
+        r"def outer(manager, other):
+    marker = 0
+    def inner():
+        try:
+            with manager: pass; pass; nonlocal marker
+        finally:
+            cleanup()
+    return inner
+",
+    ] {
+        assert_matches_cpython_versions(source, "case.py", &LEVELS, &versions);
+    }
+}
+
+#[test]
+fn manager_pass_before_declarations_keeps_tail_unprotected() {
+    let versions = [PythonVersion::Py314, PythonVersion::Py315];
+    for source in [
+        r"def f(manager, other):
+    with manager as value:
+        global marker
+        pass
+        global spare_marker
+    return value
+",
+        r"def f(manager, other):
+    with manager as value:
+        pass
+        pass
+        global marker
+    return value
+",
+        r"def f(manager, other):
+    with other:
+        with manager as value:
+            pass
+            pass
+            global marker
+    return value
+",
+        r"def outer():
+    captured = 1
+    def f(manager, other):
+        with manager as value:
+            pass
+            pass
+            nonlocal captured
+        return value
+    return f
+",
+        r"def f(manager, other):
+    with manager:
+        global marker
+        pass
+        global spare_marker
+    return 42
+",
+        r"def f(manager, other):
+    with manager:
+        pass
+        pass
+        global marker
+    return 42
+",
+    ] {
+        assert_matches_cpython_versions(source, "case.py", &LEVELS, &versions);
+    }
+}
+
+#[test]
 fn modern_manager_pass_before_declarations_matches_cpython() {
     let versions = [PythonVersion::Py314, PythonVersion::Py315];
     for source in [

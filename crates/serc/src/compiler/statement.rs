@@ -1637,6 +1637,28 @@ impl<'source> Compiler<'source> {
         let mut pending_sync_with_return_join_after_gap = false;
         let mut pending_sync_with_nonterminal_join = false;
         let mut seen_sync_with_return = false;
+        let direct_manager_pass_suite = self.context.python_version >= crate::PythonVersion::Py314
+            && self
+                .control
+                .withs
+                .active_with_exits
+                .last()
+                .is_some_and(|manager| {
+                    !manager.is_async
+                        && manager.terminal_statement_range == body.last().map(Ranged::range)
+                })
+            && body.iter().all(|statement| {
+                matches!(
+                    statement,
+                    Stmt::Pass(_) | Stmt::Global(_) | Stmt::Nonlocal(_)
+                )
+            });
+        let protected_direct_manager_pass_suite = direct_manager_pass_suite
+            && !self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty();
         for (index, statement) in body.iter().enumerate() {
             if track_sync_with_return_joins
                 && let Some(previous) = index.checked_sub(1).and_then(|index| body.get(index))
@@ -1950,6 +1972,10 @@ impl<'source> Compiler<'source> {
                             !manager.is_async
                                 && manager.terminal_statement_range == Some(statement.range)
                         }))
+                    // Earlier authored passes in a direct manager suite remain in
+                    // its protected region when another pass follows them.
+                    || (protected_direct_manager_pass_suite
+                        && body[index + 1..].iter().any(|statement| matches!(statement, Stmt::Pass(_))))
                     // Legacy exits start unlocated. Keep an authored trailing Pass
                     // after work or a join until CFG copying and line propagation,
                     // rather than replacing its donor with the preceding instruction.
@@ -1972,7 +1998,11 @@ impl<'source> Compiler<'source> {
                     .set_location(self.source_location(statement.range));
                 // A pass stays in its authored block, including before an implicit return.
                 // Context-manager exits retain the existing marker boundaries.
-                let noop_start = (is_final
+                let direct_manager_pass_tail = direct_manager_pass_suite
+                    && body[index + 1..]
+                        .iter()
+                        .all(|statement| matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_)));
+                let noop_start = ((is_final || direct_manager_pass_tail)
                     && !protected_async_with_pass
                     && !self.control.withs.active_with_region_exclusions.is_empty())
                 .then(|| {
@@ -1985,15 +2015,16 @@ impl<'source> Compiler<'source> {
                 if let Some(noop_start) = noop_start {
                     let noop_end = self.assembler.label();
                     self.assembler.mark(noop_end);
-                    if self
-                        .control
-                        .withs
-                        .active_with_exits
-                        .last()
-                        .is_some_and(|context| {
-                            !context.is_async
-                                && context.terminal_statement_range == Some(statement.range)
-                        })
+                    if direct_manager_pass_tail
+                        || self
+                            .control
+                            .withs
+                            .active_with_exits
+                            .last()
+                            .is_some_and(|context| {
+                                !context.is_async
+                                    && context.terminal_statement_range == Some(statement.range)
+                            })
                     {
                         // Only the direct synchronous body tail donates its line to the
                         // following ownerless POP_BLOCK. A nested suite's Pass retains
@@ -30598,6 +30629,30 @@ impl<'source> Compiler<'source> {
                         .is_some_and(|last| last.line == previous.line)
             }) && self.take_trailing_nop_location().is_some();
             if !trailing_nop_is_covered
+                && self.context.python_version >= crate::PythonVersion::Py314
+                && body.iter().all(|statement| {
+                    matches!(
+                        statement,
+                        Stmt::Pass(_) | Stmt::Global(_) | Stmt::Nonlocal(_)
+                    )
+                })
+                && body
+                    .iter()
+                    .filter(|statement| matches!(statement, Stmt::Pass(_)))
+                    .count()
+                    > 1
+                && self.assembler.instruction_count() > body_start
+                && let Some(Stmt::Pass(pass)) = body
+                    .iter()
+                    .rev()
+                    .find(|statement| matches!(statement, Stmt::Pass(_)))
+                && self.assembler.last_instruction_location()
+                    != Some(self.source_location(pass.range))
+                && body_previous_location
+                    .is_none_or(|previous| previous.line != self.source_location(pass.range).line)
+            {
+                body_noop = Some(WithBodyExitNoop::Located(pass.range));
+            } else if !trailing_nop_is_covered
                 && self.assembler.instruction_count() == body_start
                 && let Some(statement) =
                     with_body_fallback_statement(body, self.context.python_version)
