@@ -2078,9 +2078,6 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             }
             Kind::WriteToDebug(WriteToDebugKind::Store) => "cannot assign to __debug__".to_owned(),
             Kind::WriteToDebug(WriteToDebugKind::Delete(_)) => "cannot delete __debug__".to_owned(),
-            Kind::LateFutureImport if self.numeric_symbol_replay => {
-                "from __future__ imports must occur at the beginning of the file".to_owned()
-            }
             Kind::BreakOutsideLoop => "'break' outside loop".to_owned(),
             Kind::ContinueOutsideLoop => "'continue' not properly in loop".to_owned(),
             Kind::ReturnOutsideFunction => "'return' outside function".to_owned(),
