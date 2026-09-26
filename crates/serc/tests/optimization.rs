@@ -1998,6 +1998,30 @@ fn elided_non_ascii_identifier_preserves_discarded_builders() {
 }
 
 #[test]
+fn elided_assertions_after_terminal_comprehension_branches_match_cpython() {
+    for source in [
+        "def f(x, y, z, cm):\n    if x:\n        a = [i for i in y]\n    assert x\n",
+        "def f(x, y, z, cm):\n    if x:\n        a = {i for i in y}\n    assert x\n",
+        "def f(x, y, z, cm):\n    if x:\n        a = {i: i for i in y}\n    assert x\n",
+        "def f(x, y, z, cm):\n    if x:\n        a = [(i, j) for i in y if i for j in y if j]\n    assert x\n",
+        "def f(x, y, z, cm):\n    if x:\n        a = [(b := i) for i in y]\n    assert x\n",
+        "def f(x, y, z, cm):\n    if x:\n        work()\n    else:\n        a = [i for i in y]\n    assert x\n",
+        "def f(x, y, z, cm):\n    if x:\n        a = [i for i in y]\n    elif z:\n        a = {i for i in y}\n    else:\n        a = {i:i for i in y}\n    assert x\n",
+        "def f(x, y, z, cm):\n    if x or z:\n        assert z\n    else:\n        a = [i for i in y]\n    assert x\n",
+        "def f(x, y, z, cm):\n    if x:\n        a = [i for i in y]\n    else:\n        return x\n    assert x\n",
+        "def f(x, y, z, cm):\n    if x:\n        a = [i for i in y]\n    else:\n        raise ValueError()\n    assert x\n",
+        "def f(x, y):\n    global a\n    if x:\n        a = [i for i in y]\n    assert x\n",
+        "def outer():\n    a = None\n    def f(x, y):\n        nonlocal a\n        if x:\n            a = [i for i in y]\n        assert x\n    return f\n",
+        "def f(x, y, z, cm):\n    if x:\n        a, b = [i for i in y]\n    assert x\n",
+        "def f(x, y, z, cm):\n    if 1 < x < z:\n        a = [i for i in y]\n    else:\n        pass\n    assert x\n",
+        "def f(x, y, z, cm):\n    try:\n        if x:\n            a = [i for i in y]\n        assert x\n    finally:\n        work()\n",
+        "def f(x, y, z, cm):\n    with cm:\n        if x:\n            a = [i for i in y]\n        assert x\n",
+    ] {
+        assert_matches_cpython(source, "sub/terminal_comp_assert.py", &LEVELS);
+    }
+}
+
+#[test]
 fn elided_assertions_preserve_terminal_branch_comprehension_returns() {
     for source in [
         r"def f(flag, xs):
