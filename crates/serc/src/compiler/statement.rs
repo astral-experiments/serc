@@ -37257,7 +37257,7 @@ fn suite_unary_not_fallthrough_range(body: &[Stmt]) -> Option<TextRange> {
     }
 }
 
-// Short-circuit and negated assertions can still defer the comprehension's
+// Short-circuit, negated, and comparison assertions can still defer the comprehension's
 // restoration into a cold block, even though the comprehension is not the root test.
 fn assertion_defers_async_comprehension_restore(expression: &Expr) -> bool {
     match expression {
@@ -37268,6 +37268,10 @@ fn assertion_defers_async_comprehension_restore(expression: &Expr) -> bool {
         Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => {
             assertion_defers_async_comprehension_restore(&unary.operand)
         }
+        Expr::Compare(comparison) => comparison.operands.iter().any(|operand| match operand {
+            Expr::Compare(_) => assertion_defers_async_comprehension_restore(operand),
+            _ => super::expression::expression_defers_async_comprehension_restore(operand),
+        }),
         _ => super::expression::expression_defers_async_comprehension_restore(expression),
     }
 }
