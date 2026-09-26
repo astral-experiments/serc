@@ -1300,6 +1300,77 @@ fn manager_pass_before_declarations_keeps_tail_unprotected() {
 }
 
 #[test]
+fn legacy_protected_manager_multiple_passes_match_cpython() {
+    let versions = [PythonVersion::Py312, PythonVersion::Py313];
+    for source in [
+        r"def f(manager, other):
+    try:
+        with manager as value:
+            pass
+            pass
+            global marker
+    finally:
+        cleanup()
+    return value
+",
+        r"def f(manager, other):
+    try:
+        with manager as value:
+            pass
+            global marker
+            pass
+    finally:
+        cleanup()
+    return value
+",
+        r"def f(manager, other):
+    try:
+        with manager as value:
+            pass
+            pass
+    finally:
+        cleanup()
+    return value
+",
+        r"def f(manager, other):
+    try:
+        with manager as value:
+            pass
+            global marker
+            pass
+            global spare_marker
+    finally:
+        cleanup()
+    return value
+",
+        r"def f(manager, other):
+    try:
+        with manager:
+            pass
+            pass
+            global marker
+    finally:
+        cleanup()
+    return 42
+",
+        r"def outer(manager, other):
+    marker = 0
+    def inner():
+        try:
+            with manager as value:
+                pass
+                pass
+                nonlocal marker
+        finally:
+            cleanup()
+    return inner
+",
+    ] {
+        assert_matches_cpython_versions(source, "case.py", &LEVELS, &versions);
+    }
+}
+
+#[test]
 fn modern_manager_pass_before_declarations_matches_cpython() {
     let versions = [PythonVersion::Py314, PythonVersion::Py315];
     for source in [

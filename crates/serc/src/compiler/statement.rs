@@ -1639,9 +1639,8 @@ impl<'source> Compiler<'source> {
         let mut pending_sync_with_return_join_after_gap = false;
         let mut pending_sync_with_nonterminal_join = false;
         let mut seen_sync_with_return = false;
-        let direct_manager_pass_suite = self.context.python_version >= crate::PythonVersion::Py314
-            && self
-                .control
+        let direct_manager_pass_suite =
+            self.control
                 .withs
                 .active_with_exits
                 .last()
@@ -1649,12 +1648,12 @@ impl<'source> Compiler<'source> {
                     !manager.is_async
                         && manager.terminal_statement_range == body.last().map(Ranged::range)
                 })
-            && body.iter().all(|statement| {
-                matches!(
-                    statement,
-                    Stmt::Pass(_) | Stmt::Global(_) | Stmt::Nonlocal(_)
-                )
-            });
+                && body.iter().all(|statement| {
+                    matches!(
+                        statement,
+                        Stmt::Pass(_) | Stmt::Global(_) | Stmt::Nonlocal(_)
+                    )
+                });
         let protected_direct_manager_pass_suite = direct_manager_pass_suite
             && !self
                 .control
@@ -2013,7 +2012,9 @@ impl<'source> Compiler<'source> {
                     .set_location(self.source_location(statement.range));
                 // A pass stays in its authored block, including before an implicit return.
                 // Context-manager exits retain the existing marker boundaries.
-                let direct_manager_pass_tail = direct_manager_pass_suite
+                let direct_manager_pass_tail = self.context.python_version
+                    >= crate::PythonVersion::Py314
+                    && direct_manager_pass_suite
                     && body[index + 1..]
                         .iter()
                         .all(|statement| matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_)));
@@ -30659,8 +30660,25 @@ impl<'source> Compiler<'source> {
                         .last_instruction_location()
                         .is_some_and(|last| last.line == previous.line)
             }) && self.take_trailing_nop_location().is_some();
+            let legacy_protected_sync_manager_body = self.context.python_version
+                <= crate::PythonVersion::Py313
+                && !self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self
+                    .control
+                    .withs
+                    .active_with_exits
+                    .last()
+                    .is_some_and(|manager| {
+                        !manager.is_async
+                            && manager.terminal_statement_range == body.last().map(Ranged::range)
+                    });
             if !trailing_nop_is_covered
-                && self.context.python_version >= crate::PythonVersion::Py314
+                && (self.context.python_version >= crate::PythonVersion::Py314
+                    || legacy_protected_sync_manager_body)
                 && body.iter().all(|statement| {
                     matches!(
                         statement,
