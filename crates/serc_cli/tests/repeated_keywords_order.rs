@@ -101,10 +101,17 @@ except SyntaxError as error:
                 PythonVersion::Py315 => common::python_315_command(),
             };
             let native = python.args(["-c", oracle, source]).output().unwrap();
-            assert!(!native.status.success(), "{version}: {source:?}: {native:?}");
+            assert!(
+                !native.status.success(),
+                "{version}: {source:?}: {native:?}"
+            );
             let stdout = String::from_utf8(native.stdout).unwrap();
             let mut lines = stdout.lines();
-            assert_eq!(lines.next(), Some(expected_message), "{version}: {source:?}");
+            assert_eq!(
+                lines.next(),
+                Some(expected_message),
+                "{version}: {source:?}"
+            );
             let positions: Vec<usize> = lines
                 .next()
                 .unwrap()
@@ -130,7 +137,11 @@ except SyntaxError as error:
                 panic!("unexpected {version} error for {source:?}: {error}");
             };
             assert_eq!(message, expected_message, "{version}: {source:?}");
-            assert_eq!(range.start().to_usize(), native_start, "{version}: {source:?}");
+            assert_eq!(
+                range.start().to_usize(),
+                native_start,
+                "{version}: {source:?}"
+            );
             assert_eq!(range.end().to_usize(), native_end, "{version}: {source:?}");
         }
     }
