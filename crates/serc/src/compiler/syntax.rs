@@ -1403,6 +1403,16 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                 }
             }
         }
+        // Lambda defaults execute in the enclosing scope before its parameters are checked.
+        if self.comprehension_yield_operand
+            && let Expr::Lambda(lambda) = expression
+            && let Some(parameters) = &lambda.parameters
+        {
+            walk_parameters(self, parameters);
+            if self.error.borrow().is_some() {
+                return;
+            }
+        }
         let check_expression = match expression {
             // These are the only remaining variants checked by the pinned Ruff visitor. Its
             // tuple/list check applies only to assignment targets; a lambda without parameters
@@ -1468,7 +1478,11 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
         match expression {
             Expr::Lambda(lambda) => {
                 if let Some(parameters) = &lambda.parameters {
-                    self.visit_parameters(parameters);
+                    if self.comprehension_yield_operand {
+                        self.validate_private_parameters(parameters);
+                    } else {
+                        self.visit_parameters(parameters);
+                    }
                 }
                 self.with_scope(
                     ScopeKind::Function {
@@ -1478,6 +1492,17 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                     },
                     |visitor| visitor.visit_expr(&lambda.body),
                 );
+            }
+            Expr::Dict(dict) if self.comprehension_yield_operand => {
+                // The symbol table visits all dictionary keys before any values.
+                for item in &dict.items {
+                    if let Some(key) = &item.key {
+                        self.visit_expr(key);
+                    }
+                }
+                for item in &dict.items {
+                    self.visit_expr(&item.value);
+                }
             }
             Expr::ListComp(ast::ExprListComp {
                 elt, generators, ..

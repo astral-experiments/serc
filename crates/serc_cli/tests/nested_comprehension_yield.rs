@@ -1,6 +1,6 @@
 mod common;
 
-use serc::{CompileOptions, PythonVersion, compile_bytes_with_options, compile_with_options};
+use serc::{CompileError, CompileOptions, PythonVersion, compile_bytes_with_options, compile_with_options};
 
 fn byte_offset(source: &str, line: usize, column: usize) -> usize {
     let prefix: usize = source.split_inclusive('\n').take(line - 1).map(str::len).sum();
@@ -23,6 +23,9 @@ fn nested_comprehension_yields_match_python() {
         "def f():\n    return [(yield [y for y in (yield x)]) for x in xs]\n",
         "def f():\n    return [(yield {(yield y) for y in ys}) for x in xs]\n",
         "def f():\n    return [(yield {(yield k):(yield v) for k in ks}) for x in xs]\n",
+        "def f():\n    return [(yield {0: (yield a), (yield b): 0}) for x in xs]\n",
+        "def f():\n    return [(yield {(yield a): 0, 1: (yield b)}) for x in xs]\n",
+        "def f():\n    return [(yield (lambda a=(yield x), a=1: 0)) for x in xs]\n",
         "def f():\n    return [x for x in xs if (yield (yield x))]\n",
         "def f():\n    return [y for x in xs for y in (yield (yield x))]\n",
         "def f():\n    return [(yield ((await x), (yield y))) for x in xs]\n",
@@ -39,7 +42,7 @@ fn nested_comprehension_yields_match_python() {
         "def f():\n    return [(yield (__debug__ := (yield x))) for x in xs]\n",
         "def f():\n    return [(yield (__debug__ := 1)) for x in xs]\n",
         "def f():\n    return [(yield (yield μ)) for x in xs]\n",
-        "async def f():\n    return [(yield from (yield x)) for x in xs]\n",
+        "async def f():\n    value = [(yield from (yield x)) for x in xs]\n",
     ];
     let oracle = r"
 import sys
@@ -76,7 +79,10 @@ print(*expected[1:])
             let expected = (byte_offset(source, positions[0], positions[1]), byte_offset(source, positions[2], positions[3]));
             for result in [compile_with_options(source, "case.py", &options), compile_bytes_with_options(source.as_bytes(), "case.py", &options)] {
                 let error = result.unwrap_err();
-                assert!(error.to_string().ends_with(message), "{version}: {source:?}: {message:?} != {error}");
+                let CompileError::InvalidSyntax { message: actual_message, .. } = &error else {
+                    panic!("{version}: {source:?}: expected a syntax restriction, got {error}");
+                };
+                assert_eq!(actual_message, message, "{version}: {source:?}");
                 let range = error.range().unwrap();
                 assert_eq!((range.start().to_usize(), range.end().to_usize()), expected, "{version}: {source:?}: {error}");
             }
