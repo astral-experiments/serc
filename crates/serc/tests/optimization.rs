@@ -171,6 +171,43 @@ fn terminal_try_pass_preserves_implicit_return_location() {
 }
 
 #[test]
+fn terminal_try_consecutive_passes_preserve_locations() {
+    for source in [
+        "def f(x):\n    try:\n        x = x + 1\n        pass\n        pass\n    except ValueError:\n        recover()\n",
+        "def f(x):\n    try:\n        consume(\n            x,\n        ); pass; pass\n    except ValueError:\n        recover()\n",
+        "def f(x):\n    try:\n        x = x + 1\n        pass; pass\n    except ValueError:\n        recover()\n",
+        "def f(x):\n    try:\n        x = x + 1\n        pass\n        pass\n        pass\n    except ValueError:\n        recover()\n",
+        "def f(x):\n    try:\n        x = x + 1\n        pass; pass\n        pass\n    except ValueError:\n        recover()\n",
+        "def f(x):\n    try: pass; pass\n    except ValueError: recover()\n",
+        "def f(x):\n    try:\n        try:\n            consume(x)\n        finally:\n            pass\n        pass\n        pass\n    except ValueError:\n        recover()\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "terminal_try_consecutive_passes.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+
+    for source in [
+        "def f(x):\n    try:\n        consume(x); pass; pass\n    except ValueError:\n        recover()\n",
+        "def f(xs, flag):\n    try:\n        z = [v for v in xs] if flag else []\n        pass\n        pass\n        pass\n    except ValueError:\n        recover()\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "terminal_try_consecutive_passes_modern.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn terminal_conditional_comprehension_pass_keeps_return_location() {
     for source in [
         "def f(xs, flag):\n    try:\n        z = [v for v in xs] if flag else []\n        pass\n    except ValueError:\n        recover()\n",

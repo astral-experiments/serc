@@ -21276,6 +21276,24 @@ impl<'source> Compiler<'source> {
                         matches!(expression.value.as_ref(), Expr::Call(_))
                             && !expression_contains_inline_branch(&expression.value)
                     }
+                    Stmt::Pass(_) => {
+                        // A Pass on the preceding statement's line needs separate
+                        // NOP compaction before a later-line return can inherit its span.
+                        let first_pass = statement
+                            .body
+                            .iter()
+                            .rposition(|statement| !matches!(statement, Stmt::Pass(_)))
+                            .map_or(0, |index| index + 1);
+                        let first_line = self
+                            .source_location(statement.body[first_pass].range())
+                            .line;
+                        first_line == self.source_location(pass.range).line
+                            || first_pass == 0
+                            || self
+                                .source_location(statement.body[first_pass - 1].range())
+                                .end_line
+                                != first_line
+                    }
                     _ => false,
                 }
             {
