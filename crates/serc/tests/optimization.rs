@@ -523,3 +523,18 @@ fn optimized_deep_expression_traversal_and_cleanup() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn nonterminal_pass_finally_preserves_handler_for_all_targets() {
+    for (function, trailer) in [
+        ("def", ""),
+        ("async def", ""),
+        ("def", "    yield 1\n"),
+        ("async def", "    yield 1\n"),
+    ] {
+        let source = format!(
+            "{function} f():\n    try:\n        try:\n            work()\n        finally:\n            pass\n        after()\n    except:\n        recover()\n{trailer}"
+        );
+        assert_matches_cpython(&source, "nonterminal_pass_finally.py", &LEVELS);
+    }
+}
