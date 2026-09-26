@@ -933,6 +933,9 @@ fn capture_compiler(compile: impl FnOnce() -> Result<Vec<u8>, CompileError>) -> 
         }
         Ok(Err(CompileError::Unsupported(message))) => CompilerOutcome::Unsupported(message),
         Ok(Err(CompileError::Parse(error))) => CompilerOutcome::Rejected(error.to_string()),
+        Ok(Err(CompileError::ParseDiagnostic { message, .. })) => {
+            CompilerOutcome::Rejected(message.to_owned())
+        }
         Ok(Err(
             CompileError::InvalidPattern { message, .. }
             | CompileError::InvalidSyntax { message, .. }

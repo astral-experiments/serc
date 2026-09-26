@@ -11,6 +11,7 @@ mod config;
 mod delimiter_nesting;
 mod initial_intern_state;
 mod marshal;
+mod parse_diagnostic;
 mod source;
 mod stack;
 mod target;
@@ -159,6 +160,13 @@ pub enum CompileError {
     Decode(SourceDecodeError),
     /// Ruff rejected the Python source.
     Parse(ruff_python_parser::ParseError),
+    /// Ruff rejected the source and a target-specific diagnostic is available.
+    ParseDiagnostic {
+        /// The underlying parser error, including its original kind and range.
+        error: ruff_python_parser::ParseError,
+        /// The target-specific diagnostic.
+        message: &'static str,
+    },
     /// A pattern violates Python's semantic restrictions.
     InvalidPattern {
         /// The restriction violated by the pattern.
@@ -195,7 +203,7 @@ impl CompileError {
     /// Return the byte range associated with this error, if available.
     pub fn range(&self) -> Option<TextRange> {
         match self {
-            Self::Parse(error) => Some(error.location),
+            Self::Parse(error) | Self::ParseDiagnostic { error, .. } => Some(error.location),
             Self::InvalidPattern { range, .. }
             | Self::InvalidSyntax { range, .. }
             | Self::InvalidDocstring { range, .. } => Some(*range),
@@ -221,6 +229,11 @@ impl fmt::Display for CompileError {
             Self::InvalidFilename => formatter.write_str("embedded null character"),
             Self::Decode(error) => write!(formatter, "failed to decode Python source: {error}"),
             Self::Parse(error) => write!(formatter, "failed to parse Python source: {error}"),
+            Self::ParseDiagnostic { error, message } => write!(
+                formatter,
+                "failed to parse Python source: {message} at byte range {:?}",
+                error.location
+            ),
             Self::InvalidPattern { message, .. } | Self::InvalidSyntax { message, .. } => {
                 write!(formatter, "failed to parse Python source: {message}")
             }
@@ -238,7 +251,7 @@ impl Error for CompileError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Decode(error) => Some(error),
-            Self::Parse(error) => Some(error),
+            Self::Parse(error) | Self::ParseDiagnostic { error, .. } => Some(error),
             Self::InvalidFilename
             | Self::InvalidPattern { .. }
             | Self::InvalidSyntax { .. }
@@ -496,6 +509,24 @@ fn compile_normalized(
     let parsed = ParsedModule(Some(parsed));
     let parsed = parsed.0.as_ref().expect("parsed module is present");
     if let Some(error) = parsed.errors().first() {
+        if parsed.errors()[1..].iter().all(|later| {
+            matches!(
+                later.error,
+                ruff_python_parser::ParseErrorType::InvalidNamedAssignmentTarget
+            )
+        }) && matches!(
+            error.error,
+            ruff_python_parser::ParseErrorType::InvalidNamedAssignmentTarget
+        ) && parse_diagnostic::is_attribute_assignment_target(
+            parsed.suite(),
+            parsed.tokens(),
+            error.location,
+        ) {
+            return Err(CompileError::ParseDiagnostic {
+                error: error.clone(),
+                message: "cannot use assignment expressions with attribute",
+            });
+        }
         return Err(CompileError::Parse(error.clone()));
     }
     if let Some(error) = parsed.unsupported_syntax_errors().first() {
