@@ -1370,6 +1370,25 @@ impl Assembler {
                     && !ends_scope(previous.opcode))
     }
 
+    /// Records an intact module annotation setup followed by its same-line condition NOP.
+    pub(crate) fn record_module_annotation_nop(&mut self, name: u32, statement: SourceLocation) {
+        let [.., Item::Instruction(previous), Item::Instruction(nop)] = self.linear_items() else {
+            return;
+        };
+        if previous.opcode == crate::target::opcodes::STORE_NAME
+            && previous.operand() == Operand::Value(name)
+            && previous.location == statement
+            && previous.location.line >= 0
+            && nop.opcode == NOP
+            && nop.location.line == previous.location.line
+        {
+            let pair = (*previous, *nop);
+            self.exception_owner_provenance
+                .module_annotation_nop_pairs
+                .push(pair);
+        }
+    }
+
     fn last_instruction_mut(&mut self) -> Option<&mut Instruction> {
         let index = self
             .linear_items()

@@ -11041,6 +11041,14 @@ impl<'source> Compiler<'source> {
             if !truthiness {
                 self.assembler.mark_last_borrow_fallthrough_barrier();
             }
+            if matches!(self.unit.scope, Scope::Module)
+                && self.has_deferred_annotations()
+                && self.context.module_plan().has_annotations
+            {
+                let name = self.name_index("__conditional_annotations__")?;
+                let location = self.source_location(statement.range);
+                self.assembler.record_module_annotation_nop(name, location);
+            }
             // Constant folding retains the selected suite's original CFG entry.
             let selected = self.assembler.label();
             self.assembler
