@@ -4,6 +4,7 @@ use std::cmp::Reverse;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
+use super::block_graph::BasicBlockId;
 use super::{
     Instruction, Item, Label, LayoutAssembler, NormalizedExceptionOwner, Operand, SourceLocation,
 };
@@ -27,6 +28,10 @@ thread_local! {
 pub(super) struct ExceptionOwnerProvenance {
     // The first folded condition can share the module annotation setup's source line.
     pub(super) module_annotation_nop_pairs: Vec<(Instruction, Instruction)>,
+    // The same setup can precede a folded negated condition's original jump.
+    pub(super) module_annotation_jump_pairs: Vec<(Instruction, Instruction)>,
+    // Original block, setup and jump-derived NOP after an actual redundant-jump conversion.
+    pub(super) module_annotation_jump_nops: Vec<(BasicBlockId, Instruction, Instruction)>,
     pub(super) setups: Vec<(Label, Option<SourceLocation>)>,
     // Authored ordinary-try SETUP and its original handler, independently of split ranges.
     pub(super) ordinary_try_setups: FxHashMap<Label, Label>,

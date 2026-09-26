@@ -68,6 +68,112 @@ impl std::ops::Index<&Label> for ThreadLabelOffsets {
     }
 }
 
+// The original pair is tagged before copying passes; physical copies retire that tag.
+// Also reject duplicate tagged pairs so an ambiguous graph cannot certify a donor.
+fn unique_module_annotation_pair(
+    graph: &BlockGraph,
+    donor: Instruction,
+    next: Instruction,
+) -> bool {
+    if !donor.is_original_annotation_jump() || !next.is_original_annotation_jump() {
+        return false;
+    }
+    let mut found = false;
+    for &block in graph.order() {
+        for pair in graph[block].items().windows(2) {
+            if matches!(pair, [Item::Instruction(first), Item::Instruction(second)]
+                if *first == donor && *second == next)
+            {
+                if found {
+                    return false;
+                }
+                found = true;
+            }
+        }
+    }
+    found
+}
+
+// Bind a converted jump to its original block and its surviving adjacent donor.
+// A label between the two is an alternate entry and cannot carry the donor's line.
+fn certified_module_annotation_jump_nop(
+    graph: &BlockGraph,
+    certificates: &[(BasicBlockId, Instruction, Instruction)],
+    previous: Option<ItemPosition>,
+    position: ItemPosition,
+) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    if previous.block() != position.block() || previous.offset() + 1 != position.offset() {
+        return false;
+    }
+    let (Item::Instruction(donor), Item::Instruction(nop)) =
+        (graph.item(previous), graph.item(position))
+    else {
+        return false;
+    };
+    certificates.contains(&(position.block(), *donor, *nop))
+        && unique_module_annotation_pair(graph, *donor, *nop)
+}
+
+// Revalidate a marked borrow boundary against its original block before flattening.
+// The marker remains a barrier through borrowed-load analysis.
+pub(super) fn surviving_module_annotation_borrow_markers(
+    graph: &BlockGraph,
+    certificates: &[(BasicBlockId, Instruction, Instruction)],
+) -> Vec<(Instruction, Instruction)> {
+    let mut markers = Vec::new();
+    for &(block, donor, mut marker) in certificates {
+        if !graph.order().contains(&block)
+            || marker.opcode != NOP
+            || marker.no_location_policy.borrow_fallthrough() != BorrowFallthrough::Barrier
+            || !marker.jump_policy.always_retains_nop()
+        {
+            continue;
+        }
+        marker.jump_policy.mark_borrow_empty_block();
+        if graph[block].items().windows(2).any(|pair| {
+            matches!(pair, [Item::Instruction(first), Item::Instruction(second)]
+                if *first == donor && *second == marker)
+        }) && unique_module_annotation_pair(graph, donor, marker)
+        {
+            markers.push((donor, marker));
+        }
+    }
+    markers
+}
+
+// After borrowed-load analysis, retire only the surviving uniquely certified marker.
+// Recheck adjacency and uniqueness because linearization may have inserted labels.
+pub(super) fn retire_module_annotation_borrow_markers(
+    items: &mut [Item],
+    markers: &[(Instruction, Instruction)],
+) {
+    for &(donor, marker) in markers {
+        if !donor.is_original_annotation_jump() || !marker.is_original_annotation_jump() {
+            continue;
+        }
+        let mut matches = items.windows(2).enumerate().filter_map(|(index, pair)| {
+            matches!(pair, [Item::Instruction(first), Item::Instruction(second)]
+                if *first == donor && *second == marker)
+            .then_some(index + 1)
+        });
+        let Some(index) = matches.next() else {
+            continue;
+        };
+        if matches.next().is_some() {
+            continue;
+        }
+        let Item::Instruction(instruction) = &mut items[index] else {
+            unreachable!("certified marker is an instruction");
+        };
+        instruction
+            .no_location_policy
+            .set_borrow_fallthrough(BorrowFallthrough::BarrierIfRemoved);
+    }
+}
+
 /// Replaces the earlier of two same-line stores to the same local with a stack pop.
 pub(super) fn optimize_redundant_store_pair(first: &mut Instruction, second: &Instruction) -> bool {
     if first.opcode == STORE_FAST
@@ -5141,6 +5247,36 @@ impl OptimizationPipeline {
                                         && graph[block].items()[..offset]
                                             .contains(&Item::Label(*entry))
                                 });
+                        let module_annotation_donor = (!finalize_borrow_empty_blocks
+                            && !crossed_located_folded_marker
+                            && !crossed_other_located_marker
+                            && !crosses_exception_boundary
+                            && !crosses_removed_line_event
+                            && !preserves_original_fallthrough_nop
+                            && !preserves_compound_fallthrough_nop
+                            && !preserves_copied_finally_break_nop
+                            && !ownerless_compound_exit)
+                            .then_some(previous)
+                            .flatten()
+                            .filter(|previous| {
+                                previous.block() == block && previous.offset() + 1 == offset
+                            })
+                            .and_then(|previous| match graph.item(previous) {
+                                Item::Instruction(donor)
+                                    if self
+                                        .exception_owner_provenance
+                                        .module_annotation_jump_pairs
+                                        .contains(&(*donor, instruction))
+                                        && unique_module_annotation_pair(
+                                            graph,
+                                            *donor,
+                                            instruction,
+                                        ) =>
+                                {
+                                    Some(*donor)
+                                }
+                                _ => None,
+                            });
                         let instruction = graph.instruction_mut(position).unwrap();
                         instruction.opcode = NOP;
                         instruction.set_operand(Operand::Value(0));
@@ -5166,6 +5302,11 @@ impl OptimizationPipeline {
                             // Only this unchanged original jump survived as the normal-exit NOP.
                             // Copied, retargeted, and still-live exits retain their own owners.
                             instruction.set_exception_owner(NormalizedExceptionOwner::Absent);
+                        }
+                        if let Some(donor) = module_annotation_donor {
+                            self.exception_owner_provenance
+                                .module_annotation_jump_nops
+                                .push((block, donor, *instruction));
                         }
                         previous = Some(position);
                     }
@@ -5917,6 +6058,12 @@ impl OptimizationPipeline {
                         .module_annotation_nop_pairs
                         .contains(&(*previous, *instruction))
                 });
+            let module_annotation_jump_predecessor = certified_module_annotation_jump_nop(
+                graph,
+                &self.exception_owner_provenance.module_annotation_jump_nops,
+                previous_position,
+                position,
+            );
             let remove = instruction.opcode == NOP
                 && (!with_exits_only
                     || (instruction.fusion_policy.is_converted_pop_block()
@@ -5947,6 +6094,7 @@ impl OptimizationPipeline {
                         }))
                     || setup_nop_predecessor
                     || module_annotation_predecessor
+                    || module_annotation_jump_predecessor
                     || (constant_pass_predecessors.get(&position).is_some_and(|expected| {
                         previous_position == Some(*expected)
                     }) && previous.is_some_and(|previous: &Instruction| {
@@ -6824,6 +6972,186 @@ mod tests {
                 expected.then_some(&shared),
             );
         }
+    }
+
+    #[test]
+    fn annotation_jump_certificate_rejects_mutation_labels_and_copies() {
+        use crate::target::opcodes::STORE_NAME;
+
+        let entry = Label::from_u32(0);
+        let other = Label::from_u32(1);
+        let alternate = Label::from_u32(2);
+        let location = SourceLocation::new(1, 1, 0, 3);
+        let mut donor = Instruction::new(STORE_NAME, Operand::Value(0), location, None);
+        let mut nop = Instruction::new(NOP, Operand::Value(0), location, None);
+        donor.mark_original_annotation_jump();
+        nop.mark_original_annotation_jump();
+        let graph_for = |items| BlockGraph::from_items(items, &[other].into_iter().collect());
+        let original_items = || {
+            vec![
+                Item::Label(entry),
+                Item::Instruction(donor),
+                Item::Instruction(nop),
+            ]
+        };
+        let graph = graph_for(original_items());
+        let block = graph.label_block(entry).unwrap();
+        let donor_position = ItemPosition::new(block, 1);
+        let nop_position = ItemPosition::new(block, 2);
+        let certificates = [(block, donor, nop)];
+        let matches = |graph: &BlockGraph, previous, position| {
+            certified_module_annotation_jump_nop(graph, &certificates, previous, position)
+        };
+        assert!(matches(&graph, Some(donor_position), nop_position));
+        assert!(!matches(&graph, None, nop_position));
+
+        let mut mutated_donor = graph.clone();
+        mutated_donor
+            .instruction_mut(donor_position)
+            .unwrap()
+            .set_operand(Operand::Value(1));
+        assert!(!matches(&mutated_donor, Some(donor_position), nop_position));
+        let mut mutated_nop = graph.clone();
+        mutated_nop.instruction_mut(nop_position).unwrap().location = SourceLocation::NONE;
+        assert!(!matches(&mutated_nop, Some(donor_position), nop_position));
+
+        let mut labeled = graph.clone();
+        labeled.insert_label(block, 2, alternate);
+        assert!(!matches(
+            &labeled,
+            Some(donor_position),
+            ItemPosition::new(block, 3)
+        ));
+
+        // A sole physical copy has identical executable fields but is not the original pair.
+        let mut replaced = graph.clone();
+        replaced.remove_item(nop_position);
+        replaced.remove_item(donor_position);
+        replaced.append_to_block(
+            block,
+            [
+                Item::Instruction(donor.for_exit_copy()),
+                Item::Instruction(nop.for_exit_copy()),
+            ],
+        );
+        assert!(!matches(&replaced, Some(donor_position), nop_position));
+
+        let mut cloned = graph;
+        cloned.append_to_block(block, [Item::Instruction(donor), Item::Instruction(nop)]);
+        assert!(!matches(&cloned, Some(donor_position), nop_position));
+        assert!(!matches(
+            &cloned,
+            Some(ItemPosition::new(block, 3)),
+            ItemPosition::new(block, 4)
+        ));
+
+        let mut other_items = original_items();
+        other_items.extend([
+            Item::Label(other),
+            Item::Instruction(donor),
+            Item::Instruction(nop),
+        ]);
+        let other_graph = graph_for(other_items);
+        let other_block = other_graph.label_block(other).unwrap();
+        assert_ne!(block, other_block);
+        assert!(!matches(&other_graph, Some(donor_position), nop_position));
+        assert!(!matches(
+            &other_graph,
+            Some(ItemPosition::new(other_block, 1)),
+            ItemPosition::new(other_block, 2)
+        ));
+
+        // A changed original jump (including a new target) is not the recorded pair.
+        let mut jump = Instruction::new(JUMP_FORWARD, Operand::Forward(other), location, None);
+        jump.mark_original_annotation_jump();
+        let mut jump_graph = graph_for(vec![
+            Item::Label(entry),
+            Item::Instruction(donor),
+            Item::Instruction(jump),
+        ]);
+        assert!(unique_module_annotation_pair(&jump_graph, donor, jump));
+        let jump_block = jump_graph.label_block(entry).unwrap();
+        jump_graph
+            .instruction_mut(ItemPosition::new(jump_block, 2))
+            .unwrap()
+            .set_operand(Operand::Forward(alternate));
+        assert!(!unique_module_annotation_pair(&jump_graph, donor, jump));
+    }
+
+    #[test]
+    fn annotation_borrow_marker_retires_only_after_unique_pair_survives() {
+        use crate::target::opcodes::STORE_NAME;
+
+        let entry = Label::from_u32(0);
+        let other = Label::from_u32(1);
+        let location = SourceLocation::new(1, 1, 0, 3);
+        let mut donor = Instruction::new(STORE_NAME, Operand::Value(0), location, None);
+        let mut nop = Instruction::new(NOP, Operand::Value(0), location, None);
+        donor.mark_original_annotation_jump();
+        nop.mark_original_annotation_jump();
+        nop.jump_policy.retain_nop();
+        nop.no_location_policy
+            .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+        let mut marked = nop;
+        marked.jump_policy.mark_borrow_empty_block();
+        let original = vec![
+            Item::Label(entry),
+            Item::Instruction(donor),
+            Item::Instruction(marked),
+        ];
+        let graph = BlockGraph::from_items(original.clone(), &FxHashSet::default());
+        let block = graph.label_block(entry).unwrap();
+        let certificates = [(block, donor, nop)];
+        let markers = surviving_module_annotation_borrow_markers(&graph, &certificates);
+        assert_eq!(markers, [(donor, marked)]);
+
+        let mut items = original.clone();
+        assert!(matches!(&items[2], Item::Instruction(instruction)
+            if instruction.no_location_policy.borrow_fallthrough() == BorrowFallthrough::Barrier));
+        retire_module_annotation_borrow_markers(&mut items, &markers);
+        assert!(matches!(&items[2], Item::Instruction(instruction)
+            if instruction.no_location_policy.borrow_fallthrough() == BorrowFallthrough::BarrierIfRemoved));
+        OptimizationPipeline::remove_borrow_empty_block_markers(&mut items);
+        assert_eq!(items, original[..2]);
+
+        let mut labeled_graph = graph.clone();
+        labeled_graph.insert_label(block, 2, other);
+        assert!(
+            surviving_module_annotation_borrow_markers(&labeled_graph, &certificates).is_empty()
+        );
+        let mut replaced_graph = graph.clone();
+        replaced_graph.remove_item(ItemPosition::new(block, 2));
+        replaced_graph.remove_item(ItemPosition::new(block, 1));
+        replaced_graph.append_to_block(
+            block,
+            [
+                Item::Instruction(donor.for_exit_copy()),
+                Item::Instruction(marked.for_exit_copy()),
+            ],
+        );
+        assert!(
+            surviving_module_annotation_borrow_markers(&replaced_graph, &certificates).is_empty()
+        );
+        let mut replaced_items = original.clone();
+        replaced_items[1] = Item::Instruction(donor.for_exit_copy());
+        replaced_items[2] = Item::Instruction(marked.for_exit_copy());
+        retire_module_annotation_borrow_markers(&mut replaced_items, &markers);
+        assert!(matches!(&replaced_items[2], Item::Instruction(instruction)
+            if instruction.no_location_policy.borrow_fallthrough() == BorrowFallthrough::Barrier));
+        let mut cloned_graph = graph;
+        cloned_graph.append_to_block(block, [Item::Instruction(donor), Item::Instruction(marked)]);
+        assert!(
+            surviving_module_annotation_borrow_markers(&cloned_graph, &certificates).is_empty()
+        );
+
+        // A copy appearing after graph validation must also invalidate retirement.
+        let mut copied_items = original;
+        copied_items.extend([Item::Instruction(donor), Item::Instruction(marked)]);
+        retire_module_annotation_borrow_markers(&mut copied_items, &markers);
+        assert!(matches!(&copied_items[2], Item::Instruction(instruction)
+            if instruction.no_location_policy.borrow_fallthrough() == BorrowFallthrough::Barrier));
+        assert!(matches!(&copied_items[4], Item::Instruction(instruction)
+            if instruction.no_location_policy.borrow_fallthrough() == BorrowFallthrough::Barrier));
     }
 
     #[test]

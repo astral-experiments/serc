@@ -1061,13 +1061,18 @@ impl InstructionMetadata {
     const EXTRA_INSTRUCTIONS_MASK: u16 = 0b111 << Self::EXTRA_INSTRUCTIONS_SHIFT;
     const UNCONDITIONAL_INLINING_ONLY: u16 = 1 << 8;
     const INITIAL_BORROW_ENTRY: u16 = 1 << 12;
+    // Only the module annotation setup and its original folded jump carry this tag.
+    const ORIGINAL_ANNOTATION_JUMP: u16 = 1 << 13;
     const RETIRED_CONTAINS: u16 = 1 << 15;
     const LATE_FOLD_LOCATION: u16 = 1 << 14;
     const LEGACY_JUMP_SEED_PRESENT: u16 = 1 << 9;
     const LEGACY_JUMP_SEED_SHIFT: u16 = 10;
     const LEGACY_JUMP_SEED_WIDTH: u16 = 3 << Self::LEGACY_JUMP_SEED_SHIFT;
     const LEGACY_JUMP_SEED: u16 = Self::LEGACY_JUMP_SEED_PRESENT | Self::LEGACY_JUMP_SEED_WIDTH;
-    const FLAGS: u16 = Self::RETIRED_CONTAINS | Self::LATE_FOLD_LOCATION | Self::LEGACY_JUMP_SEED;
+    const FLAGS: u16 = Self::RETIRED_CONTAINS
+        | Self::LATE_FOLD_LOCATION
+        | Self::LEGACY_JUMP_SEED
+        | Self::ORIGINAL_ANNOTATION_JUMP;
 
     const fn flags(self) -> u16 {
         self.0.get() & Self::FLAGS
@@ -1251,6 +1256,17 @@ pub(super) struct Instruction {
 
 impl Instruction {
     const NO_DEPTH_AFTER: u32 = u32::MAX;
+
+    /// Marks an instruction in the original module annotation and folded-jump pair.
+    pub(super) fn mark_original_annotation_jump(&mut self) {
+        self.metadata = self
+            .metadata
+            .with_flags(self.metadata.flags() | InstructionMetadata::ORIGINAL_ANNOTATION_JUMP);
+    }
+
+    pub(super) const fn is_original_annotation_jump(&self) -> bool {
+        self.metadata.flags() & InstructionMetadata::ORIGINAL_ANNOTATION_JUMP != 0
+    }
 
     pub(super) fn new(
         opcode: Opcode,
@@ -1497,6 +1513,9 @@ impl Instruction {
     /// Retires source-only literal-fold provenance on a physical copy into another block.
     pub(super) fn for_exit_copy(mut self) -> Self {
         self.jump_policy.retire_original_uniform_fold();
+        self.metadata = self
+            .metadata
+            .with_flags(self.metadata.flags() & !InstructionMetadata::ORIGINAL_ANNOTATION_JUMP);
         self
     }
 
@@ -1527,7 +1546,10 @@ impl Instruction {
                 first.only_allows_unconditional_inlining()
                     || second.only_allows_unconditional_inlining(),
             )
-            .with_flags(first.metadata.flags() | second.metadata.flags()),
+            .with_flags(
+                (first.metadata.flags() | second.metadata.flags())
+                    & !InstructionMetadata::ORIGINAL_ANNOTATION_JUMP,
+            ),
             early_boolean_admissions: first
                 .early_boolean_admissions
                 .followed_by(second.early_boolean_admissions),
