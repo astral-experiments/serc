@@ -430,6 +430,11 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
         deferred_comprehension_errors: RefCell::new(Vec::new()),
         source,
         may_have_debug_patterns: source.contains("__debug__") || !source.is_ascii(),
+        may_have_legacy_coroutines: matches!(
+            python_version,
+            PythonVersion::Py312 | PythonVersion::Py313
+        ) && optimization_level != OptimizationLevel::Zero
+            && (source.contains("await") || source.contains("async")),
         body,
         mapping_key_int_max_str_digits,
         python_version: match python_version {
@@ -654,6 +659,7 @@ fn simple_function_checker_view(function: &ast::StmtFunctionDef) -> Option<Stmt>
 struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> {
     pre_lowering_only: bool,
     optimization_level: OptimizationLevel,
+    may_have_legacy_coroutines: bool,
     comprehension_yield_operand: bool,
     checking_comprehension_yield: bool,
     collecting_comprehension_errors: bool,
@@ -1923,10 +1929,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                 // Before 3.14, symbol-table traversal can mark a sync function as a
                 // coroutine from an assertion that optimization subsequently removes.
                 let legacy_coroutine = !function.is_async
-                    && self.python_version < ast::PythonVersion::PY314
-                    && self.optimization_level != OptimizationLevel::Zero
-                    && (self.source[function.range].contains("await")
-                        || self.source[function.range].contains("async"))
+                    && self.may_have_legacy_coroutines
                     && super::source::function_has_elided_coroutine_assertion(&function.body);
                 self.with_scope(
                     ScopeKind::Function {

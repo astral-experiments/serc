@@ -344,6 +344,8 @@ fn optimized_legacy_await_assertions_preserve_coroutine_symbols() {
         "def f():\n    assert await g()\n    def inner(): yield 1\n    return 3\n",
         "def f():\n    assert await g()\n    yield 1\n    return\n",
         "def f():\n    assert await g()\n    yield from xs\n",
+        "def ordinary():\n    assert condition\n    yield 1\n    return 3\ndef special():\n    assert await g()\n",
+        "def ordinary():\n    assert condition\n    yield 1\n    return 3\n# async await\n",
     ];
     for version in [PythonVersion::Py312, PythonVersion::Py313] {
         for level in [OptimizationLevel::One, OptimizationLevel::Two] {
