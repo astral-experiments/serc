@@ -54,13 +54,19 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
     let mut validator = new_validator::<PRUNE_STATEMENTS, false>(source, body, python_version);
     validator.visit_scope_body(body);
     let error = validator.error.into_inner();
-    if matches!(&error, Some(CompileError::InvalidDocstring { .. })) {
-        // Native validates future directives before cleaning docstrings. Revisit only this rare
-        // error path so an invalid directive anywhere retains its higher diagnostic priority.
-        let mut validator = new_validator::<false, true>(source, body, python_version);
-        validator.visit_body(body);
-        if let Some(future_error) = validator.error.into_inner() {
-            return Err(future_error);
+    if matches!(&error, Some(CompileError::InvalidDocstring { .. }))
+        || validator.lowering_keyword_error
+    {
+        // Revisit these error paths for diagnostics from earlier compiler phases.
+        // Future directives moved ahead of call lowering in Python 3.14.
+        if !validator.lowering_keyword_error
+            || matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315)
+        {
+            let mut validator = new_validator::<false, true>(source, body, python_version);
+            validator.visit_body(body);
+            if let Some(future_error) = validator.error.into_inner() {
+                return Err(future_error);
+            }
         }
         // Symbol-table diagnostics precede docstring cleanup too, including declarations in
         // another scope. Keep walking past code-generation errors to find those diagnostics.
@@ -105,6 +111,7 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
         error: RefCell::new(None),
         pending_pattern: None,
         lowering_pattern_error: false,
+        lowering_keyword_error: false,
         bare_starred: None,
         check_bare_starred: true,
         has_declarations: false,
@@ -310,6 +317,7 @@ struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
     error: RefCell<Option<CompileError>>,
     pending_pattern: Option<PendingPattern<'ast>>,
     lowering_pattern_error: bool,
+    lowering_keyword_error: bool,
     bare_starred: Option<(TextRange, BareStarredKind)>,
     check_bare_starred: bool,
     has_declarations: bool,
@@ -999,6 +1007,24 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
     }
 }
 
+/// Find the duplicate belonging to the earliest authored keyword, as CPython does.
+fn repeated_call_keyword(arguments: &ast::Arguments) -> Option<(&str, TextRange)> {
+    if arguments.keywords.len() < 2 {
+        return None;
+    }
+    let mut seen = FxHashMap::default();
+    let mut repeated = None;
+    // Reverse traversal preserves the next occurrence of each name without a quadratic scan.
+    for keyword in arguments.keywords.iter().rev() {
+        if let Some(name) = &keyword.arg
+            && let Some(range) = seen.insert(name.as_str(), keyword.range)
+        {
+            repeated = Some((name.as_str(), range));
+        }
+    }
+    repeated
+}
+
 /// Follow CPython's pattern walk: structural subpatterns can match anything, but only the final
 /// arm of an OR pattern may do so, and only when its enclosing pattern permits it.
 fn unreachable_pattern(
@@ -1364,6 +1390,22 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
         if self.error.borrow().is_some() {
             return;
         }
+        if self.check_bare_starred
+            && !self.pre_lowering_only
+            && self.bare_starred.is_none()
+            && let Expr::Call(call) = expression
+            && let Some((name, range)) = repeated_call_keyword(&call.arguments)
+        {
+            // CPython checks call keywords before lowering the callable or its arguments.
+            // Stringized and unevaluated annotations do not reach this phase. Revisit the
+            // module for symbol-table errors before returning this lowering diagnostic.
+            self.lowering_keyword_error = true;
+            *self.error.borrow_mut() = Some(CompileError::invalid_syntax(
+                format!("keyword argument repeated: {name}"),
+                range,
+            ));
+            return;
+        }
         let check_expression = match expression {
             // These are the only remaining variants checked by the pinned Ruff visitor. Its
             // tuple/list check applies only to assignment targets; a lambda without parameters
@@ -1639,6 +1681,9 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             // Bare stars fail during code generation. Keep walking for errors from earlier
             // compiler phases; 3.14 moved await and writes to __debug__ into such a phase.
             let code_generation_error = match &error.kind {
+                Kind::LateFutureImport | Kind::FutureFeatureNotDefined(_) => {
+                    self.python_version < ast::PythonVersion::PY314
+                }
                 Kind::ReturnInGenerator => self.pre_lowering_only,
                 Kind::BreakOutsideLoop
                 | Kind::ContinueOutsideLoop
@@ -1650,6 +1695,7 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
                 | Kind::MultipleStarredNamesInSequencePattern
                 | Kind::IrrefutableCasePattern(_)
                 | Kind::DuplicateMatchKey(_)
+                | Kind::DuplicateKeywordArgument(_)
                 | Kind::DuplicateMatchClassAttribute(_) => true,
                 Kind::YieldOutsideFunction(kind) => {
                     !kind.is_await() || self.python_version < ast::PythonVersion::PY314
