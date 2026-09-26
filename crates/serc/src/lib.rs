@@ -14,6 +14,7 @@ mod indentation;
 mod initial_intern_state;
 mod marshal;
 mod paramspec_default;
+mod python_312_starred_defaults;
 mod source;
 mod stack;
 mod target;
@@ -542,22 +543,31 @@ fn compile_normalized(
         parsed.suite(),
         parsed.unsupported_syntax_errors(),
     )?;
-    if options.python_version == PythonVersion::Py312
-        && source.contains("**")
-        && source.contains('[')
-        && let Some(error) = paramspec_default::validate(parsed.suite(), parsed.tokens())
-        && parsed
-            .unsupported_syntax_errors()
-            .first()
-            .is_none_or(|existing| {
-                error
-                    .range()
-                    .expect("ParamSpec diagnostic has a range")
-                    .start()
-                    < existing.range.start()
-            })
-    {
-        return Err(error);
+    if options.python_version == PythonVersion::Py312 {
+        // Both validators can find errors in one module; CPython reports the first.
+        let starred = python_312_starred_defaults::validate(parsed);
+        let paramspec = (source.contains("**") && source.contains('['))
+            .then(|| paramspec_default::validate(parsed.suite(), parsed.tokens()))
+            .flatten()
+            .filter(|error| {
+                parsed
+                    .unsupported_syntax_errors()
+                    .first()
+                    .is_none_or(|existing| {
+                        error
+                            .range()
+                            .expect("ParamSpec diagnostic has a range")
+                            .start()
+                            < existing.range.start()
+                    })
+            });
+        if let Some(error) = [starred, paramspec]
+            .into_iter()
+            .flatten()
+            .min_by_key(|error| error.range().expect("diagnostic has a range").start())
+        {
+            return Err(error);
+        }
     }
     if let Some(error) = parsed.unsupported_syntax_errors().first() {
         return Err(CompileError::invalid_syntax(error.to_string(), error.range));
