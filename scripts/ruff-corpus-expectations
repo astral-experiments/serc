@@ -6,8 +6,8 @@ case "${1:-}" in
     3.12)
         expected_exact=2190
         expected_rejected=280
-        expected_matched_rejection=271
-        expected_rejection_mismatch=7
+        expected_matched_rejection=274
+        expected_rejection_mismatch=4
         expected_compiler_failure=2
         ;;
     3.13)
