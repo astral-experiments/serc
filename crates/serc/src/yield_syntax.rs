@@ -1,5 +1,5 @@
-use ruff_python_ast::Expr;
 use ruff_python_ast::token::{Token, TokenKind, Tokens};
+use ruff_python_ast::{BoolOp, Expr};
 use ruff_python_parser::{Mode, ParseOptions};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 
@@ -192,16 +192,21 @@ fn adjacent_template_error(
             continue;
         }
         let range = TextRange::new(token.start(), quote);
-        let Ok(parsed) = ruff_python_parser::parse_parenthesized_expression_range(source, range)
-        else {
+        // A disjunction is an `or` chain. Requiring the appended operand at the root
+        // distinguishes bare yield/if/lambda/tuple forms from parenthesized atoms.
+        let probe = format!("({}\n or __serc_probe__)", &source[range]);
+        let Ok(parsed) = ruff_python_parser::parse_expression(&probe) else {
             continue;
         };
-        // annotated_rhs also permits tuples, conditionals, and lambdas, but this invalid
-        // grammar alternative specifically requires a disjunction before the string.
-        if matches!(
-            parsed.expr(),
-            Expr::Tuple(_) | Expr::If(_) | Expr::Lambda(_)
-        ) {
+        let Expr::BoolOp(boolean) = parsed.expr() else {
+            continue;
+        };
+        if boolean.op != BoolOp::Or
+            || !matches!(
+                boolean.values.last(),
+                Some(Expr::Name(name)) if name.id.as_str() == "__serc_probe__"
+            )
+        {
             continue;
         }
         return Some(CompileError::invalid_syntax(

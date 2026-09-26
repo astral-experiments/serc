@@ -105,6 +105,34 @@ fn bare_yield_commas_match_native_grammar() {
         ("def f():\n    f\"{tr'{yield, 1}'}\"\n", Some(F_DELIMITER)),
         ("def f():\n    f\"{(t'{yield, 1}')}\"\n", Some(F_EXPRESSION)),
         (
+            "def f():\n    f\"{yield t'{yield, 1}'}\"\n",
+            Some(F_DELIMITER),
+        ),
+        (
+            "def f():\n    f\"{yield from t'{yield, 1}'}\"\n",
+            Some(F_DELIMITER),
+        ),
+        (
+            "def f():\n    f\"{type + t'{yield, 1}'}\"\n",
+            Some("invalid syntax. Perhaps you forgot a comma?"),
+        ),
+        (
+            "def f():\n    f\"{name + t'{yield, 1}'}\"\n",
+            Some("invalid syntax. Perhaps you forgot a comma?"),
+        ),
+        (
+            "def f():\n    f\"{(1 if c else 2) + t'{yield, 1}'}\"\n",
+            Some("invalid syntax. Perhaps you forgot a comma?"),
+        ),
+        (
+            "def f():\n    f\"{(lambda: 1) + t'{yield, 1}'}\"\n",
+            Some("invalid syntax. Perhaps you forgot a comma?"),
+        ),
+        (
+            "def f():\n    f\"{(1, 2) + t'{yield, 1}'}\"\n",
+            Some("invalid syntax. Perhaps you forgot a comma?"),
+        ),
+        (
             "def f():\n    f\"{1 + t'{yield, 1}'}\"\n",
             Some("invalid syntax. Perhaps you forgot a comma?"),
         ),
