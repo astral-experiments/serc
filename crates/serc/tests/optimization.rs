@@ -139,6 +139,33 @@ fn terminating_if_before_elided_assert_preserves_branch_location() {
 }
 
 #[test]
+fn elided_inner_else_keeps_for_loop_backedge_location() {
+    for source in [
+        "def f(xs,a,b):\n for x in xs:\n  if a:\n   if b:\n    z = x\n   else:\n    assert b\n  else:\n   other(x)\n",
+        "def f(xs,a,b,c):\n for x in xs:\n  if a:\n   other(x)\n  elif c:\n   if not b:\n    work(x)\n   else:\n    assert b\n    assert (w := c)\n  else:\n   other(x)\n",
+        "def f(xs,a,b,c):\n for x in xs:\n  if a:\n   if b < c:\n    z += 1\n   else:\n    assert b\n  else:\n   other(x)\n",
+        "def f(xs,a,b,c):\n for x in xs:\n  if a:\n   if b or c:\n    z = x\n   else:\n    assert b\n  else:\n   other(x)\n",
+        "def f(xs,a,b,c):\n for x in xs:\n  if c:\n   if a:\n    work(x)\n   elif b:\n    z = x\n   else:\n    assert b\n  else:\n   other(x)\n",
+        "def f(xs,a,b):\n global z\n for x in xs:\n  if a:\n   if b:\n    z = x\n   else:\n    assert b\n  else:\n   other(x)\n",
+        "def f(xs,a,b):\n def read():\n  return z\n for x in xs:\n  if a:\n   if b:\n    z = x\n   else:\n    assert b\n  else:\n   other(x)\n",
+        "def f(xs,a,b):\n for x in xs:\n  if a:\n   if b:\n    z = x\n   else:\n    assert b\n    pass\n  else:\n   other(x)\n",
+        "def f(xs,a,b):\n for x in xs:\n  if a:\n   if True:\n    z = x\n   else:\n    assert b\n  else:\n   other(x)\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "sub/elided_inner_else_loop.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+}
+
+#[test]
 fn nested_terminal_if_before_elided_assert_matches_cpython() {
     for source in [
         "def f(a,b):\n if a:\n  if b:\n   x = 1\n  assert a\n",

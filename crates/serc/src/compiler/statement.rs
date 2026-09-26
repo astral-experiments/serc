@@ -16688,6 +16688,44 @@ impl<'source> Compiler<'source> {
                 } else if let Some(Stmt::Pass(statement)) = body.last() {
                     self.assembler
                         .set_location(self.source_location(statement.range));
+                } else if self.context.python_version >= crate::PythonVersion::Py314
+                    && test.is_none()
+                    && non_final_branch
+                    && !try_body_normal_exit
+                    && elided_else
+                    && matches!(self.unit.scope, Scope::Function { .. })
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && !self.has_active_control_flow_region()
+                    && self.control.withs.active_with_exits.is_empty()
+                    && !self.control.in_exception_handler()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.finally.is_inactive_for_return_unwind()
+                    && self.control.loops.contexts.len() == 1
+                    && self.control.loops.contexts.last().is_some_and(|context| {
+                        context.iterator_cleanup == IteratorCleanup::Sync && !context.has_orelse
+                    })
+                    && condition_has_linear_runtime_leaves(&statement.test)
+                    && !expression_suspends_current_scope(&statement.test)
+                    && suite_has_linear_borrow_fallthrough(&statement.body)
+                    && statement.elif_else_clauses.iter().all(|clause| {
+                        clause.test.as_ref().is_none_or(|test| {
+                            condition_has_linear_runtime_leaves(test)
+                                && !expression_suspends_current_scope(test)
+                                && suite_has_linear_borrow_fallthrough(&clause.body)
+                        })
+                    })
+                    && let Some(last_test) = statement
+                        .elif_else_clauses
+                        .iter()
+                        .rev()
+                        .find_map(|clause| clause.test.as_ref())
+                        .or(Some(statement.test.as_ref()))
+                    && condition_has_linear_runtime_leaves(last_test)
+                    && !expression_suspends_current_scope(last_test)
+                    && original_condition_has_unique_jump_target(last_test, false)
+                {
+                    self.assembler
+                        .set_location(self.source_location(condition_fallthrough_range(last_test)));
                 } else if let Some(Stmt::While(statement)) = body.last()
                     && statement.orelse.is_empty()
                     && early_condition_truthiness(&statement.test).is_none()
