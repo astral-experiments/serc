@@ -14621,13 +14621,13 @@ mod tests {
                     assembler
                         .exception_owner_provenance
                         .compound_try_owner_exits[0]
-                        .0 = exit
+                        .0 = exit;
                 }
                 "wrong target" => {
                     assembler
                         .exception_owner_provenance
                         .compound_try_owner_exits[0]
-                        .1 = exit
+                        .1 = exit;
                 }
                 "duplicate edge" => assembler
                     .exception_owner_provenance
