@@ -1479,6 +1479,141 @@ fn protected_comprehension_before_elided_assertion_keeps_return_locations() {
     }
 }
 
+#[test]
+fn protected_optimized_conditional_keeps_nested_exception_owners() {
+    const SOURCE: &str = r"events = []
+class Fault(Exception): pass
+class M:
+ def __enter__(self): events.append('enter'); return self
+ def __exit__(self, typ, value, tb): events.append('exit:' + (typ.__name__ if typ else 'none')); return False
+def step(): events.append('step')
+def other(): events.append('other')
+def f(a):
+ try:
+  if a:
+   with M():
+    try:
+     step()
+    except KeyError:
+     other()
+  else:
+   other()
+  assert a
+ except Fault:
+  events.append('handler')
+";
+    const TRACE: &str = r"
+import dis, marshal, sys
+scope = {}
+exec(marshal.load(sys.stdin.buffer), scope)
+f, fault, events = scope['f'], scope['Fault'], scope['events']
+cases = [('POP_JUMP', int(sys.argv[1]), False, ['handler']),
+         ('CALL', int(sys.argv[2]), True, ['enter', 'exit:Fault', 'handler'])]
+for prefix, line, argument, expected in cases:
+    matches = [instruction.offset for instruction in dis.get_instructions(f)
+               if instruction.opname.startswith(prefix) and instruction.positions.lineno == line]
+    if len(matches) != 1:
+        raise RuntimeError((prefix, line, matches))
+    target, hits = matches[0], []
+    events.clear()
+    def trace(frame, event, arg):
+        if frame.f_code is f.__code__:
+            frame.f_trace_opcodes = True
+            if event == 'opcode' and frame.f_lasti == target:
+                hits.append(target)
+                raise fault('injected')
+        return trace
+    try:
+        sys.settrace(trace)
+        result = f(argument)
+    finally:
+        sys.settrace(None)
+    if hits != [target] or result is not None or events != expected:
+        raise RuntimeError((prefix, hits, result, events, expected))
+";
+    let lines = ["if a:", "step()"].map(|needle| {
+        (SOURCE
+            .lines()
+            .position(|line| line.trim() == needle)
+            .unwrap()
+            + 1)
+        .to_string()
+    });
+    for version in [PythonVersion::Py314, PythonVersion::Py315] {
+        for level in [OptimizationLevel::One, OptimizationLevel::Two] {
+            let native = oracle(SOURCE.as_bytes(), "protected_owner.py", version, level);
+            assert!(native.status.success());
+            let actual = compile_with_options(
+                SOURCE,
+                "protected_owner.py",
+                &CompileOptions {
+                    python_version: version,
+                    optimization_level: level,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .marshal();
+            assert_eq!(actual, native.stdout, "{version}, {level:?}");
+            let index = VERSIONS
+                .iter()
+                .position(|(candidate, _, _)| *candidate == version)
+                .unwrap();
+            for (label, payload) in [("native", &native.stdout), ("serc", &actual)] {
+                let mut child = Command::new(ORACLES[index].get().unwrap())
+                    .args(["-I", "-S", "-B", "-c", TRACE])
+                    .args(&lines)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child.stdin.take().unwrap().write_all(payload).unwrap();
+                let result = child.wait_with_output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{version}, {level:?}, {label}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn protected_elided_assertion_preserves_terminal_control_flow() {
+    for (index, source) in [
+        "def f(a, ys):\n try:\n  if not a:\n   x = [i for i in ys]\n  assert a\n except ValueError:\n  work()\n",
+        "def f(obj, ys):\n try:\n  if obj.flag:\n   x = [i for i in ys]\n  assert obj\n except ValueError:\n  work()\n",
+        "def f(a, b, ys):\n try:\n  if a and b:\n   x = [i for i in ys]\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a, ys):\n try:\n  if bool(a):\n   x = [i for i in ys]\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a, obj, ys):\n try:\n  if a:\n   obj.value = [i for i in ys]\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a, obj, ys):\n try:\n  if a:\n   obj[0] = [i for i in ys]\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a, ys):\n try:\n  if a:\n   x, = [i for i in ys]\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a, ys):\n try:\n  if a:\n   x = [i for i in ys]\n  else:\n   x = []\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a):\n try:\n  if a:\n   work()\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a, b):\n try:\n  if a:\n   work()\n  elif b:\n   other()\n  else:\n   third()\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a, b):\n try:\n  if a == b:\n   work()\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a):\n try:\n  if a:\n   return 1\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a):\n try:\n  if a:\n   pass\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a, b):\n try:\n  if a:\n   if b:\n    work()\n  assert a\n  assert b\n except ValueError:\n  work()\n",
+        "def f(a):\n try:\n  if True:\n   pass\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a):\n try:\n  if False:\n   work()\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a, ys):\n try:\n  if __debug__:\n   x = [i for i in ys]\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a):\n try:\n  if a:\n   with manager():\n    work()\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a):\n try:\n  if a:\n   try:\n    work()\n   except TypeError:\n    other()\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a):\n try:\n  if a:\n   try:\n    work()\n   finally:\n    other()\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a, ys):\n try:\n  if a:\n   for y in ys:\n    work()\n  assert a\n except ValueError:\n  work()\n",
+    ].into_iter().enumerate() {
+        assert_matches_cpython_versions(
+            source,
+            &format!("sub/protected_terminal_elided_{index}.py"),
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
 const ORACLE_IDENTITY: &str = r"
 import importlib.util, sys
 assert sys.implementation.name == 'cpython'

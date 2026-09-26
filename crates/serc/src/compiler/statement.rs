@@ -1588,11 +1588,10 @@ impl<'source> Compiler<'source> {
         self.compile_suite_inner(body, false)
     }
 
-    fn protected_terminal_comprehension_before_elided(
-        &self,
-        statement: &Stmt,
-        following: &[Stmt],
-    ) -> bool {
+    // Optimized-away statements emit no instructions, so the preceding
+    // conditional supplies the normal exits of the terminal try body. Folded
+    // conditions retain their original protected markers on the existing path.
+    fn protected_terminal_if_before_elided(&self, statement: &Stmt, following: &[Stmt]) -> bool {
         !following.is_empty()
             && following.iter().all(|statement| {
                 matches!(
@@ -1601,14 +1600,10 @@ impl<'source> Compiler<'source> {
                 )
             })
             && matches!(statement, Stmt::If(conditional)
-                if matches!(conditional.test.as_ref(), Expr::Name(_))
-                    && conditional.elif_else_clauses.is_empty()
-                    && matches!(conditional.body.as_slice(), [Stmt::Assign(assignment)]
-                        if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
-                            && matches!(assignment.value.as_ref(), Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_))))
+                if early_condition_truthiness(&conditional.test).is_none())
     }
 
-    fn supports_protected_terminal_comprehension(&self) -> bool {
+    fn supports_protected_terminal_if(&self) -> bool {
         self.context.python_version >= crate::PythonVersion::Py314
             && matches!(self.unit.scope, Scope::Function { .. })
             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
@@ -1854,8 +1849,8 @@ impl<'source> Compiler<'source> {
                                     Some(super::optimization::OptimizedLocation::Elided)
                                 ))))
                         && !suite_contains_yield(&conditional.body));
-            let protected_terminal_comprehension_before_elided = final_expression_becomes_return
-                && self.supports_protected_terminal_comprehension()
+            let protected_terminal_if_before_elided = final_expression_becomes_return
+                && self.supports_protected_terminal_if()
                 && self
                     .control
                     .exceptions
@@ -1866,12 +1861,11 @@ impl<'source> Compiler<'source> {
                     .exceptions
                     .direct_try_body_statements
                     .contains(&statement.range())
-                && self
-                    .protected_terminal_comprehension_before_elided(statement, &body[index + 1..]);
+                && self.protected_terminal_if_before_elided(statement, &body[index + 1..]);
             let terminal_if_before_elided = terminal_before_elided_assertions
                 || terminal_comprehension_before_elided
                 || terminal_nested_before_elided
-                || protected_terminal_comprehension_before_elided;
+                || protected_terminal_if_before_elided;
             // An assignment with an inlined comprehension becomes terminal when
             // only removed assertions follow it; retain its target's return span.
             let terminal_assignment_before_elided = self.context.python_version
@@ -20638,13 +20632,13 @@ impl<'source> Compiler<'source> {
                         .body
                         .last()
                         .is_some_and(terminal_try_distributes_implicit_return)
-                    || (self.supports_protected_terminal_comprehension()
+                    || (self.supports_protected_terminal_if()
                         && statement
                             .body
                             .iter()
                             .enumerate()
                             .any(|(index, body_statement)| {
-                                self.protected_terminal_comprehension_before_elided(
+                                self.protected_terminal_if_before_elided(
                                     body_statement,
                                     &statement.body[index + 1..],
                                 )
