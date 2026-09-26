@@ -4362,7 +4362,7 @@ fn protected_with_assertion_join_before_pass_matches_cpython() {
     assert_matches_cpython_versions(
         "def f(flag, manager):\n    try:\n        with manager:\n            if flag:\n                assert flag\n            else:\n                assert not flag\n            pass\n        work()\n    except Exception:\n        recover()\n",
         "protected_with_join_pass.py",
-        &[OptimizationLevel::One, OptimizationLevel::Two],
+        &LEVELS,
         &[PythonVersion::Py314, PythonVersion::Py315],
     );
     for source in [
@@ -4429,7 +4429,7 @@ for name, offset, args, expected in [
         raise AssertionError((name, events))
 ";
     for version in [PythonVersion::Py314, PythonVersion::Py315] {
-        for level in [OptimizationLevel::One, OptimizationLevel::Two] {
+        for level in LEVELS {
             let native = oracle(
                 SOURCE.as_bytes(),
                 "protected_with_join_pass.py",

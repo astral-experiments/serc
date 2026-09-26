@@ -2110,8 +2110,18 @@ impl<'source> Compiler<'source> {
                     .active_with_exits
                     .last()
                     .is_some_and(|context| context.is_async);
-            // An optimized assertion-only conditional's retained join precedes the
-            // direct manager-tail pass in a separate original instruction slot.
+            // The conditional's retained join precedes the direct manager-tail
+            // pass in a separate original instruction slot.
+            let simple_assertion_suite = |suite: &[Stmt]| {
+                matches!(suite, [Stmt::Assert(assertion)]
+                    if assertion.msg.is_none()
+                        && (matches!(assertion.test.as_ref(), Expr::Name(name)
+                                if name.id.as_str() != "__debug__")
+                            || matches!(assertion.test.as_ref(), Expr::UnaryOp(unary)
+                                if unary.op == UnaryOp::Not
+                                    && matches!(unary.operand.as_ref(), Expr::Name(name)
+                                        if name.id.as_str() != "__debug__"))))
+            };
             let protected_sync_with_join_pass = self.context.python_version
                 >= crate::PythonVersion::Py314
                 && matches!(self.unit.scope, Scope::Function { .. })
@@ -2137,16 +2147,18 @@ impl<'source> Compiler<'source> {
                         && condition_has_linear_runtime_leaves(&previous.test)
                         && !expression_suspends_current_scope(&previous.test)
                         && !previous.body.is_empty()
-                        && previous.body.iter().all(|stmt| matches!(
+                        && (simple_assertion_suite(&previous.body)
+                            || previous.body.iter().all(|stmt| matches!(
                             self.context.optimized_locations.get(&stmt.range()),
                             Some(super::optimization::OptimizedLocation::Elided)
-                        ))
+                        )))
                         && matches!(previous.elif_else_clauses.as_slice(), [clause]
                             if clause.test.is_none() && !clause.body.is_empty()
-                                && clause.body.iter().all(|stmt| matches!(
+                                && (simple_assertion_suite(&clause.body)
+                                    || clause.body.iter().all(|stmt| matches!(
                                     self.context.optimized_locations.get(&stmt.range()),
                                     Some(super::optimization::OptimizedLocation::Elided)
-                                )))
+                                ))))
                 );
             let constant_pass_location = match statement {
                 Stmt::Pass(statement) => Some(self.source_location(statement.range)),
