@@ -4190,3 +4190,146 @@ for name, expected in [
         }
     }
 }
+
+#[test]
+fn protected_with_elided_if_keeps_manager_join_and_exception_owner() {
+    const SOURCE: &str = r"
+def f(flag, manager):
+    try:
+        with manager:
+            if flag:
+                assert flag
+            else:
+                assert not flag
+        work()
+    except Fault:
+        recover()
+
+def with_successor(flag, manager):
+    try:
+        with manager:
+            if flag:
+                assert flag
+            else:
+                assert not flag
+            work()
+    except Fault:
+        recover()
+
+def reverse(flag, manager):
+    with manager:
+        try:
+            if flag:
+                assert flag
+            else:
+                assert flag
+        except Fault:
+            recover()
+
+def nested_reverse(flag, manager):
+    with manager:
+        try:
+            try:
+                if flag:
+                    assert flag
+                else:
+                    assert flag
+            except Fault:
+                recover()
+        except TypeError:
+            work()
+
+def except_star(flag, manager):
+    try:
+        with manager:
+            if flag:
+                assert flag
+            else:
+                assert not flag
+    except* Fault:
+        recover()
+";
+    const TRACE: &str = r"
+import dis, marshal, sys
+
+events = []
+class Fault(Exception):
+    pass
+class Manager:
+    def __enter__(self):
+        events.append('enter')
+    def __exit__(self, typ, value, tb):
+        events.append(('exit', typ.__name__ if typ else None))
+        return False
+scope = {'Fault': Fault, 'work': lambda: events.append('work'),
+         'recover': lambda: events.append('recover')}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+for name, flag, expected in (
+    ('f', True, ['enter', 'hit', ('exit', 'Fault'), 'recover']),
+    ('with_successor', True, ['enter', 'hit', ('exit', 'Fault'), 'recover']),
+    ('reverse', False, ['enter', 'hit', ('exit', 'Fault'), 'escaped']),
+    ('nested_reverse', False, ['enter', 'hit', ('exit', 'Fault'), 'escaped']),
+    ('except_star', True, ['enter', 'hit', ('exit', 'Fault'), 'recover']),
+):
+    f = scope[name]
+    events.clear()
+    instructions = list(dis.get_instructions(f))
+    line = next(i.positions.lineno for i in instructions if i.opname == 'POP_JUMP_IF_FALSE')
+    offsets = [i.offset for i in instructions if i.opname == 'NOP' and i.positions.lineno == line]
+    assert len(offsets) == 1, (name, offsets)
+    def trace(frame, event, arg):
+        if frame.f_code is f.__code__:
+            frame.f_trace_opcodes = True
+            if event == 'opcode' and frame.f_lasti == offsets[0]:
+                events.append('hit')
+                raise Fault()
+        return trace
+    sys.settrace(trace)
+    try:
+        try:
+            f(flag, Manager())
+        except Fault:
+            events.append('escaped')
+    finally:
+        sys.settrace(None)
+    assert events == expected, (name, events, expected)
+";
+    for version in [PythonVersion::Py314, PythonVersion::Py315] {
+        assert_matches_cpython_versions(SOURCE, "protected_with_join.py", &LEVELS, &[version]);
+        for level in [OptimizationLevel::One, OptimizationLevel::Two] {
+            let native = oracle(SOURCE.as_bytes(), "protected_with_join.py", version, level);
+            assert!(native.status.success());
+            let actual = compile_with_options(
+                SOURCE,
+                "protected_with_join.py",
+                &CompileOptions {
+                    python_version: version,
+                    optimization_level: level,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .marshal();
+            assert_eq!(actual, native.stdout);
+            let index = VERSIONS
+                .iter()
+                .position(|(candidate, _, _)| *candidate == version)
+                .unwrap();
+            for payload in [&native.stdout, &actual] {
+                let mut child = Command::new(ORACLES[index].get().unwrap())
+                    .args(["-I", "-S", "-c", TRACE])
+                    .stdin(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child.stdin.take().unwrap().write_all(payload).unwrap();
+                let result = child.wait_with_output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{version:?} {level:?}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        }
+    }
+}

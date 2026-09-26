@@ -13071,12 +13071,13 @@ impl<'source> Compiler<'source> {
                             || (self.context.python_version == crate::PythonVersion::Py315
                                 && self.control.loops.contexts.is_empty()
                                 && self.control.exceptions.active_exception_region_exclusions.is_empty())
-                            || (self.context.python_version == crate::PythonVersion::Py314
-                                && matches!(self.unit.scope, Scope::Function { .. })
+                            // The manager-region join also survives inside a try body.
+                            || (matches!(self.unit.scope, Scope::Function { .. })
                                 && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                                 && self.control.loops.contexts.is_empty()
                                 && !self.control.withs.active_with_region_exclusions.is_empty()
-                                && self.control.exceptions.active_exception_region_exclusions.is_empty()))
+                                && (self.context.python_version == crate::PythonVersion::Py314
+                                    || !self.control.exceptions.active_exception_region_exclusions.is_empty())))
                         && !self.control.in_exception_handler()
                         && self.control.exceptions.active_exception_group_handlers == 0
                         && self.control.finally.active_finally_try_bodies == 0
