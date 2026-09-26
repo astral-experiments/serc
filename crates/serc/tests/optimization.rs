@@ -4835,6 +4835,24 @@ fn protected_with_assertion_join_before_pass_matches_cpython() {
 }
 
 #[test]
+fn optimized_match_cases_inside_loops_match_cpython() {
+    for source in [
+        "def f(xs,b):\n    for x in xs:\n        match x:\n            case str():\n                assert x\n            case int():\n                work(x)\n            case _:\n                other()\n        assert x\n",
+        "def f(xs,b):\n    for x in xs:\n        match x:\n            case str() | bytes():\n                assert (z := x)\n            case int():\n                work(x)\n            case _:\n                other()\n        z=x\n    else:\n        finished()\n",
+        "def f(xs,b):\n    for group in xs:\n        for x in group:\n            match x:\n                case str() | bytes():\n                    assert x\n                case int():\n                    work(x)\n                case _:\n                    other()\n            z=[v for v in xs]\n",
+        "def f(xs,b):\n    while xs:\n        x=xs.pop()\n        match x:\n            case str():\n                assert x\n            case int():\n                work(x)\n            case _:\n                other()\n        assert x\n",
+        "def f(xs):\n    while xs:\n        x = xs.pop()\n        match x:\n            case str():\n                assert x\n            case _:\n                other()\n        pass\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "sub/elided_loop.py",
+            &LEVELS[1..],
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn protected_with_assertion_join_pass_has_no_exception_owner() {
     const SOURCE: &str = concat!(
         "def f(flag, manager):\n    try:\n        with manager:\n            if flag:\n                assert flag\n            else:\n                assert not flag\n            pass\n        work()\n    except Fault:\n        recover()\n",

@@ -2834,6 +2834,9 @@ impl OptimizationPipeline {
             &self.graph,
             &mut self.borrow_authored_finally_break_origins,
         );
+        // Build this lazily for a match-success jump that needs it. A removed
+        // original NOP can be recorded under any co-located label alias.
+        let mut original_nop_offsets = None;
         let graph = &mut self.graph;
         let mut instruction_index = 0;
         let mut copied_owners = retained_break_try_owners;
@@ -2907,6 +2910,27 @@ impl OptimizationPipeline {
                 else {
                     break;
                 };
+                if self.python_version >= crate::PythonVersion::Py314
+                    && original_jump.jump_policy.is_original_match_success()
+                    && original_jump.location == SourceLocation::NONE
+                    && original_jump.jump_policy.retained_nop()
+                        == super::super::ir::RetainedJumpNop::DirectTarget
+                    && !self.original_nop_targets.is_empty()
+                    && label_offsets.get(target).is_some_and(|offset| {
+                        original_nop_offsets
+                            .get_or_insert_with(|| {
+                                self.original_nop_targets
+                                    .iter()
+                                    .filter_map(|label| label_offsets.get(*label).copied())
+                                    .collect::<FxHashSet<_>>()
+                            })
+                            .contains(offset)
+                    })
+                {
+                    // A recorded original NOP may still lead this target; retaining
+                    // the direct edge avoids threading past its source-line boundary.
+                    break;
+                }
                 if original_jump.jump_policy.is_original_empty_join()
                     && original_jump.jump_policy.retained_nop()
                         == super::super::ir::RetainedJumpNop::DirectTarget
@@ -7681,6 +7705,84 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn match_success_threading_respects_original_nop_aliases() {
+        let [entry, head, alias, later, exit, bridge] = [0, 1, 2, 3, 4, 5].map(Label::from_u32);
+        let location = SourceLocation::new(2, 2, 0, 1);
+        for (through_bridge, marker, expected) in [
+            (false, Some(head), alias),
+            (false, Some(alias), alias),
+            (false, Some(later), exit),
+            (false, None, exit),
+            (true, Some(head), alias),
+            (true, Some(alias), alias),
+            (true, Some(later), exit),
+            (true, None, exit),
+        ] {
+            let mut source = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(if through_bridge { bridge } else { alias }),
+                SourceLocation::NONE,
+                Some(0),
+            );
+            source.jump_policy.mark_original_match_success();
+            source.jump_policy.retain_nop_for_direct_target();
+            let mut items = vec![Item::Label(entry), Item::Instruction(source)];
+            if through_bridge {
+                items.extend([
+                    Item::Label(bridge),
+                    Item::Instruction(Instruction::new(
+                        JUMP_FORWARD,
+                        Operand::Forward(alias),
+                        location,
+                        Some(0),
+                    )),
+                ]);
+            }
+            items.extend([
+                Item::Label(head),
+                Item::Label(alias),
+                Item::Instruction(Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(exit),
+                    location,
+                    Some(0),
+                )),
+                Item::Label(later),
+                Item::Instruction(Instruction::new(NOP, Operand::Value(0), location, Some(0))),
+                Item::Label(exit),
+                Item::Instruction(Instruction::new(
+                    RETURN_VALUE,
+                    Operand::Value(0),
+                    location,
+                    Some(0),
+                )),
+            ]);
+            let mut assembler = Assembler::from_linear_items(items);
+            assembler.next_label = 6;
+            assembler.python_version = crate::PythonVersion::Py314;
+            let mut pipeline = assembler.into_optimization_pipeline();
+            if let Some(marker) = marker {
+                pipeline.original_nop_targets.insert(marker);
+            }
+            pipeline.thread_forward_jumps();
+            let Item::Instruction(actual) = pipeline
+                .graph
+                .iter_items()
+                .find(|item| matches!(item, Item::Instruction(_)))
+                .copied()
+                .expect("source jump")
+            else {
+                unreachable!();
+            };
+            assert_eq!(
+                actual.operand(),
+                Operand::Forward(expected),
+                "{through_bridge} {marker:?}"
+            );
         }
     }
 

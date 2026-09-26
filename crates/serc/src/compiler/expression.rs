@@ -789,7 +789,7 @@ impl Compiler<'_> {
                     && (!terminal
                         || self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                             == 0)
-                    && !self.control.in_loop()
+                    && (!self.control.in_loop() || !terminal)
                     && self
                         .control
                         .exceptions
@@ -1204,6 +1204,9 @@ impl Compiler<'_> {
                                 // its exit before restoring the authored Pass line's NOP.
                                 self.assembler
                                     .preserve_redundant_jump_nop_after_threading(success_exit);
+                            } else if elided_case_body && self.control.in_loop() {
+                                self.assembler
+                                    .preserve_direct_inlined_jump_nop(success_exit);
                             } else {
                                 self.assembler.preserve_inlined_jump_nop(success_exit);
                             }
