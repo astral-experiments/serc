@@ -39,8 +39,8 @@ impl LargeNumericKeys {
             return false;
         };
         let large = large_integer_literal(key);
-        let duplicate = (large && self.numbers.contains(&number))
-            || self.large_numbers.contains(&number);
+        let duplicate =
+            (large && self.numbers.contains(&number)) || self.large_numbers.contains(&number);
         self.numbers.insert(number.clone());
         if large {
             self.large_numbers.insert(number);
@@ -128,21 +128,45 @@ mod tests {
             Constant::Bool(false),
             Constant::Int(0),
             Constant::Float(-0.0),
-            Constant::Complex { real: 0.0, imag: -0.0 },
+            Constant::Complex {
+                real: 0.0,
+                imag: -0.0,
+            },
             Constant::Bool(true),
             Constant::Int(1),
             Constant::Float(1.0),
             Constant::Float(1.5),
-            Constant::Complex { real: 1.0, imag: -0.0 },
-            Constant::Complex { real: 1.0, imag: 1.5 },
-            Constant::BigInt { negative: false, digits: vec![0, 0, 0, 0, 16] },
-            Constant::BigInt { negative: false, digits: vec![1, 0, 0, 0, 16] },
+            Constant::Complex {
+                real: 1.0,
+                imag: -0.0,
+            },
+            Constant::Complex {
+                real: 1.0,
+                imag: 1.5,
+            },
+            Constant::BigInt {
+                negative: false,
+                digits: vec![0, 0, 0, 0, 16],
+            },
+            Constant::BigInt {
+                negative: false,
+                digits: vec![1, 0, 0, 0, 16],
+            },
             Constant::Float(18446744073709551616.0),
-            Constant::Complex { real: 18446744073709551616.0, imag: 0.0 },
-            Constant::Complex { real: 18446744073709551616.0, imag: 1.0 },
+            Constant::Complex {
+                real: 18446744073709551616.0,
+                imag: 0.0,
+            },
+            Constant::Complex {
+                real: 18446744073709551616.0,
+                imag: 1.0,
+            },
             Constant::Float(f64::INFINITY),
             Constant::Float(f64::NEG_INFINITY),
-            Constant::Complex { real: 1.0, imag: f64::INFINITY },
+            Constant::Complex {
+                real: 1.0,
+                imag: f64::INFINITY,
+            },
         ];
         for left in &values {
             for right in &values {
@@ -156,7 +180,13 @@ mod tests {
             }
         }
         assert!(python_numeric_value_key(&Constant::Float(f64::NAN)).is_none());
-        assert!(python_numeric_value_key(&Constant::Complex { real: 1.0, imag: f64::NAN }).is_none());
+        assert!(
+            python_numeric_value_key(&Constant::Complex {
+                real: 1.0,
+                imag: f64::NAN
+            })
+            .is_none()
+        );
     }
 
     #[test]
