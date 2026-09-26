@@ -195,3 +195,66 @@ sys.stdout.buffer.write(marshal.dumps(code))
         }
     }
 }
+
+#[test]
+fn reserved_debug_preserves_competing_error_order_and_ranges() {
+    let cases = [
+        "class C(__debug__=1):\n    f(x=1, x=2)\n",
+        "class C(x=1, x=2):\n    obj.__debug__ = 1\n",
+        "f(x=1, x=2)\nfrom __future__ import annotations\nmatch value:\n    case __debug__: pass\n",
+        "f(x=1, x=2)\nmatch value:\n    case __debug__: pass\nfrom __future__ import annotations\n",
+    ];
+    let oracle = r"
+import sys
+source = sys.argv[1]
+try:
+    compile(source, 'reserved.py', 'exec', dont_inherit=True)
+except SyntaxError as error:
+    lines = source.splitlines(keepends=True)
+    def pos(line, column):
+        return sum(len(part.encode()) for part in lines[:line - 1]) + len(lines[line - 1][:column - 1].encode())
+    print(error.msg)
+    print(pos(error.lineno, error.offset))
+    print(pos(error.end_lineno, error.end_offset))
+else:
+    raise AssertionError('expected a syntax error')
+";
+    for version in [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
+    ] {
+        let options = CompileOptions {
+            python_version: version,
+            ..CompileOptions::default()
+        };
+        for source in cases {
+            let mut python = match version {
+                PythonVersion::Py312 => common::python_312_command(),
+                PythonVersion::Py313 => common::python_313_command(),
+                PythonVersion::Py314 => common::python_3145_command(),
+                PythonVersion::Py315 => common::python_315_command(),
+            };
+            let output = python.args(["-c", oracle, source]).output().unwrap();
+            assert!(output.status.success(), "{version}: {source}: {output:?}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let mut expected = stdout.lines();
+            let message = expected.next().unwrap();
+            let start: u32 = expected.next().unwrap().parse().unwrap();
+            let end: u32 = expected.next().unwrap().parse().unwrap();
+            for error in [
+                compile_with_options(source, "reserved.py", &options).unwrap_err(),
+                compile_bytes_with_options(source.as_bytes(), "reserved.py", &options).unwrap_err(),
+            ] {
+                assert!(
+                    error.to_string().ends_with(message),
+                    "{version}: {source}: {error}"
+                );
+                let range = error.range().unwrap();
+                assert_eq!(u32::from(range.start()), start, "{version}: {source}");
+                assert_eq!(u32::from(range.end()), end, "{version}: {source}");
+            }
+        }
+    }
+}
