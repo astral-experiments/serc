@@ -5,8 +5,8 @@ use std::hash::{Hash, Hasher};
 
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
 use ruff_python_ast::{
-    BoolOp, Expr, ExprBinOp, ExprContext, ExprStringLiteral, ExprUnaryOp, FStringPartRef,
-    InterpolatedStringElement, Number, Operator, Pattern, Singleton, Stmt, UnaryOp,
+    BoolOp, Expr, ExprBinOp, ExprContext, ExprStringLiteral, ExprTuple, ExprUnaryOp,
+    FStringPartRef, InterpolatedStringElement, Number, Operator, Pattern, Singleton, Stmt, UnaryOp,
 };
 use ruff_text_size::Ranged;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
@@ -1748,6 +1748,14 @@ pub(super) fn optimized_percent_format(
     let Expr::Tuple(arguments) = expression.right.as_ref() else {
         return None;
     };
+    optimized_percent_format_arguments(arguments, || decode_literal(format))
+}
+
+/// Parse a decoded format against borrowed arguments, rejecting starred values before decoding.
+pub(super) fn optimized_percent_format_arguments(
+    arguments: &ExprTuple,
+    decode_format: impl FnOnce() -> Constant,
+) -> Option<Vec<PercentFormatPart<'_>>> {
     if arguments
         .elts
         .iter()
@@ -1758,7 +1766,7 @@ pub(super) fn optimized_percent_format(
 
     // Percent-format syntax is ASCII, so parsing bytes preserves surrogate-pass UTF-8 in
     // literal fragments without changing the supported conversions or width/precision limits.
-    let format = match decode_literal(format) {
+    let format = match decode_format() {
         Constant::String(value) => value.into_bytes(),
         Constant::SurrogateString(value) => value,
         _ => unreachable!("string literal decoding returns a string constant"),

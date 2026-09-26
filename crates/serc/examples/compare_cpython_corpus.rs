@@ -23,6 +23,8 @@ mod native_output_cache;
 mod native_output_reader;
 #[path = "support/standard_caller_profile.rs"]
 mod standard_caller_profile;
+#[path = "support/warning_effects_profile.rs"]
+mod warning_effects_profile;
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
@@ -909,6 +911,9 @@ fn compare(
     retain_mismatch_bytes: bool,
 ) -> Outcome {
     let standard_caller = oracle.qualified.is_some();
+    let warning_context = oracle
+        .qualified
+        .and_then(standard_caller_profile::QualifiedOracle::warning_context);
     let output = oracle
         .command()
         .args(["-I", "-S", "-c", ORACLE])
@@ -985,11 +990,12 @@ fn compare(
     } else {
         None
     };
-    let compiled = compile_input(
+    let compiled = compile_input_with_warning_context(
         &source,
         &filename,
         file_options.as_ref().unwrap_or(options),
         caller_model,
+        warning_context,
     );
     if let Some(observation) = observation {
         observation.compiled(&source, &compiled);
@@ -1039,8 +1045,30 @@ fn compile_input(
     options: &CompileOptions,
     caller_model: Option<&caller_intern_model::LoadedModel>,
 ) -> CompilerOutcome {
+    compile_input_with_warning_context(source, filename, options, caller_model, None)
+}
+
+fn compile_input_with_warning_context(
+    source: &CompilerInput,
+    filename: &str,
+    options: &CompileOptions,
+    caller_model: Option<&caller_intern_model::LoadedModel>,
+    warning_context: Option<&warning_effects_profile::WarningContext>,
+) -> CompilerOutcome {
     capture_compiler(|| {
-        compile_module_input(source, filename, options, caller_model).map(|module| module.marshal())
+        if warning_context.is_some() && caller_model.is_some() {
+            return Err(CompileError::InvalidCompilationEffects(
+                "qualified warning effects cannot combine with a legacy caller model".to_string(),
+            ));
+        }
+        let compiled = compile_module_input(source, filename, options, caller_model);
+        let compiled = match (compiled, warning_context) {
+            (Err(CompileError::UnresolvedInternState { .. }), Some(context)) => {
+                context.compile(source, filename, options)
+            }
+            (result, _) => result,
+        };
+        compiled.map(|module| module.marshal())
     })
 }
 

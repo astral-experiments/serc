@@ -20,6 +20,7 @@ mod legacy_native_labels;
 mod legacy_native_seed_bound;
 mod native_profile;
 mod orchestration;
+mod parser_warnings;
 mod scope;
 mod source;
 mod statement;
@@ -27,6 +28,8 @@ mod symbol;
 pub(crate) mod syntax;
 #[cfg(test)]
 mod tests;
+mod warning_schedule;
+mod warnings;
 
 use self::{
     constant::OutputState,

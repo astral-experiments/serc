@@ -205,10 +205,16 @@ pub(crate) struct MarshalMetadataIds {
     pub(crate) qualified_name: Option<MetadataId>,
 }
 
-/// A constant-cache admission or real code assembly in compilation order.
+/// A constant-cache admission, external retention, or real code assembly in compilation order.
 #[derive(Clone, Debug)]
 pub(crate) enum CompilationInterningEvent {
     CachedTuple(Vec<String>),
+    /// Complete additions whose canonical owners remain alive through serialization.
+    ExternalRetain(Vec<String>),
+    /// These canonical owners remain retained; other additions are unknown.
+    PartialExternalRetain(Vec<String>),
+    /// Additional retained canonical strings may have appeared at this boundary.
+    UnknownExternalAdditions,
     CodeAssembly(CodeInterningSummary),
 }
 
@@ -223,6 +229,8 @@ pub(crate) struct CodeInterningSummary {
     pub(crate) filename: CodeFilename,
     pub(crate) name: String,
     pub(crate) qualified_name: String,
+    /// Class scalar cache ownership, before assembly consults external intern additions.
+    pub(crate) qualified_name_is_canonical: Option<bool>,
 }
 
 impl CodeInterningSummary {
@@ -268,6 +276,7 @@ impl CodeInterningSummary {
             filename: code.filename.clone(),
             name: code.name.clone(),
             qualified_name: code.qualified_name.clone(),
+            qualified_name_is_canonical: code.marshal_provenance.qualified_name_is_canonical,
         }
     }
 }

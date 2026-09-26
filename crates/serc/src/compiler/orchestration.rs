@@ -291,32 +291,36 @@ impl<'source> Compiler<'source> {
         body: &'source Suite,
         python_version: crate::PythonVersion,
     ) -> Box<Self> {
-        Self::module_with_profile(
+        Self::module_with_warning_effects(
             filename,
             source,
             tokens,
             body,
             python_version,
             crate::NativeBuildProfile::Default,
+            None,
         )
     }
 
-    pub(crate) fn module_with_profile(
+    pub(crate) fn module_with_warning_effects(
         filename: impl Into<CodeFilename>,
         source: &'source str,
         tokens: &'source Tokens,
         body: &'source Suite,
         python_version: crate::PythonVersion,
         native_build_profile: crate::NativeBuildProfile,
+        warnings: Option<Rc<crate::compilation_effects::WarningRun>>,
     ) -> Box<Self> {
-        let context = Rc::new(CompilationContext::with_profile(
+        let mut context = CompilationContext::with_profile(
             filename.into(),
             source,
             tokens,
             body,
             python_version,
             native_build_profile,
-        ));
+        );
+        context.enable_warning_effects(warnings, body);
+        let context = Rc::new(context);
         let future_flags = context.module_plan().future_flags;
         let unit = CodeUnit::from_spec(CodeUnitSpec {
             scope: Scope::Module,
@@ -1465,7 +1469,7 @@ impl<'source> Compiler<'source> {
             },
         };
         code.validate()?;
-        code.marshal_provenance.assembly_order = self.context.record_code_assembly(&code);
+        code.marshal_provenance.assembly_order = self.context.record_code_assembly(&code)?;
         if matches!(self.unit.scope, Scope::Module) {
             code.marshal_provenance.interning_events = self.context.take_interning_events();
             code.marshal_provenance.interned_metadata_tuples =

@@ -794,3 +794,5 @@ mod annotation_format_name;
 mod postponed_surrogate_annotations;
 mod semantic_validation;
 mod surrogate_docstring;
+
+mod warning_effects;
