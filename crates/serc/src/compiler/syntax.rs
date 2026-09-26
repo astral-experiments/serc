@@ -23,7 +23,9 @@ use super::symbol::mangle_name;
 #[cfg(test)]
 mod declaration_tests;
 mod declarations;
+mod mapping_diagnostic;
 mod pattern_debug;
+mod unicode_printable;
 
 /// Validate AST-based syntax restrictions using Ruff's shared checker.
 pub(crate) fn validate(
@@ -1909,6 +1911,11 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             return;
         }
         // Preserve the existing public diagnostics for checks previously performed in lowering.
+        let mapping_diagnostic = matches!(error.kind, Kind::DuplicateMatchKey(_))
+            .then(|| {
+                mapping_diagnostic::find(self.source, self.body, error.range, self.python_version)
+            })
+            .flatten();
         let message = match &error.kind {
             Kind::WriteToDebug(WriteToDebugKind::Store) => "cannot assign to __debug__".to_owned(),
             Kind::WriteToDebug(WriteToDebugKind::Delete(_)) => "cannot delete __debug__".to_owned(),
@@ -1936,7 +1943,9 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             Kind::MultipleCaseAssignment(name) => {
                 format!("multiple assignments to name '{name}' in pattern")
             }
-            _ => error.to_string(),
+            _ => mapping_diagnostic
+                .as_ref()
+                .map_or_else(|| error.to_string(), |(message, _)| message.clone()),
         };
         *reported = Some(
             if matches!(
@@ -1950,7 +1959,7 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             ) {
                 CompileError::InvalidPattern {
                     message,
-                    range: error.range,
+                    range: mapping_diagnostic.map_or(error.range, |(_, range)| range),
                 }
             } else {
                 CompileError::invalid_syntax(message, error.range)
