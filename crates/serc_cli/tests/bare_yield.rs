@@ -5,6 +5,173 @@ use std::process::Command;
 use serc::{CompileOptions, PythonVersion, compile_bytes_with_options, compile_with_options};
 
 #[test]
+fn bare_yield_preserves_earlier_unsupported_syntax() {
+    let yield_statement = "def f():\n    yield, x\n";
+    for (version, prefix) in [
+        (PythonVersion::Py312, "type X[T = int] = T\n"),
+        (PythonVersion::Py312, "def g[T = int](): pass\n"),
+        (PythonVersion::Py312, "class C[T = int]: pass\n"),
+        (PythonVersion::Py312, "t'hello'\n"),
+        (PythonVersion::Py313, "t'hello'\n"),
+    ] {
+        let source = format!("{prefix}{yield_statement}");
+        let options = CompileOptions {
+            python_version: version,
+            ..CompileOptions::default()
+        };
+        for result in [
+            compile_with_options(&source, "case.py", &options),
+            compile_bytes_with_options(source.as_bytes(), "case.py", &options),
+        ] {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, serc::CompileError::InvalidSyntax { .. })
+                    && error.range().unwrap().start().to_usize() < prefix.len(),
+                "{version}: {source:?}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn bare_yield_with_other_syntax_errors() {
+    use serc::CompileError;
+
+    enum Expected {
+        Native,
+        Parse,
+        EarlierParse,
+    }
+    let yield_first = "def f():\n    yield, x\n";
+    let nesting = format!("x = {}1{}\n", "(".repeat(201), ")".repeat(201));
+    let mut cases = vec![
+        (format!("{yield_first}@\n"), Expected::Native),
+        (format!("{yield_first}if : pass\n"), Expected::Native),
+        (format!("{yield_first}$\n"), Expected::Native),
+        (format!("{yield_first}?\n"), Expected::Native),
+        (format!("{yield_first}`\n"), Expected::Native),
+        (format!("{yield_first}x = (\n"), Expected::Native),
+        ("def f():\n    yield, x; @\n".to_owned(), Expected::Native),
+        (
+            "def f():\n    α = (yield, x)\n@\n".to_owned(),
+            Expected::Native,
+        ),
+        (
+            "def f():\n    f'{(yield, 1)}'\n@\n".to_owned(),
+            Expected::Native,
+        ),
+        (
+            "def f():\n    f\"{f'{(yield, 1)}'}\"\n@\n".to_owned(),
+            Expected::Native,
+        ),
+        (
+            "def f():\n    t'{yield, 1}'\n@\n".to_owned(),
+            Expected::Native,
+        ),
+        (
+            "def f():\n    f\"{t'{yield, 1}'}\"\n@\n".to_owned(),
+            Expected::Native,
+        ),
+        (format!("@\n{yield_first}"), Expected::EarlierParse),
+        (format!("if : pass\n{yield_first}"), Expected::EarlierParse),
+        (format!("{yield_first})\n"), Expected::Parse),
+        (format!("{yield_first}x = 123abc\n"), Expected::Parse),
+        (format!("{yield_first}x = 'unterminated\n"), Expected::Parse),
+        (
+            format!("{yield_first}x = '''unterminated\n"),
+            Expected::Parse,
+        ),
+    ];
+    cases.push((format!("{yield_first}{nesting}"), Expected::Native));
+    cases.push((format!("{nesting}{yield_first}"), Expected::Native));
+
+    let oracle = r"
+import sys
+try:
+    compile(sys.argv[1], 'case.py', 'exec', dont_inherit=True)
+except SyntaxError as error:
+    print(error.msg)
+    print(error.lineno, error.offset)
+else:
+    raise AssertionError('expected a syntax error')
+";
+    for version in [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
+    ] {
+        let options = CompileOptions {
+            python_version: version,
+            ..CompileOptions::default()
+        };
+        for (source, expected) in &cases {
+            let mut python = match version {
+                PythonVersion::Py312 => common::python_312_command(),
+                PythonVersion::Py313 => common::python_313_command(),
+                PythonVersion::Py314 => common::python_3145_command(),
+                PythonVersion::Py315 => common::python_315_command(),
+            };
+            let output = python.args(["-c", oracle, source]).output().unwrap();
+            assert!(output.status.success(), "{version}: {source}: {output:?}");
+            let output = String::from_utf8(output.stdout).unwrap();
+            let mut lines = output.lines();
+            let native_message = lines.next().unwrap();
+            let position: Vec<usize> = lines
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .map(|value| value.parse().unwrap())
+                .collect();
+            let prefix: usize = source
+                .split_inclusive('\n')
+                .take(position[0] - 1)
+                .map(str::len)
+                .sum();
+            let line = source[prefix..].split('\n').next().unwrap();
+            let column = line
+                .char_indices()
+                .nth(position[1] - 1)
+                .map_or(line.len(), |(offset, _)| offset);
+            for result in [
+                compile_with_options(source, "case.py", &options),
+                compile_bytes_with_options(source.as_bytes(), "case.py", &options),
+            ] {
+                let error = result.unwrap_err();
+                match expected {
+                    Expected::Native => {
+                        assert!(
+                            error.to_string().ends_with(native_message),
+                            "{version}: {source:?}: {native_message:?} != {error}"
+                        );
+                        assert_eq!(
+                            error.range().unwrap().start().to_usize(),
+                            prefix + column,
+                            "{version}: {source:?}: {error}"
+                        );
+                    }
+                    Expected::Parse => assert!(
+                        matches!(error, CompileError::Parse(_)),
+                        "{version}: {source:?}: {error}"
+                    ),
+                    Expected::EarlierParse => {
+                        assert!(
+                            matches!(error, CompileError::Parse(_)),
+                            "{version}: {source:?}: {error}"
+                        );
+                        assert_eq!(
+                            error.range().unwrap().start().to_usize(),
+                            prefix + column,
+                            "{version}: {source:?}: {error}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn bare_yield_commas_match_native_grammar() {
     const F_DELIMITER: &str = "f-string: expecting '=', or '!', or ':', or '}'";
     const F_EXPRESSION: &str = "f-string: expecting a valid expression after '{'";
