@@ -24,6 +24,127 @@ const LEVELS: [OptimizationLevel; 3] = [
 static ORACLES: [OnceLock<OsString>; 4] = [const { OnceLock::new() }; 4];
 
 #[test]
+fn terminal_if_before_elided_assert_matches_cpython_312() {
+    for source in [
+        "def f(x):\n if x:\n  with context():\n   call()\n else:\n  if x:\n   assert x\n  assert x\n",
+        "def f(x, y):\n    if x:\n        with context():\n            call()\n    else:\n        if y:\n            pass\n        assert x\n        call()\n",
+        "def f(x, y):\n    if x:\n        with context():\n            call()\n    else:\n        if x:\n            assert x\n        assert x\n        return 1\n",
+        "def f(x, y):\n    if x:\n        with context():\n            call()\n    else:\n        if x:\n            assert x\n        assert x\n        raise ValueError\n",
+        "def f(x, y):\n    if x:\n        with context():\n            call()\n    else:\n        if x:\n            assert x\n        assert x\n        try:\n            call()\n        finally:\n            clean()\n",
+        "def f(x):\n if x:\n  call()\n else:\n  with context():\n   call()\n  if x:\n   assert x\n  assert x\n",
+        "def f(x):\n if x:\n  with context():\n   call()\n else:\n  if x:\n   assert x\n",
+        "def f(x):\n with context():\n  call()\n if x:\n  assert x\n assert x\n",
+        "def f(x):\n if x:\n  call()\n else:\n  if x:\n   assert x\n  assert x\n",
+        "def f(x):\n if x:\n  assert x\n assert x\n",
+        "def f(x):\n if x:\n  try:\n   call()\n  except Exception:\n   pass\n else:\n  if x:\n   assert x\n  assert x\n",
+        "def f(x):\n if x:\n  while x:\n   call()\n else:\n  if x:\n   assert x\n  assert x\n",
+        "def f(x):\n if x:\n  for a in x:\n   call()\n else:\n  if x:\n   assert x\n  assert x\n",
+        "def f(x):\n if x:\n  return 3\n else:\n  if x:\n   assert x\n  assert x\n",
+        "def f(x):\n try:\n  if x:\n   with context():\n    call()\n  else:\n   if x:\n    assert x\n   assert x\n except Exception:\n  recover()\n",
+        "def f(x):\n try:\n  if x:\n   with context():\n    call()\n  else:\n   if x:\n    assert x\n   assert x\n finally:\n  clean()\n",
+        "def f(x):\n with context():\n  if x:\n   with context():\n    call()\n  else:\n   if x:\n    assert x\n   assert x\n",
+        "def f(x):\n if x:\n  if x:\n   assert x\n  assert x\n else:\n  with context():\n   call()\n",
+        "def f(x):\n if x:\n  with context():\n   call()\n else:\n  if x:\n   assert x\n  assert x\n  assert x\n",
+        "async def f(x):\n if x:\n  with context():\n   call()\n else:\n  if x:\n   assert x\n  assert x\n",
+        "def f(x):\n if x:\n  with context():\n   yield x\n else:\n  if x:\n   assert x\n  assert x\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "terminal_elided_assert.py",
+            &LEVELS,
+            &[PythonVersion::Py312],
+        );
+    }
+}
+
+#[test]
+fn terminal_if_before_elided_assert_keeps_manager_exception_owner_312() {
+    const SOURCE: &str = "def f(x):\n if x:\n  with context():\n   call()\n else:\n  if x:\n   assert x\n  assert x\n";
+    const TRACE: &str = r"
+import dis, json, marshal, sys
+events = []
+class Manager:
+    def __enter__(self):
+        events.append('enter')
+    def __exit__(self, kind, value, traceback):
+        events.append('exit:' + kind.__name__)
+        return False
+scope = {'context': Manager, 'call': lambda: events.append('body')}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+f = scope['f']
+target = next(i.offset for i in dis.get_instructions(f)
+              if i.opname == 'LOAD_GLOBAL' and i.argval == 'call')
+fired = [False]
+def trace(frame, event, arg):
+    if frame.f_code is f.__code__:
+        if event == 'call':
+            frame.f_trace_opcodes = True
+        elif event == 'opcode' and frame.f_lasti == target:
+            fired[0] = True
+            raise ValueError('injected')
+    return trace
+sys.settrace(trace)
+try:
+    f(False)
+except AssertionError:
+    pass
+sys.settrace(None)
+events.clear()
+sys.settrace(trace)
+try:
+    f(True)
+except ValueError:
+    events.append('escaped')
+finally:
+    sys.settrace(None)
+assert fired[0]
+print(json.dumps(events))
+";
+    for optimization_level in LEVELS {
+        let native = oracle(
+            SOURCE.as_bytes(),
+            "terminal_elided_assert.py",
+            PythonVersion::Py312,
+            optimization_level,
+        );
+        assert!(native.status.success());
+        let actual = compile_with_options(
+            SOURCE,
+            "terminal_elided_assert.py",
+            &CompileOptions {
+                python_version: PythonVersion::Py312,
+                optimization_level,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap()
+        .marshal();
+        let execute = |bytes: &[u8]| {
+            let mut child = Command::new(ORACLES[0].get().unwrap())
+                .args(["-I", "-S", "-c", TRACE])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(bytes).unwrap();
+            child.wait_with_output().unwrap()
+        };
+        for result in [execute(&native.stdout), execute(&actual)] {
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(
+                result.stdout,
+                b"[\"enter\", \"exit:ValueError\", \"escaped\"]\n"
+            );
+        }
+    }
+}
+
+#[test]
 fn loop_tail_elided_else_matches_cpython() {
     for source in [
         r"

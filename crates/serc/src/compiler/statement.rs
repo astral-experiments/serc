@@ -1717,7 +1717,20 @@ impl<'source> Compiler<'source> {
                 }
             }
             let is_final = index + 1 == body.len();
-            if is_final && final_expression_becomes_return {
+            // In 3.12 an assertion removed by optimization does not postpone the
+            // enclosing branch's implicit return or its separate conditional exits.
+            let terminal_before_elided_assertions = self.context.python_version
+                == crate::PythonVersion::Py312
+                && !is_final
+                && self.control.statements.terminal_if_branch_has_siblings
+                && matches!(statement, Stmt::If(_))
+                && body[index + 1..].iter().all(|statement| {
+                    matches!(
+                        self.context.optimized_locations.get(&statement.range()),
+                        Some(super::optimization::OptimizedLocation::Elided)
+                    )
+                });
+            if (is_final || terminal_before_elided_assertions) && final_expression_becomes_return {
                 match statement {
                     Stmt::While(statement)
                         if self.context.python_version >= crate::PythonVersion::Py314
