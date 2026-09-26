@@ -16724,7 +16724,24 @@ impl<'source> Compiler<'source> {
                     && elided_else
                     && matches!(self.unit.scope, Scope::Function { .. })
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-                    && !self.has_active_control_flow_region()
+                    // A single ordinary try keeps the backedge's exception owner while
+                    // the false condition supplies its location.
+                    && (!self.has_active_control_flow_region()
+                        || (self.control.generators.generator_region_start.is_none()
+                            && self.control.withs.active_with_region_exclusions.is_empty()
+                            && self
+                                .control
+                                .loops
+                                .contexts
+                                .last()
+                                .is_some_and(|context| !context.has_orelse)
+                            && self
+                                .control
+                                .exceptions
+                                .active_exception_region_exclusions
+                                .len()
+                                == 1
+                            && self.control.exceptions.active_try_body_start.is_some()))
                     && self.control.withs.active_with_exits.is_empty()
                     && !self.control.in_exception_handler()
                     && self.control.exceptions.active_exception_group_handlers == 0

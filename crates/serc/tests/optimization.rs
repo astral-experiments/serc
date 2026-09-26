@@ -708,6 +708,30 @@ if events != ['finish']:
 }
 
 #[test]
+fn elided_inner_else_keeps_protected_loop_backedge_location() {
+    for source in [
+        "def f(a,b,c,ys):\n try:\n  for v in ys:\n   if a:\n    if b:\n     z = v\n    else:\n     assert b\n   else:\n    consume(v)\n except ValueError:\n  recover()\n",
+        "def f(a,b,c,ys):\n try:\n  for v in ys:\n   if a:\n    if b or c:\n     consume(v)\n    else:\n     assert b\n   else:\n    consume(v)\n  after = a\n except ValueError:\n  recover()\n",
+        "def f(a,b,c,ys):\n try:\n  for v in ys:\n   if a:\n    if not b:\n     consume(v)\n    else:\n     assert b\n   else:\n    consume(v)\n  z = a + 1\n  pass\n  pass\n except ValueError:\n  recover()\n",
+        "def f(a,b,c,ys):\n try:\n  for v in ys:\n   if a:\n    if b < c:\n     z = v\n    else:\n     assert b\n   else:\n    consume(v)\n  after = a\n except ValueError:\n  recover()\n else:\n  consume(0)\n",
+        "def f(a,b,c,items):\n    try:\n        for item in items:\n            if a:\n                if b:\n                    consume(item)\n                elif c:\n                    consume(item)\n                else:\n                    assert b\n            else:\n                consume(item)\n        z = 1\n    except ValueError:\n        recover()\n",
+        "def f(a,b,c,items):\n    try:\n        for item in items:\n            if a:\n                if b:\n                    consume(item)\n                elif c:\n                    assert c\n                else:\n                    assert b\n            else:\n                consume(item)\n        else:\n            finish()\n        z = 1\n    except ValueError:\n        recover()\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "sub/protected_elided_inner_else_loop.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+}
+
+#[test]
 fn nested_terminal_if_before_elided_assert_matches_cpython() {
     for source in [
         "def f(a,b):\n if a:\n  if b:\n   x = 1\n  assert a\n",
