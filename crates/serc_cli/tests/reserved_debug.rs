@@ -17,6 +17,25 @@ fn reserved_debug_writes_match_target_rules() {
         ("if False:\n    obj.__debug__ = 1\n", "store"),
         ("def f():\n    return\n    obj.__debug__ = 1\n", "store"),
         ("f(__debug__=1)\n", "store"),
+        ("f(__debug__=1, x=1, x=2)\n", "store"),
+        ("f(__debug__=1, __debug__=2)\n", "store"),
+        ("f(x=1, x=2, __debug__=1)\n", "duplicate-first"),
+        ("f(g(x=1, x=2), __debug__=1)\n", "store"),
+        ("g(x=1, x=2)(__debug__=1)\n", "store"),
+        ("f(x=g(y=1, y=2), __debug__=1)\n", "store"),
+        ("class C(__debug__=1, x=1, x=2): pass\n", "store"),
+        ("class C(x=1, x=2, __debug__=1): pass\n", "duplicate-first"),
+        (
+            "@f(x=1, x=2)\nclass C(__debug__=1): pass\n",
+            "duplicate-first",
+        ),
+        ("class C(__debug__=1):\n    g(y=1, y=2)\n", "body-duplicate"),
+        (
+            "class C[T](__debug__=1):\n    g(y=1, y=2)\n",
+            "body-duplicate",
+        ),
+        ("class C(__debug__=1):\n    break\n", "body-break"),
+        ("class C(g(y=1, y=2), __debug__=1): pass\n", "store"),
         ("f(**values, __debug__=1)\n", "store"),
         ("class C(__debug__=1): pass\n", "store"),
         ("class C[T](__debug__=1): pass\n", "store"),
@@ -65,7 +84,12 @@ sys.stdout.buffer.write(marshal.dumps(code))
             let modern = matches!(version, PythonVersion::Py314 | PythonVersion::Py315);
             let expected = match kind {
                 "store" => Some("cannot assign to __debug__"),
-                "modern" if modern => Some("cannot assign to __debug__"),
+                "modern" | "duplicate-first" | "body-duplicate" | "body-break" if modern => {
+                    Some("cannot assign to __debug__")
+                }
+                "duplicate-first" => Some("keyword argument repeated: x"),
+                "body-duplicate" => Some("keyword argument repeated: y"),
+                "body-break" => Some("'break' outside loop"),
                 "delete" if modern => Some("cannot delete __debug__"),
                 _ => None,
             };
