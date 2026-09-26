@@ -323,6 +323,19 @@ fn protected_elided_if_else_preserves_conditional_join() {
     }
 }
 
+#[test]
+fn elided_outer_else_preserves_nested_conditional_join() {
+    for source in [
+        "def f(a,b):\n if a:\n  if b:\n   x = 1\n  else:\n   x = 2\n else:\n  assert a\n work(x)\n",
+        "def f(a,b):\n if a and b:\n  if not b:\n   x = 1\n  else:\n   x = 2\n else:\n  assert a\n work(x)\n",
+        "def f(a,b):\n if a:\n  if b:\n   work(1)\n  else:\n   work(2)\n else:\n  assert a\n finish()\n",
+        "def f(a,b):\n if a:\n  if b:\n   x = 1\n  else:\n   x = 2\n else:\n  assert a\n  assert b\n work(x)\n",
+        "def f(a,b):\n if a:\n  if b:\n   x = 1\n  else:\n   x = 2\n else:\n  assert a\n  work(a)\n finish()\n",
+    ] {
+        assert_matches_cpython(source, "sub/elided_nested_if.py", &LEVELS);
+    }
+}
+
 const ORACLE_IDENTITY: &str = r"
 import importlib.util, sys
 assert sys.implementation.name == 'cpython'

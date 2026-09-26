@@ -12876,7 +12876,42 @@ impl<'source> Compiler<'source> {
                                     self.context.optimized_locations.get(&stmt.range()),
                                     Some(super::optimization::OptimizedLocation::Elided)
                                 )));
-                    if optimized_empty_both {
+                    let optimized_nested_else = self.context.python_version
+                        >= crate::PythonVersion::Py314
+                        && branch_index == 0
+                        && matches!(self.unit.scope, Scope::Function { .. })
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == 0
+                        && self.control.loops.contexts.is_empty()
+                        && !self.has_active_control_flow_region()
+                        && !self.control.in_exception_handler()
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && self.control.finally.active_finally_try_bodies == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && condition_has_linear_runtime_leaves(test)
+                        && !expression_suspends_current_scope(test)
+                        && original_condition_has_unique_jump_target(test, true)
+                        && matches!(statement.elif_else_clauses.as_slice(), [clause]
+                        if clause.test.is_none()
+                            && !clause.body.is_empty()
+                            && clause.body.iter().all(|stmt| matches!(
+                                self.context.optimized_locations.get(&stmt.range()),
+                                Some(super::optimization::OptimizedLocation::Elided)
+                            )))
+                        && matches!(body, [Stmt::If(nested)]
+                            if condition_has_linear_runtime_leaves(&nested.test)
+                                && !expression_suspends_current_scope(&nested.test)
+                                && original_condition_has_unique_jump_target(&nested.test, true)
+                                && original_condition_has_unique_jump_target(&nested.test, false)
+                                && suite_has_linear_borrow_fallthrough(&nested.body)
+                                && !suite_contains_yield(&nested.body)
+                                && matches!(nested.elif_else_clauses.as_slice(), [clause]
+                                    if clause.test.is_none()
+                                        && suite_has_linear_borrow_fallthrough(&clause.body)
+                                        && !suite_contains_yield(&clause.body)));
+                    if optimized_empty_both || optimized_nested_else {
                         self.assembler
                             .preserve_redundant_jump_nop_after_threading(branch_exit);
                     } else if declaration_only_body {
