@@ -13047,8 +13047,7 @@ impl<'source> Compiler<'source> {
                                 && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                                 && self.control.loops.contexts.is_empty()
                                 && !self.control.withs.active_with_region_exclusions.is_empty()
-                                && self.control.exceptions.active_exception_region_exclusions.is_empty()
-                                && self.control.statements.context.followed_by_call_expression))
+                                && self.control.exceptions.active_exception_region_exclusions.is_empty()))
                         && !self.control.in_exception_handler()
                         && self.control.exceptions.active_exception_group_handlers == 0
                         && self.control.finally.active_finally_try_bodies == 0

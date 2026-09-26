@@ -3350,3 +3350,144 @@ fn nonterminal_pass_finally_preserves_handler_for_all_targets() {
         assert_matches_cpython(&source, "nonterminal_pass_finally.py", &LEVELS);
     }
 }
+
+#[test]
+fn optimized_with_assertion_join_before_noncall_matches_cpython() {
+    for successor in [
+        "",
+        "        value = 1\n",
+        "        del flag\n",
+        "        return flag\n",
+        "        assert flag\n",
+        "        if flag:\n            value = 1\n",
+    ] {
+        let source = format!(
+            "def f(flag, manager):\n    with manager:\n        if flag:\n            assert flag\n        else:\n            assert flag\n{successor}"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "optimized_with_join_noncall.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+    // The short-circuit edge also reaches this join and must not retain the NOP.
+    assert_matches_cpython_versions(
+        "def f(a, b, manager):\n    with manager:\n        if a or b:\n            assert a\n        else:\n            assert b\n        value = a\n",
+        "optimized_with_shared_join.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
+fn optimized_with_assertion_join_before_noncall_keeps_manager_owner() {
+    const SOURCE: &str = r"
+def terminal(flag):
+    with manager('terminal'):
+        if flag:
+            assert flag
+        else:
+            assert flag
+
+def assigned(flag):
+    with manager('outer'), manager('inner'):
+        if flag: assert flag
+        else: assert flag
+        value = 1
+
+def deleted(flag):
+    with manager('delete'):
+        if flag:
+            assert flag
+        else:
+            assert flag
+        del flag
+";
+    const TRACE: &str = r"
+import dis, marshal, sys
+
+events = []
+class Fault(Exception):
+    pass
+class Manager:
+    def __init__(self, name):
+        self.name = name
+    def __enter__(self):
+        events.append((self.name, 'enter'))
+    def __exit__(self, typ, value, tb):
+        events.append((self.name, 'exit', typ.__name__ if typ else None))
+        return False
+scope = {'manager': Manager}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+for name, expected in [
+    ('terminal', [('terminal', 'enter'), 'hit', ('terminal', 'exit', 'Fault')]),
+    ('assigned', [('outer', 'enter'), ('inner', 'enter'), 'hit',
+                  ('inner', 'exit', 'Fault'), ('outer', 'exit', 'Fault')]),
+    ('deleted', [('delete', 'enter'), 'hit', ('delete', 'exit', 'Fault')]),
+]:
+    fn = scope[name]
+    instructions = list(dis.get_instructions(fn))
+    offsets = [b.offset for a, b in zip(instructions, instructions[1:])
+               if a.opname == 'NOT_TAKEN' and b.opname == 'NOP']
+    assert len(offsets) == 1, (name, offsets)
+    events.clear()
+    def trace(frame, event, arg):
+        if frame.f_code is fn.__code__:
+            frame.f_trace_opcodes = True
+            if event == 'opcode' and frame.f_lasti == offsets[0]:
+                events.append('hit')
+                raise Fault()
+        return trace
+    sys.settrace(trace)
+    try:
+        try:
+            fn(True)
+            raise AssertionError('injection did not escape')
+        except Fault:
+            pass
+    finally:
+        sys.settrace(None)
+    assert events == expected, (name, events, expected)
+";
+    for level in [OptimizationLevel::One, OptimizationLevel::Two] {
+        let native = oracle(
+            SOURCE.as_bytes(),
+            "optimized_with_join_owner.py",
+            PythonVersion::Py314,
+            level,
+        );
+        assert!(native.status.success());
+        let actual = compile_with_options(
+            SOURCE,
+            "optimized_with_join_owner.py",
+            &CompileOptions {
+                python_version: PythonVersion::Py314,
+                optimization_level: level,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap()
+        .marshal();
+        assert_eq!(actual, native.stdout);
+        let index = VERSIONS
+            .iter()
+            .position(|(version, _, _)| *version == PythonVersion::Py314)
+            .unwrap();
+        for payload in [&native.stdout, &actual] {
+            let mut child = Command::new(ORACLES[index].get().unwrap())
+                .args(["-I", "-S", "-c", TRACE])
+                .stdin(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(payload).unwrap();
+            let result = child.wait_with_output().unwrap();
+            assert!(
+                result.status.success(),
+                "{level:?}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+}
