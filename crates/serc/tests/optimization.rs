@@ -2969,3 +2969,30 @@ fn elided_match_case_assertions_keep_success_locations() {
         );
     }
 }
+
+#[test]
+fn optimized_with_assertion_join_before_call_matches_cpython() {
+    for condition in ["x", "not x", "x and y", "x < y", "f(x)", "x is None"] {
+        let source = format!(
+            "def f(x, y, callback, manager):\n    with manager:\n        if {condition}:\n            assert x\n        else:\n            assert y\n        callback(x)\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "optimized_with_join.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+
+    assert_matches_cpython_versions(
+        "def f(x, y, callback, manager1, manager2):\n    with manager1, manager2:\n        if y:\n            if x:\n                assert x\n            else:\n                assert y\n            callback(x if y else x)\n",
+        "optimized_with_nested_join.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
