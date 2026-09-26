@@ -700,6 +700,8 @@ pub(super) struct StatementContext {
     followed_by_call_expression: bool,
     // Whether the next statement assigns or deletes one name in this suite.
     followed_by_name_assignment_or_deletion: bool,
+    // Whether the next statement is a direct if with a name test.
+    followed_by_direct_name_if: bool,
     // Whether that successor is a direct loop break.
     followed_by_break: bool,
     // Whether that successor is a direct return of one local. CPython copies this tiny exit
@@ -2645,6 +2647,9 @@ impl<'source> Compiler<'source> {
                         Some(Stmt::Assign(assignment)) if matches!(assignment.targets.as_slice(), [Expr::Name(_)]))
                         || matches!(body.get(index + 1),
                             Some(Stmt::Delete(deletion)) if matches!(deletion.targets.as_slice(), [Expr::Name(_)])),
+                    followed_by_direct_name_if: matches!(body.get(index + 1),
+                        Some(Stmt::If(branch)) if matches!(branch.test.as_ref(), Expr::Name(name) if name.id.as_str() != "__debug__")
+                            && branch.elif_else_clauses.is_empty()),
                     followed_by_name_return,
                     followed_by_literal_return,
                     followed_by_global_attribute_return,
@@ -21806,7 +21811,52 @@ impl<'source> Compiler<'source> {
             // until actual copying replaces it with the owner's donor record.
             let loop_tail_inherits_outer_owner =
                 empty_try_falls_through_to_loop_backedge && body_noop_location.is_some();
+            // The normal exit of this direct nested try still falls through within
+            // the enclosing ordinary try before the next executable statement.
+            let direct_nested_pass_exit_in_outer_try = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && self.control.loops.contexts.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .len()
+                    == 1
+                && self.control.exceptions.active_try_marker_slots.len() == 1
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self.control.finally.is_inactive_for_return_unwind()
+                && !self.control.exceptions.prevent_try_exit_inlining
+                // Direct body ranges follow source order, so membership stays cheap
+                // even for a try containing many nested statements.
+                && self
+                    .control
+                    .exceptions
+                    .direct_try_body_statements
+                    .binary_search_by_key(&statement.range.start(), Ranged::start)
+                    .is_ok_and(|index| {
+                        self.control.exceptions.direct_try_body_statements[index] == statement.range
+                    })
+                && !self.control.exceptions.direct_try_body_has_else
+                && !statement.is_star
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty()
+                && matches!(statement.body.as_slice(), [Stmt::Pass(pass)]
+                    if self.source_location(pass.range).line > self.source_location(statement.range).line)
+                && body_noop_location.is_some()
+                && (self.control.statements.context.followed_by_call_expression
+                    || self
+                        .control
+                        .statements
+                        .context
+                        .followed_by_name_assignment_or_deletion
+                    || self.control.statements.context.followed_by_direct_name_if);
             let exception_policy = if !loop_tail_inherits_outer_owner
+                && !direct_nested_pass_exit_in_outer_try
                 && !coroutine_nested_pass_exit
                 && (exclude_nested_normal_exit
                     || (body_has_elided_assertion
@@ -21829,6 +21879,7 @@ impl<'source> Compiler<'source> {
                 ExceptionPolicy::default()
             };
             let exit_exclusion_start = if !loop_tail_inherits_outer_owner
+                && !direct_nested_pass_exit_in_outer_try
                 && !self
                     .control
                     .exceptions

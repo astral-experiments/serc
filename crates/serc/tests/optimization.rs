@@ -3174,3 +3174,96 @@ fn optimized_with_assertion_join_before_call_matches_cpython() {
         &[PythonVersion::Py314],
     );
 }
+
+#[test]
+fn nested_pass_exit_retains_enclosing_try_owner() {
+    const SOURCE: &str = "def f(flag, items):\n    try:\n        try:\n            pass\n        except ValueError:\n            pass\n        work()\n    except Fault:\n        events.append('caught')\n";
+    const TRACE: &str = r"
+import dis, marshal, sys
+class Fault(Exception):
+    pass
+events = []
+scope = {'Fault': Fault, 'events': events}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+f = scope['f']
+targets = [i.offset for i in dis.get_instructions(f)
+           if i.opname == 'NOP' and i.positions.lineno == 4]
+assert len(targets) == 1, targets
+target = targets[0]
+hits = []
+def trace(frame, event, arg):
+    if frame.f_code is f.__code__:
+        frame.f_trace_opcodes = True
+        if event == 'opcode' and frame.f_lasti == target:
+            hits.append(target)
+            raise Fault()
+    return trace
+sys.settrace(trace)
+try:
+    f(True, [1])
+finally:
+    sys.settrace(None)
+assert hits == [target], hits
+assert events == ['caught'], events
+";
+    for (version, index) in [(PythonVersion::Py314, 2), (PythonVersion::Py315, 3)] {
+        for optimization_level in LEVELS {
+            let native = oracle(
+                SOURCE.as_bytes(),
+                "nested_pass_exit.py",
+                version,
+                optimization_level,
+            );
+            assert!(native.status.success());
+            let actual = compile_with_options(
+                SOURCE,
+                "nested_pass_exit.py",
+                &CompileOptions {
+                    python_version: version,
+                    optimization_level,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .marshal();
+            assert_eq!(actual, native.stdout, "{version} {optimization_level:?}");
+            for payload in [&native.stdout, &actual] {
+                let mut child = Command::new(ORACLES[index].get().unwrap())
+                    .args(["-I", "-S", "-c", TRACE])
+                    .stdin(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child.stdin.take().unwrap().write_all(payload).unwrap();
+                let result = child.wait_with_output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{version} {optimization_level:?}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_pass_exit_successors_match_cpython() {
+    for successor in ["out = 1", "del item", "if flag:\n            assert flag"] {
+        let source = format!(
+            "def f(flag, item):\n    try:\n        try:\n            pass\n        except ValueError:\n            pass\n        {successor}\n    except Fault:\n        events.append('caught')\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "nested_pass_successor.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+
+    assert_matches_cpython_versions(
+        "def f():\n    try:\n        try: pass\n        except ValueError:\n            pass\n        work()\n    except Fault:\n        events.append('caught')\n",
+        "nested_same_line_pass.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
