@@ -70,6 +70,199 @@ fn semantic_validation_respects_scope_boundaries() {
 }
 
 #[test]
+fn mapping_pattern_keys_preserve_surrogate_values() {
+    let patterns = [
+        r"{'\ud800': _, '\ud801': _}",
+        r"{'\ud800': _, '\ufffd': _}",
+        r"{'\ud800\udc00': _, '\U00010000': _}",
+        r"{r'\ud800': _, '\ud800': _}",
+        r"{'prefix' '\ud800': _, 'prefix' '\ud801': _}",
+        r"{'\ud800': {'\ud801': _}, '\ud801': {'\ud800': _}}",
+        r"{'nested': {'\ud800': _, '\ud801': _}}",
+        r"{'\ud800': _, '\ud801': _} | {'\ud800': _, '\ud801': _}",
+        r"{'\ufffd\ud800': _, '\ufffd\ud801': _}",
+        r"{'\ud800\ufffd': _, '\ufffd\ud800': _}",
+    ];
+    for pattern in patterns {
+        let source = format!("match subject:\n    case {pattern}: pass\n");
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let options = CompileOptions {
+                python_version,
+                ..CompileOptions::default()
+            };
+            assert!(
+                compile_with_options(&source, "semantic.py", &options).is_ok(),
+                "{source}"
+            );
+            assert!(
+                compile_bytes_with_options(source.as_bytes(), "semantic.py", &options).is_ok(),
+                "{source}"
+            );
+        }
+        assert_matches_cpython_marshal(&source, "semantic.py");
+    }
+    for key_count in [30, 31] {
+        use std::fmt::Write as _;
+
+        let mut numeric_keys = String::new();
+        for index in 0..key_count - 2 {
+            write!(numeric_keys, ", {index}: _").unwrap();
+        }
+        let source = format!(
+            "match subject:\n    case {{'\\ud800': _, '\\ud801': _{numeric_keys}}}: pass\n"
+        );
+        assert_matches_cpython_marshal(&source, "semantic.py");
+    }
+    assert_matches_cpython_marshal(
+        "before = '\\ud800'\nmatch subject:\n    case {'\\ud800': _, '\\ud801': _}: pass\n",
+        "semantic.py",
+    );
+    let rest = "match subject:\n    case {'\\ud800': _, '\\ud801': _, **rest}: pass\n";
+    for python_version in [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
+    ] {
+        let options = CompileOptions {
+            python_version,
+            ..CompileOptions::default()
+        };
+        assert!(compile_with_options(rest, "semantic.py", &options).is_ok());
+    }
+}
+
+#[test]
+fn surrogate_mapping_keys_match_other_cpython_targets() {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let source = "match subject:\n    case {'\\ud800': _, '\\ud801': _, '\\ufffd': _}: pass\n";
+    let script = "import importlib.util, marshal, sys; assert sys.implementation.name == 'cpython'; assert sys.version.split()[0] == sys.argv[1]; assert importlib.util.MAGIC_NUMBER.hex() == sys.argv[2]; code = compile(sys.stdin.buffer.read(), 'semantic.py', 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))";
+    for (python_version, variable, default) in [
+        (PythonVersion::Py312, "SERC_TEST_PYTHON_312", "python3.12"),
+        (PythonVersion::Py313, "SERC_TEST_PYTHON_313", "python3.13"),
+        (PythonVersion::Py314, "SERC_TEST_PYTHON", "python3.14"),
+        (PythonVersion::Py315, "SERC_TEST_PYTHON_315", "python3.15"),
+    ] {
+        let executable = std::env::var_os(variable).unwrap_or_else(|| default.into());
+        let target = python_version.target();
+        let mut child = Command::new(executable)
+            .args(["-I", "-S", "-X", "utf8", "-c", script])
+            .args([target.tag.strip_prefix('v').unwrap(), &target.magic_hex()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(source.as_bytes())
+            .unwrap();
+        let expected = child.wait_with_output().unwrap();
+        assert!(
+            expected.status.success(),
+            "{}",
+            String::from_utf8_lossy(&expected.stderr)
+        );
+        let options = CompileOptions {
+            python_version,
+            ..CompileOptions::default()
+        };
+        for result in [
+            compile_with_options(source, "semantic.py", &options),
+            compile_bytes_with_options(source.as_bytes(), "semantic.py", &options),
+        ] {
+            assert_eq!(
+                result.unwrap().marshal(),
+                expected.stdout,
+                "{python_version}"
+            );
+        }
+    }
+}
+
+#[test]
+fn mapping_pattern_surrogate_duplicates_and_error_precedence() {
+    for (pattern, diagnostic) in [
+        (r"{'\ud800': _, '\U0000d800': _}", "duplicate key"),
+        (r"{'\ud800': _, '\ud801': _, '\ud800': _}", "duplicate key"),
+        (
+            r"{'\ud800': _, '\ufffd': _, '\ud801': _, '\ud801': _}",
+            "duplicate key",
+        ),
+        (r"{'a' '\ud800': _, 'a\ud800': _}", "duplicate key"),
+        (
+            r"{'\ufffd\ud800': _, '\N{REPLACEMENT CHARACTER}\U0000d800': _}",
+            "duplicate key",
+        ),
+        (
+            r"{'\ufffd': _, '\N{REPLACEMENT CHARACTER}': _}",
+            "duplicate key",
+        ),
+        (
+            r"{'\ud800': {'\ud801': _, '\ud801': _}, '\ud801': _}",
+            "duplicate key",
+        ),
+        (
+            r"{'\ud800': _ | 1, '\ud801': _}",
+            "makes remaining patterns unreachable",
+        ),
+        (
+            r"{'\ud800': _ | 1, '\ud801': _, '\ud801': _}",
+            "duplicate key",
+        ),
+        (
+            r"{'\ud800': _, '\ud801': _, 1: _, True: _}",
+            "duplicate key",
+        ),
+    ] {
+        let source = format!("match subject:\n    case {pattern}: pass\n");
+        let native = python_3145_command()
+            .args([
+                "-c",
+                "import sys; compile(sys.argv[1], 'semantic.py', 'exec')",
+                &source,
+            ])
+            .output()
+            .unwrap();
+        assert!(!native.status.success(), "CPython accepted {source}");
+        assert!(
+            String::from_utf8_lossy(&native.stderr).contains(diagnostic),
+            "{source}"
+        );
+        for python_version in [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let options = CompileOptions {
+                python_version,
+                ..CompileOptions::default()
+            };
+            for result in [
+                compile_with_options(&source, "semantic.py", &options),
+                compile_bytes_with_options(source.as_bytes(), "semantic.py", &options),
+            ] {
+                let error = result.unwrap_err();
+                assert!(
+                    error.to_string().contains(diagnostic),
+                    "{python_version}: {source}: {error}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn unreachable_or_pattern_arms_match_cpython_diagnostics() {
     let sources = [
         "match subject:\n    case [value | value]: pass\n",
