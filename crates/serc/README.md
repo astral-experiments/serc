@@ -35,21 +35,6 @@ let module = compile_bytes_with_options(b"answer = 42\n", "module.py", &options)
 let pyc = module.to_timestamp_pyc(1_700_000_000, 12);
 ```
 
-To write a hash-invalidated cache instead, pass the original source bytes to
-`to_hash_pyc`. A checked cache is normally validated against the source on
-import; an unchecked cache relies on an external system to keep it current.
-Python's `--check-hash-based-pycs` option can override those defaults.
-
-```rust
-let source = b"# coding: utf-8\r\nanswer = 42\r\n";
-let module = serc::compile_bytes(source, "module.py").unwrap();
-let checked_pyc = module.to_hash_pyc(source, true);
-let unchecked_pyc = module.to_hash_pyc(source, false);
-```
-
-The hash must use the same raw bytes that were compiled, before source decoding
-or newline normalization.
-
 `PythonVersion` also provides `Py312`, `Py313`, and `Py314`. The returned
 `CompiledModule` retains the selected target for marshal and `.pyc` output.
 `compile_with_options` accepts UTF-8 text;

@@ -68,23 +68,6 @@ with `RAYON_NUM_THREADS`:
 serc compile --jobs 4 path/to/package
 ```
 
-### Cache invalidation
-
-By default, Serc writes caches that Python validates using the source file's
-timestamp and size. Use `--invalidation-mode` to choose hash-based caches
-instead:
-
-```console
-serc compile --invalidation-mode checked-hash path/to/package
-serc compile --invalidation-mode unchecked-hash path/to/package
-```
-
-For checked hashes, Python normally hashes the source on import to decide if a
-cache is current. For unchecked hashes, Python normally trusts an external
-system to keep the cache up to date. Use `--invalidation-mode timestamp` to
-select the default explicitly. These modes affect cache validation, not the
-compiled bytecode.
-
 ### Python version
 
 Serc emits Python 3.14-compatible bytecode by default, but supports target
