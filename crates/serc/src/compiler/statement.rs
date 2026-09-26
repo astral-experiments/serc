@@ -698,6 +698,8 @@ pub(super) struct StatementContext {
     copied_nested_handler_join_successor: bool,
     // Whether the next statement evaluates a call expression in this suite.
     followed_by_call_expression: bool,
+    // Whether the next statement assigns or deletes one name in this suite.
+    followed_by_name_assignment_or_deletion: bool,
     // Whether that successor is a direct loop break.
     followed_by_break: bool,
     // Whether that successor is a direct return of one local. CPython copies this tiny exit
@@ -2525,6 +2527,10 @@ impl<'source> Compiler<'source> {
                     followed_by_break,
                     followed_by_call_expression: matches!(body.get(index + 1),
                         Some(Stmt::Expr(expression)) if matches!(expression.value.as_ref(), Expr::Call(_))),
+                    followed_by_name_assignment_or_deletion: matches!(body.get(index + 1),
+                        Some(Stmt::Assign(assignment)) if matches!(assignment.targets.as_slice(), [Expr::Name(_)]))
+                        || matches!(body.get(index + 1),
+                            Some(Stmt::Delete(deletion)) if matches!(deletion.targets.as_slice(), [Expr::Name(_)])),
                     followed_by_name_return,
                     followed_by_literal_return,
                     followed_by_global_attribute_return,
@@ -12874,9 +12880,10 @@ impl<'source> Compiler<'source> {
                                 && self.control.withs.active_with_region_exclusions.is_empty()
                                 && self.control.exceptions.active_try_marker_slots.len() == 1
                                 && self.control.exceptions.active_exception_region_exclusions.len() == 1
-                                // A call expression survives optimization, so this try body
+                                // These statements survive optimization, so this try body
                                 // has a real successor after the original conditional join.
-                                && self.control.statements.context.followed_by_call_expression
+                                && (self.control.statements.context.followed_by_call_expression
+                                    || self.control.statements.context.followed_by_name_assignment_or_deletion)
                                 && self.control.exceptions.direct_try_body_statements.contains(&statement.range)
                                 && !direct_try_body_exit))
                         && !self.control.in_exception_handler()

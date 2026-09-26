@@ -336,6 +336,21 @@ fn elided_outer_else_preserves_nested_conditional_join() {
     }
 }
 
+#[test]
+fn protected_elided_if_else_preserves_assignment_and_delete_join() {
+    for source in [
+        "def f(a):\n try:\n  if a:\n   assert a\n  else:\n   assert not a\n  a = a + 1\n except ValueError:\n  recover()\n",
+        "def f(a):\n try:\n  if a:\n   assert a\n  else:\n   assert not a\n  del a\n except ValueError:\n  recover()\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "sub/protected_elided_assignment_delete.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
 const ORACLE_IDENTITY: &str = r"
 import importlib.util, sys
 assert sys.implementation.name == 'cpython'
