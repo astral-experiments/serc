@@ -332,6 +332,7 @@ fn indentation_depth_preserves_earlier_legacy_template_error() {
 fn indentation_depth_preserves_earlier_version_errors() {
     let deep = nested_source(100, " ");
     let template = "value = t'hello'\n";
+    let delimiters = format!("value = {}1{}\n", "(".repeat(201), ")".repeat(201));
     for (version, prefix, expected) in [
         (
             PythonVersion::Py312,
@@ -348,20 +349,27 @@ fn indentation_depth_preserves_earlier_version_errors() {
             "lazy import os\n",
             "Cannot use `lazy` import",
         ),
+        (
+            PythonVersion::Py314,
+            "lazy import os\n",
+            "Cannot use `lazy` import",
+        ),
     ] {
         let options = CompileOptions {
             python_version: version,
             ..CompileOptions::default()
         };
-        for suffix in ["", "def f():\n    yield, x\n"] {
-            let source = format!("{prefix}{template}{suffix}{deep}");
-            for result in [
-                compile_with_options(&source, "indentation.py", &options),
-                compile_bytes_with_options(source.as_bytes(), "indentation.py", &options),
-            ] {
-                let error = result.unwrap_err();
-                assert!(error.to_string().contains(expected), "{version}: {error}");
-                assert!(error.range().unwrap().start().to_usize() < prefix.len());
+        for middle in ["", template, "def f():\n    yield, x\n"] {
+            for ending in ["", delimiters.as_str()] {
+                let source = format!("{prefix}{middle}{deep}{ending}");
+                for result in [
+                    compile_with_options(&source, "indentation.py", &options),
+                    compile_bytes_with_options(source.as_bytes(), "indentation.py", &options),
+                ] {
+                    let error = result.unwrap_err();
+                    assert!(error.to_string().contains(expected), "{version}: {error}");
+                    assert!(error.range().unwrap().start().to_usize() < prefix.len());
+                }
             }
         }
     }
