@@ -28760,20 +28760,17 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_copied_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0;
-        // A sibling statement keeps the normal finalizer exit inside the
-        // enclosing try body. Its handler still owns the authored Pass marker.
-        let pass_exit_try_body_owner = pass_finally_location.is_some()
-            && !pass_finally_leaves_manager
+        // This finalizer is a direct statement in one enclosing protected try
+        // body, with no intervening handler or cleanup context.
+        let direct_try_body_owner_context = !pass_finally_leaves_manager
             && !statement.is_star
             && statement.handlers.is_empty()
             && statement.orelse.is_empty()
-            && self.control.statements.context.has_following
             && self
                 .control
                 .exceptions
                 .direct_try_body_statements
                 .contains(&statement.range)
-            && self.control.exceptions.active_try_body_tail != Some(statement.range)
             && self
                 .control
                 .exceptions
@@ -28789,6 +28786,24 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_copied_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0;
+        // A sibling statement keeps the normal finalizer exit inside the
+        // enclosing try body. Its handler still owns the authored Pass marker.
+        let pass_exit_try_body_owner = pass_finally_location.is_some()
+            && direct_try_body_owner_context
+            && self.control.statements.context.has_following
+            && self.control.exceptions.active_try_body_tail != Some(statement.range);
+        // In a 3.12 generator the normal finalizer follows the inner POP_BLOCK,
+        // so a terminal exit also retains its directly enclosing try handler.
+        let legacy_terminal_try_body_owner = self.context.python_version
+            == crate::PythonVersion::Py312
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_GENERATOR
+            && self.control.generators.generator_region_start.is_some()
+            && direct_try_body_owner_context
+            && !self.control.statements.context.has_following
+            && self.control.exceptions.active_try_body_tail == Some(statement.range);
+        let pass_exit_legacy_terminal_try_body_owner =
+            legacy_terminal_try_body_owner && pass_finally_location.is_some();
         // A direct no-op finalizer followed by another statement remains inside
         // its enclosing finally's protected try body on legacy targets.
         let pass_exit_legacy_finally_owner = matches!(
@@ -28845,7 +28860,8 @@ impl<'source> Compiler<'source> {
             .or(pass_exit_generator_owner.then_some(0))
             .or(pass_exit_try_body_owner.then_some(1))
             .or(pass_exit_legacy_finally_owner.then_some(1))
-            .or(pass_exit_legacy_normal_finally_owner.then_some(1));
+            .or(pass_exit_legacy_normal_finally_owner.then_some(1))
+            .or(pass_exit_legacy_terminal_try_body_owner.then_some(1));
         let overriding_return = matches!(statement.finalbody.last(), Some(Stmt::Return(_)));
         if overriding_return
             && self.control.withs.active_with_region_exclusions.is_empty()
@@ -29657,8 +29673,8 @@ impl<'source> Compiler<'source> {
                     |control| &mut control.withs.include_simple_normal_finally_not_taken_from_with,
                     include_simple_normal_finally_not_taken_from_with,
                     |compiler| {
-                        let legacy_nested_pass = if compiler.context.python_version
-                            == crate::PythonVersion::Py312
+                        let legacy_nested_pass = if legacy_terminal_try_body_owner
+                            || compiler.context.python_version == crate::PythonVersion::Py312
                             && matches!(compiler.unit.scope, Scope::Function { .. })
                             && compiler.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                             && !statement.is_star
@@ -30796,6 +30812,7 @@ impl<'source> Compiler<'source> {
                         && !pass_exit_generator_owner
                         && !pass_exit_try_body_owner
                         && !pass_exit_legacy_normal_finally_owner
+                        && !pass_exit_legacy_terminal_try_body_owner
                     {
                         self.control
                             .generators

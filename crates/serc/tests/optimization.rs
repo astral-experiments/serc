@@ -276,6 +276,140 @@ monitor.free_tool_id(5)
 }
 
 #[test]
+fn legacy_generator_terminal_finally_keeps_enclosing_owner() {
+    const TRACE: &str = r"
+import dis, marshal, sys
+
+events = []
+class Manager:
+    def __enter__(self):
+        events.append('enter')
+        return self
+    def __exit__(self, typ, value, traceback):
+        events.append(typ.__name__ if typ else None)
+        return True
+def recover():
+    events.append('recover')
+scope = {'recover': recover}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+f = scope['f']
+line = int(sys.argv[1])
+targets = [i.offset for i in dis.get_instructions(f)
+           if i.opname in ('NOP', 'JUMP_FORWARD') and i.positions.lineno == line]
+if not targets:
+    raise RuntimeError('missing finalizer exit')
+target = min(targets)
+monitor = sys.monitoring
+monitor.use_tool_id(5, 'legacy-finally-owner')
+for fault in (ValueError, StopIteration):
+    for flag in (False, True):
+        events.clear()
+        hits = []
+        def inject(code, offset):
+            if offset == target:
+                hits.append(offset)
+                raise fault('injected')
+        monitor.register_callback(5, monitor.events.INSTRUCTION, inject)
+        monitor.set_local_events(5, f.__code__, monitor.events.INSTRUCTION)
+        try:
+            result = next(f(Manager(), flag))
+        finally:
+            monitor.set_local_events(5, f.__code__, 0)
+            monitor.register_callback(5, monitor.events.INSTRUCTION, None)
+        if hits != [target] or events != ['enter', 'AssertionError', 'recover'] or result != 1:
+            raise RuntimeError((hits, events, result))
+monitor.free_tool_id(5)
+";
+    for nested in [false, true] {
+        for generator in [false, true] {
+            let finalbody = if nested {
+                "            try:\n                if flag:\n                    pass\n            finally:\n                pass\n"
+            } else {
+                "            pass\n"
+            };
+            let exit = if generator { "yield 1" } else { "return 1" };
+            for (body, trace) in [
+                (
+                    "with manager:\n                pass\n                assert False",
+                    true,
+                ),
+                (
+                    "with manager as value:\n                pass\n                assert False",
+                    false,
+                ),
+                (
+                    "with manager, manager:\n                pass\n                assert False",
+                    false,
+                ),
+                ("with manager:\n                assert 0", false),
+            ] {
+                let source = format!(
+                    "def f(manager,flag):\n    try:\n        try:\n            {body}\n        finally:\n{finalbody}    except Exception:\n        recover()\n    {exit}\n"
+                );
+                let marker = source
+                    .lines()
+                    .enumerate()
+                    .filter_map(|(index, line)| (line.trim() == "pass").then_some(index + 1))
+                    .last()
+                    .unwrap();
+                for (index, version) in [PythonVersion::Py312, PythonVersion::Py313]
+                    .into_iter()
+                    .enumerate()
+                {
+                    for level in LEVELS {
+                        let native =
+                            oracle(source.as_bytes(), "suppressed_assert.py", version, level);
+                        assert!(
+                            native.status.success(),
+                            "{}",
+                            String::from_utf8_lossy(&native.stderr)
+                        );
+                        let actual = compile_with_options(
+                            &source,
+                            "suppressed_assert.py",
+                            &CompileOptions {
+                                python_version: version,
+                                optimization_level: level,
+                                ..CompileOptions::default()
+                            },
+                        )
+                        .unwrap()
+                        .marshal();
+                        assert_eq!(
+                            actual, native.stdout,
+                            "{version}, {level:?}, {nested}, {generator}"
+                        );
+                        if !trace
+                            || version != PythonVersion::Py312
+                            || level != OptimizationLevel::Zero
+                            || !generator
+                        {
+                            continue;
+                        }
+                        for code in [&native.stdout, &actual] {
+                            let mut child = Command::new(ORACLES[index].get().unwrap())
+                                .args(["-I", "-S", "-B", "-c", TRACE, &marker.to_string()])
+                                .stdin(Stdio::piped())
+                                .stdout(Stdio::piped())
+                                .stderr(Stdio::piped())
+                                .spawn()
+                                .unwrap();
+                            child.stdin.take().unwrap().write_all(code).unwrap();
+                            let result = child.wait_with_output().unwrap();
+                            assert!(
+                                result.status.success(),
+                                "{}",
+                                String::from_utf8_lossy(&result.stderr)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn terminal_try_pass_preserves_implicit_return_location() {
     for source in [
         "def f(x):\n    try:\n        x = x + 1\n        pass\n    except ValueError:\n        recover()\n",
