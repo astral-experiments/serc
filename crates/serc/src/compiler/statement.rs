@@ -570,6 +570,8 @@ pub(super) struct ConditionState {
 pub(super) struct LoopState {
     // CPython retains the empty end block when an async for ends a protected suite.
     emit_protected_async_for_end_nop: bool,
+    // An optimized-away assertion suffix leaves a direct manager-body async-for terminal.
+    protected_async_for_elided_assert_suffix: bool,
     // The protected iterator Boolean condition whose first short-circuit marker reuses the
     // surrounding owner. Synchronous-with continues and first generator conditions use this.
     pub(super) protected_iterator_continue_condition: Option<ruff_text_size::TextRange>,
@@ -2448,7 +2450,39 @@ impl<'source> Compiler<'source> {
                                     .len()
                                     == context.exception_region_depth
                         });
-                let emit_protected_async_for_end_nop = is_final
+                let protected_async_for_elided_assert_suffix = self.context.python_version
+                    == crate::PythonVersion::Py314
+                    && !is_final
+                    && matches!(statement, Stmt::For(statement) if statement.is_async)
+                    && matches!(self.unit.scope, Scope::Function { .. })
+                    && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+                    && self.control.loops.contexts.is_empty()
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty()
+                    && !self.control.in_exception_handler()
+                    && self.control.finally.is_inactive_for_return_unwind()
+                    && self
+                        .control
+                        .withs
+                        .active_with_exits
+                        .last()
+                        .is_some_and(|context| {
+                            !context.is_async
+                                && context.terminal_statement_range
+                                    == body.last().map(Ranged::range)
+                        })
+                    && body[index + 1..].iter().all(|statement| {
+                        matches!(statement, Stmt::Global(global) if global.names.is_empty())
+                            && matches!(
+                                self.context.optimized_locations.get(&statement.range()),
+                                Some(super::optimization::OptimizedLocation::Elided)
+                            )
+                    });
+                let emit_protected_async_for_end_nop = (is_final
+                    || protected_async_for_elided_assert_suffix)
                     && matches!(statement, Stmt::For(statement) if statement.is_async)
                     && !innermost_async_with
                     && (!self.control.withs.active_with_region_exclusions.is_empty()
@@ -2681,6 +2715,10 @@ impl<'source> Compiler<'source> {
                     &mut self.control.loops.emit_protected_async_for_end_nop,
                     emit_protected_async_for_end_nop,
                 );
+                let previous_protected_async_for_elided_assert_suffix = std::mem::replace(
+                    &mut self.control.loops.protected_async_for_elided_assert_suffix,
+                    protected_async_for_elided_assert_suffix,
+                );
                 let same_region_continuation = (!is_final
                     || self.control.statements.context.same_region_continuation
                         == Some(statement.range()))
@@ -2749,6 +2787,8 @@ impl<'source> Compiler<'source> {
                     previous_suite_fallthrough_to_loop_backedge;
                 self.control.loops.emit_protected_async_for_end_nop =
                     previous_emit_protected_async_for_end_nop;
+                self.control.loops.protected_async_for_elided_assert_suffix =
+                    previous_protected_async_for_elided_assert_suffix;
                 self.control.withs.post_async_with_condition_marker =
                     previous_post_async_with_condition_marker;
                 self.control
@@ -18817,6 +18857,8 @@ impl<'source> Compiler<'source> {
                 .is_some_and(|context| context.trailing_statement == Some(statement.range))
             // Exception-group handlers do not expose their original body tail here.
             || self.control.exceptions.active_exception_group_handlers > 0;
+        let ends_protected_body =
+            ends_protected_body || self.control.loops.protected_async_for_elided_assert_suffix;
         if self.control.loops.emit_protected_async_for_end_nop
             && !ends_protected_body
             && statement.orelse.is_empty()

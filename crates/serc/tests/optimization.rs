@@ -4825,3 +4825,104 @@ for name, offset, args, expected in [
         }
     }
 }
+
+#[test]
+fn optimized_assertions_after_async_for_preserve_manager_exit_marker() {
+    const SOURCE: &str = "async def f(xs,a,b,c):\n    with a:\n        u = 1\n        async for x in xs:\n            pass\n        assert xs\n";
+    for source in [
+        SOURCE,
+        "async def f(xs,a,b,c):\n    with a:\n        u = 1\n        async for x in xs:\n            work(x)\n        assert xs; assert a\n",
+        "async def f(xs,a,b,c):\n    async with a:\n        with b:\n            u = 1\n            async for x in xs:\n                pass\n            assert xs\n",
+        "async def f(xs,a,b,c):\n    async with a:\n        u = 1\n        async for x in xs:\n            pass\n        assert xs\n",
+        "async def f(xs,a,b,c):\n    with a:\n        u = 1\n        async for x in xs:\n            if x:\n                break\n            work(x)\n        assert xs\n",
+        "async def f(xs,a,b,c):\n    with a:\n        u = 1\n        async for x in xs:\n            pass\n        assert xs\n        work(a)\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "async_for_assert.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+    const TRACE: &str = r"
+import asyncio, dis, marshal, sys
+scope = {}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+f = scope['f']
+instructions = list(dis.get_instructions(f))
+end = next(i for i, instruction in enumerate(instructions)
+           if instruction.opname == 'END_ASYNC_FOR')
+assert instructions[end + 1].opname == 'NOP'
+class Fault(Exception):
+    pass
+class Manager:
+    def __enter__(self):
+        events.append('enter')
+        return self
+    def __exit__(self, typ, value, tb):
+        events.append(('exit', typ.__name__ if typ else None))
+        return False
+class Iter:
+    def __aiter__(self):
+        return self
+    async def __anext__(self):
+        raise StopAsyncIteration
+for target, expected in (
+    (instructions[end].offset, ['enter', ('exit', 'Fault'), 'escaped']),
+    (instructions[end + 1].offset, ['enter', 'escaped']),
+):
+    events, hits = [], []
+    def trace(frame, event, arg):
+        if frame.f_code is f.__code__:
+            frame.f_trace_opcodes = True
+            if event == 'opcode' and frame.f_lasti == target:
+                hits.append(target)
+                raise Fault()
+        return trace
+    sys.settrace(trace)
+    try:
+        try:
+            asyncio.run(f(Iter(), Manager(), None, None))
+        except Fault:
+            events.append('escaped')
+    finally:
+        sys.settrace(None)
+    assert hits == [target] and events == expected, (hits, events, expected)
+";
+    for level in [OptimizationLevel::One, OptimizationLevel::Two] {
+        let native = oracle(
+            SOURCE.as_bytes(),
+            "async_for_assert.py",
+            PythonVersion::Py314,
+            level,
+        );
+        assert!(native.status.success());
+        let actual = compile_with_options(
+            SOURCE,
+            "async_for_assert.py",
+            &CompileOptions {
+                python_version: PythonVersion::Py314,
+                optimization_level: level,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap()
+        .marshal();
+        assert_eq!(actual, native.stdout);
+        for payload in [&native.stdout, &actual] {
+            let mut child = Command::new(ORACLES[2].get().unwrap())
+                .args(["-I", "-S", "-c", TRACE])
+                .stdin(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(payload).unwrap();
+            let result = child.wait_with_output().unwrap();
+            assert!(
+                result.status.success(),
+                "{level:?}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+}
