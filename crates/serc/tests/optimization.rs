@@ -1708,6 +1708,127 @@ fn legacy_manager_declaration_only_matches_cpython() {
 }
 
 #[test]
+fn legacy_protected_manager_pass_before_declaration_matches_cpython() {
+    let versions = [PythonVersion::Py312, PythonVersion::Py313];
+    for source in [
+        r"def outer():
+    outer_marker = 0
+    def f(manager, outer, obj, predicate, cleanup):
+        try:
+            with manager as value:
+                pass
+                global marker
+        finally:
+            cleanup()
+        return
+    return f
+",
+        r"def outer():
+    outer_marker = 0
+    def f(manager, outer, obj, predicate, cleanup):
+        try:
+            with manager:
+                pass
+                nonlocal outer_marker
+        finally:
+            cleanup()
+        return
+    return f
+",
+        r"def outer():
+    outer_marker = 0
+    def f(manager, outer, obj, predicate, cleanup):
+        try:
+            with outer:
+                with manager:
+                    global spare
+                    pass
+                    global marker
+        except Exception:
+            cleanup()
+        return
+    return f
+",
+        r"def outer():
+    outer_marker = 0
+    async def f(manager, outer, obj, predicate, cleanup):
+        try:
+            async with outer:
+                with manager as value:
+                    pass
+                    global marker
+        finally:
+            cleanup()
+        return
+    return f
+",
+        r"def outer():
+    outer_marker = 0
+    def f(manager, outer, obj, predicate, cleanup):
+        with manager as value:
+            pass
+            assert predicate()
+        return
+    return f
+",
+        r"def outer():
+    outer_marker = 0
+    def f(manager, outer, obj, predicate, cleanup):
+        try:
+            with manager: pass; assert predicate()
+        finally:
+            cleanup()
+        return
+    return f
+",
+        r"def outer():
+    outer_marker = 0
+    async def f(manager, outer, obj, predicate, cleanup):
+        try:
+            async with manager as value:
+                pass
+                global marker
+        finally:
+            cleanup()
+        return
+    return f
+",
+        r"def outer():
+    outer_marker = 0
+    def f(manager, outer, obj, predicate, cleanup):
+        try:
+            with manager:
+                pass
+                pass
+                global marker
+        except Exception:
+            cleanup()
+        return
+    return f
+",
+    ] {
+        assert_matches_cpython_versions(source, "case.py", &LEVELS, &versions);
+    }
+    assert_matches_cpython_versions(
+        r"def outer():
+    outer_marker = 0
+    def f(manager, outer, obj, predicate, cleanup):
+        try:
+            with manager:
+                pass
+                assert predicate()
+        finally:
+            cleanup()
+        return
+    return f
+",
+        "case.py",
+        &LEVELS[1..],
+        &versions,
+    );
+}
+
+#[test]
 fn legacy_protected_manager_multiple_passes_match_cpython() {
     let versions = [PythonVersion::Py312, PythonVersion::Py313];
     for source in [

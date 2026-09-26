@@ -31055,7 +31055,11 @@ impl<'source> Compiler<'source> {
             } else if !trailing_nop_is_covered
                 && self.assembler.instruction_count() == body_start
                 && let Some(statement) =
-                    with_body_fallback_statement(body, self.context.python_version)
+                    with_body_fallback_statement(
+                        body,
+                        self.context.python_version >= crate::PythonVersion::Py314
+                            || legacy_protected_sync_manager_body,
+                    )
                 // A same-line `as` target store already carries the pass line event.
                 && body_previous_location.is_none_or(|previous| {
                     previous.line != self.source_location(statement.range()).line
@@ -31803,8 +31807,10 @@ impl<'source> Compiler<'source> {
                     )?;
                     if remaining.is_empty()
                         && compiler.assembler.instruction_count() == body_start
-                        && let Some(statement) =
-                            with_body_fallback_statement(body, compiler.context.python_version)
+                        && let Some(statement) = with_body_fallback_statement(
+                            body,
+                            compiler.context.python_version >= crate::PythonVersion::Py314,
+                        )
                     {
                         compiler
                             .assembler
@@ -33205,10 +33211,7 @@ enum WithBodyNormalExit {
 
 // Declarations emit no instructions or line events. For one authored pass with
 // trailing declarations, use the pass location for the empty-body fallback.
-fn with_body_fallback_statement(
-    body: &[Stmt],
-    python_version: crate::PythonVersion,
-) -> Option<&Stmt> {
+fn with_body_fallback_statement(body: &[Stmt], use_authored_pass: bool) -> Option<&Stmt> {
     let last = body.last()?;
     if matches!(last, Stmt::Global(_) | Stmt::Nonlocal(_)) {
         let mut effective = body
@@ -33216,9 +33219,7 @@ fn with_body_fallback_statement(
             .filter(|statement| !matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_)));
         return match (effective.next(), effective.next()) {
             (None, _) => None,
-            (Some(pass @ Stmt::Pass(_)), None) if python_version >= crate::PythonVersion::Py314 => {
-                Some(pass)
-            }
+            (Some(pass @ Stmt::Pass(_)), None) if use_authored_pass => Some(pass),
             _ => Some(last),
         };
     }
