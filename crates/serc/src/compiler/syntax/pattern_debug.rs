@@ -324,7 +324,14 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
                 let mut large_integer_keys = FxHashSet::default();
                 for key in &mapping.keys {
                     if let Some(error) = errors.get(&key.range()) {
-                        self.pattern_error(error.to_string(), pattern.range());
+                        let message = super::mapping_diagnostic::diagnostic(
+                            self.source,
+                            key,
+                            pattern.range(),
+                            self.python_version,
+                        )
+                        .map_or_else(|| error.to_string(), |(message, _)| message);
+                        self.pattern_error(message, pattern.range());
                         return;
                     }
                     if matches!(
@@ -342,13 +349,22 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
                         if (large && integer_keys.contains(&integer_key))
                             || large_integer_keys.contains(&integer_key)
                         {
-                            self.pattern_error(
-                                format!(
-                                    "mapping pattern checks duplicate key `{}`",
-                                    &self.source[key.range()]
-                                ),
+                            let message = super::mapping_diagnostic::diagnostic(
+                                self.source,
+                                key,
                                 pattern.range(),
+                                self.python_version,
+                            )
+                            .map_or_else(
+                                || {
+                                    format!(
+                                        "mapping pattern checks duplicate key `{}`",
+                                        &self.source[key.range()]
+                                    )
+                                },
+                                |(message, _)| message,
                             );
+                            self.pattern_error(message, pattern.range());
                             return;
                         }
                         integer_keys.insert(integer_key.clone());
