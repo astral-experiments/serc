@@ -6447,6 +6447,108 @@ impl<'source> Compiler<'source> {
                         preserve_tos,
                     )?;
                 }
+                // Managers entered inside the exceptional finalizer sit above its
+                // saved exception state. Exit them before discarding that state.
+                let mut next_with = self.control.withs.active_with_exits.len();
+                let mut with_unwind_starts = Vec::new();
+                if !return_is_overridden
+                    && !handler_before_finally_end
+                    && self.control.finally.active_finally_end_blocks == 1
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self
+                        .control
+                        .finally
+                        .active_return_finally_contexts
+                        .is_empty()
+                    && self
+                        .control
+                        .finally
+                        .preserved_return_value_contexts
+                        .is_empty()
+                    && self.control.finally.copied_return_finally_preserved_values == 0
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.exceptions.active_try_marker_slots.is_empty()
+                    && self.control.loops.contexts.is_empty()
+                {
+                    let first_inner_with = self
+                        .control
+                        .withs
+                        .active_with_exits
+                        .iter()
+                        .position(|context| context.finally_end_depth == 1)
+                        .unwrap_or(next_with);
+                    if self.control.withs.active_with_exits[first_inner_with..]
+                        .iter()
+                        .all(|context| {
+                            context.finally_end_depth == 1
+                                && context.exception_region_depth
+                                    == self
+                                        .control
+                                        .exceptions
+                                        .active_exception_region_exclusions
+                                        .len()
+                        })
+                    {
+                        with_unwind_starts = self.emit_with_unwind(
+                            first_inner_with,
+                            next_with,
+                            preserve_tos,
+                            super::legacy_native_labels::WithAwait::Return(statement.range),
+                        )?;
+                        next_with = first_inner_with;
+                    }
+                }
+                // A nested try/finally inside the manager must run its copied
+                // cleanup before the manager exits. Its enclosing exceptional
+                // finalizer ends only after those managers have exited.
+                let inner_manager_boundary = self.control.withs.active_with_exits[..next_with]
+                    .iter()
+                    .position(|context| context.finally_end_depth == 1);
+                let defer_finally_end_for_managers = !return_is_overridden
+                    && !handler_before_finally_end
+                    && self.control.finally.active_finally_end_blocks == 1
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self
+                        .control
+                        .finally
+                        .preserved_return_value_contexts
+                        .is_empty()
+                    && self.control.finally.copied_return_finally_preserved_values == 0
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_handlers
+                        .iter()
+                        .all(|handler| {
+                            handler.finally_end_depth == 1 && handler.with_depth == next_with
+                        })
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.loops.contexts.is_empty()
+                    && inner_manager_boundary.is_some_and(|boundary| {
+                        self.control.withs.active_with_exits[..boundary]
+                            .iter()
+                            .all(|context| context.finally_end_depth == 0)
+                            && self.control.withs.active_with_exits[boundary..next_with]
+                                .iter()
+                                .all(|context| context.finally_end_depth == 1)
+                    })
+                    && self
+                        .control
+                        .finally
+                        .active_return_finally_contexts
+                        .iter()
+                        .all(|context| context.with_depth >= next_with);
+                let deferred_finally_end_start =
+                    defer_finally_end_for_managers.then(|| self.assembler.label());
+                let nested_finally_region_depth = if defer_finally_end_for_managers {
+                    self.control.withs.active_with_exits[inner_manager_boundary.unwrap()]
+                        .exception_region_depth
+                } else {
+                    self.control.finally.active_finally_end_blocks
+                };
                 let nested_finally_region_unwind_start = (!handler_before_finally_end
                     && self.control.finally.active_finally_end_blocks > 0
                     && self
@@ -6454,16 +6556,18 @@ impl<'source> Compiler<'source> {
                         .exceptions
                         .active_exception_region_exclusions
                         .len()
-                        > self.control.finally.active_finally_end_blocks)
+                        > nested_finally_region_depth)
                     .then(|| {
                         let start = self.assembler.label();
                         self.assembler.mark(start);
-                        (self.control.finally.active_finally_end_blocks, start)
+                        (nested_finally_region_depth, start)
                     });
                 let finally_end_unwind_start = if handler_before_finally_end {
                     None
+                } else if let Some(start) = deferred_finally_end_start {
+                    Some(start)
                 } else {
-                    self.emit_finally_end_unwind(0, preserve_tos)?
+                    self.emit_finally_end_unwind(0, preserve_tos, None)?
                 };
                 let nested_finally_region_unwind_start =
                     nested_finally_region_unwind_start.map(|(depth, start)| {
@@ -6915,9 +7019,7 @@ impl<'source> Compiler<'source> {
                 let mut protected_outer_pop_except_start = None;
                 let mut next_loop =
                     loops_before_finally_end.unwrap_or(self.control.loops.contexts.len());
-                let mut next_with = self.control.withs.active_with_exits.len();
-                let mut with_unwind_starts = Vec::new();
-                let mut with_unwind_before_exception_start = 0;
+                let mut with_unwind_before_exception_start = with_unwind_starts.len();
                 // A named handler may sit inside an ordinary try which itself sits inside
                 // a pending finally. Keep each enclosing collector active until its own
                 // unwind boundary; the handler's saved depth also retires any try entered
@@ -7651,6 +7753,7 @@ impl<'source> Compiler<'source> {
                     starts[1] = finally_end_unwind_start;
                 }
                 if unwinds_finally_end_inside_handler
+                    && !defer_finally_end_for_managers
                     && let Some((depth, start)) = nested_finally_region_unwind_start
                     && let Some(starts) = &mut handler_region_unwind_starts
                 {
@@ -8430,7 +8533,7 @@ impl<'source> Compiler<'source> {
                             }
                         }
                         if handler_before_finally_end {
-                            let start = self.emit_finally_end_unwind(0, preserve_tos)?;
+                            let start = self.emit_finally_end_unwind(0, preserve_tos, None)?;
                             if let Some(region_starts) = &mut handler_region_unwind_starts {
                                 // POP_TOP still belongs to the finally cleanup. Its
                                 // POP_BLOCK retires that owner before POP_EXCEPT.
@@ -10927,6 +11030,19 @@ impl<'source> Compiler<'source> {
                         }
                     }
                     remaining_with_starts.extend(starts);
+                    if let Some(start) = deferred_finally_end_start
+                        && inner_manager_boundary == Some(with_index)
+                    {
+                        with_unwind_before_exception_start =
+                            with_unwind_starts.len() + remaining_with_starts.len();
+                        self.emit_finally_end_unwind(0, preserve_tos, Some(start))?;
+                        if let Some(region_starts) = &mut handler_region_unwind_starts
+                            && let Some(index) =
+                                self.control.finally.finally_end_region_indices.last()
+                        {
+                            region_starts[*index].get_or_insert(start);
+                        }
+                    }
                     if let Some(outer_index) = with_index.checked_sub(1) {
                         let outer_loop_depth = self.control.withs.active_with_exits[outer_index]
                             .loop_depth
@@ -11015,6 +11131,11 @@ impl<'source> Compiler<'source> {
                     }
                 }
                 with_unwind_starts.extend(remaining_with_starts);
+                let deferred_outer_unwind_end = deferred_finally_end_start.map(|_| {
+                    let end = self.assembler.label();
+                    self.assembler.mark(end);
+                    end
+                });
                 if exception_unwind_start.is_none() {
                     with_unwind_before_exception_start = with_unwind_starts.len();
                 }
@@ -11345,6 +11466,31 @@ impl<'source> Compiler<'source> {
                             .as_ref()
                             .and_then(|starts| starts[index])
                             .unwrap_or(exclusion_start);
+                        let exclusion_start = if let (
+                            Some(finally_start),
+                            Some(outer_end),
+                            Some(&finally_region),
+                            Some(boundary),
+                        ) = (
+                            deferred_finally_end_start,
+                            deferred_outer_unwind_end,
+                            self.control.finally.finally_end_region_indices.last(),
+                            inner_manager_boundary,
+                        ) {
+                            match index.cmp(&finally_region) {
+                                std::cmp::Ordering::Equal => finally_start,
+                                std::cmp::Ordering::Less => with_unwind_starts
+                                    .iter()
+                                    .find(|unwind| {
+                                        unwind.index < boundary
+                                            && unwind.exits_exception_region(index)
+                                    })
+                                    .map_or(outer_end, |unwind| unwind.start),
+                                std::cmp::Ordering::Greater => exclusion_start,
+                            }
+                        } else {
+                            exclusion_start
+                        };
                         if let Some(length) = copied_return_exclusion_lengths
                             .as_ref()
                             .and_then(|lengths| lengths.get(index))
@@ -15198,6 +15344,7 @@ impl<'source> Compiler<'source> {
         &mut self,
         from_depth: usize,
         preserve_tos: bool,
+        start: Option<Label>,
     ) -> Result<Option<Label>, CompileError> {
         let mut unwind_start = None;
         for _ in from_depth..self.control.finally.active_finally_end_blocks {
@@ -15209,7 +15356,7 @@ impl<'source> Compiler<'source> {
                 self.emit(SWAP, 2, 0)?;
             }
             if unwind_start.is_none() {
-                let start = self.assembler.label();
+                let start = start.unwrap_or_else(|| self.assembler.label());
                 self.assembler.mark(start);
                 unwind_start = Some(start);
             }

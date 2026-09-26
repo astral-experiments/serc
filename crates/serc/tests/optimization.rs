@@ -44,6 +44,141 @@ fn discarded_star_imports_match_cpython() {
 }
 
 #[test]
+fn exceptional_finally_return_unwinds_managers_in_order() {
+    const FINALLY: &str = r"def f(outer, inner, work, cleanup):
+    with outer:
+        try:
+            work()
+        finally:
+            with inner:
+                try:
+                    return work()
+                finally:
+                    cleanup()
+";
+    const HANDLER: &str = r"def f(outer, inner, work, cleanup):
+    with outer:
+        try:
+            work()
+        finally:
+            with inner:
+                try:
+                    return work()
+                except ValueError:
+                    return 'handled'
+";
+    const TRACE: &str = r"
+import itertools, json, marshal, sys
+scope = {}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+class WorkFault(Exception): pass
+class CleanupFault(Exception): pass
+class ExitFault(Exception): pass
+def chain(error):
+    seen, result = set(), []
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        result.append(type(error).__name__)
+        error = error.__context__
+    return result
+rows = []
+for first, second, cleanup_raises, inner_mode, outer_mode in itertools.product(
+        (False, True), ('none', 'work', 'value'), (False, True),
+        ('normal', 'suppress', 'raise'), ('normal', 'suppress', 'raise')):
+    events = []
+    class Manager:
+        def __init__(self, name, mode):
+            self.name, self.mode = name, mode
+        def __enter__(self):
+            events.append(('enter', self.name))
+            return self
+        def __exit__(self, typ, val, tb):
+            events.append(('exit', self.name, typ.__name__ if typ else None, chain(val)))
+            if self.mode == 'raise':
+                raise ExitFault(self.name)
+            return self.mode == 'suppress'
+    calls = [0]
+    def work():
+        calls[0] += 1
+        events.append(('work', calls[0]))
+        if calls[0] == 1 and first:
+            raise WorkFault('first')
+        if calls[0] == 2 and second == 'work':
+            raise WorkFault('second')
+        if calls[0] == 2 and second == 'value':
+            raise ValueError('second')
+        return calls[0]
+    def cleanup():
+        events.append(('cleanup',))
+        if cleanup_raises:
+            raise CleanupFault()
+    try:
+        outcome = ('return', scope['f'](Manager('outer', outer_mode),
+                                        Manager('inner', inner_mode), work, cleanup))
+    except BaseException as error:
+        outcome = ('raise', chain(error))
+    rows.append((events, outcome))
+print(json.dumps(rows))
+";
+
+    for source in [FINALLY, HANDLER] {
+        for (index, (python_version, _, _)) in VERSIONS.iter().copied().enumerate() {
+            for optimization_level in LEVELS {
+                let native = oracle(
+                    source.as_bytes(),
+                    "return_finally.py",
+                    python_version,
+                    optimization_level,
+                );
+                assert!(
+                    native.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&native.stderr)
+                );
+                let actual = compile_with_options(
+                    source,
+                    "return_finally.py",
+                    &CompileOptions {
+                        python_version,
+                        optimization_level,
+                        ..CompileOptions::default()
+                    },
+                )
+                .unwrap()
+                .marshal();
+                assert_eq!(
+                    actual, native.stdout,
+                    "{python_version}, {optimization_level:?}"
+                );
+                let mut outputs = Vec::new();
+                for payload in [&native.stdout, &actual] {
+                    let mut child = Command::new(ORACLES[index].get().unwrap())
+                        .args(["-I", "-S", "-B", "-c", TRACE])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    child.stdin.take().unwrap().write_all(payload).unwrap();
+                    let result = child.wait_with_output().unwrap();
+                    assert!(
+                        result.status.success(),
+                        "{python_version}, {optimization_level:?}: status {}, {}",
+                        result.status,
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                    outputs.push(result.stdout);
+                }
+                assert_eq!(
+                    outputs[0], outputs[1],
+                    "{python_version}, {optimization_level:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn optimized_terminal_guards_locate_fallthrough_returns() {
     for source in [
         "def f(x):\n    if x == 1:\n        assert x\n",
