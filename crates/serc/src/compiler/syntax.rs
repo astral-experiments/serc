@@ -2018,7 +2018,7 @@ mod tests {
                 ("class Example[T, T]: pass", "T", "T"),
                 ("def function[T, *T](): pass", "T", "*T"),
                 ("type Alias[T, **T] = int", "T", "**T"),
-                ("class Example[K, K]: pass", "K", "K"),
+                ("class Example[K, \u{212A}]: pass", "K", "\u{212A}"),
                 ("class Example[T, T: int]: pass", "T", "T: int"),
                 ("class Outer:\n class Inner[__T, __T]: pass", "__T", "__T"),
             ] {
