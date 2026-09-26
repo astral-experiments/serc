@@ -245,8 +245,9 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         }
         validate_declarations(source, body, python_version)?;
     }
-    let lowering_error =
-        validator.lowering_pattern_error || (error.is_none() && validator.bare_starred.is_some());
+    let lowering_error = validator.lowering_pattern_error
+        || matches!(&error, Some(CompileError::InvalidPattern { .. }))
+        || (error.is_none() && validator.bare_starred.is_some());
     let result = error
         .or_else(|| {
             validator
