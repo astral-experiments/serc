@@ -13678,13 +13678,33 @@ impl<'source> Compiler<'source> {
                 )
             })
             && matches!(&body[end], Stmt::If(statement)
-                if statement.elif_else_clauses.is_empty()
-                    && matches!(statement.body.as_slice(), [Stmt::Continue(_)])
-                    && condition_has_only_runtime_tests(&statement.test)
-                    && !expression_suspends_current_scope(&statement.test))
+            if statement.elif_else_clauses.is_empty()
+                && condition_has_only_runtime_tests(&statement.test)
+                && !expression_suspends_current_scope(&statement.test)
+                && (matches!(statement.body.as_slice(), [Stmt::Continue(_)])
+                    || (!self.has_active_control_flow_region()
+                        && !self.control.in_exception_handler()
+                        && self.control.finally.is_inactive_for_return_unwind()
+                        && body[end + 1..].iter().all(|suffix| matches!(
+                            self.context.optimized_locations.get(&suffix.range()),
+                            Some(super::optimization::OptimizedLocation::Elided)
+                        ))
+                        && condition_has_linear_runtime_leaves(&statement.test)
+                        && !suite_contains_yield(&statement.body)
+                        && statement.body.iter().all(|statement| {
+                            !matches!(statement, Stmt::Expr(expression)
+                                if !matches!(expression.value.as_ref(), Expr::Call(_)))
+                        })
+                        && (suite_has_linear_borrow_fallthrough(&statement.body)
+                            || (!statement.body.is_empty()
+                                && original_condition_has_unique_jump_target(&statement.test, true)
+                                && statement.body.iter().all(|statement| matches!(
+                                    self.context.optimized_locations.get(&statement.range()),
+                                    Some(super::optimization::OptimizedLocation::Elided)
+                                )))))))
         {
             // Native emits no instructions for the optimized suffix, leaving the
-            // conditional continue as the original loop-tail statement.
+            // conditional as the original loop-tail statement.
             let tail = self.compile_loop_tail_suite_inner(
                 &body[..=end],
                 restart,

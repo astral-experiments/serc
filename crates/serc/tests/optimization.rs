@@ -82,6 +82,24 @@ fn nested_terminal_if_before_elided_assert_matches_cpython() {
 }
 
 #[test]
+fn nested_loop_if_before_elided_assert_matches_cpython() {
+    for source in [
+        "def f(xs,a,b):\n for x in xs:\n  if a:\n   if b:\n    work(x)\n   assert x\n",
+        "def f(xs,a,b):\n for x in xs:\n  if a:\n   if b:\n    assert b\n   assert x\n",
+        "def f(xs,a,b):\n for x in xs:\n  if a:\n   if b:\n    a += 1\n   assert x\n",
+        "def f(xs,a,b):\n while xs:\n  x=xs.pop()\n  if a:\n   if b:\n    work(x)\n   assert x\n",
+        "def f(xs,a,b):\n for x in xs:\n  if a:\n   if b:\n    work(x)\n   assert x\n  else:\n   other(x)\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "sub/nested_loop_elided.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn terminal_if_before_elided_assert_matches_cpython_312() {
     for source in [
         "def f(x):\n if x:\n  with context():\n   call()\n else:\n  if x:\n   assert x\n  assert x\n",
