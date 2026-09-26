@@ -3603,6 +3603,7 @@ impl LayoutAssembler {
             // both that record and the differently located SETUP NOP. Serc folds
             // the POP into the setup instead. Reconcile only the captured pair,
             // with an exact retained-jump witness and no intervening rewrites.
+            let mut compound_try_exit = false;
             let removed_pop = retained_setup_nop.is_some_and(|setup| {
                 let Item::Instruction(pop) = origin.prefix[original_pop_at] else {
                     return false;
@@ -3619,15 +3620,57 @@ impl LayoutAssembler {
                 let Some(jump) = located.next() else {
                     return false;
                 };
+                // Cold-handler placement also turns an ordinary try's normal
+                // exit into a NOP. Authenticate that original exit label and the
+                // complete converted record before using it as the line donor.
+                let mut retired_jump = *jump;
+                retired_jump.opcode = NOP;
+                retired_jump.set_operand(Operand::Value(0));
+                if self
+                    .exception_owner_provenance
+                    .ownerless_compound_try_nops
+                    .iter()
+                    .any(|(source, target, original)| {
+                        *target == origin.entry
+                            && original == jump
+                            && start
+                                .checked_sub(2)
+                                .is_some_and(|index| self.items[index] == Item::Label(*source))
+                    })
+                {
+                    // Redundant-jump removal already restores this captured POP_BLOCK owner.
+                    retired_jump.set_exception_owner(NormalizedExceptionOwner::Absent);
+                }
+                compound_try_exit = *previous == retired_jump
+                    && start.checked_sub(2).is_some_and(|index| {
+                        let Item::Label(exit) = self.items[index] else {
+                            return false;
+                        };
+                        let mut exits = self
+                            .exception_owner_provenance
+                            .compound_try_owner_exits
+                            .iter()
+                            .filter(|(_, target)| *target == origin.entry);
+                        exits.next() == Some(&(exit, origin.entry))
+                            && exits.next().is_none()
+                            && self
+                                .items
+                                .iter()
+                                .filter(|item| **item == Item::Label(exit))
+                                .count()
+                                == 1
+                    });
                 located.next().is_none()
-                    && jump.jump_policy.retains_nop_for(jump.operand())
+                    && (jump.jump_policy.retains_nop_for(jump.operand()) || compound_try_exit)
                     && previous.opcode == NOP
                     && previous.location == jump.location
                     && previous.depth_after() == jump.depth_after()
                     && previous.local_policy == jump.local_policy
                     && previous.no_location_policy == jump.no_location_policy
                     && previous.jump_policy == jump.jump_policy
-                    && previous.exception_policy() == jump.exception_policy()
+                    && (previous.exception_policy() == jump.exception_policy()
+                        || (compound_try_exit
+                            && previous.exception_policy() == retired_jump.exception_policy()))
                     && previous.local_policy.hidden_exception_owner_slots() == 0
                     && previous.pre_fold_extra_instructions() == 0
                     && setup.location.line >= 0
@@ -3823,6 +3866,15 @@ impl LayoutAssembler {
                     .filter(|item| matches!(item, Item::Instruction(_)))
                     .count();
                 result.insert(logical_end - 1);
+                if removed_pop && compound_try_exit {
+                    // The same original exit retains its inner POP_BLOCK's line.
+                    // Serc represents that ownerless slot with the retired jump NOP.
+                    let logical_start = self.items[..*start]
+                        .iter()
+                        .filter(|item| matches!(item, Item::Instruction(_)))
+                        .count();
+                    result.insert(logical_start - 1);
+                }
             }
         }
         result
@@ -14437,6 +14489,185 @@ mod tests {
                 rustc_hash::FxHashSet::default()
             };
             assert_eq!(markers, expected, "{change}");
+        }
+    }
+
+    #[test]
+    fn nested_finally_retired_try_exit_requires_original_edge() {
+        use super::{ExceptionOwnerProvenance, OriginalNormalFinallyArray};
+        use crate::assembler::{
+            ExceptionPolicy, Instruction, Item, Label, LayoutAssembler, Operand, SourceLocation,
+        };
+        use crate::target::opcodes::{
+            JUMP_FORWARD, LOAD_FAST, NOP, NOT_TAKEN, POP_JUMP_IF_FALSE, TO_BOOL,
+        };
+
+        for change in [
+            "unchanged",
+            "refined owner",
+            "refined missing edge",
+            "unproven refined owner",
+            "different refined record",
+            "missing edge",
+            "wrong source",
+            "wrong target",
+            "duplicate edge",
+            "duplicate source label",
+            "moved source label",
+            "changed donor location",
+            "changed donor depth",
+            "changed setup slots",
+        ] {
+            let source = Label::from_u32(0);
+            let entry = Label::from_u32(1);
+            let setup_start = Label::from_u32(2);
+            let setup_end = Label::from_u32(3);
+            let setup_label = Label::from_u32(4);
+            let exit = Label::from_u32(5);
+            let location = SourceLocation::new(9, 9, 15, 19);
+            let plain = |opcode, operand| Instruction::new(opcode, operand, location, None);
+            let mut jump = plain(JUMP_FORWARD, Operand::Forward(entry));
+            jump.location = SourceLocation::new(3, 3, 8, 12);
+            if change.contains("refined") {
+                jump.jump_policy.retain_nop_for_direct_target();
+            }
+            let mut donor = jump;
+            donor.opcode = NOP;
+            donor.set_operand(Operand::Value(0));
+            let mut pop = plain(NOP, Operand::Value(0));
+            pop.location = SourceLocation::NONE;
+            pop.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+            pop.fusion_policy.mark_converted_pop_block();
+            let mut setup = plain(NOP, Operand::Value(0));
+            setup.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+            let mut marker = plain(NOT_TAKEN, Operand::Value(0));
+            marker.set_exception_policy(ExceptionPolicy::normalized_owner(true));
+            let prefix = vec![
+                Item::Label(entry),
+                Item::Instruction(pop),
+                Item::Label(setup_start),
+                Item::Instruction(setup),
+                Item::Label(setup_end),
+                Item::Label(setup_label),
+                Item::Instruction(plain(LOAD_FAST, Operand::Value(0))),
+                Item::Instruction(plain(TO_BOOL, Operand::Value(0))),
+                Item::Instruction(plain(POP_JUMP_IF_FALSE, Operand::Forward(exit))),
+                Item::Instruction(marker),
+            ];
+            let mut items = vec![Item::Label(source), Item::Instruction(donor)];
+            items.extend_from_slice(&prefix);
+            items.remove(3);
+            let Item::Instruction(setup) = &mut items[4] else {
+                unreachable!()
+            };
+            setup.local_policy.add_hidden_exception_owner_slots(1);
+            let mut assembler = LayoutAssembler {
+                python_version: crate::PythonVersion::Py314,
+                legacy_uniform_jump_seed: false,
+                items,
+                exception_regions: Vec::new(),
+                exception_owner_provenance: Box::new(ExceptionOwnerProvenance {
+                    source_boundaries: [entry].into_iter().collect(),
+                    block_boundaries: [entry].into_iter().collect(),
+                    compound_try_owner_exits: vec![(source, entry)],
+                    setups: vec![(setup_label, Some(location))],
+                    setup_nop_ranges: vec![(setup_start, setup_end)],
+                    original_normal_finally_arrays: vec![OriginalNormalFinallyArray {
+                        entry,
+                        prefix,
+                        incoming: vec![jump],
+                        retained_setup: Some((setup_start, setup_end, setup_label)),
+                        borrow_join: None,
+                    }],
+                    ..ExceptionOwnerProvenance::default()
+                }),
+                preserved_block_boundaries: rustc_hash::FxHashSet::default(),
+                removed_max_depth: None,
+                next_label: 6,
+                has_next_location: false,
+            };
+            match change {
+                "unchanged" => {}
+                "refined owner"
+                | "refined missing edge"
+                | "unproven refined owner"
+                | "different refined record" => {
+                    let Item::Instruction(donor) = &mut assembler.items[1] else {
+                        unreachable!()
+                    };
+                    donor.set_exception_policy(ExceptionPolicy::normalized_owner(false));
+                    if change == "refined missing edge" {
+                        assembler
+                            .exception_owner_provenance
+                            .compound_try_owner_exits
+                            .clear();
+                    }
+                    if change != "unproven refined owner" {
+                        let mut original = jump;
+                        if change == "different refined record" {
+                            original.location.line += 1;
+                        }
+                        assembler
+                            .exception_owner_provenance
+                            .ownerless_compound_try_nops
+                            .push((source, entry, original));
+                    }
+                }
+                "missing edge" => assembler
+                    .exception_owner_provenance
+                    .compound_try_owner_exits
+                    .clear(),
+                "wrong source" => {
+                    assembler
+                        .exception_owner_provenance
+                        .compound_try_owner_exits[0]
+                        .0 = exit
+                }
+                "wrong target" => {
+                    assembler
+                        .exception_owner_provenance
+                        .compound_try_owner_exits[0]
+                        .1 = exit
+                }
+                "duplicate edge" => assembler
+                    .exception_owner_provenance
+                    .compound_try_owner_exits
+                    .push((source, entry)),
+                "duplicate source label" => assembler.items.push(Item::Label(source)),
+                "moved source label" => assembler.items.swap(0, 1),
+                "changed donor location" | "changed donor depth" => {
+                    let Item::Instruction(donor) = &mut assembler.items[1] else {
+                        unreachable!()
+                    };
+                    if change == "changed donor location" {
+                        donor.location.line += 1;
+                    } else {
+                        *donor = Instruction::new(
+                            donor.opcode,
+                            donor.operand(),
+                            donor.location,
+                            Some(1),
+                        );
+                    }
+                }
+                "changed setup slots" => {
+                    let Item::Instruction(setup) = &mut assembler.items[4] else {
+                        unreachable!()
+                    };
+                    setup.local_policy.add_hidden_exception_owner_slots(1);
+                }
+                _ => unreachable!(),
+            }
+            let expected = if matches!(change, "unchanged" | "refined owner") {
+                [0, 5].into_iter().collect()
+            } else {
+                rustc_hash::FxHashSet::default()
+            };
+            assert_eq!(
+                assembler.original_normal_finally_null_markers(&rustc_hash::FxHashSet::default()),
+                expected,
+                "{change}"
+            );
         }
     }
 
