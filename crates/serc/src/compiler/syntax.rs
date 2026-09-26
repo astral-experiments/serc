@@ -2004,7 +2004,9 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             && matches!(error.kind, Kind::WriteToDebug(_))
             && !matches!(*reported, Some(CompileError::InvalidSyntax { .. }));
         if reported.is_some()
-            && !(later_future_in_same_statement || replaces_unknown_future || replaces_pending_debug)
+            && !(later_future_in_same_statement
+                || replaces_unknown_future
+                || replaces_pending_debug)
         {
             return;
         }
