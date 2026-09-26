@@ -45,6 +45,18 @@ filesystem path and preserves filename values that Rust strings cannot
 represent, including non-UTF-8 filenames on Unix. It also rejects paths
 containing a null character before decoding the source.
 
+`PreparedCompilation` binds native warning and Unicode parsing effects to an
+exact input and option set. Callers with proven effects can record every entry
+in `events()` through `CompilationEffects::record_event`. Partial
+retained-string outcomes leave all other additions unknown. A finite
+unchanged-string proof can preserve incoming absence across an event, but cannot
+create absence or recover knowledge lost earlier. `intern_state_candidates()`
+provides input-bound spellings for such proofs without claiming their
+membership. Unicode parsing effects require the target's unchanged normalization
+and named-character lookup semantics; they do not model replacements that alter
+the parsed program. Unsupported interleavings of Unicode lookups and parser
+warnings reject a prepared plan.
+
 `CompileOptions::native_build_profile` selects instruction ordering for specific
 native builds before constant folding. See the
 [native arithmetic profiles](../../docs/cpython-build-profiles.md) for artifact

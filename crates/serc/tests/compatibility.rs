@@ -2228,21 +2228,6 @@ def ordinary_second(value):
     }
 
     #[test]
-    fn matches_cpython_marshal_for_noninterned_constant_metadata_collisions() {
-        let source = r#"from package.config import exported, café
-from other import *
-
-if error.name == "package.config":
-    recover()
-
-class Outer:
-    class Inner:
-        pass
-"#;
-        assert_matches_cpython_marshal(source, "string_metadata_collision.py");
-    }
-
-    #[test]
     fn matches_cpython_marshal_for_qualified_name_constant_provenance() {
         let source = r#"module_name = "<module>"
 

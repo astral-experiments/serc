@@ -13,8 +13,8 @@ use clap::builder::styling::{AnsiColor, Effects};
 use clap::{Parser, Subcommand, ValueEnum, ValueHint};
 use rayon::prelude::*;
 use serc::{
-    CompileError, CompileOptions, NativeBuildProfile, PythonVersion,
-    compile_bytes_with_path_and_options,
+    CompileError, CompileOptions, CompiledModule, NativeBuildProfile, PreparedCompilation,
+    PythonVersion, compile_bytes_with_path_and_options,
 };
 use walkdir::WalkDir;
 
@@ -430,14 +430,14 @@ fn compile_path_with_metadata(
     let source_bytes = read_source(path, metadata.as_ref())
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
     let module =
-        compile_bytes_with_path_and_options(&source_bytes, path, options).map_err(|error| {
-            match &error {
+        compile_with_isolated_unicode(&source_bytes, path, options).map_err(
+            |error| match &error {
                 CompileError::Decode(error) => {
                     format!("failed to decode {}: {error}", path.display())
                 }
                 _ => format!("failed to compile {}: {error}", path.display()),
-            }
-        })?;
+            },
+        )?;
 
     let Some(metadata) = metadata else {
         black_box(module);
@@ -506,6 +506,26 @@ fn read_source(path: &Path, metadata: Option<&std::fs::Metadata>) -> io::Result<
     }
     source.read_to_end(&mut contents)?;
     Ok(contents)
+}
+
+/// Retry only a Unicode-sensitive failure under the CLI's isolated target model.
+fn compile_with_isolated_unicode(
+    source: &[u8],
+    path: &Path,
+    options: &CompileOptions,
+) -> Result<CompiledModule, CompileError> {
+    match compile_bytes_with_path_and_options(source, path, options) {
+        Err(error @ CompileError::UnresolvedInternState { .. }) => {
+            let Ok(prepared) = PreparedCompilation::bytes_with_path(source, path, options) else {
+                return Err(error);
+            };
+            let Ok(effects) = prepared.isolated_unicode_effects() else {
+                return Err(error);
+            };
+            prepared.finish(&effects)
+        }
+        result => result,
+    }
 }
 
 /// Encodes signed Unix seconds for a CPython timestamp cache header.

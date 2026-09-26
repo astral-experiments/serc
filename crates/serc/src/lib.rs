@@ -24,6 +24,7 @@ use std::rc::Rc;
 use code_object::{CodeFilename, CodeObject};
 use compilation_effects::WarningRun;
 pub use compilation_effects::{
+    CompilationEffect, CompilationEffects, CompilationEvent, CompilationUnicodeParsing,
     CompilationWarning, CompilationWarningEffect, CompilationWarningEffects,
     CompilationWarningPhase, PreparedCompilation,
 };

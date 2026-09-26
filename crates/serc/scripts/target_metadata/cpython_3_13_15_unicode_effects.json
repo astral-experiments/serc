@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "kind": "standard-caller-unicode-parsing-source-proof",
+  "target": {
+    "implementation": "cpython",
+    "version": "3.13.15",
+    "tag": "v3.13.15",
+    "commit": "4061bc4c35f7c26f25264666d4ba083b93d2f6f9",
+    "magic_hex": "f30d0d0a"
+  },
+  "initial_source_proof_sha256": "47c5b083c5439134a462e9451685365d5b91d35826ae733737e9de65c058ed1e",
+  "runtime_admission_sha256": "bd6e6c43c1cc3218956d5ecb5eaf54413399bcf05bf01a3ceeeb123c38d39ecc",
+  "generator_sha256": "4aaedf5c37eb3fdefde9bca6f9afd466611f843368cd02e7e9bdaadab8f28e4a",
+  "target_helper_sha256": "9a49a8b2f1cf9a3338913c1498bc745aad6570217eeec7a1a259fbc03f1dd68e",
+  "input_sha256": {
+    "Include/internal/pycore_ucnhash.h": "4e61018a9052a35db8aa7e775d08e64a24eb7f6a9484cd32587ebd1c87c33d0d",
+    "Lib/importlib/_bootstrap.py": "a6ad778d6b9b6f9ad4d1094509e4acbff911ff9424cbd9acae8882ccf0cc0482",
+    "Lib/importlib/_bootstrap_external.py": "9623292c307de38721ab92efcb2ba44bbb663f9140edd585aaf29179841f16a8",
+    "Modules/clinic/unicodedata.c.h": "d894f9d09c10315f3f2f388c8cbf97362b8f6c13212595049e80288c9e2307e6",
+    "Modules/unicodedata.c": "d44b25f8269744833467d512a6c6a0c7095818e2d2e058290318ef5d9ffa0893",
+    "Modules/unicodedata_db.h": "24b06d3a0ea1aa63bcef4df8bb71ab1380abc2cf6570f2c17296b3a23654efe4",
+    "Modules/unicodename_db.h": "22a1ddc5dc67046f02f26b5fb3da106ead4d3b326095011ba12013391aec8a1f",
+    "Objects/capsule.c": "15d36cc9fb9bf0702c680fc9b474bc2b7b8e64ce1b69fe490cc004eda0b750a7",
+    "Objects/descrobject.c": "594e5bc55afdbafc469a089c38fc595286422c5f534d17d85ea40672d94ae5ac",
+    "Objects/dictobject.c": "15bbf49b0b7c0fbc4c3cf72f68cc4fd9b50884b909ab16935fc25a37b551901b",
+    "Objects/moduleobject.c": "ed3e5d2c8d3568ca264845c454c5ea5a4070ffde03742dacb3623ad642b0e5eb",
+    "Objects/object.c": "f3d49ffbe11bdaa179d39fdf92652f0d6bd409319acadebc1699026e54598390",
+    "Objects/typeobject.c": "da9c3837a85c7494f3cf7cecde8b5e08d4fdcf599c69d94be98745ca27c50040",
+    "Objects/unicodeobject.c": "92db20b414eedbc7b8a145505a2c17b76bc026ff26daa94a25dae94e5fd912ea",
+    "Parser/pegen.c": "c4023712d12a94496e4bd718b90ad1c8ba82dcae0834732bbf030ebac298b551",
+    "Parser/string_parser.c": "18ff5130b7c1821a1378072702bfd0cade7ae45b166a48a8bc6b8c4c43d04ed5",
+    "Python/frozen.c": "ac246e0144ddfae629315a605049ad1ffb191db4b35df419bd039e7f2f6ed829",
+    "Python/import.c": "ecee029f7f2b82fff99e7358b571d596c6c8d8295edd84566fde9fe156549d2b",
+    "Python/modsupport.c": "9f8aad6f33d7984f9f6fb66b324a05ece1de4d2eef91ab015202611b3b4409f3",
+    "Tools/build/freeze_modules.py": "6e6dfe3eb63050f6128f37ca888be7fb907de9c9613bb208941b954fe295012b"
+  },
+  "semantics": "partial-parser-retained-positives",
+  "retained_strings": [
+    "UCD",
+    "_ucnhash_CAPI",
+    "bidirectional",
+    "category",
+    "combining",
+    "decimal",
+    "decomposition",
+    "digit",
+    "east_asian_width",
+    "is_normalized",
+    "lookup",
+    "mirrored",
+    "name",
+    "normalize",
+    "numeric",
+    "ucd_3_2_0",
+    "unidata_version"
+  ],
+  "unchanged_domain": {
+    "domain": "ascii-dotted-identifiers-and-locals",
+    "semantics": "incoming-absence-preservation-only",
+    "initial_dotted_sha256": "9f9834e1f17682ca43c3b241c4d8a682d7b4ce464c4f9c002d44d59669603663",
+    "excluded_prefixes": [
+      "GraphemeBreakIterator.",
+      "Segment.",
+      "UCD.",
+      "unicodedata."
+    ]
+  },
+  "loader_selection": {
+    "kind": "extension",
+    "config_path": "lib/python3.13/config-3.13-x86_64-linux-gnu/config.c",
+    "config_sha256": "b863e4ac03f84bb7a1dbee08b08dab2b086e5e1f2312d91302faabb74c9ed668",
+    "carrier_path": "lib/python3.13/lib-dynload/unicodedata.cpython-313-x86_64-linux-gnu.so",
+    "carrier_sha256": "703b1d33d7991d5bf6cf0f794dac5cb01de6420c80bfe1a6adbf4b4791751b75",
+    "libpython_path": "lib/libpython3.13.so.1.0",
+    "libpython_sha256": "18a6cab66b5167a8b7c80014d95805a3008850c6c0a47ca9906e09bddd7f7165",
+    "executable_path": "bin/python3.13",
+    "executable_sha256": "2b33ea85bdbb129c1c6bf2f2398fcfe7a5d52eb7730f7a67ae264aeafe7290b6"
+  },
+  "conditions": {
+    "qualified_initial_caller_and_runtime": true,
+    "native_normalizer_and_name_capsule": true,
+    "unmodified_import_hooks_and_modules": true,
+    "pristine_source_only_runtime": true,
+    "standard_source_codecs": true,
+    "retained_owners_preserved": true
+  },
+  "coverage": {
+    "method_keys": [
+      "bidirectional",
+      "category",
+      "combining",
+      "decimal",
+      "decomposition",
+      "digit",
+      "east_asian_width",
+      "is_normalized",
+      "lookup",
+      "mirrored",
+      "name",
+      "normalize",
+      "numeric"
+    ],
+    "module_keys": [
+      "UCD",
+      "_ucnhash_CAPI",
+      "ucd_3_2_0",
+      "unidata_version"
+    ],
+    "owners": "native module dictionary and UCD method/member descriptors",
+    "other_additions": "unknown",
+    "temporary_normalization_results": "not claimed",
+    "lookup_caches": "parser-local normalizer and interpreter-wide name capsule"
+  }
+}

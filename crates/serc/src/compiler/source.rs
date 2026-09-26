@@ -283,7 +283,7 @@ impl<'source> CompilationContext<'source> {
         }
     }
 
-    /// Enable complete assembly provenance only when native warnings can affect this input.
+    /// Enable complete assembly provenance when native external effects can affect this input.
     pub(super) fn enable_warning_effects(
         &mut self,
         warnings: Option<Rc<crate::compilation_effects::WarningRun>>,
@@ -312,7 +312,11 @@ impl<'source> CompilationContext<'source> {
                 && !super::warnings::preprocessing(body, self.python_version).is_empty())
             || (self.warning_candidates.legacy_inversion
                 && super::warnings::legacy_boolean_inversion(body, self.python_version).is_some());
-        if parser.complete && parser.warnings.is_empty() && !codegen_warnings {
+        if parser.complete
+            && parser.warnings.is_empty()
+            && !codegen_warnings
+            && !parser.unicode.is_present()
+        {
             return;
         }
         self.warning_run = Some(warnings.unwrap_or_default());
@@ -322,6 +326,16 @@ impl<'source> CompilationContext<'source> {
             .get_or_insert_with(RefCell::default)
             .get_mut()
             .all_strings = true;
+        if parser.unicode.is_present() {
+            if !parser.complete || !parser.warnings.is_empty() {
+                warnings.invalidate_plan(
+                    "Unicode parsing lookups interleave with tokenizer/parser warnings",
+                );
+            }
+            // Parsing finishes before any AST preprocessing or code assembly. This only
+            // adds retained membership; existing parser/constant origins remain intact.
+            self.record_interning_event(warnings.record_unicode(parser.unicode));
+        }
         if parser.complete {
             for warning in parser.warnings {
                 self.record_warning(warning);

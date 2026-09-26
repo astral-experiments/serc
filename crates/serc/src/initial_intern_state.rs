@@ -203,6 +203,14 @@ impl InitialInternState {
         matches!(self.mode, InitialInternMode::Supplemental)
     }
 
+    /// Recognize the unmodified isolated-startup model, without caller-supplied state.
+    pub(crate) fn is_isolated_startup(&self) -> bool {
+        self.uses_startup_state()
+            && self.strings.is_none()
+            && self.additional_strings.is_none()
+            && self.models_standard_source_codec_effects()
+    }
+
     pub(crate) fn has_unknown_entries(&self) -> bool {
         matches!(self.mode, InitialInternMode::Partial { .. })
     }

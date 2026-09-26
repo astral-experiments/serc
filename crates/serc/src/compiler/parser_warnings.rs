@@ -8,11 +8,14 @@ use ruff_python_ast::visitor::{Visitor, walk_stmt};
 use ruff_python_ast::{Expr, Stmt};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 
-use crate::{CompilationWarning, CompilationWarningPhase, PythonVersion};
+use crate::{
+    CompilationUnicodeParsing, CompilationWarning, CompilationWarningPhase, PythonVersion,
+};
 
 pub(super) struct ParserWarnings {
     pub(super) warnings: Vec<CompilationWarning>,
     pub(super) complete: bool,
+    pub(super) unicode: CompilationUnicodeParsing,
 }
 
 /// Recognize the single ordinary-literal case exactly. More involved tokenizer/parser
@@ -24,8 +27,12 @@ pub(super) fn analyze(
     relative_lazy_warning: bool,
 ) -> ParserWarnings {
     let mut warnings = Vec::new();
+    let mut unicode = CompilationUnicodeParsing::default();
     let mut complete = !relative_lazy_warning;
     for token in tokens {
+        if token.kind() == TokenKind::Identifier && !source[token.range()].is_ascii() {
+            unicode.identifiers = true;
+        }
         if matches!(
             token.kind(),
             TokenKind::Int | TokenKind::Float | TokenKind::Complex
@@ -59,6 +66,7 @@ pub(super) fn analyze(
             token.range()
         };
         let text = &source[range];
+        unicode.named_escapes |= !flags.is_byte_string() && has_named_escape(text.as_bytes());
         if let Some((offset, length, octal)) =
             first_invalid_escape(text.as_bytes(), flags.is_byte_string())
         {
@@ -102,7 +110,23 @@ pub(super) fn analyze(
     // Pegen can fetch warning-bearing tokens while speculating, and f/t-string middle
     // literals are decoded after their replacement expressions. A lexical sort is not a plan.
     complete &= warnings.len() <= 1;
-    ParserWarnings { warnings, complete }
+    ParserWarnings {
+        warnings,
+        complete,
+        unicode,
+    }
+}
+
+/// Test raw escape spelling rather than decoded literal contents. Backslashes consume
+/// the following character, so an escaped backslash cannot start a named-character lookup.
+fn has_named_escape(text: &[u8]) -> bool {
+    let mut bytes = text.iter().copied();
+    while let Some(byte) = bytes.next() {
+        if byte == b'\\' && bytes.next() == Some(b'N') {
+            return true;
+        }
+    }
+    false
 }
 
 /// The parser compares normalized module names when warning about relative lazy imports.
@@ -297,5 +321,48 @@ mod tests {
             first_invalid_escape(b"\\\r\n\\z", false),
             Some((3, 2, false))
         );
+    }
+
+    #[test]
+    fn unicode_lookups_use_raw_identifier_and_literal_spelling() {
+        for (source, identifiers, named_escapes) in [
+            ("\u{212a} = 1\n", true, false),
+            ("item.слово = 1\n", true, false),
+            ("def f(слово): pass\n", true, false),
+            ("# слово\ntext = 'слово'\n", false, false),
+            (r"text = '\N{LATIN CAPITAL LETTER A}'", false, true),
+            (r"text = '\\N{LATIN CAPITAL LETTER A}'", false, false),
+            (r"text = r'\N{LATIN CAPITAL LETTER A}'", false, false),
+            (r"text = b'\N{LATIN CAPITAL LETTER A}'", false, false),
+            (r"text = f'\N{LATIN CAPITAL LETTER A}{value}'", false, true),
+            (r"text = t'\N{LATIN CAPITAL LETTER A}{value}'", false, true),
+            (r"text = f'{value:\N{LATIN CAPITAL LETTER A}}'", false, true),
+            (r"text = rf'{слово}'", true, false),
+            (r#"text = rf"{'\N{LATIN CAPITAL LETTER A}'}""#, false, true),
+            (
+                r"text = rf'\N{{LATIN CAPITAL LETTER A}}{value}'",
+                false,
+                false,
+            ),
+            (r"text = '\u005cN{LATIN CAPITAL LETTER A}'", false, false),
+        ] {
+            let parsed = ruff_python_parser::parse_module(source).unwrap();
+            let plan = analyze(
+                source,
+                parsed.tokens(),
+                parsed.suite(),
+                PythonVersion::Py314,
+            );
+            assert_eq!(
+                plan.unicode.normalizes_identifiers(),
+                identifiers,
+                "{source}"
+            );
+            assert_eq!(
+                plan.unicode.decodes_named_escapes(),
+                named_escapes,
+                "{source}"
+            );
+        }
     }
 }
