@@ -208,8 +208,7 @@ fn warning_callbacks_preserve_annotation_assembly_order() {
 
 #[test]
 fn warning_callbacks_preserve_assembly_lines_with_mixed_newlines() {
-    let source =
-        "@decorator\r\ndef outer():\r    def inner():\n        return 1 is x\r\n    return inner\r\n";
+    let source = "@decorator\r\ndef outer():\r    def inner():\n        return 1 is x\r\n    return inner\r\n";
     for version in [
         PythonVersion::Py312,
         PythonVersion::Py313,
@@ -246,7 +245,11 @@ fn warning_callbacks_preserve_lines_for_text_and_bytes_sources() {
             };
             for prepared in [
                 PreparedCompilation::text(&source, "warning_effects_context.py", &options),
-                PreparedCompilation::bytes(source.as_bytes(), "warning_effects_context.py", &options),
+                PreparedCompilation::bytes(
+                    source.as_bytes(),
+                    "warning_effects_context.py",
+                    &options,
+                ),
             ] {
                 let prepared = prepared.unwrap();
                 let mut effects = prepared.effects();

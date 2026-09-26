@@ -604,9 +604,13 @@ mod tests {
 
     fn events(source: &str, version: PythonVersion) -> Vec<ScheduleEvent> {
         let parsed = ruff_python_parser::parse_module(source).unwrap();
-        WarningSchedule::plan(parsed.suite(), &LineIndex::from_source_text(source), version)
-            .unwrap()
-            .events
+        WarningSchedule::plan(
+            parsed.suite(),
+            &LineIndex::from_source_text(source),
+            version,
+        )
+        .unwrap()
+        .events
     }
 
     fn summary(source: &str, version: PythonVersion) -> Vec<String> {
@@ -642,8 +646,7 @@ mod tests {
 
     #[test]
     fn assembly_lines_follow_mixed_newlines() {
-        let source =
-            "@decorator\r\ndef outer():\r    def inner():\n        return 1 is x\r\n    return inner\r\n";
+        let source = "@decorator\r\ndef outer():\r    def inner():\n        return 1 is x\r\n    return inner\r\n";
         for version in VERSIONS {
             assert_eq!(
                 summary(source, version),
