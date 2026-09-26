@@ -23,6 +23,120 @@ const LEVELS: [OptimizationLevel; 3] = [
 
 static ORACLES: [OnceLock<OsString>; 4] = [const { OnceLock::new() }; 4];
 
+#[test]
+fn loop_tail_elided_else_matches_cpython() {
+    for source in [
+        r"
+def f(xs):
+    n = None
+    for count in xs:
+        if n is None:
+            n = count
+        else:
+            assert n == count
+    return n
+",
+        r"
+def f(xs, a, b):
+    for x in xs:
+        if a and b:
+            work(x)
+        else:
+            assert x
+",
+        r"
+def f(xs):
+    for x in xs:
+        if False:
+            work(x)
+        else:
+            assert x
+",
+        r"
+def f(xs):
+    for x in xs:
+        if x:
+            work(x)
+        else:
+            assert x
+            pass
+",
+        r"
+def f(xs):
+    for x in xs:
+        if x:
+            work(x)
+        else:
+            assert x
+            work_else(x)
+",
+    ] {
+        assert_matches_cpython(source, "elided_loop_else.py", &LEVELS);
+    }
+}
+
+#[test]
+fn protected_loop_tail_controls_match_cpython() {
+    for source in [
+        r"
+def f(xs):
+    try:
+        for x in xs:
+            if x:
+                work(x)
+            else:
+                assert x
+    except ValueError:
+        cleanup()
+",
+        r"
+def f(xs):
+    for x in xs:
+        try:
+            if x:
+                work(x)
+            else:
+                assert x
+        except ValueError:
+            cleanup()
+",
+        r"
+def f(xs):
+    try:
+        for x in xs:
+            if x:
+                work(x)
+            else:
+                assert x
+    finally:
+        cleanup()
+",
+        r"
+def f(xs, cm):
+    with cm:
+        for x in xs:
+            if x:
+                work(x)
+            else:
+                assert x
+",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "protected_loop_tail.py",
+            &LEVELS,
+            &[PythonVersion::Py312, PythonVersion::Py313],
+        );
+        // Optimized protected backedge ownership on newer versions is tracked separately.
+        assert_matches_cpython_versions(
+            source,
+            "protected_loop_tail.py",
+            &[OptimizationLevel::Zero],
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
 const ORACLE_IDENTITY: &str = r"
 import importlib.util, sys
 assert sys.implementation.name == 'cpython'
@@ -81,7 +195,17 @@ fn oracle(
 }
 
 fn assert_matches_cpython(source: &str, filename: &str, levels: &[OptimizationLevel]) {
-    for (python_version, _, _) in VERSIONS {
+    let versions = VERSIONS.map(|(version, _, _)| version);
+    assert_matches_cpython_versions(source, filename, levels, &versions);
+}
+
+fn assert_matches_cpython_versions(
+    source: &str,
+    filename: &str,
+    levels: &[OptimizationLevel],
+    versions: &[PythonVersion],
+) {
+    for &python_version in versions {
         for &optimization_level in levels {
             let options = CompileOptions {
                 python_version,

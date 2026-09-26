@@ -15422,7 +15422,18 @@ impl<'source> Compiler<'source> {
                 if matches!(assignment.targets.as_slice(), [Expr::Name(target)]
                     if target.id.as_str() == test.id.as_str())
         );
-        if statement.elif_else_clauses.is_empty() {
+        let optimized_empty_else = self.context.python_version >= crate::PythonVersion::Py314
+            && !non_final_branch
+            && !try_body_normal_exit
+            && !self.has_active_control_flow_region()
+            && matches!(statement.elif_else_clauses.as_slice(), [clause]
+            if clause.test.is_none()
+                && !clause.body.is_empty()
+                && clause.body.iter().all(|statement| matches!(
+                    self.context.optimized_locations.get(&statement.range()),
+                    Some(super::optimization::OptimizedLocation::Elided)
+                )));
+        if statement.elif_else_clauses.is_empty() || optimized_empty_else {
             let protected_try_normal_exit = try_body_normal_exit
                 && self.control.generators.generator_region_start.is_none()
                 && self.control.withs.active_with_region_exclusions.is_empty()
