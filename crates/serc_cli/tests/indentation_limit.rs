@@ -142,6 +142,9 @@ fn check_indentation_error_order() {
     let indentation_start = deep.find(&" ".repeat(100)).unwrap();
     let delimiters = format!("value = {}1{}\n", "(".repeat(201), ")".repeat(201));
     let deep_delimiters = format!("{}{delimiters}", deep.strip_suffix("pass\n").unwrap());
+    let early_yield = "def f():\n    yield, x\n";
+    let yield_start = early_yield.find(',').unwrap();
+    let interpolated_yield = "def f():\n    x = f\"{yield, x}\"\n";
     let mut cases = vec![
         (
             format!("{deep}bad =\n"),
@@ -169,6 +172,47 @@ fn check_indentation_error_order() {
             format!("{delimiters}{deep}"),
             "too many nested parentheses",
             "value = ".len() + 200,
+        ),
+        (format!("{early_yield}{deep}"), "invalid syntax", yield_start),
+        (
+            format!("{deep}{early_yield}"),
+            "too many levels of indentation",
+            indentation_start,
+        ),
+        (
+            format!("{early_yield}if : pass\n{deep}"),
+            "invalid syntax",
+            yield_start,
+        ),
+        (
+            format!("if : pass\n{early_yield}{deep}"),
+            "invalid syntax",
+            "if ".len(),
+        ),
+        (
+            format!("{early_yield}{deep}{delimiters}"),
+            "invalid syntax",
+            yield_start,
+        ),
+        (
+            format!("{early_yield}{delimiters}{deep}"),
+            "too many nested parentheses",
+            early_yield.len() + "value = ".len() + 200,
+        ),
+        (
+            format!("{early_yield}value = (1)\n{deep}"),
+            "invalid syntax",
+            yield_start,
+        ),
+        (
+            format!("{early_yield}{deep}value = 'unterminated\n"),
+            "invalid syntax",
+            yield_start,
+        ),
+        (
+            format!("{interpolated_yield}{deep}"),
+            "f-string: expecting '=', or '!', or ':', or '}'",
+            interpolated_yield.find(',').unwrap(),
         ),
     ];
     for token in ["?", "$", "`"] {
