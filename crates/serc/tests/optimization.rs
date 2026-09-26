@@ -898,7 +898,7 @@ fn async_comprehension_preserves_conditional_exception_owner() {
     const TRACE_CONDITION: &str = r"
 import dis, marshal, sys
 
-scope = {}
+scope = {'work': lambda: None}
 exec(marshal.loads(sys.stdin.buffer.read()), scope)
 f = scope['f']
 targets = [i.offset for i in dis.get_instructions(f)
@@ -935,15 +935,21 @@ assert hits == [target], hits
 print(outcome)
 ";
     let cases = [
-        ("{**{k: 1 for k in xs}}", false, false),
-        ("[{k: 1 for k in xs}]", false, false),
-        ("{**dict(xs)}", true, false),
-        ("{**{k: 1 for k in xs}}", false, true),
+        ("{**{k: 1 for k in xs}}", "", 4, false),
+        ("[{k: 1 for k in xs}]", "", 4, false),
+        ("{**dict(xs)}", "", 4, true),
+        ("{**{k: 1 for k in xs}}", "    pass\n", 5, false),
+        ("{**{k: 1 for k in xs}}", "    pass; pass\n", 5, true),
+        (
+            "{**{k: 1 for k in xs}}",
+            "    try:\n        work()\n    finally:\n        pass\n",
+            8,
+            false,
+        ),
     ];
-    for (expression, protected_314, authored_pass) in cases {
-        let pass = if authored_pass { "    pass\n" } else { "" };
+    for (expression, prefix, condition_line, protected_314) in cases {
         let source = format!(
-            "async def f(x, xs, d):\n    v = {expression}\n{pass}    try:\n        if x:\n            pass\n    except Exception:\n        pass\n"
+            "async def f(x, xs, d):\n    v = {expression}\n{prefix}    try:\n        if x:\n            pass\n    except Exception:\n        pass\n"
         );
         for (index, (python_version, _, _)) in VERSIONS.iter().copied().enumerate() {
             for optimization_level in LEVELS {
@@ -979,7 +985,7 @@ print(outcome)
                     for code in [&native.stdout, &actual] {
                         let mut child = Command::new(ORACLES[index].get().unwrap())
                             .args(["-I", "-S", "-B", "-c", TRACE_CONDITION])
-                            .arg(if authored_pass { "5" } else { "4" })
+                            .arg(condition_line.to_string())
                             .stdin(Stdio::piped())
                             .stdout(Stdio::piped())
                             .stderr(Stdio::piped())
