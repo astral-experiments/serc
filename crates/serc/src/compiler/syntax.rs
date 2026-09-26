@@ -2682,7 +2682,15 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             }
             Kind::YieldFromInAsyncFunction => "'yield from' inside async function".to_owned(),
             Kind::AwaitOutsideAsyncFunction(AwaitOutsideAsyncFunctionKind::Await) => {
-                if self.comprehension_yield_operand {
+                if self.comprehension_yield_operand
+                    || matches!(
+                        self.scope().kind,
+                        ScopeKind::Function {
+                            is_async: false,
+                            ..
+                        }
+                    )
+                {
                     "'await' outside async function".to_owned()
                 } else {
                     "'await' outside function".to_owned()
