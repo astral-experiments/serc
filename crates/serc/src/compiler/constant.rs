@@ -1551,19 +1551,56 @@ pub(super) fn python_constant_values_equal(left: &Constant, right: &Constant) ->
     ConstantEquality::PythonValue.equal(left, right)
 }
 
-/// Return a canonical integer value for numeric constants that compare equal to an integer.
-pub(super) fn python_integer_value_key(value: &Constant) -> Option<(bool, Vec<u16>)> {
+#[derive(Clone, Eq, Hash, PartialEq)]
+enum NumericKeyReal {
+    Integer { negative: bool, digits: Vec<u16> },
+    Float(u64),
+}
+
+/// A hashable representation of Python numeric equality, without rounding integers.
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub(super) struct PythonNumericValueKey {
+    real: NumericKeyReal,
+    imaginary: u64,
+}
+
+/// Return a canonical key for a numeric constant, excluding non-reflexive NaNs.
+pub(super) fn python_numeric_value_key(value: &Constant) -> Option<PythonNumericValueKey> {
     let (real, imaginary) = numeric_parts(value)?;
-    if imaginary.to_bits() & 0x7fff_ffff_ffff_ffff != 0 {
+    if imaginary.is_nan() {
         return None;
     }
     let real = match real {
-        NumericReal::Float(value) => float_integer_numeric_real(value)?,
+        NumericReal::Float(value) if value.is_nan() => return None,
+        NumericReal::Float(value) => match float_integer_numeric_real(value) {
+            Some(integer) => integer,
+            None => {
+                return Some(PythonNumericValueKey {
+                    real: NumericKeyReal::Float(value.to_bits()),
+                    imaginary: normalized_float_zero(imaginary),
+                });
+            }
+        },
         integer @ NumericReal::Integer { .. } => integer,
     };
     match real {
-        NumericReal::Integer { negative, digits } => Some((negative, digits)),
-        NumericReal::Float(_) => None,
+        NumericReal::Integer { negative, digits } => Some(PythonNumericValueKey {
+            real: NumericKeyReal::Integer {
+                negative: negative && !digits.is_empty(),
+                digits,
+            },
+            imaginary: normalized_float_zero(imaginary),
+        }),
+        NumericReal::Float(_) => unreachable!("integral float conversion returns an integer"),
+    }
+}
+
+fn normalized_float_zero(value: f64) -> u64 {
+    let bits = value.to_bits();
+    if bits & 0x7fff_ffff_ffff_ffff == 0 {
+        0
+    } else {
+        bits
     }
 }
 

@@ -1272,7 +1272,8 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
             return;
         }
         if let Stmt::Match(match_statement) = statement {
-            let numeric_duplicate = pattern_numeric::has_large_numeric_duplicate(match_statement);
+            let numeric_duplicate =
+                pattern_numeric::has_large_numeric_duplicate(match_statement, self.python_version);
             if numeric_duplicate
                 || (self.may_have_debug_patterns
                     && pattern_debug::has_debug_pattern(match_statement))
