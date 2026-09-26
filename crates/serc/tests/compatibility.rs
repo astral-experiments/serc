@@ -7919,6 +7919,55 @@ print(events)
     }
 
     #[test]
+    fn preserves_enclosing_finally_owner_for_nested_pass_finally() {
+        for (function, trailer) in [("def", ""), ("async def", ""), ("def", "    yield 1\n")] {
+            for (body, handler) in [("work()", ""), ("pass", " Exception")] {
+                let source = format!(
+                    "{function} f():\n    try:\n        try:\n            {body}\n        finally:\n            pass\n    except{handler}:\n        recover()\n    finally:\n        cleanup()\n{trailer}"
+                );
+                assert_matches_cpython_marshal(&source, "nested_pass_finally.py");
+                assert_matches_cpython_marshal_bytes(source.as_bytes(), "nested_pass_finally.py");
+            }
+        }
+        // The same exit at a loop backedge retains its existing owner.
+        let loop_source = "def f(items):\n    try:\n        for item in items:\n            try:\n                work()\n            finally:\n                pass\n    except:\n        recover()\n    finally:\n        cleanup()\n";
+        assert_matches_cpython_marshal(loop_source, "loop_pass_finally.py");
+    }
+
+    #[test]
+    fn trace_error_runs_outer_finally_for_nested_pass_finally() {
+        let source = r"import sys
+
+events = []
+def f():
+    try:
+        try:
+            events.append('work')
+        finally:
+            pass
+    except:
+        events.append('handler')
+    finally:
+        events.append('cleanup')
+
+def trace(frame, event, arg):
+    if frame.f_code is f.__code__ and event == 'line' and frame.f_lineno == f.__code__.co_firstlineno + 5:
+        raise RuntimeError('trace failed')
+    return trace
+
+sys.settrace(trace)
+try:
+    f()
+except RuntimeError:
+    events.append('raised')
+finally:
+    sys.settrace(None)
+print(events)
+";
+        assert_executes(source, "['work', 'cleanup', 'raised']\n");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_folded_expressions_in_protected_regions() {
         let source = "def try_except():\n    try:\n        'try'\n        body()\n    except:\n        'except'\n        recover()\n\ndef except_only():\n    try:\n        body()\n    except:\n        'except'\n\ndef nested_handlers():\n    try:\n        try:\n            body()\n        except ValueError:\n            recover()\n        except TypeError:\n            recover()\n    finally:\n        cleanup()\n\ndef with_body(manager):\n    with manager:\n        'with'\n        body()\n\ndef with_only(manager):\n    with manager:\n        'with'\n\nasync def protected_condition():\n    await source\n    if test:\n        await other\n\ntry:\n    pass\nexcept (ValueError if True else TypeError):\n    pass\n\ntry:\n    pass\nexcept* (ValueError if True else TypeError):\n    pass\n\ndef protected_conditions(manager, first, second):\n    with manager:\n        if first:\n            body()\n        if second:\n            body()\n\ndef generator_try():\n    yield 1\n    try:\n        pass\n    except Exception:\n        pass\n\nif condition:\n    try:\n        with manager:\n            body()\n    except Error:\n        pass\n";
         assert_matches_cpython_marshal(source, "protected_nop.py");
