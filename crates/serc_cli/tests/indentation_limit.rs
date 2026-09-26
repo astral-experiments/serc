@@ -173,7 +173,11 @@ fn check_indentation_error_order() {
             "too many nested parentheses",
             "value = ".len() + 200,
         ),
-        (format!("{early_yield}{deep}"), "invalid syntax", yield_start),
+        (
+            format!("{early_yield}{deep}"),
+            "invalid syntax",
+            yield_start,
+        ),
         (
             format!("{deep}{early_yield}"),
             "too many levels of indentation",
@@ -201,6 +205,16 @@ fn check_indentation_error_order() {
         ),
         (
             format!("{early_yield}value = (1)\n{deep}"),
+            "invalid syntax",
+            yield_start,
+        ),
+        (
+            format!("{early_yield}value = 1 + \\\n 2\n{deep}"),
+            "invalid syntax",
+            yield_start,
+        ),
+        (
+            format!("{early_yield}{deep})\n"),
             "invalid syntax",
             yield_start,
         ),
@@ -279,6 +293,33 @@ else:
                     }
                     error => panic!("{version} {mode}: unexpected error {error:?}"),
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn indentation_depth_preserves_earlier_legacy_template_error() {
+    let deep = nested_source(100, " ");
+    let template = "value = t'hello'\n";
+    let delimiters = format!("value = {}1{}\n", "(".repeat(201), ")".repeat(201));
+    for version in [PythonVersion::Py312, PythonVersion::Py313] {
+        let options = CompileOptions {
+            python_version: version,
+            ..CompileOptions::default()
+        };
+        for source in [
+            format!("{template}{deep}"),
+            format!("{template}def f():\n    yield, x\n{deep}"),
+            format!("{template}{deep}{delimiters}"),
+        ] {
+            for result in [
+                compile_with_options(&source, "indentation.py", &options),
+                compile_bytes_with_options(source.as_bytes(), "indentation.py", &options),
+            ] {
+                let error = result.unwrap_err();
+                assert!(error.to_string().contains("Cannot use t-strings"), "{version}: {error}");
+                assert!(error.range().unwrap().start().to_usize() < template.len());
             }
         }
     }

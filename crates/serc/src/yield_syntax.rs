@@ -46,7 +46,7 @@ fn invalid_comma(tokens: &Tokens) -> Option<usize> {
 }
 
 /// An indentation-limit failure stops native tokenization. Check its prefix so
-/// later tokenizer errors cannot mask an earlier invalid yield.
+/// later tokenizer errors cannot mask an earlier invalid yield or template.
 pub(crate) fn before_indentation_error(
     source: &str,
     options: &ParseOptions,
@@ -54,28 +54,47 @@ pub(crate) fn before_indentation_error(
     version: PythonVersion,
 ) -> Option<CompileError> {
     let prefix = &source[..indentation.start().to_usize()];
-    if !prefix.contains("yield") {
+    if !prefix.contains("yield")
+        && (version >= PythonVersion::Py314 || !prefix.contains(['t', 'T']))
+    {
         return None;
     }
-    let parsed = ruff_python_parser::parse_unchecked(prefix, options.clone())
-        .try_into_module()?;
+    let parsed = ruff_python_parser::parse_unchecked(prefix, options.clone()).try_into_module()?;
     let parsed = crate::ParsedModule(Some(parsed));
     let parsed = parsed.0.as_ref().expect("parsed module is present");
-    if !parsed.errors().is_empty() {
-        return before_parse_error(
+    let yield_error = if !parsed.errors().is_empty() {
+        before_parse_error(
             prefix,
             parsed.tokens(),
             parsed.errors(),
             parsed.unsupported_syntax_errors(),
             version,
-        );
-    }
-    if earlier_unsupported(prefix, parsed.tokens(), parsed.unsupported_syntax_errors(), version)
-        .is_some()
+        )
+    } else if earlier_unsupported(
+        prefix,
+        parsed.tokens(),
+        parsed.unsupported_syntax_errors(),
+        version,
+    )
+    .is_some()
     {
-        return None;
+        None
+    } else {
+        validate(prefix, parsed.tokens(), version).err()
+    };
+    if yield_error.is_some() {
+        return yield_error;
     }
-    validate(prefix, parsed.tokens(), version).err()
+    // Preserve the earlier version error for a completed legacy template.
+    let error = parsed.unsupported_syntax_errors().iter().find(|error| {
+        matches!(error.kind, UnsupportedSyntaxErrorKind::TemplateStrings)
+            && error.range.end() <= indentation.start()
+            && parsed
+                .errors()
+                .first()
+                .is_none_or(|prior| error.range.start() < prior.location.start())
+    })?;
+    Some(CompileError::invalid_syntax(error.to_string(), error.range))
 }
 
 /// Retain an earlier version error unless the invalid pair is inside a legacy
