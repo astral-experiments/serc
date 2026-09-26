@@ -1,6 +1,9 @@
 use ruff_python_ast::token::{Token, TokenKind, Tokens};
 use ruff_python_ast::{BoolOp, Expr};
-use ruff_python_parser::{Mode, ParseOptions};
+use ruff_python_parser::{
+    LexicalErrorType, Mode, ParseError, ParseErrorType, ParseOptions, UnsupportedSyntaxError,
+    UnsupportedSyntaxErrorKind,
+};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 
 use crate::{CompileError, PythonVersion};
@@ -22,8 +25,16 @@ pub(crate) fn validate(
     if !source.contains("yield") {
         return Ok(());
     }
+    let Some(comma) = invalid_comma(tokens) else {
+        return Ok(());
+    };
+    // Valid programs need neither a context stack nor replacement-field prefix parsing.
+    Err(bare_yield_error(source, tokens, comma, python_version))
+}
+
+fn invalid_comma(tokens: &Tokens) -> Option<usize> {
     let mut bare_yield = false;
-    let invalid_comma = tokens.iter().enumerate().find_map(|(index, token)| {
+    tokens.iter().enumerate().find_map(|(index, token)| {
         let kind = token.kind();
         if kind.is_trivia() {
             return None;
@@ -31,12 +42,92 @@ pub(crate) fn validate(
         let invalid = bare_yield && kind == TokenKind::Comma;
         bare_yield = kind == TokenKind::Yield;
         invalid.then_some(index)
-    });
-    let Some(comma) = invalid_comma else {
-        return Ok(());
-    };
-    // Valid programs need neither a context stack nor replacement-field prefix parsing.
-    Err(bare_yield_error(source, tokens, comma, python_version))
+    })
+}
+
+/// Retain an earlier version error unless the invalid pair is inside a legacy
+/// template, whose quote or surrounding field determines the native error.
+pub(crate) fn earlier_unsupported(
+    source: &str,
+    tokens: &Tokens,
+    unsupported: &[UnsupportedSyntaxError],
+    version: PythonVersion,
+) -> Option<CompileError> {
+    if unsupported.is_empty() || !source.contains("yield") {
+        return None;
+    }
+    let comma = tokens[invalid_comma(tokens)?].start();
+    let error = unsupported.iter().find(|error| {
+        error.range.start() < comma
+            && !(version < PythonVersion::Py314
+                && matches!(error.kind, UnsupportedSyntaxErrorKind::TemplateStrings)
+                && error.range.contains(comma))
+    })?;
+    Some(CompileError::invalid_syntax(error.to_string(), error.range))
+}
+
+/// Prefer an earlier invalid yield only when recovered tokens do not reveal a
+/// tokenizer failure that CPython can report before its grammar error.
+pub(crate) fn before_parse_error(
+    source: &str,
+    tokens: &Tokens,
+    errors: &[ParseError],
+    unsupported: &[UnsupportedSyntaxError],
+    version: PythonVersion,
+) -> Option<CompileError> {
+    if !source.contains("yield") {
+        return None;
+    }
+    let comma = invalid_comma(tokens)?;
+    let comma_start = tokens[comma].start();
+    if errors.first()?.location.start() <= comma_start {
+        return None;
+    }
+    if unsupported.iter().any(|error| {
+        error.range.start() <= comma_start
+            && !(version < PythonVersion::Py314
+                && matches!(error.kind, UnsupportedSyntaxErrorKind::TemplateStrings)
+                && error.range.contains(comma_start))
+    }) {
+        return None;
+    }
+
+    let mut stack = Vec::new();
+    for token in tokens {
+        match token.kind() {
+            TokenKind::Lpar | TokenKind::Lsqb | TokenKind::Lbrace => stack.push(token.kind()),
+            TokenKind::Rpar | TokenKind::Rsqb | TokenKind::Rbrace => {
+                let expected = match token.kind() {
+                    TokenKind::Rpar => TokenKind::Lpar,
+                    TokenKind::Rsqb => TokenKind::Lsqb,
+                    TokenKind::Rbrace => TokenKind::Lbrace,
+                    _ => unreachable!(),
+                };
+                if stack.pop() != Some(expected) {
+                    return None;
+                }
+            }
+            TokenKind::Int | TokenKind::Float | TokenKind::Complex
+                if crate::delimiter_nesting::invalid_number_suffix(source, token.range()) =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    if errors.iter().any(|error| match &error.error {
+        // CPython treats these as grammar tokens, and an open delimiter at EOF
+        // need not preempt an earlier grammar error.
+        ParseErrorType::Lexical(LexicalErrorType::UnrecognizedToken {
+            tok: '$' | '?' | '`',
+        }) => false,
+        ParseErrorType::Lexical(LexicalErrorType::Eof) if !stack.is_empty() => false,
+        ParseErrorType::Lexical(_) => true,
+        _ => false,
+    }) {
+        return None;
+    }
+    Some(bare_yield_error(source, tokens, comma, version))
 }
 
 /// Recover the first invalid pair's context only after the allocation-free token scan rejects it.

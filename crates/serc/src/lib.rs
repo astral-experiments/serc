@@ -497,7 +497,24 @@ fn compile_normalized(
     let parsed = ParsedModule(Some(parsed));
     let parsed = parsed.0.as_ref().expect("parsed module is present");
     if let Some(error) = parsed.errors().first() {
+        if let Some(yield_error) = yield_syntax::before_parse_error(
+            source,
+            parsed.tokens(),
+            parsed.errors(),
+            parsed.unsupported_syntax_errors(),
+            options.python_version,
+        ) {
+            return Err(yield_error);
+        }
         return Err(CompileError::Parse(error.clone()));
+    }
+    if let Some(error) = yield_syntax::earlier_unsupported(
+        source,
+        parsed.tokens(),
+        parsed.unsupported_syntax_errors(),
+        options.python_version,
+    ) {
+        return Err(error);
     }
     yield_syntax::validate(source, parsed.tokens(), options.python_version)?;
     if let Some(error) = parsed.unsupported_syntax_errors().first() {
