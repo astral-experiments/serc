@@ -210,6 +210,10 @@ impl Assembler {
                 .exception_owner_provenance
                 .module_annotation_nop_pairs
                 .is_empty()
+            && self
+                .exception_owner_provenance
+                .module_annotation_jump_pairs
+                .is_empty()
             && !(self.early_boolean_admissions_certified && self.has_early_boolean_admissions)
             && (self.has_only_linear_assertion_side_exits()
                 || self.has_only_linear_constant_return()
@@ -1018,6 +1022,11 @@ impl OptimizationPipeline {
             fusion_owners.retain_pipeline(&self);
         }
         let mut retained_finally_entries = self.retained_finally_entries(&retained_finally_origins);
+        let module_annotation_borrow_markers =
+            control_flow::surviving_module_annotation_borrow_markers(
+                &self.graph,
+                &self.exception_owner_provenance.module_annotation_jump_nops,
+            );
         let features = self.graph.features();
         let mut items = self.graph.into_items();
         if !omitted_borrow_markers.is_empty() {
@@ -1186,6 +1195,10 @@ impl OptimizationPipeline {
             }
         }
         if features.has_borrow_empty_block() || !omitted_borrow_markers.is_empty() {
+            control_flow::retire_module_annotation_borrow_markers(
+                &mut items,
+                &module_annotation_borrow_markers,
+            );
             Self::remove_borrow_empty_block_markers(&mut items);
         }
         #[cfg(any(test, debug_assertions))]
