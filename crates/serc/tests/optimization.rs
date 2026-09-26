@@ -2381,3 +2381,150 @@ for value in (False, True):
         }
     }
 }
+
+#[test]
+fn elided_assert_after_nested_while_keeps_backedge_location() {
+    for source in [
+        r"def f(xs,x,y,cm):
+    while xs:
+        if x:
+            while y:
+                if y:
+                    raise ValueError
+            assert x
+        else:
+            break
+",
+        r"def f(xs,x,y,cm):
+    while xs:
+        if x:
+            while y:
+                if y:
+                    return 1
+            assert x
+        else:
+            continue
+",
+        r"def f(xs,x,y,cm):
+    while xs:
+        if x:
+            while y:
+                if y:
+                    work()
+            assert x
+        else:
+            work()
+",
+        r"def f(xs,x,y,cm):
+    for z in xs:
+        if x:
+            while y:
+                if y:
+                    work()
+            assert x
+        else:
+            return 1
+",
+        r"def f(xs,x,y):
+    while xs:
+        if x:
+            while y:
+                if y:
+                    raise ValueError
+            assert x
+            assert y
+        else:
+            break
+",
+        r"def f(xs,x,y):
+    while xs:
+        if x:
+            while y:
+                if y:
+                    raise ValueError
+        else:
+            break
+",
+        r"def f(xs,x,y):
+    while xs:
+        if x:
+            while y:
+                if y:
+                    raise ValueError
+            assert x
+            pass
+        else:
+            break
+",
+        r"def f(xs,x,y):
+    while xs:
+        if x:
+            while y:
+                if y:
+                    raise ValueError
+            else:
+                work()
+            assert x
+        else:
+            break
+",
+        r"def f(xs,x,y,cm):
+    while xs:
+        if x:
+            while y:
+                try:
+                    work()
+                finally:
+                    clean()
+            assert x
+        else:
+            break
+",
+        r"def f(xs,x,y,cm):
+    while xs:
+        if x:
+            while y:
+                with cm:
+                    work()
+            assert x
+        else:
+            break
+",
+        r"def f(xs,x,y):
+    while xs:
+        if x:
+            while (
+                y()
+            ):
+                if x:
+                    raise ValueError
+            assert x
+        else:
+            break
+",
+        r"def f(xs,x,y,z):
+    while xs:
+        if x:
+            while y:
+                if x:
+                    raise ValueError
+            assert x
+        elif z:
+            work()
+        else:
+            break
+",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "sub/nested_while_elided.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+}

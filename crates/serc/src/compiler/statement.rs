@@ -16508,6 +16508,37 @@ impl<'source> Compiler<'source> {
                     self.assembler.set_location(
                         self.source_location(condition_fallthrough_range(&statement.test)),
                     );
+                } else if self.context.python_version >= crate::PythonVersion::Py314
+                    && branch_index == 0
+                    && has_else
+                    && !try_body_normal_exit
+                    && !non_final_branch
+                    && matches!(self.unit.scope, Scope::Function { .. })
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && !self.has_active_control_flow_region()
+                    && !self.control.in_exception_handler()
+                    && self.control.finally.is_inactive_for_return_unwind()
+                    && body.last().is_some_and(|statement| {
+                        matches!(
+                            self.context.optimized_locations.get(&statement.range()),
+                            Some(super::optimization::OptimizedLocation::Elided)
+                        )
+                    })
+                    && let Some(index) = body.iter().rposition(|statement| {
+                        !matches!(
+                            self.context.optimized_locations.get(&statement.range()),
+                            Some(super::optimization::OptimizedLocation::Elided)
+                        )
+                    })
+                    && let Stmt::While(inner) = &body[index]
+                    && condition_has_linear_runtime_leaves(&inner.test)
+                    && !expression_suspends_current_scope(&inner.test)
+                    && !suite_contains_nested_exception_cleanup(&body[..=index])
+                    && let Some(range) = loop_false_fallthrough_range(&body[..=index])
+                {
+                    // Optimized-away assertions leave the nested loop's false edge
+                    // as the donor for this branch's enclosing backedge.
+                    self.assembler.set_location(self.source_location(range));
                 } else if let Some(location) = self.assembler.last_instruction_location() {
                     self.assembler.set_location(location);
                 } else if let Some(statement) = body.last() {
