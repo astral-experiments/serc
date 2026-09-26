@@ -98,6 +98,7 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
 ) -> Validator<'source, 'ast, PRUNE_STATEMENTS, FUTURE_ONLY> {
     Validator {
         checker: SemanticSyntaxChecker::new(),
+        checked_type_params: None,
         checker_prefix: CheckerPrefix::Initial,
         error: RefCell::new(None),
         pending_pattern: None,
@@ -302,6 +303,7 @@ fn simple_function_checker_view(function: &ast::StmtFunctionDef) -> Option<Stmt>
 struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> {
     pre_lowering_only: bool,
     checker: SemanticSyntaxChecker,
+    checked_type_params: Option<&'ast ast::TypeParams>,
     checker_prefix: CheckerPrefix,
     error: RefCell<Option<CompileError>>,
     pending_pattern: Option<PendingPattern<'ast>>,
@@ -791,7 +793,15 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
         self.checker = checker;
     }
 
-    fn check_statement(&mut self, statement: &Stmt) {
+    fn check_statement(&mut self, statement: &'ast Stmt) {
+        // Ruff identifies the repeated parameter by range; keep its normalized AST name for
+        // the CPython diagnostic emitted synchronously by the checker.
+        self.checked_type_params = match statement {
+            Stmt::FunctionDef(function) => function.type_params.as_deref(),
+            Stmt::ClassDef(class) => class.type_params.as_deref(),
+            Stmt::TypeAlias(alias) => alias.type_params.as_deref(),
+            _ => None,
+        };
         if let Stmt::AnnAssign(assignment) = statement
             && matches!(assignment.target.as_ref(), Expr::Name(_))
             && crate::stack::is_simple_annotation(&assignment.annotation)
@@ -1681,6 +1691,13 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             Kind::AwaitOutsideAsyncFunction(AwaitOutsideAsyncFunctionKind::AsyncWith) => {
                 "'async with' outside async function".to_owned()
             }
+            Kind::DuplicateTypeParameter => self
+                .checked_type_params
+                .and_then(|params| params.iter().find(|param| param.range() == error.range))
+                .map_or_else(
+                    || error.to_string(),
+                    |param| format!("duplicate type parameter '{}'", param.name().as_str()),
+                ),
             Kind::MultipleCaseAssignment(name) => {
                 format!("multiple assignments to name '{name}' in pattern")
             }
@@ -1712,7 +1729,7 @@ mod tests {
     use ruff_python_parser::parse_module;
 
     use super::{validate, validate_without_statement_pruning};
-    use crate::{CompileError, PythonVersion};
+    use crate::{CompileError, CompileOptions, PythonVersion, compile_with_options};
 
     const TARGETS: [PythonVersion; 4] = [
         PythonVersion::Py312,
@@ -1720,6 +1737,35 @@ mod tests {
         PythonVersion::Py314,
         PythonVersion::Py315,
     ];
+
+    #[test]
+    fn duplicate_type_parameter_diagnostics_include_normalized_name() {
+        for python_version in TARGETS {
+            for (source, name, highlighted) in [
+                ("class Example[T, T]: pass", "T", "T"),
+                ("def function[T, *T](): pass", "T", "*T"),
+                ("type Alias[T, **T] = int", "T", "**T"),
+                ("class Example[K, \u{212A}]: pass", "K", "\u{212A}"),
+                ("class Example[T, T: int]: pass", "T", "T: int"),
+                ("class Outer:\n class Inner[__T, __T]: pass", "__T", "__T"),
+            ] {
+                let options = CompileOptions {
+                    python_version,
+                    ..CompileOptions::default()
+                };
+                let error = compile_with_options(source, "duplicate.py", &options).unwrap_err();
+                let CompileError::InvalidSyntax { message, range } = error else {
+                    panic!("unexpected error for {python_version}: {source:?}: {error}");
+                };
+                assert_eq!(
+                    message,
+                    format!("duplicate type parameter '{name}'"),
+                    "{python_version}: {source:?}"
+                );
+                assert_eq!(&source[range], highlighted, "{python_version}: {source:?}");
+            }
+        }
+    }
 
     #[test]
     fn bare_starred_errors_keep_cpython_validation_phase_order() {
