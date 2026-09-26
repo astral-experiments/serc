@@ -1570,3 +1570,15 @@ fn elided_assertions_preserve_terminal_branch_comprehension_returns() {
         assert_matches_cpython(source, "terminal_comprehension_assert.py", &LEVELS);
     }
 }
+
+#[test]
+fn nested_conditional_except_before_finally_matches_cpython() {
+    for source in [
+        "def f(x, d):\n    try:\n        try:\n            if x:\n                pass\n        except Exception:\n            pass\n    finally:\n        d.clear()\n",
+        "async def f(x, d):\n    try:\n        try:\n            if x:\n                work()\n        except:\n            pass\n    finally:\n        d.clear()\n",
+        "def f(x, d):\n    try:\n        try:\n            if x:\n                pass\n        except Exception:\n            pass\n        else:\n            work()\n    finally:\n        d.clear()\n",
+        "def f(x, d):\n    try:\n        if x:\n            pass\n    except Exception:\n        pass\n    d.clear()\n",
+    ] {
+        assert_matches_cpython(source, "case.py", &LEVELS);
+    }
+}

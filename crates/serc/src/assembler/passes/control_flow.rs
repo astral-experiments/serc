@@ -3350,13 +3350,33 @@ impl OptimizationPipeline {
             .filter_map(|region| graph.label_block(region.target))
             .collect::<FxHashSet<_>>();
         blocked.extend(order.first().copied());
+        let normal_try_exits = if self.python_version == crate::PythonVersion::Py314 {
+            self.exception_owner_provenance
+                .normal_try_exits
+                .iter()
+                .copied()
+                .collect::<FxHashSet<_>>()
+        } else {
+            FxHashSet::default()
+        };
+        let track_normal_try_exits = !normal_try_exits.is_empty();
+        let mut conditional_blocked_non_fallthrough = if track_normal_try_exits {
+            blocked.clone()
+        } else {
+            FxHashSet::default()
+        };
+        let mut fallthrough_entries = FxHashSet::default();
         for blocks in order.windows(2) {
             if super::super::block_has_fallthrough(graph[blocks[0]].items()) {
                 blocked.insert(blocks[1]);
+                if track_normal_try_exits {
+                    fallthrough_entries.insert(blocks[1]);
+                }
             }
         }
         let mut incoming = FxHashSet::default();
         let mut conditional_incoming = FxHashMap::<_, usize>::default();
+        let mut conditional_sources = FxHashMap::default();
         let mut conditional_blocked = blocked.clone();
         let original_reachable = graph.reachable_blocks(&self.exception_regions);
         for source in order.iter().copied() {
@@ -3390,8 +3410,14 @@ impl OptimizationPipeline {
                     && !instruction.jump_policy.always_retains_nop()
                 {
                     *conditional_incoming.entry(target).or_default() += 1;
+                    if track_normal_try_exits {
+                        conditional_sources.insert(target, source);
+                    }
                 } else {
                     conditional_blocked.insert(target);
+                    if track_normal_try_exits {
+                        conditional_blocked_non_fallthrough.insert(target);
+                    }
                 }
                 // Every original entry must take the same unconditional-copy path.
                 // Conditional, backward, and retained-NOP entries can keep this block live.
@@ -3412,6 +3438,36 @@ impl OptimizationPipeline {
                 (incoming.contains(block) && !blocked.contains(block))
                     || (conditional_incoming.get(block).copied().unwrap_or_default() > 1
                         && !conditional_blocked.contains(block))
+                    // A normal-try exit may be the common target of a conditional
+                    // and its uninterrupted fallthrough. If its sole jump vanishes,
+                    // 3.14's borrowing traversal stops at that empty original array.
+                    || (track_normal_try_exits
+                        && conditional_incoming.get(block).copied().unwrap_or_default() == 1
+                        && fallthrough_entries.contains(block)
+                        && !conditional_blocked_non_fallthrough.contains(block)
+                        && conditional_sources.get(block).is_some_and(|source| {
+                            let source_index = positions[source];
+                            let target_index = positions[block];
+                            let exit = self.borrow_empty_jump_head_target(graph[*block].items());
+                            let recorded_exit = exit.is_some_and(|target| {
+                                graph[*block].items().iter().any(|item| {
+                                    matches!(item, Item::Label(entry)
+                                        if normal_try_exits.contains(&(*entry, target)))
+                                })
+                            });
+                            recorded_exit
+                                && order[source_index..target_index].iter().enumerate().all(
+                                    |(offset, path_block)| {
+                                        original_reachable[path_block.index()]
+                                            && super::super::block_has_fallthrough(graph[*path_block].items())
+                                            && (offset == 0
+                                                || graph[*path_block].items().iter().all(|item| {
+                                                    !matches!(item, Item::Instruction(instruction)
+                                                        if instruction.opcode.has_jump())
+                                                }))
+                                    },
+                                )
+                        }))
             })
             .filter_map(|block| {
                 let items = graph[block].items();

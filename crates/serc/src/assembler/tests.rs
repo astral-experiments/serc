@@ -10,6 +10,125 @@ use crate::target::opcodes::*;
 use crate::target::operands::{CommonConstant, Conversion, FunctionAttribute, ResumeLocation};
 
 #[test]
+fn conditional_normal_try_borrow_head_requires_proven_fallthrough() {
+    let source = super::Label::from_u32(0);
+    let fallthrough = super::Label::from_u32(1);
+    let head = super::Label::from_u32(2);
+    let exit = super::Label::from_u32(3);
+    let extra = super::Label::from_u32(4);
+    let located = SourceLocation::new(1, 1, 0, 1);
+
+    for (variation, expected) in [
+        ("converging", true),
+        ("missing-provenance", false),
+        ("wrong-entry", false),
+        ("wrong-target", false),
+        ("intervening-conditional", false),
+        ("unreachable-fallthrough", false),
+        ("extra-incoming", false),
+        ("python-315", false),
+        ("live-jump", true),
+    ] {
+        let instruction =
+            |opcode, operand| Item::Instruction(Instruction::new(opcode, operand, located, None));
+        let mut items = Vec::new();
+        if variation == "extra-incoming" {
+            items.extend([
+                instruction(JUMP_FORWARD, Operand::Forward(source)),
+                Item::Label(extra),
+                instruction(JUMP_FORWARD, Operand::Forward(head)),
+            ]);
+        }
+        items.extend([
+            Item::Label(source),
+            instruction(LOAD_CONST, Operand::Value(0)),
+            instruction(POP_JUMP_IF_FALSE, Operand::Forward(head)),
+            instruction(NOT_TAKEN, Operand::Value(0)),
+        ]);
+        if variation == "unreachable-fallthrough" {
+            items.push(instruction(JUMP_FORWARD, Operand::Forward(exit)));
+        }
+        items.push(Item::Label(fallthrough));
+        if variation == "intervening-conditional" {
+            items.extend([
+                instruction(LOAD_CONST, Operand::Value(0)),
+                instruction(POP_JUMP_IF_TRUE, Operand::Forward(exit)),
+                instruction(NOT_TAKEN, Operand::Value(0)),
+            ]);
+        }
+        items.extend([
+            instruction(NOP, Operand::Value(0)),
+            Item::Label(head),
+            Item::Instruction(Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(exit),
+                SourceLocation::NONE,
+                None,
+            )),
+        ]);
+        if variation == "live-jump" {
+            items.extend([Item::Label(extra), instruction(NOP, Operand::Value(0))]);
+        }
+        items.extend([
+            Item::Label(exit),
+            instruction(LOAD_CONST, Operand::Value(0)),
+            instruction(RETURN_VALUE, Operand::Value(0)),
+        ]);
+        let mut assembler = Assembler::from_linear_items(items);
+        assembler.next_label = 5;
+        assembler.python_version = if variation == "python-315" {
+            crate::PythonVersion::Py315
+        } else {
+            crate::PythonVersion::Py314
+        };
+        if variation != "missing-provenance" {
+            assembler.exception_owner_provenance.normal_try_exits.push((
+                if variation == "wrong-entry" {
+                    fallthrough
+                } else {
+                    head
+                },
+                if variation == "wrong-target" {
+                    fallthrough
+                } else {
+                    exit
+                },
+            ));
+        }
+        let mut pipeline = assembler.into_optimization_pipeline();
+        assert_eq!(
+            pipeline.record_borrow_empty_jump_heads(),
+            expected,
+            "{variation}"
+        );
+        let jump = pipeline
+            .graph
+            .iter_items()
+            .find_map(|item| match item {
+                Item::Instruction(jump)
+                    if jump.opcode == JUMP_FORWARD && jump.location == SourceLocation::NONE =>
+                {
+                    Some(jump)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            jump.jump_policy.borrow_empty_block(),
+            expected,
+            "{variation}"
+        );
+        if variation == "live-jump" {
+            pipeline.remove_redundant_forward_jumps(true);
+            assert!(pipeline.graph.iter_items().any(|item| {
+                matches!(item, Item::Instruction(jump)
+                    if jump.opcode == JUMP_FORWARD && jump.operand() == Operand::Forward(exit))
+            }));
+        }
+    }
+}
+
+#[test]
 #[cfg(target_pointer_width = "64")]
 fn instruction_items_remain_cache_compact() {
     assert_eq!(std::mem::size_of::<Option<super::Label>>(), 4);
