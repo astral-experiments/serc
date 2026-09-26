@@ -44,6 +44,32 @@ fn terminal_try_pass_preserves_implicit_return_location() {
     }
 }
 
+#[test]
+fn terminal_conditional_comprehension_pass_keeps_return_location() {
+    for source in [
+        "def f(xs, flag):\n    try:\n        z = [v for v in xs] if flag else []\n        pass\n    except ValueError:\n        recover()\n",
+        "def f(xs, flag):\n    try:\n        z = {v for v in xs} if not flag else []; pass\n    except ValueError:\n        recover()\n",
+        "def f(xs, flag):\n    try:\n        z = {v: v for v in xs} if check(flag) else []\n        pass\n    except ValueError:\n        recover()\n",
+        "def f(xs, flag):\n    try:\n        with manager():\n            pass\n            global other\n        z = [v for v in xs if v] if flag else []\n        pass\n    except ValueError:\n        recover()\n",
+        "def f(xs, flag):\n    try:\n        try:\n            pass\n        except TypeError:\n            recover_inner()\n        z = [v for v in xs if v] if flag else []\n        pass\n    except ValueError:\n        recover()\n",
+        "def f(xs, flag):\n    try:\n        try:\n            work()\n        finally:\n            pass\n        z = [v for v in xs if v] if flag else []\n        pass\n    except ValueError:\n        recover()\n",
+        "def f(xs, flag):\n    global z\n    try:\n        z = [(w := v) for v in xs] if flag else []\n        pass\n    except ValueError:\n        recover()\n",
+        "def outer():\n    z = None\n    def f(xs, flag):\n        nonlocal z\n        try:\n            z = [v for v in xs] if flag else []\n            pass\n        except ValueError:\n            recover()\n    return f\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "terminal_conditional_comprehension_pass.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+}
+
 static ORACLES: [OnceLock<OsString>; 4] = [const { OnceLock::new() }; 4];
 
 #[test]

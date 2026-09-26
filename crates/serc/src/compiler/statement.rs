@@ -21181,8 +21181,16 @@ impl<'source> Compiler<'source> {
                 && let [.., previous, Stmt::Pass(pass)] = statement.body.as_slice()
                 && match previous {
                     Stmt::Assign(assignment) => {
+                        // Conditional comprehensions can also fall through to the pass.
                         matches!(assignment.targets.as_slice(), [Expr::Name(_)])
-                            && !expression_contains_inline_branch(&assignment.value)
+                            && (!expression_contains_inline_branch(&assignment.value)
+                                || matches!(assignment.value.as_ref(), Expr::If(expression)
+                                    if matches!(expression.body.as_ref(), Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_))
+                                        && condition_has_linear_runtime_leaves(&expression.test)
+                                        && !expression_contains_inline_branch(&expression.orelse)
+                                        && !expression_suspends_current_scope(&expression.test)
+                                        && !expression_suspends_current_scope(&expression.body)
+                                        && !expression_suspends_current_scope(&expression.orelse)))
                     }
                     Stmt::Delete(delete) => {
                         matches!(delete.targets.as_slice(), [Expr::Name(_)])
