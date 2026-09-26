@@ -16569,11 +16569,6 @@ fn nested_finally_marker_control_flow_boundaries() {
 
 #[test]
 fn nested_finally_condition_marker_matches_each_target() {
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
-
-    use serc::{CompileOptions, PythonVersion, compile_with_options};
-
     let source = r"async def example(condition):
     try:
         pass
@@ -16588,6 +16583,15 @@ fn nested_finally_condition_marker_matches_each_target() {
         finally:
             pass
 ";
+    assert_finally_condition_marker_matches_each_target(source);
+}
+
+fn assert_finally_condition_marker_matches_each_target(source: &str) {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    use serc::{CompileOptions, PythonVersion, compile_with_options};
+
     let oracle = "import importlib.util, marshal, sys; assert sys.implementation.name == 'cpython'; assert sys.version.split()[0] == sys.argv[1]; assert importlib.util.MAGIC_NUMBER.hex() == sys.argv[2]; code = compile(sys.stdin.read(), 'nested_finally_targets.py', 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))";
     for (version, variable, fallback) in [
         (PythonVersion::Py312, "SERC_TEST_PYTHON_312", "python3.12"),
@@ -16625,5 +16629,41 @@ fn nested_finally_condition_marker_matches_each_target() {
             .unwrap()
             .marshal();
         assert_eq!(actual, expected.stdout, "{version:?}");
+    }
+}
+
+#[test]
+fn branching_try_nested_finally_condition_marker() {
+    let source = r"async def example(condition, other):
+    try:
+        if other:
+            raise ValueError()
+        pass
+    except Exception as error:
+        if not error.flag:
+            pass
+        return [make()]
+    finally:
+        try:
+            if condition:
+                pass
+        finally:
+            pass
+";
+    assert_finally_condition_marker_matches_each_target(source);
+    for source in [
+        source.replace("async def", "def"),
+        source.replace("if condition:", "if not condition:"),
+        source.replace("if condition:", "if condition.flag:"),
+        source.replace("return [make()]", "return []"),
+        source.replace("return [make()]", "return 1"),
+        source.replace("raise ValueError()", "return []"),
+        source.replace("raise ValueError()", "observe()"),
+        source.replace("        pass\n    except", "        observe()\n    except"),
+        source.replace("        pass\n    except", "    except"),
+        source.replace("if other:", "if False:"),
+        source.replace("if other:", "if True:"),
+    ] {
+        common::assert_matches_cpython_marshal(&source, "branching_try_finally_marker.py");
     }
 }
