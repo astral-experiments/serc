@@ -9083,6 +9083,12 @@ def generic[T](value: T) -> T:
 def complex(value: Complex) -> Result:
     local: Declared = value
     return local
+
+class _Generic[__T]:
+    def typed(self, __value: __T, *, alias: _Generic__T) -> list[__T]:
+        __local = __value
+        _Generic__local = __local
+        return alias, __local
 ";
         for version in [
             PythonVersion::Py312,
@@ -9140,6 +9146,7 @@ def complex(value: Complex) -> Result:
                         ("nested", true),
                         ("generic", false),
                         ("complex", false),
+                        ("typed", true),
                     ],
                     "{version:?}, future={future}"
                 );
