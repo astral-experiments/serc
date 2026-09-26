@@ -12233,6 +12233,18 @@ impl<'source> Compiler<'source> {
                     // NOP cannot make borrowed-load traversal cross that empty block.
                     self.assembler.mark_last_borrow_fallthrough_barrier();
                 }
+                if branch_index == 0
+                    && matches!(self.unit.scope, Scope::Module)
+                    && self.has_deferred_annotations()
+                    && self.context.module_plan().has_annotations
+                    && matches!(test, Expr::UnaryOp(unary)
+                        if unary.op == UnaryOp::Not
+                            && matches!(unary.operand.as_ref(), Expr::BooleanLiteral(value) if value.value))
+                {
+                    let name = self.name_index("__conditional_annotations__")?;
+                    let location = self.source_location(statement.range);
+                    self.assembler.record_module_annotation_jump(name, location);
+                }
                 if branch_index == 0 && self.control.finally.copy_return_finally_condition_exit {
                     self.assembler.allow_last_condition_split_return_copy();
                 }

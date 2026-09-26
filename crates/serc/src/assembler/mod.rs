@@ -1554,6 +1554,31 @@ impl Assembler {
         }
     }
 
+    /// Records a same-line folded condition jump immediately after annotation setup.
+    pub(crate) fn record_module_annotation_jump(&mut self, name: u32, statement: SourceLocation) {
+        let [.., Item::Instruction(previous), Item::Instruction(jump)] = self.linear_items_mut()
+        else {
+            return;
+        };
+        if previous.opcode == crate::target::opcodes::STORE_NAME
+            && previous.operand() == Operand::Value(name)
+            && previous.location == statement
+            && previous.location.line >= 0
+            && jump.opcode == JUMP_FORWARD
+            && matches!(jump.operand(), Operand::Forward(_))
+            && jump.location.line == previous.location.line
+        {
+            // Only this original setup and jump carry the certificate through CFG passes.
+            // Physical exit copies retire the tag before they can replace the pair.
+            previous.mark_original_annotation_jump();
+            jump.mark_original_annotation_jump();
+            let pair = (*previous, *jump);
+            self.exception_owner_provenance
+                .module_annotation_jump_pairs
+                .push(pair);
+        }
+    }
+
     fn last_instruction_mut(&mut self) -> Option<&mut Instruction> {
         let index = self
             .linear_items()
