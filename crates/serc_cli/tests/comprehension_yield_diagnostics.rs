@@ -29,6 +29,21 @@ fn comprehension_yield_diagnostics_match_python() {
         "def f():\n return [[y for y in (yield ys)] for x in xs]\n",
         "def f():\n return [f'{(yield α)}' for x in xs]\n",
         "class C:\r\n values = [(yield α) for x in xs]\r\n",
+        "*first\n[(yield y) for y in ys]\n",
+        "*first\n[(yield from y) for y in ys]\n",
+        "*first\n[(yield (yield y)) for y in ys]\n",
+        "*first\n[(yield (__debug__ := 1)) for x in xs]\n",
+        "*first\n[(yield from (__debug__ := 1)) for x in xs]\n",
+        "*first\n{(yield y) for y in ys}\n",
+        "*first\n{(yield y): y for y in ys}\n",
+        "*first\n((yield y) for y in ys)\n",
+        "*first\n[y for y in ys if (yield y)]\n",
+        "*first\n[y for x in xs for y in (yield x)]\n",
+        // These yields belong to the enclosing scope or a nested lambda, not the comprehension.
+        "*first\n(yield y)\n",
+        "*first\n[x for x in (yield xs)]\n",
+        "*first\n[(lambda: (yield x)) for x in xs]\n",
+        "def f():\n *first\n [x for x in (yield xs)]\n",
     ];
     let oracle = r"
 import sys

@@ -1843,9 +1843,13 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
                 | Kind::DuplicateMatchKey(_)
                 | Kind::DuplicateMatchClassAttribute(_) => true,
                 Kind::YieldOutsideFunction(kind) => {
-                    (!self.comprehension_yield_operand
-                        || !matches!(self.scope().kind, ScopeKind::Comprehension { .. }))
-                        && (!kind.is_await() || self.python_version < ast::PythonVersion::PY314)
+                    if kind.is_await() {
+                        self.python_version < ast::PythonVersion::PY314
+                    } else {
+                        // Comprehension yields fail in the symbol-table pass, before bare stars
+                        // and yields outside a function fail during code generation.
+                        !matches!(self.scope().kind, ScopeKind::Comprehension { .. })
+                    }
                 }
                 Kind::AwaitOutsideAsyncFunction(_) | Kind::WriteToDebug(_) => {
                     self.python_version < ast::PythonVersion::PY314
