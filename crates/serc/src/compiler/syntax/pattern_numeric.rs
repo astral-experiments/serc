@@ -466,4 +466,35 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn large_duplicate_in_class_body_preserves_symbol_order() {
+        let mapping = "{18446744073709551616: _, 18446744073709551616.0: _}";
+        for (suffix, modern_message, modern_span) in [
+            (
+                "await x\nfrom __future__ import annotations\n",
+                "'await' outside function",
+                "await x",
+            ),
+            (
+                "from __future__ import annotations\nawait x\n",
+                "from __future__ imports must occur",
+                "from __future__ import annotations",
+            ),
+        ] {
+            let source = format!("class C(x=1, x=2):\n match v:\n  case {mapping}: pass\n{suffix}");
+            let parsed = parse_module(&source).unwrap();
+            for target in TARGETS {
+                let error = validate(&source, &parsed.syntax().body, target).unwrap_err();
+                let range = error.range().expect("diagnostic has a source range");
+                let (message, span) = if target >= PythonVersion::Py314 {
+                    (modern_message, modern_span)
+                } else {
+                    ("mapping pattern checks duplicate key", mapping)
+                };
+                assert!(error.to_string().contains(message), "{target}: {error:?}");
+                assert_eq!(&source[range], span, "{target}: {error:?}");
+            }
+        }
+    }
 }
