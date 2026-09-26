@@ -2,7 +2,7 @@
 
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
 use ruff_python_ast::{self as ast, Expr, Pattern, Stmt};
-use ruff_text_size::TextRange;
+use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::FxHashMap;
 
 use crate::{CompileError, PythonVersion};
@@ -22,12 +22,40 @@ pub(super) fn validate(body: &[Stmt], version: PythonVersion) -> Result<(), Comp
         version,
         future_annotations,
         error: None,
+        stop_pattern_debug: None,
+        stopped: false,
     };
     validator.visit_body(body);
     if let Some(error) = validator.error {
         return Err(error);
     }
     validator.resolve()
+}
+
+/// Check symbol-collection declaration errors encountered before this pattern write.
+/// Binding resolution happens after symbol collection, so it must not precede the write.
+pub(super) fn immediate_before_pattern_debug(
+    body: &[Stmt],
+    version: PythonVersion,
+    range: TextRange,
+) -> Option<CompileError> {
+    let future_annotations = body.iter().any(|statement| {
+        matches!(statement, Stmt::ImportFrom(import) if import.level == 0
+            && import.module.as_deref() == Some("__future__")
+            && import.names.iter().any(|alias| alias.name.as_str() == "annotations"))
+    });
+    let mut validator = Validator {
+        scopes: vec![Scope::new(ScopeKind::Module, None)],
+        current: 0,
+        private_name: None,
+        version,
+        future_annotations,
+        error: None,
+        stop_pattern_debug: Some(range),
+        stopped: false,
+    };
+    validator.visit_body(body);
+    validator.error
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -108,6 +136,8 @@ struct Validator<'a> {
     version: PythonVersion,
     future_annotations: bool,
     error: Option<CompileError>,
+    stop_pattern_debug: Option<TextRange>,
+    stopped: bool,
 }
 
 impl<'a> Validator<'a> {
@@ -116,6 +146,9 @@ impl<'a> Validator<'a> {
     }
 
     fn record(&mut self, scope: usize, spelling: &str, usage: NameUse) {
+        if self.stopped || self.error.is_some() {
+            return;
+        }
         let name = self.name(spelling);
         let symbol = self.scopes[scope].symbols.entry(name).or_default();
         match usage {
@@ -316,7 +349,7 @@ impl<'a> Validator<'a> {
 
 impl<'a> Visitor<'a> for Validator<'a> {
     fn visit_stmt(&mut self, statement: &'a Stmt) {
-        if self.error.is_some() {
+        if self.error.is_some() || self.stopped {
             return;
         }
         match statement {
@@ -425,6 +458,9 @@ impl<'a> Visitor<'a> for Validator<'a> {
     }
 
     fn visit_expr(&mut self, expression: &'a Expr) {
+        if self.error.is_some() || self.stopped {
+            return;
+        }
         if crate::stack_growth_required() {
             return crate::grow_stack(|| self.visit_expr(expression));
         }
@@ -511,6 +547,32 @@ impl<'a> Visitor<'a> for Validator<'a> {
     }
 
     fn visit_pattern(&mut self, pattern: &'a Pattern) {
+        if self.error.is_some() || self.stopped {
+            return;
+        }
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.visit_pattern(pattern));
+        }
+        if self.stop_pattern_debug.is_some()
+            && let Pattern::MatchClass(class) = pattern
+        {
+            self.visit_expr(&class.cls);
+            for child in &class.arguments.patterns {
+                self.visit_pattern(child);
+            }
+            for keyword in &class.arguments.keywords {
+                if keyword.attr.as_str() == "__debug__"
+                    && self.stop_pattern_debug == Some(keyword.pattern.range())
+                {
+                    self.stopped = true;
+                    return;
+                }
+            }
+            for keyword in &class.arguments.keywords {
+                self.visit_pattern(&keyword.pattern);
+            }
+            return;
+        }
         walk_pattern(self, pattern);
         let name = match pattern {
             Pattern::MatchAs(pattern) => pattern.name.as_ref(),
@@ -519,6 +581,10 @@ impl<'a> Visitor<'a> for Validator<'a> {
             _ => None,
         };
         if let Some(name) = name {
+            if name.as_str() == "__debug__" && self.stop_pattern_debug == Some(pattern.range()) {
+                self.stopped = true;
+                return;
+            }
             self.record(self.current, name.as_str(), NameUse::Assign);
         }
     }

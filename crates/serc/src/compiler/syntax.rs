@@ -23,6 +23,7 @@ use super::symbol::mangle_name;
 #[cfg(test)]
 mod declaration_tests;
 mod declarations;
+mod pattern_debug;
 
 /// Validate AST-based syntax restrictions using Ruff's shared checker.
 pub(crate) fn validate(
@@ -54,11 +55,18 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
     let mut validator = new_validator::<PRUNE_STATEMENTS, false>(source, body, python_version);
     validator.visit_scope_body(body);
     let error = validator.error.into_inner();
-    let lowering_error = validator.lowering_keyword_error || validator.lowering_debug_error;
+    let debug_pattern_replay =
+        matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315)
+            && validator.may_have_debug_patterns
+            && pattern_debug::body_has_debug_pattern(body);
+    let lowering_error =
+        validator.lowering_keyword_error || validator.lowering_debug_error || debug_pattern_replay;
     if matches!(&error, Some(CompileError::InvalidDocstring { .. })) || lowering_error {
         // Revisit these error paths for diagnostics from earlier compiler phases.
         // Future directives moved ahead of call lowering in Python 3.14.
-        if !lowering_error || matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315)
+        if !debug_pattern_replay
+            && (!lowering_error
+                || matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315))
         {
             let mut validator = new_validator::<false, true>(source, body, python_version);
             validator.visit_body(body);
@@ -71,7 +79,15 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         let mut validator = new_validator::<false, false>(source, body, python_version);
         validator.pre_lowering_only = true;
         validator.visit_body(body);
+        let pattern_debug_range = validator.symbol_pattern_debug_range;
         if let Some(priority_error) = validator.error.into_inner() {
+            if let Some(range) = pattern_debug_range
+                && (source.contains("global") || source.contains("nonlocal"))
+                && let Some(declaration_error) =
+                    declarations::immediate_before_pattern_debug(body, python_version, range)
+            {
+                return Err(declaration_error);
+            }
             return Err(priority_error);
         }
         validate_declarations(source, body, python_version)?;
@@ -107,6 +123,8 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
         checker: SemanticSyntaxChecker::new(),
         checker_prefix: CheckerPrefix::Initial,
         error: RefCell::new(None),
+        collected_match_errors: RefCell::new(None),
+        symbol_pattern_debug_range: None,
         pending_pattern: None,
         lowering_pattern_error: false,
         lowering_keyword_error: false,
@@ -116,6 +134,7 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
         has_declarations: false,
         pre_lowering_only: false,
         source,
+        may_have_debug_patterns: source.contains("__debug__") || !source.is_ascii(),
         body,
         python_version: match python_version {
             PythonVersion::Py312 => ast::PythonVersion::PY312,
@@ -316,6 +335,8 @@ struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
     checker: SemanticSyntaxChecker,
     checker_prefix: CheckerPrefix,
     error: RefCell<Option<CompileError>>,
+    collected_match_errors: RefCell<Option<Vec<SemanticSyntaxError>>>,
+    symbol_pattern_debug_range: Option<TextRange>,
     pending_pattern: Option<PendingPattern<'ast>>,
     lowering_pattern_error: bool,
     lowering_keyword_error: bool,
@@ -324,6 +345,7 @@ struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
     check_bare_starred: bool,
     has_declarations: bool,
     source: &'source str,
+    may_have_debug_patterns: bool,
     body: &'ast [Stmt],
     python_version: ast::PythonVersion,
     future_annotations: bool,
@@ -1154,6 +1176,13 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
             walk_stmt(self, statement);
             return;
         }
+        if self.may_have_debug_patterns
+            && let Stmt::Match(match_statement) = statement
+            && pattern_debug::has_debug_pattern(match_statement)
+        {
+            self.visit_debug_match(statement, match_statement);
+            return;
+        }
         let mut prechecked_match_cases = 0;
         match statement {
             Stmt::Expr(statement) => {
@@ -1792,6 +1821,10 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
 
     fn report_semantic_error(&self, error: SemanticSyntaxError) {
         use SemanticSyntaxErrorKind as Kind;
+        if let Some(errors) = self.collected_match_errors.borrow_mut().as_mut() {
+            errors.push(error);
+            return;
+        }
         if FUTURE_ONLY
             && !matches!(
                 &error.kind,
