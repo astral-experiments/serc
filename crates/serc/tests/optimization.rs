@@ -639,6 +639,108 @@ fn protected_for_loop_backedge_locations_match_cpython_312() {
 }
 
 #[test]
+fn preceding_exception_setups_preserve_optimized_backedge_locations() {
+    for source in [
+        "def f(xs, work, recover):\n try:\n  work()\n except ValueError:\n  recover()\n for x in xs:\n  if x:\n   assert False\n  if x:\n   assert False\n",
+        "def f(xs, work, recover):\n try:\n  try:\n   work()\n  except ValueError:\n   recover()\n except Exception:\n  recover()\n for x in xs:\n  if not x:\n   assert False\n  if not x:\n   assert False\n",
+        "def f(xs, work, cleanup):\n try:\n  work()\n finally:\n  cleanup()\n for x in xs:\n  if x:\n   assert False\n  if x:\n   assert False\n",
+        "def f(xs, work, manager):\n with manager:\n  work()\n for x in xs:\n  if x:\n   assert False\n  if x:\n   assert False\n",
+        "def f(xs, work, recover, y):\n try:\n  work()\n except ValueError:\n  recover()\n for x in xs:\n  if x and y:\n   assert False\n  if x and y:\n   assert False\n  work()\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "preceding_exception_backedge.py",
+            &LEVELS,
+            &[PythonVersion::Py312],
+        );
+    }
+}
+
+#[test]
+fn preceding_exception_setup_does_not_own_later_backedge() {
+    const SOURCE: &str = "def f(xs, work, handler):\n    try:\n        work()\n    except ValueError:\n        handler()\n    for x in xs:\n        if x:\n            assert False\n        if x:\n            assert False\n";
+    const TRACE: &str = r"
+import dis, marshal, sys
+scope = {}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+f = scope['f']
+backedges = [i.offset for i in dis.get_instructions(f)
+             if i.opname == 'JUMP_BACKWARD' and i.positions.lineno is None]
+if len(backedges) != 1:
+    raise RuntimeError(('backedges', backedges))
+target = backedges[0]
+if any(e.start <= target < e.end for e in dis.Bytecode(f).exception_entries):
+    raise RuntimeError('earlier handler owns later backedge')
+class Fault(Exception): pass
+monitor = sys.monitoring
+monitor.use_tool_id(5, 'backedge-owner')
+for fail in (False, True):
+    events, hits = [], []
+    def work():
+        events.append('work')
+        if fail:
+            raise ValueError()
+    def handler():
+        events.append('handler')
+    def trace(code, offset):
+        if offset == target:
+            hits.append(offset)
+            raise Fault()
+    monitor.register_callback(5, monitor.events.INSTRUCTION, trace)
+    monitor.set_local_events(5, f.__code__, monitor.events.INSTRUCTION)
+    try:
+        try:
+            f([True, True], work, handler)
+            raise RuntimeError('backedge was not reached')
+        except Fault:
+            pass
+    finally:
+        monitor.set_local_events(5, f.__code__, 0)
+        monitor.register_callback(5, monitor.events.INSTRUCTION, None)
+    expected = ['work', 'handler'] if fail else ['work']
+    if events != expected or hits != [target]:
+        raise RuntimeError((events, hits, expected))
+monitor.free_tool_id(5)
+";
+    for level in [OptimizationLevel::One, OptimizationLevel::Two] {
+        let native = oracle(
+            SOURCE.as_bytes(),
+            "preceding_exception_trace.py",
+            PythonVersion::Py312,
+            level,
+        );
+        assert!(native.status.success());
+        let actual = compile_with_options(
+            SOURCE,
+            "preceding_exception_trace.py",
+            &CompileOptions {
+                python_version: PythonVersion::Py312,
+                optimization_level: level,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap()
+        .marshal();
+        assert_eq!(actual, native.stdout);
+        for payload in [&native.stdout, &actual] {
+            let mut child = Command::new(ORACLES[0].get().unwrap())
+                .args(["-I", "-S", "-B", "-c", TRACE])
+                .stdin(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(payload).unwrap();
+            let result = child.wait_with_output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+}
+
+#[test]
 fn terminating_if_before_elided_assert_preserves_branch_location() {
     for source in [
         "def f(a,b,c):\n if a:\n  if b:\n   raise ValueError()\n  assert a\n else:\n  other()\n after()\n",
@@ -4829,21 +4931,6 @@ for name, offset, args, expected in [
 #[test]
 fn optimized_assertions_after_async_for_preserve_manager_exit_marker() {
     const SOURCE: &str = "async def f(xs,a,b,c):\n    with a:\n        u = 1\n        async for x in xs:\n            pass\n        assert xs\n";
-    for source in [
-        SOURCE,
-        "async def f(xs,a,b,c):\n    with a:\n        u = 1\n        async for x in xs:\n            work(x)\n        assert xs; assert a\n",
-        "async def f(xs,a,b,c):\n    async with a:\n        with b:\n            u = 1\n            async for x in xs:\n                pass\n            assert xs\n",
-        "async def f(xs,a,b,c):\n    async with a:\n        u = 1\n        async for x in xs:\n            pass\n        assert xs\n",
-        "async def f(xs,a,b,c):\n    with a:\n        u = 1\n        async for x in xs:\n            if x:\n                break\n            work(x)\n        assert xs\n",
-        "async def f(xs,a,b,c):\n    with a:\n        u = 1\n        async for x in xs:\n            pass\n        assert xs\n        work(a)\n",
-    ] {
-        assert_matches_cpython_versions(
-            source,
-            "async_for_assert.py",
-            &LEVELS,
-            &[PythonVersion::Py314],
-        );
-    }
     const TRACE: &str = r"
 import asyncio, dis, marshal, sys
 scope = {}
@@ -4889,6 +4976,21 @@ for target, expected in (
         sys.settrace(None)
     assert hits == [target] and events == expected, (hits, events, expected)
 ";
+    for source in [
+        SOURCE,
+        "async def f(xs,a,b,c):\n    with a:\n        u = 1\n        async for x in xs:\n            work(x)\n        assert xs; assert a\n",
+        "async def f(xs,a,b,c):\n    async with a:\n        with b:\n            u = 1\n            async for x in xs:\n                pass\n            assert xs\n",
+        "async def f(xs,a,b,c):\n    async with a:\n        u = 1\n        async for x in xs:\n            pass\n        assert xs\n",
+        "async def f(xs,a,b,c):\n    with a:\n        u = 1\n        async for x in xs:\n            if x:\n                break\n            work(x)\n        assert xs\n",
+        "async def f(xs,a,b,c):\n    with a:\n        u = 1\n        async for x in xs:\n            pass\n        assert xs\n        work(a)\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "async_for_assert.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
     for level in [OptimizationLevel::One, OptimizationLevel::Two] {
         let native = oracle(
             SOURCE.as_bytes(),
