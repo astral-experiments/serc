@@ -137,6 +137,18 @@ def f(xs, cm):
     }
 }
 
+#[test]
+fn elided_if_else_preserves_conditional_join() {
+    for source in [
+        "def f(a):\n if a:\n  assert x\n else:\n  assert y\n work(a)\n return 42\n",
+        "def f(a,b):\n if a and b:\n  assert x\n else:\n  assert y\n work(a)\n",
+        "def f(a,b):\n if a or b:\n  assert x\n else:\n  assert y\n work(a)\n",
+        "def f(a):\n if not __debug__:\n  assert x\n else:\n  assert y\n work(a)\n",
+    ] {
+        assert_matches_cpython(source, "sub/elided_if_else.py", &LEVELS);
+    }
+}
+
 const ORACLE_IDENTITY: &str = r"
 import importlib.util, sys
 assert sys.implementation.name == 'cpython'

@@ -12784,7 +12784,39 @@ impl<'source> Compiler<'source> {
                                 .inherited_followed_by_small_return
                             && !self.has_active_control_flow_region()))
                         && matches!(body.last(), Some(Stmt::Assert(_)));
-                    if declaration_only_body {
+                    let optimized_empty_both = self.context.python_version
+                        >= crate::PythonVersion::Py314
+                        && branch_index == 0
+                        && !self.has_active_control_flow_region()
+                        && !self.control.in_exception_handler()
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && self.control.finally.active_finally_try_bodies == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self.control.finally.active_finally_end_blocks == 0
+                        // A shared true target (for example `a or b`) also has a
+                        // short-circuit predecessor, so its join is not retained.
+                        && original_condition_has_unique_jump_target(test, true)
+                        && condition_has_linear_runtime_leaves(test)
+                        && !expression_suspends_current_scope(test)
+                        && !body.is_empty()
+                        && body.iter().all(|stmt| {
+                            matches!(
+                                self.context.optimized_locations.get(&stmt.range()),
+                                Some(super::optimization::OptimizedLocation::Elided)
+                            )
+                        })
+                        && matches!(statement.elif_else_clauses.as_slice(), [clause]
+                            if clause.test.is_none()
+                                && !clause.body.is_empty()
+                                && clause.body.iter().all(|stmt| matches!(
+                                    self.context.optimized_locations.get(&stmt.range()),
+                                    Some(super::optimization::OptimizedLocation::Elided)
+                                )));
+                    if optimized_empty_both {
+                        self.assembler
+                            .preserve_redundant_jump_nop_after_threading(branch_exit);
+                    } else if declaration_only_body {
                         self.assembler
                             .preserve_empty_join_inlined_jump_nop(branch_exit);
                         if !original_condition_has_unique_jump_target(test, true) {
