@@ -1318,6 +1318,8 @@ pub(super) struct UncompactedConditionalArray {
     source_entry: Option<Label>,
 }
 
+type OwnerSignaturePositions = FxHashMap<OwnerInstructionSignature, SmallVec<[usize; 1]>>;
+
 /// Whole-input lookup tables shared by conditional-array certificates.
 struct UncompactedPrefixIndexes {
     positions: FxHashMap<Label, usize>,
@@ -1325,10 +1327,7 @@ struct UncompactedPrefixIndexes {
     forward_jumps: FxHashMap<Label, smallvec::SmallVec<[usize; 1]>>,
     targets: FxHashSet<Label>,
     authored_break_targets: FxHashSet<Label>,
-    pass_positions: OnceCell<(
-        FxHashMap<OwnerInstructionSignature, SmallVec<[usize; 1]>>,
-        FxHashMap<OwnerInstructionSignature, SmallVec<[usize; 1]>>,
-    )>,
+    pass_positions: OnceCell<(OwnerSignaturePositions, OwnerSignaturePositions)>,
 }
 
 impl UncompactedPrefixIndexes {
