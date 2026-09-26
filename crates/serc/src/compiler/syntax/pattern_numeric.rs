@@ -4,37 +4,46 @@ use ruff_python_ast::visitor::{Visitor, walk_pattern};
 use ruff_python_ast::{self as ast, Expr, Pattern};
 use rustc_hash::FxHashSet;
 
-use crate::code_object::Constant;
+use crate::PythonVersion;
 
-use super::super::constant::{fold_constant, python_integer_value_key};
+use super::super::constant::{
+    PythonNumericValueKey, fold_constant_with_literals, literal_constant, python_numeric_value_key,
+};
 
-/// Index integer-valued numeric keys without rounding integers through a float.
+/// Index numeric keys without rounding integers through a float.
 #[derive(Default)]
 pub(super) struct LargeNumericKeys {
-    integers: FxHashSet<(bool, Vec<u16>)>,
-    large_integers: FxHashSet<(bool, Vec<u16>)>,
+    numbers: FxHashSet<PythonNumericValueKey>,
+    large_numbers: FxHashSet<PythonNumericValueKey>,
 }
 
 impl LargeNumericKeys {
-    pub(super) fn duplicate(&mut self, key: &Expr) -> bool {
+    pub(super) fn duplicate(&mut self, key: &Expr, version: ast::PythonVersion) -> bool {
         if !matches!(
             key,
             Expr::NumberLiteral(_) | Expr::BooleanLiteral(_) | Expr::UnaryOp(_) | Expr::BinOp(_)
         ) {
             return false;
         }
-        let Some(constant) = fold_constant(key) else {
+        let version = match version {
+            ast::PythonVersion::PY312 => PythonVersion::Py312,
+            ast::PythonVersion::PY313 => PythonVersion::Py313,
+            ast::PythonVersion::PY314 => PythonVersion::Py314,
+            _ => PythonVersion::Py315,
+        };
+        let Some(constant) = fold_constant_with_literals(key, version, &literal_constant, false)
+        else {
             return false;
         };
-        let Some(integer) = python_integer_value_key(&constant) else {
+        let Some(number) = python_numeric_value_key(&constant) else {
             return false;
         };
-        let large = matches!(constant, Constant::BigInt { .. });
-        let duplicate =
-            (large && self.integers.contains(&integer)) || self.large_integers.contains(&integer);
-        self.integers.insert(integer.clone());
+        let large = large_integer_literal(key);
+        let duplicate = (large && self.numbers.contains(&number))
+            || self.large_numbers.contains(&number);
+        self.numbers.insert(number.clone());
         if large {
-            self.large_integers.insert(integer);
+            self.large_numbers.insert(number);
         }
         duplicate
     }
@@ -42,21 +51,29 @@ impl LargeNumericKeys {
 
 /// Only a literal integer outside Ruff's supported range needs the ordered retry.
 fn large_integer_literal(key: &Expr) -> bool {
-    let key = if let Expr::UnaryOp(unary) = key {
-        if unary.op != ast::UnaryOp::USub {
-            return false;
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| large_integer_literal(key));
+    }
+    match key {
+        Expr::NumberLiteral(number) => {
+            matches!(&number.value, ast::Number::Int(integer) if integer.as_u64().is_none())
         }
-        unary.operand.as_ref()
-    } else {
-        key
-    };
-    matches!(key, Expr::NumberLiteral(number)
-        if matches!(&number.value, ast::Number::Int(integer) if integer.as_u64().is_none()))
+        Expr::UnaryOp(unary) if unary.op == ast::UnaryOp::USub => {
+            large_integer_literal(&unary.operand)
+        }
+        Expr::BinOp(binary) => {
+            large_integer_literal(&binary.left) || large_integer_literal(&binary.right)
+        }
+        _ => false,
+    }
 }
 
 /// An ordered retry is needed only when the shared checker can miss a duplicate.
-pub(super) fn has_large_numeric_duplicate(statement: &ast::StmtMatch) -> bool {
-    struct Finder(bool);
+pub(super) fn has_large_numeric_duplicate(
+    statement: &ast::StmtMatch,
+    version: ast::PythonVersion,
+) -> bool {
+    struct Finder(bool, ast::PythonVersion);
     impl<'ast> Visitor<'ast> for Finder {
         fn visit_pattern(&mut self, pattern: &'ast Pattern) {
             if crate::stack_growth_required() {
@@ -70,7 +87,7 @@ pub(super) fn has_large_numeric_duplicate(statement: &ast::StmtMatch) -> bool {
                 && mapping.keys.iter().any(large_integer_literal)
             {
                 let mut seen = LargeNumericKeys::default();
-                if mapping.keys.iter().any(|key| seen.duplicate(key)) {
+                if mapping.keys.iter().any(|key| seen.duplicate(key, self.1)) {
                     self.0 = true;
                     return;
                 }
@@ -79,7 +96,7 @@ pub(super) fn has_large_numeric_duplicate(statement: &ast::StmtMatch) -> bool {
         }
         fn visit_expr(&mut self, _expression: &'ast Expr) {}
     }
-    let mut finder = Finder(false);
+    let mut finder = Finder(false, version);
     for case in &statement.cases {
         finder.visit_pattern(&case.pattern);
         if finder.0 {
@@ -146,6 +163,41 @@ mod tests {
                 "18446744073709551616",
                 "18446744073709551616",
             ),
+            (
+                "18446744073709551616.0",
+                "18446744073709551616+0j",
+                "(1.8446744073709552e+19+0j)",
+            ),
+            (
+                "18446744073709551616+0j",
+                "18446744073709551616.0",
+                "1.8446744073709552e+19",
+            ),
+            (
+                "18446744073709551616+0j",
+                "18446744073709551617+0j",
+                "(1.8446744073709552e+19+0j)",
+            ),
+            (
+                "18446744073709551617+0j",
+                "18446744073709551616+0j",
+                "(1.8446744073709552e+19+0j)",
+            ),
+            (
+                "18446744073709551616+1j",
+                "18446744073709551617+1j",
+                "(1.8446744073709552e+19+1j)",
+            ),
+            (
+                "18446744073709551617+1.5j",
+                "18446744073709551616+1.5j",
+                "(1.8446744073709552e+19+1.5j)",
+            ),
+            (
+                "18446744073709551616+1e309j",
+                "18446744073709551617+1e309j",
+                "(1.8446744073709552e+19+infj)",
+            ),
         ];
         for (first, second, repr) in equal {
             let mapping = format!("{{{first}: _, {second}: _}}");
@@ -170,6 +222,9 @@ mod tests {
         let unequal = [
             ("18446744073709551617", "18446744073709551616.0"),
             ("18446744073709551616", "18446744073709551616+1j"),
+            ("18446744073709551616+1j", "18446744073709551617+2j"),
+            ("18446744073709551617", "18446744073709551617+0j"),
+            ("18446744073709551617+0j", "18446744073709551617"),
             ("18446744073709551616", "1e309"),
             ("9007199254740993", "9007199254740992.0"),
             (&too_large, "1e309"),
