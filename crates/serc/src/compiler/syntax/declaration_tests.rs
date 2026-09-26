@@ -36,6 +36,54 @@ fn all_versions_error(source: &str, message: &str, diagnostic: &str) {
 }
 
 #[test]
+fn declarations_precede_pattern_lowering_errors() {
+    for pattern in [
+        "{1: _, 1: _}",
+        "Point(x=1, x=2)",
+        "[x, x]",
+        "[(1 as x) | (2 as y)]",
+        "[*x, *y]",
+        "[x | 1]",
+    ] {
+        let matching = format!("match subject:\n case {pattern}: pass\n");
+        let declaration = "def f():\n nonlocal missing\n";
+        for source in [
+            format!("{matching}{declaration}"),
+            format!("{declaration}{matching}"),
+        ] {
+            all_versions_error(
+                &source,
+                "no binding for nonlocal 'missing' found",
+                "nonlocal missing",
+            );
+        }
+    }
+
+    for source in [
+        "match subject:\n case {1: _, 1: _}: pass\ndef f():\n value = 1\n global value\n",
+        "def f():\n value = 1\n global value\nmatch subject:\n case {1: _, 1: _}: pass\n",
+    ] {
+        all_versions_error(
+            source,
+            "name 'value' is assigned to before global declaration",
+            "global value",
+        );
+    }
+
+    let bound = "def outer():\n value = 1\n def inner():\n  nonlocal value\n  match subject:\n   case {1: _, 1: _}: pass\n";
+    for version in TARGETS {
+        let options = CompileOptions {
+            python_version: version,
+            ..CompileOptions::default()
+        };
+        assert!(matches!(
+            compile_with_options(bound, "declarations.py", &options),
+            Err(CompileError::InvalidPattern { .. })
+        ));
+    }
+}
+
+#[test]
 fn declaration_order_rejects_uses_bindings_parameters_and_annotations() {
     for (source, message, diagnostic) in [
         (
