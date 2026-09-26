@@ -867,18 +867,7 @@ fn collect_explicitly_interned<'a>(
     metadata_tuples: &mut FxHashSet<HashedObjectKey<'a>>,
     needs_metadata_alias_scan: bool,
 ) -> FrozensetRecreationNeed {
-    // Identifier objects can enter the compilation-wide constant cache before an equal
-    // ordinary string. Preserve that recorded origin when sharing constant and metadata strings.
-    values.extend(
-        code.marshal_provenance
-            .canonical_constant_strings
-            .iter()
-            .map(String::as_str),
-    );
-    let mut qualified_names = QualifiedNameConstants {
-        track: python_version != PythonVersion::Py312,
-        ..QualifiedNameConstants::default()
-    };
+    let mut qualified_names = QualifiedNameConstants::for_root(code, python_version, values);
     let frozenset_recreation_need = if !code.marshal_provenance.subtree_has_frozenset_constants {
         collect_interning_provenance_without_frozensets(
             code,
@@ -902,32 +891,12 @@ fn collect_explicitly_interned<'a>(
         return frozenset_recreation_need;
     }
 
-    // A class body normally loads the same qualified-name object that becomes its interned code
-    // metadata. If an equal ordinary constant reached the compilation-wide constant cache first,
-    // the class constant instead reuses that plain object and remains distinct from the metadata.
-    let mut ordinary_first = FxHashSet::default();
-    if qualified_names.origins.values().any(Option::is_none) {
-        // Compiler provenance includes earlier admissions from discarded code. Only spellings
-        // without a recorded origin require reconstructing their surviving constant order.
-        collect_qualified_name_origins(
-            code,
-            &qualified_names.constants.into_iter().collect(),
-            &qualified_names.origins,
-            &mut FxHashSet::default(),
-            &mut ordinary_first,
-        );
-    }
     let additional_values: Vec<_> = qualified_names
-        .origins
-        .into_iter()
-        .filter_map(|(value, origin)| {
-            // An already recorded interned constant does not depend on initial membership.
-            // Otherwise, interning metadata can replace its pointer with an equal canonical
-            // object, leaving the class's fresh constant as a separate plain string.
-            (!values.contains(value)
-                && origin.unwrap_or_else(|| !ordinary_first.contains(value))
-                && !initial_intern_state.contains_for(python_version, value))
-            .then_some(value)
+        .initial_membership_values(code, values)
+        .filter(|value| {
+            // Interning metadata replaces its pointer when an equal canonical object
+            // already exists; the class's fresh constant remains a separate plain string.
+            !initial_intern_state.contains_for(python_version, value)
         })
         .collect();
     values.extend(additional_values);
@@ -955,13 +924,7 @@ fn collect_interning_provenance_without_frozensets<'a>(
     if needs_metadata_alias_scan {
         collect_metadata_tuple_keys(code, metadata_tuples);
     }
-    values.extend(
-        code.marshal_provenance
-            .explicitly_interned_strings
-            .iter()
-            .map(String::as_str),
-    );
-    qualified_names.record(code);
+    qualified_names.record(code, values);
     for constant in &code.constants {
         if let Constant::Code(code) = constant {
             collect_interning_provenance_without_frozensets(
@@ -986,13 +949,7 @@ fn collect_interning_provenance<'a>(
     if needs_metadata_alias_scan {
         collect_metadata_tuple_keys(code, metadata_tuples);
     }
-    values.extend(
-        code.marshal_provenance
-            .explicitly_interned_strings
-            .iter()
-            .map(String::as_str),
-    );
-    qualified_names.record(code);
+    qualified_names.record(code, values);
     // Reuse the provenance walk to classify frozenset recreation for code trees that can contain
     // one (and for hand-built objects without a conservative compiler hint).
     let mut frozenset_recreation_need = FrozensetRecreationNeed::None;
@@ -1097,7 +1054,40 @@ struct QualifiedNameConstants<'a> {
 }
 
 impl<'a> QualifiedNameConstants<'a> {
-    fn record(&mut self, code: &'a CodeObject) {
+    fn for_root(
+        code: &'a CodeObject,
+        python_version: PythonVersion,
+        values: &mut FxHashSet<&'a str>,
+    ) -> Self {
+        // Only the root's compilation-wide canonical admissions seed this set.
+        values.extend(
+            code.marshal_provenance
+                .canonical_constant_strings
+                .iter()
+                .map(String::as_str),
+        );
+        Self {
+            track: python_version != PythonVersion::Py312,
+            ..Self::default()
+        }
+    }
+
+    fn record_tree(&mut self, code: &'a CodeObject, values: &mut FxHashSet<&'a str>) {
+        self.record(code, values);
+        for constant in &code.constants {
+            if let Constant::Code(child) = constant {
+                self.record_tree(child, values);
+            }
+        }
+    }
+
+    fn record(&mut self, code: &'a CodeObject, values: &mut FxHashSet<&'a str>) {
+        values.extend(
+            code.marshal_provenance
+                .explicitly_interned_strings
+                .iter()
+                .map(String::as_str),
+        );
         if !self.track {
             return;
         }
@@ -1109,6 +1099,35 @@ impl<'a> QualifiedNameConstants<'a> {
         if let Some(canonical) = code.marshal_provenance.qualified_name_is_canonical {
             *origin = Some(canonical);
         }
+    }
+
+    /// Select the same initial-membership queries for validation and graph construction.
+    fn initial_membership_values<'b>(
+        self,
+        code: &'a CodeObject,
+        values: &'b FxHashSet<&'a str>,
+    ) -> impl Iterator<Item = &'a str> + 'b
+    where
+        'a: 'b,
+    {
+        // A class body normally loads the same qualified-name object that becomes its interned
+        // code metadata. An equal ordinary constant admitted first instead remains distinct.
+        let mut ordinary_first = FxHashSet::default();
+        if self.origins.values().any(Option::is_none) {
+            // Recorded origins include discarded code and override surviving constant order.
+            collect_qualified_name_origins(
+                code,
+                &self.constants.into_iter().collect(),
+                &self.origins,
+                &mut FxHashSet::default(),
+                &mut ordinary_first,
+            );
+        }
+        self.origins.into_iter().filter_map(move |(value, origin)| {
+            // Already recorded interned constants do not depend on initial membership.
+            (!values.contains(value) && origin.unwrap_or_else(|| !ordinary_first.contains(value)))
+                .then_some(value)
+        })
     }
 }
 
@@ -1327,20 +1346,21 @@ fn validate_qualified_name_intern_state(
     python_version: PythonVersion,
     initial_intern_state: &InitialInternState,
 ) -> Result<(), CompileError> {
-    if code.marshal_provenance.qualified_name_is_canonical == Some(true)
-        && !should_intern(&code.qualified_name)
-        && initial_intern_state
-            .membership_for(python_version, &code.qualified_name)
-            .is_none()
+    let mut values = FxHashSet::default();
+    let mut qualified_names = QualifiedNameConstants::for_root(code, python_version, &mut values);
+    qualified_names.record_tree(code, &mut values);
+    if let Some(value) = qualified_names
+        .initial_membership_values(code, &values)
+        .filter(|value| {
+            initial_intern_state
+                .membership_for(python_version, value)
+                .is_none()
+        })
+        .min()
     {
         return Err(CompileError::UnresolvedInternState {
-            value: code.qualified_name.clone(),
+            value: value.to_owned(),
         });
-    }
-    for constant in &code.constants {
-        if let Constant::Code(child) = constant {
-            validate_qualified_name_intern_state(child, python_version, initial_intern_state)?;
-        }
     }
     Ok(())
 }

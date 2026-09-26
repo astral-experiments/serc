@@ -511,6 +511,187 @@ fn class_qualified_name_origins_preserve_hints_and_surviving_order() {
 }
 
 #[test]
+fn partial_intern_state_validates_resolved_qualified_name_origins() {
+    use super::graph::validate_initial_intern_state;
+    use crate::{CompileError, InitialInternState, PythonVersion};
+
+    fn class(name: &str, canonical: Option<bool>, frozenset_hint: bool) -> Constant {
+        let mut code = code_object(vec![Constant::String(name.to_string())]);
+        code.qualified_name = name.to_string();
+        code.marshal_provenance.qualified_name_constant_index = Some(0);
+        code.marshal_provenance.qualified_name_is_canonical = canonical;
+        code.marshal_provenance.subtree_has_frozenset_constants = frozenset_hint;
+        Constant::Code(Box::new(code))
+    }
+
+    let name = "outer.<locals>.ValidatedClass";
+    let unknown = InitialInternState::from_partial(std::iter::empty::<&str>());
+    let present = InitialInternState::from_partial([name]);
+    let absent = InitialInternState::from_complete(std::iter::empty::<&str>());
+    let proven_absent = InitialInternState::from_partial_with_absence(
+        std::iter::empty::<&str>(),
+        move |_, value| value == name,
+    );
+    for frozenset_hint in [false, true] {
+        for ordinary_first in [false, true] {
+            for canonical in [None, Some(false), Some(true)] {
+                let ordinary = Constant::String(name.to_string());
+                let class = class(name, canonical, frozenset_hint);
+                let mut root = code_object(if ordinary_first {
+                    vec![ordinary, class]
+                } else {
+                    vec![class, ordinary]
+                });
+                root.marshal_provenance.subtree_has_frozenset_constants = frozenset_hint;
+                let expected = if canonical.unwrap_or(!ordinary_first) {
+                    Err(CompileError::UnresolvedInternState {
+                        value: name.to_string(),
+                    })
+                } else {
+                    Ok(())
+                };
+                for version in [
+                    PythonVersion::Py313,
+                    PythonVersion::Py314,
+                    PythonVersion::Py315,
+                ] {
+                    assert_eq!(
+                        validate_initial_intern_state(&root, version, &unknown),
+                        expected,
+                    );
+                    for known in [&present, &absent, &proven_absent] {
+                        assert!(validate_initial_intern_state(&root, version, known).is_ok());
+                    }
+                }
+                assert!(
+                    validate_initial_intern_state(&root, PythonVersion::Py312, &unknown).is_ok()
+                );
+            }
+        }
+
+        // Hints are merged by constant spelling across the whole tree. A later missing hint
+        // preserves the recorded origin, and a later explicit hint replaces it.
+        for last_origin in [false, true] {
+            let mut root = code_object(vec![
+                class(name, Some(!last_origin), frozenset_hint),
+                class(name, Some(last_origin), frozenset_hint),
+                class(name, None, frozenset_hint),
+            ]);
+            root.marshal_provenance.subtree_has_frozenset_constants = frozenset_hint;
+            let expected = if last_origin {
+                Err(CompileError::UnresolvedInternState {
+                    value: name.to_string(),
+                })
+            } else {
+                Ok(())
+            };
+            assert_eq!(
+                validate_initial_intern_state(&root, PythonVersion::Py314, &unknown),
+                expected,
+            );
+        }
+    }
+
+    let scalar = code_object(vec![class("ValidatedClass", None, false)]);
+    assert!(validate_initial_intern_state(&scalar, PythonVersion::Py314, &unknown).is_ok());
+
+    // The graph queries the indexed constant, which can differ from hand-built metadata.
+    let Constant::Code(mut indexed) = class(name, Some(true), false) else {
+        unreachable!();
+    };
+    indexed.qualified_name = "other.metadata".to_string();
+    assert_eq!(
+        validate_initial_intern_state(&indexed, PythonVersion::Py314, &unknown),
+        Err(CompileError::UnresolvedInternState {
+            value: name.to_string(),
+        }),
+    );
+    assert!(validate_initial_intern_state(&indexed, PythonVersion::Py314, &present).is_ok());
+
+    let multiple = code_object(vec![
+        class("z.UnknownClass", None, false),
+        class("a.UnknownClass", None, false),
+    ]);
+    assert_eq!(
+        validate_initial_intern_state(&multiple, PythonVersion::Py314, &unknown),
+        Err(CompileError::UnresolvedInternState {
+            value: "a.UnknownClass".to_string(),
+        }),
+    );
+}
+
+#[test]
+fn partial_intern_state_qualified_name_queries_match_recorded_interns() {
+    use super::graph::validate_initial_intern_state;
+    use crate::{CompileError, InitialInternState, PythonVersion};
+
+    let name = "namespace.RecordedClass";
+    let unknown = InitialInternState::from_partial(std::iter::empty::<&str>());
+    for frozenset_hint in [false, true] {
+        let mut class = code_object(vec![Constant::String(name.to_string())]);
+        class.qualified_name = name.to_string();
+        class.marshal_provenance.qualified_name_constant_index = Some(0);
+        class.marshal_provenance.qualified_name_is_canonical = Some(true);
+        class.marshal_provenance.subtree_has_frozenset_constants = frozenset_hint;
+        let mut root = code_object(vec![Constant::Code(Box::new(class.clone()))]);
+        root.marshal_provenance.subtree_has_frozenset_constants = frozenset_hint;
+
+        let mut canonical = root.clone();
+        canonical
+            .marshal_provenance
+            .canonical_constant_strings
+            .insert(name.to_string());
+        let mut explicit = root.clone();
+        explicit
+            .marshal_provenance
+            .explicitly_interned_strings
+            .insert(name.to_string());
+        let mut child_explicit = class.clone();
+        child_explicit
+            .marshal_provenance
+            .explicitly_interned_strings
+            .insert(name.to_string());
+        let mut nested_explicit = root.clone();
+        nested_explicit.constants = vec![Constant::Code(Box::new(child_explicit))];
+
+        // The serializer does not include nested canonical admissions, parser names, or
+        // metadata names in its set of already recorded interned constants.
+        let mut child_canonical = class;
+        child_canonical
+            .marshal_provenance
+            .canonical_constant_strings
+            .insert(name.to_string());
+        let mut nested_canonical = root.clone();
+        nested_canonical.constants = vec![Constant::Code(Box::new(child_canonical))];
+        let mut parser = root.clone();
+        parser
+            .marshal_provenance
+            .parser_interned_strings
+            .insert(name.to_string());
+        let mut metadata = root.clone();
+        metadata.names.push(name.into());
+
+        for version in [
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            for recorded in [&canonical, &explicit, &nested_explicit] {
+                assert!(validate_initial_intern_state(recorded, version, &unknown).is_ok());
+            }
+            for unrecorded in [&root, &nested_canonical, &parser, &metadata] {
+                assert_eq!(
+                    validate_initial_intern_state(unrecorded, version, &unknown),
+                    Err(CompileError::UnresolvedInternState {
+                        value: name.to_string(),
+                    }),
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn compiled_class_qualified_names_match_unhinted_surviving_provenance() {
     fn remove_hints(code: &mut CodeObject, observed: &mut Vec<(String, bool)>) {
         if let Some(origin) = code.marshal_provenance.qualified_name_is_canonical.take() {
