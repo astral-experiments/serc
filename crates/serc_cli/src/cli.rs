@@ -917,13 +917,19 @@ mod tests {
                 .set_times(std::fs::FileTimes::new().set_modified(original_mtime))
                 .unwrap();
             drop(source);
-            compile_path_with_metadata(&source_path, false, &CompileOptions::default(), |path| {
-                let metadata = fs_err::metadata(path)?;
-                let replacement_path = directory.path().join("replacement.py");
-                fs_err::write(&replacement_path, replacement)?;
-                fs_err::rename(&replacement_path, path)?;
-                Ok(metadata)
-            })
+            compile_path_with_metadata(
+                &source_path,
+                false,
+                InvalidationMode::Timestamp,
+                &CompileOptions::default(),
+                |path| {
+                    let metadata = fs_err::metadata(path)?;
+                    let replacement_path = directory.path().join("replacement.py");
+                    fs_err::write(&replacement_path, replacement)?;
+                    fs_err::rename(&replacement_path, path)?;
+                    Ok(metadata)
+                },
+            )
             .unwrap();
 
             let expected =
@@ -945,11 +951,14 @@ mod tests {
         fs_err::write(&source_path, "pass\n").unwrap();
         fs_err::write(&cache_directory, "not a directory").unwrap();
 
-        let error =
-            compile_path_with_metadata(&source_path, false, &CompileOptions::default(), |path| {
-                fs_err::metadata(path)
-            })
-            .unwrap_err();
+        let error = compile_path_with_metadata(
+            &source_path,
+            false,
+            InvalidationMode::Timestamp,
+            &CompileOptions::default(),
+            |path| fs_err::metadata(path),
+        )
+        .unwrap_err();
         assert!(error.starts_with(&format!("failed to create {}:", cache_directory.display())));
     }
 
