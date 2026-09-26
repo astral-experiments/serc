@@ -9,7 +9,7 @@ use ruff_python_ast::visitor::{
 use ruff_python_ast::{self as ast, Expr, Pattern, Stmt};
 use ruff_python_parser::semantic_errors::{
     AwaitOutsideAsyncFunctionKind, InvalidExpressionKind, LazyImportContext, SemanticSyntaxChecker,
-    SemanticSyntaxContext, SemanticSyntaxError, SemanticSyntaxErrorKind,
+    SemanticSyntaxContext, SemanticSyntaxError, SemanticSyntaxErrorKind, WriteToDebugKind,
 };
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -544,6 +544,28 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
                 statement.range(),
             ));
         }
+    }
+
+    fn check_debug_write(&self, name: &str, context: ast::ExprContext, range: TextRange) {
+        // These checks moved from code generation into symbol analysis in Python 3.14,
+        // which also made them apply inside stringized and unevaluated annotations.
+        if name != "__debug__"
+            || (!self.check_bare_starred && self.python_version < ast::PythonVersion::PY314)
+        {
+            return;
+        }
+        let kind = match context {
+            ast::ExprContext::Store => WriteToDebugKind::Store,
+            ast::ExprContext::Del if self.python_version >= ast::PythonVersion::PY314 => {
+                WriteToDebugKind::Delete(self.python_version)
+            }
+            _ => return,
+        };
+        self.report_semantic_error(SemanticSyntaxError {
+            kind: SemanticSyntaxErrorKind::WriteToDebug(kind),
+            range,
+            python_version: self.python_version,
+        });
     }
 
     fn defer_pattern_reachability(&mut self, statement: &'ast ast::StmtMatch) {
@@ -1260,6 +1282,16 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                     self.visit_expr(target);
                 }
             }
+            Stmt::AugAssign(statement) if self.python_version < ast::PythonVersion::PY314 => {
+                // Legacy augmented attribute stores bypass the ordinary attribute-name check.
+                // Their base expression and RHS still undergo normal validation.
+                if let Expr::Attribute(attribute) = statement.target.as_ref() {
+                    self.visit_expr(&attribute.value);
+                } else {
+                    self.visit_expr(&statement.target);
+                }
+                self.visit_expr(&statement.value);
+            }
             Stmt::FunctionDef(function) => {
                 for decorator in &function.decorator_list {
                     self.visit_decorator(decorator);
@@ -1383,7 +1415,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
         }
         // This adapter does not supply declarations to Ruff's global-order check. A bare name
         // therefore only needs checking when it assigns to or deletes `__debug__`. Ordinary
-        // literals and attribute wrappers cannot report errors or update validation state.
+        // literals have no validation state; attribute chains check the target before their base.
         match expression {
             Expr::Name(name)
                 if name.id.as_str() != "__debug__"
@@ -1398,6 +1430,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
             | Expr::NoneLiteral(_)
             | Expr::EllipsisLiteral(_) => return,
             Expr::Attribute(attribute) => {
+                self.check_debug_write(attribute.attr.as_str(), attribute.ctx, attribute.range);
                 let mut base = attribute.value.as_ref();
                 while let Expr::Attribute(attribute) = base {
                     base = attribute.value.as_ref();
@@ -1530,6 +1563,34 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
         }
         self.validate_private_parameters(parameters);
         walk_parameters(self, parameters);
+    }
+
+    fn visit_pattern(&mut self, pattern: &'ast Pattern) {
+        if let Pattern::MatchClass(class) = pattern {
+            for keyword in &class.arguments.keywords {
+                self.check_debug_write(
+                    keyword.attr.as_str(),
+                    ast::ExprContext::Store,
+                    keyword.pattern.range(),
+                );
+            }
+        }
+        walk_pattern(self, pattern);
+    }
+
+    fn visit_arguments(&mut self, arguments: &'ast ast::Arguments) {
+        for argument in &arguments.args {
+            self.visit_expr(argument);
+        }
+        // Native checks explicit keyword names before walking any keyword values.
+        for keyword in &arguments.keywords {
+            if let Some(name) = &keyword.arg {
+                self.check_debug_write(name.as_str(), ast::ExprContext::Store, keyword.range);
+            }
+        }
+        for keyword in &arguments.keywords {
+            self.visit_keyword(keyword);
+        }
     }
 
     fn visit_annotation(&mut self, annotation: &'ast Expr) {
@@ -1739,6 +1800,8 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
         }
         // Preserve the existing public diagnostics for checks previously performed in lowering.
         let message = match &error.kind {
+            Kind::WriteToDebug(WriteToDebugKind::Store) => "cannot assign to __debug__".to_owned(),
+            Kind::WriteToDebug(WriteToDebugKind::Delete(_)) => "cannot delete __debug__".to_owned(),
             Kind::BreakOutsideLoop => "'break' outside loop".to_owned(),
             Kind::ContinueOutsideLoop => "'continue' not properly in loop".to_owned(),
             Kind::ReturnOutsideFunction => "'return' outside function".to_owned(),
@@ -1971,7 +2034,7 @@ mod tests {
             ),
             (
                 "value = ((__debug__ := first).a.b.c, (yield second).d.e.f)",
-                "cannot assign to `__debug__`",
+                "cannot assign to __debug__",
                 "__debug__",
             ),
             (
