@@ -189,7 +189,6 @@ sys.stdout.buffer.write(marshal.dumps(code))
                 if let Some(expected) = expected {
                     assert_eq!(String::from_utf8_lossy(&native.stdout).trim(), expected);
                     let error = compiled.unwrap_err();
-                    let expected = serc_message(expected);
                     assert!(
                         error.to_string().ends_with(expected),
                         "{version}: {source}: {error}"
@@ -221,18 +220,10 @@ sys.stdout.buffer.write(marshal.dumps(code))
             );
             if let Some(expected) = expected {
                 assert!(
-                    String::from_utf8_lossy(&output.stderr).contains(serc_message(expected)),
+                    String::from_utf8_lossy(&output.stderr).contains(expected),
                     "{output:?}"
                 );
             }
         }
-    }
-}
-
-fn serc_message(native: &str) -> &str {
-    if native == "from __future__ imports must occur at the beginning of the file" {
-        "__future__ imports must be at the top of the file"
-    } else {
-        native
     }
 }
