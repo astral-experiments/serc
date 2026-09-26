@@ -30509,6 +30509,13 @@ impl<'source> Compiler<'source> {
             if !trailing_nop_is_covered
                 && self.assembler.instruction_count() == body_start
                 && let Some(statement) = body.last()
+                // A suite of declarations emits no line event, including synthetic
+                // declarations left by optimized-away assertions. Other suites may
+                // contain an authored pass whose location still needs this fallback.
+                && !(self.context.python_version >= crate::PythonVersion::Py314
+                    && body
+                        .iter()
+                        .all(|statement| matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))))
                 // A same-line `as` target store already carries the pass line event.
                 && body_previous_location.is_none_or(|previous| {
                     previous.line != self.source_location(statement.range()).line
@@ -31257,6 +31264,10 @@ impl<'source> Compiler<'source> {
                     if remaining.is_empty()
                         && compiler.assembler.instruction_count() == body_start
                         && let Some(statement) = body.last()
+                        && !(compiler.context.python_version >= crate::PythonVersion::Py314
+                            && body.iter().all(|statement| {
+                                matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))
+                            }))
                     {
                         compiler
                             .assembler

@@ -584,6 +584,36 @@ fn optimized_nested_else_with_declarations_matches_cpython() {
 }
 
 #[test]
+fn optimized_empty_manager_bodies_match_cpython() {
+    for (header, manager) in [
+        ("def f():", "with"),
+        ("async def f():", "with"),
+        ("async def f():", "async with"),
+    ] {
+        for body in [
+            "        assert predicate()\n",
+            "        assert predicate()\n        assert other()\n",
+            "        pass\n",
+            "        global marker\n        pass\n",
+            "        global marker\n        assert predicate()\n",
+        ] {
+            for continuation in ["", "    after = work()\n"] {
+                let source = format!(
+                    "{header}\n    before = 1\n    {manager} manager(\n        1,\n        option=True,\n    ) as context:\n{body}{continuation}"
+                );
+                assert_matches_cpython(&source, "case.py", &LEVELS);
+            }
+        }
+    }
+
+    assert_matches_cpython(
+        "def outer():\n    captured = 1\n    def f(m):\n        with m as token:\n            nonlocal captured\n            assert predicate()\n        return captured, token\n    return f\n",
+        "case.py",
+        &LEVELS,
+    );
+}
+
+#[test]
 fn nested_continue_with_elided_assertion_matches_cpython() {
     for source in [
         "def f(xs, a, cm):\n    for x in xs:\n        if a:\n            if x:\n                continue\n            global g\n            assert x\n",
