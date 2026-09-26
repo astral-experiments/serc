@@ -1282,6 +1282,14 @@ print(outcome)
     let cases = [
         ("{**{k: 1 for k in xs}}", "", 4, false),
         ("[{k: 1 for k in xs}]", "", 4, false),
+        ("[x, *[k for k in xs], x]", "", 4, false),
+        ("({k: 1 for k in xs}, 1)", "", 4, false),
+        ("(x, {k: 1 for k in xs})", "", 4, false),
+        ("([x, *xs], [x, *[k for k in xs]])", "", 4, false),
+        ("([x, *[k for k in xs]], [x, *xs])", "", 4, false),
+        ("(*({k: 1 for k in xs},), x)", "", 4, false),
+        ("([k for k in xs], (*xs, 1, 2))", "", 4, false),
+        ("([k for k in xs], (*[1, 2], [x, *xs]))", "", 4, false),
         ("{**dict(xs)}", "", 4, true),
         ("{**{k: 1 for k in xs}}", "    pass\n", 5, false),
         ("{**{k: 1 for k in xs}}", "    pass; pass\n", 5, true),
@@ -1351,6 +1359,22 @@ print(outcome)
                 }
             }
         }
+    }
+}
+
+#[test]
+fn comprehension_collection_continuations_preserve_exception_owners() {
+    for expression in [
+        "[x, *[k for k in xs], x]",
+        "({k: 1 for k in xs}, 1)",
+        "([x, *xs], [x, *[k for k in xs]])",
+        "(*({k: 1 for k in xs},), x)",
+        "([k for k in xs], (*[1, 2], [x, *xs]))",
+    ] {
+        let source = format!(
+            "def f(x, xs, d):\n    v = {expression}\n    try:\n        if x:\n            pass\n    except Exception:\n        pass\n"
+        );
+        assert_matches_cpython(&source, "case.py", &LEVELS);
     }
 }
 

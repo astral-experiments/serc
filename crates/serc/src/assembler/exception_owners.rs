@@ -2005,8 +2005,8 @@ impl ExceptionOwnerProvenance {
         all: &[Item],
     ) -> Option<(Label, &'a [Item], usize)> {
         use crate::target::opcodes::{
-            BUILD_LIST, BUILD_MAP, CALL, DICT_UPDATE, LOAD_ATTR, LOAD_FAST, STORE_DEREF,
-            STORE_FAST, STORE_NAME, SWAP,
+            BUILD_LIST, BUILD_MAP, BUILD_TUPLE, CALL, DICT_UPDATE, LIST_EXTEND, LOAD_ATTR,
+            LOAD_CONST, LOAD_FAST, LOAD_SMALL_INT, STORE_DEREF, STORE_FAST, STORE_NAME, SWAP,
         };
 
         let leading = prefix
@@ -2064,36 +2064,46 @@ impl ExceptionOwnerProvenance {
             if incoming.as_slice() != [*jump] {
                 continue;
             }
-            let instructions = prefix[start..]
+            // The original seal contains adjacent instructions. A live label
+            // inside the restore would split that array, even if filtering it
+            // produced the same sequence of opcodes.
+            let mut records = prefix[start..]
                 .iter()
-                .filter_map(|item| {
-                    if let Item::Instruction(instruction) = item {
-                        Some(*instruction)
-                    } else {
-                        None
-                    }
-                })
-                .take(original.len() + 1)
-                .collect::<Vec<_>>();
+                .skip_while(|item| matches!(item, Item::Label(_)));
+            if !original
+                .iter()
+                .all(|instruction| records.next() == Some(&Item::Instruction(*instruction)))
+            {
+                continue;
+            }
+            let next = records.find_map(|item| {
+                if let Item::Instruction(instruction) = item {
+                    Some(*instruction)
+                } else {
+                    None
+                }
+            });
             // All authored restores are STORE_FAST_MAYBE_NULL in CPython,
             // including cells. They remain distinct through superinstruction
             // insertion. The following operation is not swappable, so only n
             // swappable restores precede it and SWAP(n + 1) cannot be eliminated.
-            if instructions.starts_with(original)
-                && instructions.get(original.len()).is_some_and(|next| {
-                    matches!(
-                        next.opcode,
-                        BUILD_LIST
-                            | BUILD_MAP
-                            | CALL
-                            | DICT_UPDATE
-                            | LOAD_ATTR
-                            | LOAD_FAST
-                            | STORE_DEREF
-                            | STORE_NAME
-                    )
-                })
-            {
+            if next.is_some_and(|next| {
+                matches!(
+                    next.opcode,
+                    BUILD_LIST
+                        | BUILD_MAP
+                        | BUILD_TUPLE
+                        | CALL
+                        | DICT_UPDATE
+                        | LIST_EXTEND
+                        | LOAD_ATTR
+                        | LOAD_CONST
+                        | LOAD_FAST
+                        | LOAD_SMALL_INT
+                        | STORE_DEREF
+                        | STORE_NAME
+                )
+            }) {
                 return Some((*entry, &prefix[start..], restores.len()));
             }
         }
@@ -2206,12 +2216,14 @@ impl ExceptionOwnerProvenance {
         source_head: bool,
     ) -> bool {
         use crate::target::opcodes::{
-            BINARY_OP, BUILD_LIST, BUILD_MAP, BUILD_STRING, BUILD_TUPLE, CALL, CALL_KW,
-            CONTAINS_OP, DICT_UPDATE, FORMAT_SIMPLE, GET_ITER, IMPORT_FROM, IMPORT_NAME, LOAD_ATTR,
-            LOAD_CONST, LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL, LOAD_NAME, LOAD_SMALL_INT,
-            MAKE_FUNCTION, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, PUSH_NULL, SET_FUNCTION_ATTRIBUTE,
-            STORE_DEREF, STORE_FAST, STORE_NAME, TO_BOOL,
+            BINARY_OP, BUILD_LIST, BUILD_MAP, BUILD_STRING, BUILD_TUPLE, CALL, CALL_INTRINSIC_1,
+            CALL_KW, CONTAINS_OP, DICT_UPDATE, FORMAT_SIMPLE, GET_ITER, IMPORT_FROM, IMPORT_NAME,
+            LIST_APPEND, LIST_EXTEND, LOAD_ATTR, LOAD_CONST, LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL,
+            LOAD_NAME, LOAD_SMALL_INT, MAKE_FUNCTION, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE,
+            PUSH_NULL, SET_FUNCTION_ATTRIBUTE, STORE_DEREF, STORE_FAST, STORE_NAME, TO_BOOL,
+            UNPACK_SEQUENCE,
         };
+        use crate::target::operands::UnaryIntrinsic;
 
         let empty_class_success = Self::empty_class_success_prefix(prefix, all);
         let leading_labels = prefix
@@ -2285,6 +2297,7 @@ impl ExceptionOwnerProvenance {
             positions, targets, ..
         } = indexes();
         let mut instructions = Vec::new();
+        let mut instruction_item_positions = Vec::new();
         let mut labels = FxHashSet::default();
         let mut from_import_members = FxHashSet::default();
         for (item_index, item) in prefix.iter().enumerate() {
@@ -2341,6 +2354,9 @@ impl ExceptionOwnerProvenance {
                         from_import_members.insert(instructions.len() + 2);
                     }
                     instructions.push(*instruction);
+                    if comprehension_restore_count > 0 {
+                        instruction_item_positions.push(item_index);
+                    }
                 }
             }
         }
@@ -2419,6 +2435,18 @@ impl ExceptionOwnerProvenance {
         let mut folded_slots = 0usize;
         let mut membership_folds = 0;
         let mut null_setup_cells = FxHashSet::default();
+        // These entry opcodes extend the original comprehension certificate.
+        // Their original array must remain physically continuous through the
+        // marker, including after the collection operation.
+        let mut expanded_collection = comprehension_restore_count > 0
+            && instructions
+                .get(comprehension_restore_count + 1)
+                .is_some_and(|next| {
+                    matches!(
+                        next.opcode,
+                        BUILD_TUPLE | LIST_EXTEND | LOAD_CONST | LOAD_SMALL_INT
+                    )
+                });
         for (index, instruction) in instructions.iter().enumerate() {
             let membership_fold = instruction.opcode == LOAD_CONST
                 && original_folds.contains(&index)
@@ -2459,6 +2487,12 @@ impl ExceptionOwnerProvenance {
                         else {
                             return false;
                         };
+                        if start_at >= end_at
+                            || !indexes().has_unique_label(*start)
+                            || !indexes().has_unique_label(*end)
+                        {
+                            return false;
+                        }
                         let range = &all[start_at..end_at];
                         labels.contains(start)
                             && labels.contains(end)
@@ -2529,6 +2563,29 @@ impl ExceptionOwnerProvenance {
                     if closure_members.contains(&index) => {}
                 MAKE_FUNCTION | SET_FUNCTION_ATTRIBUTE
                     if annotated_function_members.contains(&index) => {}
+                BUILD_TUPLE
+                    if comprehension_restore_count > 0
+                        && index > comprehension_restore_count
+                        && let Operand::Value(count @ 1..) = instruction.operand()
+                        && let Some(previous) = instructions.get(index - 1)
+                        // Consume the restored runtime result, or follow an
+                        // independently certified operation that cannot fold.
+                        && let suffix = &instructions[comprehension_restore_count + 1..index]
+                        && ((suffix.iter().all(|part| matches!(part.opcode, LOAD_FAST | LOAD_CONST | LOAD_SMALL_INT))
+                                && usize::try_from(count).is_ok_and(|count| count > suffix.len()))
+                            || matches!(previous.opcode, LIST_EXTEND | CALL_INTRINSIC_1))
+                        && instruction_item_positions[index]
+                            - instruction_item_positions[comprehension_restore_count]
+                            == index - comprehension_restore_count
+                        && let (Some(before), Some(after)) =
+                            (previous.depth_after(), instruction.depth_after())
+                        && before.checked_sub(count - 1) == Some(after)
+                        && instructions
+                            .get(index + 1)
+                            .is_some_and(|next| next.opcode != UNPACK_SEQUENCE) =>
+                {
+                    expanded_collection = true;
+                }
                 BUILD_LIST => {
                     // Empty local lists retain their existing certificate. Nonempty
                     // lists below CPython's three-item constant-fold threshold also
@@ -2536,7 +2593,34 @@ impl ExceptionOwnerProvenance {
                     let unchanged =
                         instructions.get(index + 1).is_some_and(|next| {
                             match instruction.operand() {
-                                Operand::Value(0) => next.opcode == STORE_FAST,
+                                Operand::Value(0) => {
+                                    next.opcode == STORE_FAST
+                                        // These retained operations block the
+                                        // constant-list-to-tuple fold from reaching
+                                        // this empty list.
+                                        || (comprehension_restore_count > 0
+                                            && index > comprehension_restore_count
+                                            && instruction_item_positions[index]
+                                                - instruction_item_positions[comprehension_restore_count]
+                                                == index - comprehension_restore_count
+                                            && instruction_item_positions[index + 1]
+                                                == instruction_item_positions[index] + 1
+                                            && (matches!(next.opcode, LOAD_FAST | LIST_EXTEND)
+                                                || (next.opcode == BUILD_LIST
+                                                    && next.operand() == Operand::Value(0)
+                                                    && instructions.get(index + 2).is_some_and(|next| next.opcode == LIST_EXTEND)
+                                                    && instruction_item_positions[index + 2]
+                                                        == instruction_item_positions[index] + 2)
+                                                || instructions.get(index + 1..index + 4)
+                                                    .is_some_and(|parts| {
+                                                        matches!(parts[0].opcode, LOAD_CONST | LOAD_SMALL_INT)
+                                                            && matches!(parts[1].opcode, LOAD_CONST | LOAD_SMALL_INT)
+                                                            && parts[2].opcode == BUILD_LIST
+                                                            && parts[2].operand() == Operand::Value(2)
+                                                            && instruction_item_positions[index + 3]
+                                                                == instruction_item_positions[index] + 3
+                                                    })))
+                                }
                                 Operand::Value(1..=2) => {
                                     !matches!(next.opcode, GET_ITER | CONTAINS_OP)
                                 }
@@ -2545,6 +2629,11 @@ impl ExceptionOwnerProvenance {
                         });
                     if !unchanged {
                         return false;
+                    }
+                    if instruction.operand() == Operand::Value(0)
+                        && instructions[index + 1].opcode != STORE_FAST
+                    {
+                        expanded_collection = true;
                     }
                 }
                 BUILD_MAP => {
@@ -2566,6 +2655,68 @@ impl ExceptionOwnerProvenance {
                     {
                         return false;
                     }
+                }
+                LIST_EXTEND | LIST_APPEND => {
+                    // The restored runtime value or a subsequent simple load feeds
+                    // this list operation. A continuous prefix excludes copied arrays.
+                    if comprehension_restore_count == 0
+                        || index <= comprehension_restore_count
+                        || instruction_item_positions[index]
+                            - instruction_item_positions[comprehension_restore_count]
+                            != index - comprehension_restore_count
+                        || !matches!(instruction.operand(), Operand::Value(1..))
+                        || (index != comprehension_restore_count + 1
+                            && !matches!(
+                                instructions[index - 1].opcode,
+                                LOAD_FAST | LOAD_CONST | LOAD_SMALL_INT | BUILD_LIST | BUILD_TUPLE
+                            )
+                            && !(instruction.opcode == LIST_APPEND
+                                && instructions[index - 1].opcode == LIST_EXTEND
+                                && instructions[index - 1].operand() == Operand::Value(1)))
+                        || (instruction.opcode == LIST_APPEND
+                            && index == comprehension_restore_count + 1)
+                    {
+                        return false;
+                    }
+                    let Operand::Value(depth) = instruction.operand() else {
+                        unreachable!()
+                    };
+                    let (Some(before), Some(after)) = (
+                        instructions[index - 1].depth_after(),
+                        instruction.depth_after(),
+                    ) else {
+                        return false;
+                    };
+                    if before.checked_sub(1) != Some(after) || after < depth {
+                        return false;
+                    }
+                    expanded_collection = true;
+                }
+                CALL_INTRINSIC_1 => {
+                    // LIST_EXTEND prevents constant-list-to-tuple folding; an
+                    // immediately iterated result would instead be optimized away.
+                    if comprehension_restore_count == 0
+                        || index <= comprehension_restore_count
+                        || instruction.operand()
+                            != Operand::Value(UnaryIntrinsic::LIST_TO_TUPLE.argument())
+                        || instruction_item_positions[index]
+                            - instruction_item_positions[comprehension_restore_count]
+                            != index - comprehension_restore_count
+                        || instructions[comprehension_restore_count + 1..index]
+                            .iter()
+                            .rev()
+                            .find(|part| matches!(part.opcode, LIST_EXTEND | BUILD_LIST))
+                            .is_none_or(|part| part.opcode != LIST_EXTEND)
+                        || !matches!(instructions[index - 1].opcode, LIST_APPEND | LIST_EXTEND)
+                        || instructions
+                            .get(index + 1)
+                            .is_none_or(|next| next.opcode == GET_ITER)
+                        || instructions[index - 1].depth_after() != instruction.depth_after()
+                        || instruction.depth_after().is_none()
+                    {
+                        return false;
+                    }
+                    expanded_collection = true;
                 }
                 STORE_FAST => {
                     // Certified comprehension restores are still MAYBE_NULL
@@ -2727,6 +2878,61 @@ impl ExceptionOwnerProvenance {
                 LOAD_NAME | LOAD_ATTR | LOAD_CONST | STORE_NAME | CALL | IMPORT_NAME => {}
                 crate::target::opcodes::SWAP if comprehension_restore_count > 0 && index == 0 => {}
                 _ => return false,
+            }
+        }
+        if expanded_collection {
+            // A retained SETUP is wrapped in synthetic exception-range labels;
+            // they do not split its original array. Admit only the complete
+            // adjacent quartet and reject any independently authored boundary.
+            let mut item_index = instruction_item_positions[comprehension_restore_count] + 1;
+            let marker_index = instruction_item_positions[instructions.len() - 1];
+            while item_index < marker_index {
+                if matches!(prefix[item_index], Item::Instruction(_)) {
+                    item_index += 1;
+                    continue;
+                }
+                let Some(
+                    [
+                        Item::Label(start),
+                        Item::Instruction(nop),
+                        Item::Label(end),
+                        Item::Label(setup),
+                    ],
+                ) = prefix.get(item_index..item_index + 4)
+                else {
+                    return false;
+                };
+                let mut setup_matches = self
+                    .setups
+                    .iter()
+                    .filter(|(label, _)| [start, end, setup].contains(&label));
+                if item_index + 4 > marker_index
+                    || nop.opcode != NOP
+                    || nop.operand() != Operand::Value(0)
+                    || nop.exception_policy() != super::ExceptionPolicy::EXCLUDE_ALWAYS
+                    || !self.setup_nop_ranges.contains(&(*start, *end))
+                    || self
+                        .setup_nop_ranges
+                        .iter()
+                        .filter(|(candidate_start, candidate_end)| {
+                            [start, end, setup].contains(&candidate_start)
+                                || [start, end, setup].contains(&candidate_end)
+                        })
+                        .count()
+                        != 1
+                    || self.original_fallthrough_setups.contains(start)
+                    || setup_matches.next() != Some(&(*setup, Some(nop.location)))
+                    || setup_matches.next().is_some()
+                    || [start, end, setup].iter().any(|label| {
+                        !indexes().has_unique_label(**label)
+                            || targets.contains(*label)
+                            || self.block_boundaries.contains(*label)
+                            || self.source_boundaries.contains(*label)
+                    })
+                {
+                    return false;
+                }
+                item_index += 4;
             }
         }
         // Retained SETUPs need an authored NOP proof. A certified comprehension
@@ -14763,7 +14969,8 @@ mod tests {
         };
 
         for (opcode, case) in [CALL, LOAD_ATTR, LOAD_FAST].into_iter().flat_map(|opcode| {
-            ["original", "unsealed", "cloned", "retired"].map(|case| (opcode, case))
+            ["original", "unsealed", "cloned", "retired", "split restore"]
+                .map(|case| (opcode, case))
         }) {
             let entry = Label::from_u32(0);
             let exit = Label::from_u32(1);
@@ -14794,11 +15001,14 @@ mod tests {
             };
             if case == "unsealed" {
                 provenance.original_comprehension_normal_restores.clear();
+            } else if case == "split restore" {
+                // Even a non-target label splits the originally sealed array.
+                items.insert(3, Item::Label(Label::from_u32(3)));
             }
             provenance.capture_uncompacted_conditional_arrays(&items);
             assert_eq!(
                 provenance.uncompacted_conditional_arrays.len(),
-                usize::from(case != "unsealed"),
+                usize::from(!matches!(case, "unsealed" | "split restore")),
                 "{opcode:?}: {case}"
             );
             if case == "cloned" {
@@ -14819,7 +15029,7 @@ mod tests {
                 exception_regions: vec![],
                 preserved_block_boundaries: rustc_hash::FxHashSet::default(),
                 removed_max_depth: None,
-                next_label: 3,
+                next_label: 4,
                 has_next_location: false,
             };
             let targets = [if case == "cloned" { clone } else { entry }, exit]
@@ -14837,6 +15047,166 @@ mod tests {
                 markers,
                 assembler.uncompacted_conditional_null_markers::<false>(&targets, &unique),
                 "{opcode:?}: {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn expanded_comprehension_continuations_require_a_contiguous_marker() {
+        use super::{ExceptionOwnerProvenance, OnceCell};
+        use crate::assembler::{Instruction, Item, Label, Operand, SourceLocation};
+        use crate::target::opcodes::{
+            BUILD_TUPLE, LOAD_CONST, LOAD_FAST, NOT_TAKEN, POP_JUMP_IF_FALSE, STORE_FAST, SWAP,
+            TO_BOOL,
+        };
+
+        let entry = Label::from_u32(0);
+        let exit = Label::from_u32(1);
+        let alias = Label::from_u32(2);
+        let make = |opcode, operand, depth| {
+            Item::Instruction(Instruction::new(
+                opcode,
+                operand,
+                SourceLocation::new(3, 3, 0, 4),
+                Some(depth),
+            ))
+        };
+        let prefix = vec![
+            Item::Label(entry),
+            make(SWAP, Operand::Value(2), 2),
+            make(STORE_FAST, Operand::Value(0), 1),
+            make(LOAD_CONST, Operand::Value(0), 2),
+            make(BUILD_TUPLE, Operand::Value(2), 1),
+            make(STORE_FAST, Operand::Value(20), 0),
+            make(LOAD_FAST, Operand::Value(20), 1),
+            make(TO_BOOL, Operand::Value(0), 1),
+            make(POP_JUMP_IF_FALSE, Operand::Forward(exit), 0),
+            make(NOT_TAKEN, Operand::Value(0), 0),
+        ];
+        let provenance = ExceptionOwnerProvenance::default();
+        for gap in [None, Some(5), Some(7), Some(9)] {
+            let mut candidate = prefix.clone();
+            if let Some(gap) = gap {
+                candidate.insert(gap, Item::Label(alias));
+            }
+            let mut all = candidate.clone();
+            all.push(Item::Label(exit));
+            assert_eq!(
+                provenance.uncompacted_prefix(&candidate, &all, &OnceCell::new(), 1, false),
+                gap.is_none(),
+                "gap: {gap:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn expanded_comprehension_continuations_accept_only_a_sealed_setup() {
+        use super::{ExceptionOwnerProvenance, OnceCell};
+        use crate::assembler::{
+            ExceptionPolicy, Instruction, Item, Label, Operand, SourceLocation,
+        };
+        use crate::target::opcodes::{
+            BUILD_TUPLE, JUMP_FORWARD, LOAD_CONST, LOAD_FAST, NOP, NOT_TAKEN, POP_JUMP_IF_FALSE,
+            STORE_FAST, SWAP, TO_BOOL,
+        };
+
+        let entry = Label::from_u32(0);
+        let exit = Label::from_u32(1);
+        let start = Label::from_u32(2);
+        let end = Label::from_u32(3);
+        let setup = Label::from_u32(4);
+        let alias = Label::from_u32(5);
+        let make = |opcode, operand, line, depth| {
+            Item::Instruction(Instruction::new(
+                opcode,
+                operand,
+                SourceLocation::new(line, line, 0, 4),
+                Some(depth),
+            ))
+        };
+        let mut nop = Instruction::new(
+            NOP,
+            Operand::Value(0),
+            SourceLocation::new(3, 3, 0, 4),
+            Some(0),
+        );
+        nop.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+        for case in [
+            "sealed",
+            "fallthrough",
+            "target",
+            "block",
+            "source",
+            "duplicate label",
+            "duplicate pair",
+            "duplicate setup",
+            "cross-role start",
+            "cross-role end",
+            "setup as range end",
+            "start as setup",
+            "moved nop",
+            "extra alias",
+            "terminator",
+            "mismatched location",
+        ] {
+            let mut prefix = vec![
+                Item::Label(entry),
+                make(SWAP, Operand::Value(2), 2, 2),
+                make(STORE_FAST, Operand::Value(0), 2, 1),
+                make(LOAD_CONST, Operand::Value(0), 2, 2),
+                make(BUILD_TUPLE, Operand::Value(2), 2, 1),
+                make(STORE_FAST, Operand::Value(20), 2, 0),
+                Item::Label(start),
+                Item::Instruction(nop),
+                Item::Label(end),
+                Item::Label(setup),
+                make(LOAD_FAST, Operand::Value(20), 4, 1),
+                make(TO_BOOL, Operand::Value(0), 4, 1),
+                make(POP_JUMP_IF_FALSE, Operand::Forward(exit), 4, 0),
+                make(NOT_TAKEN, Operand::Value(0), 4, 0),
+            ];
+            let mut provenance = ExceptionOwnerProvenance {
+                setups: vec![(setup, Some(nop.location))],
+                setup_nop_ranges: vec![(start, end)],
+                ..ExceptionOwnerProvenance::default()
+            };
+            let mut extra = None;
+            match case {
+                "sealed" => {}
+                "fallthrough" => {
+                    provenance.original_fallthrough_setups.insert(start);
+                }
+                "target" => extra = Some(make(JUMP_FORWARD, Operand::Forward(start), 5, 0)),
+                "block" => {
+                    provenance.block_boundaries.insert(setup);
+                }
+                "source" => {
+                    provenance.source_boundaries.insert(end);
+                }
+                "duplicate label" => extra = Some(Item::Label(start)),
+                "duplicate pair" => provenance.setup_nop_ranges.push((start, end)),
+                "duplicate setup" => provenance.setups.push((setup, Some(nop.location))),
+                "cross-role start" => provenance.setup_nop_ranges.push((alias, start)),
+                "cross-role end" => provenance.setup_nop_ranges.push((end, alias)),
+                "setup as range end" => provenance.setup_nop_ranges.push((alias, setup)),
+                "start as setup" => provenance.setups.push((start, Some(nop.location))),
+                "moved nop" => prefix.swap(6, 7),
+                "extra alias" => prefix.insert(9, Item::Label(alias)),
+                "terminator" => {
+                    prefix.insert(6, make(JUMP_FORWARD, Operand::Forward(alias), 2, 0));
+                }
+                "mismatched location" => {
+                    provenance.setups[0].1 = Some(SourceLocation::new(9, 9, 0, 4));
+                }
+                _ => unreachable!(),
+            }
+            let mut all = prefix.clone();
+            all.push(Item::Label(exit));
+            all.extend(extra);
+            assert_eq!(
+                provenance.uncompacted_prefix(&prefix, &all, &OnceCell::new(), 1, false),
+                case == "sealed",
+                "{case}"
             );
         }
     }
