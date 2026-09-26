@@ -786,7 +786,9 @@ impl Compiler<'_> {
                     && matches!(case.pattern, Pattern::MatchClass(_) | Pattern::MatchOr(_))
                     && case.guard.is_none()
                     && matches!(self.unit.scope, Scope::Function { .. })
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && (!terminal
+                        || self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == 0)
                     && !self.control.in_loop()
                     && self
                         .control

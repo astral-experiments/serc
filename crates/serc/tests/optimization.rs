@@ -557,6 +557,29 @@ fn nonterminal_elided_match_case_preserves_unlocated_exit() {
 }
 
 #[test]
+fn nonterminal_elided_match_in_suspended_function_matches_cpython() {
+    for source in [
+        "async def f(x):\n await work()\n match x:\n  case str():\n   assert x\n  case int():\n   work()\n  case _:\n   other()\n after()\n",
+        "async def f(x):\n match x:\n  case str() | bytes():\n   assert (z := x)\n  case int():\n   work()\n  case _:\n   other()\n await work()\n",
+        "def f(x):\n yield x\n match x:\n  case str() | bytes():\n   assert x\n  case int():\n   work()\n  case _:\n   other()\n after()\n",
+        "def f(x):\n match x:\n  case str(v) | bytes(v):\n   assert (z := x)\n  case int():\n   work()\n  case _:\n   other()\n yield x\n",
+        "async def f(x):\n yield x\n match x:\n  case str() | bytes():\n   assert x\n  case int():\n   work()\n  case _:\n   other()\n after()\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "sub/nonterminal_elided_match_suspended.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+}
+
+#[test]
 fn elided_inner_else_keeps_for_loop_backedge_location() {
     for source in [
         "def f(xs,a,b):\n for x in xs:\n  if a:\n   if b:\n    z = x\n   else:\n    assert b\n  else:\n   other(x)\n",
