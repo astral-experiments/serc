@@ -2205,11 +2205,10 @@ impl<'source> Compiler<'source> {
                     // its protected region when another pass follows them.
                     || (protected_direct_manager_pass_suite
                         && body[index + 1..].iter().any(|statement| matches!(statement, Stmt::Pass(_))))
-                    // A pass before an assertion keeps its own protected
-                    // line event, including when declarations intervene.
+                    // Preserve the authored Pass in its protected array until legacy NOP
+                    // compaction can compare it with the surviving successor.
                     || (legacy_protected_sync_manager_body
-                        && body.get(next_runtime_statement)
-                            .is_some_and(|statement| matches!(statement, Stmt::Assert(_))))
+                        && body.get(next_runtime_statement).is_some())
                     // Legacy exits start unlocated. Keep an authored trailing Pass
                     // after work or a join until CFG copying and line propagation,
                     // rather than replacing its donor with the preceding instruction.
