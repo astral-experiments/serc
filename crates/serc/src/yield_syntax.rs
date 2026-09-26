@@ -206,7 +206,7 @@ fn interpolation_error(
     )
 }
 
-/// Match the legacy invalid_expression disjunction/adjacent-expression rule before field fallback.
+/// Match the legacy `invalid_expression` disjunction/adjacent-expression rule before field fallback.
 fn adjacent_template_error(
     source: &str,
     tokens: &[Token],
