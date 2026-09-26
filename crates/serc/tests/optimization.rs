@@ -2067,6 +2067,112 @@ fn legacy_manager_declaration_only_matches_cpython() {
 }
 
 #[test]
+fn legacy_protected_manager_pass_before_assertion_matches_cpython() {
+    let versions = [PythonVersion::Py312, PythonVersion::Py313];
+    for source in [
+        r"def outer():
+    outer_marker = 0
+    def f(outer, inner, obj, predicate, cleanup, flag):
+        try:
+            with inner:
+                pass
+                assert predicate()
+        finally:
+            cleanup()
+        return
+    return f
+",
+        r"def outer():
+    outer_marker = 0
+    def f(outer, inner, obj, predicate, cleanup, flag):
+        try:
+            with inner as value:
+                pass
+                global spare
+                assert predicate()
+        finally:
+            cleanup()
+        return
+    return f
+",
+        r"def outer():
+    outer_marker = 0
+    def f(outer, inner, obj, predicate, cleanup, flag):
+        try:
+            with inner:
+                pass
+                pass
+                nonlocal outer_marker
+                assert True
+        finally:
+            cleanup()
+        return
+    return f
+",
+        r"def outer():
+    outer_marker = 0
+    def f(outer, inner, obj, predicate, cleanup, flag):
+        try:
+            with inner as obj.value:
+                pass
+                assert False
+        except Exception:
+            cleanup()
+        return
+    return f
+",
+        r"def outer():
+    outer_marker = 0
+    def f(outer, inner, obj, predicate, cleanup, flag):
+        try:
+            with outer:
+                with inner:
+                    assert predicate()
+                    pass
+                    assert predicate()
+        finally:
+            cleanup()
+        return
+    return f
+",
+        r"def outer():
+    outer_marker = 0
+    async def f(outer, inner, obj, predicate, cleanup, flag):
+        try:
+            async with outer:
+                with inner:
+                    pass
+                    assert predicate()
+        finally:
+            cleanup()
+        return
+    return f
+",
+        r"def outer():
+    outer_marker = 0
+    def f(outer, inner, obj, predicate, cleanup, flag):
+        try:
+            with inner as value: pass; assert predicate()
+        finally:
+            cleanup()
+        return
+    return f
+",
+        r"def outer():
+    outer_marker = 0
+    def f(outer, inner, obj, predicate, cleanup, flag):
+        with inner:
+            pass
+            assert predicate()
+        return
+    return f
+",
+    ] {
+        assert_matches_cpython_versions(source, "case.py", &LEVELS, &versions);
+    }
+}
+
+#[test]
 fn legacy_protected_manager_pass_before_declaration_matches_cpython() {
     let versions = [PythonVersion::Py312, PythonVersion::Py313];
     for source in [

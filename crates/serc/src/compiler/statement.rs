@@ -1679,7 +1679,7 @@ impl<'source> Compiler<'source> {
         let mut pending_sync_with_return_join_after_gap = false;
         let mut pending_sync_with_nonterminal_join = false;
         let mut seen_sync_with_return = false;
-        let direct_manager_pass_suite =
+        let direct_sync_manager_body =
             self.control
                 .withs
                 .active_with_exits
@@ -1687,20 +1687,42 @@ impl<'source> Compiler<'source> {
                 .is_some_and(|manager| {
                     !manager.is_async
                         && manager.terminal_statement_range == body.last().map(Ranged::range)
-                })
-                && body.iter().all(|statement| {
-                    matches!(
-                        statement,
-                        Stmt::Pass(_) | Stmt::Global(_) | Stmt::Nonlocal(_)
-                    )
                 });
-        let protected_direct_manager_pass_suite = direct_manager_pass_suite
+        let direct_manager_pass_suite = direct_sync_manager_body
+            && body.iter().all(|statement| {
+                matches!(
+                    statement,
+                    Stmt::Pass(_) | Stmt::Global(_) | Stmt::Nonlocal(_)
+                )
+            });
+        let protected_direct_sync_manager_body = direct_sync_manager_body
             && !self
                 .control
                 .exceptions
                 .active_exception_region_exclusions
                 .is_empty();
+        let protected_direct_manager_pass_suite =
+            direct_manager_pass_suite && protected_direct_sync_manager_body;
+        let legacy_protected_sync_manager_body = protected_direct_sync_manager_body
+            && self.context.python_version <= crate::PythonVersion::Py313;
+        let mut next_runtime_statement = 0;
         for (index, statement) in body.iter().enumerate() {
+            if legacy_protected_sync_manager_body
+                && matches!(statement, Stmt::Pass(_))
+                && next_runtime_statement <= index
+            {
+                // Advance this cursor only after passing its previous target; every
+                // suite statement is visited at most once across consecutive passes.
+                next_runtime_statement = body[index + 1..]
+                    .iter()
+                    .position(|statement| {
+                        !matches!(
+                            statement,
+                            Stmt::Pass(_) | Stmt::Global(_) | Stmt::Nonlocal(_)
+                        )
+                    })
+                    .map_or(body.len(), |offset| index + 1 + offset);
+            }
             if track_sync_with_return_joins
                 && let Some(previous) = index.checked_sub(1).and_then(|index| body.get(index))
             {
@@ -2136,6 +2158,11 @@ impl<'source> Compiler<'source> {
                     // its protected region when another pass follows them.
                     || (protected_direct_manager_pass_suite
                         && body[index + 1..].iter().any(|statement| matches!(statement, Stmt::Pass(_))))
+                    // A pass before an assertion keeps its own protected
+                    // line event, including when declarations intervene.
+                    || (legacy_protected_sync_manager_body
+                        && body.get(next_runtime_statement)
+                            .is_some_and(|statement| matches!(statement, Stmt::Assert(_))))
                     // Legacy exits start unlocated. Keep an authored trailing Pass
                     // after work or a join until CFG copying and line propagation,
                     // rather than replacing its donor with the preceding instruction.
