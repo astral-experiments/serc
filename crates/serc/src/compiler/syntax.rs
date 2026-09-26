@@ -1933,6 +1933,9 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
                     format!("future feature {feature} is not defined")
                 }
             }
+            Kind::LateFutureImport => {
+                "from __future__ imports must occur at the beginning of the file".to_owned()
+            }
             Kind::WriteToDebug(WriteToDebugKind::Store) => "cannot assign to __debug__".to_owned(),
             Kind::WriteToDebug(WriteToDebugKind::Delete(_)) => "cannot delete __debug__".to_owned(),
             Kind::BreakOutsideLoop => "'break' outside loop".to_owned(),
@@ -2085,6 +2088,38 @@ mod tests {
                     "{python_version}: {source:?}"
                 );
                 assert_eq!(&source[range], name, "{python_version}: {source:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn late_future_import_reports_native_message() {
+        for (source, span) in [
+            (
+                "x = 1\nfrom __future__ import annotations\n",
+                "from __future__ import annotations",
+            ),
+            (
+                "x = 1\nfrom __future__ import generator_stop, annotations\n",
+                "from __future__ import generator_stop, annotations",
+            ),
+            (
+                "if False:\n    from __future__ import annotations\n",
+                "from __future__ import annotations",
+            ),
+        ] {
+            let parsed = parse_module(source).unwrap();
+            for python_version in TARGETS {
+                let error = validate(source, &parsed.syntax().body, python_version).unwrap_err();
+                let CompileError::InvalidSyntax { message, range } = error else {
+                    panic!("unexpected {python_version} error for {source:?}: {error}");
+                };
+                assert_eq!(
+                    message,
+                    "from __future__ imports must occur at the beginning of the file",
+                    "{python_version}: {source:?}"
+                );
+                assert_eq!(&source[range], span, "{python_version}: {source:?}");
             }
         }
     }
