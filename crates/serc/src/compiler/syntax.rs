@@ -1417,8 +1417,10 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                 found
             };
             if let Some(error) = deferred {
-                if matches!(error.kind, SemanticSyntaxErrorKind::ReboundComprehensionVariable)
-                    && let Expr::Name(name) = named.target.as_ref()
+                if matches!(
+                    error.kind,
+                    SemanticSyntaxErrorKind::ReboundComprehensionVariable
+                ) && let Expr::Name(name) = named.target.as_ref()
                 {
                     *self.error.borrow_mut() = Some(CompileError::invalid_syntax(
                         format!(
@@ -1530,10 +1532,8 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
             ) {
                 let mut depth = crate::stack::ExpressionDepth::default();
                 depth.visit_expr(expression);
-                let previous = std::mem::replace(
-                    &mut self.collecting_comprehension_errors,
-                    deferred_frame,
-                );
+                let previous =
+                    std::mem::replace(&mut self.collecting_comprehension_errors, deferred_frame);
                 self.with_checker(|checker, context| {
                     crate::stack::with_depth(depth.maximum(), || {
                         checker.visit_expr(expression, context);
@@ -1541,10 +1541,8 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                 });
                 self.collecting_comprehension_errors = previous;
             } else {
-                let previous = std::mem::replace(
-                    &mut self.checking_comprehension_yield,
-                    comprehension_yield,
-                );
+                let previous =
+                    std::mem::replace(&mut self.checking_comprehension_yield, comprehension_yield);
                 self.with_checker(|checker, context| checker.visit_expr(expression, context));
                 self.checking_comprehension_yield = previous;
             }

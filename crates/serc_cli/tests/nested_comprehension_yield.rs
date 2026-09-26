@@ -1,9 +1,15 @@
 mod common;
 
-use serc::{CompileError, CompileOptions, PythonVersion, compile_bytes_with_options, compile_with_options};
+use serc::{
+    CompileError, CompileOptions, PythonVersion, compile_bytes_with_options, compile_with_options,
+};
 
 fn byte_offset(source: &str, line: usize, column: usize) -> usize {
-    let prefix: usize = source.split_inclusive('\n').take(line - 1).map(str::len).sum();
+    let prefix: usize = source
+        .split_inclusive('\n')
+        .take(line - 1)
+        .map(str::len)
+        .sum();
     prefix + column - 1
 }
 
@@ -67,10 +73,19 @@ for source in (sys.argv[1], sys.argv[1].encode()):
 print(expected[0])
 print(*expected[1:])
 ";
-    for version in [PythonVersion::Py312, PythonVersion::Py313, PythonVersion::Py314, PythonVersion::Py315] {
-        let options = CompileOptions { python_version: version, ..CompileOptions::default() };
-        let modern_debug_after_star = matches!(version, PythonVersion::Py314 | PythonVersion::Py315)
-            .then_some("*first\n[(yield (__debug__ := 1)) for x in xs]\n");
+    for version in [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
+    ] {
+        let options = CompileOptions {
+            python_version: version,
+            ..CompileOptions::default()
+        };
+        let modern_debug_after_star =
+            matches!(version, PythonVersion::Py314 | PythonVersion::Py315)
+                .then_some("*first\n[(yield (__debug__ := 1)) for x in xs]\n");
         for source in sources.into_iter().chain(modern_debug_after_star) {
             let mut python = match version {
                 PythonVersion::Py312 => common::python_312_command(),
@@ -83,16 +98,35 @@ print(*expected[1:])
             let output = String::from_utf8(output.stdout).unwrap();
             let mut lines = output.lines();
             let message = lines.next().unwrap();
-            let positions: Vec<usize> = lines.next().unwrap().split_whitespace().map(|value| value.parse().unwrap()).collect();
-            let expected = (byte_offset(source, positions[0], positions[1]), byte_offset(source, positions[2], positions[3]));
-            for result in [compile_with_options(source, "case.py", &options), compile_bytes_with_options(source.as_bytes(), "case.py", &options)] {
+            let positions: Vec<usize> = lines
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .map(|value| value.parse().unwrap())
+                .collect();
+            let expected = (
+                byte_offset(source, positions[0], positions[1]),
+                byte_offset(source, positions[2], positions[3]),
+            );
+            for result in [
+                compile_with_options(source, "case.py", &options),
+                compile_bytes_with_options(source.as_bytes(), "case.py", &options),
+            ] {
                 let error = result.unwrap_err();
-                let CompileError::InvalidSyntax { message: actual_message, .. } = &error else {
+                let CompileError::InvalidSyntax {
+                    message: actual_message,
+                    ..
+                } = &error
+                else {
                     panic!("{version}: {source:?}: expected a syntax restriction, got {error}");
                 };
                 assert_eq!(actual_message, message, "{version}: {source:?}");
                 let range = error.range().unwrap();
-                assert_eq!((range.start().to_usize(), range.end().to_usize()), expected, "{version}: {source:?}: {error}");
+                assert_eq!(
+                    (range.start().to_usize(), range.end().to_usize()),
+                    expected,
+                    "{version}: {source:?}: {error}"
+                );
             }
         }
     }
