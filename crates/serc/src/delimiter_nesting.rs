@@ -119,7 +119,7 @@ fn earlier_indentation_error(source: &str, options: &ParseOptions, range: TextRa
     })
 }
 
-fn invalid_number_suffix(source: &str, range: TextRange) -> bool {
+pub(crate) fn invalid_number_suffix(source: &str, range: TextRange) -> bool {
     let literal = &source[range.start().to_usize()..range.end().to_usize()];
     let suffix = &source[range.end().to_usize()..];
     let Some(first) = suffix.bytes().next() else {
