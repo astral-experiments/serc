@@ -1559,7 +1559,7 @@ pub(super) fn python_integer_value_key(value: &Constant) -> Option<(bool, Vec<u1
     }
     let real = match real {
         NumericReal::Float(value) => float_integer_numeric_real(value)?,
-        integer => integer,
+        integer @ NumericReal::Integer { .. } => integer,
     };
     match real {
         NumericReal::Integer { negative, digits } => Some((negative, digits)),

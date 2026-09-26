@@ -74,234 +74,6 @@ pub(super) fn has_debug_pattern(statement: &ast::StmtMatch) -> bool {
     finder.0
 }
 
-#[cfg(test)]
-mod tests {
-    use ruff_python_parser::parse_module;
-    use ruff_text_size::{TextRange, TextSize};
-
-    use crate::{CompileError, PythonVersion};
-
-    use super::super::validate;
-
-    #[test]
-    fn reserved_names_follow_native_pattern_and_symbol_order() {
-        let debug = "cannot assign to __debug__";
-        let duplicate = "attribute name repeated in class pattern: a";
-        let cases = [
-            (
-                "match value:\n case C(__debug__, __debug__=other): pass\n",
-                [
-                    (debug, "other", false),
-                    (debug, "other", false),
-                    (debug, "__debug__", false),
-                    (debug, "__debug__", false),
-                ],
-            ),
-            (
-                "match value:\n case C(__debug__=v, a=1, a=2): pass\n",
-                [(debug, "v", true); 4],
-            ),
-            (
-                "match value:\n case C(a=1, a=2, __debug__=v): pass\n",
-                [
-                    (duplicate, "2", false),
-                    (duplicate, "2", false),
-                    (debug, "v", true),
-                    (debug, "v", true),
-                ],
-            ),
-            (
-                "match value:\n case C(D(__debug__=inner), __debug__=outer): pass\n",
-                [
-                    (debug, "outer", false),
-                    (debug, "outer", false),
-                    (debug, "inner", false),
-                    (debug, "inner", false),
-                ],
-            ),
-            (
-                "match value:\n case [C(__debug__=v), *a, *b]: pass\n",
-                [
-                    (
-                        "multiple starred names in sequence pattern",
-                        "[C(__debug__=v), *a, *b]",
-                        false,
-                    ),
-                    (
-                        "multiple starred names in sequence pattern",
-                        "[C(__debug__=v), *a, *b]",
-                        false,
-                    ),
-                    (debug, "v", true),
-                    (debug, "v", true),
-                ],
-            ),
-            (
-                "match value:\n case C(__debug__=v) if f(x=1, x=2): pass\n",
-                [(debug, "v", true); 4],
-            ),
-            (
-                "match value:\n case 1: break\n case C(__debug__=v): pass\n",
-                [
-                    ("'break' outside loop", "break", false),
-                    ("'break' outside loop", "break", false),
-                    (debug, "v", true),
-                    (debug, "v", true),
-                ],
-            ),
-            (
-                "match value:\n case [*__debug__]: pass\n",
-                [(debug, "*__debug__", false); 4],
-            ),
-            (
-                "match value:\n case {**__debug__}: pass\n",
-                [(debug, "{**__debug__}", false); 4],
-            ),
-            (
-                "match value:\n case C() as __debug__: pass\n",
-                [(debug, "C() as __debug__", false); 4],
-            ),
-            (
-                "match value:\n case C(__ｄｅｂｕｇ__=x): pass\n",
-                [(debug, "x", true); 4],
-            ),
-            (
-                "match value:\n case C(__debug__=x): pass\nfrom __future__ import annotations\n",
-                [(debug, "x", true); 4],
-            ),
-            (
-                "x=1\nglobal x\nmatch value:\n case C(__debug__=z): pass\n",
-                [(
-                    "name 'x' is assigned to before global declaration",
-                    "global x",
-                    false,
-                ); 4],
-            ),
-            (
-                "match value:\n case C(__debug__=z): pass\nx=1\nglobal x\n",
-                [
-                    (
-                        "name 'x' is assigned to before global declaration",
-                        "global x",
-                        false,
-                    ),
-                    (
-                        "name 'x' is assigned to before global declaration",
-                        "global x",
-                        false,
-                    ),
-                    (debug, "z", false),
-                    (debug, "z", false),
-                ],
-            ),
-            (
-                "def f():\n nonlocal x\nmatch value:\n case C(__debug__=z): pass\n",
-                [
-                    ("no binding for nonlocal 'x' found", "nonlocal x", false),
-                    ("no binding for nonlocal 'x' found", "nonlocal x", false),
-                    (debug, "z", false),
-                    (debug, "z", false),
-                ],
-            ),
-            (
-                "match value:\n case [x, (C(x) | D(x)), E(__debug__=y)]: pass\n",
-                [
-                    (
-                        "multiple assignments to name 'x' in pattern",
-                        "C(x) | D(x)",
-                        false,
-                    ),
-                    (
-                        "multiple assignments to name 'x' in pattern",
-                        "C(x) | D(x)",
-                        false,
-                    ),
-                    (debug, "y", true),
-                    (debug, "y", true),
-                ],
-            ),
-            (
-                "match value:\n case [C(x) | D(y), E(__debug__=v)]: pass\n",
-                [
-                    (
-                        "alternative patterns bind different names",
-                        "C(x) | D(y)",
-                        false,
-                    ),
-                    (
-                        "alternative patterns bind different names",
-                        "C(x) | D(y)",
-                        false,
-                    ),
-                    (debug, "v", true),
-                    (debug, "v", true),
-                ],
-            ),
-        ];
-        let targets = [
-            PythonVersion::Py312,
-            PythonVersion::Py313,
-            PythonVersion::Py314,
-            PythonVersion::Py315,
-        ];
-        for (source, expected) in cases {
-            let parsed = parse_module(source).unwrap();
-            for (version, (message, fragment, last)) in targets.into_iter().zip(expected) {
-                let position = if last {
-                    source.rfind(fragment)
-                } else {
-                    source.find(fragment)
-                }
-                .unwrap();
-                let range = TextRange::new(
-                    TextSize::try_from(position).unwrap(),
-                    TextSize::try_from(position + fragment.len()).unwrap(),
-                );
-                let actual = validate(source, &parsed.syntax().body, version).unwrap_err();
-                match actual {
-                    CompileError::InvalidPattern {
-                        message: actual,
-                        range: actual_range,
-                    }
-                    | CompileError::InvalidSyntax {
-                        message: actual,
-                        range: actual_range,
-                    } => {
-                        assert_eq!(
-                            (actual.as_str(), actual_range),
-                            (message, range),
-                            "{version}, {source}"
-                        );
-                    }
-                    other => panic!("unexpected {version} diagnostic for {source}: {other:?}"),
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn large_integer_and_float_keys_precede_legacy_debug_writes() {
-        let source = "match value:\n case {18446744073709551616: _, 18446744073709551616.0: C(__debug__=x)}: pass\n";
-        let parsed = parse_module(source).unwrap();
-        for version in [PythonVersion::Py312, PythonVersion::Py313] {
-            let error = validate(source, &parsed.syntax().body, version).unwrap_err();
-            let CompileError::InvalidPattern { message, range } = error else {
-                panic!("expected a duplicate key for {version}: {error:?}");
-            };
-            assert!(message.starts_with("mapping pattern checks duplicate key"));
-            let start = source.find('{').unwrap();
-            let end = source.find('}').unwrap() + 1;
-            assert_eq!(
-                range,
-                TextRange::new(
-                    TextSize::try_from(start).unwrap(),
-                    TextSize::try_from(end).unwrap()
-                )
-            );
-        }
-    }
-}
-
 pub(super) fn body_has_debug_pattern(body: &[Stmt]) -> bool {
     struct Finder(bool);
     impl<'ast> Visitor<'ast> for Finder {
@@ -686,6 +458,234 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ruff_python_parser::parse_module;
+    use ruff_text_size::{TextRange, TextSize};
+
+    use crate::{CompileError, PythonVersion};
+
+    use super::super::validate;
+
+    #[test]
+    fn reserved_names_follow_native_pattern_and_symbol_order() {
+        let debug = "cannot assign to __debug__";
+        let duplicate = "attribute name repeated in class pattern: a";
+        let cases = [
+            (
+                "match value:\n case C(__debug__, __debug__=other): pass\n",
+                [
+                    (debug, "other", false),
+                    (debug, "other", false),
+                    (debug, "__debug__", false),
+                    (debug, "__debug__", false),
+                ],
+            ),
+            (
+                "match value:\n case C(__debug__=v, a=1, a=2): pass\n",
+                [(debug, "v", true); 4],
+            ),
+            (
+                "match value:\n case C(a=1, a=2, __debug__=v): pass\n",
+                [
+                    (duplicate, "2", false),
+                    (duplicate, "2", false),
+                    (debug, "v", true),
+                    (debug, "v", true),
+                ],
+            ),
+            (
+                "match value:\n case C(D(__debug__=inner), __debug__=outer): pass\n",
+                [
+                    (debug, "outer", false),
+                    (debug, "outer", false),
+                    (debug, "inner", false),
+                    (debug, "inner", false),
+                ],
+            ),
+            (
+                "match value:\n case [C(__debug__=v), *a, *b]: pass\n",
+                [
+                    (
+                        "multiple starred names in sequence pattern",
+                        "[C(__debug__=v), *a, *b]",
+                        false,
+                    ),
+                    (
+                        "multiple starred names in sequence pattern",
+                        "[C(__debug__=v), *a, *b]",
+                        false,
+                    ),
+                    (debug, "v", true),
+                    (debug, "v", true),
+                ],
+            ),
+            (
+                "match value:\n case C(__debug__=v) if f(x=1, x=2): pass\n",
+                [(debug, "v", true); 4],
+            ),
+            (
+                "match value:\n case 1: break\n case C(__debug__=v): pass\n",
+                [
+                    ("'break' outside loop", "break", false),
+                    ("'break' outside loop", "break", false),
+                    (debug, "v", true),
+                    (debug, "v", true),
+                ],
+            ),
+            (
+                "match value:\n case [*__debug__]: pass\n",
+                [(debug, "*__debug__", false); 4],
+            ),
+            (
+                "match value:\n case {**__debug__}: pass\n",
+                [(debug, "{**__debug__}", false); 4],
+            ),
+            (
+                "match value:\n case C() as __debug__: pass\n",
+                [(debug, "C() as __debug__", false); 4],
+            ),
+            (
+                "match value:\n case C(__ｄｅｂｕｇ__=x): pass\n",
+                [(debug, "x", true); 4],
+            ),
+            (
+                "match value:\n case C(__debug__=x): pass\nfrom __future__ import annotations\n",
+                [(debug, "x", true); 4],
+            ),
+            (
+                "x=1\nglobal x\nmatch value:\n case C(__debug__=z): pass\n",
+                [(
+                    "name 'x' is assigned to before global declaration",
+                    "global x",
+                    false,
+                ); 4],
+            ),
+            (
+                "match value:\n case C(__debug__=z): pass\nx=1\nglobal x\n",
+                [
+                    (
+                        "name 'x' is assigned to before global declaration",
+                        "global x",
+                        false,
+                    ),
+                    (
+                        "name 'x' is assigned to before global declaration",
+                        "global x",
+                        false,
+                    ),
+                    (debug, "z", false),
+                    (debug, "z", false),
+                ],
+            ),
+            (
+                "def f():\n nonlocal x\nmatch value:\n case C(__debug__=z): pass\n",
+                [
+                    ("no binding for nonlocal 'x' found", "nonlocal x", false),
+                    ("no binding for nonlocal 'x' found", "nonlocal x", false),
+                    (debug, "z", false),
+                    (debug, "z", false),
+                ],
+            ),
+            (
+                "match value:\n case [x, (C(x) | D(x)), E(__debug__=y)]: pass\n",
+                [
+                    (
+                        "multiple assignments to name 'x' in pattern",
+                        "C(x) | D(x)",
+                        false,
+                    ),
+                    (
+                        "multiple assignments to name 'x' in pattern",
+                        "C(x) | D(x)",
+                        false,
+                    ),
+                    (debug, "y", true),
+                    (debug, "y", true),
+                ],
+            ),
+            (
+                "match value:\n case [C(x) | D(y), E(__debug__=v)]: pass\n",
+                [
+                    (
+                        "alternative patterns bind different names",
+                        "C(x) | D(y)",
+                        false,
+                    ),
+                    (
+                        "alternative patterns bind different names",
+                        "C(x) | D(y)",
+                        false,
+                    ),
+                    (debug, "v", true),
+                    (debug, "v", true),
+                ],
+            ),
+        ];
+        let targets = [
+            PythonVersion::Py312,
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ];
+        for (source, expected) in cases {
+            let parsed = parse_module(source).unwrap();
+            for (version, (message, fragment, last)) in targets.into_iter().zip(expected) {
+                let position = if last {
+                    source.rfind(fragment)
+                } else {
+                    source.find(fragment)
+                }
+                .unwrap();
+                let range = TextRange::new(
+                    TextSize::try_from(position).unwrap(),
+                    TextSize::try_from(position + fragment.len()).unwrap(),
+                );
+                let actual = validate(source, &parsed.syntax().body, version).unwrap_err();
+                match actual {
+                    CompileError::InvalidPattern {
+                        message: actual,
+                        range: actual_range,
+                    }
+                    | CompileError::InvalidSyntax {
+                        message: actual,
+                        range: actual_range,
+                    } => {
+                        assert_eq!(
+                            (actual.as_str(), actual_range),
+                            (message, range),
+                            "{version}, {source}"
+                        );
+                    }
+                    other => panic!("unexpected {version} diagnostic for {source}: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn large_integer_and_float_keys_precede_legacy_debug_writes() {
+        let source = "match value:\n case {18446744073709551616: _, 18446744073709551616.0: C(__debug__=x)}: pass\n";
+        let parsed = parse_module(source).unwrap();
+        for version in [PythonVersion::Py312, PythonVersion::Py313] {
+            let error = validate(source, &parsed.syntax().body, version).unwrap_err();
+            let CompileError::InvalidPattern { message, range } = error else {
+                panic!("expected a duplicate key for {version}: {error:?}");
+            };
+            assert!(message.starts_with("mapping pattern checks duplicate key"));
+            let start = source.find('{').unwrap();
+            let end = source.find('}').unwrap() + 1;
+            assert_eq!(
+                range,
+                TextRange::new(
+                    TextSize::try_from(start).unwrap(),
+                    TextSize::try_from(end).unwrap()
+                )
+            );
         }
     }
 }
