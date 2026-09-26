@@ -366,6 +366,8 @@ pub(super) struct ComprehensionState {
 #[derive(Debug, Default)]
 pub(super) struct WithState {
     active_with_exits: Vec<WithExitContext>,
+    // The last statement of a manager body prefix with a separately compiled tail.
+    split_body_prefix_end: Option<TextRange>,
     // Only direct None-condition siblings in the innermost synchronous-with body can reuse a
     // preceding conditional owner. Nested suites and earlier returns use a different layout.
     shifted_sync_with_none_owner_statements: Vec<TextRange>,
@@ -1678,6 +1680,18 @@ impl<'source> Compiler<'source> {
         let mut pending_sync_with_return_join_after_gap = false;
         let mut pending_sync_with_nonterminal_join = false;
         let mut seen_sync_with_return = false;
+        let split_manager_prefix = body.last().is_some_and(|statement| {
+            self.control.withs.split_body_prefix_end == Some(statement.range())
+        });
+        let legacy_split_sync_manager_prefix = self.context.python_version
+            <= crate::PythonVersion::Py313
+            && split_manager_prefix
+            && self
+                .control
+                .withs
+                .active_with_exits
+                .last()
+                .is_some_and(|manager| !manager.is_async);
         let direct_sync_manager_body =
             self.control
                 .withs
@@ -1702,8 +1716,14 @@ impl<'source> Compiler<'source> {
                 .is_empty();
         let protected_direct_manager_pass_suite =
             direct_manager_pass_suite && protected_direct_sync_manager_body;
-        let legacy_protected_sync_manager_body = protected_direct_sync_manager_body
-            && self.context.python_version <= crate::PythonVersion::Py313;
+        let legacy_protected_sync_manager_body = self.context.python_version
+            <= crate::PythonVersion::Py313
+            && !self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && (direct_sync_manager_body || legacy_split_sync_manager_prefix);
         let mut next_runtime_statement = 0;
         for (index, statement) in body.iter().enumerate() {
             if legacy_protected_sync_manager_body
@@ -2210,7 +2230,7 @@ impl<'source> Compiler<'source> {
                     // Preserve the authored Pass in its protected array until legacy NOP
                     // compaction can compare it with the surviving successor.
                     || (legacy_protected_sync_manager_body
-                        && body.get(next_runtime_statement).is_some())
+                        && (body.get(next_runtime_statement).is_some() || split_manager_prefix))
                     // Legacy exits start unlocated. Keep an authored trailing Pass
                     // after work or a join until CFG copying and line propagation,
                     // rather than replacing its donor with the preceding instruction.
@@ -2227,7 +2247,9 @@ impl<'source> Compiler<'source> {
                             )))
                     || ((!is_final || inherited_statement_has_following)
                         && self.control.withs.active_with_exits.is_empty()))
-                && (self.control.withs.active_with_region_exclusions.is_empty() || body.len() > 1)
+                && (self.control.withs.active_with_region_exclusions.is_empty()
+                    || body.len() > 1
+                    || legacy_split_sync_manager_prefix)
             {
                 self.assembler
                     .set_location(self.source_location(statement.range));
@@ -31424,9 +31446,15 @@ impl<'source> Compiler<'source> {
                 // The extracted try remains the prefix's continuation inside this manager.
                 // Keep that original successor visible when compiling a local suite tail.
                 self.with_control_override(
-                    |control| &mut control.loops.split_loop_tail_prefix_end,
+                    |control| &mut control.withs.split_body_prefix_end,
                     leading.last().map(Ranged::range),
-                    |compiler| compiler.compile_suite(leading),
+                    |compiler| {
+                        compiler.with_control_override(
+                            |control| &mut control.loops.split_loop_tail_prefix_end,
+                            leading.last().map(Ranged::range),
+                            |compiler| compiler.compile_suite(leading),
+                        )
+                    },
                 )?;
                 // Exceptional finally suites stay cold together. Their normal-finally
                 // jump can remain across the handler blocks, so it must keep its owner.

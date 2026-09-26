@@ -2935,6 +2935,81 @@ fn legacy_protected_manager_pass_before_work_matches_cpython() {
 }
 
 #[test]
+fn legacy_protected_manager_pass_before_split_try_matches_cpython() {
+    let versions = [PythonVersion::Py312, PythonVersion::Py313];
+    for source in [
+        r"def f(manager):
+    try:
+        with manager:
+            pass
+            try:
+                work()
+            finally:
+                cleanup()
+    except Exception:
+        recover()
+",
+        r"def f(manager, other):
+    try:
+        with manager, other:
+            pass; pass
+            global marker
+            try:
+                work()
+            except Exception:
+                recover()
+            finally:
+                cleanup()
+    finally:
+        finish()
+",
+        r"def f(manager):
+    try:
+        with manager:
+            pass
+            try:
+                yield work()
+            finally:
+                cleanup()
+    except Exception:
+        recover()
+",
+        r"def f(manager):
+    with manager:
+        pass
+        try:
+            work()
+        finally:
+            cleanup()
+",
+        r"def f(manager):
+    try:
+        return work()
+    finally:
+        with manager:
+            pass
+            try:
+                work()
+            finally:
+                cleanup()
+",
+        r"def f(manager):
+    try:
+        with manager:
+            pass
+            try:
+                return work()
+            finally:
+                cleanup()
+    except Exception:
+        recover()
+",
+    ] {
+        assert_matches_cpython_versions(source, "manager_split_pass.py", &LEVELS, &versions);
+    }
+}
+
+#[test]
 fn legacy_protected_manager_pass_before_declaration_matches_cpython() {
     let versions = [PythonVersion::Py312, PythonVersion::Py313];
     for source in [
