@@ -148,6 +148,115 @@ monitor.free_tool_id(5)
 }
 
 #[test]
+fn legacy_normal_finalizer_pass_keeps_outer_handler() {
+    const TRACE: &str = r"
+import dis, marshal, sys
+
+events = []
+def work():
+    events.append('work')
+def after():
+    events.append('after')
+def recover():
+    events.append('recover')
+scope = {'work': work, 'after': after, 'recover': recover}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+f = scope['f']
+targets = [instruction.offset for instruction in dis.get_instructions(f)
+           if instruction.opname == 'NOP' and instruction.positions.lineno == 10]
+if not targets:
+    raise RuntimeError('missing pass marker')
+target = min(targets)
+generator, has_sibling = (argument == '1' for argument in sys.argv[1:])
+monitor = sys.monitoring
+monitor.use_tool_id(5, 'legacy-normal-finalizer')
+for fault in (ValueError, StopIteration):
+    for flag in (False, True):
+        events.clear()
+        hits = []
+        def inject(code, offset):
+            if offset == target:
+                hits.append(offset)
+                raise fault('injected')
+        monitor.register_callback(5, monitor.events.INSTRUCTION, inject)
+        monitor.set_local_events(5, f.__code__, monitor.events.INSTRUCTION)
+        try:
+            value = f(None, flag)
+            if generator:
+                value = next(value)
+            result = ('value', value)
+        except BaseException as error:
+            result = ('error', type(error))
+        finally:
+            monitor.set_local_events(5, f.__code__, 0)
+            monitor.register_callback(5, monitor.events.INSTRUCTION, None)
+        expected = ('value', 1) if has_sibling else (
+            'error', RuntimeError if generator and fault is StopIteration else fault)
+        expected_events = ['work', 'recover'] if has_sibling else ['work']
+        if hits != [target] or events != expected_events or result != expected:
+            raise RuntimeError((hits, events, result, expected))
+monitor.free_tool_id(5)
+";
+    for generator in [false, true] {
+        for has_sibling in [false, true] {
+            let sibling = if has_sibling { "        after()\n" } else { "" };
+            let exit = if generator { "yield 1" } else { "return 1" };
+            let source = format!(
+                "def f(manager,flag):\n    try:\n        try:\n            work()\n        finally:\n            try:\n                if flag:\n                    pass\n            finally:\n                pass\n{sibling}    except Exception:\n        recover()\n    {exit}\n"
+            );
+            for optimization_level in LEVELS {
+                let native = oracle(
+                    source.as_bytes(),
+                    "legacy_normal_finalizer.py",
+                    PythonVersion::Py312,
+                    optimization_level,
+                );
+                assert!(
+                    native.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&native.stderr)
+                );
+                let actual = compile_with_options(
+                    &source,
+                    "legacy_normal_finalizer.py",
+                    &CompileOptions {
+                        python_version: PythonVersion::Py312,
+                        optimization_level,
+                        ..CompileOptions::default()
+                    },
+                )
+                .unwrap()
+                .marshal();
+                assert_eq!(
+                    actual, native.stdout,
+                    "{optimization_level:?}, {generator}, {has_sibling}"
+                );
+                for code in [&native.stdout, &actual] {
+                    let mut child = Command::new(ORACLES[0].get().unwrap())
+                        .args(["-I", "-S", "-B", "-c", TRACE])
+                        .args([
+                            if generator { "1" } else { "0" },
+                            if has_sibling { "1" } else { "0" },
+                        ])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    child.stdin.take().unwrap().write_all(code).unwrap();
+                    let result = child.wait_with_output().unwrap();
+                    assert!(
+                        result.status.success(),
+                        "{optimization_level:?}, {generator}, {has_sibling}: {}",
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn terminal_try_pass_preserves_implicit_return_location() {
     for source in [
         "def f(x):\n    try:\n        x = x + 1\n        pass\n    except ValueError:\n        recover()\n",

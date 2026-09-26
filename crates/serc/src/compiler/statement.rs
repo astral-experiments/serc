@@ -500,6 +500,8 @@ pub(super) struct FinallyState<'ast> {
     // CPython's normalized `NOT_TAKEN` can reuse a normal-finally CFG slot that still owns the
     // coroutine stop-iteration handler.
     pub(super) active_normal_finally_bodies: usize,
+    // Direct nested pass finalizer in a protected normal finalizer copy.
+    legacy_normal_finally_nested_pass: Option<TextRange>,
     pub(super) active_finally_end_blocks: usize,
     // Exception collector owning each active exceptional-finally body, outermost first.
     finally_end_region_indices: Vec<usize>,
@@ -28753,10 +28755,24 @@ impl<'source> Compiler<'source> {
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_copied_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0;
+        let pass_exit_legacy_normal_finally_owner = self.context.python_version
+            == crate::PythonVersion::Py312
+            && pass_finally_location.is_some()
+            && self.control.finally.legacy_normal_finally_nested_pass == Some(statement.range)
+            && self.control.finally.active_normal_finally_bodies == 1
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .len()
+                == 1;
         let pass_exit_exception_depth = pass_exit_enclosing_finally_depth
             .or(pass_exit_generator_owner.then_some(0))
             .or(pass_exit_try_body_owner.then_some(1))
-            .or(pass_exit_legacy_finally_owner.then_some(1));
+            .or(pass_exit_legacy_finally_owner.then_some(1))
+            .or(pass_exit_legacy_normal_finally_owner.then_some(1));
         let overriding_return = matches!(statement.finalbody.last(), Some(Stmt::Return(_)));
         if overriding_return
             && self.control.withs.active_with_region_exclusions.is_empty()
@@ -29568,9 +29584,44 @@ impl<'source> Compiler<'source> {
                     |control| &mut control.withs.include_simple_normal_finally_not_taken_from_with,
                     include_simple_normal_finally_not_taken_from_with,
                     |compiler| {
-                        compiler.with_control_counter(
-                            |control| &mut control.finally.active_normal_finally_bodies,
-                            |compiler| compiler.compile_suite_inner(&statement.finalbody, terminal),
+                        let legacy_nested_pass = if compiler.context.python_version
+                            == crate::PythonVersion::Py312
+                            && matches!(compiler.unit.scope, Scope::Function { .. })
+                            && compiler.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                            && !statement.is_star
+                            && statement.handlers.is_empty()
+                            && statement.orelse.is_empty()
+                            && compiler.control.statements.context.has_following
+                            && compiler.control.exceptions.direct_try_body_statements.contains(&statement.range)
+                            && compiler.control.exceptions.active_try_body_tail != Some(statement.range)
+                            && compiler.control.exceptions.active_exception_region_exclusions.len() == 1
+                            && compiler.control.exceptions.active_exception_handlers.is_empty()
+                            && compiler.control.exceptions.active_exception_group_handlers == 0
+                            && compiler.control.withs.active_with_exits.is_empty()
+                            && compiler.control.withs.active_with_region_exclusions.is_empty()
+                            && compiler.control.loops.contexts.is_empty()
+                            && compiler.control.finally.active_finally_try_bodies == 0
+                            && compiler.control.finally.active_normal_finally_bodies == 0
+                            && compiler.control.finally.active_copied_finally_bodies == 0
+                            && compiler.control.finally.active_finally_end_blocks == 0
+                        {
+                            match statement.finalbody.as_slice() {
+                                [Stmt::Try(nested)] if !nested.is_star
+                                    && nested.handlers.is_empty()
+                                    && nested.orelse.is_empty()
+                                    && matches!(nested.finalbody.as_slice(), [Stmt::Pass(_)]) => Some(nested.range),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        compiler.with_control_override(
+                            |control| &mut control.finally.legacy_normal_finally_nested_pass,
+                            legacy_nested_pass,
+                            |compiler| compiler.with_control_counter(
+                                |control| &mut control.finally.active_normal_finally_bodies,
+                                |compiler| compiler.compile_suite_inner(&statement.finalbody, terminal),
+                            ),
                         )
                     },
                 )?;
@@ -30671,6 +30722,7 @@ impl<'source> Compiler<'source> {
                     if self.control.generators.generator_region_start.is_some()
                         && !pass_exit_generator_owner
                         && !pass_exit_try_body_owner
+                        && !pass_exit_legacy_normal_finally_owner
                     {
                         self.control
                             .generators
