@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::builder::Styles;
 use clap::builder::styling::{AnsiColor, Effects};
-use clap::{Parser, Subcommand, ValueHint};
+use clap::{Parser, Subcommand, ValueEnum, ValueHint};
 use rayon::prelude::*;
 use serc::{
     CompileError, CompileOptions, NativeBuildProfile, PythonVersion,
@@ -40,8 +40,18 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Compile Python files to timestamp-invalidated .pyc files.
+    /// Compile Python files to .pyc files.
     Compile(CompileCommand),
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum InvalidationMode {
+    /// Validate against source modification time and size.
+    Timestamp,
+    /// Validate against a hash of the source contents.
+    CheckedHash,
+    /// Trust an external system to keep the cache current.
+    UncheckedHash,
 }
 
 #[derive(Debug, clap::Args)]
@@ -57,6 +67,10 @@ struct CompileCommand {
     /// Floating-point instruction ordering for a named CPython native build.
     #[arg(long, default_value_t = NativeBuildProfile::default())]
     native_build_profile: NativeBuildProfile,
+
+    /// How Python validates cached bytecode against its source.
+    #[arg(long, value_enum, default_value = "timestamp")]
+    invalidation_mode: InvalidationMode,
 
     /// Maximum number of files to compile in parallel [default: available CPUs].
     #[arg(short, long)]
@@ -109,7 +123,9 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
     );
     if jobs <= 1 {
         for path in &paths {
-            if let Err(message) = compile_path(path, command.check, &options) {
+            if let Err(message) =
+                compile_path(path, command.check, command.invalidation_mode, &options)
+            {
                 failures += 1;
                 write_error(&message);
             }
@@ -140,7 +156,7 @@ fn compile_command(command: CompileCommand) -> Result<ExitCode, String> {
                     std::iter::from_fn(|| groups.get(next_group.fetch_add(1, Ordering::Relaxed)))
                         .flatten()
                         .filter_map(|&(index, path)| {
-                            compile_path(path, command.check, &options)
+                            compile_path(path, command.check, command.invalidation_mode, &options)
                                 .err()
                                 .map(|message| (index, message))
                         })
@@ -382,16 +398,24 @@ fn has_python_suffix(path: &Path) -> bool {
         .is_some_and(|name| name.as_encoded_bytes().ends_with(b".py"))
 }
 
-fn compile_path(path: &Path, check: bool, options: &CompileOptions) -> Result<(), String> {
-    compile_path_with_metadata(path, check, options, |path| fs_err::metadata(path))
+fn compile_path(
+    path: &Path,
+    check: bool,
+    invalidation_mode: InvalidationMode,
+    options: &CompileOptions,
+) -> Result<(), String> {
+    compile_path_with_metadata(path, check, invalidation_mode, options, |path| {
+        fs_err::metadata(path)
+    })
 }
 
-/// Compiles a source file, optionally replacing its timestamp-invalidated cache.
+/// Compiles a source file, optionally replacing its cache.
 ///
 /// Check mode skips both the metadata loader and cache output.
 fn compile_path_with_metadata(
     path: &Path,
     check: bool,
+    invalidation_mode: InvalidationMode,
     options: &CompileOptions,
     load_metadata: impl FnOnce(&Path) -> io::Result<std::fs::Metadata>,
 ) -> Result<(), String> {
@@ -420,12 +444,16 @@ fn compile_path_with_metadata(
         return Ok(());
     };
 
-    let source_size = metadata.len();
-    let modified = metadata
-        .modified()
-        .map_err(|error| format!("failed to read the mtime for {}: {error}", path.display()))?;
-    let source_mtime = encode_mtime(modified);
-    let pyc = module.to_timestamp_pyc(source_mtime, low_u32(source_size));
+    let pyc = match invalidation_mode {
+        InvalidationMode::Timestamp => {
+            let modified = metadata.modified().map_err(|error| {
+                format!("failed to read the mtime for {}: {error}", path.display())
+            })?;
+            module.to_timestamp_pyc(encode_mtime(modified), low_u32(metadata.len()))
+        }
+        InvalidationMode::CheckedHash => module.to_hash_pyc(&source_bytes, true),
+        InvalidationMode::UncheckedHash => module.to_hash_pyc(&source_bytes, false),
+    };
     let output = cache_path(path, options.python_version)?;
 
     let parent = output.parent().ok_or_else(|| {
@@ -550,8 +578,9 @@ fn write_error(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        cache_path, cache_tag, compilation_groups, compile_path_with_metadata, discover,
-        encode_mtime, has_python_suffix, prepare_compilation, prioritize_compilation_groups,
+        InvalidationMode, cache_path, cache_tag, compilation_groups, compile_path_with_metadata,
+        discover, encode_mtime, has_python_suffix, prepare_compilation,
+        prioritize_compilation_groups,
     };
     use super::{default_jobs, jobs_for_inputs};
     use serc::{CompileOptions, PythonVersion};
@@ -816,12 +845,18 @@ mod tests {
         let replacement_mtime = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         fs_err::write(&source_path, source).unwrap();
 
-        compile_path_with_metadata(&source_path, false, &CompileOptions::default(), |path| {
-            fs_err::write(path, replacement)?;
-            let file = std::fs::OpenOptions::new().write(true).open(path)?;
-            file.set_times(std::fs::FileTimes::new().set_modified(replacement_mtime))?;
-            fs_err::metadata(path)
-        })
+        compile_path_with_metadata(
+            &source_path,
+            false,
+            InvalidationMode::Timestamp,
+            &CompileOptions::default(),
+            |path| {
+                fs_err::write(path, replacement)?;
+                let file = std::fs::OpenOptions::new().write(true).open(path)?;
+                file.set_times(std::fs::FileTimes::new().set_modified(replacement_mtime))?;
+                fs_err::metadata(path)
+            },
+        )
         .unwrap();
 
         let expected = serc::compile_bytes(replacement.as_bytes(), source_path.to_str().unwrap())
