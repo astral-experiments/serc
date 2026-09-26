@@ -2215,13 +2215,10 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             return;
         }
         let mut reported = self.error.borrow_mut();
-        // In the modern future-only replay, the shared checker reports an unknown
-        // feature before it reports that the same import is misplaced. Native
-        // compilation checks the placement first, but an earlier import's error
-        // must still retain its priority.
-        let later_future_in_same_statement = FUTURE_ONLY
-            && self.python_version >= ast::PythonVersion::PY314
-            && matches!(error.kind, Kind::LateFutureImport)
+        // The shared checker reports an unknown feature before it reports that the
+        // same import is misplaced. Native compilation checks placement first, but
+        // an earlier statement's error must still retain its priority.
+        let later_future_in_same_statement = matches!(error.kind, Kind::LateFutureImport)
             && self
                 .reported_future_feature
                 .get()
@@ -2244,7 +2241,7 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
         {
             return;
         }
-        if FUTURE_ONLY && matches!(error.kind, Kind::FutureFeatureNotDefined(_)) {
+        if matches!(error.kind, Kind::FutureFeatureNotDefined(_)) {
             self.reported_future_feature.set(Some(error.range));
         }
         if self.checking_class_header.get()
