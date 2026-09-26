@@ -76,34 +76,31 @@ pub(super) fn diagnostic(
     mapping_range: TextRange,
     version: ast::PythonVersion,
 ) -> Option<(String, TextRange)> {
-    let repr = match key {
-        Expr::StringLiteral(string) => {
-            diagnostic_string_literal_repr(string, source, |character| {
-                unicode_printable::is_printable(character, version)
-            })
+    let repr = if let Expr::StringLiteral(string) = key {
+        diagnostic_string_literal_repr(string, source, |character| {
+            unicode_printable::is_printable(character, version)
+        })
+    } else {
+        // Avoid unbounded big-integer conversion before applying the decimal-size guard.
+        if matches!(
+            key,
+            Expr::NumberLiteral(_) | Expr::UnaryOp(_) | Expr::BinOp(_)
+        ) && source[key.range()].len() > 8192
+        {
+            return None;
         }
-        _ => {
-            // Avoid unbounded big-integer conversion before applying the decimal-size guard.
-            if matches!(
-                key,
-                Expr::NumberLiteral(_) | Expr::UnaryOp(_) | Expr::BinOp(_)
-            ) && source[key.range()].len() > 8192
-            {
-                return None;
-            }
-            let version = match version {
-                ast::PythonVersion::PY312 => PythonVersion::Py312,
-                ast::PythonVersion::PY313 => PythonVersion::Py313,
-                ast::PythonVersion::PY314 => PythonVersion::Py314,
-                _ => PythonVersion::Py315,
-            };
-            constant_repr(&fold_constant_with_literals(
-                key,
-                version,
-                &literal_constant,
-                false,
-            )?)?
-        }
+        let version = match version {
+            ast::PythonVersion::PY312 => PythonVersion::Py312,
+            ast::PythonVersion::PY313 => PythonVersion::Py313,
+            ast::PythonVersion::PY314 => PythonVersion::Py314,
+            _ => PythonVersion::Py315,
+        };
+        constant_repr(&fold_constant_with_literals(
+            key,
+            version,
+            &literal_constant,
+            false,
+        )?)?
     };
     Some((
         format!("mapping pattern checks duplicate key ({repr})"),
