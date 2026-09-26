@@ -333,7 +333,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
                         self.pattern_error(message, pattern.range());
                         return;
                     }
-                    if numeric_keys.duplicate(key) {
+                    if numeric_keys.duplicate(key, self.python_version) {
                         let message = super::mapping_diagnostic::diagnostic(
                             self.source,
                             key,
