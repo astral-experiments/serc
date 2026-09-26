@@ -54,6 +54,7 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
     let mut validator = new_validator::<PRUNE_STATEMENTS, false>(source, body, python_version);
     validator.visit_scope_body(body);
     let lowering_keyword_error = validator.lowering_keyword_error.get();
+    let lowering_error = lowering_keyword_error || validator.lowering_debug_error;
     let mut error = validator.error.into_inner();
     if lowering_keyword_error && let Some(CompileError::InvalidSyntax { range, .. }) = &error {
         // A class body is compiled before its bases and class-call keywords. Revisit only
@@ -71,10 +72,10 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
             })
             .or(error);
     }
-    if matches!(&error, Some(CompileError::InvalidDocstring { .. })) || lowering_keyword_error {
+    if matches!(&error, Some(CompileError::InvalidDocstring { .. })) || lowering_error {
         // Revisit these error paths for diagnostics from earlier compiler phases.
         // Future directives moved ahead of call lowering in Python 3.14.
-        if !lowering_keyword_error
+        if !lowering_error
             || matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315)
         {
             let mut validator = new_validator::<false, true>(source, body, python_version);
@@ -130,6 +131,7 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
         suppress_class_keyword: Cell::new(false),
         class_lowering_target: None,
         class_lowering_depth: 0,
+        lowering_debug_error: false,
         bare_starred: None,
         check_bare_starred: true,
         pre_lowering_only: false,
@@ -343,6 +345,7 @@ struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
     suppress_class_keyword: Cell<bool>,
     class_lowering_target: Option<TextRange>,
     class_lowering_depth: usize,
+    lowering_debug_error: bool,
     bare_starred: Option<(TextRange, BareStarredKind)>,
     check_bare_starred: bool,
     source: &'source str,
@@ -568,7 +571,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
         }
     }
 
-    fn check_debug_write(&self, name: &str, context: ast::ExprContext, range: TextRange) {
+    fn check_debug_write(&mut self, name: &str, context: ast::ExprContext, range: TextRange) {
         // These checks moved from code generation into symbol analysis in Python 3.14,
         // which also made them apply inside stringized and unevaluated annotations.
         if name != "__debug__"
@@ -583,11 +586,18 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
             }
             _ => return,
         };
+        let track_lowering_error = self.python_version < ast::PythonVersion::PY314
+            && !self.pre_lowering_only
+            && self.bare_starred.is_none()
+            && self.error.borrow().is_none();
         self.report_semantic_error(SemanticSyntaxError {
             kind: SemanticSyntaxErrorKind::WriteToDebug(kind),
             range,
             python_version: self.python_version,
         });
+        if track_lowering_error && self.error.borrow().is_some() {
+            self.lowering_debug_error = true;
+        }
     }
 
     /// Call keyword names are checked before the callable or any argument is lowered.
