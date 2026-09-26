@@ -21,6 +21,29 @@ const LEVELS: [OptimizationLevel; 3] = [
     OptimizationLevel::Two,
 ];
 
+#[test]
+fn terminal_try_pass_preserves_implicit_return_location() {
+    for source in [
+        "def f(x):\n    try:\n        x = x + 1\n        pass\n    except ValueError:\n        recover()\n",
+        "def f(x):\n    try:\n        del x\n        pass\n    except ValueError:\n        recover()\n",
+        "def f(x):\n    try:\n        consume(x)\n        pass\n    except ValueError:\n        recover()\n",
+        "def f(x):\n    try:\n        x = x + 1; pass\n    except ValueError:\n        recover()\n",
+        "def f(x):\n    try:\n        del x; pass\n    except ValueError:\n        recover()\n",
+        "def f(x):\n    try:\n        consume(x); pass\n    except ValueError:\n        recover()\n",
+        "def f(x):\n    try:\n        x = (x +\n             1); pass\n    except ValueError:\n        recover()\n",
+        "def f(x):\n    try:\n        consume(\n            x,\n        ); pass\n    except ValueError:\n        recover()\n",
+        "def f(x, y):\n    try:\n        if y:\n            assert x\n        else:\n            assert y\n        z = x + 1\n        pass\n    except ValueError:\n        recover()\n",
+        "def f(x, y):\n    try:\n        if y:\n            assert x\n        else:\n            assert y\n        del x\n        pass\n    except ValueError:\n        recover()\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "terminal_try_pass.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
 static ORACLES: [OnceLock<OsString>; 4] = [const { OnceLock::new() }; 4];
 
 #[test]

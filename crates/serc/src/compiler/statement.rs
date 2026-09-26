@@ -21153,6 +21153,46 @@ impl<'source> Compiler<'source> {
                 && let Some(location) = body_noop_location
             {
                 self.assembler.set_location(location);
+            } else if self.context.python_version >= crate::PythonVersion::Py314
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && !statement.is_star
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty()
+                && self.control.loops.contexts.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && let [.., previous, Stmt::Pass(pass)] = statement.body.as_slice()
+                && match previous {
+                    Stmt::Assign(assignment) => {
+                        matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                            && !expression_contains_inline_branch(&assignment.value)
+                    }
+                    Stmt::Delete(delete) => {
+                        matches!(delete.targets.as_slice(), [Expr::Name(_)])
+                    }
+                    Stmt::Expr(expression) => {
+                        matches!(expression.value.as_ref(), Expr::Call(_))
+                            && !expression_contains_inline_branch(&expression.value)
+                    }
+                    _ => false,
+                }
+            {
+                // In CPython, the normal try exit inherits the trailing Pass
+                // location when it becomes the implicit return.
+                self.assembler
+                    .set_location(self.source_location(pass.range));
             } else if suite_has_shared_terminal_condition_exit(normal_exit_suite) {
                 self.assembler.set_location(SourceLocation::NONE);
             } else if (statement.orelse.is_empty()
