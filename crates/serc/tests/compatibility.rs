@@ -16203,3 +16203,134 @@ print(events)
         );
     }
 }
+
+#[test]
+fn nested_finally_condition_marker_exception_coverage() {
+    for (function, condition, result) in [
+        ("async def", "condition", "[make()]"),
+        ("def", "condition", "[make()]"),
+        ("async def", "not condition", "[make()]"),
+        ("async def", "condition.flag", "[make()]"),
+        ("async def", "condition", "[]"),
+        ("async def", "condition", "1"),
+        ("async def", "condition is None", "[make()]"),
+        ("async def", "bool(condition)", "[make()]"),
+    ] {
+        let source = format!(
+            r"{function} example(condition):
+    try:
+        pass
+    except Exception as error:
+        if not error.flag:
+            pass
+        return {result}
+    finally:
+        try:
+            if {condition}:
+                pass
+        finally:
+            pass
+"
+        );
+        common::assert_matches_cpython_marshal(&source, "nested_finally_marker.py");
+    }
+}
+
+#[test]
+fn nested_finally_marker_control_flow_boundaries() {
+    let source = r"async def example(condition, other):
+    try:
+        pass
+    except Exception as error:
+        if not error.flag:
+            pass
+        return [make()]
+    finally:
+        try:
+            if condition:
+                pass
+        finally:
+            pass
+";
+    for source in [
+        source.replace(
+            "            if condition:\n                pass",
+            "            if condition:\n                pass\n            if other:\n                pass",
+        ),
+        source.replace(
+            "            if condition:\n                pass",
+            "            if condition:\n                pass\n            try:\n                observe()\n            except LookupError:\n                pass",
+        ),
+        source.replace(
+            "        return [make()]",
+            "        if other:\n            return []\n        return [make()]",
+        ),
+        source.replace(
+            "        if not error.flag:\n            pass",
+            "        if not error.flag: pass",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(&source, "nested_finally_boundaries.py");
+    }
+}
+
+#[test]
+fn nested_finally_condition_marker_matches_each_target() {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    use serc::{CompileOptions, PythonVersion, compile_with_options};
+
+    let source = r"async def example(condition):
+    try:
+        pass
+    except Exception as error:
+        if not error.flag:
+            pass
+        return [make()]
+    finally:
+        try:
+            if condition:
+                pass
+        finally:
+            pass
+";
+    let oracle = "import importlib.util, marshal, sys; assert sys.implementation.name == 'cpython'; assert sys.version.split()[0] == sys.argv[1]; assert importlib.util.MAGIC_NUMBER.hex() == sys.argv[2]; code = compile(sys.stdin.read(), 'nested_finally_targets.py', 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))";
+    for (version, variable, fallback) in [
+        (PythonVersion::Py312, "SERC_TEST_PYTHON_312", "python3.12"),
+        (PythonVersion::Py313, "SERC_TEST_PYTHON_313", "python3.13"),
+        (PythonVersion::Py314, "SERC_TEST_PYTHON", "python3.14"),
+        (PythonVersion::Py315, "SERC_TEST_PYTHON_315", "python3.15"),
+    ] {
+        let executable = std::env::var_os(variable).unwrap_or_else(|| fallback.into());
+        let target = version.target();
+        let mut child = Command::new(executable)
+            .args(["-I", "-S", "-B", "-c", oracle])
+            .args([target.tag.trim_start_matches('v'), &target.magic_hex()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start the pinned CPython oracle");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(source.as_bytes())
+            .unwrap();
+        let expected = child.wait_with_output().unwrap();
+        assert!(
+            expected.status.success(),
+            "{version:?}: {}",
+            String::from_utf8_lossy(&expected.stderr)
+        );
+        let options = CompileOptions {
+            python_version: version,
+            ..CompileOptions::default()
+        };
+        let actual = compile_with_options(source, "nested_finally_targets.py", &options)
+            .unwrap()
+            .marshal();
+        assert_eq!(actual, expected.stdout, "{version:?}");
+    }
+}
