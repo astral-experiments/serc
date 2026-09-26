@@ -11,6 +11,7 @@ mod config;
 mod delimiter_nesting;
 mod initial_intern_state;
 mod marshal;
+mod paramspec_default;
 mod source;
 mod stack;
 mod target;
@@ -497,6 +498,23 @@ fn compile_normalized(
     let parsed = parsed.0.as_ref().expect("parsed module is present");
     if let Some(error) = parsed.errors().first() {
         return Err(CompileError::Parse(error.clone()));
+    }
+    if options.python_version == PythonVersion::Py312
+        && source.contains("**")
+        && source.contains('[')
+        && let Some(error) = paramspec_default::validate(parsed.suite(), parsed.tokens())
+        && parsed
+            .unsupported_syntax_errors()
+            .first()
+            .is_none_or(|existing| {
+                error
+                    .range()
+                    .expect("ParamSpec diagnostic has a range")
+                    .start()
+                    < existing.range.start()
+            })
+    {
+        return Err(error);
     }
     if let Some(error) = parsed.unsupported_syntax_errors().first() {
         return Err(CompileError::invalid_syntax(error.to_string(), error.range));
