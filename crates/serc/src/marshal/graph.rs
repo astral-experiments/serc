@@ -1543,11 +1543,12 @@ fn frozenset_intern_dependencies(
     }
 
     let mut owners = FxHashMap::default();
-    // The tuple-cache and in-place slot mutation proof is pinned to Python 3.13.
+    // Python 3.13 and 3.15 merge equal safe constant tuples in the compiler
+    // cache before code construction interns their contents in place.
     count_tuple(
         &code.constants,
         false,
-        python_version == PythonVersion::Py313,
+        matches!(python_version, PythonVersion::Py313 | PythonVersion::Py315),
         &mut owners,
     );
     let mut dependencies = PartialInternDependencies {

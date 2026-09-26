@@ -1639,27 +1639,53 @@ fn partial_intern_state_accepts_shared_co_consts_with_one_frozenset_slot() {
     use crate::{CompileOptions, InitialInternState, PythonVersion, compile_with_options};
 
     let source = "def first(x):\n    return x in {'tuple_owner_999', 'tuple_companion_999'}\ndef second(x):\n    return x in {'tuple_owner_999', 'tuple_companion_999'}\n";
-    let mut options = CompileOptions {
-        python_version: PythonVersion::Py313,
-        initial_intern_state: InitialInternState::from_partial(std::iter::empty::<&str>()),
-        ..CompileOptions::default()
+    for version in [PythonVersion::Py313, PythonVersion::Py315] {
+        let mut options = CompileOptions {
+            python_version: version,
+            initial_intern_state: InitialInternState::from_partial(std::iter::empty::<&str>()),
+            ..CompileOptions::default()
+        };
+        let bytes = compile_with_options(source, "tuple_owner.py", &options)
+            .unwrap()
+            .marshal();
+        for members in [
+            vec![],
+            vec!["tuple_owner_999"],
+            vec!["tuple_companion_999"],
+            vec!["tuple_owner_999", "tuple_companion_999"],
+        ] {
+            options.initial_intern_state = InitialInternState::from_complete(members);
+            assert_eq!(
+                bytes,
+                compile_with_options(source, "tuple_owner.py", &options)
+                    .unwrap()
+                    .marshal()
+            );
+        }
+    }
+}
+
+#[test]
+fn partial_intern_state_keeps_distinct_frozenset_owners_on_py315() {
+    use crate::{
+        CompileError, CompileOptions, InitialInternState, PythonVersion, compile_with_options,
     };
-    let bytes = compile_with_options(source, "tuple_owner.py", &options)
-        .unwrap()
-        .marshal();
-    for members in [
-        vec![],
-        vec!["tuple_owner_999"],
-        vec!["tuple_companion_999"],
-        vec!["tuple_owner_999", "tuple_companion_999"],
-    ] {
-        options.initial_intern_state = InitialInternState::from_complete(members);
-        assert_eq!(
-            bytes,
-            compile_with_options(source, "tuple_owner.py", &options)
-                .unwrap()
-                .marshal()
-        );
+
+    let sources = [
+        "def first(x):\n    return x in {'tuple_owner_999', 'tuple_companion_999'}\ndef second(x):\n    return x in {'tuple_companion_999', 'tuple_owner_999'}\n",
+        "def first(x):\n    return x in {'tuple_owner_999', 'tuple_companion_999'}\ndef second(x):\n    'different tuple'\n    return x in {'tuple_owner_999', 'tuple_companion_999'}\n",
+        "def first(x):\n    return x in {'tuple_owner_999', 'tuple_companion_999'}\ndef second(x):\n    return x in {'tuple_owner_999', 'tuple_companion_999'}\ndef third(x):\n    'different tuple'\n    return x in {'tuple_owner_999', 'tuple_companion_999'}\n",
+    ];
+    for source in sources {
+        let options = CompileOptions {
+            python_version: PythonVersion::Py315,
+            initial_intern_state: InitialInternState::from_partial(std::iter::empty::<&str>()),
+            ..CompileOptions::default()
+        };
+        assert!(matches!(
+            compile_with_options(source, "distinct_owners.py", &options),
+            Err(CompileError::UnresolvedInternState { .. })
+        ));
     }
 }
 
@@ -1686,23 +1712,18 @@ fn partial_intern_state_unifies_ordinary_tuple_and_co_consts_owner_slots() {
     let partial = InitialInternState::from_partial(std::iter::empty::<&str>());
     for constants in cases {
         let code = code_object(constants);
-        assert!(validate_initial_intern_state(&code, PythonVersion::Py313, &partial).is_ok());
-        let bytes = encode_code_with_options(&code, PythonVersion::Py313, &partial);
-        for complete in [
-            InitialInternState::from_complete(std::iter::empty::<&str>()),
-            InitialInternState::from_complete([marker]),
-        ] {
-            assert_eq!(
-                bytes,
-                encode_code_with_options(&code, PythonVersion::Py313, &complete)
-            );
+        for version in [PythonVersion::Py313, PythonVersion::Py315] {
+            assert!(validate_initial_intern_state(&code, version, &partial).is_ok());
+            let bytes = encode_code_with_options(&code, version, &partial);
+            for complete in [
+                InitialInternState::from_complete(std::iter::empty::<&str>()),
+                InitialInternState::from_complete([marker]),
+            ] {
+                assert_eq!(bytes, encode_code_with_options(&code, version, &complete));
+            }
         }
-        // The owner-alias proof is scoped to the pinned 3.13 target.
-        for version in [
-            PythonVersion::Py312,
-            PythonVersion::Py314,
-            PythonVersion::Py315,
-        ] {
+        // The owner-alias proof is scoped to the pinned 3.13 and 3.15 targets.
+        for version in [PythonVersion::Py312, PythonVersion::Py314] {
             assert_eq!(
                 validate_initial_intern_state(&code, version, &partial),
                 Err(CompileError::UnresolvedInternState {
@@ -1765,12 +1786,14 @@ fn partial_intern_state_does_not_merge_unsafe_tuple_owner_slots() {
         cases.push(constants);
     }
     for constants in cases {
-        assert_eq!(
-            validate_initial_intern_state(&code_object(constants), PythonVersion::Py313, &partial),
-            Err(CompileError::UnresolvedInternState {
-                value: marker.to_string()
-            })
-        );
+        for version in [PythonVersion::Py313, PythonVersion::Py315] {
+            assert_eq!(
+                validate_initial_intern_state(&code_object(constants.clone()), version, &partial),
+                Err(CompileError::UnresolvedInternState {
+                    value: marker.to_string()
+                })
+            );
+        }
     }
 }
 
@@ -1781,17 +1804,19 @@ fn partial_intern_state_preserves_unique_set_origins_needed_by_later_shared_sets
     };
 
     let source = "def first(x):\n    return x in {'shared_origin_984', 'unique_companion_984'}\ndef second(x):\n    return x in {'shared_origin_984'}\ndef third(x):\n    'different tuple'\n    return x in {'shared_origin_984'}\n";
-    let options = CompileOptions {
-        python_version: PythonVersion::Py313,
-        initial_intern_state: InitialInternState::from_partial(std::iter::empty::<&str>()),
-        ..CompileOptions::default()
-    };
-    assert_eq!(
-        compile_with_options(source, "earlier_unique.py", &options).unwrap_err(),
-        CompileError::UnresolvedInternState {
-            value: "shared_origin_984".to_string()
-        }
-    );
+    for version in [PythonVersion::Py313, PythonVersion::Py315] {
+        let options = CompileOptions {
+            python_version: version,
+            initial_intern_state: InitialInternState::from_partial(std::iter::empty::<&str>()),
+            ..CompileOptions::default()
+        };
+        assert_eq!(
+            compile_with_options(source, "earlier_unique.py", &options).unwrap_err(),
+            CompileError::UnresolvedInternState {
+                value: "shared_origin_984".to_string()
+            }
+        );
+    }
 }
 
 #[test]
@@ -1801,17 +1826,19 @@ fn partial_intern_state_keeps_shared_tuple_origins_for_later_sensitive_sets() {
     };
 
     let source = "def first(x):\n    return x in {'shared_origin_999', 'other_member_999'}\ndef second(x):\n    return x in {'shared_origin_999', 'other_member_999'}\ndef third(x):\n    return x in {'shared_origin_999'}\ndef fourth(x):\n    'different tuple'\n    return x in {'shared_origin_999'}\n";
-    let options = CompileOptions {
-        python_version: PythonVersion::Py313,
-        initial_intern_state: InitialInternState::from_partial(std::iter::empty::<&str>()),
-        ..CompileOptions::default()
-    };
-    assert_eq!(
-        compile_with_options(source, "shared_tuple_origin.py", &options).unwrap_err(),
-        CompileError::UnresolvedInternState {
-            value: "shared_origin_999".to_string()
-        }
-    );
+    for version in [PythonVersion::Py313, PythonVersion::Py315] {
+        let options = CompileOptions {
+            python_version: version,
+            initial_intern_state: InitialInternState::from_partial(std::iter::empty::<&str>()),
+            ..CompileOptions::default()
+        };
+        assert_eq!(
+            compile_with_options(source, "shared_tuple_origin.py", &options).unwrap_err(),
+            CompileError::UnresolvedInternState {
+                value: "shared_origin_999".to_string()
+            }
+        );
+    }
 }
 
 #[test]
@@ -1963,16 +1990,18 @@ fn partial_intern_state_preserves_dominated_origins_across_later_promotions() {
             CodeInterningSummary::from_code(&code),
         ));
         code.marshal_provenance.interning_events = events;
-        assert_eq!(
-            validate_initial_intern_state(
-                &code,
-                PythonVersion::Py313,
-                &InitialInternState::from_partial([known])
-            ),
-            Err(CompileError::UnresolvedInternState {
-                value: unknown.to_string()
-            })
-        );
+        for version in [PythonVersion::Py313, PythonVersion::Py315] {
+            assert_eq!(
+                validate_initial_intern_state(
+                    &code,
+                    version,
+                    &InitialInternState::from_partial([known])
+                ),
+                Err(CompileError::UnresolvedInternState {
+                    value: unknown.to_string()
+                })
+            );
+        }
     }
 }
 
