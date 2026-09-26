@@ -779,10 +779,9 @@ impl Compiler<'_> {
                 }
             }
             if !guard_always_false {
-                // A terminal class or OR case with an erased body keeps its
-                // copied-subject pop and success return unlocated in a plain function.
+                // A class or OR case with an erased body keeps its copied-subject
+                // pop and success exit unlocated in a plain function.
                 let elided_case_body = self.context.python_version >= PythonVersion::Py314
-                    && terminal
                     && copied_subject
                     && matches!(case.pattern, Pattern::MatchClass(_) | Pattern::MatchOr(_))
                     && case.guard.is_none()

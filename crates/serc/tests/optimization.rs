@@ -512,6 +512,32 @@ fn terminating_if_before_elided_assert_preserves_branch_location() {
 }
 
 #[test]
+fn nonterminal_elided_match_case_preserves_unlocated_exit() {
+    for source in [
+        "def f(x):\n match x:\n  case str():\n   assert x\n  case int():\n   work()\n  case _:\n   other()\n after()\n",
+        "def f(x):\n match x:\n  case None:\n   pass\n  case str() | bytes():\n   assert x\n   assert (w := x)\n  case int():\n   work()\n  case _:\n   other()\n after()\n",
+        "def f(x):\n match x:\n  case str(v) | bytes(v):\n   assert (z := x)\n  case int():\n   work()\n  case _:\n   other()\n after()\n",
+        "def f(x):\n match x:\n  case A(foo=y) | B(foo=y):\n   assert x\n  case int():\n   work()\n  case _:\n   other()\n after()\n",
+        "def f(x):\n match x:\n  case (1, 2) | (3, 4):\n   assert x\n  case int():\n   work()\n  case _:\n   other()\n after()\n",
+        "def f(x):\n global z\n match x:\n  case str() | bytes():\n   assert (z := x)\n  case int():\n   work()\n  case _:\n   other()\n after()\n",
+        "def f(x):\n match x:\n  case str():\n   assert x\n   pass\n  case int():\n   work()\n  case _:\n   other()\n after()\n",
+        "def f(x):\n match x:\n  case str():\n   assert x\n   work()\n  case int():\n   work()\n  case _:\n   other()\n after()\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "sub/nonterminal_elided_match.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+}
+
+#[test]
 fn elided_inner_else_keeps_for_loop_backedge_location() {
     for source in [
         "def f(xs,a,b):\n for x in xs:\n  if a:\n   if b:\n    z = x\n   else:\n    assert b\n  else:\n   other(x)\n",
