@@ -25,6 +25,7 @@ mod declaration_tests;
 mod declarations;
 mod mapping_diagnostic;
 mod pattern_debug;
+mod pattern_numeric;
 mod unicode_printable;
 
 /// Validate AST-based syntax restrictions using Ruff's shared checker.
@@ -74,8 +75,12 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315)
             && validator.may_have_debug_patterns
             && pattern_debug::body_has_debug_pattern(body);
-    let lowering_error =
-        lowering_keyword_error || validator.lowering_debug_error || debug_pattern_replay;
+    let mut numeric_symbol_replay = validator.lowering_numeric_error
+        && matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315);
+    let lowering_error = lowering_keyword_error
+        || validator.lowering_debug_error
+        || validator.lowering_numeric_error
+        || debug_pattern_replay;
     let mut error = validator.error.into_inner();
     if lowering_keyword_error && let Some(CompileError::InvalidSyntax { range, .. }) = &error {
         // A class body is compiled before its bases and class-call keywords. Revisit only
@@ -88,20 +93,26 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         );
         replay.class_lowering_target = Some(*range);
         replay.visit_scope_body(body);
-        error = replay
-            .error
-            .into_inner()
-            .or_else(|| {
-                replay
-                    .bare_starred
-                    .map(|(range, kind)| CompileError::invalid_syntax(kind.message(), range))
-            })
-            .or(error);
+        let replay_numeric_error = replay.lowering_numeric_error;
+        let replay_error = replay.error.into_inner().or_else(|| {
+            replay
+                .bare_starred
+                .map(|(range, kind)| CompileError::invalid_syntax(kind.message(), range))
+        });
+        // A numeric duplicate found in the class body needs the same ordered symbol replay
+        // as one found by the initial walk.
+        if replay_error.is_some()
+            && matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315)
+        {
+            numeric_symbol_replay |= replay_numeric_error;
+        }
+        error = replay_error.or(error);
     }
     if matches!(&error, Some(CompileError::InvalidDocstring { .. })) || lowering_error {
         // Revisit these error paths for diagnostics from earlier compiler phases.
         // Future directives moved ahead of call lowering in Python 3.14.
         if !debug_pattern_replay
+            && !numeric_symbol_replay
             && (!lowering_error
                 || matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315))
         {
@@ -117,15 +128,23 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         let mut validator =
             new_validator::<false, false>(source, body, python_version, optimization_level);
         validator.pre_lowering_only = true;
+        validator.numeric_symbol_replay = numeric_symbol_replay;
         validator.visit_body(body);
         let pattern_debug_range = validator.symbol_pattern_debug_range;
         if let Some(priority_error) = validator.error.into_inner() {
-            if let Some(range) = pattern_debug_range
-                && (source.contains("global") || source.contains("nonlocal"))
-                && let Some(declaration_error) =
+            if source.contains("global") || source.contains("nonlocal") {
+                let prior_declaration = if let Some(range) = pattern_debug_range {
                     declarations::immediate_before_pattern_debug(body, python_version, range)
-            {
-                return Err(declaration_error);
+                } else if numeric_symbol_replay {
+                    priority_error.range().and_then(|range| {
+                        declarations::immediate_before_node(body, python_version, range)
+                    })
+                } else {
+                    None
+                };
+                if let Some(declaration_error) = prior_declaration {
+                    return Err(declaration_error);
+                }
             }
             return Err(priority_error);
         }
@@ -175,6 +194,8 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
         class_lowering_target: None,
         class_lowering_depth: 0,
         lowering_debug_error: false,
+        lowering_numeric_error: false,
+        numeric_symbol_replay: false,
         bare_starred: None,
         check_bare_starred: true,
         has_declarations: false,
@@ -395,6 +416,8 @@ struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
     class_lowering_target: Option<TextRange>,
     class_lowering_depth: usize,
     lowering_debug_error: bool,
+    lowering_numeric_error: bool,
+    numeric_symbol_replay: bool,
     bare_starred: Option<(TextRange, BareStarredKind)>,
     check_bare_starred: bool,
     has_declarations: bool,
@@ -1282,12 +1305,17 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
             walk_stmt(self, statement);
             return;
         }
-        if self.may_have_debug_patterns
-            && let Stmt::Match(match_statement) = statement
-            && pattern_debug::has_debug_pattern(match_statement)
-        {
-            self.visit_debug_match(statement, match_statement);
-            return;
+        if let Stmt::Match(match_statement) = statement {
+            let numeric_duplicate =
+                pattern_numeric::has_large_numeric_duplicate(match_statement, self.python_version);
+            if numeric_duplicate
+                || (self.may_have_debug_patterns
+                    && pattern_debug::has_debug_pattern(match_statement))
+            {
+                self.lowering_numeric_error |= numeric_duplicate;
+                self.visit_debug_match(statement, match_statement);
+                return;
+            }
         }
         let mut prechecked_match_cases = 0;
         match statement {
@@ -2002,11 +2030,21 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
                 .reported_future_feature
                 .get()
                 .is_some_and(|range| error.range.contains_range(range));
+        // Ruff reports an unknown future name before its enclosing late import. During this
+        // symbol-order replay CPython rejects the late import first, even for an unknown name.
+        let replaces_unknown_future = self.numeric_symbol_replay
+            && matches!(error.kind, Kind::LateFutureImport)
+            && reported
+                .as_ref()
+                .and_then(CompileError::range)
+                .is_some_and(|range| range != error.range && error.range.contains_range(range));
+        let replaces_pending_debug = self.pending_pattern.is_some()
+            && matches!(error.kind, Kind::WriteToDebug(_))
+            && !matches!(*reported, Some(CompileError::InvalidSyntax { .. }));
         if reported.is_some()
-            && !later_future_in_same_statement
-            && !(self.pending_pattern.is_some()
-                && matches!(error.kind, Kind::WriteToDebug(_))
-                && !matches!(*reported, Some(CompileError::InvalidSyntax { .. })))
+            && !(later_future_in_same_statement
+                || replaces_unknown_future
+                || replaces_pending_debug)
         {
             return;
         }

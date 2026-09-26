@@ -8,10 +8,10 @@ use ruff_python_parser::semantic_errors::{
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::{CompileError, code_object::Constant};
+use crate::CompileError;
 
-use super::super::constant::{fold_constant, python_integer_value_key};
 use super::Validator;
+use super::pattern_numeric::LargeNumericKeys;
 
 #[derive(Default)]
 struct PatternNames<'ast> {
@@ -320,8 +320,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
                 }
             }
             Pattern::MatchMapping(mapping) => {
-                let mut integer_keys = FxHashSet::default();
-                let mut large_integer_keys = FxHashSet::default();
+                let mut numeric_keys = LargeNumericKeys::default();
                 for key in &mapping.keys {
                     if let Some(error) = errors.get(&key.range()) {
                         let message = super::mapping_diagnostic::diagnostic(
@@ -334,43 +333,24 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool>
                         self.pattern_error(message, pattern.range());
                         return;
                     }
-                    if matches!(
-                        key,
-                        ast::Expr::NumberLiteral(_)
-                            | ast::Expr::BooleanLiteral(_)
-                            | ast::Expr::UnaryOp(_)
-                            | ast::Expr::BinOp(_)
-                    ) && let Some(constant) = fold_constant(key)
-                        && let Some(integer_key) = python_integer_value_key(&constant)
-                    {
-                        // Ruff's checker cannot compare arbitrary-size integers with floats or
-                        // complex values. Index their exact integer values without a quadratic scan.
-                        let large = matches!(constant, Constant::BigInt { .. });
-                        if (large && integer_keys.contains(&integer_key))
-                            || large_integer_keys.contains(&integer_key)
-                        {
-                            let message = super::mapping_diagnostic::diagnostic(
-                                self.source,
-                                key,
-                                pattern.range(),
-                                self.python_version,
-                            )
-                            .map_or_else(
-                                || {
-                                    format!(
-                                        "mapping pattern checks duplicate key `{}`",
-                                        &self.source[key.range()]
-                                    )
-                                },
-                                |(message, _)| message,
-                            );
-                            self.pattern_error(message, pattern.range());
-                            return;
-                        }
-                        integer_keys.insert(integer_key.clone());
-                        if large {
-                            large_integer_keys.insert(integer_key);
-                        }
+                    if numeric_keys.duplicate(key, self.python_version) {
+                        let message = super::mapping_diagnostic::diagnostic(
+                            self.source,
+                            key,
+                            pattern.range(),
+                            self.python_version,
+                        )
+                        .map_or_else(
+                            || {
+                                format!(
+                                    "mapping pattern checks duplicate key `{}`",
+                                    &self.source[key.range()]
+                                )
+                            },
+                            |(message, _)| message,
+                        );
+                        self.pattern_error(message, pattern.range());
+                        return;
                     }
                     self.visit_expr(key);
                     if self.error.borrow().is_some() {

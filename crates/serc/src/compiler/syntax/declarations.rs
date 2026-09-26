@@ -23,6 +23,8 @@ pub(super) fn validate(body: &[Stmt], version: PythonVersion) -> Result<(), Comp
         future_annotations,
         error: None,
         stop_pattern_debug: None,
+        stop_node: None,
+        finding_stop: false,
         stopped: false,
     };
     validator.visit_body(body);
@@ -52,8 +54,46 @@ pub(super) fn immediate_before_pattern_debug(
         future_annotations,
         error: None,
         stop_pattern_debug: Some(range),
+        stop_node: None,
+        finding_stop: false,
         stopped: false,
     };
+    validator.visit_body(body);
+    validator.error
+}
+
+/// Check declarations encountered before an earlier symbol-table error, without resolving
+/// nonlocal bindings that CPython examines after collecting the entire symbol table.
+pub(super) fn immediate_before_node(
+    body: &[Stmt],
+    version: PythonVersion,
+    range: TextRange,
+) -> Option<CompileError> {
+    let future_annotations = body.iter().any(|statement| {
+        matches!(statement, Stmt::ImportFrom(import) if import.level == 0
+            && import.module.as_deref() == Some("__future__")
+            && import.names.iter().any(|alias| alias.name.as_str() == "annotations"))
+    });
+    let new_validator = |finding_stop| Validator {
+        scopes: vec![Scope::new(ScopeKind::Module, None)],
+        current: 0,
+        private_name: None,
+        version,
+        future_annotations,
+        error: None,
+        stop_pattern_debug: None,
+        stop_node: Some(range),
+        finding_stop,
+        stopped: false,
+    };
+    // Some reported ranges refer to identifiers rather than visited statements or expressions.
+    // Do not consider a declaration after such an unmatched range to precede the error.
+    let mut finder = new_validator(true);
+    finder.visit_body(body);
+    if !finder.stopped {
+        return None;
+    }
+    let mut validator = new_validator(false);
     validator.visit_body(body);
     validator.error
 }
@@ -137,6 +177,8 @@ struct Validator<'a> {
     future_annotations: bool,
     error: Option<CompileError>,
     stop_pattern_debug: Option<TextRange>,
+    stop_node: Option<TextRange>,
+    finding_stop: bool,
     stopped: bool,
 }
 
@@ -169,7 +211,7 @@ impl<'a> Validator<'a> {
     }
 
     fn reject(&mut self, message: String, range: TextRange) {
-        if self.error.is_none() {
+        if self.error.is_none() && !self.finding_stop {
             self.error = Some(CompileError::invalid_syntax(message, range));
         }
     }
@@ -352,6 +394,10 @@ impl<'a> Visitor<'a> for Validator<'a> {
         if self.error.is_some() || self.stopped {
             return;
         }
+        if self.stop_node == Some(statement.range()) {
+            self.stopped = true;
+            return;
+        }
         match statement {
             Stmt::Global(statement) => {
                 for name in &statement.names {
@@ -461,6 +507,10 @@ impl<'a> Visitor<'a> for Validator<'a> {
         if self.error.is_some() || self.stopped {
             return;
         }
+        if self.stop_node == Some(expression.range()) {
+            self.stopped = true;
+            return;
+        }
         if crate::stack_growth_required() {
             return crate::grow_stack(|| self.visit_expr(expression));
         }
@@ -526,6 +576,10 @@ impl<'a> Visitor<'a> for Validator<'a> {
     }
 
     fn visit_alias(&mut self, alias: &'a ast::Alias) {
+        if self.stop_node == Some(alias.range) {
+            self.stopped = true;
+            return;
+        }
         let name = alias.asname.as_ref().map_or_else(
             || alias.name.as_str().split('.').next().unwrap(),
             ast::Identifier::as_str,
