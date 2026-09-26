@@ -55,10 +55,12 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
     let mut validator = new_validator::<PRUNE_STATEMENTS, false>(source, body, python_version);
     validator.visit_scope_body(body);
     let lowering_keyword_error = validator.lowering_keyword_error.get();
-    let debug_pattern_replay = matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315)
-        && validator.may_have_debug_patterns
-        && pattern_debug::body_has_debug_pattern(body);
-    let lowering_error = lowering_keyword_error || validator.lowering_debug_error || debug_pattern_replay;
+    let debug_pattern_replay =
+        matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315)
+            && validator.may_have_debug_patterns
+            && pattern_debug::body_has_debug_pattern(body);
+    let lowering_error =
+        lowering_keyword_error || validator.lowering_debug_error || debug_pattern_replay;
     let mut error = validator.error.into_inner();
     if lowering_keyword_error && let Some(CompileError::InvalidSyntax { range, .. }) = &error {
         // A class body is compiled before its bases and class-call keywords. Revisit only
