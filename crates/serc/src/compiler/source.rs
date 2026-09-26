@@ -301,8 +301,39 @@ impl<'source> CompilationContext<'source> {
             }
         }
 
-        let mut original_scopes =
-            ScopeArena::analyze_with_optimized_assertions(body, self.python_version);
+        let mut original_source = SourceAnalysis::new(self.python_version, 0);
+        let mut original_scopes = ScopeArena::analyze_with_optimized_assertions(
+            body,
+            self.python_version,
+            &mut original_source,
+        );
+        // Parsing interns identifiers even when a later optimization removes their
+        // expressions. Preserve those raw names, but retain all lowering and cache
+        // facts from the optimized tree and do not mark literal objects canonical.
+        original_source.generated_mangled_strings.retain(|name| {
+            !original_source
+                .raw_private_identifiers
+                .contains(name.as_str())
+        });
+        #[expect(
+            clippy::iter_over_hash_type,
+            reason = "The retained names are used only for membership."
+        )]
+        for (name, _) in original_source.origins {
+            if !original_source
+                .generated_mangled_strings
+                .contains(name.as_ref())
+            {
+                self.generated_mangled_strings.remove(name.as_ref());
+                if !name.is_ascii() && self.interned_metadata_tuples.is_none() {
+                    self.interned_metadata_tuples = Some(RefCell::default());
+                }
+                if !self.constant_string_origins.contains_key(name.as_ref()) {
+                    self.constant_string_origins
+                        .insert(Cow::Owned(name.into_owned()), Cell::default());
+                }
+            }
+        }
         original_scopes.retain_lowered_comprehension_locals(&self.scopes);
         self.scopes = original_scopes;
         let eager_annotations = self.python_version <= crate::PythonVersion::Py313

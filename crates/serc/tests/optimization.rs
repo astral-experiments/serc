@@ -1002,3 +1002,150 @@ print(outcome)
         }
     }
 }
+
+#[test]
+fn elided_assertion_identifiers_preserve_frozenset_identity() {
+    const SOURCE: &str = r#"
+def first():
+    sink(items={"shared_member", "second_member", "third_member"})
+
+def second():
+    sink(extra=None, items={"shared_member", "second_member", "third_member"})
+
+def discarded_assert():
+    assert context.shared_member
+"#;
+    const TEXT_ORACLE: &str = r"
+import marshal, sys
+source = sys.stdin.buffer.read().decode('utf-8')
+code = compile(source, sys.argv[2], 'exec', dont_inherit=True, optimize=int(sys.argv[1]))
+sys.stdout.buffer.write(marshal.dumps(code))
+";
+    const IDENTITY_ORACLE: &str = r"
+import marshal, sys, types
+module = marshal.loads(sys.stdin.buffer.read())
+functions = {c.co_name: c for c in module.co_consts if isinstance(c, types.CodeType)}
+sets = [next(c for c in functions[name].co_consts if isinstance(c, frozenset))
+        for name in ('first', 'second')]
+assert sets[0] == sets[1]
+assert (sets[0] is sets[1]) == (sys.argv[1] == 'shared')
+";
+    let cases = [
+        (SOURCE.to_string(), false),
+        (SOURCE.replace("    assert context.shared_member", "    pass"), true),
+        (SOURCE.replace("    assert context.shared_member", "    context.shared_member"), false),
+        (SOURCE.replace("extra=None, ", ""), true),
+        (SOURCE.replace("\"shared_member\"", "\"Key_member\"").replace("context.shared_member", "context.Key_member"), false),
+        (SOURCE.replace("assert context.shared_member", "assert (lambda: context.shared_member)()"), false),
+        (SOURCE.replace("shared_member", "_Box__member").replace("def discarded_assert():\n    assert context._Box__member", "class Box:\n    def f(self):\n        return self.__member\n\n    def discarded_assert(self):\n        assert context._Box__member"), false),
+        (SOURCE.replace("def discarded_assert():\n    assert context.shared_member", "assert context.shared_member"), false),
+    ];
+    for (source, shared) in cases {
+        for (version, _, _) in VERSIONS {
+            for level in [OptimizationLevel::One, OptimizationLevel::Two] {
+                let options = CompileOptions {
+                    python_version: version,
+                    optimization_level: level,
+                    ..CompileOptions::default()
+                };
+                let expected = oracle(source.as_bytes(), "case.py", version, level);
+                assert!(
+                    expected.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&expected.stderr)
+                );
+                let actual = compile_bytes_with_options(source.as_bytes(), "case.py", &options)
+                    .unwrap()
+                    .marshal();
+                assert_eq!(actual, expected.stdout, "{version}, {level:?}, bytes");
+
+                let index = VERSIONS
+                    .iter()
+                    .position(|(candidate, _, _)| *candidate == version)
+                    .unwrap();
+                let executable = ORACLES[index].get().expect("oracle identity was checked");
+                let level_arg = if level == OptimizationLevel::One {
+                    "1"
+                } else {
+                    "2"
+                };
+                let mut child = Command::new(executable)
+                    .args([
+                        "-I",
+                        "-S",
+                        "-X",
+                        "utf8",
+                        "-c",
+                        TEXT_ORACLE,
+                        level_arg,
+                        "case.py",
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(source.as_bytes())
+                    .unwrap();
+                let expected_text = child.wait_with_output().unwrap();
+                assert!(
+                    expected_text.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&expected_text.stderr)
+                );
+                let actual_text = compile_with_options(&source, "case.py", &options)
+                    .unwrap()
+                    .marshal();
+                assert_eq!(
+                    actual_text, expected_text.stdout,
+                    "{version}, {level:?}, text"
+                );
+
+                for (label, payload) in [
+                    ("native", expected.stdout.as_slice()),
+                    ("serc", actual.as_slice()),
+                ] {
+                    let mut child = Command::new(executable)
+                        .args([
+                            "-I",
+                            "-S",
+                            "-X",
+                            "utf8",
+                            "-c",
+                            IDENTITY_ORACLE,
+                            if shared { "shared" } else { "distinct" },
+                        ])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    child.stdin.take().unwrap().write_all(payload).unwrap();
+                    let identity = child.wait_with_output().unwrap();
+                    assert!(
+                        identity.status.success(),
+                        "{version}, {level:?}, {label}: {}",
+                        String::from_utf8_lossy(&identity.stderr)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn elided_non_ascii_identifier_preserves_discarded_builders() {
+    const PREFIX: &str = "def marker():\n    assert probe.élève\n\n";
+    let discarded = [
+        "if False:\n    def hidden(value):\n        return value + 1\n",
+        "saved = (\"élève\",)\nif False:\n    class Hidden:\n        def method(self):\n            return (\"élève\",)\n",
+        "if False:\n    async def hidden(items):\n        async for item in items:\n            try:\n                yield item\n            finally:\n                cleanup()\n",
+    ];
+    for body in discarded {
+        assert_matches_cpython(&format!("{PREFIX}{body}"), "case.py", &LEVELS);
+    }
+}
