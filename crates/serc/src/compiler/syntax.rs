@@ -25,6 +25,7 @@ mod declaration_tests;
 mod declarations;
 mod mapping_diagnostic;
 mod pattern_debug;
+mod pattern_numeric;
 mod unicode_printable;
 
 /// Validate AST-based syntax restrictions using Ruff's shared checker.
@@ -74,8 +75,10 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315)
             && validator.may_have_debug_patterns
             && pattern_debug::body_has_debug_pattern(body);
-    let lowering_error =
-        lowering_keyword_error || validator.lowering_debug_error || debug_pattern_replay;
+    let lowering_error = lowering_keyword_error
+        || validator.lowering_debug_error
+        || validator.lowering_numeric_error
+        || debug_pattern_replay;
     let mut error = validator.error.into_inner();
     if lowering_keyword_error && let Some(CompileError::InvalidSyntax { range, .. }) = &error {
         // A class body is compiled before its bases and class-call keywords. Revisit only
@@ -175,6 +178,7 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
         class_lowering_target: None,
         class_lowering_depth: 0,
         lowering_debug_error: false,
+        lowering_numeric_error: false,
         bare_starred: None,
         check_bare_starred: true,
         has_declarations: false,
@@ -395,6 +399,7 @@ struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
     class_lowering_target: Option<TextRange>,
     class_lowering_depth: usize,
     lowering_debug_error: bool,
+    lowering_numeric_error: bool,
     bare_starred: Option<(TextRange, BareStarredKind)>,
     check_bare_starred: bool,
     has_declarations: bool,
@@ -1282,12 +1287,16 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
             walk_stmt(self, statement);
             return;
         }
-        if self.may_have_debug_patterns
-            && let Stmt::Match(match_statement) = statement
-            && pattern_debug::has_debug_pattern(match_statement)
-        {
-            self.visit_debug_match(statement, match_statement);
-            return;
+        if let Stmt::Match(match_statement) = statement {
+            let numeric_duplicate = pattern_numeric::has_large_numeric_duplicate(match_statement);
+            if numeric_duplicate
+                || (self.may_have_debug_patterns
+                    && pattern_debug::has_debug_pattern(match_statement))
+            {
+                self.lowering_numeric_error |= numeric_duplicate;
+                self.visit_debug_match(statement, match_statement);
+                return;
+            }
         }
         let mut prechecked_match_cases = 0;
         match statement {
