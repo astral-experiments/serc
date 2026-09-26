@@ -2244,7 +2244,7 @@ impl Compiler<'_> {
 }
 
 /// Collect function annotations in the target's code-generation order.
-fn function_annotations(
+pub(super) fn function_annotations(
     definition: &StmtFunctionDef,
     python_version: PythonVersion,
 ) -> Vec<(&str, &Expr)> {
