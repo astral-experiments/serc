@@ -491,12 +491,26 @@ fn compile_normalized(
     let parse_options = ruff_python_parser::ParseOptions::from(ruff_python_parser::Mode::Module)
         .with_target_version(target_version);
     delimiter_nesting::validate(source, &parse_options, options.python_version)?;
-    let parsed = ruff_python_parser::parse_unchecked(source, parse_options)
+    let parsed = ruff_python_parser::parse_unchecked(source, parse_options.clone())
         .try_into_module()
         .ok_or_else(|| CompileError::Internal("parser did not return a module".to_string()))?;
     let parsed = ParsedModule(Some(parsed));
     let parsed = parsed.0.as_ref().expect("parsed module is present");
-    if let Some(error) = parsed.errors().first() {
+    let parse_error = parsed.errors().first();
+    if let Some(range) = indentation::first_excess(parsed.tokens())
+        && parse_error.is_none_or(|error| range.start() <= error.location.start())
+    {
+        if let Some(error) = yield_syntax::before_indentation_error(
+            source,
+            &parse_options,
+            range,
+            options.python_version,
+        ) {
+            return Err(error);
+        }
+        return Err(indentation::excess_error(range));
+    }
+    if let Some(error) = parse_error {
         if let Some(yield_error) = yield_syntax::before_parse_error(
             source,
             parsed.tokens(),
@@ -517,7 +531,6 @@ fn compile_normalized(
         return Err(error);
     }
     yield_syntax::validate(source, parsed.tokens(), options.python_version)?;
-    indentation::validate(parsed.tokens())?;
     if let Some(error) = parsed.unsupported_syntax_errors().first() {
         return Err(CompileError::invalid_syntax(error.to_string(), error.range));
     }

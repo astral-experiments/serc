@@ -45,6 +45,39 @@ fn invalid_comma(tokens: &Tokens) -> Option<usize> {
     })
 }
 
+/// An indentation-limit failure stops native tokenization. Check its prefix so
+/// later tokenizer errors cannot mask an earlier invalid yield.
+pub(crate) fn before_indentation_error(
+    source: &str,
+    options: &ParseOptions,
+    indentation: TextRange,
+    version: PythonVersion,
+) -> Option<CompileError> {
+    let prefix = &source[..indentation.start().to_usize()];
+    if !prefix.contains("yield") {
+        return None;
+    }
+    let parsed = ruff_python_parser::parse_unchecked(prefix, options.clone())
+        .try_into_module()?;
+    let parsed = crate::ParsedModule(Some(parsed));
+    let parsed = parsed.0.as_ref().expect("parsed module is present");
+    if !parsed.errors().is_empty() {
+        return before_parse_error(
+            prefix,
+            parsed.tokens(),
+            parsed.errors(),
+            parsed.unsupported_syntax_errors(),
+            version,
+        );
+    }
+    if earlier_unsupported(prefix, parsed.tokens(), parsed.unsupported_syntax_errors(), version)
+        .is_some()
+    {
+        return None;
+    }
+    validate(prefix, parsed.tokens(), version).err()
+}
+
 /// Retain an earlier version error unless the invalid pair is inside a legacy
 /// template, whose quote or surrounding field determines the native error.
 pub(crate) fn earlier_unsupported(

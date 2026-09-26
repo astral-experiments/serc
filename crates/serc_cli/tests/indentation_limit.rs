@@ -3,7 +3,9 @@ mod common;
 use std::fmt::Write as _;
 use std::process::Command;
 
-use serc::{CompileOptions, PythonVersion, compile_bytes_with_options, compile_with_options};
+use serc::{
+    CompileError, CompileOptions, PythonVersion, compile_bytes_with_options, compile_with_options,
+};
 
 fn nested_source(levels: usize, indent: &str) -> String {
     let mut source = String::new();
@@ -120,6 +122,107 @@ sys.stdout.buffer.write(marshal.dumps(code))
                     String::from_utf8_lossy(&output.stderr)
                         .contains("too many levels of indentation")
                 );
+            }
+        }
+    }
+}
+
+#[test]
+fn indentation_depth_respects_earlier_errors() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(check_indentation_error_order)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn check_indentation_error_order() {
+    let deep = nested_source(100, " ");
+    let indentation_start = deep.find(&" ".repeat(100)).unwrap();
+    let delimiters = format!("value = {}1{}\n", "(".repeat(201), ")".repeat(201));
+    let cases = [
+        (
+            format!("{deep}bad =\n"),
+            "too many levels of indentation",
+            indentation_start,
+        ),
+        (
+            format!("{deep}{delimiters}"),
+            "too many levels of indentation",
+            indentation_start,
+        ),
+        (
+            format!("{deep}value = 0b2\n"),
+            "too many levels of indentation",
+            indentation_start,
+        ),
+        (
+            format!("{deep})\n"),
+            "too many levels of indentation",
+            indentation_start,
+        ),
+        (format!("bad =\n{deep}"), "invalid syntax", 5),
+        (
+            format!("bad =\n{deep}{delimiters}"),
+            "invalid syntax",
+            5,
+        ),
+        (
+            format!("{delimiters}{deep}"),
+            "too many nested parentheses",
+            "value = ".len() + 200,
+        ),
+    ];
+    let oracle = r"
+import sys
+source = sys.argv[1]
+if sys.argv[2] == 'bytes':
+    source = source.encode('utf-8')
+try:
+    compile(source, 'indentation.py', 'exec', dont_inherit=True, optimize=0)
+except SyntaxError as error:
+    print(error.msg)
+else:
+    raise SystemExit('expected a syntax error')
+";
+    for version in [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
+    ] {
+        let options = CompileOptions {
+            python_version: version,
+            ..CompileOptions::default()
+        };
+        for (source, expected_message, expected_start) in &cases {
+            for mode in ["text", "bytes"] {
+                let mut python = match version {
+                    PythonVersion::Py312 => common::python_312_command(),
+                    PythonVersion::Py313 => common::python_313_command(),
+                    PythonVersion::Py314 => common::python_3145_command(),
+                    PythonVersion::Py315 => common::python_315_command(),
+                };
+                let native = python.args(["-c", oracle, source, mode]).output().unwrap();
+                assert!(native.status.success(), "{version} {mode}: {native:?}");
+                assert_eq!(String::from_utf8_lossy(&native.stdout).trim(), *expected_message);
+                let result = if mode == "bytes" {
+                    compile_bytes_with_options(source.as_bytes(), "indentation.py", &options)
+                } else {
+                    compile_with_options(source, "indentation.py", &options)
+                };
+                let error = result.unwrap_err();
+                assert_eq!(error.range().unwrap().start().to_usize(), *expected_start);
+                match error {
+                    CompileError::InvalidSyntax { message, .. } => {
+                        assert_eq!(message, *expected_message, "{version} {mode}");
+                    }
+                    CompileError::Parse(_) => {
+                        assert_eq!(*expected_message, "invalid syntax", "{version} {mode}");
+                    }
+                    error => panic!("{version} {mode}: unexpected error {error:?}"),
+                }
             }
         }
     }
