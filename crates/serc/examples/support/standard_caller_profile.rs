@@ -202,9 +202,17 @@ pub(super) struct QualifiedOracle {
     runtime: tempfile::TempDir,
     executable: PathBuf,
     environment: BTreeMap<String, String>,
+    warning_context: Option<super::warning_effects_profile::WarningContext>,
 }
 
 impl QualifiedOracle {
+    /// Return the separately source-proved effects for this qualified invocation.
+    pub(super) fn warning_context(
+        &self,
+    ) -> Option<&super::warning_effects_profile::WarningContext> {
+        self.warning_context.as_ref()
+    }
+
     /// Construct the unchanged oracle invocation under the admitted environment.
     pub(super) fn command(&self) -> Command {
         let mut command = Command::new(&self.executable);
@@ -288,7 +296,14 @@ pub(super) fn load(
         let scoped_absence =
             load_scoped_absence(directory, &proof_hash, &proof, &artifact.sha256, &admission)?;
         match prepare_runtime(python, &preparer, &admission_path, &admission) {
-            Ok(qualified) => {
+            Ok(mut qualified) => {
+                qualified.warning_context = Some(
+                    super::warning_effects_profile::WarningContext::for_qualified_caller(
+                        &proof_hash,
+                        &artifact.sha256,
+                        version,
+                    )?,
+                );
                 let mut retained = proof.state.retained_strings.clone();
                 for path in &proof.state.retained_runtime_paths {
                     retained.push(
@@ -557,6 +572,7 @@ fn prepare_runtime(
             runtime,
             executable,
             environment,
+            warning_context: None,
         }),
         Err(error) => {
             restore_directories(runtime.path());
@@ -1072,6 +1088,7 @@ mod tests {
         fs_err::set_permissions(&library, std::fs::Permissions::from_mode(0o555)).unwrap();
         fs_err::set_permissions(&path, std::fs::Permissions::from_mode(0o555)).unwrap();
         let qualified = QualifiedOracle {
+            warning_context: None,
             runtime,
             executable: path.join("python"),
             environment: BTreeMap::new(),
