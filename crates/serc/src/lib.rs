@@ -14,6 +14,7 @@ mod marshal;
 mod source;
 mod stack;
 mod target;
+mod yield_syntax;
 
 use std::error::Error;
 use std::fmt;
@@ -498,6 +499,7 @@ fn compile_normalized(
     if let Some(error) = parsed.errors().first() {
         return Err(CompileError::Parse(error.clone()));
     }
+    yield_syntax::validate(source, parsed.tokens(), options.python_version)?;
     if let Some(error) = parsed.unsupported_syntax_errors().first() {
         return Err(CompileError::invalid_syntax(error.to_string(), error.range));
     }
