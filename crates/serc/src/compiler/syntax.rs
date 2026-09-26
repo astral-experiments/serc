@@ -1980,10 +1980,20 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                 ..
             }) => {
                 self.comprehension(generators, ComprehensionKind::Dict, |visitor| {
-                    if let Some(key) = key {
-                        visitor.visit_expr(key);
+                    // CPython's symbol-table pass visits the value before the key.
+                    // Restrict this ordering to direct yields with simple operands:
+                    // other expressions can contain earlier phase-specific errors.
+                    if key.as_deref().is_some_and(direct_yield_with_simple_operand)
+                        && direct_yield_with_simple_operand(value)
+                    {
+                        visitor.visit_expr(value);
+                        visitor.visit_expr(key.as_deref().expect("key was checked"));
+                    } else {
+                        if let Some(key) = key {
+                            visitor.visit_expr(key);
+                        }
+                        visitor.visit_expr(value);
                     }
-                    visitor.visit_expr(value);
                 });
             }
             _ => walk_expr(self, expression),
@@ -2047,6 +2057,27 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
         }
         walk_interpolated_string_element(self, element);
     }
+}
+
+/// Identify direct yields whose operands cannot contain earlier syntax errors.
+fn direct_yield_with_simple_operand(expression: &Expr) -> bool {
+    let value = match expression {
+        Expr::Yield(yield_) => yield_.value.as_deref(),
+        Expr::YieldFrom(yield_from) => Some(yield_from.value.as_ref()),
+        _ => return false,
+    };
+    value.is_none_or(|value| {
+        matches!(
+            value,
+            Expr::Name(_)
+                | Expr::StringLiteral(_)
+                | Expr::BytesLiteral(_)
+                | Expr::NumberLiteral(_)
+                | Expr::BooleanLiteral(_)
+                | Expr::NoneLiteral(_)
+                | Expr::EllipsisLiteral(_)
+        )
+    })
 }
 
 impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContext
