@@ -33,6 +33,8 @@ pub(super) struct ExceptionOwnerProvenance {
     // Original block, setup and jump-derived NOP after an actual redundant-jump conversion.
     pub(super) module_annotation_jump_nops: Vec<(BasicBlockId, Instruction, Instruction)>,
     pub(super) setups: Vec<(Label, Option<SourceLocation>)>,
+    // Original 3.12 SETUP entries and targets, captured before region splitting.
+    pub(super) legacy_native_setup_targets: Vec<(Label, Label)>,
     // Authored ordinary-try SETUP and its original handler, independently of split ranges.
     pub(super) ordinary_try_setups: FxHashMap<Label, Label>,
     // Authored name-clearing exception handlers, independent of overlapping outer regions.

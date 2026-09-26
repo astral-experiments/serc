@@ -1341,11 +1341,95 @@ impl OptimizationPipeline {
         &self,
         original_arrays: &FxHashMap<BasicBlockId, usize>,
     ) -> Vec<(BasicBlockId, Instruction)> {
-        if !self.exception_regions.is_empty() || !self.exception_owner_provenance.setups.is_empty()
-        {
+        let full_order = self.graph.order();
+        // Avoid building provenance maps when no conditional can queue its
+        // fallthrough twice, the only shape this analysis can repair.
+        if !full_order.windows(2).any(|pair| {
+            block_has_fallthrough(self.graph[pair[0]].items())
+                && block_jump_target(self.graph[pair[0]].items())
+                    .and_then(|label| self.graph.label_block(label))
+                    == Some(pair[1])
+        }) {
             return Vec::new();
         }
-        let order = self.graph.order();
+        let mut prefix_len = full_order.len();
+        if !self.exception_regions.is_empty() || !self.exception_owner_provenance.setups.is_empty()
+        {
+            // Native 3.12 also traverses SETUP targets. Only simulate the prefix
+            // before every original handler target when each setup is mapped
+            // to its authored target and no later jump can reenter the prefix.
+            // Stop at an empty or split native instruction array because the
+            // physical Serc blocks no longer establish the native traversal.
+            let setups = &self.exception_owner_provenance.setups;
+            let captured = &self.exception_owner_provenance.legacy_native_setup_targets;
+            let targets = captured.iter().copied().collect::<FxHashMap<_, _>>();
+            let setup_entries = setups
+                .iter()
+                .map(|(entry, _)| *entry)
+                .collect::<FxHashSet<_>>();
+            if self.exception_regions.is_empty()
+                || setups.is_empty()
+                || self
+                    .exception_regions
+                    .iter()
+                    .any(|region| region.is_scope_fallback)
+                || targets.len() != captured.len()
+                || setup_entries.len() != setups.len()
+                || targets.len() != setups.len()
+                || setups.iter().any(|(entry, _)| !targets.contains_key(entry))
+            {
+                return Vec::new();
+            }
+            let positions = full_order
+                .iter()
+                .enumerate()
+                .map(|(i, &block)| (block, i))
+                .collect::<FxHashMap<_, _>>();
+            for target in targets
+                .values()
+                .copied()
+                .chain(self.exception_regions.iter().map(|region| region.target))
+            {
+                let Some(handler) = self
+                    .graph
+                    .label_block(target)
+                    .and_then(|block| positions.get(&block).copied())
+                else {
+                    return Vec::new();
+                };
+                prefix_len = prefix_len.min(handler);
+            }
+            let mut prefix_arrays = FxHashSet::default();
+            for (index, &block) in full_order[..prefix_len].iter().enumerate() {
+                if self.graph[block].last_instruction().is_none()
+                    || !original_arrays
+                        .get(&block)
+                        .is_some_and(|array| prefix_arrays.insert(*array))
+                {
+                    prefix_len = index;
+                    break;
+                }
+            }
+            if full_order[prefix_len..].iter().any(|block| {
+                self.graph[*block].items().iter().any(|item| {
+                    let Item::Instruction(instruction) = item else {
+                        return false;
+                    };
+                    let (Operand::Forward(target) | Operand::Backward(target)) =
+                        instruction.operand()
+                    else {
+                        return false;
+                    };
+                    self.graph
+                        .label_block(target)
+                        .and_then(|block| positions.get(&block))
+                        .is_none_or(|position| *position < prefix_len)
+                })
+            }) {
+                return Vec::new();
+            }
+        }
+        let order = &full_order[..prefix_len];
         let Some(&entry) = order.first() else {
             return Vec::new();
         };
@@ -1392,7 +1476,8 @@ impl OptimizationPipeline {
                 .then(|| order.get(position + 1).copied())
                 .flatten();
             let target = block_jump_target(self.graph[block].items())
-                .and_then(|label| self.graph.label_block(label));
+                .and_then(|label| self.graph.label_block(label))
+                .filter(|target| positions.contains_key(target));
             for successor in fallthrough.into_iter().chain(target) {
                 if repeated {
                     repeated_successors.insert(successor);
@@ -3386,6 +3471,80 @@ mod finally_capture_seed_tests {
                     .visit_legacy_seed_captures_mut(|instruction| {
                         assert_eq!(instruction.legacy_initial_jump_width(), None);
                     });
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod protected_repeated_backedge_tests {
+    use super::*;
+    use crate::assembler::Assembler;
+    use crate::target::opcodes::{POP_JUMP_IF_FALSE, RERAISE};
+
+    #[test]
+    fn protected_prefix_requires_authored_targets_and_no_reentry() {
+        for case in 0..7 {
+            let start = Label::from_u32(0);
+            let second = Label::from_u32(1);
+            let backedge = Label::from_u32(2);
+            let end = Label::from_u32(3);
+            let handler = Label::from_u32(4);
+            let branch =
+                |target| Instruction::new(POP_JUMP_IF_FALSE, target, SourceLocation::NONE, Some(0));
+            let jump = |target| {
+                Instruction::new(
+                    JUMP_BACKWARD,
+                    Operand::Backward(target),
+                    SourceLocation::NONE,
+                    Some(0),
+                )
+            };
+            let mut assembler = Assembler::from_linear_items(vec![
+                Item::Label(start),
+                Item::Instruction(branch(Operand::Forward(second))),
+                Item::Label(second),
+                Item::Instruction(branch(Operand::Backward(start))),
+                Item::Label(backedge),
+                Item::Instruction(jump(start)),
+                Item::Label(end),
+                Item::Instruction(Instruction::new(
+                    RETURN_VALUE,
+                    Operand::Value(0),
+                    SourceLocation::NONE,
+                    Some(0),
+                )),
+                Item::Label(handler),
+                Item::Instruction(if case == 5 {
+                    jump(start)
+                } else {
+                    Instruction::new(RERAISE, Operand::Value(0), SourceLocation::NONE, Some(0))
+                }),
+            ]);
+            assembler.python_version = PythonVersion::Py312;
+            assembler.next_label = 5;
+            assembler.add_exception_region(start, end, handler, 0, false);
+            assembler.record_exception_setup(start, false);
+            if case != 1 {
+                let target = match case {
+                    2 => Label::from_u32(900),
+                    4 => second,
+                    _ => handler,
+                };
+                assembler.record_legacy_native_setup_target(start, target);
+            }
+            if case == 3 {
+                assembler.record_legacy_native_setup_target(start, handler);
+            }
+            if case == 6 {
+                assembler.record_exception_setup(start, false);
+            }
+            let pipeline = assembler.into_optimization_pipeline();
+            let arrays = pipeline.legacy_instruction_arrays();
+            let found = pipeline.legacy_repeated_backedges(&arrays);
+            assert_eq!(found.len(), usize::from(case == 0), "case {case}");
+            if case == 0 {
+                assert_eq!(found[0].0, pipeline.graph.label_block(backedge).unwrap());
             }
         }
     }

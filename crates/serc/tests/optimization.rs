@@ -97,6 +97,22 @@ fn optimized_for_loop_backedge_locations_match_cpython_312() {
 }
 
 #[test]
+fn protected_for_loop_backedge_locations_match_cpython_312() {
+    for source in [
+        "def f(xs, cleanup):\n try:\n  for x in xs:\n   if x:\n    assert False\n   if x:\n    assert False\n finally:\n  cleanup()\n",
+        "def f(xs, manager):\n with manager:\n  for x in xs:\n   if x:\n    assert False\n   if x:\n    assert False\n",
+        "def f(xs, x):\n for item in xs:\n  if x:\n   assert False\n  if x:\n   assert False\n try:\n  z = x + 1\n  pass\n except ValueError:\n  recover()\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "protected_loop_backedge_locations.py",
+            &LEVELS,
+            &[PythonVersion::Py312],
+        );
+    }
+}
+
+#[test]
 fn nested_terminal_if_before_elided_assert_matches_cpython() {
     for source in [
         "def f(a,b):\n if a:\n  if b:\n   x = 1\n  assert a\n",

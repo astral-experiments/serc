@@ -23303,6 +23303,8 @@ impl<'source> Compiler<'source> {
         );
 
         self.assembler.record_exception_setup(handler_start, false);
+        self.assembler
+            .record_legacy_native_setup_target(handler_start, common_cleanup);
         self.assembler.mark(handler_start);
         self.set_depth(base_depth + 1);
         self.assembler.set_location(SourceLocation::NONE);
@@ -28458,6 +28460,8 @@ impl<'source> Compiler<'source> {
                 .push((statement_nop_start, statement_nop_end));
         }
         self.assembler.record_exception_setup(protected_start, true);
+        self.assembler
+            .record_legacy_native_setup_target(protected_start, finally_handler);
         self.assembler.mark(protected_start);
         let pass_finally_location = match statement.finalbody.as_slice() {
             [Stmt::Pass(statement)] => Some(self.source_location(statement.range)),
@@ -30498,6 +30502,8 @@ impl<'source> Compiler<'source> {
 
         self.assembler
             .record_exception_setup(finally_handler, false);
+        self.assembler
+            .record_legacy_native_setup_target(finally_handler, cleanup);
         self.assembler.mark(finally_handler);
         self.set_depth(base_depth + 1);
         self.assembler.set_location(SourceLocation::NONE);
@@ -31258,6 +31264,8 @@ impl<'source> Compiler<'source> {
         }
         self.assembler
             .record_synchronous_with_exception_setup(protected_start);
+        self.assembler
+            .record_legacy_native_setup_target(protected_start, handler);
         self.bind_native_source_label(
             super::legacy_native_labels::NativeRole::WithBlock(item.context_expr.range()),
             protected_start,
@@ -31609,6 +31617,8 @@ impl<'source> Compiler<'source> {
         );
 
         self.assembler.record_exception_setup(handler, false);
+        self.assembler
+            .record_legacy_native_setup_target(handler, cleanup);
         self.bind_native_source_label(
             super::legacy_native_labels::NativeRole::WithFinal(item.context_expr.range()),
             handler,

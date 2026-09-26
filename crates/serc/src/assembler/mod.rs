@@ -15751,6 +15751,15 @@ impl Assembler {
             .push((label, nop_location));
     }
 
+    /// Records a 3.12 SETUP target before exception ranges can be split or copied.
+    pub(crate) fn record_legacy_native_setup_target(&mut self, entry: Label, handler: Label) {
+        if self.python_version == crate::PythonVersion::Py312 {
+            self.exception_owner_provenance
+                .legacy_native_setup_targets
+                .push((entry, handler));
+        }
+    }
+
     /// Retains the authored handler identity of an ordinary try's original SETUP.
     pub(crate) fn record_ordinary_try_exception_setup(
         &mut self,
@@ -15759,6 +15768,7 @@ impl Assembler {
         handler: Label,
     ) {
         self.record_exception_setup(label, retained_nop);
+        self.record_legacy_native_setup_target(label, handler);
         self.exception_owner_provenance
             .ordinary_try_setups
             .insert(label, handler);
