@@ -18,6 +18,7 @@ mod python_312_starred_defaults;
 mod source;
 mod stack;
 mod target;
+mod type_alias_syntax;
 mod yield_from_syntax;
 mod yield_syntax;
 
@@ -677,20 +678,31 @@ fn compile_normalized(
         }
         return Err(indentation::excess_error(range));
     }
+    let prefer_type_alias_error = |error| {
+        type_alias_syntax::before_error(
+            source,
+            parsed.suite(),
+            parsed.tokens(),
+            parsed.errors(),
+            parsed.unsupported_syntax_errors(),
+            options.python_version,
+            &error,
+        )
+        .unwrap_or(error)
+    };
     if let Some(error) = parse_error {
         if may_depend_on_decimal_parse {
             return Err(unknown_decimal_parse());
         }
-        if let Some(yield_error) = yield_syntax::before_parse_error(
+        let error = if let Some(yield_error) = yield_syntax::before_parse_error(
             source,
             parsed.tokens(),
             parsed.errors(),
             parsed.unsupported_syntax_errors(),
             options.python_version,
         ) {
-            return Err(yield_error);
-        }
-        if parsed.errors().len() == 1
+            yield_error
+        } else if parsed.errors().len() == 1
             && parsed.unsupported_syntax_errors().is_empty()
             && matches!(
                 error.error,
@@ -698,15 +710,16 @@ fn compile_normalized(
             )
             && is_attribute_named_expression_target(parsed.suite(), error.location)
         {
-            return Err(CompileError::invalid_syntax(
+            CompileError::invalid_syntax(
                 "cannot use assignment expressions with attribute",
                 error.location,
-            ));
-        }
-        if let Some((message, range)) = yield_from_syntax::invalid_tuple_diagnostic(parsed) {
-            return Err(CompileError::invalid_syntax(message, range));
-        }
-        return Err(CompileError::Parse(error.clone()));
+            )
+        } else if let Some((message, range)) = yield_from_syntax::invalid_tuple_diagnostic(parsed) {
+            CompileError::invalid_syntax(message, range)
+        } else {
+            CompileError::Parse(error.clone())
+        };
+        return Err(prefer_type_alias_error(error));
     }
     if let Some(error) = yield_syntax::earlier_unsupported(
         source,
@@ -714,9 +727,11 @@ fn compile_normalized(
         parsed.unsupported_syntax_errors(),
         options.python_version,
     ) {
-        return Err(error);
+        return Err(prefer_type_alias_error(error));
     }
-    yield_syntax::validate(source, parsed.tokens(), options.python_version)?;
+    if let Err(error) = yield_syntax::validate(source, parsed.tokens(), options.python_version) {
+        return Err(prefer_type_alias_error(error));
+    }
     decimal_literals::validate(
         source,
         parsed.tokens(),
@@ -753,7 +768,10 @@ fn compile_normalized(
         if may_depend_on_decimal_parse {
             return Err(unknown_decimal_parse());
         }
-        return Err(CompileError::invalid_syntax(error.to_string(), error.range));
+        return Err(prefer_type_alias_error(CompileError::invalid_syntax(
+            error.to_string(),
+            error.range,
+        )));
     }
     if may_depend_on_decimal_parse
         && has_large_decimal_token(source, parsed.tokens())
