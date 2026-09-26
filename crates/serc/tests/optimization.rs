@@ -4333,3 +4333,118 @@ for name, flag, expected in (
         }
     }
 }
+
+#[test]
+fn protected_with_assertion_join_before_pass_matches_cpython() {
+    assert_matches_cpython_versions(
+        "def f(flag, manager):\n    try:\n        with manager:\n            if flag:\n                assert flag\n            else:\n                assert not flag\n            pass\n        work()\n    except Exception:\n        recover()\n",
+        "protected_with_join_pass.py",
+        &[OptimizationLevel::One, OptimizationLevel::Two],
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+    for source in [
+        "def f(flag, other, manager):\n    try:\n        with manager:\n            if flag or other:\n                assert flag\n            else:\n                assert not flag\n            work()\n        work()\n    except Exception:\n        recover()\n",
+        "def f(flag, manager):\n    try:\n        with manager:\n            if flag:\n                assert flag\n            else:\n                assert not flag\n            work()\n        work()\n    except Exception:\n        recover()\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "protected_with_join_pass.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
+fn protected_with_assertion_join_pass_has_no_exception_owner() {
+    const SOURCE: &str = concat!(
+        "def f(flag, manager):\n    try:\n        with manager:\n            if flag:\n                assert flag\n            else:\n                assert not flag\n            pass\n        work()\n    except Fault:\n        recover()\n",
+        "\ndef g(flag, outer, inner):\n    try:\n        with outer:\n            with inner:\n                if flag:\n                    assert flag\n                else:\n                    assert not flag\n                pass\n            work()\n    except Fault:\n        recover()\n",
+    );
+    const TRACE: &str = r"
+import dis, marshal, sys
+events = []
+class Fault(Exception):
+    pass
+class Manager:
+    def __enter__(self):
+        events.append('enter')
+    def __exit__(self, typ, value, tb):
+        events.append('exit')
+        return False
+scope = {'Fault': Fault, 'work': lambda: events.append('work'),
+         'recover': lambda: events.append('recover')}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+for name, offset, args, expected in [
+    ('f', 7, (True, Manager()), ['enter', 'hit']),
+    ('g', 8, (True, Manager(), Manager()), ['enter', 'enter', 'hit']),
+]:
+    fn = scope[name]
+    offsets = [instruction.offset for instruction in dis.get_instructions(fn)
+               if instruction.opname == 'NOP'
+               and instruction.positions.lineno == fn.__code__.co_firstlineno + offset]
+    if len(offsets) != 1:
+        raise AssertionError((name, offsets))
+    def trace(frame, event, arg):
+        if frame.f_code is fn.__code__:
+            frame.f_trace_opcodes = True
+            if event == 'opcode' and frame.f_lasti == offsets[0]:
+                events.append('hit')
+                raise Fault()
+        return trace
+    events.clear()
+    sys.settrace(trace)
+    try:
+        try:
+            fn(*args)
+            raise AssertionError('injection did not escape')
+        except Fault:
+            pass
+    finally:
+        sys.settrace(None)
+    if events != expected:
+        raise AssertionError((name, events))
+";
+    for version in [PythonVersion::Py314, PythonVersion::Py315] {
+        for level in [OptimizationLevel::One, OptimizationLevel::Two] {
+            let native = oracle(
+                SOURCE.as_bytes(),
+                "protected_with_join_pass.py",
+                version,
+                level,
+            );
+            assert!(native.status.success());
+            let actual = compile_with_options(
+                SOURCE,
+                "protected_with_join_pass.py",
+                &CompileOptions {
+                    python_version: version,
+                    optimization_level: level,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .marshal();
+            assert_eq!(actual, native.stdout);
+            let index = VERSIONS
+                .iter()
+                .position(|(target, _, _)| *target == version)
+                .unwrap();
+            for payload in [&native.stdout, &actual] {
+                let mut child = Command::new(ORACLES[index].get().unwrap())
+                    .args(["-I", "-S", "-c", TRACE])
+                    .stdin(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child.stdin.take().unwrap().write_all(payload).unwrap();
+                let result = child.wait_with_output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{version:?} {level:?}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        }
+    }
+}

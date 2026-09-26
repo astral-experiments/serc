@@ -2110,6 +2110,44 @@ impl<'source> Compiler<'source> {
                     .active_with_exits
                     .last()
                     .is_some_and(|context| context.is_async);
+            // An optimized assertion-only conditional's retained join precedes the
+            // direct manager-tail pass in a separate original instruction slot.
+            let protected_sync_with_join_pass = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && self.control.loops.contexts.is_empty()
+                && !self.control.in_exception_handler()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && !self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && !self.control.withs.active_with_region_exclusions.is_empty()
+                && matches!(statement, Stmt::Pass(pass)
+                    if self.control.withs.active_with_exits.last().is_some_and(|manager|
+                        !manager.is_async && manager.terminal_statement_range == Some(pass.range)))
+                && matches!(body.get(index.wrapping_sub(1)), Some(Stmt::If(previous))
+                    if original_condition_has_unique_jump_target(&previous.test, true)
+                        && condition_has_linear_runtime_leaves(&previous.test)
+                        && !expression_suspends_current_scope(&previous.test)
+                        && !previous.body.is_empty()
+                        && previous.body.iter().all(|stmt| matches!(
+                            self.context.optimized_locations.get(&stmt.range()),
+                            Some(super::optimization::OptimizedLocation::Elided)
+                        ))
+                        && matches!(previous.elif_else_clauses.as_slice(), [clause]
+                            if clause.test.is_none() && !clause.body.is_empty()
+                                && clause.body.iter().all(|stmt| matches!(
+                                    self.context.optimized_locations.get(&stmt.range()),
+                                    Some(super::optimization::OptimizedLocation::Elided)
+                                )))
+                );
             let constant_pass_location = match statement {
                 Stmt::Pass(statement) => Some(self.source_location(statement.range)),
                 _ => None,
@@ -2143,6 +2181,7 @@ impl<'source> Compiler<'source> {
                 && (self.control.exceptions.active_exception_region_exclusions.is_empty()
                     || self.control.finally.active_finally_end_blocks > 0
                     || protected_async_with_pass
+                    || protected_sync_with_join_pass
                     || (self.control.statements.retained_branch_pass == Some(statement.range)
                         && self.assembler.current_block_last_instruction_location().is_some_and(
                             |previous| previous.line >= 0
