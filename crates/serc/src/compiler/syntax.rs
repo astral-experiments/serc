@@ -28,6 +28,42 @@ mod pattern_debug;
 mod pattern_numeric;
 mod unicode_printable;
 
+/// Conservatively identify modules whose mapping patterns might contain duplicate keys.
+pub(crate) fn may_have_duplicate_mapping_key(body: &[Stmt]) -> bool {
+    struct Finder(bool);
+
+    impl<'ast> Visitor<'ast> for Finder {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_stmt(statement));
+            }
+            if !self.0 {
+                walk_stmt(self, statement);
+            }
+        }
+
+        fn visit_pattern(&mut self, pattern: &'ast Pattern) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_pattern(pattern));
+            }
+            if self.0 {
+                return;
+            }
+            if matches!(pattern, Pattern::MatchMapping(mapping) if mapping.keys.len() > 1) {
+                self.0 = true;
+            } else {
+                walk_pattern(self, pattern);
+            }
+        }
+
+        fn visit_expr(&mut self, _expression: &'ast Expr) {}
+    }
+
+    let mut finder = Finder(false);
+    finder.visit_body(body);
+    finder.0
+}
+
 /// Validate AST-based syntax restrictions using Ruff's shared checker.
 #[cfg(test)]
 pub(crate) fn validate(
@@ -39,13 +75,30 @@ pub(crate) fn validate(
 }
 
 /// Validate syntax before optimization, retaining symbol-table checks in discarded assertions.
-pub(crate) fn validate_with_optimization(
+#[cfg(test)]
+fn validate_with_optimization(
     source: &str,
     body: &[Stmt],
     python_version: PythonVersion,
     optimization_level: OptimizationLevel,
 ) -> Result<(), CompileError> {
-    validate_with_statement_pruning::<true>(source, body, python_version, optimization_level)
+    validate_with_integer_limit(source, body, python_version, optimization_level, None)
+}
+
+pub(crate) fn validate_with_integer_limit(
+    source: &str,
+    body: &[Stmt],
+    python_version: PythonVersion,
+    optimization_level: OptimizationLevel,
+    mapping_key_int_max_str_digits: Option<u32>,
+) -> Result<(), CompileError> {
+    validate_with_statement_pruning::<true>(
+        source,
+        body,
+        python_version,
+        optimization_level,
+        mapping_key_int_max_str_digits,
+    )
 }
 
 fn validate_declarations(
@@ -66,9 +119,15 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
     body: &[Stmt],
     python_version: PythonVersion,
     optimization_level: OptimizationLevel,
+    mapping_key_int_max_str_digits: Option<u32>,
 ) -> Result<(), CompileError> {
-    let mut validator =
-        new_validator::<PRUNE_STATEMENTS, false>(source, body, python_version, optimization_level);
+    let mut validator = new_validator::<PRUNE_STATEMENTS, false>(
+        source,
+        body,
+        python_version,
+        optimization_level,
+        mapping_key_int_max_str_digits,
+    );
     validator.visit_scope_body(body);
     let lowering_keyword_error = validator.lowering_keyword_error.get();
     let debug_pattern_replay =
@@ -90,6 +149,7 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
             body,
             python_version,
             optimization_level,
+            mapping_key_int_max_str_digits,
         );
         replay.class_lowering_target = Some(*range);
         replay.visit_scope_body(body);
@@ -116,8 +176,13 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
             && (!lowering_error
                 || matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315))
         {
-            let mut validator =
-                new_validator::<false, true>(source, body, python_version, optimization_level);
+            let mut validator = new_validator::<false, true>(
+                source,
+                body,
+                python_version,
+                optimization_level,
+                mapping_key_int_max_str_digits,
+            );
             validator.visit_body(body);
             if let Some(future_error) = validator.error.into_inner() {
                 return Err(future_error);
@@ -125,8 +190,13 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         }
         // Symbol-table diagnostics precede docstring cleanup too, including declarations in
         // another scope. Keep walking past code-generation errors to find those diagnostics.
-        let mut validator =
-            new_validator::<false, false>(source, body, python_version, optimization_level);
+        let mut validator = new_validator::<false, false>(
+            source,
+            body,
+            python_version,
+            optimization_level,
+            mapping_key_int_max_str_digits,
+        );
         validator.pre_lowering_only = true;
         validator.numeric_symbol_replay = numeric_symbol_replay;
         validator.visit_body(body);
@@ -177,6 +247,7 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
     body: &'ast [Stmt],
     python_version: PythonVersion,
     optimization_level: OptimizationLevel,
+    mapping_key_int_max_str_digits: Option<u32>,
 ) -> Validator<'source, 'ast, PRUNE_STATEMENTS, FUTURE_ONLY> {
     Validator {
         checker: SemanticSyntaxChecker::new(),
@@ -206,6 +277,7 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
         source,
         may_have_debug_patterns: source.contains("__debug__") || !source.is_ascii(),
         body,
+        mapping_key_int_max_str_digits,
         python_version: match python_version {
             PythonVersion::Py312 => ast::PythonVersion::PY312,
             PythonVersion::Py313 => ast::PythonVersion::PY313,
@@ -229,7 +301,13 @@ fn validate_without_statement_pruning(
     body: &[Stmt],
     python_version: PythonVersion,
 ) -> Result<(), CompileError> {
-    validate_with_statement_pruning::<false>(source, body, python_version, OptimizationLevel::Zero)
+    validate_with_statement_pruning::<false>(
+        source,
+        body,
+        python_version,
+        OptimizationLevel::Zero,
+        None,
+    )
 }
 
 /// Returns the UTF-8 failure CPython encounters before it starts cleaning a docstring.
@@ -429,6 +507,7 @@ struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
     may_have_debug_patterns: bool,
     body: &'ast [Stmt],
     python_version: ast::PythonVersion,
+    mapping_key_int_max_str_digits: Option<u32>,
     future_annotations: bool,
     private_name: Option<&'ast str>,
     mangled_names: Option<FxHashSet<&'ast str>>,
@@ -2174,11 +2253,18 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             self.lowering_keyword_error.set(true);
         }
         // Preserve the existing public diagnostics for checks previously performed in lowering.
-        let mapping_diagnostic = matches!(error.kind, Kind::DuplicateMatchKey(_))
-            .then(|| {
-                mapping_diagnostic::find(self.source, self.body, error.range, self.python_version)
-            })
-            .flatten();
+        if matches!(error.kind, Kind::DuplicateMatchKey(_))
+            && let Some(diagnostic) = mapping_diagnostic::find(
+                self.source,
+                self.body,
+                error.range,
+                self.python_version,
+                self.mapping_key_int_max_str_digits,
+            )
+        {
+            *reported = Some(diagnostic);
+            return;
+        }
         let message = match &error.kind {
             Kind::FutureFeatureNotDefined(name) => {
                 if name == "braces" {
@@ -2225,9 +2311,7 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             Kind::MultipleCaseAssignment(name) => {
                 format!("multiple assignments to name '{name}' in pattern")
             }
-            _ => mapping_diagnostic
-                .as_ref()
-                .map_or_else(|| error.to_string(), |(message, _)| message.clone()),
+            _ => error.to_string(),
         };
         *reported = Some(
             if matches!(
@@ -2241,7 +2325,7 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             ) {
                 CompileError::InvalidPattern {
                     message,
-                    range: mapping_diagnostic.map_or(error.range, |(_, range)| range),
+                    range: error.range,
                 }
             } else {
                 CompileError::invalid_syntax(message, error.range)

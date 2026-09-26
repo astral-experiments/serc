@@ -31,7 +31,7 @@ pub use config::{
     ParsePythonVersionError, PythonVersion,
 };
 pub use initial_intern_state::InitialInternState;
-use ruff_text_size::{TextRange, TextSize};
+use ruff_text_size::{Ranged, TextRange, TextSize};
 use siphasher::sip::SipHasher13;
 pub use source::{SourceDecodeError, decode_source};
 
@@ -189,6 +189,13 @@ pub enum CompileError {
     },
     /// The source uses valid Python syntax that this backend does not support yet.
     Unsupported(String),
+    /// CPython raises `ValueError` when formatting an integer exceeds the selected limit.
+    IntegerStringConversionLimit {
+        /// The maximum number of decimal digits configured at the formatting event.
+        max_digits: u32,
+    },
+    /// The caller has not established the integer-to-string limit needed for this diagnostic.
+    UnresolvedIntegerStringLimit,
     /// Initial intern-state uncertainty can affect serialized object identity.
     UnresolvedInternState {
         /// The string whose prior canonical identity is unknown.
@@ -209,6 +216,8 @@ impl CompileError {
             Self::InvalidFilename
             | Self::Decode(_)
             | Self::Unsupported(_)
+            | Self::IntegerStringConversionLimit { .. }
+            | Self::UnresolvedIntegerStringLimit
             | Self::UnresolvedInternState { .. }
             | Self::Internal(_) => None,
         }
@@ -233,6 +242,13 @@ impl fmt::Display for CompileError {
             }
             Self::InvalidDocstring { message, .. } => formatter.write_str(message),
             Self::Unsupported(message) => formatter.write_str(message),
+            Self::IntegerStringConversionLimit { max_digits } => write!(
+                formatter,
+                "Exceeds the limit ({max_digits} digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit"
+            ),
+            Self::UnresolvedIntegerStringLimit => {
+                formatter.write_str("unresolved integer-to-string conversion limit")
+            }
             Self::UnresolvedInternState { value } => {
                 write!(formatter, "unresolved initial intern state for {value:?}")
             }
@@ -251,6 +267,8 @@ impl Error for CompileError {
             | Self::InvalidSyntax { .. }
             | Self::InvalidDocstring { .. }
             | Self::Unsupported(_)
+            | Self::IntegerStringConversionLimit { .. }
+            | Self::UnresolvedIntegerStringLimit
             | Self::UnresolvedInternState { .. }
             | Self::Internal(_) => None,
         }
@@ -288,6 +306,34 @@ pub fn compile_with_options(
     options: &CompileOptions,
 ) -> Result<CompiledModule, CompileError> {
     validate_filename(filename)?;
+    compile_text_source(source, filename.into(), options, None)
+}
+
+/// Compile source with a proved CPython integer-string limit for duplicate mapping keys.
+///
+/// `limit` is zero for an unlimited interpreter, or a value from 640 through `i32::MAX`.
+/// It must be the limit at the key-formatting event, after any callbacks have run. The caller
+/// must also establish that earlier callbacks return normally and do not replace the result.
+/// Decimal parsing has a separate limit; duplicate-key diagnostics remain unsupported when a
+/// decimal token could depend on it. Large values that can invoke `_pylong` also remain unsupported
+/// unless CPython's earlier check already proves a conversion-limit error.
+pub fn compile_with_options_and_mapping_key_limit(
+    source: &str,
+    filename: &str,
+    options: &CompileOptions,
+    limit: u32,
+) -> Result<CompiledModule, CompileError> {
+    validate_filename(filename)?;
+    validate_mapping_key_limit(limit)?;
+    compile_text_source(source, filename.into(), options, Some(limit))
+}
+
+fn compile_text_source(
+    source: &str,
+    filename: CodeFilename,
+    options: &CompileOptions,
+    mapping_key_int_max_str_digits: Option<u32>,
+) -> Result<CompiledModule, CompileError> {
     if source.contains('\0') {
         return Err(CompileError::Decode(SourceDecodeError::NullByte));
     }
@@ -300,7 +346,7 @@ pub fn compile_with_options(
         ));
     }
     let source = source::normalize_source(source);
-    compile_normalized(&source, filename.into(), options)
+    compile_normalized(&source, filename, options, mapping_key_int_max_str_digits)
 }
 
 /// Decode and compile Python source bytes for CPython 3.14.5.
@@ -341,7 +387,22 @@ pub fn compile_bytes_with_options(
     options: &CompileOptions,
 ) -> Result<CompiledModule, CompileError> {
     validate_filename(filename)?;
-    compile_byte_source(source, filename.into(), options)
+    compile_byte_source(source, filename.into(), options, None)
+}
+
+/// Decode and compile source bytes with a proved duplicate-key integer-string limit.
+///
+/// The limit and callback requirements are the same as
+/// [`compile_with_options_and_mapping_key_limit`].
+pub fn compile_bytes_with_options_and_mapping_key_limit(
+    source: &[u8],
+    filename: &str,
+    options: &CompileOptions,
+    limit: u32,
+) -> Result<CompiledModule, CompileError> {
+    validate_filename(filename)?;
+    validate_mapping_key_limit(limit)?;
+    compile_byte_source(source, filename.into(), options, Some(limit))
 }
 
 /// Decode and compile source bytes with an operating-system filename and the selected options.
@@ -357,26 +418,59 @@ pub fn compile_bytes_with_path_and_options(
     if filename.as_os_str().as_encoded_bytes().contains(&0) {
         return Err(CompileError::InvalidFilename);
     }
-    compile_byte_source(source, CodeFilename::from_path(filename), options)
+    compile_byte_source(source, CodeFilename::from_path(filename), options, None)
+}
+
+/// Decode and compile source bytes with an OS filename and proved duplicate-key limit.
+///
+/// The limit and callback requirements are the same as
+/// [`compile_with_options_and_mapping_key_limit`].
+pub fn compile_bytes_with_path_options_and_mapping_key_limit(
+    source: &[u8],
+    filename: &Path,
+    options: &CompileOptions,
+    limit: u32,
+) -> Result<CompiledModule, CompileError> {
+    if filename.as_os_str().as_encoded_bytes().contains(&0) {
+        return Err(CompileError::InvalidFilename);
+    }
+    validate_mapping_key_limit(limit)?;
+    compile_byte_source(
+        source,
+        CodeFilename::from_path(filename),
+        options,
+        Some(limit),
+    )
 }
 
 fn compile_byte_source(
     source: &[u8],
     filename: CodeFilename,
     options: &CompileOptions,
+    mapping_key_int_max_str_digits: Option<u32>,
 ) -> Result<CompiledModule, CompileError> {
     let decoded = source::decode_source_with_codec(source).map_err(CompileError::Decode)?;
     if !options
         .initial_intern_state
         .models_standard_source_codec_effects()
     {
-        return compile_normalized(&decoded.source, filename, options);
+        return compile_normalized(
+            &decoded.source,
+            filename,
+            options,
+            mapping_key_int_max_str_digits,
+        );
     }
     let strings = decoded.codec.map_or(&[][..], |codec| {
         target::source_codec_strings(options.python_version, codec)
     });
     if strings.is_empty() && decoded.registry_name.is_none() {
-        return compile_normalized(&decoded.source, filename, options);
+        return compile_normalized(
+            &decoded.source,
+            filename,
+            options,
+            mapping_key_int_max_str_digits,
+        );
     }
     let state = options.initial_intern_state.with_additional_strings(
         strings
@@ -391,12 +485,22 @@ fn compile_byte_source(
             initial_intern_state: state,
             ..options.clone()
         },
+        mapping_key_int_max_str_digits,
     )
 }
 
 fn validate_filename(filename: &str) -> Result<(), CompileError> {
     if filename.contains('\0') {
         return Err(CompileError::InvalidFilename);
+    }
+    Ok(())
+}
+
+fn validate_mapping_key_limit(limit: u32) -> Result<(), CompileError> {
+    if limit != 0 && !(640..=2_147_483_647).contains(&limit) {
+        return Err(CompileError::Unsupported(
+            "integer-to-string limit must be zero or between 640 and i32::MAX".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -477,13 +581,61 @@ impl Drop for ParsedModule {
     }
 }
 
+// A Python decimal integer may fail while parsing, before mapping-key lowering. The
+// parsing limit is separate from the limit supplied for formatting. This raw scan
+// overapproximates a long decimal token even when Ruff stops on an earlier error.
+fn may_depend_on_decimal_parse(source: &str) -> bool {
+    if !source.contains("match") || !source.contains("case") {
+        return false;
+    }
+    let mut digits = 0_usize;
+    for byte in source.bytes() {
+        if byte.is_ascii_digit() {
+            digits += 1;
+            if digits > 640 {
+                return true;
+            }
+        } else if byte != b'_' {
+            digits = 0;
+        }
+    }
+    false
+}
+
+fn unknown_decimal_parse() -> CompileError {
+    CompileError::Unsupported("decimal integer parsing limit is not known".to_owned())
+}
+
+fn has_large_decimal_token(source: &str, tokens: &ruff_python_ast::token::Tokens) -> bool {
+    use ruff_python_ast::token::TokenKind;
+    tokens.iter().any(|token| {
+        if token.kind() != TokenKind::Int {
+            return false;
+        }
+        let spelling = &source[token.range()];
+        if spelling.starts_with("0x")
+            || spelling.starts_with("0X")
+            || spelling.starts_with("0o")
+            || spelling.starts_with("0O")
+            || spelling.starts_with("0b")
+            || spelling.starts_with("0B")
+        {
+            return false;
+        }
+        spelling.bytes().filter(u8::is_ascii_digit).count() > 640
+    })
+}
+
 fn compile_normalized(
     source: &str,
     filename: CodeFilename,
     options: &CompileOptions,
+    mapping_key_int_max_str_digits: Option<u32>,
 ) -> Result<CompiledModule, CompileError> {
     if stack_growth_required() {
-        return grow_stack(|| compile_normalized(source, filename, options));
+        return grow_stack(|| {
+            compile_normalized(source, filename, options, mapping_key_int_max_str_digits)
+        });
     }
     options
         .native_build_profile
@@ -496,7 +648,15 @@ fn compile_normalized(
     };
     let parse_options = ruff_python_parser::ParseOptions::from(ruff_python_parser::Mode::Module)
         .with_target_version(target_version);
-    delimiter_nesting::validate(source, &parse_options, options.python_version)?;
+    let may_depend_on_decimal_parse = may_depend_on_decimal_parse(source);
+    if let Err(error) = delimiter_nesting::validate(source, &parse_options, options.python_version)
+    {
+        return Err(if may_depend_on_decimal_parse {
+            unknown_decimal_parse()
+        } else {
+            error
+        });
+    }
     let parsed = ruff_python_parser::parse_unchecked(source, parse_options.clone())
         .try_into_module()
         .ok_or_else(|| CompileError::Internal("parser did not return a module".to_string()))?;
@@ -517,6 +677,9 @@ fn compile_normalized(
         return Err(indentation::excess_error(range));
     }
     if let Some(error) = parse_error {
+        if may_depend_on_decimal_parse {
+            return Err(unknown_decimal_parse());
+        }
         if let Some(yield_error) = yield_syntax::before_parse_error(
             source,
             parsed.tokens(),
@@ -570,13 +733,23 @@ fn compile_normalized(
         }
     }
     if let Some(error) = parsed.unsupported_syntax_errors().first() {
+        if may_depend_on_decimal_parse {
+            return Err(unknown_decimal_parse());
+        }
         return Err(CompileError::invalid_syntax(error.to_string(), error.range));
     }
-    compiler::syntax::validate_with_optimization(
+    if may_depend_on_decimal_parse
+        && has_large_decimal_token(source, parsed.tokens())
+        && compiler::syntax::may_have_duplicate_mapping_key(parsed.suite())
+    {
+        return Err(unknown_decimal_parse());
+    }
+    compiler::syntax::validate_with_integer_limit(
         source,
         parsed.suite(),
         options.python_version,
         options.optimization_level,
+        mapping_key_int_max_str_digits,
     )?;
     let optimized_body = (options.optimization_level != OptimizationLevel::Zero).then(|| {
         compiler::optimization::prepare(
