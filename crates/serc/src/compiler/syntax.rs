@@ -123,6 +123,7 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
         let mut validator =
             new_validator::<false, false>(source, body, python_version, optimization_level);
         validator.pre_lowering_only = true;
+        validator.numeric_symbol_replay = numeric_symbol_replay;
         validator.visit_body(body);
         let pattern_debug_range = validator.symbol_pattern_debug_range;
         if let Some(priority_error) = validator.error.into_inner() {
@@ -189,6 +190,7 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
         class_lowering_depth: 0,
         lowering_debug_error: false,
         lowering_numeric_error: false,
+        numeric_symbol_replay: false,
         bare_starred: None,
         check_bare_starred: true,
         has_declarations: false,
@@ -410,6 +412,7 @@ struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
     class_lowering_depth: usize,
     lowering_debug_error: bool,
     lowering_numeric_error: bool,
+    numeric_symbol_replay: bool,
     bare_starred: Option<(TextRange, BareStarredKind)>,
     check_bare_starred: bool,
     has_declarations: bool,
@@ -2021,8 +2024,16 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
                 .reported_future_feature
                 .get()
                 .is_some_and(|range| error.range.contains_range(range));
+        // Ruff reports an unknown future name before its enclosing late import. During this
+        // symbol-order replay CPython rejects the late import first, even for an unknown name.
+        let replaces_unknown_future = self.numeric_symbol_replay
+            && matches!(error.kind, Kind::LateFutureImport)
+            && reported.as_ref().and_then(CompileError::range).is_some_and(|range| {
+                range != error.range && error.range.contains_range(range)
+            });
         if reported.is_some()
             && !later_future_in_same_statement
+            && !replaces_unknown_future
             && !(self.pending_pattern.is_some()
                 && matches!(error.kind, Kind::WriteToDebug(_))
                 && !matches!(*reported, Some(CompileError::InvalidSyntax { .. })))
