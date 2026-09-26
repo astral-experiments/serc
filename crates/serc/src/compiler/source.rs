@@ -2824,6 +2824,57 @@ fn annotation_string_literal_repr(
     (repr, has_surrogates)
 }
 
+/// Render a string literal's decoded value using the target's printable characters.
+pub(super) fn diagnostic_string_literal_repr(
+    string: &ruff_python_ast::ExprStringLiteral,
+    source: &str,
+    is_printable: impl Fn(char) -> bool,
+) -> String {
+    use std::fmt::Write;
+
+    let mut body = AnnotationStringBody::default();
+    for literal in &string.value {
+        body.push_literal(
+            literal.as_str(),
+            source,
+            literal.range,
+            literal.flags.prefix().is_raw(),
+            false,
+        );
+    }
+    let quote = if body.value.contains('\'') && !body.value.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    let mut result = String::new();
+    result.push(quote);
+    let mut surrogates = body.surrogates.iter().copied().peekable();
+    for (offset, character) in body.value.char_indices() {
+        if surrogates.peek().is_some_and(|(index, _)| *index == offset) {
+            let (_, surrogate) = surrogates.next().expect("matching surrogate exists");
+            write!(result, "\\u{surrogate:04x}").unwrap();
+            continue;
+        }
+        match character {
+            '\t' => result.push_str("\\t"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\\' => result.push_str("\\\\"),
+            ch if ch == quote => {
+                result.push('\\');
+                result.push(ch);
+            }
+            ch if is_printable(ch) => result.push(ch),
+            ch if u32::from(ch) < 0x100 => write!(result, "\\x{:02x}", u32::from(ch)).unwrap(),
+            ch if u32::from(ch) < 0x10000 => write!(result, "\\u{:04x}", u32::from(ch)).unwrap(),
+            ch => write!(result, "\\U{:08x}", u32::from(ch)).unwrap(),
+        }
+    }
+    result.push(quote);
+    result
+}
+
 fn python_string_repr(value: &str) -> String {
     ruff_python_literal::escape::UnicodeEscape::new_repr(value)
         .str_repr(ruff_python_ast::str::TripleQuotes::No)
