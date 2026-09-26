@@ -2038,12 +2038,11 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
                 .as_ref()
                 .and_then(CompileError::range)
                 .is_some_and(|range| range != error.range && error.range.contains_range(range));
+        let replaces_pending_debug = self.pending_pattern.is_some()
+            && matches!(error.kind, Kind::WriteToDebug(_))
+            && !matches!(*reported, Some(CompileError::InvalidSyntax { .. }));
         if reported.is_some()
-            && !later_future_in_same_statement
-            && !replaces_unknown_future
-            && !(self.pending_pattern.is_some()
-                && matches!(error.kind, Kind::WriteToDebug(_))
-                && !matches!(*reported, Some(CompileError::InvalidSyntax { .. })))
+            && !(later_future_in_same_statement || replaces_unknown_future || replaces_pending_debug)
         {
             return;
         }
