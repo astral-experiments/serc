@@ -2,7 +2,9 @@ mod common;
 
 use std::process::Command;
 
-use serc::{CompileOptions, PythonVersion, compile_bytes_with_options, compile_with_options};
+use serc::{
+    CompileError, CompileOptions, PythonVersion, compile_bytes_with_options, compile_with_options,
+};
 
 #[test]
 fn decimal_literal_digit_limit_matches_cpython() {
@@ -115,17 +117,75 @@ fn decimal_limit_respects_earlier_version_errors() {
     let exception = "try:\n    pass\nexcept TypeError, ValueError:\n    pass\n";
     let pattern = "match 1:\n    case +1:\n        pass\n";
     let mut cases = Vec::new();
-    for unsupported in [template, default, lazy, unpack, exception, pattern] {
-        cases.push(format!("{unsupported}{large}"));
-        cases.push(format!("{large}{unsupported}"));
+    for (unsupported, message) in [
+        (template, "Cannot use t-strings"),
+        (default, "Cannot set default type for a type parameter"),
+        (lazy, "Cannot use `lazy` import statement"),
+        (unpack, "Cannot use iterable unpacking"),
+        (exception, "Multiple exception types must be parenthesized"),
+        (pattern, "Unary '+' is not allowed in a literal pattern"),
+    ] {
+        cases.push((format!("{unsupported}{large}"), message));
+        cases.push((format!("{large}{unsupported}"), message));
     }
     cases.extend([
-        format!("t'{{{digits}}}'\n"),
-        format!("def f[T = {digits}]():\n    pass\n"),
-        format!("def f[T: {digits} = int]():\n    pass\n"),
-        format!("value = [*{digits} for v in ()]\n"),
-        format!("try:\n    pass\nexcept TypeError, {digits}:\n    pass\n"),
-        format!("match 1:\n    case +{digits}:\n        pass\n"),
+        (format!("t'{{{digits}}}'\n"), "Cannot use t-strings"),
+        (
+            format!("def f[T = {digits}]():\n    pass\n"),
+            "Cannot set default type for a type parameter",
+        ),
+        (
+            format!("def f[T: {digits} = int]():\n    pass\n"),
+            "Cannot set default type for a type parameter",
+        ),
+        (
+            format!("value = [*{digits} for v in ()]\n"),
+            "Cannot use iterable unpacking",
+        ),
+        (
+            format!("value = [*v for v in [{digits}]]\n"),
+            "Cannot use iterable unpacking",
+        ),
+        (
+            format!("value = [*v for v in () if {digits}]\n"),
+            "Cannot use iterable unpacking",
+        ),
+        (
+            format!("value = [*v for v in ()] + {digits}\n"),
+            "Cannot use iterable unpacking",
+        ),
+        (
+            format!("f([*v for v in ()], {digits})\n"),
+            "Cannot use iterable unpacking",
+        ),
+        (
+            format!("value = [[*v for v in ()] for v in [{digits}]]\n"),
+            "Cannot use iterable unpacking",
+        ),
+        (
+            format!("value = {{*v for v in [{digits}]}}\n"),
+            "Cannot use iterable unpacking",
+        ),
+        (
+            format!("value = {{**v for v in [{digits}]}}\n"),
+            "Cannot use dictionary unpacking",
+        ),
+        (
+            format!("value = (*v for v in [{digits}])\n"),
+            "Cannot use iterable unpacking",
+        ),
+        (
+            format!("try:\n    pass\nexcept TypeError, {digits}:\n    pass\n"),
+            "Multiple exception types must be parenthesized",
+        ),
+        (
+            format!("try:\n    pass\nexcept TypeError, ValueError:\n    value = {digits}\n"),
+            "Multiple exception types must be parenthesized",
+        ),
+        (
+            format!("match 1:\n    case +{digits}:\n        pass\n"),
+            "Unary '+' is not allowed in a literal pattern",
+        ),
     ]);
     let oracle = r"
 import sys
@@ -146,7 +206,7 @@ else:
             python_version: version,
             ..CompileOptions::default()
         };
-        for source in &cases {
+        for (source, unsupported_message) in &cases {
             let mut python = match version {
                 PythonVersion::Py312 => common::python_312_command(),
                 PythonVersion::Py313 => common::python_313_command(),
@@ -158,13 +218,16 @@ else:
             let expected = String::from_utf8(native.stdout).unwrap();
             assert!(matches!(expected.trim(), "decimal" | "other"), "{version}");
             let error = compile_with_options(source, "ordering.py", &options).unwrap_err();
-            assert_eq!(
-                error
-                    .to_string()
-                    .contains("Exceeds the limit (4300 digits)"),
-                expected.trim() == "decimal",
-                "{version}: {error}"
-            );
+            let CompileError::InvalidSyntax { message, range } = error else {
+                panic!("{version}: expected a syntax diagnostic, got {error:?}");
+            };
+            let expected_message = if expected.trim() == "decimal" {
+                "Exceeds the limit (4300 digits)"
+            } else {
+                unsupported_message
+            };
+            assert!(message.contains(expected_message), "{version}: {message}");
+            assert!(!range.is_empty(), "{version}: missing diagnostic range");
         }
     }
 }
