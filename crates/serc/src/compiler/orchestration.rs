@@ -329,32 +329,45 @@ impl<'source> Compiler<'source> {
         body: &'source Suite,
         python_version: crate::PythonVersion,
     ) -> Box<Self> {
-        Self::module_with_profile(
+        Self::module_with_scope_body(
             filename,
             source,
             tokens,
             body,
+            body,
             python_version,
             crate::NativeBuildProfile::Default,
+            None,
         )
     }
 
-    pub(crate) fn module_with_profile(
+    pub(crate) fn module_with_scope_body(
         filename: impl Into<CodeFilename>,
         source: &'source str,
         tokens: &'source Tokens,
         body: &'source Suite,
+        scope_body: &Suite,
         python_version: crate::PythonVersion,
         native_build_profile: crate::NativeBuildProfile,
+        optimized: Option<&super::optimization::OptimizedSuite>,
     ) -> Box<Self> {
-        let context = Rc::new(CompilationContext::with_profile(
+        let mut context = CompilationContext::with_profile(
             filename.into(),
             source,
             tokens,
             body,
             python_version,
             native_build_profile,
-        ));
+        );
+        if !std::ptr::eq(body, scope_body) {
+            // CPython resolves bindings, closures, and suspension flags before removing
+            // assertions. Keep that symbol table even when code generation has no asserts.
+            context.preserve_unoptimized_scopes(scope_body);
+        }
+        if let Some(optimized) = optimized {
+            context.optimized_locations.clone_from(&optimized.locations);
+        }
+        let context = Rc::new(context);
         let future_flags = context.module_plan().future_flags;
         let unit = CodeUnit::from_spec(CodeUnitSpec {
             scope: Scope::Module,
@@ -588,6 +601,15 @@ impl<'source> Compiler<'source> {
             }
             cell_names.insert(name);
         }
+        let cell_only_comprehension_names = context
+            .scopes
+            .elided_comprehension_cells(scope_id)
+            .iter()
+            .copied()
+            .filter(|name| !locals.contains(name))
+            .collect::<Vec<_>>();
+        locals.extend(cell_only_comprehension_names);
+        locals[fast_local_count..].sort_by_key(|&name| names.resolve(name));
         let free_start = locals.len();
         let free_indices = body_free_aliases
             .iter()
@@ -667,6 +689,27 @@ impl<'source> Compiler<'source> {
                 .iter_unordered(),
         );
         self.symbols.fast_local_count = self.symbols.locals.len();
+        let simple_module_annotations = self.context.module_plan().has_simple_annotations;
+        let module_annotations = self.context.module_plan().has_annotations;
+        let deferred_annotations = self.has_deferred_annotations();
+        let future_module_annotations =
+            self.unit.flags & CO_FUTURE_ANNOTATIONS != 0 && module_annotations;
+        if module_annotations && deferred_annotations {
+            let annotation_name = self.required_name_id("__conditional_annotations__");
+            self.symbols.locals.push(annotation_name);
+            self.symbols.cell_names.insert(annotation_name);
+        }
+        let cell_only_comprehension_names = self
+            .context
+            .scopes
+            .elided_comprehension_cells(ScopeId::MODULE)
+            .iter()
+            .copied()
+            .filter(|name| !self.symbols.locals.contains(name))
+            .collect::<Vec<_>>();
+        self.symbols.locals.extend(cell_only_comprehension_names);
+        self.symbols.locals[self.symbols.fast_local_count..]
+            .sort_by_key(|&name| self.context.scopes.names.resolve(name));
         self.assembler.set_location(SourceLocation::NONE);
         let comprehension_cells = self
             .symbols
@@ -679,19 +722,12 @@ impl<'source> Compiler<'source> {
         for index in comprehension_cells {
             self.emit(MAKE_CELL, to_u32(index, "module cell index")?, 0)?;
         }
-        let simple_module_annotations = self.context.module_plan().has_simple_annotations;
-        let module_annotations = self.context.module_plan().has_annotations;
-        let deferred_annotations = self.has_deferred_annotations();
-        let future_module_annotations =
-            self.unit.flags & CO_FUTURE_ANNOTATIONS != 0 && module_annotations;
-        if module_annotations && deferred_annotations {
-            let annotation_cell =
-                to_u32(self.symbols.locals.len(), "module annotation cell index")?;
-            let annotation_name = self.required_name_id("__conditional_annotations__");
-            self.symbols.locals.push(annotation_name);
-            self.symbols.cell_names.insert(annotation_name);
-            self.assembler.set_location(SourceLocation::NONE);
-            self.emit(MAKE_CELL, annotation_cell, 0)?;
+        if self.context.python_version == PythonVersion::Py315 && self.context.module_contains_yield
+        {
+            self.assembler
+                .set_location(SourceLocation::new(1, 1, -1, -1));
+            self.emit(RETURN_GENERATOR, 0, 1)?;
+            self.emit(POP_TOP, 0, -1)?;
         }
         self.assembler.set_location(SourceLocation::new(0, 1, 0, 0));
         self.emit_resume(ResumeLocation::AT_FUNC_START, ResumeDepth::Zero)?;
@@ -718,7 +754,7 @@ impl<'source> Compiler<'source> {
         if module_annotations && !deferred_annotations {
             if let Some(statement) = body.first() {
                 self.assembler
-                    .set_location(self.source_location(statement.range()));
+                    .set_location(self.physical_source_location(statement.range()));
             }
             self.emit(SETUP_ANNOTATIONS, 0, 0)?;
         }
@@ -726,7 +762,7 @@ impl<'source> Compiler<'source> {
             self.name_index("__conditional_annotations__")?;
             if let Some(statement) = body.first() {
                 self.assembler
-                    .set_location(self.source_location(statement.range()));
+                    .set_location(self.physical_source_location(statement.range()));
             }
             if !future_module_annotations {
                 if simple_module_annotations {
