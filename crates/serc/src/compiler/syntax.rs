@@ -1990,9 +1990,10 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
         // symbol-order replay CPython rejects the late import first, even for an unknown name.
         let replaces_unknown_future = self.numeric_symbol_replay
             && matches!(error.kind, Kind::LateFutureImport)
-            && reported.as_ref().and_then(CompileError::range).is_some_and(|range| {
-                range != error.range && error.range.contains_range(range)
-            });
+            && reported
+                .as_ref()
+                .and_then(CompileError::range)
+                .is_some_and(|range| range != error.range && error.range.contains_range(range));
         if reported.is_some()
             && !later_future_in_same_statement
             && !replaces_unknown_future
@@ -2038,6 +2039,9 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             }
             Kind::WriteToDebug(WriteToDebugKind::Store) => "cannot assign to __debug__".to_owned(),
             Kind::WriteToDebug(WriteToDebugKind::Delete(_)) => "cannot delete __debug__".to_owned(),
+            Kind::LateFutureImport if self.numeric_symbol_replay => {
+                "from __future__ imports must occur at the beginning of the file".to_owned()
+            }
             Kind::BreakOutsideLoop => "'break' outside loop".to_owned(),
             Kind::ContinueOutsideLoop => "'continue' not properly in loop".to_owned(),
             Kind::ReturnOutsideFunction => "'return' outside function".to_owned(),
