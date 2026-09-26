@@ -30,8 +30,8 @@ impl LargeNumericKeys {
             return false;
         };
         let large = matches!(constant, Constant::BigInt { .. });
-        let duplicate = (large && self.integers.contains(&integer))
-            || self.large_integers.contains(&integer);
+        let duplicate =
+            (large && self.integers.contains(&integer)) || self.large_integers.contains(&integer);
         self.integers.insert(integer.clone());
         if large {
             self.large_integers.insert(integer);
@@ -106,14 +106,46 @@ mod tests {
     #[test]
     fn large_integer_mapping_keys_compare_exact_values() {
         let equal = [
-            ("18446744073709551616", "18446744073709551616.0", "1.8446744073709552e+19"),
-            ("18446744073709551616.0", "18446744073709551616", "18446744073709551616"),
-            ("-18446744073709551616", "-18446744073709551616.0", "-1.8446744073709552e+19"),
-            ("-18446744073709551616.0", "-18446744073709551616", "-18446744073709551616"),
-            ("0x1_0000_0000_0000_0000", "18446744073709551616", "18446744073709551616"),
-            ("18446744073709551616", "18446744073709551617.0", "1.8446744073709552e+19"),
-            ("18446744073709551616", "18446744073709551616+0j", "(1.8446744073709552e+19+0j)"),
-            ("18446744073709551616+0j", "18446744073709551616", "18446744073709551616"),
+            (
+                "18446744073709551616",
+                "18446744073709551616.0",
+                "1.8446744073709552e+19",
+            ),
+            (
+                "18446744073709551616.0",
+                "18446744073709551616",
+                "18446744073709551616",
+            ),
+            (
+                "-18446744073709551616",
+                "-18446744073709551616.0",
+                "-1.8446744073709552e+19",
+            ),
+            (
+                "-18446744073709551616.0",
+                "-18446744073709551616",
+                "-18446744073709551616",
+            ),
+            (
+                "0x1_0000_0000_0000_0000",
+                "18446744073709551616",
+                "18446744073709551616",
+            ),
+            (
+                "18446744073709551616",
+                "18446744073709551617.0",
+                "1.8446744073709552e+19",
+            ),
+            (
+                "18446744073709551616",
+                "18446744073709551616+0j",
+                "(1.8446744073709552e+19+0j)",
+            ),
+            (
+                "18446744073709551616+0j",
+                "18446744073709551616",
+                "18446744073709551616",
+            ),
         ];
         for (first, second, repr) in equal {
             let mapping = format!("{{{first}: _, {second}: _}}");
@@ -124,7 +156,11 @@ mod tests {
                 let CompileError::InvalidPattern { message, range } = error else {
                     panic!("{target}: {source:?}: {error:?}");
                 };
-                assert_eq!(message, format!("mapping pattern checks duplicate key ({repr})"), "{target}: {source:?}");
+                assert_eq!(
+                    message,
+                    format!("mapping pattern checks duplicate key ({repr})"),
+                    "{target}: {source:?}"
+                );
                 assert_eq!(&source[range], mapping, "{target}: {source:?}");
             }
         }
@@ -146,10 +182,17 @@ mod tests {
                     .unwrap_or_else(|error| panic!("{target}: {source:?}: {error:?}"));
             }
         }
-        let source = format!("match subject:\n case {{{max_power}: _, 8.98846567431158e307: _}}: pass\n");
+        let source =
+            format!("match subject:\n case {{{max_power}: _, 8.98846567431158e307: _}}: pass\n");
         let parsed = parse_module(&source).unwrap();
         for target in TARGETS {
-            assert!(matches!(validate(&source, &parsed.syntax().body, target), Err(CompileError::InvalidPattern { .. })), "{target}: {source:?}");
+            assert!(
+                matches!(
+                    validate(&source, &parsed.syntax().body, target),
+                    Err(CompileError::InvalidPattern { .. })
+                ),
+                "{target}: {source:?}"
+            );
         }
     }
 
@@ -158,68 +201,144 @@ mod tests {
         let big = "18446744073709551616";
         let float = "18446744073709551616.0";
         for (source, expected, span) in [
-            (format!("match x:\n case {{{big}: [*a, *b], {float}: _}}: pass\n"), "mapping pattern checks duplicate key", format!("{{{big}: [*a, *b], {float}: _}}")),
-            (format!("match x:\n case {{1: _, 1.0: _, {big}: _, {float}: _}}: pass\n"), "mapping pattern checks duplicate key (1.0)", format!("{{1: _, 1.0: _, {big}: _, {float}: _}}")),
-            (format!("match x:\n case {{{big}: _, {float}: _, 1: _, 1.0: _}}: pass\n"), "mapping pattern checks duplicate key (1.8446744073709552e+19)", format!("{{{big}: _, {float}: _, 1: _, 1.0: _}}")),
-            (format!("match x:\n case _: pass\n case {{{big}: _, {float}: _}}: pass\n"), "wildcard makes remaining patterns unreachable", "_".to_owned()),
-            (format!("match x:\n case 1: break\n case {{{big}: _, {float}: _}}: pass\n"), "'break' outside loop", "break".to_owned()),
-            (format!("match x:\n case {{{big}: _, {float}: _}}: pass\ny = 1\nglobal y\n"), "name 'y' is assigned to before global declaration", "global y".to_owned()),
+            (
+                format!("match x:\n case {{{big}: [*a, *b], {float}: _}}: pass\n"),
+                "mapping pattern checks duplicate key",
+                format!("{{{big}: [*a, *b], {float}: _}}"),
+            ),
+            (
+                format!("match x:\n case {{1: _, 1.0: _, {big}: _, {float}: _}}: pass\n"),
+                "mapping pattern checks duplicate key (1.0)",
+                format!("{{1: _, 1.0: _, {big}: _, {float}: _}}"),
+            ),
+            (
+                format!("match x:\n case {{{big}: _, {float}: _, 1: _, 1.0: _}}: pass\n"),
+                "mapping pattern checks duplicate key (1.8446744073709552e+19)",
+                format!("{{{big}: _, {float}: _, 1: _, 1.0: _}}"),
+            ),
+            (
+                format!("match x:\n case _: pass\n case {{{big}: _, {float}: _}}: pass\n"),
+                "wildcard makes remaining patterns unreachable",
+                "_".to_owned(),
+            ),
+            (
+                format!("match x:\n case 1: break\n case {{{big}: _, {float}: _}}: pass\n"),
+                "'break' outside loop",
+                "break".to_owned(),
+            ),
+            (
+                format!("match x:\n case {{{big}: _, {float}: _}}: pass\ny = 1\nglobal y\n"),
+                "name 'y' is assigned to before global declaration",
+                "global y".to_owned(),
+            ),
         ] {
             let parsed = parse_module(&source).unwrap();
             for target in TARGETS {
                 let error = validate(&source, &parsed.syntax().body, target).unwrap_err();
                 let (message, range) = match error {
-                    CompileError::InvalidPattern { message, range } | CompileError::InvalidSyntax { message, range } => (message, range),
+                    CompileError::InvalidPattern { message, range }
+                    | CompileError::InvalidSyntax { message, range } => (message, range),
                     other => panic!("{target}: {source:?}: {other:?}"),
                 };
-                assert!(message.contains(expected), "{target}: {source:?}: {message:?}");
+                assert!(
+                    message.contains(expected),
+                    "{target}: {source:?}: {message:?}"
+                );
                 assert_eq!(&source[range], span, "{target}: {source:?}");
             }
         }
 
-        let source = format!("match x:\n case {{{big}: _, {float}: _}}: pass\nfrom __future__ import annotations\n");
+        let source = format!(
+            "match x:\n case {{{big}: _, {float}: _}}: pass\nfrom __future__ import annotations\n"
+        );
         let parsed = parse_module(&source).unwrap();
         for target in TARGETS {
             let error = validate(&source, &parsed.syntax().body, target).unwrap_err();
             let message = error.to_string();
             if target >= PythonVersion::Py314 {
-                assert!(message.contains("from __future__ imports must occur"), "{target}: {message}");
+                assert!(
+                    message.contains("from __future__ imports must occur"),
+                    "{target}: {message}"
+                );
             } else {
-                assert!(message.contains("mapping pattern checks duplicate key"), "{target}: {message}");
+                assert!(
+                    message.contains("mapping pattern checks duplicate key"),
+                    "{target}: {message}"
+                );
             }
         }
 
         let mapping = format!("match v:\n case {{{big}: _, {float}: _}}: pass\n");
         for (source, legacy, modern) in [
-            (format!("{mapping}await x\nfrom __future__ import annotations\n"),
-                "mapping pattern checks duplicate key", "'await' outside function"),
-            (format!("{mapping}from __future__ import annotations\nawait x\n"),
-                "mapping pattern checks duplicate key", "from __future__ imports must occur"),
-            (format!("x=1\nglobal x\n{mapping}await x\n"),
-                "name 'x' is assigned to before global declaration", "name 'x' is assigned to before global declaration"),
-            (format!("{mapping}await x\nx=1\nglobal x\n"),
-                "name 'x' is used prior to global declaration", "'await' outside function"),
-            (format!("def f():\n nonlocal missing\n{mapping}await x\n"),
-                "no binding for nonlocal 'missing' found", "'await' outside function"),
-            (format!("x=1\nglobal x\n{mapping}from __future__ import annotations\n"),
-                "name 'x' is assigned to before global declaration", "name 'x' is assigned to before global declaration"),
-            (format!("{mapping}from __future__ import annotations\nx=1\nglobal x\n"),
-                "name 'x' is assigned to before global declaration", "from __future__ imports must occur"),
-            (format!("{mapping}x=1\nglobal x\nfrom __future__ import unknown\n"),
-                "name 'x' is assigned to before global declaration", "name 'x' is assigned to before global declaration"),
-            (format!("{mapping}from __future__ import unknown\nx=1\nglobal x\n"),
-                "name 'x' is assigned to before global declaration", "from __future__ imports must occur"),
-            (format!("{mapping}await x\nfrom __future__ import unknown\n"),
-                "mapping pattern checks duplicate key", "'await' outside function"),
-            (format!("{mapping}from __future__ import unknown\n"),
-                "mapping pattern checks duplicate key", "from __future__ imports must occur"),
+            (
+                format!("{mapping}await x\nfrom __future__ import annotations\n"),
+                "mapping pattern checks duplicate key",
+                "'await' outside function",
+            ),
+            (
+                format!("{mapping}from __future__ import annotations\nawait x\n"),
+                "mapping pattern checks duplicate key",
+                "from __future__ imports must occur",
+            ),
+            (
+                format!("x=1\nglobal x\n{mapping}await x\n"),
+                "name 'x' is assigned to before global declaration",
+                "name 'x' is assigned to before global declaration",
+            ),
+            (
+                format!("{mapping}await x\nx=1\nglobal x\n"),
+                "name 'x' is used prior to global declaration",
+                "'await' outside function",
+            ),
+            (
+                format!("def f():\n nonlocal missing\n{mapping}await x\n"),
+                "no binding for nonlocal 'missing' found",
+                "'await' outside function",
+            ),
+            (
+                format!("x=1\nglobal x\n{mapping}from __future__ import annotations\n"),
+                "name 'x' is assigned to before global declaration",
+                "name 'x' is assigned to before global declaration",
+            ),
+            (
+                format!("{mapping}from __future__ import annotations\nx=1\nglobal x\n"),
+                "name 'x' is assigned to before global declaration",
+                "from __future__ imports must occur",
+            ),
+            (
+                format!("{mapping}x=1\nglobal x\nfrom __future__ import unknown\n"),
+                "name 'x' is assigned to before global declaration",
+                "name 'x' is assigned to before global declaration",
+            ),
+            (
+                format!("{mapping}from __future__ import unknown\nx=1\nglobal x\n"),
+                "name 'x' is assigned to before global declaration",
+                "from __future__ imports must occur",
+            ),
+            (
+                format!("{mapping}await x\nfrom __future__ import unknown\n"),
+                "mapping pattern checks duplicate key",
+                "'await' outside function",
+            ),
+            (
+                format!("{mapping}from __future__ import unknown\n"),
+                "mapping pattern checks duplicate key",
+                "from __future__ imports must occur",
+            ),
         ] {
             let parsed = parse_module(&source).unwrap();
             for target in TARGETS {
                 let error = validate(&source, &parsed.syntax().body, target).unwrap_err();
                 let message = error.to_string();
-                let expected = if target >= PythonVersion::Py314 { modern } else { legacy };
-                assert!(message.contains(expected), "{target}: {source:?}: {message}");
+                let expected = if target >= PythonVersion::Py314 {
+                    modern
+                } else {
+                    legacy
+                };
+                assert!(
+                    message.contains(expected),
+                    "{target}: {source:?}: {message}"
+                );
             }
         }
     }
