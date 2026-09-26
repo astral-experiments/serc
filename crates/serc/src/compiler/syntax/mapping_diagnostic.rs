@@ -84,8 +84,10 @@ pub(super) fn diagnostic(
         }
         _ => {
             // Avoid unbounded big-integer conversion before applying the decimal-size guard.
-            if matches!(key, Expr::NumberLiteral(_) | Expr::UnaryOp(_) | Expr::BinOp(_))
-                && source[key.range()].len() > 8192
+            if matches!(
+                key,
+                Expr::NumberLiteral(_) | Expr::UnaryOp(_) | Expr::BinOp(_)
+            ) && source[key.range()].len() > 8192
             {
                 return None;
             }
@@ -423,7 +425,11 @@ mod tests {
                 let CompileError::InvalidPattern { message, range } = error else {
                     panic!("unexpected diagnostic for {version}, {source:?}: {error:?}");
                 };
-                assert_eq!(message, format!("mapping pattern checks duplicate key ({repr})"), "{version}: {source:?}");
+                assert_eq!(
+                    message,
+                    format!("mapping pattern checks duplicate key ({repr})"),
+                    "{version}: {source:?}"
+                );
                 assert_eq!(&source[range], mapping, "{version}: {source:?}");
             }
         }
