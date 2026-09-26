@@ -188,5 +188,31 @@ mod tests {
                 assert!(message.contains("mapping pattern checks duplicate key"), "{target}: {message}");
             }
         }
+
+        let mapping = format!("match v:\n case {{{big}: _, {float}: _}}: pass\n");
+        for (source, legacy, modern) in [
+            (format!("{mapping}await x\nfrom __future__ import annotations\n"),
+                "mapping pattern checks duplicate key", "'await' outside function"),
+            (format!("{mapping}from __future__ import annotations\nawait x\n"),
+                "mapping pattern checks duplicate key", "from __future__ imports must occur"),
+            (format!("x=1\nglobal x\n{mapping}await x\n"),
+                "name 'x' is assigned to before global declaration", "name 'x' is assigned to before global declaration"),
+            (format!("await x\nx=1\nglobal x\n{mapping}"),
+                "name 'x' is used prior to global declaration", "'await' outside function"),
+            (format!("def f():\n nonlocal missing\n{mapping}await x\n"),
+                "no binding for nonlocal 'missing' found", "'await' outside function"),
+            (format!("x=1\nglobal x\n{mapping}from __future__ import annotations\n"),
+                "name 'x' is assigned to before global declaration", "name 'x' is assigned to before global declaration"),
+            (format!("{mapping}from __future__ import annotations\nx=1\nglobal x\n"),
+                "name 'x' is assigned to before global declaration", "from __future__ imports must occur"),
+        ] {
+            let parsed = parse_module(&source).unwrap();
+            for target in TARGETS {
+                let error = validate(&source, &parsed.syntax().body, target).unwrap_err();
+                let message = error.to_string();
+                let expected = if target >= PythonVersion::Py314 { modern } else { legacy };
+                assert!(message.contains(expected), "{target}: {source:?}: {message}");
+            }
+        }
     }
 }
