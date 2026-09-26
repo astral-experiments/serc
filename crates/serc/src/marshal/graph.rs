@@ -917,18 +917,17 @@ fn collect_explicitly_interned<'a>(
             &mut ordinary_first,
         );
     }
-    values.extend(
-        qualified_names
-            .origins
-            .into_iter()
-            .filter_map(|(value, origin)| {
-                // Interning metadata replaces its pointer when an equal canonical object
-                // already exists; the class's fresh constant remains a separate plain string.
-                (origin.unwrap_or_else(|| !ordinary_first.contains(value))
-                    && !initial_intern_state.contains_for(python_version, value))
-                .then_some(value)
-            }),
-    );
+    for (value, origin) in qualified_names.origins {
+        // An already recorded interned constant does not depend on initial membership.
+        // Otherwise, interning metadata can replace its pointer with an equal canonical
+        // object, leaving the class's fresh constant as a separate plain string.
+        if !values.contains(value)
+            && origin.unwrap_or_else(|| !ordinary_first.contains(value))
+            && !initial_intern_state.contains_for(python_version, value)
+        {
+            values.insert(value);
+        }
+    }
     frozenset_recreation_need
 }
 

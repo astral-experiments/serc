@@ -1831,6 +1831,58 @@ fn partial_intern_state_keeps_nested_uncertainty_and_a_deterministic_witness() {
 }
 
 #[test]
+fn partial_intern_state_accepts_already_interned_class_name() {
+    use crate::{
+        CompileError, CompileOptions, InitialInternState, PythonVersion, compile_with_options,
+    };
+
+    // The class identifier already supplies the constant's canonical interned origin.
+    let source = "class Café:\n    pass\n";
+    for version in [PythonVersion::Py314, PythonVersion::Py315] {
+        let mut options = CompileOptions {
+            python_version: version,
+            initial_intern_state: InitialInternState::from_partial(std::iter::empty::<&str>()),
+            ..CompileOptions::default()
+        };
+        let partial = compile_with_options(source, "class.py", &options)
+            .unwrap()
+            .marshal();
+        options.initial_intern_state =
+            InitialInternState::from_complete(std::iter::empty::<&str>());
+        let absent = compile_with_options(source, "class.py", &options)
+            .unwrap()
+            .marshal();
+        options.initial_intern_state = InitialInternState::from_complete(["Café"]);
+        let present = compile_with_options(source, "class.py", &options)
+            .unwrap()
+            .marshal();
+        assert_eq!(partial, absent, "{version:?}");
+        assert_eq!(partial, present, "{version:?}");
+
+        // A separately constructed qualified name can actually depend on membership.
+        let nested = "class Outer:\n    class Inner:\n        pass\n";
+        options.initial_intern_state = InitialInternState::from_partial(std::iter::empty::<&str>());
+        assert_eq!(
+            compile_with_options(nested, "class.py", &options).unwrap_err(),
+            CompileError::UnresolvedInternState {
+                value: "Outer.Inner".to_string()
+            },
+            "{version:?}"
+        );
+        options.initial_intern_state =
+            InitialInternState::from_complete(std::iter::empty::<&str>());
+        let absent = compile_with_options(nested, "class.py", &options)
+            .unwrap()
+            .marshal();
+        options.initial_intern_state = InitialInternState::from_complete(["Outer.Inner"]);
+        let present = compile_with_options(nested, "class.py", &options)
+            .unwrap()
+            .marshal();
+        assert_ne!(absent, present, "{version:?}");
+    }
+}
+
+#[test]
 fn partial_intern_state_rejects_relevant_unknowns_before_returning_a_module() {
     use crate::{
         CompileError, CompileOptions, InitialInternState, PythonVersion, compile_with_options,
