@@ -73,6 +73,11 @@ for source in (sys.argv[1], sys.argv[1].encode()):
 print(expected[0])
 print(*expected[1:])
 ";
+    let nested = (0..40).fold(
+        "{(k := 1): (yield v) for k in ks}".to_owned(),
+        |expression, _| format!("[(yield {expression}) for x in xs]"),
+    );
+    let deep_source = format!("def f():\n    return {nested}\n");
     for version in [
         PythonVersion::Py312,
         PythonVersion::Py313,
@@ -86,7 +91,11 @@ print(*expected[1:])
         let modern_debug_after_star =
             matches!(version, PythonVersion::Py314 | PythonVersion::Py315)
                 .then_some("*first\n[(yield (__debug__ := 1)) for x in xs]\n");
-        for source in sources.into_iter().chain(modern_debug_after_star) {
+        for source in sources
+            .into_iter()
+            .chain(modern_debug_after_star)
+            .chain(std::iter::once(deep_source.as_str()))
+        {
             let mut python = match version {
                 PythonVersion::Py312 => common::python_312_command(),
                 PythonVersion::Py313 => common::python_313_command(),
