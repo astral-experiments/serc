@@ -274,6 +274,10 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
         has_declarations: false,
         pre_lowering_only: false,
         optimization_level,
+        comprehension_yield_operand: false,
+        checking_comprehension_yield: false,
+        collecting_comprehension_errors: false,
+        deferred_comprehension_errors: RefCell::new(Vec::new()),
         source,
         may_have_debug_patterns: source.contains("__debug__") || !source.is_ascii(),
         body,
@@ -500,6 +504,10 @@ fn simple_function_checker_view(function: &ast::StmtFunctionDef) -> Option<Stmt>
 struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> {
     pre_lowering_only: bool,
     optimization_level: OptimizationLevel,
+    comprehension_yield_operand: bool,
+    checking_comprehension_yield: bool,
+    collecting_comprehension_errors: bool,
+    deferred_comprehension_errors: RefCell<Vec<FxHashMap<TextRange, Vec<SemanticSyntaxError>>>>,
     checker: SemanticSyntaxChecker,
     checked_type_params: Option<&'ast ast::TypeParams>,
     checker_prefix: CheckerPrefix,
@@ -1884,6 +1892,98 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                 return;
             }
         }
+        if self.comprehension_yield_operand
+            && let Expr::Named(named) = expression
+        {
+            // Ruff scans a whole comprehension at entry. Release an observed named-expression
+            // error only when the symbol-table walk actually reaches that expression.
+            let deferred = {
+                let mut frames = self.deferred_comprehension_errors.borrow_mut();
+                let mut found = None;
+                // CPython checks iterable restrictions, then iteration-variable conflicts in
+                // surrounding comprehensions, before it reaches a containing class scope.
+                'priority: for priority in 0..3 {
+                    for frame in frames.iter_mut().rev() {
+                        for range in [named.range, named.target.range()] {
+                            if let Some(errors) = frame.get_mut(&range)
+                                && let Some(index) = errors.iter().position(|error| {
+                                    matches!(
+                                        (&error.kind, priority),
+                                        (SemanticSyntaxErrorKind::NamedExpressionInComprehensionIterable, 0)
+                                            | (SemanticSyntaxErrorKind::ReboundComprehensionVariable, 1)
+                                            | (SemanticSyntaxErrorKind::NamedExpressionInClassBodyComprehension, 2)
+                                    )
+                                })
+                            {
+                                found = Some(errors.remove(index));
+                                break 'priority;
+                            }
+                        }
+                    }
+                }
+                found
+            };
+            if let Some(error) = deferred {
+                if matches!(
+                    error.kind,
+                    SemanticSyntaxErrorKind::ReboundComprehensionVariable
+                ) && let Expr::Name(name) = named.target.as_ref()
+                {
+                    *self.error.borrow_mut() = Some(CompileError::invalid_syntax(
+                        format!(
+                            "assignment expression cannot rebind comprehension iteration variable '{}'",
+                            name.id
+                        ),
+                        error.range,
+                    ));
+                } else if matches!(
+                    error.kind,
+                    SemanticSyntaxErrorKind::NamedExpressionInClassBodyComprehension
+                ) {
+                    *self.error.borrow_mut() = Some(CompileError::invalid_syntax(
+                        error.to_string(),
+                        named.target.range(),
+                    ));
+                } else {
+                    self.report_semantic_error(error);
+                }
+                if self.error.borrow().is_some() {
+                    return;
+                }
+            }
+        }
+        let comprehension_yield = matches!(self.scope().kind, ScopeKind::Comprehension { .. })
+            && matches!(expression, Expr::Yield(_) | Expr::YieldFrom(_));
+        if comprehension_yield {
+            let value = match expression {
+                Expr::Yield(yield_) => yield_.value.as_deref(),
+                Expr::YieldFrom(yield_from) => Some(yield_from.value.as_ref()),
+                _ => unreachable!(),
+            };
+            if let Some(value) = value {
+                // Symbol-table checks inside the operand precede the enclosing yield error.
+                // Suppress later lowering errors while visiting the operand in that order.
+                let previous_pre_lowering = std::mem::replace(&mut self.pre_lowering_only, true);
+                let previous_operand =
+                    std::mem::replace(&mut self.comprehension_yield_operand, true);
+                self.visit_expr(value);
+                self.comprehension_yield_operand = previous_operand;
+                self.pre_lowering_only = previous_pre_lowering;
+                if self.error.borrow().is_some() {
+                    return;
+                }
+            }
+        }
+        // Lambda defaults execute in the enclosing scope before its parameters are checked.
+        if self.comprehension_yield_operand
+            && let Expr::Lambda(lambda) = expression
+            && let Some(parameters) = &lambda.parameters
+        {
+            walk_parameters(self, parameters);
+            if self.error.borrow().is_some() {
+                return;
+            }
+        }
         let check_expression = match expression {
             // These are the only remaining variants checked by the pinned Ruff visitor. Its
             // tuple/list check applies only to assignment targets; a lambda without parameters
@@ -1922,6 +2022,16 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
             | Expr::Slice(_)
             | Expr::IpyEscapeCommand(_) => false,
         };
+        let deferred_frame = self.comprehension_yield_operand
+            && matches!(
+                expression,
+                Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_) | Expr::Generator(_)
+            );
+        if deferred_frame {
+            self.deferred_comprehension_errors
+                .borrow_mut()
+                .push(FxHashMap::default());
+        }
         if check_expression {
             if matches!(
                 expression,
@@ -1929,19 +2039,32 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
             ) {
                 let mut depth = crate::stack::ExpressionDepth::default();
                 depth.visit_expr(expression);
+                let previous =
+                    std::mem::replace(&mut self.collecting_comprehension_errors, deferred_frame);
                 self.with_checker(|checker, context| {
                     crate::stack::with_depth(depth.maximum(), || {
                         checker.visit_expr(expression, context);
                     });
                 });
+                self.collecting_comprehension_errors = previous;
             } else {
+                let previous =
+                    std::mem::replace(&mut self.checking_comprehension_yield, comprehension_yield);
                 self.with_checker(|checker, context| checker.visit_expr(expression, context));
+                self.checking_comprehension_yield = previous;
             }
+        }
+        if comprehension_yield {
+            return;
         }
         match expression {
             Expr::Lambda(lambda) => {
                 if let Some(parameters) = &lambda.parameters {
-                    self.visit_parameters(parameters);
+                    if self.comprehension_yield_operand {
+                        self.validate_private_parameters(parameters);
+                    } else {
+                        self.visit_parameters(parameters);
+                    }
                 }
                 self.with_scope(
                     ScopeKind::Function {
@@ -1951,6 +2074,17 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                     },
                     |visitor| visitor.visit_expr(&lambda.body),
                 );
+            }
+            Expr::Dict(dict) if self.comprehension_yield_operand => {
+                // The symbol table visits all dictionary keys before any values.
+                for item in &dict.items {
+                    if let Some(key) = &item.key {
+                        self.visit_expr(key);
+                    }
+                }
+                for item in &dict.items {
+                    self.visit_expr(&item.value);
+                }
             }
             Expr::ListComp(ast::ExprListComp {
                 elt, generators, ..
@@ -1980,12 +2114,15 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                 ..
             }) => {
                 self.comprehension(generators, ComprehensionKind::Dict, |visitor| {
-                    // CPython's symbol-table pass visits the value before the key.
-                    // Restrict this ordering to direct yields with simple operands:
-                    // other expressions can contain earlier phase-specific errors.
-                    if key.as_deref().is_some_and(direct_yield_with_simple_operand)
+                    if visitor.comprehension_yield_operand {
+                        visitor.visit_expr(value);
+                        if let Some(key) = key {
+                            visitor.visit_expr(key);
+                        }
+                    } else if key.as_deref().is_some_and(direct_yield_with_simple_operand)
                         && direct_yield_with_simple_operand(value)
                     {
+                        // Outside an operand replay, only simple direct yields are reordered.
                         visitor.visit_expr(value);
                         visitor.visit_expr(key.as_deref().expect("key was checked"));
                     } else {
@@ -1997,6 +2134,9 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
                 });
             }
             _ => walk_expr(self, expression),
+        }
+        if deferred_frame {
+            self.deferred_comprehension_errors.borrow_mut().pop();
         }
     }
 
@@ -2193,6 +2333,16 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             errors.push(error);
             return;
         }
+        if self.checking_comprehension_yield && matches!(error.kind, Kind::InvalidStarExpression) {
+            return;
+        }
+        if self.comprehension_yield_operand
+            && matches!(self.scope().kind, ScopeKind::Comprehension { .. })
+            && (matches!(&error.kind, Kind::YieldOutsideFunction(kind) if kind.is_await())
+                || matches!(error.kind, Kind::AwaitOutsideAsyncFunction(_)))
+        {
+            return;
+        }
         if FUTURE_ONLY
             && !matches!(
                 &error.kind,
@@ -2206,6 +2356,23 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             && matches!(error.kind, Kind::DuplicateKeywordArgument(_))
         {
             // The replay checks this class call after its body, as CPython lowering does.
+            return;
+        }
+        if self.collecting_comprehension_errors
+            && matches!(
+                error.kind,
+                Kind::ReboundComprehensionVariable
+                    | Kind::NamedExpressionInComprehensionIterable
+                    | Kind::NamedExpressionInClassBodyComprehension
+            )
+        {
+            self.deferred_comprehension_errors
+                .borrow_mut()
+                .last_mut()
+                .expect("comprehension error frame")
+                .entry(error.range)
+                .or_default()
+                .push(error);
             return;
         }
         // The declaration pass checks complete symbol histories and places errors on the full
@@ -2254,7 +2421,9 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
                 | Kind::DuplicateKeywordArgument(_)
                 | Kind::DuplicateMatchClassAttribute(_) => true,
                 Kind::YieldOutsideFunction(kind) => {
-                    !kind.is_await() || self.python_version < ast::PythonVersion::PY314
+                    (!self.comprehension_yield_operand
+                        || !matches!(self.scope().kind, ScopeKind::Comprehension { .. }))
+                        && (!kind.is_await() || self.python_version < ast::PythonVersion::PY314)
                 }
                 Kind::AwaitOutsideAsyncFunction(_) | Kind::WriteToDebug(_) => {
                     self.python_version < ast::PythonVersion::PY314
@@ -2355,7 +2524,19 @@ impl<const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> SemanticSyntaxContex
             }
             Kind::YieldFromInAsyncFunction => "'yield from' inside async function".to_owned(),
             Kind::AwaitOutsideAsyncFunction(AwaitOutsideAsyncFunctionKind::Await) => {
-                "'await' outside function".to_owned()
+                if self.comprehension_yield_operand {
+                    "'await' outside async function".to_owned()
+                } else {
+                    "'await' outside function".to_owned()
+                }
+            }
+            Kind::DuplicateParameter(name) if self.comprehension_yield_operand => {
+                let kind = if self.python_version >= ast::PythonVersion::PY315 {
+                    "parameter"
+                } else {
+                    "argument"
+                };
+                format!("duplicate {kind} '{name}' in function definition")
             }
             Kind::AwaitOutsideAsyncFunction(AwaitOutsideAsyncFunctionKind::AsyncFor) => {
                 "'async for' outside async function".to_owned()
