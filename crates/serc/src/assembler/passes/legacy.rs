@@ -1354,12 +1354,9 @@ impl OptimizationPipeline {
             return Vec::new();
         }
         if !self.exception_regions.is_empty()
-            && let Some(backedges) = self.legacy_repeated_backedges_with_setups(original_arrays)
+            && let Some(tails) = self.legacy_repeated_tails_with_setups(original_arrays)
         {
-            return backedges
-                .into_iter()
-                .map(|(block, instruction)| (block, instruction, 1, 2))
-                .collect();
+            return tails;
         }
         let mut prefix_len = full_order.len();
         if !self.exception_regions.is_empty() || !self.exception_owner_provenance.setups.is_empty()
@@ -1588,10 +1585,10 @@ impl OptimizationPipeline {
     /// blocks.  Merge those fragments in a temporary graph, then restore the
     /// authored SETUP edges that do not appear in the emitted instructions.
     /// Return `None` when the retained provenance cannot establish this graph.
-    fn legacy_repeated_backedges_with_setups(
+    fn legacy_repeated_tails_with_setups(
         &self,
         original_arrays: &FxHashMap<BasicBlockId, usize>,
-    ) -> Option<Vec<(BasicBlockId, Instruction)>> {
+    ) -> Option<Vec<(BasicBlockId, Instruction, usize, usize)>> {
         let setups = &self.exception_owner_provenance.setups;
         let captured = &self.exception_owner_provenance.legacy_native_setup_targets;
         let targets = captured.iter().copied().collect::<FxHashMap<_, _>>();
@@ -1828,6 +1825,7 @@ impl OptimizationPipeline {
 
         let mut visited = vec![false; groups.len()];
         let mut repeated_successors = vec![false; groups.len()];
+        let mut predecessor_counts = vec![(0, 0); groups.len()];
         let mut pending = vec![0];
         // Duplicate pending entries can multiply through a graph. Decline an
         // unbounded traversal rather than slowing compilation pathologically.
@@ -1840,6 +1838,11 @@ impl OptimizationPipeline {
             let repeated = visited[index];
             visited[index] = true;
             for &successor in &edges[index] {
+                let (ordinary, native) = &mut predecessor_counts[successor];
+                *native += 1;
+                if !repeated {
+                    *ordinary += 1;
+                }
                 repeated_successors[successor] |= repeated;
                 if !visited[successor] {
                     pending.push(successor);
@@ -1847,7 +1850,7 @@ impl OptimizationPipeline {
             }
         }
 
-        let mut backedges = Vec::new();
+        let mut tails = Vec::new();
         for (index, fragments) in groups.iter().enumerate() {
             if !repeated_successors[index] {
                 continue;
@@ -1865,16 +1868,29 @@ impl OptimizationPipeline {
                 continue;
             };
             if instructions.next().is_none()
-                && matches!(
+                && (matches!(
                     instruction.opcode,
                     JUMP_BACKWARD | JUMP_BACKWARD_NO_INTERRUPT
-                )
+                ) || (instruction.opcode == JUMP_FORWARD && wrapper.is_none()))
                 && instruction.location == SourceLocation::NONE
             {
-                backedges.push((block, *instruction));
+                let mut expected = *instruction;
+                let counts = if instruction.opcode == JUMP_FORWARD {
+                    if let Operand::Forward(target) = instruction.operand()
+                        && label_group(target) == Some(index + 1)
+                    {
+                        // Native removes this jump after reachability. Its exact
+                        // unlocated NOP still needs the original incoming count.
+                        legacy_nop(&mut expected);
+                    }
+                    predecessor_counts[index]
+                } else {
+                    (1, 2)
+                };
+                tails.push((block, expected, counts.0, counts.1));
             }
         }
-        Some(backedges)
+        Some(tails)
     }
 
     fn legacy_predecessors(&self) -> FxHashMap<BasicBlockId, usize> {
@@ -3976,7 +3992,7 @@ mod protected_repeated_backedge_tests {
             }
             let pipeline = assembler.into_optimization_pipeline();
             let arrays = pipeline.legacy_instruction_arrays();
-            let result = pipeline.legacy_repeated_backedges_with_setups(&arrays);
+            let result = pipeline.legacy_repeated_tails_with_setups(&arrays);
             if case == 0 || case == 7 {
                 assert_eq!(
                     result.unwrap()[0].0,
@@ -4077,7 +4093,7 @@ mod protected_repeated_backedge_tests {
                     .unwrap();
                 pipeline.graph.remove_item_at(block, instruction);
             }
-            let found = pipeline.legacy_repeated_backedges_with_setups(&arrays);
+            let found = pipeline.legacy_repeated_tails_with_setups(&arrays);
             match case {
                 0 => assert_eq!(
                     found.unwrap()[0].0,

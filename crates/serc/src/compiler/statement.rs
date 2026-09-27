@@ -710,6 +710,8 @@ pub(super) struct StatementContext {
     followed_by_call_expression: bool,
     // Whether the next statement assigns or deletes one name in this suite.
     followed_by_name_assignment_or_deletion: bool,
+    // Whether an elided conditional join reaches a call/name store/delete after erased asserts.
+    elided_join_has_live_successor: bool,
     // Whether the next statement is a direct if with a name test.
     followed_by_direct_name_if: bool,
     // Whether that successor is a direct loop break.
@@ -1667,6 +1669,40 @@ impl<'source> Compiler<'source> {
             && self.control.finally.is_inactive_for_return_unwind()
     }
 
+    /// Certifies ordinary coroutine work ending after its conditional prefixes.
+    fn coroutine_branch_has_linear_tail(&self, body: &[Stmt]) -> bool {
+        let is_elided = |statement: &Stmt| {
+            matches!(
+                self.context.optimized_locations.get(&statement.range()),
+                Some(super::optimization::OptimizedLocation::Elided)
+            )
+        };
+        let linear = |statement: &Stmt| {
+            let single = std::slice::from_ref(statement);
+            suite_has_nonsuspending_conditional_work(single)
+                && (suite_has_linear_borrow_fallthrough(single)
+                    || matches!(statement, Stmt::Assign(assignment)
+                        if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                            && matches!(assignment.value.as_ref(),
+                                Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_))))
+        };
+        let Some(end) = body.iter().rposition(|statement| !is_elided(statement)) else {
+            return false;
+        };
+        linear(&body[end])
+            && body[..end].iter().all(|statement| {
+                is_elided(statement)
+                    || matches!(statement, Stmt::Pass(_))
+                    || linear(statement)
+                    || matches!(statement, Stmt::If(conditional)
+                        if conditional.elif_else_clauses.is_empty()
+                            && condition_has_linear_runtime_leaves(&conditional.test)
+                            && !expression_suspends_current_scope(&conditional.test)
+                            && suite_has_linear_borrow_fallthrough(&conditional.body)
+                            && suite_has_nonsuspending_conditional_work(&conditional.body))
+            })
+    }
+
     /// Certifies target-supported, nonsuspending exits before erased assertions.
     fn terminal_if_before_elided(&self, statement: &Stmt, following: &[Stmt]) -> bool {
         let Stmt::If(conditional) = statement else {
@@ -1707,7 +1743,15 @@ impl<'source> Compiler<'source> {
                 || (self.context.python_version == crate::PythonVersion::Py313
                     && self.unit.flags & CO_COROUTINE != 0
                     && self.control.exceptions.active_exception_region_exclusions.is_empty()
-                    && suite_has_nonsuspending_conditional_work(&conditional.body)))
+                    && suite_has_nonsuspending_conditional_work(&conditional.body))
+                // Modern exit copying sees the erased assertion's empty join
+                // after this body's last ordinary operation, including an
+                // inlined comprehension. A terminal nested conditional has
+                // different return donors and is not covered by this proof.
+                || (self.context.python_version >= crate::PythonVersion::Py314
+                    && self.unit.flags & CO_COROUTINE != 0
+                    && self.control.exceptions.active_exception_region_exclusions.is_empty()
+                    && self.coroutine_branch_has_linear_tail(&conditional.body)))
             && !following.is_empty()
             && following.iter().all(is_elided)
     }
@@ -2689,8 +2733,13 @@ impl<'source> Compiler<'source> {
                                     .len()
                                     == context.exception_region_depth
                         });
-                let protected_async_for_elided_assert_suffix = self.context.python_version
+                // Erased assertions still leave the manager's original POP_BLOCK
+                // after END_ASYNC_FOR, including in a shallow 3.15 manager body.
+                let protected_async_for_elided_assert_suffix = (self.context.python_version
                     == crate::PythonVersion::Py314
+                    || (self.context.python_version == crate::PythonVersion::Py315
+                        && self.control.withs.active_with_exits.len() == 1
+                        && self.control.exceptions.active_exception_group_handlers == 0))
                     && !is_final
                     && matches!(statement, Stmt::For(statement) if statement.is_async)
                     && matches!(self.unit.scope, Scope::Function { .. })
@@ -2970,6 +3019,19 @@ impl<'source> Compiler<'source> {
                     &mut self.control.loops.guarded_match_try_loop_tail,
                     guarded_match_try_loop_tail,
                 );
+                // Optimized assertions emit no instructions or original block boundary.
+                // Keep this continuation fact separate from lexical adjacency used elsewhere.
+                let elided_join_successor = if matches!(statement, Stmt::If(_)) {
+                    body[index + 1..].iter().find(|next| {
+                        !matches!(next, Stmt::Global(global) if global.names.is_empty())
+                            || !matches!(
+                                self.context.optimized_locations.get(&next.range()),
+                                Some(super::optimization::OptimizedLocation::Elided)
+                            )
+                    })
+                } else {
+                    None
+                };
                 let context = StatementContext {
                     preceded_by_try,
                     preceded_by_suffixed_try,
@@ -2996,6 +3058,12 @@ impl<'source> Compiler<'source> {
                     followed_by_name_assignment_or_deletion: matches!(body.get(index + 1),
                         Some(Stmt::Assign(assignment)) if matches!(assignment.targets.as_slice(), [Expr::Name(_)]))
                         || matches!(body.get(index + 1),
+                            Some(Stmt::Delete(deletion)) if matches!(deletion.targets.as_slice(), [Expr::Name(_)])),
+                    elided_join_has_live_successor: matches!(elided_join_successor,
+                        Some(Stmt::Expr(expression)) if matches!(expression.value.as_ref(), Expr::Call(_)))
+                        || matches!(elided_join_successor,
+                            Some(Stmt::Assign(assignment)) if matches!(assignment.targets.as_slice(), [Expr::Name(_)]))
+                        || matches!(elided_join_successor,
                             Some(Stmt::Delete(deletion)) if matches!(deletion.targets.as_slice(), [Expr::Name(_)])),
                     followed_by_direct_name_if: matches!(body.get(index + 1),
                         Some(Stmt::If(branch)) if matches!(branch.test.as_ref(), Expr::Name(name) if name.id.as_str() != "__debug__")
@@ -13814,12 +13882,11 @@ impl<'source> Compiler<'source> {
                         .contexts
                         .is_empty()
                         || (body_has_original_empty_block
-                            && (self.control.statements.context.followed_by_call_expression
-                                || self
-                                    .control
-                                    .statements
-                                    .context
-                                    .followed_by_name_assignment_or_deletion
+                            && (self
+                                .control
+                                .statements
+                                .context
+                                .elided_join_has_live_successor
                                 || self.control.loops.contexts.last().is_some_and(|context| {
                                     context.with_depth < self.control.withs.active_with_exits.len()
                                         && self
@@ -13844,8 +13911,7 @@ impl<'source> Compiler<'source> {
                                 && self.control.exceptions.active_exception_region_exclusions.len() == 1
                                 // These statements survive optimization, so this try body
                                 // has a real successor after the original conditional join.
-                                && (self.control.statements.context.followed_by_call_expression
-                                    || self.control.statements.context.followed_by_name_assignment_or_deletion)
+                                && self.control.statements.context.elided_join_has_live_successor
                                 && self.control.exceptions.direct_try_body_statements.contains(&statement.range)
                                 && !direct_try_body_exit)
                             || (self.context.python_version == crate::PythonVersion::Py315
@@ -19328,10 +19394,19 @@ impl<'source> Compiler<'source> {
         let clauses = &branch.elif_else_clauses;
         let has_elided =
             is_elided(&branch.body) || clauses.iter().any(|clause| is_elided(&clause.body));
-        let has_boolean = matches!(branch.test.as_ref(), Expr::BoolOp(_))
+        let is_boolean = |mut test: &Expr| {
+            // Negation reverses the conditional edges without adding a new join.
+            while let Expr::UnaryOp(unary) = test
+                && unary.op == UnaryOp::Not
+            {
+                test = &unary.operand;
+            }
+            matches!(test, Expr::BoolOp(_))
+        };
+        let has_boolean = is_boolean(&branch.test)
             || clauses
                 .iter()
-                .any(|clause| matches!(clause.test.as_ref(), Some(Expr::BoolOp(_))));
+                .any(|clause| clause.test.as_ref().is_some_and(is_boolean));
         has_elided
             && has_boolean
             && valid_test(&branch.test)
@@ -19348,7 +19423,6 @@ impl<'source> Compiler<'source> {
         if self.context.python_version < crate::PythonVersion::Py314
             || !matches!(self.unit.scope, Scope::Function { .. })
             || self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
-            || !self.control.loops.contexts.is_empty()
             || self.has_active_control_flow_region()
             || !self.control.withs.active_with_exits.is_empty()
             || self.control.in_exception_handler()

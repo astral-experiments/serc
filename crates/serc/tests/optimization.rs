@@ -23,6 +23,58 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn erased_assertion_gaps_preserve_conditional_join_nops() {
+    for gap in [
+        "",
+        "        assert flag\n",
+        "        assert flag, describe()\n        assert (hidden := flag)\n",
+    ] {
+        for successor in ["work()", "value = flag", "del flag"] {
+            let source = format!(
+                "def f(flag):\n    try:\n        if flag:\n            assert flag\n        else:\n            assert not flag\n{gap}        {successor}\n    except ValueError:\n        recover()\n"
+            );
+            assert_matches_cpython(&source, "erased_assertion_join_gap.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn comprehension_setups_preserve_repeated_legacy_jump_locations() {
+    for (case, source) in [
+        "def f(items, a, b):\n    for item in items:\n        [x for x in item]\n        if a:\n            assert a\n        if b:\n            assert b\n",
+        "def f(items, a, b):\n    value = {x for x in items}\n    for item in items:\n        if a:\n            assert a\n        if b:\n            assert b\n",
+        "def f(items, a, b):\n    if a:\n        assert a\n    if b:\n        assert b\n    else:\n        [x for x in items]\n    a+a\n",
+        "def f(items, a, b):\n    for item in items:\n        [[y for y in x] for x in items]\n        if a:\n            assert a\n        if b:\n            assert b\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            source,
+            &format!("comprehension_repeated_jump_{case}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn manager_setups_preserve_repeated_legacy_empty_branch_locations() {
+    for (case, source) in [
+        "def f(a, b, c, obj):\n    with obj:\n        value = obj.action()\n    if a:\n        assert a\n    if b:\n        assert b\n    else:\n        assert c\n    obj.action()\n",
+        "def f(a, b, obj):\n    with obj:\n        if a:\n            assert a\n        if b:\n            assert b\n        else:\n            assert a\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            source,
+            &format!("manager_repeated_empty_branch_{case}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn erased_try_else_keeps_condition_location_on_retained_exit() {
     for (case, source) in [
         "def f(obj, flag):\n    try:\n        if flag:\n            obj.action()\n        else:\n            assert flag\n    except ValueError:\n        return False\n    if flag:\n        assert obj\n    return True\n",
@@ -198,6 +250,26 @@ fn coroutine_nested_branches_keep_returns_before_erased_assertions() {
         assert_matches_cpython_versions(
             source,
             &format!("coroutine_nested_return_{case}.py"),
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
+fn coroutine_linear_tails_keep_returns_before_erased_assertions() {
+    for (case, source) in [
+        "async def f(a, b, c):\n    if a:\n        return\n    else:\n        if b:\n            if c:\n                action()\n            action()\n        assert b\n",
+        "async def f(a, b, items):\n    if a:\n        if b:\n            value = [item for item in items]\n        assert a\n",
+        "async def f(a, b, c, items):\n    if a:\n        return\n    else:\n        if b:\n            value = [item for item in items]\n            if c:\n                action()\n            value = a + b\n        assert b\n",
+        "async def f(a, b, c, manager):\n    async with manager:\n        await action()\n    if a:\n        return\n    else:\n        if b:\n            if c:\n                action()\n            action()\n        assert b\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython_versions(
+            source,
+            &format!("coroutine_linear_tail_{case}.py"),
             &LEVELS,
             &[PythonVersion::Py314, PythonVersion::Py315],
         );
@@ -4566,6 +4638,8 @@ fn optimized_deep_expression_traversal_and_cleanup() {
 #[test]
 fn optimized_conditional_joins_match_cpython() {
     for source in [
+        "def f(a, b):\n    for x in a:\n        if not (a and b):\n            assert a\n",
+        "def f(a, b):\n    for x in a:\n        for y in a:\n            if a or b:\n                assert a\n",
         "def f(xs, a, b, c):\n    for x in xs:\n        if x == a:\n            assert x\n        elif x == b or x == c:\n            assert x\n",
         "def f(xs, a, b):\n    for x in xs:\n        if x == a or x == b:\n            assert x\n",
         "def f(x, a, b, c):\n    if x == a:\n        assert x\n    elif x == b or x == c:\n        assert x\n",
@@ -7556,6 +7630,33 @@ for name, offset, args, expected in [
                 );
             }
         }
+    }
+}
+
+#[test]
+fn optimized_assertions_after_shallow_async_for_keep_manager_exit_location() {
+    for (case, source) in [
+        "async def f(cm, items):\n    with cm:\n        async for item in items:\n            pass\n        assert items\n",
+        "async def f(cm, items):\n    with cm:\n        async for item in items:\n            work(item)\n        assert items\n        assert cm\n",
+        "async def f(cm, items):\n    with cm:\n        async for item in items:\n            value = item\n        assert items\n",
+        "async def f(cm, items):\n    with cm:\n        async for item in items:\n            continue\n        assert items\n",
+        "async def f(cm, items):\n    with cm:\n        async for item in items:\n            assert item\n        assert items\n",
+        "async def f(cm, items):\n    with cm:\n        async for item in items:\n            pass\n",
+        "async def f(cm, items):\n    with cm:\n        async for item in items:\n            pass\n        assert items\n        pass\n",
+        "async def f(cm, items):\n    with cm:\n        async for item in items:\n            pass\n        pass\n        assert items\n",
+        "async def f(cm, items):\n    with cm:\n        async for item in items:\n            pass\n        assert items\n        work(items)\n",
+        "async def f(cm, items):\n    async for item in items:\n        pass\n    assert items\n",
+        "async def f(cm, items):\n    async with cm:\n        async for item in items:\n            pass\n        assert items\n",
+        "async def f(cm, items):\n    with cm:\n        for item in items:\n            pass\n        assert items\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            source,
+            &format!("shallow_async_for_manager_exit_{case}.py"),
+            &LEVELS,
+        );
     }
 }
 

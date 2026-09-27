@@ -4618,6 +4618,15 @@ impl Compiler<'_> {
         if !temporary_names.is_empty() {
             self.assembler
                 .record_exception_setup(protected_start, false);
+            if matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && generators.iter().all(|generator| !generator.is_async)
+            {
+                // Native's inlined-comprehension SETUP targets this restore
+                // block, before exception ranges can split the body arrays.
+                self.assembler
+                    .record_legacy_native_setup_target(protected_start, cleanup);
+            }
         }
         self.assembler.mark(protected_start);
         self.emit(build_opcode, 0, 1)?;
