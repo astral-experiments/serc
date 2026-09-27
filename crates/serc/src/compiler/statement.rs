@@ -1918,11 +1918,8 @@ impl<'source> Compiler<'source> {
                     }));
             // A nested conditional before removed assertions can contribute its own
             // return locations to the enclosing terminal branch.
-            let terminal_nested_before_elided = (self.context.python_version
-                >= crate::PythonVersion::Py314
-                || (self.context.python_version == crate::PythonVersion::Py312
-                    && matches!(statement, Stmt::If(conditional)
-                        if matches!(conditional.body.as_slice(), [Stmt::Pass(_)]))))
+            let terminal_nested_before_elided = self.context.python_version
+                != crate::PythonVersion::Py313
                 && !is_final
                 && plain_function_suite
                 && self.control.statements.in_terminal_if_branch_suite
@@ -3858,6 +3855,30 @@ impl<'source> Compiler<'source> {
             // Runtime arms retain their shared discard before falling through the
             // enclosing if's separate footer. Keep that non-exiting original array
             // through small-exit copying instead of distributing the return into it.
+            self.compile_if(statement)?;
+            self.assembler.set_location(SourceLocation::NONE);
+            return self.emit_deferred_implicit_return();
+        }
+        if self.context.python_version == crate::PythonVersion::Py312
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && statement.elif_else_clauses.is_empty()
+            && matches!(statement.body.as_slice(), [Stmt::Expr(expression)]
+                if matches!(expression.value.as_ref(), Expr::Call(_))
+                    && !expression_contains_inline_branch(&expression.value)
+                    && !expression_suspends_current_scope(&expression.value))
+            && condition_has_linear_runtime_leaves(&statement.test)
+            && condition_jump_target_count(&statement.test, false) == 1
+            && condition_jump_target_count(&statement.test, true) == 1
+            && !expression_suspends_current_scope(&statement.test)
+            && self.control.loops.contexts.is_empty()
+            && !self.has_active_control_flow_region()
+            && !self.control.in_exception_handler()
+            && self.control.finally.is_inactive_for_return_unwind()
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+        {
+            // Keep the shared, unlocated footer until 3.12 counts predecessors.
+            // An earlier empty conditional can queue this condition twice, so
+            // its call arm cannot always donate a location to the original exit.
             self.compile_if(statement)?;
             self.assembler.set_location(SourceLocation::NONE);
             return self.emit_deferred_implicit_return();

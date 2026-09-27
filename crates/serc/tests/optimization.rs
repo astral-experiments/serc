@@ -23,6 +23,46 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn empty_conditionals_preserve_legacy_terminal_return_locations() {
+    for (case, source) in [
+        "def f(a, b, obj):\n    if a:\n        assert a\n    if b:\n        obj.action()\n",
+        "def f(a, b, obj):\n    if a:\n        global marker\n    if b:\n        obj.action()\n",
+        "def f(a, b, obj):\n    if a:\n        assert a\n    obj.action()\n    if b:\n        obj.action()\n",
+        "def f(a, b, obj):\n    if a:\n        assert a\n    if b:\n        assert b\n    else:\n        value = obj.action()\n    return obj if b else a\n",
+        "def f(a, b, obj):\n    if a:\n        pass\n    if b:\n        obj.action()\n",
+        "def f(a, b, obj):\n    if a:\n        assert a\n    if b:\n        value = obj.action()\n",
+        "def f(a, b, c, obj):\n    if a:\n        assert a\n    if b:\n        if c:\n            value = obj.attr\n",
+        "def f(a, b, obj):\n    if b:\n        obj.action()\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(
+            source,
+            &format!("empty_condition_terminal_return_{case}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn consecutive_elided_conditions_preserve_empty_branch_locations() {
+    for (prefix, suffix) in [
+        (
+            "    if a:\n        assert a\n",
+            "    if c:\n        assert c\n",
+        ),
+        ("", "    if c:\n        assert c\n"),
+        ("    if a:\n        assert a\n", "    action()\n"),
+    ] {
+        let source = format!(
+            "def f(a, b, c):\n{prefix}    if b:\n        assert b\n    else:\n        assert c\n{suffix}"
+        );
+        assert_matches_cpython(&source, "consecutive_elided_conditions.py", &LEVELS);
+    }
+}
+
+#[test]
 fn legacy_protected_and_coroutine_branches_keep_returns_before_erased_assertions() {
     for (case, source) in [
         "def f(a):\n    try:\n        if a:\n            pass\n        assert a\n    except:\n        raise\n",
@@ -135,6 +175,30 @@ fn with_conditional_exit_before_removed_assertion() {
         assert_matches_cpython(
             &source,
             &format!("with_conditional_exit_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn nested_linear_branch_preserves_returns_before_removed_assertions() {
+    for (index, leaf) in [
+        "value = action()",
+        "obj.value = action()",
+        "value, other = action()",
+        "action()",
+        "b += 1",
+        "assert b",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = format!(
+            "def f(a, b, obj):\n    if a:\n        if b:\n            {leaf}\n        assert a\n"
+        );
+        assert_matches_cpython(
+            &source,
+            &format!("nested_linear_return_{index}.py"),
             &LEVELS,
         );
     }

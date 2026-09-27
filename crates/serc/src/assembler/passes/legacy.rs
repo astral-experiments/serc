@@ -9,11 +9,11 @@ use super::super::{
     block_jump_target,
 };
 use crate::target::opcodes::{
-    CALL_INTRINSIC_1, COMPARE_OP, CONTAINS_OP, COPY, COPY_FREE_VARS, IS_OP, JUMP_BACKWARD,
-    JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, LOAD_CLOSURE, LOAD_CONST, LOAD_FAST,
+    CALL, CALL_FUNCTION_EX, CALL_INTRINSIC_1, COMPARE_OP, CONTAINS_OP, COPY, COPY_FREE_VARS, IS_OP,
+    JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, LOAD_CLOSURE, LOAD_CONST, LOAD_FAST,
     LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, MAKE_CELL, NOP, POP_TOP, PUSH_NULL, RERAISE, RESUME,
-    RETURN_GENERATOR, RETURN_VALUE, STORE_FAST, STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST,
-    TO_BOOL, UNARY_NOT, YIELD_VALUE,
+    RETURN_CONST, RETURN_GENERATOR, RETURN_VALUE, STORE_FAST, STORE_FAST_LOAD_FAST,
+    STORE_FAST_STORE_FAST, TO_BOOL, UNARY_NOT, YIELD_VALUE,
 };
 use crate::target::{is_conditional_jump_for, is_unconditional_jump};
 use crate::{CompileError, PythonVersion};
@@ -158,8 +158,8 @@ impl OptimizationPipeline {
         if self.python_version == PythonVersion::Py312 {
             self.inline_legacy_exit_blocks(&original_arrays, false);
         }
-        let repeated_backedges = if self.python_version == PythonVersion::Py312 {
-            self.legacy_repeated_backedges(&original_arrays)
+        let repeated_predecessors = if self.python_version == PythonVersion::Py312 {
+            self.legacy_repeated_tail_predecessors(&original_arrays)
         } else {
             Vec::new()
         };
@@ -241,9 +241,9 @@ impl OptimizationPipeline {
         let mut predecessors = self.legacy_predecessors();
         if self.python_version == PythonVersion::Py312 {
             predecessors.retain(|block, _| blocks_before_cold_relocation.contains(block));
-            if !repeated_backedges.is_empty() {
+            if !repeated_predecessors.is_empty() {
                 let surviving_blocks = self.graph.order().iter().copied().collect::<FxHashSet<_>>();
-                for (block, original) in repeated_backedges {
+                for (block, expected, before, native) in repeated_predecessors {
                     let mut instructions = self.graph[block].items().iter().filter_map(|item| {
                         if let Item::Instruction(instruction) = item {
                             Some(instruction)
@@ -254,10 +254,10 @@ impl OptimizationPipeline {
                     if surviving_blocks.contains(&block)
                         && let Some(instruction) = instructions.next()
                         && instructions.next().is_none()
-                        && *instruction == original
-                        && predecessors.get(&block) == Some(&1)
+                        && *instruction == expected
+                        && predecessors.get(&block) == Some(&before)
                     {
-                        predecessors.insert(block, 2);
+                        predecessors.insert(block, native);
                     }
                 }
             }
@@ -1337,11 +1337,11 @@ impl OptimizationPipeline {
         predecessors
     }
 
-    /// Recovers repeated visits to an unlocated 3.12 backedge during CFG marking.
-    fn legacy_repeated_backedges(
+    /// Recovers repeated predecessor counts for certified unlocated 3.12 tails.
+    fn legacy_repeated_tail_predecessors(
         &self,
         original_arrays: &FxHashMap<BasicBlockId, usize>,
-    ) -> Vec<(BasicBlockId, Instruction)> {
+    ) -> Vec<(BasicBlockId, Instruction, usize, usize)> {
         let full_order = self.graph.order();
         // Avoid building provenance maps when no conditional can queue its
         // fallthrough twice, the only shape this analysis can repair.
@@ -1356,7 +1356,10 @@ impl OptimizationPipeline {
         if !self.exception_regions.is_empty()
             && let Some(backedges) = self.legacy_repeated_backedges_with_setups(original_arrays)
         {
-            return backedges;
+            return backedges
+                .into_iter()
+                .map(|(block, instruction)| (block, instruction, 1, 2))
+                .collect();
         }
         let mut prefix_len = full_order.len();
         if !self.exception_regions.is_empty() || !self.exception_owner_provenance.setups.is_empty()
@@ -1468,6 +1471,7 @@ impl OptimizationPipeline {
         let mut visits = FxHashMap::<BasicBlockId, usize>::default();
         let mut pending = vec![entry];
         let mut repeated_successors = FxHashSet::default();
+        let mut predecessor_counts = FxHashMap::<BasicBlockId, (usize, usize)>::default();
         while let Some(block) = pending.pop() {
             let Some(&position) = positions.get(&block) else {
                 return Vec::new();
@@ -1485,6 +1489,14 @@ impl OptimizationPipeline {
                 .and_then(|label| self.graph.label_block(label))
                 .filter(|target| positions.contains_key(target));
             for successor in fallthrough.into_iter().chain(target) {
+                // Native increments on every pop, including an already visited
+                // block. Keep the ordinary count too: cleanup must leave the
+                // certified tail's incoming edges unchanged before restoration.
+                let (ordinary, native) = predecessor_counts.entry(successor).or_default();
+                *native += 1;
+                if !repeated {
+                    *ordinary += 1;
+                }
                 if repeated {
                     repeated_successors.insert(successor);
                 }
@@ -1506,12 +1518,56 @@ impl OptimizationPipeline {
                     }
                 });
                 let instruction = instructions.next()?;
+                let backedge = instruction.opcode == JUMP_BACKWARD
+                    || instruction.opcode == JUMP_BACKWARD_NO_INTERRUPT;
+                let counts = predecessor_counts.get(&block).copied();
+                let has_call_fallthrough =
+                    positions[&block].checked_sub(1).is_some_and(|previous| {
+                        let previous = order[previous];
+                        if !visited.contains(&previous) {
+                            return false;
+                        }
+                        let mut tail =
+                            self.graph[previous]
+                                .items()
+                                .iter()
+                                .rev()
+                                .filter_map(|item| {
+                                    if let Item::Instruction(instruction) = item {
+                                        Some(instruction.opcode)
+                                    } else {
+                                        None
+                                    }
+                                });
+                        tail.next() == Some(POP_TOP)
+                            && matches!(tail.next(), Some(CALL | CALL_FUNCTION_EX))
+                    });
+                let unprotected_tail = self.exception_regions.is_empty()
+                    && self.exception_owner_provenance.setups.is_empty()
+                    && (instruction.opcode == JUMP_FORWARD
+                        // Native's early fallthrough donation sees the call's
+                        // artificial POP_TOP as unlocated. Located store donors
+                        // and eager all-jump false footers need different proofs.
+                        || (instruction.opcode == RETURN_CONST
+                            && has_call_fallthrough
+                            && counts.is_some_and(|(ordinary, _)| ordinary >= 2)));
                 if instructions.next().is_none()
-                    && (instruction.opcode == JUMP_BACKWARD
-                        || instruction.opcode == JUMP_BACKWARD_NO_INTERRUPT)
+                    && (backedge || unprotected_tail)
                     && instruction.location == SourceLocation::NONE
                 {
-                    Some((block, *instruction))
+                    let (ordinary, native) = if backedge { (1, 2) } else { counts? };
+                    let mut expected = *instruction;
+                    if instruction.opcode == JUMP_FORWARD
+                        && let Operand::Forward(target) = instruction.operand()
+                        && self.graph.label_block(target)
+                            == order.get(positions[&block] + 1).copied()
+                    {
+                        // Redundant-jump cleanup changes only these two fields.
+                        // The late line pass must still see the repeated count
+                        // while this exact unlocated NOP survives in its array.
+                        legacy_nop(&mut expected);
+                    }
+                    Some((block, expected, ordinary, native))
                 } else {
                     None
                 }
@@ -4085,7 +4141,7 @@ mod protected_repeated_backedge_tests {
             }
             let pipeline = assembler.into_optimization_pipeline();
             let arrays = pipeline.legacy_instruction_arrays();
-            let found = pipeline.legacy_repeated_backedges(&arrays);
+            let found = pipeline.legacy_repeated_tail_predecessors(&arrays);
             assert_eq!(found.len(), usize::from(case == 0), "case {case}");
             if case == 0 {
                 assert_eq!(found[0].0, pipeline.graph.label_block(backedge).unwrap());
