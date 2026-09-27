@@ -136,6 +136,47 @@ fn exceptional_finally_return_unwinds_managers_in_order() {
                 except ValueError:
                     return 'handled'
 ";
+    const LOOP_OUTSIDE: &str = r"def f(outer, inner, work, cleanup):
+    with outer:
+        try:
+            work()
+        finally:
+            for x in (1,):
+                with inner:
+                    return work()
+";
+    const LOOP_INSIDE: &str = r"def f(outer, inner, work, cleanup):
+    with outer:
+        try:
+            work()
+        finally:
+            with inner:
+                for x in (1,):
+                    return work()
+";
+    const MANAGER_IN_HANDLER: &str = r"def f(outer, inner, work, cleanup):
+    with outer:
+        try:
+            work()
+        finally:
+            try:
+                work()
+            except ValueError:
+                with inner:
+                    return work()
+";
+    const MANAGER_IN_HANDLER_IN_LOOP: &str = r"def f(outer, inner, work, cleanup):
+    with outer:
+        try:
+            work()
+        finally:
+            for x in (1,):
+                try:
+                    work()
+                except ValueError:
+                    with inner:
+                        return work()
+";
     const TRACE: &str = r"
 import itertools, json, marshal, sys
 scope = {}
@@ -190,7 +231,14 @@ for first, second, cleanup_raises, inner_mode, outer_mode in itertools.product(
 print(json.dumps(rows))
 ";
 
-    for source in [FINALLY, HANDLER] {
+    for source in [
+        FINALLY,
+        HANDLER,
+        LOOP_OUTSIDE,
+        LOOP_INSIDE,
+        MANAGER_IN_HANDLER,
+        MANAGER_IN_HANDLER_IN_LOOP,
+    ] {
         for (index, (python_version, _, _)) in VERSIONS.iter().copied().enumerate() {
             for optimization_level in LEVELS {
                 let native = oracle(
@@ -223,6 +271,204 @@ print(json.dumps(rows))
                 for payload in [&native.stdout, &actual] {
                     let mut child = Command::new(ORACLES[index].get().unwrap())
                         .args(["-I", "-S", "-B", "-c", TRACE])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    child.stdin.take().unwrap().write_all(payload).unwrap();
+                    let result = child.wait_with_output().unwrap();
+                    assert!(
+                        result.status.success(),
+                        "{python_version}, {optimization_level:?}: status {}, {}",
+                        result.status,
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                    outputs.push(result.stdout);
+                }
+                assert_eq!(
+                    outputs[0], outputs[1],
+                    "{python_version}, {optimization_level:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn exceptional_finally_return_inside_older_handler() {
+    const GENERATOR: &str = r"def f(manager, work):
+    try:
+        yield 'ready'
+    except ValueError:
+        try:
+            work()
+        finally:
+            with manager:
+                return 7
+
+def ordinary(manager, work):
+    try:
+        raise ValueError('trigger')
+    except ValueError:
+        try:
+            work()
+        finally:
+            with manager:
+                return 7
+";
+    const ASYNC: &str = r"async def f(outer, inner, work):
+    async with outer:
+        try:
+            await work()
+        except ValueError:
+            try:
+                await work()
+            finally:
+                async with inner:
+                    return 7
+";
+    const GENERATOR_TRACE: &str = r"
+import itertools, json, marshal, sys
+scope = {}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+def chain(error):
+    seen, result = set(), []
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        result.append(type(error).__name__)
+        error = error.__context__
+    return result
+rows = []
+for action, work_fails, mode in itertools.product(
+        ('resume', 'throw', 'close', 'ordinary'), (False, True),
+        ('normal', 'suppress', 'raise')):
+    events = []
+    class Manager:
+        def __enter__(self):
+            events.append(('enter', type(sys.exception()).__name__))
+            return self
+        def __exit__(self, typ, val, tb):
+            events.append(('exit', typ.__name__ if typ else None, chain(val)))
+            if mode == 'raise':
+                raise RuntimeError('exit')
+            return mode == 'suppress'
+    def work():
+        events.append(('work', type(sys.exception()).__name__))
+        if work_fails:
+            raise ValueError('work')
+    try:
+        if action == 'ordinary':
+            value = scope['ordinary'](Manager(), work)
+        else:
+            generator = scope['f'](Manager(), work)
+            events.append(('first', next(generator)))
+            if action == 'throw':
+                value = generator.throw(ValueError('trigger'))
+            elif action == 'close':
+                value = generator.close()
+            else:
+                value = next(generator)
+        outcome = ('value', value)
+    except StopIteration as error:
+        outcome = ('return', error.value, chain(error))
+    except BaseException as error:
+        outcome = ('raise', chain(error))
+    rows.append((events, outcome))
+print(json.dumps(rows))
+";
+    const ASYNC_TRACE: &str = r"
+import asyncio, itertools, json, marshal, sys
+scope = {}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+def chain(error):
+    seen, result = set(), []
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        result.append(type(error).__name__)
+        error = error.__context__
+    return result
+rows = []
+for failures, action, mode in itertools.product(
+        (1, 2), ('resume', 'throw', 'cancel', 'close'), ('normal', 'suppress', 'raise')):
+    events, steps, calls = [], [], [0]
+    class Pause:
+        def __await__(self):
+            yield 'suspended'
+    class Manager:
+        def __init__(self, name):
+            self.name = name
+        async def __aenter__(self):
+            events.append(('enter', self.name))
+            return self
+        async def __aexit__(self, typ, val, tb):
+            events.append(('exit', self.name, typ.__name__ if typ else None, chain(val)))
+            if self.name == 'inner':
+                await Pause()
+                if mode == 'raise':
+                    raise RuntimeError('exit')
+            return self.name == 'inner' and mode == 'suppress'
+    async def work():
+        calls[0] += 1
+        events.append(('work', calls[0]))
+        if calls[0] <= failures:
+            raise ValueError('work')
+    coroutine = scope['f'](Manager('outer'), Manager('inner'), work)
+    try:
+        first = coroutine.send(None)
+        steps.append(first)
+        if first != 'suspended':
+            raise RuntimeError('inner exit did not suspend')
+        if action == 'throw':
+            value = coroutine.throw(RuntimeError('throw'))
+        elif action == 'cancel':
+            value = coroutine.throw(asyncio.CancelledError('cancel'))
+        elif action == 'close':
+            value = coroutine.close()
+        else:
+            value = coroutine.send(None)
+        outcome = ('value', value)
+    except StopIteration as error:
+        outcome = ('return', error.value)
+    except BaseException as error:
+        outcome = ('raise', chain(error))
+    rows.append((events, steps, outcome))
+print(json.dumps(rows))
+";
+
+    for (source, trace) in [(GENERATOR, GENERATOR_TRACE), (ASYNC, ASYNC_TRACE)] {
+        for (index, (python_version, _, _)) in VERSIONS.iter().copied().enumerate() {
+            for optimization_level in LEVELS {
+                let native = oracle(
+                    source.as_bytes(),
+                    "return_older_handler.py",
+                    python_version,
+                    optimization_level,
+                );
+                assert!(
+                    native.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&native.stderr)
+                );
+                let actual = compile_with_options(
+                    source,
+                    "return_older_handler.py",
+                    &CompileOptions {
+                        python_version,
+                        optimization_level,
+                        ..CompileOptions::default()
+                    },
+                )
+                .unwrap()
+                .marshal();
+                assert_eq!(
+                    actual, native.stdout,
+                    "{python_version}, {optimization_level:?}"
+                );
+                let mut outputs = Vec::new();
+                for payload in [&native.stdout, &actual] {
+                    let mut child = Command::new(ORACLES[index].get().unwrap())
+                        .args(["-I", "-S", "-B", "-c", trace])
                         .stdin(Stdio::piped())
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped())
@@ -1805,6 +2051,158 @@ fn elided_inner_else_keeps_protected_loop_backedge_location() {
 }
 
 #[test]
+fn shared_match_exit_keeps_each_return_location() {
+    for source in [
+        r"def enclosing():
+    cell = 1
+    async def f(value, flag, work):
+        if flag:
+            match value:
+                case int():
+                    result = 1
+                case str():
+                    result = 2
+                case None:
+                    result = 3
+            assert flag
+    return f
+f = enclosing()
+",
+        r"def enclosing():
+    cell = 1
+    def f(value, flag, work):
+        if flag:
+            match value:
+                case int() if flag:
+                    result = 1
+                case str() | bytes():
+                    result = 2
+                case None:
+                    result = 3
+            global marker
+            assert flag
+        else:
+            work()
+    return f
+f = enclosing()
+",
+        r"def enclosing():
+    cell = 1
+    def f(value, flag, work):
+        yield 1
+        if flag:
+            match value:
+                case 1:
+                    result = 1
+                case 2:
+                    result = 2
+                case _:
+                    result = 3
+            nonlocal cell
+            assert flag
+    return f
+f = enclosing()
+",
+        r"def enclosing():
+    cell = 1
+    async def f(value, flag, work):
+        yield 1
+        if flag:
+            match value:
+                case int():
+                    result = 1
+                case str():
+                    result = 2
+                case None:
+                    result = 3
+            assert flag
+        else:
+            work()
+    return f
+f = enclosing()
+",
+        r"def enclosing():
+    cell = 1
+    def f(value, flag, work):
+        if flag:
+            match value:
+                case int():
+                    result = 1
+                case str():
+                    result = 2
+                case None:
+                    result = 3
+            work()
+    return f
+f = enclosing()
+",
+        r#"def enclosing():
+    def f(value, flag, work, manager):
+        try:
+            if flag:
+                match value:
+                    case int():
+                        return
+                    case str():
+                        result = 2
+                global marker
+                assert flag
+        except Exception:
+            work("caught")
+    return f
+f = enclosing()
+"#,
+        r"def enclosing():
+    def f(value, flag, work, manager):
+        with manager:
+            if flag:
+                match value:
+                    case int():
+                        result = 1
+                global marker
+                assert flag
+    return f
+f = enclosing()
+",
+        r"def enclosing():
+    def f(value, flag, work, manager):
+        if flag:
+            match value:
+                case _:
+                    result = 1
+            global marker
+            assert flag
+    return f
+f = enclosing()
+",
+    ] {
+        assert_matches_cpython(source, "sub/shared_match_return.py", &LEVELS);
+    }
+}
+
+#[test]
+fn nested_pass_before_elided_assert_preserves_return_locations() {
+    for source in [
+        "def f(a,b):\n if a:\n  if b:\n   pass\n  assert a\n",
+        "def f(a,b,c):\n if a:\n  if b and c:\n   pass\n  assert a\n",
+        "def f(a,b):\n if a:\n  if b:\n   pass\n  else:\n   assert b\n  assert a\n",
+        "def f(a,b):\n if a:\n  if b:\n   pass\n  assert a\n else:\n  work()\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "sub/nested_pass_elided.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+}
+
+#[test]
 fn nested_terminal_if_before_elided_assert_matches_cpython() {
     for source in [
         "def f(a,b):\n if a:\n  if b:\n   x = 1\n  assert a\n",
@@ -2569,6 +2967,134 @@ fn protected_elided_assertion_preserves_terminal_control_flow() {
             &LEVELS,
             &[PythonVersion::Py314, PythonVersion::Py315],
         );
+    }
+}
+
+#[test]
+fn folded_protected_branch_before_elided_assertion_keeps_exit_location() {
+    let versions = [
+        PythonVersion::Py312,
+        PythonVersion::Py313,
+        PythonVersion::Py314,
+        PythonVersion::Py315,
+    ];
+    for (index, source) in [
+        "def f(a):\n try:\n  if True:\n   pass\n  else:\n   other()\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a, b):\n try:\n  if 1:\n   pass\n  else:\n   pass\n  assert a\n  assert b\n except ValueError:\n  work()\n",
+        "def f(a):\n try:\n  if True:\n   pass\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a):\n try:\n  if False:\n   work()\n  else:\n   pass\n  assert a\n except ValueError:\n  work()\n",
+        "def f(a):\n try:\n  if __debug__:\n   work()\n  else:\n   pass\n  assert a\n except ValueError:\n  work()\n",
+    ].into_iter().enumerate() {
+        assert_matches_cpython_versions(
+            source,
+            &format!("sub/folded_protected_exit_{index}.py"),
+            &LEVELS,
+            &versions,
+        );
+    }
+    for (index, source) in [
+        "def f(a):\n try:\n  try:\n   if True:\n    pass\n   else:\n    other()\n   assert a\n  except ValueError:\n   work()\n except TypeError:\n  other()\n",
+        "def f(a, obj):\n with obj:\n  try:\n   if True:\n    pass\n   else:\n    other()\n   assert a\n  except ValueError:\n   work()\n",
+        "def f(a, xs):\n for x in xs:\n  try:\n   if True:\n    pass\n   else:\n    other()\n   assert a\n  except ValueError:\n   work()\n",
+        "def f(a):\n yield 1\n try:\n  if True:\n   pass\n  else:\n   other()\n  assert a\n except ValueError:\n  work()\n",
+        "async def f(a):\n try:\n  if True:\n   pass\n  else:\n   other()\n  assert a\n except ValueError:\n  work()\n",
+    ].into_iter().enumerate() {
+        assert_matches_cpython_versions(
+            source,
+            &format!("sub/folded_protected_context_{index}.py"),
+            &LEVELS[1..],
+            &versions,
+        );
+    }
+}
+
+#[test]
+fn folded_try_pass_after_branch_keeps_existing_exception_owner() {
+    const TRACE: &str = r"
+import dis, marshal, sys, types
+sys.modules['synthetic_module'] = types.ModuleType('synthetic_module')
+events = []
+class Manager:
+    def __enter__(self):
+        events.append('enter')
+        return self
+    def __exit__(self, kind, value, traceback):
+        events.append('exit:' + (kind.__name__ if kind else 'none'))
+        return False
+scope = {'recover': lambda: events.append('recover'), 'other': lambda: events.append('other')}
+exec(marshal.load(sys.stdin.buffer), scope)
+f = scope['outer']()
+targets = [i.offset for i in dis.get_instructions(f)
+           if i.opname == 'NOP' and i.positions.lineno == int(sys.argv[1])]
+if len(targets) != 1:
+    raise RuntimeError(('expected one Pass NOP', targets))
+target, hits = targets[0], []
+def inject(code, offset):
+    if offset == target:
+        hits.append(offset)
+        raise ValueError('injected')
+monitor = sys.monitoring
+monitor.use_tool_id(5, 'folded-pass-owner')
+monitor.register_callback(5, monitor.events.INSTRUCTION, inject)
+monitor.set_local_events(5, f.__code__, monitor.events.INSTRUCTION)
+try:
+    values = list(f(sys.argv[2] == 'true', Manager(), []))
+finally:
+    monitor.set_local_events(5, f.__code__, 0)
+    monitor.register_callback(5, monitor.events.INSTRUCTION, None)
+    monitor.free_tool_id(5)
+if hits != [target] or values != [1] or events != ['enter', 'recover', 'exit:none']:
+    raise RuntimeError((hits, values, events))
+";
+    for (body, target_line, argument) in [
+        ("if a:\n      pass", "9", "true"),
+        (
+            "if a:\n      pass\n     else:\n      pass\n     pass",
+            "11",
+            "false",
+        ),
+        ("if a: pass\n     pass; pass", "8", "true"),
+    ] {
+        let source = format!(
+            "from synthetic_module import *\ndef outer():\n marker = 1\n def f(a, manager, xs):\n  with manager:\n   try:\n    if True:\n     {body}\n    else:\n     other()\n    assert a\n   except ValueError:\n    recover()\n  for x in xs:\n   if x:\n    assert False\n   if x:\n    assert False\n  yield 1\n return f\n"
+        );
+        for version in [PythonVersion::Py314, PythonVersion::Py315] {
+            for level in [OptimizationLevel::One, OptimizationLevel::Two] {
+                let native = oracle(source.as_bytes(), "folded_pass_owner.py", version, level);
+                assert!(native.status.success());
+                let actual = compile_with_options(
+                    &source,
+                    "folded_pass_owner.py",
+                    &CompileOptions {
+                        python_version: version,
+                        optimization_level: level,
+                        ..CompileOptions::default()
+                    },
+                )
+                .unwrap()
+                .marshal();
+                let index = VERSIONS
+                    .iter()
+                    .position(|(candidate, _, _)| *candidate == version)
+                    .unwrap();
+                for (label, bytes) in [("native", &native.stdout), ("serc", &actual)] {
+                    let mut child = Command::new(ORACLES[index].get().unwrap())
+                        .args(["-I", "-S", "-B", "-c", TRACE, target_line, argument])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    child.stdin.take().unwrap().write_all(bytes).unwrap();
+                    let result = child.wait_with_output().unwrap();
+                    assert!(
+                        result.status.success(),
+                        "{version}, {level:?}, {label}: {}",
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -3866,6 +4392,127 @@ fn legacy_protected_manager_pass_before_split_try_matches_cpython() {
 }
 
 #[test]
+fn modern_manager_finally_jump_and_copied_exit_keep_owners() {
+    const JUMP_SOURCE: &str = "def f(manager, work):\n    try:\n        raise ValueError()\n    except ValueError:\n        with manager:\n            try:\n                work()\n            finally:\n                pass\n";
+    const DIRECT_SOURCE: &str = "def f(manager, work):\n    with manager:\n        try:\n            work()\n        finally:\n            pass\n";
+    const PREFIX_SOURCE: &str = "def f(manager, work):\n    with manager:\n        pass\n        try:\n            work()\n        finally:\n            pass\n";
+    const COPY_SOURCE: &str = "def f(manager, work, flag):\n    try:\n        if flag:\n            return work()\n        work()\n    finally:\n        with manager:\n            try:\n                work()\n            finally:\n                pass\n";
+    const ASSERT_SOURCE: &str = "def f(manager, work, flag):\n    with manager:\n        pass\n        try:\n            work()\n        finally:\n            pass\n            assert flag\n";
+    const TRACE: &str = r"
+import dis, marshal, sys
+mode = sys.argv[1]
+scope = {}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+f = scope['f']
+targets = [i.offset for i in dis.get_instructions(f)
+           if (i.opname == 'JUMP_FORWARD' and i.positions.lineno == 9 if mode == 'jump'
+               else i.opname == 'NOT_TAKEN' and i.positions.lineno == 8 if mode == 'assert'
+               else i.opname == 'NOP' and i.positions.lineno == (6 if mode == 'direct' else 3 if mode == 'prefix' else 11))]
+if mode == 'assert':
+    targets = targets[:1]
+if (len(targets) < 2 if mode == 'copy' else len(targets) != 1):
+    raise RuntimeError(('missing finalizer marker', mode, targets))
+monitor = sys.monitoring
+monitor.use_tool_id(5, 'modern-manager-finally-owner')
+for flag in ((True, False) if mode == 'copy' else (False,)):
+    target = targets[1 if mode == 'copy' and not flag else 0]
+    for exception in (RuntimeError, StopIteration):
+        for suppress in (False, True):
+            events, hits = [], []
+            class Manager:
+                def __enter__(self):
+                    events.append('enter')
+                def __exit__(self, typ, value, traceback):
+                    events.append(('exit', typ))
+                    return suppress
+            def work():
+                events.append('work')
+                return 7
+            def inject(code, offset):
+                if code is f.__code__ and offset == target:
+                    hits.append(offset)
+                    raise exception('injected')
+            monitor.register_callback(5, monitor.events.INSTRUCTION, inject)
+            monitor.set_local_events(5, f.__code__, monitor.events.INSTRUCTION)
+            try:
+                if mode in ('copy', 'assert'):
+                    f(Manager(), work, flag)
+                else:
+                    f(Manager(), work)
+                outcome = None
+            except BaseException as error:
+                outcome = type(error)
+            finally:
+                monitor.set_local_events(5, f.__code__, 0)
+                monitor.register_callback(5, monitor.events.INSTRUCTION, None)
+            if mode in ('jump', 'prefix') or (mode == 'assert' and sys.version_info[:2] == (3, 14)):
+                expected_events = (['enter', 'work', ('exit', exception)] if mode in ('jump', 'assert')
+                                   else ['enter', ('exit', exception)])
+                expected_outcome = None if suppress else exception
+            else:
+                expected_events = (['enter', 'work'] if mode in ('direct', 'assert')
+                                   else ['work', 'enter', 'work'])
+                expected_outcome = exception
+            if hits != [target] or events != expected_events or outcome is not expected_outcome:
+                raise RuntimeError((mode, hits, events, outcome, expected_outcome))
+monitor.free_tool_id(5)
+";
+
+    for (index, python_version) in [(2, PythonVersion::Py314), (3, PythonVersion::Py315)] {
+        for optimization_level in LEVELS {
+            for (mode, source) in [
+                ("jump", JUMP_SOURCE),
+                ("direct", DIRECT_SOURCE),
+                ("prefix", PREFIX_SOURCE),
+                ("copy", COPY_SOURCE),
+                ("assert", ASSERT_SOURCE),
+            ] {
+                if mode == "assert" && optimization_level != OptimizationLevel::Zero {
+                    continue;
+                }
+                let native = oracle(
+                    source.as_bytes(),
+                    "modern_manager_finally.py",
+                    python_version,
+                    optimization_level,
+                );
+                assert!(
+                    native.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&native.stderr)
+                );
+                let actual = compile_with_options(
+                    source,
+                    "modern_manager_finally.py",
+                    &CompileOptions {
+                        python_version,
+                        optimization_level,
+                        ..CompileOptions::default()
+                    },
+                )
+                .unwrap()
+                .marshal();
+                for code in [&native.stdout, &actual] {
+                    let mut child = Command::new(ORACLES[index].get().unwrap())
+                        .args(["-I", "-S", "-B", "-c", TRACE, mode])
+                        .stdin(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    child.stdin.take().unwrap().write_all(code).unwrap();
+                    let result = child.wait_with_output().unwrap();
+                    assert!(
+                        result.status.success(),
+                        "{python_version}, {optimization_level:?}, {mode}: {}",
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn legacy_manager_finally_jump_keeps_manager_owner() {
     const SOURCE: &str = "def f(manager, work):\n    try:\n        raise ValueError()\n    except ValueError:\n        with manager:\n            pass\n            try:\n                work()\n            finally:\n                pass\n";
     const TRACE: &str = r"
@@ -4197,6 +4844,117 @@ fn elided_assertion_with_nested_finally_matches_cpython() {
         "def outer():\n    x = None\n    def f():\n        try:\n            operation()\n            nonlocal x\n        except ValueError:\n            raise\n        finally:\n            try:\n                cleanup()\n            except TypeError:\n                pass\n    return f\n",
     ] {
         assert_matches_cpython(source, "case.py", &LEVELS);
+    }
+}
+
+#[test]
+fn elided_assertion_after_manager_finally_matches_cpython() {
+    for source in [
+        "def f(cm, x):\n    with cm:\n        try:\n            work()\n        finally:\n            cleanup()\n        assert x\n",
+        "def f(cm, x, y):\n    with cm:\n        try:\n            work()\n        finally:\n            cleanup()\n        assert x; assert y\n",
+        "def f(cm, x):\n    with cm:\n        try:\n            work()\n        finally:\n            cleanup()\n        assert (value := x)\n    return value\n",
+        "def f(cm, other, x):\n    with cm, other:\n        try:\n            work()\n        finally:\n            cleanup()\n        assert x\n",
+        "def f(cm, x):\n    with cm:\n        try:\n            work()\n        finally:\n            cleanup()\n        assert x\n        after()\n",
+        "async def f(cm, x):\n    await before()\n    with cm:\n        try:\n            work()\n        finally:\n            cleanup()\n        assert x\n",
+        "def f(cm, x, y, value):\n    with cm:\n        try:\n            if x:\n                if y:\n                    work()\n                assert value\n            else:\n                other()\n        finally:\n            cleanup()\n        assert value\n",
+        "def outer():\n    cell = None\n    def f(cm, x, y, value):\n        with cm:\n            try:\n                if x:\n                    if y:\n                        work()\n                    nonlocal cell\n                else:\n                    other()\n            finally:\n                cleanup()\n            assert value\n    return f\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "manager_finally_assert.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
+fn elided_assertion_after_manager_finally_preserves_preceding_pass_owner() {
+    const SOURCE: &str = "def f(cm, x):\n    with cm:\n        pass\n        try:\n            work()\n        finally:\n            cleanup()\n        assert x\n";
+    const TRACE: &str = r"
+import dis, json, marshal, sys
+events = []
+class Fault(Exception): pass
+class Manager:
+    def __enter__(self):
+        events.append('enter')
+    def __exit__(self, typ, value, tb):
+        events.append(('exit', typ.__name__ if typ else None))
+        return False
+scope = {'work': lambda: events.append('work'), 'cleanup': lambda: events.append('cleanup')}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+f = scope['f']
+targets = [i.offset for i in dis.get_instructions(f)
+           if i.opname == 'NOP' and i.positions.lineno == 3]
+if len(targets) != 1:
+    raise RuntimeError('expected one authored pass NOP')
+hits = []
+def trace(frame, event, arg):
+    if frame.f_code is f.__code__:
+        frame.f_trace_opcodes = True
+        if event == 'opcode' and frame.f_lasti == targets[0]:
+            hits.append(True)
+            raise Fault()
+    return trace
+sys.settrace(trace)
+try:
+    try:
+        f(Manager(), True)
+    except Fault:
+        events.append('escaped')
+finally:
+    sys.settrace(None)
+if len(hits) != 1:
+    raise RuntimeError('authored pass NOP was not reached')
+print(json.dumps(events))
+";
+    for (index, (python_version, _, _)) in VERSIONS.iter().copied().enumerate().skip(2) {
+        for optimization_level in &LEVELS[1..] {
+            let native = oracle(
+                SOURCE.as_bytes(),
+                "manager_finally_assert.py",
+                python_version,
+                *optimization_level,
+            );
+            assert!(
+                native.status.success(),
+                "{}",
+                String::from_utf8_lossy(&native.stderr)
+            );
+            let actual = compile_with_options(
+                SOURCE,
+                "manager_finally_assert.py",
+                &CompileOptions {
+                    python_version,
+                    optimization_level: *optimization_level,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .marshal();
+            let mut outputs = Vec::new();
+            for payload in [&native.stdout, &actual] {
+                let mut child = Command::new(ORACLES[index].get().unwrap())
+                    .args(["-I", "-S", "-B", "-c", TRACE])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child.stdin.take().unwrap().write_all(payload).unwrap();
+                let result = child.wait_with_output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                outputs.push(result.stdout);
+            }
+            assert_eq!(
+                outputs[0], outputs[1],
+                "{python_version}, {optimization_level:?}"
+            );
+        }
     }
 }
 

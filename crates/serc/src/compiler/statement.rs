@@ -368,6 +368,8 @@ pub(super) struct WithState {
     active_with_exits: Vec<WithExitContext>,
     // The last statement of a manager body prefix with a separately compiled tail.
     split_body_prefix_end: Option<TextRange>,
+    // A sole-Pass finalizer keeps the preceding authored Pass in the manager region.
+    split_pass_finally_prefix_end: Option<TextRange>,
     // Only direct None-condition siblings in the innermost synchronous-with body can reuse a
     // preceding conditional owner. Nested suites and earlier returns use a different layout.
     shifted_sync_with_none_owner_statements: Vec<TextRange>,
@@ -1690,6 +1692,9 @@ impl<'source> Compiler<'source> {
         let split_manager_prefix = body.last().is_some_and(|statement| {
             self.control.withs.split_body_prefix_end == Some(statement.range())
         });
+        let split_pass_finally_prefix = body.last().is_some_and(|statement| {
+            self.control.withs.split_pass_finally_prefix_end == Some(statement.range())
+        });
         let legacy_split_sync_manager_prefix = self.context.python_version
             <= crate::PythonVersion::Py313
             && split_manager_prefix
@@ -1845,8 +1850,11 @@ impl<'source> Compiler<'source> {
                     }));
             // A nested conditional before removed assertions can contribute its own
             // return locations to the enclosing terminal branch.
-            let terminal_nested_before_elided = self.context.python_version
+            let terminal_nested_before_elided = (self.context.python_version
                 >= crate::PythonVersion::Py314
+                || (self.context.python_version == crate::PythonVersion::Py312
+                    && matches!(statement, Stmt::If(conditional)
+                        if matches!(conditional.body.as_slice(), [Stmt::Pass(_)]))))
                 && !is_final
                 && plain_function_suite
                 && self.control.statements.in_terminal_if_branch_suite
@@ -1872,6 +1880,7 @@ impl<'source> Compiler<'source> {
                         && condition_has_linear_runtime_leaves(&conditional.test)
                         && !expression_suspends_current_scope(&conditional.test)
                         && (suite_has_linear_borrow_fallthrough(&conditional.body)
+                            || matches!(conditional.body.as_slice(), [Stmt::Pass(_)])
                             || (!conditional.body.is_empty()
                                 && conditional.body.iter().all(|statement| matches!(
                                     self.context.optimized_locations.get(&statement.range()),
@@ -2218,6 +2227,8 @@ impl<'source> Compiler<'source> {
                     || self.control.finally.active_finally_end_blocks > 0
                     || protected_async_with_pass
                     || protected_sync_with_join_pass
+                    || (self.context.python_version >= crate::PythonVersion::Py314
+                        && split_pass_finally_prefix)
                     || (self.control.statements.retained_branch_pass == Some(statement.range)
                         && self.assembler.current_block_last_instruction_location().is_some_and(
                             |previous| previous.line >= 0
@@ -2257,7 +2268,9 @@ impl<'source> Compiler<'source> {
                         && self.control.withs.active_with_exits.is_empty()))
                 && (self.control.withs.active_with_region_exclusions.is_empty()
                     || body.len() > 1
-                    || legacy_split_sync_manager_prefix)
+                    || legacy_split_sync_manager_prefix
+                    || (self.context.python_version >= crate::PythonVersion::Py314
+                        && split_pass_finally_prefix))
             {
                 self.assembler
                     .set_location(self.source_location(statement.range));
@@ -3894,7 +3907,11 @@ impl<'source> Compiler<'source> {
                         // Resolve the return after 3.12's static swaps, even when an
                         // elided assertion follows the comprehension assignment.
                         self.assembler.set_location(SourceLocation::NONE);
-                    } else if suite_has_shared_terminal_condition_exit(body) {
+                    } else if suite_has_shared_terminal_condition_exit(body)
+                        || (self.assembler.at_original_match_join()
+                            && self.assembler.at_original_unconditional_join())
+                    {
+                        // Let each incoming edge supply the shared return's location.
                         self.assembler.set_location(SourceLocation::NONE);
                     } else if let Some(range) = suite_assert_success_fallthrough_range(body) {
                         self.assembler.set_location(self.source_location(range));
@@ -3976,7 +3993,11 @@ impl<'source> Compiler<'source> {
                         // Resolve the return after 3.12's static swaps, even when an
                         // elided assertion follows the comprehension assignment.
                         self.assembler.set_location(SourceLocation::NONE);
-                    } else if suite_has_shared_terminal_condition_exit(body) {
+                    } else if suite_has_shared_terminal_condition_exit(body)
+                        || (self.assembler.at_original_match_join()
+                            && self.assembler.at_original_unconditional_join())
+                    {
+                        // Let each incoming edge supply the shared return's location.
                         self.assembler.set_location(SourceLocation::NONE);
                     } else if let Some(range) = suite_assert_success_fallthrough_range(body) {
                         self.assembler.set_location(self.source_location(range));
@@ -4614,144 +4635,7 @@ impl<'source> Compiler<'source> {
     ) -> Result<(), CompileError> {
         let starting_depth = self.control.stack.depth;
         match statement {
-            Stmt::Assign(assignment) => {
-                let unpacked = if let [target] = assignment.targets.as_slice()
-                    && let Expr::Tuple(value) = assignment.value.as_ref()
-                    // Legacy AST folding replaces constant tuples before code generation,
-                    // so their LOAD_CONST remains followed by UNPACK_SEQUENCE.
-                    && !(self.context.python_version <= crate::PythonVersion::Py313
-                        && self.return_value_is_constant(&assignment.value))
-                {
-                    let targets = match target {
-                        Expr::Tuple(target) => Some(target.elts.as_slice()),
-                        Expr::List(target) => Some(target.elts.as_slice()),
-                        _ => None,
-                    };
-                    targets.filter(|targets| {
-                        targets.len() == value.elts.len()
-                            && targets.len() <= 3
-                            && !targets.iter().any(Expr::is_starred_expr)
-                            && !value.elts.iter().any(Expr::is_starred_expr)
-                    })
-                } else {
-                    None
-                };
-                if let Some(targets) = unpacked {
-                    let Expr::Tuple(value) = assignment.value.as_ref() else {
-                        unreachable!();
-                    };
-                    for value in &value.elts {
-                        self.compile_expression(value)?;
-                    }
-                    if targets.len() > 1 {
-                        // CPython turns BUILD_TUPLE into a NOP before UNPACK_SEQUENCE
-                        // becomes SWAP. Its line can survive between multiline values
-                        // and targets, just as in a singleton comprehension assignment.
-                        let tuple_location = self.source_location(value.range);
-                        let emit_tuple_nop = self
-                            .assembler
-                            .current_block_last_instruction_location()
-                            .is_none_or(|previous| previous.line != tuple_location.line);
-                        if emit_tuple_nop {
-                            self.assembler.set_location(tuple_location);
-                            self.emit(NOP, 0, 0)?;
-                        }
-                        self.assembler
-                            .set_location(self.source_location(assignment.targets[0].range()));
-                        self.emit(SWAP, to_u32(targets.len(), "unpack target count")?, 0)?;
-                        if !emit_tuple_nop {
-                            // A real NOP already counts as the original tuple-build record.
-                            self.assembler.add_last_constant_fold_slots(1);
-                        }
-                    }
-                    let target_start = self.assembler.item_count();
-                    for target in targets {
-                        self.compile_store_target(target)?;
-                    }
-                    if targets.len() == 1 {
-                        // Both original instructions disappear before this target. Recording
-                        // them here keeps the vacancy after any value-expression branch join.
-                        self.assembler.add_constant_fold_slots_at(target_start, 2);
-                    }
-                } else {
-                    let defer_restore =
-                        self.assignment_defers_async_comprehension_restore(assignment);
-                    self.with_control_override(
-                        |control| &mut control.comprehensions.defer_async_comprehension_restore,
-                        defer_restore,
-                        |compiler| {
-                            let newly_owned = if assignment
-                                .targets
-                                .iter()
-                                // Fast-local stores mark the producer STORED_AS_LOCAL. Global,
-                                // name and cell stores consume copies without setting that flag.
-                                .any(|target| {
-                                    let Expr::Name(name) = target else {
-                                        return false;
-                                    };
-                                    let name = compiler.required_name_id(name.id.as_str());
-                                    if compiler.symbols.active_temporaries.contains(name) {
-                                        !compiler.symbols.cell_names.contains(name)
-                                            || compiler.symbols.active_temporary_fast_cells.contains(name)
-                                    } else {
-                                        matches!(&compiler.unit.scope,
-                                            Scope::Function { indices, free_indices, cells, globals }
-                                                if indices.contains_key(&name)
-                                                    && !globals.contains(name)
-                                                    && !free_indices.contains_key(&name)
-                                                    && !cells.contains(name))
-                                    }
-                                })
-                                && let Expr::Name(name) = assignment.value.as_ref()
-                            {
-                                let name = compiler.required_name_id(name.id.as_str());
-                                compiler.symbols.owned_load_locals.insert(name)
-                            } else {
-                                false
-                            };
-                            compiler.compile_expression(&assignment.value)?;
-                            if newly_owned && let Expr::Name(name) = assignment.value.as_ref() {
-                                let name = compiler.required_name_id(name.id.as_str());
-                                compiler.symbols.owned_load_locals.remove(name);
-                            }
-                            Ok(())
-                        },
-                    )?;
-                    for (index, target) in assignment.targets.iter().enumerate() {
-                        if index + 1 < assignment.targets.len() {
-                            self.emit(COPY, 1, 1)?;
-                        }
-                        self.compile_store_target(target)?;
-                    }
-                    self.emit_pending_comprehension_restores(matches!(
-                        assignment.targets.as_slice(),
-                        [Expr::Name(_)]
-                    ))?;
-                    if matches!(
-                        assignment.value.as_ref(),
-                        Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)
-                    ) && matches!(assignment.targets.as_slice(), [Expr::Name(_)])
-                        && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) != 0
-                        && self.control.generators.coroutine_suspension_epoch == 0
-                        && !self.control.generators.emitted_yield_value
-                        && self.control.generators.generator_region_start.is_some()
-                        && self.control.withs.active_with_region_exclusions.is_empty()
-                        && self
-                            .control
-                            .exceptions
-                            .active_exception_region_exclusions
-                            .is_empty()
-                        && self.control.finally.active_normal_finally_bodies == 0
-                        && self.control.finally.active_finally_end_blocks == 0
-                        && self.control.exceptions.active_exception_group_handlers == 0
-                        && !self.control.in_loop()
-                    {
-                        self.control
-                            .generators
-                            .pre_suspension_inline_comprehension_restore = true;
-                    }
-                }
-            }
+            Stmt::Assign(assignment) => self.compile_assignment_statement(assignment)?,
             Stmt::AugAssign(assignment) => {
                 self.compile_augmented_assignment(assignment)?;
             }
@@ -6519,46 +6403,17 @@ impl<'source> Compiler<'source> {
                 // A nested try/finally inside the manager must run its copied
                 // cleanup before the manager exits. Its enclosing exceptional
                 // finalizer ends only after those managers have exited.
-                let inner_manager_boundary = self.control.withs.active_with_exits[..next_with]
-                    .iter()
-                    .position(|context| context.finally_end_depth == 1);
-                let defer_finally_end_for_managers = !return_is_overridden
-                    && !handler_before_finally_end
-                    && self.control.finally.active_finally_end_blocks == 1
-                    && self.control.finally.active_normal_finally_bodies == 0
-                    && self.control.finally.active_copied_finally_bodies == 0
-                    && self
-                        .control
-                        .finally
-                        .preserved_return_value_contexts
-                        .is_empty()
-                    && self.control.finally.copied_return_finally_preserved_values == 0
-                    && self
-                        .control
-                        .exceptions
-                        .active_exception_handlers
-                        .iter()
-                        .all(|handler| {
-                            handler.finally_end_depth == 1 && handler.with_depth == next_with
-                        })
-                    && self.control.exceptions.active_exception_group_handlers == 0
-                    && self.control.loops.contexts.is_empty()
-                    && inner_manager_boundary.is_some_and(|boundary| {
-                        self.control.withs.active_with_exits[..boundary]
-                            .iter()
-                            .all(|context| context.finally_end_depth == 0)
-                            && self.control.withs.active_with_exits[boundary..next_with]
-                                .iter()
-                                .all(|context| context.finally_end_depth == 1)
-                    })
-                    && self
-                        .control
-                        .finally
-                        .active_return_finally_contexts
-                        .iter()
-                        .all(|context| context.with_depth >= next_with);
+                let (inner_manager_boundary, inner_loop_boundary, defer_finally_end_for_managers) =
+                    self.return_finally_manager_boundaries(
+                        return_is_overridden,
+                        handler_before_finally_end,
+                        next_with,
+                    );
+                let handler_outside_finally_end =
+                    self.handler_outside_finally_end(inner_manager_boundary);
                 let deferred_finally_end_start =
                     defer_finally_end_for_managers.then(|| self.assembler.label());
+                let mut deferred_finally_end_marked = false;
                 let nested_finally_region_depth = if defer_finally_end_for_managers {
                     self.control.withs.active_with_exits[inner_manager_boundary.unwrap()]
                         .exception_region_depth
@@ -6599,38 +6454,7 @@ impl<'source> Compiler<'source> {
                 // inside this sole ordinary try keep its owner through a computed return's
                 // SWAP/POP pairs, even when a while is the innermost loop.
                 let protected_sync_iterator_below_while =
-                    !return_is_overridden
-                        && preserve_tos
-                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                            == 0
-                        && self.control.exceptions.active_exception_handlers.is_empty()
-                        && self.control.exceptions.active_exception_group_handlers == 0
-                        && self.control.exceptions.active_try_marker_slots.len() == 1
-                        && self
-                            .control
-                            .exceptions
-                            .active_exception_region_exclusions
-                            .len()
-                            == 1
-                        && self.control.withs.active_with_exits.is_empty()
-                        && self.control.finally.is_inactive_for_return_unwind()
-                        && self.control.loops.contexts.last().is_some_and(|context| {
-                            context.iterator_cleanup == IteratorCleanup::None
-                        })
-                        && self
-                            .control
-                            .loops
-                            .contexts
-                            .iter()
-                            .any(|context| context.iterator_cleanup == IteratorCleanup::Sync)
-                        && self.control.loops.contexts.iter().all(|context| {
-                            matches!(
-                                context.iterator_cleanup,
-                                IteratorCleanup::None | IteratorCleanup::Sync
-                            ) && context.exception_region_depth == 1
-                                && context.with_depth == 0
-                                && context.finally_end_depth == 0
-                        });
+                    self.protected_sync_iterator_below_while(return_is_overridden, preserve_tos);
                 // A result returned from a loop that was already protected by this try keeps the
                 // iterator cleanup protected. For a literal, start the exclusion before
                 // loading the returned constant; other returned values are already on the stack.
@@ -8048,6 +7872,20 @@ impl<'source> Compiler<'source> {
                                 None
                             },
                         )?;
+                        // The manager was entered in an exceptional finally inside
+                        // this handler. Exit the manager, restore the finally state,
+                        // then restore the older handler's exception state.
+                        if handler_outside_finally_end
+                            && let Some(start) = deferred_finally_end_start
+                        {
+                            with_unwind_before_exception_start = with_unwind_starts.len();
+                            self.emit_return_deferred_finally_end(
+                                start,
+                                preserve_tos,
+                                handler_region_unwind_starts.as_deref_mut(),
+                            )?;
+                            deferred_finally_end_marked = true;
+                        }
                         let preserve_named_handler_pop_slots = name.is_some()
                             && handler_count == 1
                             && next_finally > 0
@@ -8555,6 +8393,22 @@ impl<'source> Compiler<'source> {
                                 // POP_BLOCK retires that owner before POP_EXCEPT.
                                 region_starts[0] = start;
                             }
+                        }
+                        if let Some(start) = deferred_finally_end_start
+                            && !deferred_finally_end_marked
+                            && next_handler == 1
+                            && next_finally == 0
+                            && next_with <= inner_manager_boundary.unwrap()
+                            && next_loop <= inner_loop_boundary
+                        {
+                            with_unwind_before_exception_start = with_unwind_starts.len();
+                            self.emit_return_deferred_finally_end(
+                                start,
+                                preserve_tos,
+                                handler_region_unwind_starts.as_deref_mut(),
+                            )?;
+
+                            deferred_finally_end_marked = true;
                         }
                         next_loop = loop_depth;
                         next_handler -= 1;
@@ -10996,6 +10850,27 @@ impl<'source> Compiler<'source> {
                         None
                     },
                 )?;
+                // A manager nested in a handler can already have exited before
+                // the handler restores its exception state, while an iterator
+                // surrounding that handler still needs to be discarded. Finish
+                // the exceptional finally after that iterator and before any
+                // managers that were entered outside the finally.
+                if let Some(start) = deferred_finally_end_start
+                    && !deferred_finally_end_marked
+                    && next_handler == 0
+                    && next_finally == 0
+                    && next_with <= inner_manager_boundary.unwrap()
+                    && deferred_outer_iterator_depth <= inner_loop_boundary
+                {
+                    with_unwind_before_exception_start = with_unwind_starts.len();
+                    self.emit_return_deferred_finally_end(
+                        start,
+                        preserve_tos,
+                        handler_region_unwind_starts.as_deref_mut(),
+                    )?;
+
+                    deferred_finally_end_marked = true;
+                }
                 if delay_literal_iterator_exception_unwind_start
                     && delay_iterator_exception_unwind_start
                     && exception_unwind_start.is_none()
@@ -11047,17 +10922,25 @@ impl<'source> Compiler<'source> {
                     }
                     remaining_with_starts.extend(starts);
                     if let Some(start) = deferred_finally_end_start
+                        && !deferred_finally_end_marked
                         && inner_manager_boundary == Some(with_index)
                     {
+                        let iterator_depth = inner_loop_boundary.min(deferred_outer_iterator_depth);
+                        self.emit_return_loop_iterator_cleanup(
+                            iterator_depth,
+                            deferred_outer_iterator_depth,
+                            preserve_tos,
+                            None,
+                        )?;
+                        deferred_outer_iterator_depth = iterator_depth;
                         with_unwind_before_exception_start =
                             with_unwind_starts.len() + remaining_with_starts.len();
-                        self.emit_finally_end_unwind(0, preserve_tos, Some(start))?;
-                        if let Some(region_starts) = &mut handler_region_unwind_starts
-                            && let Some(index) =
-                                self.control.finally.finally_end_region_indices.last()
-                        {
-                            region_starts[*index].get_or_insert(start);
-                        }
+                        self.emit_return_deferred_finally_end(
+                            start,
+                            preserve_tos,
+                            handler_region_unwind_starts.as_deref_mut(),
+                        )?;
+                        deferred_finally_end_marked = true;
                     }
                     if let Some(outer_index) = with_index.checked_sub(1) {
                         let outer_loop_depth = self.control.withs.active_with_exits[outer_index]
@@ -11495,13 +11378,23 @@ impl<'source> Compiler<'source> {
                         ) {
                             match index.cmp(&finally_region) {
                                 std::cmp::Ordering::Equal => finally_start,
-                                std::cmp::Ordering::Less => with_unwind_starts
-                                    .iter()
-                                    .find(|unwind| {
-                                        unwind.index < boundary
-                                            && unwind.exits_exception_region(index)
-                                    })
-                                    .map_or(outer_end, |unwind| unwind.start),
+                                std::cmp::Ordering::Less => {
+                                    if handler_outside_finally_end
+                                        && let Some(start) = handler_region_unwind_starts
+                                            .as_ref()
+                                            .and_then(|starts| starts[index])
+                                    {
+                                        start
+                                    } else {
+                                        with_unwind_starts
+                                            .iter()
+                                            .find(|unwind| {
+                                                unwind.index < boundary
+                                                    && unwind.exits_exception_region(index)
+                                            })
+                                            .map_or(outer_end, |unwind| unwind.start)
+                                    }
+                                }
                                 std::cmp::Ordering::Greater => exclusion_start,
                             }
                         } else {
@@ -11556,6 +11449,149 @@ impl<'source> Compiler<'source> {
                 "statement changed stack depth from {starting_depth} to {}",
                 self.control.stack.depth
             )));
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn compile_assignment_statement(
+        &mut self,
+        assignment: &ruff_python_ast::StmtAssign,
+    ) -> Result<(), CompileError> {
+        let unpacked = if let [target] = assignment.targets.as_slice()
+            && let Expr::Tuple(value) = assignment.value.as_ref()
+            // Legacy AST folding replaces constant tuples before code generation,
+            // so their LOAD_CONST remains followed by UNPACK_SEQUENCE.
+            && !(self.context.python_version <= crate::PythonVersion::Py313
+                && self.return_value_is_constant(&assignment.value))
+        {
+            let targets = match target {
+                Expr::Tuple(target) => Some(target.elts.as_slice()),
+                Expr::List(target) => Some(target.elts.as_slice()),
+                _ => None,
+            };
+            targets.filter(|targets| {
+                targets.len() == value.elts.len()
+                    && targets.len() <= 3
+                    && !targets.iter().any(Expr::is_starred_expr)
+                    && !value.elts.iter().any(Expr::is_starred_expr)
+            })
+        } else {
+            None
+        };
+        if let Some(targets) = unpacked {
+            let Expr::Tuple(value) = assignment.value.as_ref() else {
+                unreachable!();
+            };
+            for value in &value.elts {
+                self.compile_expression(value)?;
+            }
+            if targets.len() > 1 {
+                // CPython turns BUILD_TUPLE into a NOP before UNPACK_SEQUENCE
+                // becomes SWAP. Its line can survive between multiline values
+                // and targets, just as in a singleton comprehension assignment.
+                let tuple_location = self.source_location(value.range);
+                let emit_tuple_nop = self
+                    .assembler
+                    .current_block_last_instruction_location()
+                    .is_none_or(|previous| previous.line != tuple_location.line);
+                if emit_tuple_nop {
+                    self.assembler.set_location(tuple_location);
+                    self.emit(NOP, 0, 0)?;
+                }
+                self.assembler
+                    .set_location(self.source_location(assignment.targets[0].range()));
+                self.emit(SWAP, to_u32(targets.len(), "unpack target count")?, 0)?;
+                if !emit_tuple_nop {
+                    // A real NOP already counts as the original tuple-build record.
+                    self.assembler.add_last_constant_fold_slots(1);
+                }
+            }
+            let target_start = self.assembler.item_count();
+            for target in targets {
+                self.compile_store_target(target)?;
+            }
+            if targets.len() == 1 {
+                // Both original instructions disappear before this target. Recording
+                // them here keeps the vacancy after any value-expression branch join.
+                self.assembler.add_constant_fold_slots_at(target_start, 2);
+            }
+        } else {
+            let defer_restore = self.assignment_defers_async_comprehension_restore(assignment);
+            self.with_control_override(
+                |control| &mut control.comprehensions.defer_async_comprehension_restore,
+                defer_restore,
+                |compiler| {
+                    let newly_owned = if assignment
+                        .targets
+                        .iter()
+                        // Fast-local stores mark the producer STORED_AS_LOCAL. Global,
+                        // name and cell stores consume copies without setting that flag.
+                        .any(|target| {
+                            let Expr::Name(name) = target else {
+                                return false;
+                            };
+                            let name = compiler.required_name_id(name.id.as_str());
+                            if compiler.symbols.active_temporaries.contains(name) {
+                                !compiler.symbols.cell_names.contains(name)
+                                    || compiler.symbols.active_temporary_fast_cells.contains(name)
+                            } else {
+                                matches!(&compiler.unit.scope,
+                                    Scope::Function { indices, free_indices, cells, globals }
+                                        if indices.contains_key(&name)
+                                            && !globals.contains(name)
+                                            && !free_indices.contains_key(&name)
+                                            && !cells.contains(name))
+                            }
+                        })
+                        && let Expr::Name(name) = assignment.value.as_ref()
+                    {
+                        let name = compiler.required_name_id(name.id.as_str());
+                        compiler.symbols.owned_load_locals.insert(name)
+                    } else {
+                        false
+                    };
+                    compiler.compile_expression(&assignment.value)?;
+                    if newly_owned && let Expr::Name(name) = assignment.value.as_ref() {
+                        let name = compiler.required_name_id(name.id.as_str());
+                        compiler.symbols.owned_load_locals.remove(name);
+                    }
+                    Ok(())
+                },
+            )?;
+            for (index, target) in assignment.targets.iter().enumerate() {
+                if index + 1 < assignment.targets.len() {
+                    self.emit(COPY, 1, 1)?;
+                }
+                self.compile_store_target(target)?;
+            }
+            self.emit_pending_comprehension_restores(matches!(
+                assignment.targets.as_slice(),
+                [Expr::Name(_)]
+            ))?;
+            if matches!(
+                assignment.value.as_ref(),
+                Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)
+            ) && matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) != 0
+                && self.control.generators.coroutine_suspension_epoch == 0
+                && !self.control.generators.emitted_yield_value
+                && self.control.generators.generator_region_start.is_some()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && !self.control.in_loop()
+            {
+                self.control
+                    .generators
+                    .pre_suspension_inline_comprehension_restore = true;
+            }
         }
         Ok(())
     }
@@ -15357,6 +15393,164 @@ impl<'source> Compiler<'source> {
             }
             with_unwind_starts.extend(starts);
             *next_with = index;
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn protected_sync_iterator_below_while(
+        &self,
+        return_is_overridden: bool,
+        preserve_tos: bool,
+    ) -> bool {
+        !return_is_overridden
+            && preserve_tos
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.exceptions.active_try_marker_slots.len() == 1
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .len()
+                == 1
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.finally.is_inactive_for_return_unwind()
+            && self
+                .control
+                .loops
+                .contexts
+                .last()
+                .is_some_and(|context| context.iterator_cleanup == IteratorCleanup::None)
+            && self
+                .control
+                .loops
+                .contexts
+                .iter()
+                .any(|context| context.iterator_cleanup == IteratorCleanup::Sync)
+            && self.control.loops.contexts.iter().all(|context| {
+                matches!(
+                    context.iterator_cleanup,
+                    IteratorCleanup::None | IteratorCleanup::Sync
+                ) && context.exception_region_depth == 1
+                    && context.with_depth == 0
+                    && context.finally_end_depth == 0
+            })
+    }
+
+    // The exceptional-finally state lies between one older handler and its
+    // inner managers. A newer try region needs a separate exclusion boundary.
+    #[inline(never)]
+    fn handler_outside_finally_end(&self, inner_manager_boundary: Option<usize>) -> bool {
+        self.control.finally.active_finally_end_blocks == 1
+            && self.control.loops.contexts.is_empty()
+            && self
+                .control
+                .finally
+                .active_return_finally_contexts
+                .is_empty()
+            && self
+                .control
+                .finally
+                .finally_end_region_indices
+                .last()
+                .is_some_and(|index| {
+                    *index + 1
+                        == self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len()
+                })
+            && matches!(self.control.exceptions.active_exception_handlers.as_slice(), [handler]
+                if handler.finally_end_depth == 0
+                    && Some(handler.with_depth) == inner_manager_boundary
+                    && handler.loop_depth == 0)
+    }
+
+    #[inline(never)]
+    fn return_finally_manager_boundaries(
+        &self,
+        return_is_overridden: bool,
+        handler_before_finally_end: bool,
+        next_with: usize,
+    ) -> (Option<usize>, usize, bool) {
+        let inner_manager_boundary = self.control.withs.active_with_exits[..next_with]
+            .iter()
+            .position(|context| context.finally_end_depth == 1);
+        let inner_loop_boundary = self
+            .control
+            .loops
+            .contexts
+            .iter()
+            .position(|context| context.finally_end_depth == 1)
+            .unwrap_or(self.control.loops.contexts.len());
+        let defer_finally_end_for_managers = !return_is_overridden
+            && !handler_before_finally_end
+            && self.control.finally.active_finally_end_blocks == 1
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self
+                .control
+                .finally
+                .preserved_return_value_contexts
+                .is_empty()
+            && self.control.finally.copied_return_finally_preserved_values == 0
+            && (self
+                .control
+                .exceptions
+                .active_exception_handlers
+                .iter()
+                .all(|handler| {
+                    handler.finally_end_depth == 1
+                        && handler.with_depth <= next_with
+                        && handler.loop_depth == self.control.loops.contexts.len()
+                })
+                || self.handler_outside_finally_end(inner_manager_boundary))
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.loops.contexts[..inner_loop_boundary]
+                .iter()
+                .all(|context| context.finally_end_depth == 0)
+            && self.control.loops.contexts[inner_loop_boundary..]
+                .iter()
+                .all(|context| context.finally_end_depth == 1)
+            && inner_manager_boundary.is_some_and(|boundary| {
+                self.control.withs.active_with_exits[..boundary]
+                    .iter()
+                    .all(|context| context.finally_end_depth == 0)
+                    && self.control.withs.active_with_exits[boundary..next_with]
+                        .iter()
+                        .all(|context| context.finally_end_depth == 1)
+            })
+            && self
+                .control
+                .finally
+                .active_return_finally_contexts
+                .iter()
+                .all(|context| {
+                    context.with_depth >= next_with
+                        && context.loop_depth >= self.control.loops.contexts.len()
+                });
+        (
+            inner_manager_boundary,
+            inner_loop_boundary,
+            defer_finally_end_for_managers,
+        )
+    }
+
+    #[inline(never)]
+    fn emit_return_deferred_finally_end(
+        &mut self,
+        start: Label,
+        preserve_tos: bool,
+        region_starts: Option<&mut [Option<Label>]>,
+    ) -> Result<(), CompileError> {
+        self.emit_finally_end_unwind(0, preserve_tos, Some(start))?;
+        if let Some(region_starts) = region_starts
+            && let Some(index) = self.control.finally.finally_end_region_indices.last()
+        {
+            region_starts[*index].get_or_insert(start);
         }
         Ok(())
     }
@@ -20633,8 +20827,25 @@ impl<'source> Compiler<'source> {
             && statement.finalbody.is_empty()
             && self.control.finally.active_finally_try_bodies == 0
         {
-            statement.body.last().and_then(|tail| match tail {
-                Stmt::If(branch) if if_has_folded_pass_arms(branch) => Some(branch.range),
+            let effective_tail = statement.body.iter().rev().find(|tail| {
+                !matches!(
+                    self.context.optimized_locations.get(&tail.range()),
+                    Some(super::optimization::OptimizedLocation::Elided)
+                )
+            });
+            let has_elided_suffix =
+                effective_tail.map(Ranged::range) != statement.body.last().map(Ranged::range);
+            effective_tail.and_then(|tail| match tail {
+                Stmt::If(branch)
+                    if if_has_folded_pass_arms(branch)
+                        || (has_elided_suffix
+                            && early_condition_truthiness(&branch.test) == Some(true)
+                            && matches!(branch.body.as_slice(), [Stmt::Pass(_)])
+                            && matches!(branch.elif_else_clauses.as_slice(), [clause]
+                                if clause.test.is_none())) =>
+                {
+                    Some(branch.range)
+                }
                 _ => None,
             })
         } else {
@@ -30301,13 +30512,15 @@ impl<'source> Compiler<'source> {
                 && !drop_expression_if_exit_nop
                 && !drop_shared_manager_exit_nop
                 && conditional_exit.is_none();
-            // On legacy targets the normal-finally jump precedes the manager's
-            // POP_BLOCK, so a surviving jump still belongs to the manager.
+            // The original normal-finally jump precedes the manager POP_BLOCK.
+            // Finalizer copies may instead leave the ownerless POP_BLOCK marker.
+            let preserve_manager_jump = pass_finally_leaves_manager
+                && (self.context.python_version <= crate::PythonVersion::Py313
+                    || separate_manager_pop);
             let exception_policy = if !original_nested_pass_exit
                 && pass_exit_exception_depth.is_none()
                 && pass_finally_location.is_some()
-                && !(self.context.python_version <= crate::PythonVersion::Py313
-                    && pass_finally_leaves_manager)
+                && !preserve_manager_jump
                 && (pass_finally_leaves_manager
                     || !self
                         .control
@@ -31483,6 +31696,23 @@ impl<'source> Compiler<'source> {
         if remaining.is_empty() {
             let body_start = self.assembler.instruction_count();
             let body_previous_location = self.assembler.last_instruction_location();
+            // Assertions removed by optimization do not separate a try/finally
+            // from the manager's normal exit in CPython's instruction graph.
+            let terminal_try_body = if self.context.python_version >= crate::PythonVersion::Py314 {
+                let end = body
+                    .iter()
+                    .rposition(|statement| {
+                        !matches!(statement, Stmt::Global(global) if global.names.is_empty())
+                            || !matches!(
+                                self.context.optimized_locations.get(&statement.range()),
+                                Some(super::optimization::OptimizedLocation::Elided)
+                            )
+                    })
+                    .map_or(0, |index| index + 1);
+                &body[..end]
+            } else {
+                body
+            };
             let terminal_if = matches!(
                 body.last(),
                 Some(Stmt::If(statement))
@@ -31590,7 +31820,10 @@ impl<'source> Compiler<'source> {
                         )
                     },
                 )?;
-            } else if let Some((last @ Stmt::Try(statement), leading)) = body.split_last()
+            } else if let Some((last @ Stmt::Try(statement), leading)) = terminal_try_body.split_last()
+                // Splitting an earlier authored statement into a separate suite can
+                // change its retained exception slot. Keep that existing path intact.
+                && (terminal_try_body.len() == body.len() || leading.is_empty())
                 // A loop-else cleanup jumps past the conditional's original false join.
                 // That located join keeps the with owner; it is not the manager POP_BLOCK.
                 && !matches!(statement.finalbody.last(), Some(Stmt::If(tail))
@@ -31618,13 +31851,14 @@ impl<'source> Compiler<'source> {
                     }) && try_normal_exit_predecessors(statement) > 0))
                 && !suite_terminates(&statement.finalbody)
                 && !suite_terminates(leading)
-                && statement.finalbody.iter().any(|statement| {
+                && (statement.finalbody.iter().any(|statement| {
                     !matches!(statement, Stmt::Pass(_))
                         && !matches!(
                             statement,
                             Stmt::Expr(expression) if self.context.fold_constant(&expression.value).is_some()
                         )
-                })
+                }) || (self.context.python_version >= crate::PythonVersion::Py314
+                    && matches!(statement.finalbody.as_slice(), [Stmt::Pass(_)])))
             {
                 // The extracted try remains the prefix's continuation inside this manager.
                 // Keep that original successor visible when compiling a local suite tail.
@@ -31633,9 +31867,17 @@ impl<'source> Compiler<'source> {
                     leading.last().map(Ranged::range),
                     |compiler| {
                         compiler.with_control_override(
-                            |control| &mut control.loops.split_loop_tail_prefix_end,
-                            leading.last().map(Ranged::range),
-                            |compiler| compiler.compile_suite(leading),
+                            |control| &mut control.withs.split_pass_finally_prefix_end,
+                            matches!(statement.finalbody.as_slice(), [Stmt::Pass(_)])
+                                .then(|| leading.last().map(Ranged::range))
+                                .flatten(),
+                            |compiler| {
+                                compiler.with_control_override(
+                                    |control| &mut control.loops.split_loop_tail_prefix_end,
+                                    leading.last().map(Ranged::range),
+                                    |compiler| compiler.compile_suite(leading),
+                                )
+                            },
                         )
                     },
                 )?;
@@ -31680,6 +31922,9 @@ impl<'source> Compiler<'source> {
                     body_noop = Some(WithBodyExitNoop::RetainedConvertedPopBlock(range));
                 } else if let Some((location, entry)) = manager_pop {
                     body_noop = Some(WithBodyExitNoop::RetainedManagerPopBlock(location, entry));
+                }
+                if terminal_try_body.len() < body.len() {
+                    self.compile_suite(&body[terminal_try_body.len()..])?;
                 }
             } else if !matches!(body, [Stmt::Pass(_)]) {
                 // Keep direct pass-only bodies on the with compiler's fallback path. CPython
