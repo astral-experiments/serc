@@ -8670,7 +8670,7 @@ fn instruction_free_branch_tails_preserve_join_locations() {
 
 #[test]
 fn erased_loop_arms_keep_distinct_condition_backedges() {
-    let source = r#"def f(items, obj, enabled, active, alternate, left, right, offset, work):
+    let source = r"def f(items, obj, enabled, active, alternate, left, right, offset, work):
     for item in items:
         value = item + offset
         if obj.flag or enabled:
@@ -8694,6 +8694,6 @@ fn erased_loop_arms_keep_distinct_condition_backedges() {
         else:
             assert value
             assert enabled
-"#;
+";
     assert_matches_cpython(source, "erased_loop_condition_backedges.py", &LEVELS);
 }
