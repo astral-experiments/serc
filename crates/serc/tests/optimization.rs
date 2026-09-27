@@ -238,6 +238,485 @@ fn optimized_terminal_guards_locate_fallthrough_returns() {
 }
 
 #[test]
+fn optimized_nested_guards_locate_each_fallthrough_return_on_313() {
+    for source in [
+        "def f(x, y):\n    if x:\n        if y:\n            pass\n        assert y\n",
+        "def f(x, y):\n    if x:\n        if y:\n            work()\n        assert y\n    else:\n        fallback()\n",
+        "def f(x, y):\n    if x:\n        if y:\n            try:\n                work()\n            finally:\n                cleanup()\n        assert y\n    else:\n        raise ValueError()\n",
+        "def f(x, y):\n    if x and y:\n        if x:\n            pass\n        assert y\n    elif y:\n        fallback()\n    else:\n        return 1\n",
+        "def f(x, y):\n    if x:\n        if y:\n            pass\n",
+        "def f(manager, x, y):\n    try:\n        with manager:\n            pass\n            work()\n    finally:\n        cleanup()\n    if x:\n        if y:\n            pass\n        assert y\n",
+        "def f(manager, x, y):\n    if x:\n        try:\n            with manager:\n                pass\n                work()\n        except Exception:\n            recover()\n        if y:\n            pass\n        assert y\n",
+        "def f(manager, x, y):\n    try:\n        with manager:\n            pass\n            assert x\n            work()\n    finally:\n        cleanup()\n    if x:\n        if y:\n            pass\n        assert y\n",
+        "if False:\n    from package import *\ndef f(x, y):\n    if x:\n        if y:\n            pass\n        assert y\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "sub/nested_terminal_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py313],
+        );
+    }
+}
+
+#[test]
+fn optimized_footer_after_protected_loop_backedge() {
+    for source in [
+        "def f(xs, work, recover, x, y):\n    try:\n        work()\n    except ValueError:\n        recover()\n    for item in xs:\n        if item:\n            assert False\n        if item:\n            assert False\n    if x:\n        if y:\n            pass\n        assert y\n",
+        "def f(xs, work, recover, x, y):\n    try:\n        try:\n            work()\n        except ValueError:\n            recover()\n    except Exception:\n        recover()\n    for item in xs:\n        if not item:\n            assert False\n        if not item:\n            assert False\n    if x:\n        if y:\n            work()\n        assert y\n    else:\n        recover()\n",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "sub/protected_loop_footer.py",
+            &LEVELS,
+            &[PythonVersion::Py313],
+        );
+    }
+}
+
+#[test]
+fn optimized_footer_keeps_protected_manager_pass_exception_owner_on_313() {
+    const SOURCE: &str = r"def f(manager, x, y):
+    try:
+        with manager:
+            pass
+            work()
+    except Exception:
+        recover()
+    if x:
+        if y:
+            pass
+        assert y
+";
+    const TRACE: &str = r"
+import dis, marshal, sys
+events, hits = [], []
+class Manager:
+    def __enter__(self): events.append('enter')
+    def __exit__(self, kind, value, traceback):
+        events.append('exit:' + (kind.__name__ if kind else 'None'))
+        return False
+scope = {'work': lambda: events.append('work'), 'recover': lambda: events.append('recover')}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+f = scope['f']
+targets = [i.offset for i in dis.get_instructions(f)
+           if i.opname == 'NOP' and
+           (i.positions.lineno, i.positions.end_lineno, i.positions.col_offset, i.positions.end_col_offset) == (4, 4, 12, 16)]
+if len(targets) != 1: raise RuntimeError(('manager pass marker count', targets))
+target = targets[0]
+monitor = sys.monitoring
+monitor.use_tool_id(5, 'manager-pass-optimized-footer')
+def inject(code, offset):
+    if offset == target:
+        hits.append(offset)
+        raise ValueError('injected')
+monitor.register_callback(5, monitor.events.INSTRUCTION, inject)
+monitor.set_local_events(5, f.__code__, monitor.events.INSTRUCTION)
+try:
+    for x, y in [(False, False), (True, True)]:
+        events.clear()
+        hits.clear()
+        result = f(Manager(), x, y)
+        if hits != [target] or events != ['enter', 'exit:ValueError', 'recover'] or result is not None:
+            raise RuntimeError((x, y, hits, events, result))
+finally:
+    monitor.set_local_events(5, f.__code__, 0)
+    monitor.register_callback(5, monitor.events.INSTRUCTION, None)
+    monitor.free_tool_id(5)
+";
+    for optimization_level in LEVELS {
+        let native = oracle(
+            SOURCE.as_bytes(),
+            "manager_footer.py",
+            PythonVersion::Py313,
+            optimization_level,
+        );
+        assert!(
+            native.status.success(),
+            "{}",
+            String::from_utf8_lossy(&native.stderr)
+        );
+        let actual = compile_with_options(
+            SOURCE,
+            "manager_footer.py",
+            &CompileOptions {
+                python_version: PythonVersion::Py313,
+                optimization_level,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap()
+        .marshal();
+        assert_eq!(actual, native.stdout, "{optimization_level:?}");
+        for code in [&native.stdout, &actual] {
+            let mut child = Command::new(ORACLES[1].get().unwrap())
+                .args(["-I", "-S", "-B", "-c", TRACE])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(code).unwrap();
+            let result = child.wait_with_output().unwrap();
+            assert!(
+                result.status.success(),
+                "{optimization_level:?}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+}
+
+#[test]
+fn optimized_footer_keeps_split_manager_pass_exception_owner_on_313() {
+    const SOURCE: &str = r"def f(manager, x, y):
+    try:
+        with manager:
+            pass
+            try:
+                work()
+            finally:
+                cleanup()
+    except Exception:
+        recover()
+    if x:
+        if y:
+            pass
+        assert y
+";
+    const TRACE: &str = r"
+import dis, marshal, sys
+events, hits = [], []
+class Manager:
+    def __enter__(self): events.append('enter')
+    def __exit__(self, kind, value, traceback):
+        events.append('exit:' + (kind.__name__ if kind else 'None'))
+        return False
+scope = {'work': lambda: events.append('work'), 'cleanup': lambda: events.append('cleanup'), 'recover': lambda: events.append('recover')}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+f = scope['f']
+targets = [i.offset for i in dis.get_instructions(f)
+           if i.opname == 'NOP' and
+           (i.positions.lineno, i.positions.end_lineno, i.positions.col_offset, i.positions.end_col_offset) == (4, 4, 12, 16)]
+if len(targets) != 1: raise RuntimeError(('manager pass marker count', targets))
+target = targets[0]
+monitor = sys.monitoring
+monitor.use_tool_id(5, 'manager-pass-optimized-footer')
+def inject(code, offset):
+    if offset == target:
+        hits.append(offset)
+        raise ValueError('injected')
+monitor.register_callback(5, monitor.events.INSTRUCTION, inject)
+monitor.set_local_events(5, f.__code__, monitor.events.INSTRUCTION)
+try:
+    for x, y in [(False, False), (True, True)]:
+        events.clear()
+        hits.clear()
+        result = f(Manager(), x, y)
+        if hits != [target] or events != ['enter', 'exit:ValueError', 'recover'] or result is not None:
+            raise RuntimeError((x, y, hits, events, result))
+finally:
+    monitor.set_local_events(5, f.__code__, 0)
+    monitor.register_callback(5, monitor.events.INSTRUCTION, None)
+    monitor.free_tool_id(5)
+events.clear()
+result = f(Manager(), False, False)
+if events != ['enter', 'work', 'cleanup', 'exit:None'] or result is not None:
+    raise RuntimeError((events, result))
+";
+    for optimization_level in LEVELS {
+        let native = oracle(
+            SOURCE.as_bytes(),
+            "manager_footer.py",
+            PythonVersion::Py313,
+            optimization_level,
+        );
+        assert!(
+            native.status.success(),
+            "{}",
+            String::from_utf8_lossy(&native.stderr)
+        );
+        let actual = compile_with_options(
+            SOURCE,
+            "manager_footer.py",
+            &CompileOptions {
+                python_version: PythonVersion::Py313,
+                optimization_level,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap()
+        .marshal();
+        assert_eq!(actual, native.stdout, "{optimization_level:?}");
+        for code in [&native.stdout, &actual] {
+            let mut child = Command::new(ORACLES[1].get().unwrap())
+                .args(["-I", "-S", "-B", "-c", TRACE])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(code).unwrap();
+            let result = child.wait_with_output().unwrap();
+            assert!(
+                result.status.success(),
+                "{optimization_level:?}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+}
+
+#[test]
+fn optimized_footer_after_legacy_manager_finally_preserves_jump_owner() {
+    const SOURCE: &str = r"def f(manager, work, x, y):
+    try:
+        raise ValueError()
+    except ValueError:
+        with manager:
+            pass
+            try:
+                work()
+            finally:
+                pass
+    if x:
+        if y:
+            pass
+        assert y
+";
+    const TRACE: &str = r"
+import dis, marshal, sys
+scope = {}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+f = scope['f']
+targets = [i.offset for i in dis.get_instructions(f)
+           if i.opname == 'JUMP_FORWARD' and i.positions.lineno == 10]
+if len(targets) != 1:
+    raise RuntimeError(('missing finalizer jump', targets))
+target = targets[0]
+monitor = sys.monitoring
+monitor.use_tool_id(5, 'legacy-manager-finally-footer')
+try:
+    for error_type in (RuntimeError, StopIteration):
+        for suppress in (False, True):
+            for x, y in ((False, False), (True, True)):
+                events, hits = [], []
+                class Manager:
+                    def __enter__(self): events.append('enter')
+                    def __exit__(self, typ, value, traceback):
+                        events.append(('exit', typ))
+                        return suppress
+                def work(): events.append('work')
+                def inject(code, offset):
+                    if offset == target:
+                        hits.append(offset)
+                        raise error_type('injected')
+                monitor.register_callback(5, monitor.events.INSTRUCTION, inject)
+                monitor.set_local_events(5, f.__code__, monitor.events.INSTRUCTION)
+                try:
+                    result = f(Manager(), work, x, y)
+                    outcome = None
+                except BaseException as error:
+                    result, outcome = None, type(error)
+                finally:
+                    monitor.set_local_events(5, f.__code__, 0)
+                    monitor.register_callback(5, monitor.events.INSTRUCTION, None)
+                expected = None if suppress else error_type
+                if hits != [target] or events != ['enter', 'work', ('exit', error_type)] or outcome is not expected or result is not None:
+                    raise RuntimeError((hits, events, outcome, result, expected))
+finally:
+    monitor.free_tool_id(5)
+";
+    for (index, python_version) in [(1, PythonVersion::Py313)] {
+        for optimization_level in LEVELS {
+            let native = oracle(
+                SOURCE.as_bytes(),
+                "manager_finally_footer.py",
+                python_version,
+                optimization_level,
+            );
+            assert!(
+                native.status.success(),
+                "{}",
+                String::from_utf8_lossy(&native.stderr)
+            );
+            let actual = compile_with_options(
+                SOURCE,
+                "manager_finally_footer.py",
+                &CompileOptions {
+                    python_version,
+                    optimization_level,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap()
+            .marshal();
+            assert_eq!(
+                actual, native.stdout,
+                "{python_version}, {optimization_level:?}"
+            );
+            for code in [&native.stdout, &actual] {
+                let mut child = Command::new(ORACLES[index].get().unwrap())
+                    .args(["-I", "-S", "-B", "-c", TRACE])
+                    .stdin(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child.stdin.take().unwrap().write_all(code).unwrap();
+                let result = child.wait_with_output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{python_version}, {optimization_level:?}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn optimized_footer_after_exceptional_manager_return_unwind() {
+    const SOURCE: &str = r"def f(outer, inner, work, cleanup, events, take, x, y):
+    with outer:
+        try:
+            work()
+        finally:
+            with inner:
+                try:
+                    if take:
+                        return work()
+                finally:
+                    cleanup()
+    events.append('footer')
+    if x:
+        if y:
+            pass
+        assert y
+";
+    const TRACE: &str = r"
+import itertools, json, marshal, sys
+scope = {}
+exec(marshal.loads(sys.stdin.buffer.read()), scope)
+rows, covered = [], set()
+class ExitFault(Exception): pass
+for fault, take, suppress, pair, inner_raises, outer_raises in itertools.product((False, True), repeat=6):
+    events, calls = [], [0]
+    class Manager:
+        def __init__(self, name): self.name = name
+        def __enter__(self):
+            events.append(('enter', self.name))
+            return self
+        def __exit__(self, typ, value, traceback):
+            events.append(('exit', self.name, typ.__name__ if typ else None))
+            if (self.name == 'inner' and inner_raises) or (self.name == 'outer' and outer_raises):
+                events.append(('raise-exit', self.name))
+                raise ExitFault(self.name)
+            return suppress and self.name == 'outer'
+    def work():
+        calls[0] += 1
+        events.append(('work', calls[0]))
+        if fault and calls[0] == 1:
+            raise ValueError('work')
+        return 10 + calls[0]
+    def cleanup(): events.append(('cleanup',))
+    try:
+        result = scope['f'](Manager('outer'), Manager('inner'), work, cleanup,
+                            events, take, pair, pair)
+        outcome = ('return', result)
+    except BaseException as error:
+        outcome = ('raise', type(error).__name__)
+    if take and not inner_raises and not outer_raises and outcome != ('return', 12):
+        raise RuntimeError(('return path not reached', events, outcome))
+    if not take and not inner_raises and not outer_raises and (not fault or suppress) and 'footer' not in events:
+        raise RuntimeError(('footer not reached', events, outcome))
+    if ('enter', 'inner') not in events or ('cleanup',) not in events:
+        raise RuntimeError(('finalizer not reached', events, outcome))
+    if inner_raises and ('raise-exit', 'inner') not in events:
+        raise RuntimeError(('inner exit not reached', events, outcome))
+    if outer_raises and ('raise-exit', 'outer') not in events:
+        raise RuntimeError(('outer exit not reached', events, outcome))
+    if 'footer' in events: covered.add('footer')
+    if take and outcome == ('return', 12): covered.add('return')
+    if fault and suppress and 'footer' in events: covered.add('suppressed')
+    if ('raise-exit', 'inner') in events: covered.add('inner_exit_fault')
+    if ('raise-exit', 'outer') in events: covered.add('outer_exit_fault')
+    rows.append((events, outcome))
+if covered != {'footer', 'return', 'suppressed', 'inner_exit_fault', 'outer_exit_fault'}:
+    raise RuntimeError(('missing coverage', covered))
+print(json.dumps(rows))
+";
+    for optimization_level in LEVELS {
+        let native = oracle(
+            SOURCE.as_bytes(),
+            "return_manager_footer.py",
+            PythonVersion::Py313,
+            optimization_level,
+        );
+        assert!(
+            native.status.success(),
+            "{}",
+            String::from_utf8_lossy(&native.stderr)
+        );
+        let actual = compile_with_options(
+            SOURCE,
+            "return_manager_footer.py",
+            &CompileOptions {
+                python_version: PythonVersion::Py313,
+                optimization_level,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap()
+        .marshal();
+        assert_eq!(actual, native.stdout, "{optimization_level:?}");
+        let mut outputs = Vec::new();
+        for payload in [&native.stdout, &actual] {
+            let mut child = Command::new(ORACLES[1].get().unwrap())
+                .args(["-I", "-S", "-B", "-c", TRACE])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(payload).unwrap();
+            let result = child.wait_with_output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            outputs.push(result.stdout);
+        }
+        assert_eq!(outputs[0], outputs[1], "{optimization_level:?}");
+    }
+}
+
+#[test]
+fn optimized_footer_after_folded_protected_branch_matches_cpython() {
+    let source = r"def f(flag, x, y):
+    try:
+        if True:
+            if flag:
+                work()
+        else:
+            other()
+        assert flag
+    except ValueError:
+        recover()
+    if x:
+        if y:
+            work()
+        assert y
+";
+    assert_matches_cpython_versions(
+        source,
+        "folded_protected_footer.py",
+        &LEVELS,
+        &[PythonVersion::Py313, PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn legacy_nested_finally_pass_keeps_outer_owner() {
     const SOURCE: &str = "def f(work, cleanup, after):\n    try:\n        try:\n            work()\n        finally:\n            pass\n        after()\n    finally:\n        cleanup()\n";
     const TERMINAL: &str = "def f(work, cleanup):\n    try:\n        try:\n            work()\n        finally:\n            pass\n    finally:\n        cleanup()\n";
@@ -5563,6 +6042,43 @@ for target, expected in (
                 String::from_utf8_lossy(&result.stderr)
             );
         }
+    }
+}
+
+#[test]
+fn optimized_footer_after_instruction_free_branch_tail() {
+    let template = "def f(x, y, z, value):\n    if x:\n        if y:\n            work()\n        TAIL\n    else:\n        other()\n    after()\n    if y:\n        if z:\n            pass\n        assert z\n";
+    for tail in [
+        "assert value",
+        "global marker",
+        "pass\n        global marker",
+    ] {
+        let source = template.replace("TAIL", tail);
+        assert_matches_cpython_versions(
+            &source,
+            "tail_and_footer.py",
+            &LEVELS,
+            &[PythonVersion::Py313],
+        );
+    }
+}
+
+#[test]
+fn optimized_footer_after_dotted_import_in_same_module() {
+    for import in [
+        "if False:\n    from SercOuter.SercInner.Leaf import item\n",
+        "from SercOuter.SercInner import item\n",
+        "if False:\n    import SercOuter.SercInner.Leaf\n",
+    ] {
+        let source = format!(
+            "{import}class SercOuter:\n    class SercInner:\n        pass\ndef f(x, y):\n    if x:\n        if y:\n            pass\n        assert y\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "dotted_import_footer.py",
+            &LEVELS,
+            &[PythonVersion::Py313],
+        );
     }
 }
 

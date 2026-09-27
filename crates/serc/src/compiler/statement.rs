@@ -3542,7 +3542,23 @@ impl<'source> Compiler<'source> {
         preserve_protected_folded_nop: bool,
     ) -> Result<(), CompileError> {
         if self.context.python_version >= crate::PythonVersion::Py313
-            && self.optimized_conditional_join(statement)
+            && (self.optimized_conditional_join(statement)
+                || (self.context.python_version == crate::PythonVersion::Py313
+                    && std::iter::once(statement.body.as_slice())
+                        .chain(
+                            statement
+                                .elif_else_clauses
+                                .iter()
+                                .map(|clause| clause.body.as_slice()),
+                        )
+                        .any(|body| {
+                            body.last().is_some_and(|last| {
+                                matches!(
+                                    self.context.optimized_locations.get(&last.range()),
+                                    Some(super::optimization::OptimizedLocation::Elided)
+                                )
+                            })
+                        })))
             && self.control.loops.contexts.is_empty()
             && !self.has_active_control_flow_region()
             && self.control.withs.active_with_exits.is_empty()
