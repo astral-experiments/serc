@@ -4917,7 +4917,10 @@ impl<'source> Compiler<'source> {
 
     /// Recovers the original return donor hidden by removed branch-tail assertions.
     fn elided_branch_return_location(&self, body: &[Stmt]) -> Option<SourceLocation> {
-        match self.elided_linear_branch_tail(body, true)? {
+        match self
+            .elided_linear_branch_tail(body, true)
+            .or_else(|| self.elided_returning_while_tail(body))?
+        {
             // Each original predecessor donates its span when this footer is copied.
             Stmt::If(_) => Some(SourceLocation::NONE),
             Stmt::While(statement) => {
@@ -4925,6 +4928,70 @@ impl<'source> Compiler<'source> {
             }
             _ => None,
         }
+    }
+
+    /// Finds a returning loop whose sole footer predecessor is its false condition edge.
+    fn elided_returning_while_tail<'a>(&self, body: &'a [Stmt]) -> Option<&'a Stmt> {
+        if self.context.python_version < crate::PythonVersion::Py314
+            || !self.supports_elided_terminal_if()
+            || self.unit.flags & CO_COROUTINE != 0
+            || self.has_active_control_flow_region()
+            || self.control.exceptions.active_exception_group_handlers != 0
+            || self.control.statements.in_match
+        {
+            return None;
+        }
+        let end = body
+            .iter()
+            .rposition(|statement| !self.context.is_elided_statement(statement))?;
+        if end + 1 == body.len() {
+            return None;
+        }
+        let linear = |statement: &Stmt| {
+            self.context.is_elided_statement(statement)
+                || (suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                    && !suite_contains_yield(std::slice::from_ref(statement)))
+        };
+        let Stmt::While(statement) = &body[end] else {
+            return None;
+        };
+        if !body[..end].iter().all(linear)
+            || !statement.orelse.is_empty()
+            || !condition_has_linear_runtime_leaves(&statement.test)
+            || expression_suspends_current_scope(&statement.test)
+            || !original_condition_has_unique_jump_target(&statement.test, false)
+        {
+            return None;
+        }
+        let (Stmt::Return(returned), leading) = statement.body.split_last()? else {
+            return None;
+        };
+        if returned.value.as_deref().is_some_and(|value| {
+            expression_contains_inline_branch(value) || expression_suspends_current_scope(value)
+        }) {
+            return None;
+        }
+        for part in leading {
+            if linear(part) {
+                continue;
+            }
+            let Stmt::If(guard) = part else {
+                return None;
+            };
+            let Some((Stmt::Continue(_), prefix)) = guard.body.split_last() else {
+                return None;
+            };
+            if !guard.elif_else_clauses.is_empty()
+                || !condition_has_linear_runtime_leaves(&guard.test)
+                || expression_suspends_current_scope(&guard.test)
+                || !prefix.iter().all(linear)
+            {
+                return None;
+            }
+        }
+        // Return and continue cannot reach the implicit footer. Breaks, nested
+        // statements, and additional condition exits are excluded above.
+        Some(&body[end])
     }
 
     /// Finds a linear conditional or loop exit hidden by removed branch-tail assertions.

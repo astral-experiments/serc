@@ -23,6 +23,21 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn returning_while_uses_condition_location_after_removed_assertion() {
+    for condition in ["value >= 0", "count", "value >= 0 or count"] {
+        for prefix in [
+            "",
+            "            if value > 0 and count != 0:\n                count += 1\n                continue\n",
+        ] {
+            let source = format!(
+                "def f(obj, value, count):\n    if value < 0:\n        return obj.first()\n    else:\n        while {condition}:\n{prefix}            assert count\n            return obj.second()\n        assert value\n"
+            );
+            assert_matches_cpython(&source, "returning_while_footer.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn erased_false_branch_preserves_borrowed_local_loads() {
     for condition in ["False", "__debug__", "0", "0x0"] {
         for assertion in ["assert x", "assert x\n            assert y"] {
