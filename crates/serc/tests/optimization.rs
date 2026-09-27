@@ -37,6 +37,55 @@ fn erased_suffix_preserves_conditional_expression_join() {
 }
 
 #[test]
+fn erased_nested_binary_if_preserves_legacy_scope_exit() {
+    for (prefix, outer, otherwise) in [
+        ("    if a:\n        assert a\n", true, true),
+        ("", true, true),
+        ("    d = a\n", true, true),
+        ("    if a:\n        pass\n", true, true),
+        (
+            "    if a:\n        assert b\n    else:\n        assert c\n",
+            true,
+            true,
+        ),
+        ("    if a:\n        assert a\n", false, true),
+        ("    if a:\n        assert a\n", true, false),
+        ("    assert a\n", true, true),
+    ] {
+        let (outer_if, indent) = if outer {
+            ("    if b:\n", "        ")
+        } else {
+            ("", "    ")
+        };
+        let mut source =
+            format!("def f(a, b, c):\n{prefix}{outer_if}{indent}if c:\n{indent}    assert b\n");
+        if otherwise {
+            writeln!(source, "{indent}else:\n{indent}    assert c").unwrap();
+        }
+        assert_matches_cpython(&source, "erased_nested_binary_if.py", &LEVELS);
+    }
+    assert_matches_cpython(
+        "def f(a, b):\n    if a.ready:\n        assert b\n    if a is None and b is not None:\n        flag = not a.ready\n        if b.ready:\n            assert a\n        else:\n            assert b\n",
+        "erased_nested_binary_if_assignment.py",
+        &LEVELS,
+    );
+}
+
+#[test]
+fn conditional_prefix_preserves_erased_nested_join() {
+    for prefix in [
+        "        if b:\n            value = obj.first\n",
+        "        if b:\n            value = obj.first\n        else:\n            value = obj.second\n",
+        "        if b:\n            value = obj.first\n            assert b\n        else:\n            value = obj.second\n            assert c\n",
+    ] {
+        let source = format!(
+            "def f(a, b, c, obj):\n    if a:\n{prefix}        if c:\n            assert c\n        else:\n            assert b\n    else:\n        assert a\n    action()\n"
+        );
+        assert_matches_cpython(&source, "conditional_prefix_join.py", &LEVELS);
+    }
+}
+
+#[test]
 fn elided_condition_before_terminal_for_preserves_legacy_footer_location() {
     for first in ["a", "check(a)"] {
         for second in ["b", "check(b)"] {

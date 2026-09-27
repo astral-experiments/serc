@@ -3998,6 +3998,56 @@ impl<'source> Compiler<'source> {
             .at_original_while_else_break_conjunction_join(&conditions)
     }
 
+    /// Identifies a terminal nested binary branch with two erased assertion arms.
+    fn has_erased_binary_if_scope_exit(&self, statement: &ruff_python_ast::StmtIf) -> bool {
+        let outer_test = match statement.test.as_ref() {
+            Expr::Name(_) => true,
+            Expr::BoolOp(boolean) if boolean.op == BoolOp::And => {
+                matches!(boolean.values.as_slice(), [Expr::Compare(left), Expr::Compare(right)]
+                    if matches!(left.first_operand(), Expr::Name(_))
+                        && matches!(left.ops.as_ref(), [CmpOp::Is])
+                        && matches!(left.comparators(), [Expr::NoneLiteral(_)])
+                        && matches!(right.first_operand(), Expr::Name(_))
+                        && matches!(right.ops.as_ref(), [CmpOp::IsNot])
+                        && matches!(right.comparators(), [Expr::NoneLiteral(_)]))
+            }
+            _ => false,
+        };
+        if !outer_test || !statement.elif_else_clauses.is_empty() {
+            return false;
+        }
+        let Some((Stmt::If(inner), prefix)) = statement.body.split_last() else {
+            return false;
+        };
+        let linear_prefix = match prefix {
+            [] => true,
+            [Stmt::Assign(assignment)] => {
+                matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                    && matches!(assignment.value.as_ref(), Expr::UnaryOp(unary)
+                        if unary.op == UnaryOp::Not
+                            && matches!(unary.operand.as_ref(), Expr::Attribute(attribute)
+                                if matches!(attribute.value.as_ref(), Expr::Name(_))))
+            }
+            _ => false,
+        };
+        let inner_test = match inner.test.as_ref() {
+            Expr::Name(_) => true,
+            Expr::Attribute(attribute) => matches!(attribute.value.as_ref(), Expr::Name(_)),
+            _ => false,
+        };
+        linear_prefix
+            && inner_test
+            && !inner.body.is_empty()
+            && inner
+                .body
+                .iter()
+                .all(|part| self.context.is_elided_statement(part))
+            && matches!(inner.elif_else_clauses.as_slice(), [clause]
+                if clause.test.is_none()
+                    && !clause.body.is_empty()
+                    && clause.body.iter().all(|part| self.context.is_elided_statement(part)))
+    }
+
     fn compile_terminal_if(
         &mut self,
         statement: &ruff_python_ast::StmtIf,
@@ -4272,6 +4322,11 @@ impl<'source> Compiler<'source> {
             // native exit duplication assigns each predecessor its own return. In 3.13
             // this happens before folding; 3.12 duplicates exits after CFG optimization.
             self.compile_if(statement)?;
+            if plain_312_scope_exit && self.has_erased_binary_if_scope_exit(statement) {
+                // An earlier erased conditional can count this shared exit twice.
+                // Preserve its original return until native exit copying finishes.
+                self.assembler.record_current_original_scope_exit();
+            }
             if plain_312_scope_exit
                 && statement.elif_else_clauses.is_empty()
                 && early_condition_truthiness(&statement.test).is_none()
@@ -14286,7 +14341,54 @@ impl<'source> Compiler<'source> {
                         // original end block. Each inner arm may emit work or vanish
                         // independently; its false fallthrough still donates the line.
                         && body.split_last().is_some_and(|(last, leading)| {
-                            (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
+                            let linear_prefix_arm = |arm: &[Stmt]| {
+                                let mut has_runtime_work = false;
+                                for statement in arm {
+                                    if matches!(statement, Stmt::Pass(_))
+                                        || (matches!(statement, Stmt::Global(global) if global.names.is_empty())
+                                            && self.context.is_elided_statement(statement))
+                                    {
+                                        continue;
+                                    }
+                                    if !suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement)) {
+                                        return false;
+                                    }
+                                    has_runtime_work = true;
+                                }
+                                has_runtime_work
+                            };
+                            // A preceding ordinary conditional also merges before the
+                            // final test. It cannot enter the erased inner join directly.
+                            let ordinary_conditional_prefix = branch_index == 0
+                                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                                && !self.control.statements.in_match
+                                && self.control.withs.active_with_exits.is_empty()
+                                && !self.control.loops.suite_fallthrough_to_loop_backedge
+                                && self.control.finally.is_inactive_for_return_unwind()
+                                && matches!(last, Stmt::If(nested)
+                                    if is_elided_suite(&nested.body)
+                                        && matches!(nested.elif_else_clauses.as_slice(), [clause]
+                                            if clause.test.is_none() && is_elided_suite(&clause.body)))
+                                && leading.iter().filter(|statement| matches!(statement, Stmt::If(_))).count() == 1
+                                && leading.iter().all(|statement| {
+                                    match statement {
+                                        Stmt::If(prefix) => condition_has_linear_runtime_leaves(&prefix.test)
+                                            && !expression_suspends_current_scope(&prefix.test)
+                                            && linear_prefix_arm(&prefix.body)
+                                            && !suite_contains_yield(&prefix.body)
+                                            && (prefix.elif_else_clauses.is_empty()
+                                                || matches!(prefix.elif_else_clauses.as_slice(), [clause]
+                                                    if clause.test.is_none()
+                                                        && linear_prefix_arm(&clause.body)
+                                                        && !suite_contains_yield(&clause.body))),
+                                        _ => (matches!(statement, Stmt::Global(global) if global.names.is_empty())
+                                            && self.context.is_elided_statement(statement))
+                                            || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement)),
+                                    }
+                                });
+                            (leading.is_empty()
+                                || suite_has_linear_borrow_fallthrough(leading)
+                                || ordinary_conditional_prefix)
                                 && matches!(last, Stmt::If(nested)
                                     if condition_has_linear_runtime_leaves(&nested.test)
                                 && !expression_suspends_current_scope(&nested.test)
