@@ -4048,6 +4048,72 @@ impl<'source> Compiler<'source> {
                     && clause.body.iter().all(|part| self.context.is_elided_statement(part)))
     }
 
+    /// Identifies a shared scope exit after flat guards and a nested raising branch.
+    fn has_nested_raising_if_scope_exit(statement: &ruff_python_ast::StmtIf) -> bool {
+        let runtime_name = |expression: &Expr| matches!(expression, Expr::Name(name) if name.id.as_str() != "__debug__");
+        let name_call = |expression: &Expr| {
+            matches!(expression, Expr::Call(call)
+                if runtime_name(&call.func)
+                    && matches!(call.arguments.args.as_ref(), [argument] if runtime_name(argument))
+                    && call.arguments.keywords.is_empty())
+        };
+        let not_none = |expression: &Expr| {
+            matches!(expression, Expr::Compare(comparison)
+                if runtime_name(comparison.first_operand())
+                    && matches!(comparison.ops.as_ref(), [CmpOp::IsNot])
+                    && matches!(comparison.comparators(), [Expr::NoneLiteral(_)]))
+        };
+        let raises_name = |body: &[Stmt]| {
+            matches!(body, [Stmt::Raise(raised)]
+                if raised.exc.as_deref().is_some_and(runtime_name)
+                    && raised.cause.is_none())
+        };
+        if !statement.elif_else_clauses.is_empty()
+            || early_condition_truthiness(&statement.test).is_some()
+            || !(runtime_name(&statement.test) || name_call(&statement.test))
+        {
+            return false;
+        }
+        let Some((Stmt::If(inner), prefix)) = statement.body.split_last() else {
+            return false;
+        };
+        let inner_test = match inner.test.as_ref() {
+            Expr::Name(_) => runtime_name(&inner.test),
+            Expr::BoolOp(boolean) if boolean.op == BoolOp::And => {
+                matches!(boolean.values.as_slice(), [left, right]
+                    if runtime_name(left) && runtime_name(right))
+                    || matches!(boolean.values.as_slice(), [left, right]
+                        if not_none(left) && name_call(right))
+            }
+            _ => false,
+        };
+        if !inner_test
+            || early_condition_truthiness(&inner.test).is_some()
+            || !inner.elif_else_clauses.is_empty()
+            || !raises_name(&inner.body)
+        {
+            return false;
+        }
+        let mut has_assignment = false;
+        prefix.iter().all(|part| match part {
+            Stmt::If(guard) => {
+                guard.elif_else_clauses.is_empty()
+                    && early_condition_truthiness(&guard.test).is_none()
+                    && (runtime_name(&guard.test)
+                        || not_none(&guard.test)
+                        || name_call(&guard.test))
+                    && raises_name(&guard.body)
+            }
+            Stmt::Assign(assignment) if !has_assignment => {
+                has_assignment = true;
+                matches!(assignment.targets.as_slice(), [target] if runtime_name(target))
+                    && matches!(assignment.value.as_ref(), Expr::Attribute(attribute)
+                        if runtime_name(&attribute.value))
+            }
+            _ => false,
+        })
+    }
+
     fn compile_terminal_if(
         &mut self,
         statement: &ruff_python_ast::StmtIf,
@@ -4322,7 +4388,10 @@ impl<'source> Compiler<'source> {
             // native exit duplication assigns each predecessor its own return. In 3.13
             // this happens before folding; 3.12 duplicates exits after CFG optimization.
             self.compile_if(statement)?;
-            if plain_312_scope_exit && self.has_erased_binary_if_scope_exit(statement) {
+            if plain_312_scope_exit
+                && (self.has_erased_binary_if_scope_exit(statement)
+                    || Self::has_nested_raising_if_scope_exit(statement))
+            {
                 // An earlier erased conditional can count this shared exit twice.
                 // Preserve its original return until native exit copying finishes.
                 self.assembler.record_current_original_scope_exit();
@@ -12473,7 +12542,28 @@ impl<'source> Compiler<'source> {
             self.assembler
                 .set_location(self.source_location(statement.test.range()));
             self.emit(NOP, 0, 0)?;
-            if !truthiness {
+            // An erased body with no else emits no discarded CFG block. Its
+            // constant-false NOP can still reach the following local loads.
+            let erased_false_body = self.context.python_version == crate::PythonVersion::Py314
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && self.control.stack.depth == 0
+                && self.control.loops.contexts.is_empty()
+                && !self.control.loops.suite_fallthrough_to_loop_backedge
+                && self.control.withs.active_with_exits.is_empty()
+                && !self.has_active_control_flow_region()
+                && !self.control.in_exception_handler()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self.control.finally.is_inactive_for_return_unwind()
+                && !self.control.statements.in_match
+                && matches!(statement.test.as_ref(), Expr::BooleanLiteral(value) if !value.value)
+                && statement.elif_else_clauses.is_empty()
+                && !statement.body.is_empty()
+                && statement
+                    .body
+                    .iter()
+                    .all(|part| self.context.is_elided_statement(part));
+            if !truthiness && !erased_false_body {
                 self.assembler.mark_last_borrow_fallthrough_barrier();
             }
             if matches!(self.unit.scope, Scope::Module)
@@ -14357,8 +14447,8 @@ impl<'source> Compiler<'source> {
                                 }
                                 has_runtime_work
                             };
-                            // A preceding ordinary conditional also merges before the
-                            // final test. It cannot enter the erased inner join directly.
+                            // Earlier ordinary conditionals also merge before the final
+                            // test; they cannot enter the erased inner join directly.
                             let ordinary_conditional_prefix = branch_index == 0
                                 && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                                 && !self.control.statements.in_match
@@ -14369,7 +14459,7 @@ impl<'source> Compiler<'source> {
                                     if is_elided_suite(&nested.body)
                                         && matches!(nested.elif_else_clauses.as_slice(), [clause]
                                             if clause.test.is_none() && is_elided_suite(&clause.body)))
-                                && leading.iter().filter(|statement| matches!(statement, Stmt::If(_))).count() == 1
+                                && matches!(leading.iter().filter(|statement| matches!(statement, Stmt::If(_))).count(), 1 | 2)
                                 && leading.iter().all(|statement| {
                                     match statement {
                                         Stmt::If(prefix) => condition_has_linear_runtime_leaves(&prefix.test)
@@ -14379,7 +14469,8 @@ impl<'source> Compiler<'source> {
                                             && (prefix.elif_else_clauses.is_empty()
                                                 || matches!(prefix.elif_else_clauses.as_slice(), [clause]
                                                     if clause.test.is_none()
-                                                        && linear_prefix_arm(&clause.body)
+                                                        && (linear_prefix_arm(&clause.body)
+                                                            || is_elided_suite(&clause.body))
                                                         && !suite_contains_yield(&clause.body))),
                                         _ => (matches!(statement, Stmt::Global(global) if global.names.is_empty())
                                             && self.context.is_elided_statement(statement))

@@ -23,6 +23,18 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn erased_false_branch_preserves_borrowed_local_loads() {
+    for condition in ["False", "__debug__"] {
+        for assertion in ["assert x", "assert x\n            assert y"] {
+            let source = format!(
+                "def f(a, b, x, y):\n    if a:\n        if {condition}:\n            {assertion}\n        result = consume(x, y)\n    elif b:\n        result = x\n    else:\n        result = None\n    return result\n"
+            );
+            assert_matches_cpython(&source, "erased_false_borrow.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
 fn erased_suffix_preserves_conditional_expression_join() {
     for condition in ["b", "b is not None"] {
         for (left, right) in [("x", "y"), ("left(x)", "right(y)")] {
@@ -82,6 +94,78 @@ fn conditional_prefix_preserves_erased_nested_join() {
             "def f(a, b, c, obj):\n    if a:\n{prefix}        if c:\n            assert c\n        else:\n            assert b\n    else:\n        assert a\n    action()\n"
         );
         assert_matches_cpython(&source, "conditional_prefix_join.py", &LEVELS);
+    }
+}
+
+#[test]
+fn erased_condition_before_nested_raise_preserves_scope_exit() {
+    for prefix in [
+        "    if a:\n        assert a\n",
+        "",
+        "    if a:\n        pass\n",
+        "    assert a\n",
+        "    if a:\n        assert b\n    else:\n        assert c\n",
+    ] {
+        let source = format!(
+            "def f(a, b, c):\n{prefix}    if b:\n        if c:\n            raise ValueError\n"
+        );
+        assert_matches_cpython(&source, "nested_raise.py", &LEVELS);
+    }
+    for tail in ["c", "b and c"] {
+        let source = format!(
+            "def f(a, b, c):\n    if a:\n        assert a\n    if b:\n        if {tail}:\n            raise ValueError\n"
+        );
+        assert_matches_cpython(&source, "nested_raise_condition.py", &LEVELS);
+    }
+    for guards in 0..=3 {
+        for assignment in [false, true] {
+            let mut source = "def f(a, obj, enter, check, finish):\n    if a is not None:\n        assert a\n    if enter(obj):\n".to_owned();
+            for (index, condition) in ["a", "check(obj)", "a is not None"]
+                .into_iter()
+                .take(guards)
+                .enumerate()
+            {
+                writeln!(
+                    source,
+                    "        if {condition}:\n            raise ValueError"
+                )
+                .unwrap();
+                if assignment && index == 0 {
+                    source.push_str("        value = obj.value\n");
+                }
+            }
+            if assignment && guards == 0 {
+                source.push_str("        value = obj.value\n");
+            }
+            source.push_str(
+                "        if a is not None and finish(obj):\n            raise ValueError\n",
+            );
+            assert_matches_cpython(&source, "nested_raise_guards.py", &LEVELS);
+        }
+    }
+    for source in [
+        "def f(a, b, c):\n    if a:\n        assert a\n    if b:\n        if c:\n            pass\n",
+        "def f(a, b, c):\n    if a:\n        assert a\n    if b:\n        if c:\n            raise ValueError\n    return None\n",
+        "def f(a, obj, finish):\n    if a is not None:\n        assert a\n    if a is not None and finish(obj):\n        raise ValueError\n",
+    ] {
+        assert_matches_cpython(source, "nested_raise_control.py", &LEVELS);
+    }
+}
+
+#[test]
+fn conditional_prefixes_with_erased_else_preserve_nested_join() {
+    for prefix in [
+        "        if b:\n            value = obj.first\n        if c:\n            value = obj.second\n",
+        "        if b:\n            value = obj.first\n        if c:\n            value = obj.second\n        else:\n            assert c\n",
+        "        if b:\n            value = obj.first\n        else:\n            assert b\n        if c:\n            value = obj.second\n",
+        "        if b:\n            value = obj.first\n        else:\n            assert b\n",
+        "        if b:\n            value = obj.first\n        if c:\n            value = obj.second\n        else:\n            value = obj.third\n",
+        "        if b:\n            value = obj.first\n        else:\n            assert b\n        if c:\n            value = obj.second\n        else:\n            assert c\n",
+    ] {
+        let source = format!(
+            "def f(a, b, c, obj):\n    if a:\n{prefix}        if c:\n            assert c\n        else:\n            assert b\n    else:\n        assert a\n    action()\n"
+        );
+        assert_matches_cpython(&source, "conditional_prefix_elses.py", &LEVELS);
     }
 }
 
