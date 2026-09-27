@@ -16483,8 +16483,25 @@ impl<'source> Compiler<'source> {
                     && context.finally_end_depth == self.control.finally.active_finally_end_blocks
                     && self.assembler.instruction_count() == context.body_start
             });
+        // With no intervening cleanup, the removed else reaches the iterator
+        // directly. Native normalizes that backward condition into fresh slots.
+        let protected_iterator_loop_else = eligible_else
+            && statement.elif_else_clauses.len() == 1
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.in_loop_tail_without_nested_cleanup()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self
+                .control
+                .loops
+                .contexts
+                .last()
+                .is_some_and(|context| context.iterator_cleanup == IteratorCleanup::Sync)
+            && condition_has_linear_runtime_leaves(&statement.test)
+            && !expression_suspends_current_scope(&statement.test)
+            && suite_has_linear_borrow_fallthrough(&statement.body);
         let optimized_empty_else = eligible_else
             && (self.control.withs.active_with_region_exclusions.is_empty()
+                || protected_iterator_loop_else
                 // Elided arms share the original loop backedge even inside a
                 // manager. Its threaded false edge gets fresh, ownerless slots.
                 || (statement.elif_else_clauses.len() == 1
@@ -16498,7 +16515,8 @@ impl<'source> Compiler<'source> {
             && !self.control.in_exception_handler()
             && (self.control.exceptions.active_exception_region_exclusions.is_empty()
                 && self.control.finally.active_finally_try_bodies == 0
-                || protected_finally_loop_else)
+                || protected_finally_loop_else
+                || protected_iterator_loop_else)
             && self.control.exceptions.active_exception_group_handlers == 0
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_copied_finally_bodies == 0
@@ -17342,13 +17360,22 @@ impl<'source> Compiler<'source> {
                         .set_location(self.source_location(statement.range));
                 } else if self.context.python_version >= crate::PythonVersion::Py314
                     && test.is_none()
-                    && non_final_branch
-                    && !try_body_normal_exit
+                    && ((non_final_branch && !try_body_normal_exit)
+                        || (try_body_normal_exit
+                            && !non_final_branch
+                            && leading.is_empty()
+                            && statement.elif_else_clauses.len() == 1
+                            && self.control.exceptions.normal_try_loop_tail_owner
+                                == Some((
+                                    restart,
+                                    self.control.exceptions.active_exception_region_exclusions.len(),
+                                ))))
                     && elided_else
                     && matches!(self.unit.scope, Scope::Function { .. })
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     // A single ordinary try keeps the backedge's exception owner while
-                    // the false condition supplies its location.
+                    // the false condition supplies its location. A normal try exit's
+                    // converted POP_BLOCK prevents threading but keeps the same donor.
                     && (!self.has_active_control_flow_region()
                         || (self.control.generators.generator_region_start.is_none()
                             && self.control.withs.active_with_region_exclusions.is_empty()
@@ -27198,8 +27225,23 @@ impl<'source> Compiler<'source> {
             // A following while header leaves that block empty when POP_BLOCK is removed.
             self.assembler.prevent_borrow_reachability(protected_end);
         }
-        // An elided assertion cannot populate a while's empty exit block.
-        // A loop else suite has its own exit and keeps the existing proof.
+        let plain_if_exit = self.context.python_version == crate::PythonVersion::Py314
+            && !statement.is_star
+            && statement.orelse.is_empty()
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && !self.has_active_control_flow_region()
+            && !self.control.in_exception_handler()
+            && self.control.finally.is_inactive_for_return_unwind()
+            && statement.finalbody.iter().all(|statement| {
+                matches!(statement, Stmt::Expr(expression)
+                    if matches!(expression.value.as_ref(), Expr::Call(_))
+                        && !expression_contains_inline_branch(&expression.value))
+            });
+        // Elided assertions cannot populate the original join. Loop else suites
+        // and conditional alternatives retain their own exit proofs.
         let effective_body_tail = statement
             .body
             .iter()
@@ -27210,7 +27252,23 @@ impl<'source> Compiler<'source> {
                     Some(super::optimization::OptimizedLocation::Elided)
                 )
             })
-            .filter(|tail| matches!(tail, Stmt::While(loop_) if loop_.orelse.is_empty()))
+            .filter(|tail| match tail {
+                Stmt::While(loop_) => loop_.orelse.is_empty(),
+                // Without another arm, the body's fallthrough and false edge
+                // share the empty original join before normal cleanup.
+                Stmt::If(branch) => {
+                    plain_if_exit
+                        && statement
+                            .body
+                            .first()
+                            .is_some_and(|first| first.range() == branch.range)
+                        && branch.elif_else_clauses.is_empty()
+                        && condition_has_only_runtime_tests(&branch.test)
+                        && !expression_contains_inline_branch(&branch.test)
+                        && suite_has_linear_borrow_fallthrough(&branch.body)
+                }
+                _ => false,
+            })
             .or_else(|| statement.body.last());
         let simple_fallthrough_handlers_reach_finally =
             statement.handlers.iter().all(|handler| {

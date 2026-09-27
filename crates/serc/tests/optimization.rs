@@ -222,6 +222,37 @@ fn elided_assertions_preserve_protected_while_exit_location() {
 }
 
 #[test]
+fn elided_assertion_after_simple_if_preserves_finally_borrow_boundary() {
+    for (case, branches) in [
+        "",
+        "        else:\n            pass\n",
+        "        elif other():\n            recover()\n",
+        "        elif other():\n            recover()\n        else:\n            pass\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = format!(
+            "def f(obj, count):
+    try:
+        if condition():
+            action()
+{branches}        assert obj
+    except ValueError:
+        recover()
+    finally:
+        obj.close()
+"
+        );
+        assert_matches_cpython(
+            &source,
+            &format!("simple_if_finally_borrow_{case}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn discarded_imports_preserve_none_admission_order() {
     for (index, import) in [
         "import package",
@@ -2794,19 +2825,7 @@ def f(xs, cm):
                 assert x
 ",
     ] {
-        assert_matches_cpython_versions(
-            source,
-            "protected_loop_tail.py",
-            &LEVELS,
-            &[PythonVersion::Py312, PythonVersion::Py313],
-        );
-        // Optimized protected backedge ownership on newer versions is tracked separately.
-        assert_matches_cpython_versions(
-            source,
-            "protected_loop_tail.py",
-            &[OptimizationLevel::Zero],
-            &[PythonVersion::Py314, PythonVersion::Py315],
-        );
+        assert_matches_cpython(source, "protected_loop_tail.py", &LEVELS);
     }
 }
 
