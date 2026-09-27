@@ -4458,7 +4458,25 @@ impl<'source> Compiler<'source> {
                 && let Some((Stmt::For(iterator), prefix)) = statement.body.split_last()
                 && !iterator.is_async
                 && iterator.orelse.is_empty()
-                && prefix.iter().all(|part| self.context.is_elided_statement(part))
+                && (prefix.iter().all(|part| self.context.is_elided_statement(part))
+                    || (!self.control.statements.in_match
+                        && matches!(iterator.target.as_ref(), Expr::Name(_))
+                        && matches!(iterator.iter.as_ref(), Expr::Name(_))
+                        && condition_jump_target_count(&statement.test, false) == 1
+                        && iterator.body.iter().all(|part| self.context.is_elided_statement(part))
+                        && prefix.iter().all(|part| {
+                            self.context.is_elided_statement(part)
+                                || suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+                                || matches!(part, Stmt::For(previous)
+                                    if !previous.is_async
+                                        && previous.orelse.is_empty()
+                                        && matches!(previous.target.as_ref(), Expr::Name(_))
+                                        && matches!(previous.iter.as_ref(), Expr::Name(_))
+                                        && !previous.body.is_empty()
+                                        && previous.body.iter().all(|part| {
+                                            self.context.is_elided_statement(part)
+                                        }))
+                        })))
                 && !iterator.body.is_empty()
                 && ((matches!(iterator.target.as_ref(), Expr::Name(_))
                     && matches!(iterator.iter.as_ref(), Expr::Name(_))
@@ -4494,6 +4512,8 @@ impl<'source> Compiler<'source> {
                 // An earlier erased conditional can count this original footer twice.
                 // A linear call body and two simple AND leaves retain the same exit.
                 // Linear iterator calls, unpacking, and call arguments leave those edges intact.
+                // Completed linear work and erased-body loops before a final erased
+                // Name loop add no edge to the shared footer.
                 // Its iterator exhaustion stays unlocated until the native line pass.
                 self.assembler.record_current_original_scope_exit();
             }
@@ -18740,7 +18760,51 @@ impl<'source> Compiler<'source> {
                     && self.control.finally.active_finally_end_blocks == 0
                     && self.control.finally.active_overriding_finally_returns == 0
                     && self.assembler.at_shared_match_failure_join();
-                if shared_match_failure {
+                let copied_erased_branch_exit = self.context.python_version
+                    >= crate::PythonVersion::Py314
+                    && branch_index + 1 < branch_count
+                    && !non_final_branch
+                    && !try_body_normal_exit
+                    && matches!(self.unit.scope, Scope::Function { .. })
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && !self.control.statements.in_match
+                    && !self.has_active_control_flow_region()
+                    && self.control.withs.active_with_exits.is_empty()
+                    && !self.control.in_exception_handler()
+                    && self.control.finally.is_inactive_for_return_unwind()
+                    && self.control.loops.contexts.len() == 1
+                    && self.control.loops.contexts.last().is_some_and(|context| {
+                        context.iterator_cleanup == IteratorCleanup::Sync
+                            && !context.has_orelse
+                            && context.continue_label == restart
+                    })
+                    && test.is_some_and(|test| {
+                        condition_has_only_runtime_tests(test)
+                            && condition_has_linear_runtime_leaves(test)
+                            && !expression_suspends_current_scope(test)
+                            && condition_jump_target_count(test, true) > 1
+                    })
+                    && condition_has_only_runtime_tests(&statement.test)
+                    && condition_has_linear_runtime_leaves(&statement.test)
+                    && !expression_suspends_current_scope(&statement.test)
+                    && !statement.body.is_empty()
+                    && statement
+                        .body
+                        .iter()
+                        .all(|statement| self.context.is_elided_statement(statement))
+                    && statement.elif_else_clauses.iter().all(|clause| {
+                        !clause.body.is_empty()
+                            && clause
+                                .body
+                                .iter()
+                                .all(|statement| self.context.is_elided_statement(statement))
+                            && clause.test.as_ref().is_none_or(|test| {
+                                condition_has_only_runtime_tests(test)
+                                    && condition_has_linear_runtime_leaves(test)
+                                    && !expression_suspends_current_scope(test)
+                            })
+                    });
+                if shared_match_failure || copied_erased_branch_exit {
                     self.assembler.set_location(SourceLocation::NONE);
                 } else if let Some(range) = suite_match_failure_range(body) {
                     self.assembler.set_location(self.source_location(range));
@@ -18856,11 +18920,10 @@ impl<'source> Compiler<'source> {
                         .set_location(self.source_location(statement.range()));
                 }
                 let backedge = self.emit_loop_tail_backedge(restart, try_body_normal_exit)?;
-                if shared_match_failure {
-                    // Native first copies the common loop exit into this arm's original
-                    // forward if-exit array: [unlocated NOP, unlocated JUMP]. Preserve
-                    // that two-record budget and split its cleanup/condition donors before
-                    // late NOP removal. This is not the common original loop backedge.
+                if shared_match_failure || copied_erased_branch_exit {
+                    // Native copies the common backedge into this arm's forward exit:
+                    // [unlocated NOP, unlocated JUMP]. Preserve that original array so
+                    // each incoming condition edge supplies its own backedge location.
                     self.assembler.add_last_inlined_jump_slot();
                     self.assembler
                         .prepare_no_location_block_for_inlining(backedge);

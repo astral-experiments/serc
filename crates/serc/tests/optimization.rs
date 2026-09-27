@@ -23,6 +23,20 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn elided_for_after_completed_prefix_preserves_legacy_footer_location() {
+    for source in [
+        "def f(items, others):\n    assert items\n    assert others\n    if ready():\n        assert items\n    if active():\n        value = prepare()\n        for item in items:\n            assert item\n            assert value\n        for other in others:\n            assert other\n",
+        "def f(items, others):\n    assert items\n    assert others\n    if ready():\n        assert items\n    if active():\n        for item in items:\n            assert item\n            assert value\n        for other in others:\n            assert other\n",
+        "def f(items, others):\n    assert items\n    assert others\n    if ready():\n        assert items\n    if active():\n        value = prepare()\n        for other in others:\n            assert other\n",
+        "def f(items, others):\n    assert items\n    assert others\n    if ready():\n        assert items\n    if active():\n        for other in others:\n            assert other\n",
+        "def f(items, others):\n    assert items\n    assert others\n    if active():\n        value = prepare()\n        for item in items:\n            assert item\n            assert value\n        for other in others:\n            assert other\n",
+        "def f(items, others):\n    assert items\n    assert others\n    if ready():\n        assert items\n    if active():\n        value = items\n        for item in items:\n            assert item\n            assert value\n        for other in others:\n            assert other\n",
+    ] {
+        assert_matches_cpython(source, "completed_for_prefix.py", &LEVELS);
+    }
+}
+
+#[test]
 fn elif_footer_keeps_each_predecessors_location_after_removed_assertion() {
     for otherwise in ["assert kind", "value = build()"] {
         let source = format!(
@@ -8652,4 +8666,34 @@ fn instruction_free_branch_tails_preserve_join_locations() {
     ] {
         assert_matches_cpython(source, "branch_tail.py", &LEVELS);
     }
+}
+
+#[test]
+fn erased_loop_arms_keep_distinct_condition_backedges() {
+    let source = r#"def f(items, obj, enabled, active, alternate, left, right, offset, work):
+    for item in items:
+        value = item + offset
+        if obj.flag or enabled:
+            assert value
+            if item is not None:
+                assert value
+                assert enabled
+        else:
+            assert value
+            if item is not None:
+                assert value
+                assert enabled
+        if active and (item is left or item is right):
+            assert value
+            assert enabled
+        elif alternate and (item is left or item is right):
+            assert value
+            assert enabled
+            assert active
+            assert alternate
+        else:
+            assert value
+            assert enabled
+"#;
+    assert_matches_cpython(source, "erased_loop_condition_backedges.py", &LEVELS);
 }
