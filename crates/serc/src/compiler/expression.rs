@@ -876,8 +876,15 @@ impl Compiler<'_> {
                 let body_previous_location = self.assembler.last_instruction_location();
                 let body_start = self.assembler.instruction_count();
                 let terminal_body = self.terminal_match_case_body(&case.body);
+                // Elided assertions leave the conditional's original join immediately
+                // before the case-success jump, just as a direct case-tail If does.
+                let effective_body = if self.supports_terminal_match_case(&case.body) {
+                    terminal_body
+                } else {
+                    &case.body
+                };
                 let tail_if = if !terminal
-                    && let Some((Stmt::If(statement), leading)) = case.body.split_last()
+                    && let Some((Stmt::If(statement), leading)) = effective_body.split_last()
                     && statement.elif_else_clauses.is_empty()
                     && early_condition_truthiness(&statement.test).is_none()
                     && (!suite_terminates(&statement.body)

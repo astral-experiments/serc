@@ -66,6 +66,25 @@ fn sync_manager_preserves_elided_branch_pop_block() {
 }
 
 #[test]
+fn erased_match_case_suffix_preserves_join_before_successor() {
+    for scope in ["def", "async def"] {
+        for assertion in ["            assert c\n", "\n"] {
+            for successor in [
+                "    action()\n",
+                "    with cm:\n        action()\n",
+                "    try:\n        action()\n    except ValueError:\n        recover()\n",
+                "    if b:\n        action()\n",
+            ] {
+                let source = format!(
+                    "{scope} f(a, b, c, cm):\n    match a:\n        case 1:\n            if c:\n                action()\n{assertion}{successor}"
+                );
+                assert_matches_cpython(&source, "match_case_erased_suffix.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn coroutine_manager_preserves_nested_elided_join_nop() {
     for manager in ["with", "async with"] {
         for prefix in ["", "        work()\n", "        await work()\n"] {
@@ -3463,6 +3482,22 @@ fn elided_loop_arms_inside_managers_match_cpython() {
 "
             );
             assert_matches_cpython(&source, "elided_manager_loop.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn elided_manager_loop_arms_preserve_conditional_successor_nops() {
+    for gap in ["", "            assert a\n"] {
+        for successor in [
+            "if b:\n                assert b\n            else:\n                assert a",
+            "if b:\n                break",
+            "if b and c:\n                work()",
+        ] {
+            let source = format!(
+                "def f(cm, items, a, b, c):\n    with cm:\n        for item in items:\n            if a:\n                assert a\n            else:\n                assert b\n{gap}            {successor}\n"
+            );
+            assert_matches_cpython(&source, "elided_manager_conditional_successor.py", &LEVELS);
         }
     }
 }

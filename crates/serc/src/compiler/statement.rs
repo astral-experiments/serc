@@ -609,6 +609,8 @@ pub(super) struct LoopState {
     synthesized_loop_tail_predecessor: Option<TextRange>,
     // This statement is followed by a loop tail compiled separately from its prefix.
     split_loop_tail_prefix_end: Option<TextRange>,
+    // The last non-elided prefix statement before a separately compiled runtime conditional.
+    split_loop_tail_conditional_predecessor: Option<TextRange>,
     // This exact case-tail iterator reaches a sibling after the enclosing match.
     pub(super) match_case_iterator_continuation: Option<TextRange>,
     exclude_loop_tail_not_taken_from_control_flow_regions: bool,
@@ -715,6 +717,8 @@ pub(super) struct StatementContext {
     followed_by_name_assignment_or_deletion: bool,
     // Whether an elided conditional join reaches a call/name store/delete after erased asserts.
     elided_join_has_live_successor: bool,
+    // Whether an elided join reaches another runtime conditional after erased asserts.
+    elided_join_has_conditional_successor: bool,
     // Whether the next statement is a direct if with a name test.
     followed_by_direct_name_if: bool,
     // Whether that successor is a direct loop break.
@@ -1602,7 +1606,7 @@ impl<'source> Compiler<'source> {
     }
 
     /// Certifies case exits with flat work and at most one final conditional.
-    fn supports_terminal_match_case(&self, body: &[Stmt]) -> bool {
+    pub(super) fn supports_terminal_match_case(&self, body: &[Stmt]) -> bool {
         let is_elided = |statement: &Stmt| {
             matches!(
                 self.context.optimized_locations.get(&statement.range()),
@@ -3185,6 +3189,11 @@ impl<'source> Compiler<'source> {
                             Some(Stmt::Assign(assignment)) if matches!(assignment.targets.as_slice(), [Expr::Name(_)]))
                         || matches!(elided_join_successor,
                             Some(Stmt::Delete(deletion)) if matches!(deletion.targets.as_slice(), [Expr::Name(_)])),
+                    elided_join_has_conditional_successor: matches!(elided_join_successor,
+                        Some(Stmt::If(branch)) if condition_has_linear_runtime_leaves(&branch.test)
+                            && !expression_suspends_current_scope(&branch.test))
+                        || self.control.loops.split_loop_tail_conditional_predecessor
+                            == Some(statement.range()),
                     followed_by_direct_name_if: matches!(body.get(index + 1),
                         Some(Stmt::If(branch)) if matches!(branch.test.as_ref(), Expr::Name(name) if name.id.as_str() != "__debug__")
                             && branch.elif_else_clauses.is_empty()),
@@ -14030,6 +14039,32 @@ impl<'source> Compiler<'source> {
                                 .statements
                                 .context
                                 .elided_join_has_live_successor
+                                || (self
+                                    .control
+                                    .statements
+                                    .context
+                                    .elided_join_has_conditional_successor
+                                    && matches!(self.unit.scope, Scope::Function { .. })
+                                    && self.unit.flags
+                                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                        == 0
+                                    && !self
+                                        .control
+                                        .withs
+                                        .active_with_region_exclusions
+                                        .is_empty()
+                                    && self
+                                        .control
+                                        .exceptions
+                                        .active_exception_region_exclusions
+                                        .is_empty()
+                                    && self.control.loops.contexts.last().is_some_and(
+                                        |context| {
+                                            context.iterator_cleanup == IteratorCleanup::Sync
+                                                && context.with_depth
+                                                    == self.control.withs.active_with_exits.len()
+                                        },
+                                    ))
                                 || self.control.loops.contexts.last().is_some_and(|context| {
                                     context.with_depth < self.control.withs.active_with_exits.len()
                                         && self
@@ -14943,10 +14978,26 @@ impl<'source> Compiler<'source> {
         }
         match body.split_last() {
             Some((Stmt::If(statement), leading)) => {
+                let conditional_predecessor =
+                    (condition_has_linear_runtime_leaves(&statement.test)
+                        && !expression_suspends_current_scope(&statement.test))
+                    .then(|| {
+                        leading
+                            .iter()
+                            .rfind(|statement| !self.context.is_elided_statement(statement))
+                            .map(Ranged::range)
+                    })
+                    .flatten();
                 self.with_control_override(
-                    |control| &mut control.loops.synthesized_loop_tail_predecessor,
-                    leading.last().map(Ranged::range),
-                    |compiler| compiler.compile_loop_tail_prefix(leading),
+                    |control| &mut control.loops.split_loop_tail_conditional_predecessor,
+                    conditional_predecessor,
+                    |compiler| {
+                        compiler.with_control_override(
+                            |control| &mut control.loops.synthesized_loop_tail_predecessor,
+                            leading.last().map(Ranged::range),
+                            |compiler| compiler.compile_loop_tail_prefix(leading),
+                        )
+                    },
                 )?;
                 self.compile_loop_tail_if(statement, restart, split_short_circuit, mode, leading)
             }
