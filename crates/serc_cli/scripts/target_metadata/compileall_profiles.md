@@ -1,7 +1,8 @@
 The CLI's GNU/Linux x86-64 target models a fresh stock CPython process for each
-file: `python [-O|-OO] -m compileall -q -f --invalidation-mode timestamp file.py`,
-or `python [-O|-OO] -m py_compile file.pyi` for an explicit file without the
-`.py` suffix. The pinned interpreter has no site customizations and its standard
+file:
+`python [-O|-OO] -m compileall -q -f --invalidation-mode timestamp file.py`, or
+`python [-O|-OO] -m py_compile file.pyi` for an explicit file without the `.py`
+suffix. The pinned interpreter has no site customizations and its standard
 library cache is populated for the requested optimization count. Library callers
 retain their existing isolated startup model. Other platforms retain their
 existing target metadata.
@@ -17,7 +18,8 @@ modeled separately by the compiler. Source-codec import effects remain enabled.
 
 Optimization counts zero, one and two or greater select distinct profiles.
 Repeated native `-OO` and `-OOO` captures and the pinned imported-module source
-establish the last class; the raw flag count still determines the cache filename.
+establish the last class; the raw flag count still determines the cache
+filename.
 
 Regenerate the Rust table from the admitted fixture with:
 

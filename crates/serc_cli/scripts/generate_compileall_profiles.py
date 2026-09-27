@@ -23,7 +23,7 @@ import generate_cpython_target as target
 
 CRATE_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = CRATE_ROOT / "scripts/target_metadata/cpython_compileall_profiles.json"
-FIXTURE_SHA256 = "9778735d7b8b75f82a0029199fc91019def0362b37f582430465ba2c31d46b1e"
+FIXTURE_SHA256 = "b24c741f64d8ee493fd7904c3cd1cacee7482bb5921ebcb26a4b1925e67733f5"
 OUTPUT = CRATE_ROOT / "src/compileall_profiles_data.rs"
 VERSIONS = ("3.12", "3.13", "3.14", "3.15")
 CALLERS = ("compileall", "py_compile")

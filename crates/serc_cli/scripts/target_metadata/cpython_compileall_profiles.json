@@ -254,12 +254,7 @@
       "caller": "py_compile",
       "captures": [
         {
-          "argv": [
-            "<python>",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "f2a2a9e365672a8f47a9083f16901184c63025a4024bb0402b3ad91069c24821",
           "capture_receipt_sha256": "7cbe128b9727773a77605476ac1023d16c8073aa266f2197078dd18275129523",
           "enum_inventory_sha256": "75611ebd369429af584b62f272e9b0957d20fa5e51126bba57b238fc80180371",
@@ -277,12 +272,7 @@
           "unresolved_mortal_names": []
         },
         {
-          "argv": [
-            "<python>",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "f2a2a9e365672a8f47a9083f16901184c63025a4024bb0402b3ad91069c24821",
           "capture_receipt_sha256": "e9c24b257c8e4296371fdfdeaae8a90346ea56b6922e4320c36e736de3a4f7c7",
           "enum_inventory_sha256": "716521bfa5b8e5bf13cbee91c48fd82b36c4d87fcb6312f74517c72e1630cdef",
@@ -309,13 +299,7 @@
       "caller": "py_compile",
       "captures": [
         {
-          "argv": [
-            "<python>",
-            "-O",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-O", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "d28fb8a48cb2606a060b4c5a71ae66ed57242a072531666d13842489307b715b",
           "capture_receipt_sha256": "3a249833fb9235e2461aa41a058ba3027b34c01e7e05a71570b7d70404e2e6c4",
           "enum_inventory_sha256": "34426c8380e79ccc159ab8b82d287d211c99ea5a51e495ae19080ef36b170fd0",
@@ -333,13 +317,7 @@
           "unresolved_mortal_names": []
         },
         {
-          "argv": [
-            "<python>",
-            "-O",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-O", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "d28fb8a48cb2606a060b4c5a71ae66ed57242a072531666d13842489307b715b",
           "capture_receipt_sha256": "69df055c025c3df7af3a91e229ec22208804b37aef06ffda0e911a8d3cad0f90",
           "enum_inventory_sha256": "e1118b2578b85da35c88748833bd3d9477d200a05b4002508f56d5f504c9a5ea",
@@ -366,13 +344,7 @@
       "caller": "py_compile",
       "captures": [
         {
-          "argv": [
-            "<python>",
-            "-OO",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-OO", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "d28fb8a48cb2606a060b4c5a71ae66ed57242a072531666d13842489307b715b",
           "capture_receipt_sha256": "129da337dd38ddedb8aef0750e361f8c390ec162a8058911b7fdca907921b58c",
           "enum_inventory_sha256": "1b28a623737f5b83e252f788f76d51afce8057139ae98d5b01a86678ecfeab94",
@@ -390,13 +362,7 @@
           "unresolved_mortal_names": []
         },
         {
-          "argv": [
-            "<python>",
-            "-OO",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-OO", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "d28fb8a48cb2606a060b4c5a71ae66ed57242a072531666d13842489307b715b",
           "capture_receipt_sha256": "7436bca23dfa6061aa7480d0d76a9ba15c25bc022601958971857e8f53dc8083",
           "enum_inventory_sha256": "e2fbaa2d1a868b9599055eac992332247fec250aada2e2f9e71259629a95aadf",
@@ -414,13 +380,7 @@
           "unresolved_mortal_names": []
         },
         {
-          "argv": [
-            "<python>",
-            "-OOO",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-OOO", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "d28fb8a48cb2606a060b4c5a71ae66ed57242a072531666d13842489307b715b",
           "capture_receipt_sha256": "8265224432a7f25b516d83479ef42fc969bb4c5df167e379da8078a15c0bd18d",
           "enum_inventory_sha256": "a27c88db9a870db209c06a45581df4edcb58666571c2ebe8e3c71e6a654c4543",
@@ -438,13 +398,7 @@
           "unresolved_mortal_names": []
         },
         {
-          "argv": [
-            "<python>",
-            "-OOO",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-OOO", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "d28fb8a48cb2606a060b4c5a71ae66ed57242a072531666d13842489307b715b",
           "capture_receipt_sha256": "ff97ba3c29e2b28096ad6f4f5ae7c265ce48b06d248115bc312dbdc115e4ef42",
           "enum_inventory_sha256": "6fe920ae045bbb91fac6342c442540db5336dd484e34527860974e98eea9e5d2",
@@ -639,9 +593,7 @@
           "projected_stable_interns": 8928,
           "raw_interns": 8971,
           "source_sha256": "4adfaaa45e596993730d22e31df4031310b850fa0969d4cfb1ec0811bb438a7b",
-          "unresolved_mortal_names": [
-            "_FlagBoundary__in_progress"
-          ]
+          "unresolved_mortal_names": ["_FlagBoundary__in_progress"]
         },
         {
           "argv": [
@@ -751,12 +703,7 @@
       "caller": "py_compile",
       "captures": [
         {
-          "argv": [
-            "<python>",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "e6d72b31941e740015d6437a5b4307811a7a166b847fda50b1ecf770dff3c267",
           "capture_receipt_sha256": "1354a42a25ad3bd583278b9c2638d3976979352ea39e64b2a05ee37e3880e5eb",
           "enum_inventory_sha256": "4dd873437b0274f4bd21989931c24cf62192be01adbbe9eb9b2ef312e054952a",
@@ -779,12 +726,7 @@
           ]
         },
         {
-          "argv": [
-            "<python>",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "f1045d2763dc68a60158f2e6e4962c2f223e209f5cee9b7afcb00a381f7d33dc",
           "capture_receipt_sha256": "1f874a644f1b1b6a17c8383e0859b60b7f51ac76218411033e89b5ca4dd7937c",
           "enum_inventory_sha256": "9612e66b720b4a4d664fb5490b4abfe446d506431489d894b4cfef9e7e4216b4",
@@ -816,13 +758,7 @@
       "caller": "py_compile",
       "captures": [
         {
-          "argv": [
-            "<python>",
-            "-O",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-O", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "0bd84856c622c9c8095a5623428617cb1a4c068b5435997743148492c2a0b4ca",
           "capture_receipt_sha256": "badc483771cede9c91bb0942ce5be38cdae284aca5185a45500ad6f2f72b7e77",
           "enum_inventory_sha256": "fe93042cc022c31629b9c03ebed2bb8ac484da497ab21aa41e34edc8f25fabe1",
@@ -845,13 +781,7 @@
           ]
         },
         {
-          "argv": [
-            "<python>",
-            "-O",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-O", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "65b0fe7792d9af053a2e5e773a092395115de1880c12272634b359a900899cda",
           "capture_receipt_sha256": "b70f89f908ec707e07de55b2ebe1593768d7c8d3a5e4dfbe3be6ae293a31ec54",
           "enum_inventory_sha256": "1bf816f0db1ed788dc6d5d7489bd26859752b49de2a7411e4abc04a72c8d8098",
@@ -886,13 +816,7 @@
       "caller": "py_compile",
       "captures": [
         {
-          "argv": [
-            "<python>",
-            "-OO",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-OO", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "38ee552d5cba3b74a9c15726f1ab3bdb11abbb6558bd61eb35046515516694ba",
           "capture_receipt_sha256": "ae8b88b0762b17b797ae9a6bf6d8089a75529078267a7351ff1be8834ba50b4c",
           "enum_inventory_sha256": "a0b091c1385711b3c28988179c0000ac3f1b5aa7ec6c57b655cb1ef16123c40c",
@@ -916,13 +840,7 @@
           ]
         },
         {
-          "argv": [
-            "<python>",
-            "-OO",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-OO", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "7199e9debbe76ccde7c6bfe741dc6281cede956e2e17921f9ed31e82fd063a29",
           "capture_receipt_sha256": "94a090983f52b24a4dd82c33d1f3ac42c6f1a001f2efc3a3c882eaa3377d4824",
           "enum_inventory_sha256": "5aa8c9da0cac94418fe73e243f34b320e3f9b564aaf03ee2c9ce3d88d7745e6e",
@@ -943,13 +861,7 @@
           ]
         },
         {
-          "argv": [
-            "<python>",
-            "-OOO",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-OOO", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "d6c295b727325de652abad5d9a2d337391dbbda1175e2039f67d9659a7104614",
           "capture_receipt_sha256": "ed95cd706560c5f7f1855dca5943cef45228d3ffeebb55241d944b57bb74a986",
           "enum_inventory_sha256": "08d4834a9f3a7c9c260442d9d6c3c1fcf07a15be2f0267c8bbc43a31969cb81e",
@@ -975,13 +887,7 @@
           ]
         },
         {
-          "argv": [
-            "<python>",
-            "-OOO",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-OOO", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "d957adc583c51a7d0525ac4cacfa63b754d09d4f9ae67d52791cc0734ce07bba",
           "capture_receipt_sha256": "0cfbc9e2f64dc3d94c110afcb3a9af715490c401ecfb9b2dafff81c392a8abc5",
           "enum_inventory_sha256": "6d1031d89c685de9b02355a80c1a7e7d1491252cf22812890e85dd4f12b8ca0d",
@@ -1791,12 +1697,7 @@
       "caller": "py_compile",
       "captures": [
         {
-          "argv": [
-            "<python>",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "4e3514c9829ab1b91fc4539d0fdc6ec5e1a96f420b74d950dec4bd177a8b1444",
           "capture_receipt_sha256": "c6a4fec5224eb2083230860508b2d4f6a8e864f91c523e0c0cbe990e1b73ef98",
           "enum_inventory_sha256": "b88116f3367b6ef0f09351e71063b1e5c9c6922a0cbc45183d25ef375b41d332",
@@ -1822,12 +1723,7 @@
           ]
         },
         {
-          "argv": [
-            "<python>",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "989eb3ca9906fbab20fce320119abfea0a1c80127178f6376df8aba5b4f8809f",
           "capture_receipt_sha256": "54abf6724d9b1657074d32b66f2bdc0b943ceb1ebca35782cdba46504f45b7c7",
           "enum_inventory_sha256": "c0eea166b4f3e9b7d90ec8d58399c544804157247c47f87a1e97d63a73bad2e3",
@@ -1861,13 +1757,7 @@
       "caller": "py_compile",
       "captures": [
         {
-          "argv": [
-            "<python>",
-            "-O",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-O", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "4652171bd7601774b448c6be01aa897a24d1a2ca6e6f2f652397885cc2f96471",
           "capture_receipt_sha256": "12836e0d8e10037e72163f92494d973af3a08a918c4b7d2e4603df312d0cd467",
           "enum_inventory_sha256": "2e55504c6d639aa2576c9ca78ba8c84d414f645ec1db060a531c71cbbaaeafe1",
@@ -1892,13 +1782,7 @@
           ]
         },
         {
-          "argv": [
-            "<python>",
-            "-O",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-O", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "fe78b770cbbd576694c57f8eb2606c30c1dea93c7e2569485c6b1db464532a0c",
           "capture_receipt_sha256": "f78516fe1e1448616237b9a26aa95dc01d0ddc004dd7d3f2a26f643ab404cd47",
           "enum_inventory_sha256": "eb89f2b18c2cc94a0d077eb52fe7e799035a7f3d86b68a8436760175b5d4a9ef",
@@ -1932,13 +1816,7 @@
       "caller": "py_compile",
       "captures": [
         {
-          "argv": [
-            "<python>",
-            "-OO",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-OO", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "caa17b777b9248dc3acc923f33cb1c85ed6d700e913faa8dc2c212623136a542",
           "capture_receipt_sha256": "790e60b1cf4a15c6cedae614065d97456558ed0f51bea0f321c20d8796056409",
           "enum_inventory_sha256": "8c198969b6b17410d8a06c30fdf76ce7b962fce3d732c656cefd2ea57e245511",
@@ -1964,13 +1842,7 @@
           ]
         },
         {
-          "argv": [
-            "<python>",
-            "-OO",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-OO", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "8e745642b3630eafc87de3289a79bf72dc2652150204aafd8a6cbbc89aa94cfd",
           "capture_receipt_sha256": "ffd2422dbaa58dd54e6a97a16b9f3c3d42cbfaa79c3d55472d38a4970dc30556",
           "enum_inventory_sha256": "3aac917a120641a5bae4a549c46df71815260962630e32b2113200fa765243c4",
@@ -1995,13 +1867,7 @@
           ]
         },
         {
-          "argv": [
-            "<python>",
-            "-OOO",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-OOO", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "caa17b777b9248dc3acc923f33cb1c85ed6d700e913faa8dc2c212623136a542",
           "capture_receipt_sha256": "d84d29fd4a7445607022ca5dde7c03133543f1340c2669f3d92c64b342eb86b0",
           "enum_inventory_sha256": "d5571e8c1becda31e5f25668d2ef0efbfdc9b1582839ec04c3c797819a64bba5",
@@ -2027,13 +1893,7 @@
           ]
         },
         {
-          "argv": [
-            "<python>",
-            "-OOO",
-            "-m",
-            "py_compile",
-            "<source.pyi>"
-          ],
+          "argv": ["<python>", "-OOO", "-m", "py_compile", "<source.pyi>"],
           "canonical_sha256": "8e62b4d9eedb6eff24051a91be8a81c3904fc147db4ed6a3378cc00fc22bed00",
           "capture_receipt_sha256": "01754e7d8cd386fb0db9766c29a06812a09a39957addb5c24a2f6e4df1d545d0",
           "enum_inventory_sha256": "48deeb70b6e450bead3627d471d165d59ddd573b613748d566d7e122b6c36e0a",
@@ -2404,7 +2264,10 @@
     ["AsyncExitStack.__aexit__", 16777152],
     ["AsyncExitStack.__aexit__.<locals>._fix_exception_context", 16777152],
     ["AsyncExitStack._create_async_cb_wrapper", 16777152],
-    ["AsyncExitStack._create_async_cb_wrapper.<locals>._exit_wrapper", 16777152],
+    [
+      "AsyncExitStack._create_async_cb_wrapper.<locals>._exit_wrapper",
+      16777152
+    ],
     ["AsyncExitStack._create_async_exit_wrapper", 262080],
     ["AsyncExitStack._push_async_cm_exit", 262080],
     ["AsyncExitStack.aclose", 16777152],
@@ -3505,7 +3368,10 @@
     ["HelpFormatter._fill_text", 16777152],
     ["HelpFormatter._format_action", 16777152],
     ["HelpFormatter._format_action_invocation", 16777152],
-    ["HelpFormatter._format_action_invocation.<locals>.color_option_strings", 16773120],
+    [
+      "HelpFormatter._format_action_invocation.<locals>.color_option_strings",
+      16773120
+    ],
     ["HelpFormatter._format_actions_usage", 4032],
     ["HelpFormatter._format_args", 16777152],
     ["HelpFormatter._format_text", 16777152],
@@ -3513,7 +3379,10 @@
     ["HelpFormatter._format_usage.<locals>.get_lines", 16777152],
     ["HelpFormatter._get_actions_usage_parts", 16777152],
     ["HelpFormatter._get_actions_usage_parts_with_split", 4032],
-    ["HelpFormatter._get_actions_usage_parts_with_split.<locals>.<genexpr>", 4032],
+    [
+      "HelpFormatter._get_actions_usage_parts_with_split.<locals>.<genexpr>",
+      4032
+    ],
     ["HelpFormatter._get_default_metavar_for_optional", 16777152],
     ["HelpFormatter._get_default_metavar_for_positional", 16777152],
     ["HelpFormatter._get_help_string", 16777152],
@@ -5050,8 +4919,14 @@
     ["StackSummary.format_frame_summary", 16777152],
     ["StackSummary.format_frame_summary.<locals>.<lambda>", 16777152],
     ["StackSummary.format_frame_summary.<locals>.output_line", 16777152],
-    ["StackSummary.format_frame_summary.<locals>.output_line.<locals>.<genexpr>", 16777152],
-    ["StackSummary.format_frame_summary.<locals>.output_line.<locals>.<lambda>", 16777152],
+    [
+      "StackSummary.format_frame_summary.<locals>.output_line.<locals>.<genexpr>",
+      16777152
+    ],
+    [
+      "StackSummary.format_frame_summary.<locals>.output_line.<locals>.<lambda>",
+      16777152
+    ],
     ["StackSummary.from_list", 16777152],
     ["Starred", 258048],
     ["StartupState", 16515072],
@@ -6965,11 +6840,20 @@
     ["_extract_caret_anchors_from_line_segment", 16777215],
     ["_extract_caret_anchors_from_line_segment.<locals>.<lambda>", 16777152],
     ["_extract_caret_anchors_from_line_segment.<locals>.increment", 16777152],
-    ["_extract_caret_anchors_from_line_segment.<locals>.increment_until", 16777152],
-    ["_extract_caret_anchors_from_line_segment.<locals>.next_valid_char", 16777152],
+    [
+      "_extract_caret_anchors_from_line_segment.<locals>.increment_until",
+      16777152
+    ],
+    [
+      "_extract_caret_anchors_from_line_segment.<locals>.next_valid_char",
+      16777152
+    ],
     ["_extract_caret_anchors_from_line_segment.<locals>.nextline", 16777152],
     ["_extract_caret_anchors_from_line_segment.<locals>.normalize", 16777152],
-    ["_extract_caret_anchors_from_line_segment.<locals>.setup_positions", 16777152],
+    [
+      "_extract_caret_anchors_from_line_segment.<locals>.setup_positions",
+      16777152
+    ],
     ["_extract_from_extended_frame_gen", 16777215],
     ["_f", 16777215],
     ["_fallback", 16777215],
@@ -13148,7 +13032,10 @@
     ["singledispatch", 16777215],
     ["singledispatch.<locals>._is_union_type", 4032],
     ["singledispatch.<locals>._is_valid_dispatch_type", 16777152],
-    ["singledispatch.<locals>._is_valid_dispatch_type.<locals>.<genexpr>", 16777152],
+    [
+      "singledispatch.<locals>._is_valid_dispatch_type.<locals>.<genexpr>",
+      16777152
+    ],
     ["singledispatch.<locals>.dispatch", 16777152],
     ["singledispatch.<locals>.register", 16777152],
     ["singledispatch.<locals>.register.<locals>.<lambda>", 16777152],
@@ -14481,10 +14368,7 @@
           "ReprEnum",
           "StrEnum"
         ],
-        "simple_enum_classes": [
-          "EnumCheck",
-          "RegexFlag"
-        ],
+        "simple_enum_classes": ["EnumCheck", "RegexFlag"],
         "temporary_key_format": null
       },
       "executable_sha256": "febd623a8152b648d90174369fb7eb121be1ed653fa0fa5d72e3b512cce8aa8e",
@@ -14730,11 +14614,7 @@
           "immutable_static_type[4].dictionary.key['__alloc__']",
           63
         ],
-        [
-          "__base__",
-          "immutable_static_type[1].dictionary.key['__base__']",
-          63
-        ],
+        ["__base__", "immutable_static_type[1].dictionary.key['__base__']", 63],
         [
           "__basicsize__",
           "immutable_static_type[1].dictionary.key['__basicsize__']",
@@ -14800,11 +14680,7 @@
           "immutable_static_type[65].dictionary.key['__self_class__']",
           63
         ],
-        [
-          "__stdin__",
-          "interpreter.sysdict.key['__stdin__']",
-          63
-        ],
+        ["__stdin__", "interpreter.sysdict.key['__stdin__']", 63],
         [
           "__text_signature__",
           "immutable_static_type[1].dictionary.key['__text_signature__']",
@@ -14855,11 +14731,7 @@
           "interpreter.imports.modules.value['_thread'].module.md_dict.value['LockType'].type.dictionary.key['_at_fork_reinit']",
           63
         ],
-        [
-          "_attributes",
-          "interpreter.ast._attributes",
-          63
-        ],
+        ["_attributes", "interpreter.ast._attributes", 63],
         [
           "_checkClosed",
           "interpreter.imports.modules.value['_io'].module.md_dict.value['_IOBase'].type.dictionary.key['_checkClosed']",
@@ -14905,11 +14777,7 @@
           "interpreter.sysdict.key['_current_exceptions']",
           63
         ],
-        [
-          "_current_frames",
-          "interpreter.sysdict.key['_current_frames']",
-          63
-        ],
+        ["_current_frames", "interpreter.sysdict.key['_current_frames']", 63],
         [
           "_debugmallocstats",
           "interpreter.sysdict.key['_debugmallocstats']",
@@ -15000,31 +14868,15 @@
           "immutable_static_type[116].dictionary.key['add_note']",
           63
         ],
-        [
-          "addaudithook",
-          "interpreter.sysdict.key['addaudithook']",
-          63
-        ],
+        ["addaudithook", "interpreter.sysdict.key['addaudithook']", 63],
         [
           "adler32",
           "interpreter.imports.modules.value['zlib'].module.md_dict.key['adler32']",
           63
         ],
-        [
-          "ag_await",
-          "immutable_static_type[2].dictionary.key['ag_await']",
-          63
-        ],
-        [
-          "ag_code",
-          "immutable_static_type[2].dictionary.key['ag_code']",
-          63
-        ],
-        [
-          "ag_frame",
-          "immutable_static_type[2].dictionary.key['ag_frame']",
-          63
-        ],
+        ["ag_await", "immutable_static_type[2].dictionary.key['ag_await']", 63],
+        ["ag_code", "immutable_static_type[2].dictionary.key['ag_code']", 63],
+        ["ag_frame", "immutable_static_type[2].dictionary.key['ag_frame']", 63],
         [
           "ag_running",
           "immutable_static_type[2].dictionary.key['ag_running']",
@@ -15035,11 +14887,7 @@
           "immutable_static_type[2].dictionary.key['ag_suspended']",
           63
         ],
-        [
-          "aiter",
-          "interpreter.builtins.key['aiter']",
-          63
-        ],
+        ["aiter", "interpreter.builtins.key['aiter']", 63],
         [
           "alarm",
           "interpreter.imports.modules.value['_signal'].module.md_dict.key['alarm']",
@@ -15055,21 +14903,13 @@
           "interpreter.imports.modules.value['_thread'].module.md_dict.key['allocate']",
           63
         ],
-        [
-          "annotation",
-          "interpreter.ast.annotation",
-          63
-        ],
+        ["annotation", "interpreter.ast.annotation", 63],
         [
           "appendleft",
           "interpreter.imports.modules.value['_collections'].module.md_dict.value['deque'].type.dictionary.key['appendleft']",
           63
         ],
-        [
-          "argtypes",
-          "interpreter.ast.argtypes",
-          63
-        ],
+        ["argtypes", "interpreter.ast.argtypes", 63],
         [
           "ascii_decode",
           "interpreter.imports.modules.value['_codecs'].module.md_dict.key['ascii_decode']",
@@ -15095,11 +14935,7 @@
           "interpreter.imports.modules.value['math'].module.md_dict.key['asinh']",
           7
         ],
-        [
-          "asname",
-          "interpreter.ast.asname",
-          63
-        ],
+        ["asname", "interpreter.ast.asname", 63],
         [
           "atan",
           "interpreter.imports.modules.value['math'].module.md_dict.key['atan']",
@@ -15125,31 +14961,15 @@
           "immutable_static_type[111].dictionary.key['bits_per_digit']",
           63
         ],
-        [
-          "breakpoint",
-          "interpreter.builtins.key['breakpoint']",
-          63
-        ],
-        [
-          "breakpointhook",
-          "interpreter.sysdict.key['breakpointhook']",
-          63
-        ],
+        ["breakpoint", "interpreter.builtins.key['breakpoint']", 63],
+        ["breakpointhook", "interpreter.sysdict.key['breakpointhook']", 63],
         [
           "c_contiguous",
           "immutable_static_type[47].dictionary.key['c_contiguous']",
           63
         ],
-        [
-          "call_tracing",
-          "interpreter.sysdict.key['call_tracing']",
-          63
-        ],
-        [
-          "cases",
-          "interpreter.ast.cases",
-          63
-        ],
+        ["call_tracing", "interpreter.sysdict.key['call_tracing']", 63],
+        ["cases", "interpreter.ast.cases", 63],
         [
           "cbrt",
           "interpreter.imports.modules.value['math'].module.md_dict.key['cbrt']",
@@ -15250,11 +15070,7 @@
           "interpreter.imports.modules.value['math'].module.md_dict.key['comb']",
           7
         ],
-        [
-          "comparators",
-          "interpreter.ast.comparators",
-          63
-        ],
+        ["comparators", "interpreter.ast.comparators", 63],
         [
           "compressobj",
           "interpreter.imports.modules.value['zlib'].module.md_dict.key['compressobj']",
@@ -15265,21 +15081,13 @@
           "immutable_static_type[14].dictionary.key['conjugate']",
           63
         ],
-        [
-          "context_expr",
-          "interpreter.ast.context_expr",
-          63
-        ],
+        ["context_expr", "interpreter.ast.context_expr", 63],
         [
           "contiguous",
           "immutable_static_type[47].dictionary.key['contiguous']",
           63
         ],
-        [
-          "conversion",
-          "interpreter.ast.conversion",
-          63
-        ],
+        ["conversion", "interpreter.ast.conversion", 63],
         [
           "copy_file_range",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['copy_file_range']",
@@ -15325,16 +15133,8 @@
           "interpreter.imports.modules.value['time'].module.md_dict.key['ctime']",
           63
         ],
-        [
-          "ctx",
-          "interpreter.ast.ctx",
-          63
-        ],
-        [
-          "cutoff",
-          "immutable_static_type[183].dictionary.key['cutoff']",
-          63
-        ],
+        ["ctx", "interpreter.ast.ctx", 63],
+        ["cutoff", "immutable_static_type[183].dictionary.key['cutoff']", 63],
         [
           "daemon_threads_allowed",
           "interpreter.imports.modules.value['_thread'].module.md_dict.key['daemon_threads_allowed']",
@@ -15355,11 +15155,7 @@
           "interpreter.imports.modules.value['zlib'].module.md_dict.key['decompressobj']",
           63
         ],
-        [
-          "decorator_list",
-          "interpreter.ast.decorator_list",
-          63
-        ],
+        ["decorator_list", "interpreter.ast.decorator_list", 63],
         [
           "default_factory",
           "interpreter.imports.modules.value['_collections'].module.md_dict.value['defaultdict'].type.dictionary.key['default_factory']",
@@ -15385,11 +15181,7 @@
           "immutable_static_type[44].dictionary.key['denominator']",
           63
         ],
-        [
-          "derive",
-          "immutable_static_type[117].dictionary.key['derive']",
-          63
-        ],
+        ["derive", "immutable_static_type[117].dictionary.key['derive']", 63],
         [
           "detach",
           "interpreter.imports.modules.value['_io'].module.md_dict.value['_TextIOBase'].type.dictionary.key['detach']",
@@ -15400,21 +15192,13 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.key['device_encoding']",
           63
         ],
-        [
-          "dig",
-          "immutable_static_type[115].dictionary.key['dig']",
-          63
-        ],
+        ["dig", "immutable_static_type[115].dictionary.key['dig']", 63],
         [
           "dist",
           "interpreter.imports.modules.value['math'].module.md_dict.key['dist']",
           7
         ],
-        [
-          "divmod",
-          "interpreter.builtins.key['divmod']",
-          63
-        ],
+        ["divmod", "interpreter.builtins.key['divmod']", 63],
         [
           "dup",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['dup']",
@@ -15430,21 +15214,9 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.value['times_result'].type.dictionary.key['elapsed']",
           63
         ],
-        [
-          "elt",
-          "interpreter.ast.elt",
-          56
-        ],
-        [
-          "elts",
-          "interpreter.ast.elts",
-          63
-        ],
-        [
-          "epsilon",
-          "immutable_static_type[115].dictionary.key['epsilon']",
-          63
-        ],
+        ["elt", "interpreter.ast.elt", 56],
+        ["elts", "interpreter.ast.elts", 63],
+        ["epsilon", "immutable_static_type[115].dictionary.key['epsilon']", 63],
         [
           "erf",
           "interpreter.imports.modules.value['math'].module.md_dict.key['erf']",
@@ -15455,11 +15227,7 @@
           "interpreter.imports.modules.value['math'].module.md_dict.key['erfc']",
           7
         ],
-        [
-          "err_msg",
-          "immutable_static_type[182].dictionary.key['err_msg']",
-          63
-        ],
+        ["err_msg", "immutable_static_type[182].dictionary.key['err_msg']", 63],
         [
           "escape_decode",
           "interpreter.imports.modules.value['_codecs'].module.md_dict.key['escape_decode']",
@@ -15550,21 +15318,13 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.value['statvfs_result'].type.dictionary.key['f_fsid']",
           63
         ],
-        [
-          "f_lasti",
-          "immutable_static_type[34].dictionary.key['f_lasti']",
-          63
-        ],
+        ["f_lasti", "immutable_static_type[34].dictionary.key['f_lasti']", 63],
         [
           "f_namemax",
           "interpreter.imports.modules.value['posix'].module.md_dict.value['statvfs_result'].type.dictionary.key['f_namemax']",
           63
         ],
-        [
-          "f_trace",
-          "immutable_static_type[34].dictionary.key['f_trace']",
-          63
-        ],
+        ["f_trace", "immutable_static_type[34].dictionary.key['f_trace']", 63],
         [
           "f_trace_lines",
           "immutable_static_type[34].dictionary.key['f_trace_lines']",
@@ -15605,11 +15365,7 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.key['fdatasync']",
           63
         ],
-        [
-          "finalbody",
-          "interpreter.ast.finalbody",
-          63
-        ],
+        ["finalbody", "interpreter.ast.finalbody", 63],
         [
           "finalizer",
           "immutable_static_type[187].dictionary.key['finalizer']",
@@ -15650,11 +15406,7 @@
           "interpreter.imports.modules.value['math'].module.md_dict.key['frexp']",
           7
         ],
-        [
-          "fromhex",
-          "immutable_static_type[4].dictionary.key['fromhex']",
-          56
-        ],
+        ["fromhex", "immutable_static_type[4].dictionary.key['fromhex']", 56],
         [
           "fsum",
           "interpreter.imports.modules.value['math'].module.md_dict.key['fsum']",
@@ -15680,11 +15432,7 @@
           "interpreter.imports.modules.value['math'].module.md_dict.key['gcd']",
           7
         ],
-        [
-          "generators",
-          "interpreter.ast.generators",
-          63
-        ],
+        ["generators", "interpreter.ast.generators", 63],
         [
           "get_asyncgen_hooks",
           "interpreter.sysdict.key['get_asyncgen_hooks']",
@@ -15755,11 +15503,7 @@
           "interpreter.sysdict.key['getdefaultencoding']",
           56
         ],
-        [
-          "getdlopenflags",
-          "interpreter.sysdict.key['getdlopenflags']",
-          63
-        ],
+        ["getdlopenflags", "interpreter.sysdict.key['getdlopenflags']", 63],
         [
           "getgrouplist",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['getgrouplist']",
@@ -15810,11 +15554,7 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.key['getpriority']",
           63
         ],
-        [
-          "getprofile",
-          "interpreter.sysdict.key['getprofile']",
-          63
-        ],
+        ["getprofile", "interpreter.sysdict.key['getprofile']", 63],
         [
           "getrandom",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['getrandom']",
@@ -15825,11 +15565,7 @@
           "interpreter.sysdict.key['getrecursionlimit']",
           56
         ],
-        [
-          "getrefcount",
-          "interpreter.sysdict.key['getrefcount']",
-          63
-        ],
+        ["getrefcount", "interpreter.sysdict.key['getrefcount']", 63],
         [
           "getresgid",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['getresgid']",
@@ -15855,11 +15591,7 @@
           "interpreter.sysdict.key['getswitchinterval']",
           63
         ],
-        [
-          "gettrace",
-          "interpreter.sysdict.key['gettrace']",
-          63
-        ],
+        ["gettrace", "interpreter.sysdict.key['gettrace']", 63],
         [
           "getunicodeinternedsize",
           "interpreter.sysdict.key['getunicodeinternedsize']",
@@ -15890,16 +15622,8 @@
           "interpreter.imports.modules.value['time'].module.md_dict.key['gmtime']",
           63
         ],
-        [
-          "guard",
-          "interpreter.ast.guard",
-          63
-        ],
-        [
-          "handlers",
-          "interpreter.ast.handlers",
-          63
-        ],
+        ["guard", "interpreter.ast.guard", 63],
+        ["handlers", "interpreter.ast.handlers", 63],
         [
           "hash_bits",
           "immutable_static_type[183].dictionary.key['hash_bits']",
@@ -15915,16 +15639,8 @@
           "interpreter.imports.modules.value['math'].module.md_dict.key['hypot']",
           7
         ],
-        [
-          "ifs",
-          "interpreter.ast.ifs",
-          63
-        ],
-        [
-          "indices",
-          "immutable_static_type[62].dictionary.key['indices']",
-          56
-        ],
+        ["ifs", "interpreter.ast.ifs", 63],
+        ["indices", "immutable_static_type[62].dictionary.key['indices']", 56],
         [
           "init_frozen",
           "interpreter.imports.modules.value['_imp'].module.md_dict.key['init_frozen']",
@@ -15950,21 +15666,13 @@
           "immutable_static_type[61].dictionary.key['intersection_update']",
           63
         ],
-        [
-          "is_async",
-          "interpreter.ast.is_async",
-          63
-        ],
+        ["is_async", "interpreter.ast.is_async", 63],
         [
           "is_file",
           "interpreter.imports.modules.value['posix'].module.md_dict.value['DirEntry'].type.dictionary.key['is_file']",
           56
         ],
-        [
-          "is_finalizing",
-          "interpreter.sysdict.key['is_finalizing']",
-          63
-        ],
+        ["is_finalizing", "interpreter.sysdict.key['is_finalizing']", 63],
         [
           "is_integer",
           "immutable_static_type[33].dictionary.key['is_integer']",
@@ -16020,31 +15728,11 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.key['killpg']",
           63
         ],
-        [
-          "kw_defaults",
-          "interpreter.ast.kw_defaults",
-          63
-        ],
-        [
-          "kwarg",
-          "interpreter.ast.kwarg",
-          63
-        ],
-        [
-          "kwd_attrs",
-          "interpreter.ast.kwd_attrs",
-          63
-        ],
-        [
-          "kwd_patterns",
-          "interpreter.ast.kwd_patterns",
-          63
-        ],
-        [
-          "kwonlyargs",
-          "interpreter.ast.kwonlyargs",
-          63
-        ],
+        ["kw_defaults", "interpreter.ast.kw_defaults", 63],
+        ["kwarg", "interpreter.ast.kwarg", 63],
+        ["kwd_attrs", "interpreter.ast.kwd_attrs", 63],
+        ["kwd_patterns", "interpreter.ast.kwd_patterns", 63],
+        ["kwonlyargs", "interpreter.ast.kwonlyargs", 63],
         [
           "latin_1_decode",
           "interpreter.imports.modules.value['_codecs'].module.md_dict.key['latin_1_decode']",
@@ -16125,11 +15813,7 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.value['uname_result'].type.dictionary.key['machine']",
           63
         ],
-        [
-          "major",
-          "immutable_static_type[184].dictionary.key['major']",
-          63
-        ],
+        ["major", "immutable_static_type[184].dictionary.key['major']", 63],
         [
           "makedev",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['makedev']",
@@ -16145,46 +15829,26 @@
           "immutable_static_type[115].dictionary.key['max_10_exp']",
           63
         ],
-        [
-          "max_exp",
-          "immutable_static_type[115].dictionary.key['max_exp']",
-          63
-        ],
+        ["max_exp", "immutable_static_type[115].dictionary.key['max_exp']", 63],
         [
           "memfd_create",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['memfd_create']",
           63
         ],
-        [
-          "micro",
-          "immutable_static_type[184].dictionary.key['micro']",
-          63
-        ],
+        ["micro", "immutable_static_type[184].dictionary.key['micro']", 63],
         [
           "min_10_exp",
           "immutable_static_type[115].dictionary.key['min_10_exp']",
           63
         ],
-        [
-          "min_exp",
-          "immutable_static_type[115].dictionary.key['min_exp']",
-          63
-        ],
-        [
-          "minor",
-          "immutable_static_type[184].dictionary.key['minor']",
-          63
-        ],
+        ["min_exp", "immutable_static_type[115].dictionary.key['min_exp']", 63],
+        ["minor", "immutable_static_type[184].dictionary.key['minor']", 63],
         [
           "modf",
           "interpreter.imports.modules.value['math'].module.md_dict.key['modf']",
           7
         ],
-        [
-          "modulus",
-          "immutable_static_type[183].dictionary.key['modulus']",
-          63
-        ],
+        ["modulus", "immutable_static_type[183].dictionary.key['modulus']", 63],
         [
           "monotonic",
           "interpreter.imports.modules.value['time'].module.md_dict.key['monotonic']",
@@ -16195,16 +15859,8 @@
           "interpreter.imports.modules.value['time'].module.md_dict.key['monotonic_ns']",
           63
         ],
-        [
-          "nan",
-          "immutable_static_type[183].dictionary.key['nan']",
-          56
-        ],
-        [
-          "ndim",
-          "immutable_static_type[47].dictionary.key['ndim']",
-          63
-        ],
+        ["nan", "immutable_static_type[183].dictionary.key['nan']", 56],
+        ["ndim", "immutable_static_type[47].dictionary.key['ndim']", 63],
         [
           "nextafter",
           "interpreter.imports.modules.value['math'].module.md_dict.key['nextafter']",
@@ -16230,11 +15886,7 @@
           "immutable_static_type[44].dictionary.key['numerator']",
           63
         ],
-        [
-          "oct",
-          "interpreter.builtins.key['oct']",
-          63
-        ],
+        ["oct", "interpreter.builtins.key['oct']", 63],
         [
           "old_value",
           "immutable_static_type[15].dictionary.key['old_value']",
@@ -16245,21 +15897,9 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.key['openpty']",
           63
         ],
-        [
-          "operand",
-          "interpreter.ast.operand",
-          63
-        ],
-        [
-          "optional_vars",
-          "interpreter.ast.optional_vars",
-          63
-        ],
-        [
-          "orelse",
-          "interpreter.ast.orelse",
-          63
-        ],
+        ["operand", "interpreter.ast.operand", 63],
+        ["optional_vars", "interpreter.ast.optional_vars", 63],
+        ["orelse", "interpreter.ast.orelse", 63],
         [
           "pause",
           "interpreter.imports.modules.value['_signal'].module.md_dict.key['pause']",
@@ -16320,11 +15960,7 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.key['posix_spawnp']",
           63
         ],
-        [
-          "posonlyargs",
-          "interpreter.ast.posonlyargs",
-          63
-        ],
+        ["posonlyargs", "interpreter.ast.posonlyargs", 63],
         [
           "pread",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['pread']",
@@ -16380,11 +16016,7 @@
           "interpreter.imports.modules.value['math'].module.md_dict.key['radians']",
           7
         ],
-        [
-          "radix",
-          "immutable_static_type[115].dictionary.key['radix']",
-          63
-        ],
+        ["radix", "immutable_static_type[115].dictionary.key['radix']", 63],
         [
           "raise_signal",
           "interpreter.imports.modules.value['_signal'].module.md_dict.key['raise_signal']",
@@ -16410,11 +16042,7 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.key['readv']",
           63
         ],
-        [
-          "reason",
-          "immutable_static_type[179].dictionary.key['reason']",
-          63
-        ],
+        ["reason", "immutable_static_type[179].dictionary.key['reason']", 63],
         [
           "reconfigure",
           "interpreter.imports.modules.value['_io'].module.md_dict.value['TextIOWrapper'].type.dictionary.key['reconfigure']",
@@ -16455,26 +16083,14 @@
           "interpreter.sysdict.value['monitoring'].module.md_dict.key['restart_events']",
           63
         ],
-        [
-          "returns",
-          "interpreter.ast.returns",
-          63
-        ],
+        ["returns", "interpreter.ast.returns", 63],
         [
           "rotate",
           "interpreter.imports.modules.value['_collections'].module.md_dict.value['deque'].type.dictionary.key['rotate']",
           63
         ],
-        [
-          "rounds",
-          "immutable_static_type[115].dictionary.key['rounds']",
-          63
-        ],
-        [
-          "run",
-          "immutable_static_type[17].dictionary.key['run']",
-          63
-        ],
+        ["rounds", "immutable_static_type[115].dictionary.key['rounds']", 63],
+        ["run", "immutable_static_type[17].dictionary.key['run']", 63],
         [
           "sched_get_priority_max",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['sched_get_priority_max']",
@@ -16530,11 +16146,7 @@
           "immutable_static_type[183].dictionary.key['seed_bits']",
           63
         ],
-        [
-          "serial",
-          "immutable_static_type[184].dictionary.key['serial']",
-          63
-        ],
+        ["serial", "immutable_static_type[184].dictionary.key['serial']", 63],
         [
           "set_asyncgen_hooks",
           "interpreter.sysdict.key['set_asyncgen_hooks']",
@@ -16575,11 +16187,7 @@
           "interpreter.imports.modules.value['_signal'].module.md_dict.key['set_wakeup_fd']",
           63
         ],
-        [
-          "setdlopenflags",
-          "interpreter.sysdict.key['setdlopenflags']",
-          63
-        ],
+        ["setdlopenflags", "interpreter.sysdict.key['setdlopenflags']", 63],
         [
           "setegid",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['setegid']",
@@ -16625,11 +16233,7 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.key['setpriority']",
           63
         ],
-        [
-          "setprofile",
-          "interpreter.sysdict.key['setprofile']",
-          63
-        ],
+        ["setprofile", "interpreter.sysdict.key['setprofile']", 63],
         [
           "setrecursionlimit",
           "interpreter.sysdict.key['setrecursionlimit']",
@@ -16660,11 +16264,7 @@
           "interpreter.sysdict.key['setswitchinterval']",
           63
         ],
-        [
-          "settrace",
-          "interpreter.sysdict.key['settrace']",
-          63
-        ],
+        ["settrace", "interpreter.sysdict.key['settrace']", 63],
         [
           "setuid",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['setuid']",
@@ -16735,11 +16335,7 @@
           "interpreter.imports.modules.value['_signal'].module.md_dict.key['sigwaitinfo']",
           63
         ],
-        [
-          "simple",
-          "interpreter.ast.simple",
-          63
-        ],
+        ["simple", "interpreter.ast.simple", 63],
         [
           "sin",
           "interpreter.imports.modules.value['math'].module.md_dict.key['sin']",
@@ -16830,11 +16426,7 @@
           "immutable_static_type[131].dictionary.key['strerror']",
           63
         ],
-        [
-          "strides",
-          "immutable_static_type[47].dictionary.key['strides']",
-          63
-        ],
+        ["strides", "immutable_static_type[47].dictionary.key['strides']", 63],
         [
           "strptime",
           "interpreter.imports.modules.value['time'].module.md_dict.key['strptime']",
@@ -16855,11 +16447,7 @@
           "immutable_static_type[117].dictionary.key['subgroup']",
           63
         ],
-        [
-          "subject",
-          "interpreter.ast.subject",
-          63
-        ],
+        ["subject", "interpreter.ast.subject", 63],
         [
           "suboffsets",
           "immutable_static_type[47].dictionary.key['suboffsets']",
@@ -16870,11 +16458,7 @@
           "interpreter.imports.modules.value['math'].module.md_dict.key['sumprod']",
           7
         ],
-        [
-          "symbols",
-          "immutable_static_type[58].dictionary.key['symbols']",
-          63
-        ],
+        ["symbols", "immutable_static_type[58].dictionary.key['symbols']", 63],
         [
           "symmetric_difference",
           "immutable_static_type[35].dictionary.key['symmetric_difference']",
@@ -16910,11 +16494,7 @@
           "interpreter.imports.modules.value['math'].module.md_dict.key['tanh']",
           7
         ],
-        [
-          "targets",
-          "interpreter.ast.targets",
-          63
-        ],
+        ["targets", "interpreter.ast.targets", 63],
         [
           "tcgetpgrp",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['tcgetpgrp']",
@@ -17005,11 +16585,7 @@
           "interpreter.imports.modules.value['time'].module.md_dict.value['struct_time'].type.dictionary.key['tm_zone']",
           63
         ],
-        [
-          "tobytes",
-          "immutable_static_type[47].dictionary.key['tobytes']",
-          63
-        ],
+        ["tobytes", "immutable_static_type[47].dictionary.key['tobytes']", 63],
         [
           "toreadonly",
           "immutable_static_type[47].dictionary.key['toreadonly']",
@@ -17025,16 +16601,8 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.key['ttyname']",
           63
         ],
-        [
-          "type_comment",
-          "interpreter.ast.type_comment",
-          63
-        ],
-        [
-          "type_ignores",
-          "interpreter.ast.type_ignores",
-          63
-        ],
+        ["type_comment", "interpreter.ast.type_comment", 63],
+        ["type_ignores", "interpreter.ast.type_ignores", 63],
         [
           "tzset",
           "interpreter.imports.modules.value['time'].module.md_dict.key['tzset']",
@@ -17170,16 +16738,8 @@
           "interpreter.imports.modules.value['_signal'].module.md_dict.key['valid_signals']",
           63
         ],
-        [
-          "var",
-          "immutable_static_type[15].dictionary.key['var']",
-          63
-        ],
-        [
-          "vararg",
-          "interpreter.ast.vararg",
-          63
-        ],
+        ["var", "immutable_static_type[15].dictionary.key['var']", 63],
+        ["vararg", "interpreter.ast.vararg", 63],
         [
           "varnames",
           "immutable_static_type[58].dictionary.key['varnames']",
@@ -17234,10 +16794,7 @@
           "ReprEnum",
           "StrEnum"
         ],
-        "simple_enum_classes": [
-          "EnumCheck",
-          "RegexFlag"
-        ],
+        "simple_enum_classes": ["EnumCheck", "RegexFlag"],
         "temporary_key_format": "_%s__in_progress"
       },
       "executable_sha256": "da775e5e09a4cfdd488a6d942c90b564dbbc3776ec8bf24f4a8ad0b4128fa3fa",
@@ -17562,11 +17119,7 @@
           "immutable_static_type[66].dictionary.key['__self_class__']",
           4032
         ],
-        [
-          "__stdin__",
-          "interpreter.sysdict.key['__stdin__']",
-          4032
-        ],
+        ["__stdin__", "interpreter.sysdict.key['__stdin__']", 4032],
         [
           "__thisclass__",
           "immutable_static_type[66].dictionary.key['__thisclass__']",
@@ -17612,16 +17165,8 @@
           "interpreter.imports.modules.value['_thread'].module.md_dict.value['lock'].type.dictionary.key['_at_fork_reinit']",
           4032
         ],
-        [
-          "_attributes",
-          "interpreter.ast._attributes",
-          4032
-        ],
-        [
-          "_baserepl",
-          "interpreter.sysdict.key['_baserepl']",
-          4032
-        ],
+        ["_attributes", "interpreter.ast._attributes", 4032],
+        ["_baserepl", "interpreter.sysdict.key['_baserepl']", 4032],
         [
           "_checkClosed",
           "interpreter.imports.modules.value['_io'].module.md_dict.value['_IOBase'].type.dictionary.key['_checkClosed']",
@@ -17672,11 +17217,7 @@
           "interpreter.sysdict.key['_current_exceptions']",
           4032
         ],
-        [
-          "_current_frames",
-          "interpreter.sysdict.key['_current_frames']",
-          4032
-        ],
+        ["_current_frames", "interpreter.sysdict.key['_current_frames']", 4032],
         [
           "_debugmallocstats",
           "interpreter.sysdict.key['_debugmallocstats']",
@@ -17707,21 +17248,13 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.key['_inputhook']",
           4032
         ],
-        [
-          "_is_gil_enabled",
-          "interpreter.sysdict.key['_is_gil_enabled']",
-          4032
-        ],
+        ["_is_gil_enabled", "interpreter.sysdict.key['_is_gil_enabled']", 4032],
         [
           "_is_inputhook_installed",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['_is_inputhook_installed']",
           4032
         ],
-        [
-          "_is_interned",
-          "interpreter.sysdict.key['_is_interned']",
-          4032
-        ],
+        ["_is_interned", "interpreter.sysdict.key['_is_interned']", 4032],
         [
           "_is_main_interpreter",
           "interpreter.imports.modules.value['_thread'].module.md_dict.key['_is_main_interpreter']",
@@ -17792,16 +17325,8 @@
           "immutable_static_type[118].dictionary.key['add_note']",
           4032
         ],
-        [
-          "addaudithook",
-          "interpreter.sysdict.key['addaudithook']",
-          4032
-        ],
-        [
-          "addop",
-          "immutable_static_type[90].dictionary.key['addop']",
-          4032
-        ],
+        ["addaudithook", "interpreter.sysdict.key['addaudithook']", 4032],
+        ["addop", "immutable_static_type[90].dictionary.key['addop']", 4032],
         [
           "adler32",
           "interpreter.imports.modules.value['zlib'].module.md_dict.key['adler32']",
@@ -17812,11 +17337,7 @@
           "immutable_static_type[2].dictionary.key['ag_await']",
           4032
         ],
-        [
-          "ag_code",
-          "immutable_static_type[2].dictionary.key['ag_code']",
-          4032
-        ],
+        ["ag_code", "immutable_static_type[2].dictionary.key['ag_code']", 4032],
         [
           "ag_frame",
           "immutable_static_type[2].dictionary.key['ag_frame']",
@@ -17832,11 +17353,7 @@
           "immutable_static_type[2].dictionary.key['ag_suspended']",
           4032
         ],
-        [
-          "aiter",
-          "interpreter.builtins.key['aiter']",
-          4032
-        ],
+        ["aiter", "interpreter.builtins.key['aiter']", 4032],
         [
           "alarm",
           "interpreter.imports.modules.value['_signal'].module.md_dict.key['alarm']",
@@ -17882,26 +17399,14 @@
           "immutable_static_type[113].dictionary.key['bits_per_digit']",
           4032
         ],
-        [
-          "breakpoint",
-          "interpreter.builtins.key['breakpoint']",
-          4032
-        ],
-        [
-          "breakpointhook",
-          "interpreter.sysdict.key['breakpointhook']",
-          4032
-        ],
+        ["breakpoint", "interpreter.builtins.key['breakpoint']", 4032],
+        ["breakpointhook", "interpreter.sysdict.key['breakpointhook']", 4032],
         [
           "c_contiguous",
           "immutable_static_type[48].dictionary.key['c_contiguous']",
           4032
         ],
-        [
-          "call_tracing",
-          "interpreter.sysdict.key['call_tracing']",
-          4032
-        ],
+        ["call_tracing", "interpreter.sysdict.key['call_tracing']", 4032],
         [
           "cell_contents",
           "immutable_static_type[10].dictionary.key['cell_contents']",
@@ -18022,11 +17527,7 @@
           "interpreter.imports.modules.value['time'].module.md_dict.key['ctime']",
           4032
         ],
-        [
-          "cutoff",
-          "immutable_static_type[189].dictionary.key['cutoff']",
-          4032
-        ],
+        ["cutoff", "immutable_static_type[189].dictionary.key['cutoff']", 4032],
         [
           "daemon_threads_allowed",
           "interpreter.imports.modules.value['_thread'].module.md_dict.key['daemon_threads_allowed']",
@@ -18067,11 +17568,7 @@
           "immutable_static_type[45].dictionary.key['denominator']",
           4032
         ],
-        [
-          "derive",
-          "immutable_static_type[119].dictionary.key['derive']",
-          4032
-        ],
+        ["derive", "immutable_static_type[119].dictionary.key['derive']", 4032],
         [
           "detach",
           "interpreter.imports.modules.value['_io'].module.md_dict.value['_TextIOBase'].type.dictionary.key['detach']",
@@ -18082,16 +17579,8 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.key['device_encoding']",
           4032
         ],
-        [
-          "dig",
-          "immutable_static_type[117].dictionary.key['dig']",
-          4032
-        ],
-        [
-          "divmod",
-          "interpreter.builtins.key['divmod']",
-          4032
-        ],
+        ["dig", "immutable_static_type[117].dictionary.key['dig']", 4032],
+        ["divmod", "interpreter.builtins.key['divmod']", 4032],
         [
           "dup",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['dup']",
@@ -18267,11 +17756,7 @@
           "interpreter.sysdict.value['monitoring'].module.md_dict.key['free_tool_id']",
           4032
         ],
-        [
-          "fromhex",
-          "immutable_static_type[4].dictionary.key['fromhex']",
-          4032
-        ],
+        ["fromhex", "immutable_static_type[4].dictionary.key['fromhex']", 4032],
         [
           "fsync",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['fsync']",
@@ -18357,11 +17842,7 @@
           "interpreter.sysdict.key['getdefaultencoding']",
           3584
         ],
-        [
-          "getdlopenflags",
-          "interpreter.sysdict.key['getdlopenflags']",
-          4032
-        ],
+        ["getdlopenflags", "interpreter.sysdict.key['getdlopenflags']", 4032],
         [
           "getgrall",
           "interpreter.imports.modules.value['grp'].module.md_dict.key['getgrall']",
@@ -18417,11 +17898,7 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.key['getpriority']",
           4032
         ],
-        [
-          "getprofile",
-          "interpreter.sysdict.key['getprofile']",
-          4032
-        ],
+        ["getprofile", "interpreter.sysdict.key['getprofile']", 4032],
         [
           "getpwall",
           "interpreter.imports.modules.value['pwd'].module.md_dict.key['getpwall']",
@@ -18437,11 +17914,7 @@
           "interpreter.sysdict.key['getrecursionlimit']",
           3584
         ],
-        [
-          "getrefcount",
-          "interpreter.sysdict.key['getrefcount']",
-          4032
-        ],
+        ["getrefcount", "interpreter.sysdict.key['getrefcount']", 4032],
         [
           "getresgid",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['getresgid']",
@@ -18467,11 +17940,7 @@
           "interpreter.sysdict.key['getswitchinterval']",
           4032
         ],
-        [
-          "gettrace",
-          "interpreter.sysdict.key['gettrace']",
-          4032
-        ],
+        ["gettrace", "interpreter.sysdict.key['gettrace']", 4032],
         [
           "getunicodeinternedsize",
           "interpreter.sysdict.key['getunicodeinternedsize']",
@@ -18492,11 +17961,7 @@
           "interpreter.imports.modules.value['_weakref'].module.md_dict.key['getweakrefs']",
           4032
         ],
-        [
-          "gil",
-          "immutable_static_type[191].dictionary.key['gil']",
-          4032
-        ],
+        ["gil", "immutable_static_type[191].dictionary.key['gil']", 4032],
         [
           "gmtime",
           "interpreter.imports.modules.value['time'].module.md_dict.key['gmtime']",
@@ -18577,11 +18042,7 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.value['DirEntry'].type.dictionary.key['is_file']",
           3584
         ],
-        [
-          "is_finalizing",
-          "interpreter.sysdict.key['is_finalizing']",
-          4032
-        ],
+        ["is_finalizing", "interpreter.sysdict.key['is_finalizing']", 4032],
         [
           "is_integer",
           "immutable_static_type[33].dictionary.key['is_integer']",
@@ -18667,11 +18128,7 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.value['uname_result'].type.dictionary.key['machine']",
           4032
         ],
-        [
-          "major",
-          "immutable_static_type[190].dictionary.key['major']",
-          4032
-        ],
+        ["major", "immutable_static_type[190].dictionary.key['major']", 4032],
         [
           "makedev",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['makedev']",
@@ -18697,11 +18154,7 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.key['memfd_create']",
           4032
         ],
-        [
-          "micro",
-          "immutable_static_type[190].dictionary.key['micro']",
-          4032
-        ],
+        ["micro", "immutable_static_type[190].dictionary.key['micro']", 4032],
         [
           "min_10_exp",
           "immutable_static_type[117].dictionary.key['min_10_exp']",
@@ -18712,11 +18165,7 @@
           "immutable_static_type[117].dictionary.key['min_exp']",
           4032
         ],
-        [
-          "minor",
-          "immutable_static_type[190].dictionary.key['minor']",
-          4032
-        ],
+        ["minor", "immutable_static_type[190].dictionary.key['minor']", 4032],
         [
           "modulus",
           "immutable_static_type[189].dictionary.key['modulus']",
@@ -18732,16 +18181,8 @@
           "interpreter.imports.modules.value['time'].module.md_dict.key['monotonic_ns']",
           4032
         ],
-        [
-          "nan",
-          "immutable_static_type[189].dictionary.key['nan']",
-          4032
-        ],
-        [
-          "ndim",
-          "immutable_static_type[48].dictionary.key['ndim']",
-          4032
-        ],
+        ["nan", "immutable_static_type[189].dictionary.key['nan']", 4032],
+        ["ndim", "immutable_static_type[48].dictionary.key['ndim']", 4032],
         [
           "new_label",
           "immutable_static_type[90].dictionary.key['new_label']",
@@ -18767,11 +18208,7 @@
           "immutable_static_type[45].dictionary.key['numerator']",
           4032
         ],
-        [
-          "oct",
-          "interpreter.builtins.key['oct']",
-          4032
-        ],
+        ["oct", "interpreter.builtins.key['oct']", 4032],
         [
           "old_value",
           "immutable_static_type[15].dictionary.key['old_value']",
@@ -18922,11 +18359,7 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.key['pwritev']",
           4032
         ],
-        [
-          "radix",
-          "immutable_static_type[117].dictionary.key['radix']",
-          4032
-        ],
+        ["radix", "immutable_static_type[117].dictionary.key['radix']", 4032],
         [
           "raise_signal",
           "interpreter.imports.modules.value['_signal'].module.md_dict.key['raise_signal']",
@@ -18952,11 +18385,7 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.key['readv']",
           4032
         ],
-        [
-          "reason",
-          "immutable_static_type[183].dictionary.key['reason']",
-          4032
-        ],
+        ["reason", "immutable_static_type[183].dictionary.key['reason']", 4032],
         [
           "reconfigure",
           "interpreter.imports.modules.value['_io'].module.md_dict.value['TextIOWrapper'].type.dictionary.key['reconfigure']",
@@ -18997,16 +18426,8 @@
           "interpreter.imports.modules.value['_collections'].module.md_dict.value['deque'].type.dictionary.key['rotate']",
           4032
         ],
-        [
-          "rounds",
-          "immutable_static_type[117].dictionary.key['rounds']",
-          4032
-        ],
-        [
-          "run",
-          "immutable_static_type[17].dictionary.key['run']",
-          4032
-        ],
+        ["rounds", "immutable_static_type[117].dictionary.key['rounds']", 4032],
+        ["run", "immutable_static_type[17].dictionary.key['run']", 4032],
         [
           "sched_get_priority_max",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['sched_get_priority_max']",
@@ -19057,11 +18478,7 @@
           "immutable_static_type[189].dictionary.key['seed_bits']",
           4032
         ],
-        [
-          "serial",
-          "immutable_static_type[190].dictionary.key['serial']",
-          4032
-        ],
+        ["serial", "immutable_static_type[190].dictionary.key['serial']", 4032],
         [
           "set_asyncgen_hooks",
           "interpreter.sysdict.key['set_asyncgen_hooks']",
@@ -19102,11 +18519,7 @@
           "interpreter.imports.modules.value['_signal'].module.md_dict.key['set_wakeup_fd']",
           4032
         ],
-        [
-          "setdlopenflags",
-          "interpreter.sysdict.key['setdlopenflags']",
-          4032
-        ],
+        ["setdlopenflags", "interpreter.sysdict.key['setdlopenflags']", 4032],
         [
           "setegid",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['setegid']",
@@ -19152,11 +18565,7 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.key['setpriority']",
           4032
         ],
-        [
-          "setprofile",
-          "interpreter.sysdict.key['setprofile']",
-          4032
-        ],
+        ["setprofile", "interpreter.sysdict.key['setprofile']", 4032],
         [
           "setrecursionlimit",
           "interpreter.sysdict.key['setrecursionlimit']",
@@ -19187,11 +18596,7 @@
           "interpreter.sysdict.key['setswitchinterval']",
           4032
         ],
-        [
-          "settrace",
-          "interpreter.sysdict.key['settrace']",
-          4032
-        ],
+        ["settrace", "interpreter.sysdict.key['settrace']", 4032],
         [
           "setuid",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['setuid']",
@@ -19667,11 +19072,7 @@
           "interpreter.imports.modules.value['_signal'].module.md_dict.key['valid_signals']",
           4032
         ],
-        [
-          "var",
-          "immutable_static_type[15].dictionary.key['var']",
-          4032
-        ],
+        ["var", "immutable_static_type[15].dictionary.key['var']", 4032],
         [
           "varnames",
           "immutable_static_type[59].dictionary.key['varnames']",
@@ -19707,36 +19108,28 @@
       "enum_temporary_key_proof": {
         "classes": [
           {
-            "bases": [
-              "enum.IntEnum"
-            ],
+            "bases": ["enum.IntEnum"],
             "class": "Format",
             "keywords": [],
             "line": 22,
             "source": "Lib/annotationlib.py"
           },
           {
-            "bases": [
-              "enum.IntEnum"
-            ],
+            "bases": ["enum.IntEnum"],
             "class": "CompressionParameter",
             "keywords": [],
             "line": 175,
             "source": "Lib/compression/zstd/__init__.py"
           },
           {
-            "bases": [
-              "enum.IntEnum"
-            ],
+            "bases": ["enum.IntEnum"],
             "class": "DecompressionParameter",
             "keywords": [],
             "line": 209,
             "source": "Lib/compression/zstd/__init__.py"
           },
           {
-            "bases": [
-              "enum.IntEnum"
-            ],
+            "bases": ["enum.IntEnum"],
             "class": "Strategy",
             "keywords": [],
             "line": 222,
@@ -19745,96 +19138,68 @@
           {
             "bases": [],
             "class": "Enum",
-            "keywords": [
-              "metaclass=EnumType"
-            ],
+            "keywords": ["metaclass=EnumType"],
             "line": 1106,
             "source": "Lib/enum.py"
           },
           {
-            "bases": [
-              "Enum"
-            ],
+            "bases": ["Enum"],
             "class": "ReprEnum",
             "keywords": [],
             "line": 1330,
             "source": "Lib/enum.py"
           },
           {
-            "bases": [
-              "int",
-              "ReprEnum"
-            ],
+            "bases": ["int", "ReprEnum"],
             "class": "IntEnum",
             "keywords": [],
             "line": 1336,
             "source": "Lib/enum.py"
           },
           {
-            "bases": [
-              "str",
-              "ReprEnum"
-            ],
+            "bases": ["str", "ReprEnum"],
             "class": "StrEnum",
             "keywords": [],
             "line": 1342,
             "source": "Lib/enum.py"
           },
           {
-            "bases": [
-              "StrEnum"
-            ],
+            "bases": ["StrEnum"],
             "class": "FlagBoundary",
             "keywords": [],
             "line": 1385,
             "source": "Lib/enum.py"
           },
           {
-            "bases": [
-              "Enum"
-            ],
+            "bases": ["Enum"],
             "class": "Flag",
-            "keywords": [
-              "boundary=STRICT"
-            ],
+            "keywords": ["boundary=STRICT"],
             "line": 1400,
             "source": "Lib/enum.py"
           },
           {
-            "bases": [
-              "int",
-              "ReprEnum",
-              "Flag"
-            ],
+            "bases": ["int", "ReprEnum", "Flag"],
             "class": "IntFlag",
-            "keywords": [
-              "boundary=KEEP"
-            ],
+            "keywords": ["boundary=KEEP"],
             "line": 1632,
             "source": "Lib/enum.py"
           },
           {
-            "bases": [
-              "enum.IntEnum"
-            ],
+            "bases": ["enum.IntEnum"],
             "class": "_ParameterKind",
             "keywords": [],
             "line": 2624,
             "source": "Lib/inspect.py"
           },
           {
-            "bases": [
-              "enum.IntFlag"
-            ],
+            "bases": ["enum.IntFlag"],
             "class": "BufferFlags",
             "keywords": [],
             "line": 3328,
             "source": "Lib/inspect.py"
           },
           {
-            "bases": [
-              "enum.Enum"
-            ],
+            "bases": ["enum.Enum"],
             "class": "PycInvalidationMode",
             "keywords": [],
             "line": 66,
@@ -19842,12 +19207,8 @@
           }
         ],
         "excluded_simple_enum_classes": {
-          "Lib/enum.py": [
-            "EnumCheck"
-          ],
-          "Lib/re/__init__.py": [
-            "RegexFlag"
-          ]
+          "Lib/enum.py": ["EnumCheck"],
+          "Lib/re/__init__.py": ["RegexFlag"]
         },
         "format": "_%s__in_progress",
         "reason": "EnumType.__new__ creates and deletes the temporary attribute; _simple=True returns before that block. Unowned keys can survive in caches, so the bounded family remains unknown.",
@@ -21029,11 +20390,7 @@
           "immutable_static_type[66].dictionary.key['__self_class__']",
           258048
         ],
-        [
-          "__stdin__",
-          "interpreter.sysdict.key['__stdin__']",
-          258048
-        ],
+        ["__stdin__", "interpreter.sysdict.key['__stdin__']", 258048],
         [
           "__unpacked__",
           "immutable_static_type[74].dictionary.key['__unpacked__']",
@@ -21069,11 +20426,7 @@
           "interpreter.imports.modules.value['_thread'].module.md_dict.value['lock'].type.dictionary.key['_at_fork_reinit']",
           258048
         ],
-        [
-          "_baserepl",
-          "interpreter.sysdict.key['_baserepl']",
-          258048
-        ],
+        ["_baserepl", "interpreter.sysdict.key['_baserepl']", 258048],
         [
           "_checkClosed",
           "interpreter.imports.modules.value['_io'].module.md_dict.value['_IOBase'].type.dictionary.key['_checkClosed']",
@@ -21174,21 +20527,13 @@
           "interpreter.sysdict.key['_is_gil_enabled']",
           258048
         ],
-        [
-          "_is_immortal",
-          "interpreter.sysdict.key['_is_immortal']",
-          258048
-        ],
+        ["_is_immortal", "interpreter.sysdict.key['_is_immortal']", 258048],
         [
           "_is_inputhook_installed",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['_is_inputhook_installed']",
           258048
         ],
-        [
-          "_is_interned",
-          "interpreter.sysdict.key['_is_interned']",
-          258048
-        ],
+        ["_is_interned", "interpreter.sysdict.key['_is_interned']", 258048],
         [
           "_is_main_interpreter",
           "interpreter.imports.modules.value['_thread'].module.md_dict.key['_is_main_interpreter']",
@@ -21264,16 +20609,8 @@
           "immutable_static_type[122].dictionary.key['add_note']",
           258048
         ],
-        [
-          "addaudithook",
-          "interpreter.sysdict.key['addaudithook']",
-          258048
-        ],
-        [
-          "addop",
-          "immutable_static_type[90].dictionary.key['addop']",
-          258048
-        ],
+        ["addaudithook", "interpreter.sysdict.key['addaudithook']", 258048],
+        ["addop", "immutable_static_type[90].dictionary.key['addop']", 258048],
         [
           "adler32",
           "interpreter.imports.modules.value['zlib'].module.md_dict.key['adler32']",
@@ -21284,11 +20621,7 @@
           "immutable_static_type[2].dictionary.key['ag_await']",
           258048
         ],
-        [
-          "aiter",
-          "interpreter.builtins.key['aiter']",
-          258048
-        ],
+        ["aiter", "interpreter.builtins.key['aiter']", 258048],
         [
           "alarm",
           "interpreter.imports.modules.value['_signal'].module.md_dict.key['alarm']",
@@ -21354,26 +20687,14 @@
           "immutable_static_type[117].dictionary.key['bits_per_digit']",
           258048
         ],
-        [
-          "breakpoint",
-          "interpreter.builtins.key['breakpoint']",
-          258048
-        ],
-        [
-          "breakpointhook",
-          "interpreter.sysdict.key['breakpointhook']",
-          258048
-        ],
+        ["breakpoint", "interpreter.builtins.key['breakpoint']", 258048],
+        ["breakpointhook", "interpreter.sysdict.key['breakpointhook']", 258048],
         [
           "c_contiguous",
           "immutable_static_type[48].dictionary.key['c_contiguous']",
           258048
         ],
-        [
-          "call_tracing",
-          "interpreter.sysdict.key['call_tracing']",
-          258048
-        ],
+        ["call_tracing", "interpreter.sysdict.key['call_tracing']", 258048],
         [
           "characters_written",
           "immutable_static_type[137].dictionary.key['characters_written']",
@@ -21499,11 +20820,7 @@
           "interpreter.imports.modules.value['_thread'].module.md_dict.key['daemon_threads_allowed']",
           258048
         ],
-        [
-          "days",
-          "immutable_extension_type[3].dictionary.key['days']",
-          258048
-        ],
+        ["days", "immutable_extension_type[3].dictionary.key['days']", 258048],
         [
           "dcgettext",
           "interpreter.imports.modules.value['_locale'].module.md_dict.key['dcgettext']",
@@ -21549,11 +20866,7 @@
           "interpreter.imports.modules.value['_zstd'].module.md_dict.value['ZstdDict'].type.dictionary.key['dict_id']",
           258048
         ],
-        [
-          "dig",
-          "immutable_static_type[121].dictionary.key['dig']",
-          258048
-        ],
+        ["dig", "immutable_static_type[121].dictionary.key['dig']", 258048],
         [
           "dup",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['dup']",
@@ -21869,11 +21182,7 @@
           "interpreter.sysdict.key['getdefaultencoding']",
           229376
         ],
-        [
-          "getdlopenflags",
-          "interpreter.sysdict.key['getdlopenflags']",
-          258048
-        ],
+        ["getdlopenflags", "interpreter.sysdict.key['getdlopenflags']", 258048],
         [
           "getgrall",
           "interpreter.imports.modules.value['grp'].module.md_dict.key['getgrall']",
@@ -21929,21 +21238,13 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.key['getpriority']",
           258048
         ],
-        [
-          "getprofile",
-          "interpreter.sysdict.key['getprofile']",
-          258048
-        ],
+        ["getprofile", "interpreter.sysdict.key['getprofile']", 258048],
         [
           "getpwall",
           "interpreter.imports.modules.value['pwd'].module.md_dict.key['getpwall']",
           28672
         ],
-        [
-          "getrefcount",
-          "interpreter.sysdict.key['getrefcount']",
-          258048
-        ],
+        ["getrefcount", "interpreter.sysdict.key['getrefcount']", 258048],
         [
           "getresgid",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['getresgid']",
@@ -21969,21 +21270,13 @@
           "interpreter.sysdict.key['getswitchinterval']",
           258048
         ],
-        [
-          "gettrace",
-          "interpreter.sysdict.key['gettrace']",
-          258048
-        ],
+        ["gettrace", "interpreter.sysdict.key['gettrace']", 258048],
         [
           "getunicodeinternedsize",
           "interpreter.sysdict.key['getunicodeinternedsize']",
           258048
         ],
-        [
-          "gil",
-          "immutable_static_type[195].dictionary.key['gil']",
-          258048
-        ],
+        ["gil", "immutable_static_type[195].dictionary.key['gil']", 258048],
         [
           "gmtime",
           "interpreter.imports.modules.value['time'].module.md_dict.key['gmtime']",
@@ -22074,11 +21367,7 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.value['DirEntry'].type.dictionary.key['is_file']",
           229376
         ],
-        [
-          "is_finalizing",
-          "interpreter.sysdict.key['is_finalizing']",
-          258048
-        ],
+        ["is_finalizing", "interpreter.sysdict.key['is_finalizing']", 258048],
         [
           "is_integer",
           "immutable_static_type[33].dictionary.key['is_integer']",
@@ -22189,11 +21478,7 @@
           "immutable_static_type[121].dictionary.key['max_exp']",
           258048
         ],
-        [
-          "micro",
-          "immutable_static_type[194].dictionary.key['micro']",
-          258048
-        ],
+        ["micro", "immutable_static_type[194].dictionary.key['micro']", 258048],
         [
           "microseconds",
           "immutable_extension_type[3].dictionary.key['microseconds']",
@@ -22224,16 +21509,8 @@
           "interpreter.imports.modules.value['time'].module.md_dict.key['monotonic_ns']",
           258048
         ],
-        [
-          "nan",
-          "immutable_static_type[193].dictionary.key['nan']",
-          258048
-        ],
-        [
-          "ndim",
-          "immutable_static_type[48].dictionary.key['ndim']",
-          258048
-        ],
+        ["nan", "immutable_static_type[193].dictionary.key['nan']", 258048],
+        ["ndim", "immutable_static_type[48].dictionary.key['ndim']", 258048],
         [
           "new_label",
           "immutable_static_type[90].dictionary.key['new_label']",
@@ -22254,21 +21531,13 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.value['uname_result'].type.dictionary.key['nodename']",
           258048
         ],
-        [
-          "now",
-          "immutable_extension_type[1].dictionary.key['now']",
-          258048
-        ],
+        ["now", "immutable_extension_type[1].dictionary.key['now']", 258048],
         [
           "numerator",
           "immutable_static_type[45].dictionary.key['numerator']",
           258048
         ],
-        [
-          "oct",
-          "interpreter.builtins.key['oct']",
-          258048
-        ],
+        ["oct", "interpreter.builtins.key['oct']", 258048],
         [
           "openpty",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['openpty']",
@@ -22399,11 +21668,7 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.key['pwritev']",
           258048
         ],
-        [
-          "radix",
-          "immutable_static_type[121].dictionary.key['radix']",
-          258048
-        ],
+        ["radix", "immutable_static_type[121].dictionary.key['radix']", 258048],
         [
           "raise_signal",
           "interpreter.imports.modules.value['_signal'].module.md_dict.key['raise_signal']",
@@ -22459,21 +21724,13 @@
           "immutable_static_type[194].dictionary.key['releaselevel']",
           258048
         ],
-        [
-          "remote_exec",
-          "interpreter.sysdict.key['remote_exec']",
-          258048
-        ],
+        ["remote_exec", "interpreter.sysdict.key['remote_exec']", 258048],
         [
           "removexattr",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['removexattr']",
           258048
         ],
-        [
-          "resize",
-          "immutable_static_type[4].dictionary.key['resize']",
-          258048
-        ],
+        ["resize", "immutable_static_type[4].dictionary.key['resize']", 258048],
         [
           "restart_events",
           "interpreter.sysdict.value['monitoring'].module.md_dict.key['restart_events']",
@@ -22489,11 +21746,7 @@
           "immutable_static_type[121].dictionary.key['rounds']",
           258048
         ],
-        [
-          "run",
-          "immutable_static_type[17].dictionary.key['run']",
-          258048
-        ],
+        ["run", "immutable_static_type[17].dictionary.key['run']", 258048],
         [
           "sched_get_priority_max",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['sched_get_priority_max']",
@@ -22604,11 +21857,7 @@
           "interpreter.imports.modules.value['_signal'].module.md_dict.key['set_wakeup_fd']",
           258048
         ],
-        [
-          "setdlopenflags",
-          "interpreter.sysdict.key['setdlopenflags']",
-          258048
-        ],
+        ["setdlopenflags", "interpreter.sysdict.key['setdlopenflags']", 258048],
         [
           "setegid",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['setegid']",
@@ -22654,11 +21903,7 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.key['setpriority']",
           258048
         ],
-        [
-          "setprofile",
-          "interpreter.sysdict.key['setprofile']",
-          258048
-        ],
+        ["setprofile", "interpreter.sysdict.key['setprofile']", 258048],
         [
           "setrecursionlimit",
           "interpreter.sysdict.key['setrecursionlimit']",
@@ -22689,11 +21934,7 @@
           "interpreter.sysdict.key['setswitchinterval']",
           258048
         ],
-        [
-          "settrace",
-          "interpreter.sysdict.key['settrace']",
-          258048
-        ],
+        ["settrace", "interpreter.sysdict.key['settrace']", 258048],
         [
           "setuid",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['setuid']",
@@ -23269,10 +22510,7 @@
           "ReprEnum",
           "StrEnum"
         ],
-        "simple_enum_classes": [
-          "EnumCheck",
-          "RegexFlag"
-        ],
+        "simple_enum_classes": ["EnumCheck", "RegexFlag"],
         "temporary_key_format": "_%s__in_progress"
       },
       "executable_sha256": "83a76a0cfc4413c3afd73d24dba58561a1ddbe00951c2f3ed20254a7cd24ff47",
@@ -23600,11 +22838,7 @@
           "immutable_static_type[69].dictionary.key['__self_class__']",
           16515072
         ],
-        [
-          "__stdin__",
-          "interpreter.sysdict.key['__stdin__']",
-          16515072
-        ],
+        ["__stdin__", "interpreter.sysdict.key['__stdin__']", 16515072],
         [
           "__unpacked__",
           "immutable_static_type[77].dictionary.key['__unpacked__']",
@@ -23645,16 +22879,8 @@
           "interpreter.imports.modules.value['_thread'].module.md_dict.value['lock'].type.dictionary.key['_at_fork_reinit']",
           16515072
         ],
-        [
-          "_attributes",
-          "interpreter.ast._attributes",
-          16515072
-        ],
-        [
-          "_baserepl",
-          "interpreter.sysdict.key['_baserepl']",
-          16515072
-        ],
+        ["_attributes", "interpreter.ast._attributes", 16515072],
+        ["_baserepl", "interpreter.sysdict.key['_baserepl']", 16515072],
         [
           "_checkClosed",
           "interpreter.imports.modules.value['_io'].module.md_dict.value['_IOBase'].type.dictionary.key['_checkClosed']",
@@ -23760,21 +22986,13 @@
           "interpreter.sysdict.key['_is_gil_enabled']",
           16515072
         ],
-        [
-          "_is_immortal",
-          "interpreter.sysdict.key['_is_immortal']",
-          16515072
-        ],
+        ["_is_immortal", "interpreter.sysdict.key['_is_immortal']", 16515072],
         [
           "_is_inputhook_installed",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['_is_inputhook_installed']",
           16515072
         ],
-        [
-          "_is_interned",
-          "interpreter.sysdict.key['_is_interned']",
-          16515072
-        ],
+        ["_is_interned", "interpreter.sysdict.key['_is_interned']", 16515072],
         [
           "_is_main_interpreter",
           "interpreter.imports.modules.value['_thread'].module.md_dict.key['_is_main_interpreter']",
@@ -23850,11 +23068,7 @@
           "immutable_static_type[124].dictionary.key['add_note']",
           16515072
         ],
-        [
-          "addaudithook",
-          "interpreter.sysdict.key['addaudithook']",
-          16515072
-        ],
+        ["addaudithook", "interpreter.sysdict.key['addaudithook']", 16515072],
         [
           "addop",
           "immutable_static_type[93].dictionary.key['addop']",
@@ -23900,11 +23114,7 @@
           "immutable_static_type[4].dictionary.key['ag_suspended']",
           16515072
         ],
-        [
-          "aiter",
-          "interpreter.builtins.key['aiter']",
-          16515072
-        ],
+        ["aiter", "interpreter.builtins.key['aiter']", 16515072],
         [
           "alarm",
           "interpreter.imports.modules.value['_signal'].module.md_dict.key['alarm']",
@@ -23955,11 +23165,7 @@
           "immutable_static_type[119].dictionary.key['bits_per_digit']",
           16515072
         ],
-        [
-          "breakpoint",
-          "interpreter.builtins.key['breakpoint']",
-          16515072
-        ],
+        ["breakpoint", "interpreter.builtins.key['breakpoint']", 16515072],
         [
           "breakpointhook",
           "interpreter.sysdict.key['breakpointhook']",
@@ -23970,11 +23176,7 @@
           "immutable_static_type[51].dictionary.key['c_contiguous']",
           16515072
         ],
-        [
-          "call_tracing",
-          "interpreter.sysdict.key['call_tracing']",
-          16515072
-        ],
+        ["call_tracing", "interpreter.sysdict.key['call_tracing']", 16515072],
         [
           "cell_contents",
           "immutable_static_type[11].dictionary.key['cell_contents']",
@@ -24160,11 +23362,7 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.key['device_encoding']",
           16515072
         ],
-        [
-          "dig",
-          "immutable_static_type[123].dictionary.key['dig']",
-          16515072
-        ],
+        ["dig", "immutable_static_type[123].dictionary.key['dig']", 16515072],
         [
           "dup",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['dup']",
@@ -24550,11 +23748,7 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.key['getpriority']",
           16515072
         ],
-        [
-          "getprofile",
-          "interpreter.sysdict.key['getprofile']",
-          16515072
-        ],
+        ["getprofile", "interpreter.sysdict.key['getprofile']", 16515072],
         [
           "getpwall",
           "interpreter.imports.modules.value['pwd'].module.md_dict.key['getpwall']",
@@ -24570,11 +23764,7 @@
           "interpreter.sysdict.key['getrecursionlimit']",
           14680064
         ],
-        [
-          "getrefcount",
-          "interpreter.sysdict.key['getrefcount']",
-          16515072
-        ],
+        ["getrefcount", "interpreter.sysdict.key['getrefcount']", 16515072],
         [
           "getresgid",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['getresgid']",
@@ -24600,11 +23790,7 @@
           "interpreter.sysdict.key['getswitchinterval']",
           16515072
         ],
-        [
-          "gettrace",
-          "interpreter.sysdict.key['gettrace']",
-          16515072
-        ],
+        ["gettrace", "interpreter.sysdict.key['gettrace']", 16515072],
         [
           "getunicodeinternedsize",
           "interpreter.sysdict.key['getunicodeinternedsize']",
@@ -24625,11 +23811,7 @@
           "interpreter.imports.modules.value['_weakref'].module.md_dict.key['getweakrefs']",
           16515072
         ],
-        [
-          "gil",
-          "immutable_static_type[198].dictionary.key['gil']",
-          16515072
-        ],
+        ["gil", "immutable_static_type[198].dictionary.key['gil']", 16515072],
         [
           "gmtime",
           "interpreter.imports.modules.value['time'].module.md_dict.key['gmtime']",
@@ -24720,11 +23902,7 @@
           "interpreter.sysdict.value['_jit'].module.md_dict.key['is_enabled']",
           16515072
         ],
-        [
-          "is_finalizing",
-          "interpreter.sysdict.key['is_finalizing']",
-          16515072
-        ],
+        ["is_finalizing", "interpreter.sysdict.key['is_finalizing']", 16515072],
         [
           "is_integer",
           "immutable_static_type[34].dictionary.key['is_integer']",
@@ -24885,16 +24063,8 @@
           "interpreter.imports.modules.value['time'].module.md_dict.key['monotonic_ns']",
           16515072
         ],
-        [
-          "nan",
-          "immutable_static_type[196].dictionary.key['nan']",
-          16515072
-        ],
-        [
-          "ndim",
-          "immutable_static_type[51].dictionary.key['ndim']",
-          16515072
-        ],
+        ["nan", "immutable_static_type[196].dictionary.key['nan']", 16515072],
+        ["ndim", "immutable_static_type[51].dictionary.key['ndim']", 16515072],
         [
           "new_label",
           "immutable_static_type[93].dictionary.key['new_label']",
@@ -24915,21 +24085,13 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.value['uname_result'].type.dictionary.key['nodename']",
           16515072
         ],
-        [
-          "now",
-          "immutable_extension_type[1].dictionary.key['now']",
-          16515072
-        ],
+        ["now", "immutable_extension_type[1].dictionary.key['now']", 16515072],
         [
           "numerator",
           "immutable_static_type[48].dictionary.key['numerator']",
           16515072
         ],
-        [
-          "oct",
-          "interpreter.builtins.key['oct']",
-          16515072
-        ],
+        ["oct", "interpreter.builtins.key['oct']", 16515072],
         [
           "old_value",
           "immutable_static_type[16].dictionary.key['old_value']",
@@ -25135,11 +24297,7 @@
           "immutable_static_type[197].dictionary.key['releaselevel']",
           16515072
         ],
-        [
-          "remote_exec",
-          "interpreter.sysdict.key['remote_exec']",
-          16515072
-        ],
+        ["remote_exec", "interpreter.sysdict.key['remote_exec']", 16515072],
         [
           "removexattr",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['removexattr']",
@@ -25165,11 +24323,7 @@
           "immutable_static_type[123].dictionary.key['rounds']",
           16515072
         ],
-        [
-          "run",
-          "immutable_static_type[18].dictionary.key['run']",
-          16515072
-        ],
+        ["run", "immutable_static_type[18].dictionary.key['run']", 16515072],
         [
           "sched_get_priority_max",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['sched_get_priority_max']",
@@ -25330,11 +24484,7 @@
           "interpreter.imports.modules.value['posix'].module.md_dict.key['setpriority']",
           16515072
         ],
-        [
-          "setprofile",
-          "interpreter.sysdict.key['setprofile']",
-          16515072
-        ],
+        ["setprofile", "interpreter.sysdict.key['setprofile']", 16515072],
         [
           "setrecursionlimit",
           "interpreter.sysdict.key['setrecursionlimit']",
@@ -25365,11 +24515,7 @@
           "interpreter.sysdict.key['setswitchinterval']",
           16515072
         ],
-        [
-          "settrace",
-          "interpreter.sysdict.key['settrace']",
-          16515072
-        ],
+        ["settrace", "interpreter.sysdict.key['settrace']", 16515072],
         [
           "setuid",
           "interpreter.imports.modules.value['posix'].module.md_dict.key['setuid']",
@@ -26015,11 +25161,7 @@
           "interpreter.imports.modules.value['_signal'].module.md_dict.key['valid_signals']",
           16515072
         ],
-        [
-          "var",
-          "immutable_static_type[16].dictionary.key['var']",
-          16515072
-        ],
+        ["var", "immutable_static_type[16].dictionary.key['var']", 16515072],
         [
           "varnames",
           "immutable_static_type[62].dictionary.key['varnames']",
