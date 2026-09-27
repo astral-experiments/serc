@@ -23,6 +23,27 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn legacy_coroutine_conditional_work_keeps_returns_before_erased_assertions() {
+    for (case, source) in [
+        "async def f(a, b, items):\n    if a:\n        if b:\n            value = [x for x in items]\n        assert a\n",
+        "async def f(a, b, items):\n    if a:\n        return\n    else:\n        if b:\n            value = {x for x in items}\n        assert a\n",
+        "async def f(a, b, items):\n    await action()\n    if a:\n        if b:\n            value = {x: a for x in items}\n        assert a\n",
+        "async def f(a, b, obj):\n    if a:\n        if b:\n            value = [x for x in (a, b)]\n        assert a\n",
+        "async def f(a, b, obj):\n    if a:\n        if b:\n            if obj:\n                action()\n        assert a\n",
+        "async def f(a, b, obj, items):\n    if a:\n        if b:\n            value = [x for x in items]\n            if obj:\n                action(value)\n            value = [x for x in items]\n        assert a\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython_versions(
+            source,
+            &format!("legacy_coroutine_conditional_work_{case}.py"),
+            &LEVELS,
+            &[PythonVersion::Py313],
+        );
+    }
+}
+#[test]
 fn empty_conditionals_preserve_legacy_terminal_return_locations() {
     for (case, source) in [
         "def f(a, b, obj):\n    if a:\n        assert a\n    if b:\n        obj.action()\n",
@@ -80,6 +101,26 @@ fn legacy_protected_and_coroutine_branches_keep_returns_before_erased_assertions
             &format!("legacy_elided_branch_{case}.py"),
             &LEVELS,
             &[PythonVersion::Py313],
+        );
+    }
+}
+
+#[test]
+fn coroutine_nested_branches_keep_returns_before_erased_assertions() {
+    for (case, source) in [
+        "async def f(a, b):\n    if a:\n        if b:\n            pass\n        assert a\n",
+        "async def f(a, b):\n    if a:\n        if b:\n            value = action()\n        assert a\n",
+        "async def f(a, b):\n    if a:\n        assert a\n    else:\n        if b:\n            action()\n        assert b\n",
+        "async def f(a, b):\n    await action()\n    if a:\n        if b:\n            value = a\n        assert a\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython_versions(
+            source,
+            &format!("coroutine_nested_return_{case}.py"),
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
         );
     }
 }
@@ -153,6 +194,29 @@ fn elided_try_guards_keep_python313_false_edge_return_locations() {
 }
 
 #[test]
+fn elided_protected_elif_preserves_loop_condition_owner() {
+    for (function, manager) in [
+        ("def", "with"),
+        ("async def", "with"),
+        ("async def", "async with"),
+    ] {
+        let source = format!(
+            "{function} f(cm, items, a, b):
+    {manager} cm:
+        for item in items:
+            if a:
+                assert item
+            elif b:
+                assert items
+            else:
+                assert a
+"
+        );
+        assert_matches_cpython(&source, "elided_protected_elif.py", &LEVELS);
+    }
+}
+
+#[test]
 fn with_conditional_exit_before_removed_assertion() {
     for (index, body) in [
         "if flag:\n    return 1\nassert flag\n",
@@ -200,6 +264,26 @@ fn nested_linear_branch_preserves_returns_before_removed_assertions() {
             &source,
             &format!("nested_linear_return_{index}.py"),
             &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn nested_branch_returns_survive_removed_inner_assertions() {
+    for (index, source) in [
+        "def f(a, b):\n    if a:\n        if b:\n            pass\n            assert b\n        assert a\n",
+        "def f(a, b):\n    if a:\n        if b:\n            value = action()\n            assert b\n        assert a\n",
+        "def f(a, b, c):\n    if a:\n        if b:\n            if c:\n                action()\n            action()\n        assert a\n",
+        "def f(a, b, c):\n    if a:\n        action()\n    else:\n        if b:\n            if c:\n                value = b\n            value = action()\n        assert a\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython_versions(
+            source,
+            &format!("nested_branch_assert_return_{index}.py"),
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
         );
     }
 }
@@ -3006,6 +3090,18 @@ fn elided_loop_arms_inside_managers_match_cpython() {
             );
             assert_matches_cpython(&source, "elided_manager_loop.py", &LEVELS);
         }
+    }
+}
+
+#[test]
+fn elided_loop_arms_preserve_forward_continuation_nops() {
+    for source in [
+        "def f(cm, items):\n    for item in items:\n        with cm:\n            if item:\n                assert item\n            else:\n                assert items\n",
+        "def f(cm, items):\n    with cm:\n        for item in items:\n            if item:\n                assert item\n            else:\n                assert items\n            work(item)\n",
+        "async def f(items):\n    for item in items:\n        if item:\n            assert item\n        else:\n            assert items\n        work(item)\n",
+        "def f(items):\n    for item in items:\n        if item:\n            assert item\n        else:\n            assert items\n        value = item\n    yield value\n",
+    ] {
+        assert_matches_cpython(source, "elided_loop_forward_join.py", &LEVELS);
     }
 }
 
@@ -6699,6 +6795,32 @@ print(outcome, events)
                 );
             }
         }
+    }
+}
+
+#[test]
+fn terminal_match_case_conditionals_keep_returns_before_erased_assertions() {
+    for (case, source) in [
+        "def f(a, b):\n    match a:\n        case 1:\n            if b:\n                action()\n            assert b\n",
+        "def f(a, b):\n    match a:\n        case 1:\n            if (value := action()):\n                consume(value)\n            assert b\n        case 2:\n            with manager():\n                action()\n",
+        "async def f(a, b):\n    match a:\n        case 1:\n            if b:\n                action()\n            assert b\n",
+        "def f(a, b):\n    match a:\n        case 1:\n            action()\n        case _:\n            if b:\n                action()\n            assert b\n",
+        "def f(a, b):\n    match a:\n        case 1 | 2:\n            if b:\n                action()\n            assert b\n        case _:\n            pass\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython_versions(
+            source,
+            &format!("terminal_match_case_{case}.py"),
+            &LEVELS,
+            &[
+                PythonVersion::Py312,
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
+        );
     }
 }
 

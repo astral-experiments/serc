@@ -1596,6 +1596,39 @@ impl<'source> Compiler<'source> {
         self.compile_suite_inner(body, false)
     }
 
+    /// Certifies a terminal branch with erased assertions or a linear conditional prefix.
+    fn linear_terminal_branch_before_elided(&self, body: &[Stmt]) -> bool {
+        let is_elided = |statement: &Stmt| {
+            matches!(
+                self.context.optimized_locations.get(&statement.range()),
+                Some(super::optimization::OptimizedLocation::Elided)
+            )
+        };
+        let Some(end) = body.iter().rposition(|statement| !is_elided(statement)) else {
+            return false;
+        };
+        let emitted = &body[..=end];
+        if end + 1 < body.len()
+            && (suite_has_linear_borrow_fallthrough(emitted) || matches!(emitted, [Stmt::Pass(_)]))
+        {
+            return true;
+        }
+        let Some((last, prefix)) = emitted.split_last() else {
+            return false;
+        };
+        suite_has_linear_borrow_fallthrough(std::slice::from_ref(last))
+            && prefix.iter().all(|statement| {
+                is_elided(statement)
+                    || suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                    || matches!(statement, Stmt::If(conditional)
+                        if conditional.elif_else_clauses.is_empty()
+                            && condition_has_linear_runtime_leaves(&conditional.test)
+                            && !expression_suspends_current_scope(&conditional.test)
+                            && suite_has_linear_borrow_fallthrough(&conditional.body)
+                            && !suite_contains_yield(&conditional.body))
+            })
+    }
+
     // Optimized-away statements emit no instructions, so the preceding
     // conditional supplies the normal exits of the terminal try body. A folded
     // true branch can also carry a nested runtime conditional or breaking loop.
@@ -1635,9 +1668,16 @@ impl<'source> Compiler<'source> {
     }
 
     // In 3.13, erased assertions leave an unlocated exit whose predecessors
-    // receive separate returns before NOP cleanup. Admit only linear branches;
-    // terminating guards retain the ordinary try's separate location policy.
+    // receive separate returns before NOP cleanup. Ordinary try bodies admit
+    // only linear branches; a coroutine's outer synthetic owner also permits
+    // nonsuspending conditional work without authored cleanup or abrupt exits.
     fn legacy_terminal_if_before_elided(&self, statement: &Stmt, following: &[Stmt]) -> bool {
+        self.context.python_version == crate::PythonVersion::Py313
+            && self.terminal_if_before_elided(statement, following)
+    }
+
+    /// Certifies target-supported, nonsuspending exits before erased assertions.
+    fn terminal_if_before_elided(&self, statement: &Stmt, following: &[Stmt]) -> bool {
         let Stmt::If(conditional) = statement else {
             return false;
         };
@@ -1647,8 +1687,7 @@ impl<'source> Compiler<'source> {
                 Some(super::optimization::OptimizedLocation::Elided)
             )
         };
-        self.context.python_version == crate::PythonVersion::Py313
-            && conditional.elif_else_clauses.is_empty()
+        conditional.elif_else_clauses.is_empty()
             && condition_has_linear_runtime_leaves(&conditional.test)
             && !expression_suspends_current_scope(&conditional.test)
             // Several success edges into an erased body still share an original
@@ -1673,14 +1712,23 @@ impl<'source> Compiler<'source> {
                                 && !expression_suspends_current_scope(&statement.value)
                         }
                         _ => true,
-                    })))
+                    }))
+                || (self.context.python_version == crate::PythonVersion::Py313
+                    && self.unit.flags & CO_COROUTINE != 0
+                    && self.control.exceptions.active_exception_region_exclusions.is_empty()
+                    && suite_has_nonsuspending_conditional_work(&conditional.body)))
             && !following.is_empty()
             && following.iter().all(is_elided)
     }
 
     fn supports_legacy_elided_terminal_if(&self) -> bool {
         self.context.python_version == crate::PythonVersion::Py313
-            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.supports_elided_terminal_if()
+    }
+
+    /// Checks the enclosing scope and cleanup state for terminal-exit copying.
+    fn supports_elided_terminal_if(&self) -> bool {
+        matches!(self.unit.scope, Scope::Function { .. })
             && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
             && self.control.loops.contexts.is_empty()
             && !self.control.loops.suite_fallthrough_to_loop_backedge
@@ -1945,6 +1993,8 @@ impl<'source> Compiler<'source> {
                         && condition_has_linear_runtime_leaves(&conditional.test)
                         && !expression_suspends_current_scope(&conditional.test)
                         && (suite_has_linear_borrow_fallthrough(&conditional.body)
+                            || (self.context.python_version >= crate::PythonVersion::Py314
+                                && self.linear_terminal_branch_before_elided(&conditional.body))
                             || matches!(conditional.body.as_slice(), [Stmt::Pass(_)])
                             // The nested pass keeps its original NOP until after
                             // exit copying. Both conditions need separate returns
@@ -1960,8 +2010,9 @@ impl<'source> Compiler<'source> {
                                     Some(super::optimization::OptimizedLocation::Elided)
                                 ))))
                         && !suite_contains_yield(&conditional.body));
-            let legacy_coroutine_if_before_elided = final_expression_becomes_return
-                && self.supports_legacy_elided_terminal_if()
+            let coroutine_if_before_elided = final_expression_becomes_return
+                && self.context.python_version >= crate::PythonVersion::Py313
+                && self.supports_elided_terminal_if()
                 && self.unit.flags & CO_COROUTINE != 0
                 && self.control.statements.in_terminal_if_branch_suite
                 && self
@@ -1975,7 +2026,7 @@ impl<'source> Compiler<'source> {
                     .statements
                     .context
                     .propagates_following_to_suites
-                && self.legacy_terminal_if_before_elided(statement, &body[index + 1..]);
+                && self.terminal_if_before_elided(statement, &body[index + 1..]);
             let legacy_protected_if_before_elided = final_expression_becomes_return
                 && self.supports_legacy_elided_terminal_if()
                 && self
@@ -2013,7 +2064,7 @@ impl<'source> Compiler<'source> {
                 || terminal_comprehension_before_elided
                 || terminal_nested_before_elided
                 || protected_terminal_if_before_elided
-                || legacy_coroutine_if_before_elided
+                || coroutine_if_before_elided
                 || legacy_protected_if_before_elided;
             // An assignment with an inlined comprehension becomes terminal when
             // only removed assertions follow it; retain its target's return span.
@@ -13624,6 +13675,11 @@ impl<'source> Compiler<'source> {
                     if native_elided_loop_exit {
                         self.assembler.set_location(SourceLocation::NONE);
                     }
+                    let body_has_original_empty_block = self
+                        .assembler
+                        .current_original_block_pre_fusion_instruction_count()
+                        == 0
+                        && self.assembler.current_original_block_location().is_none();
                     let branch_exit = if exclude_direct_try_body_exit
                         && self.control.in_iterator_loop()
                         && self
@@ -13736,6 +13792,31 @@ impl<'source> Compiler<'source> {
                                 )
                             })
                     };
+                    // The erased true arm retains its own original array. A live
+                    // successor or an inner synchronous manager keeps the common
+                    // end block from becoming a copied, unlocated loop backedge.
+                    // A lexical successor alone is insufficient: it may also vanish.
+                    let elided_join_has_forward_continuation = self
+                        .control
+                        .loops
+                        .contexts
+                        .is_empty()
+                        || (body_has_original_empty_block
+                            && (self.control.statements.context.followed_by_call_expression
+                                || self
+                                    .control
+                                    .statements
+                                    .context
+                                    .followed_by_name_assignment_or_deletion
+                                || self.control.loops.contexts.last().is_some_and(|context| {
+                                    context.with_depth < self.control.withs.active_with_exits.len()
+                                        && self
+                                            .control
+                                            .withs
+                                            .active_with_exits
+                                            .last()
+                                            .is_some_and(|manager| !manager.is_async)
+                                })));
                     let optimized_empty_both = self.context.python_version
                         >= crate::PythonVersion::Py314
                         && branch_index + 2 == branch_count
@@ -13744,7 +13825,7 @@ impl<'source> Compiler<'source> {
                                 & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                                 == 0
                                 && matches!(self.unit.scope, Scope::Function { .. })
-                                && self.control.loops.contexts.is_empty()
+                                && elided_join_has_forward_continuation
                                 && self.control.generators.generator_region_start.is_none()
                                 && self.control.withs.active_with_region_exclusions.is_empty()
                                 && self.control.exceptions.active_try_marker_slots.len() == 1
@@ -13756,18 +13837,18 @@ impl<'source> Compiler<'source> {
                                 && self.control.exceptions.direct_try_body_statements.contains(&statement.range)
                                 && !direct_try_body_exit)
                             || (self.context.python_version == crate::PythonVersion::Py315
-                                && self.control.loops.contexts.is_empty()
+                                && elided_join_has_forward_continuation
                                 && self.control.exceptions.active_exception_region_exclusions.is_empty())
                             // Retain the join inside the generator's exception wrapper.
                             || (self.context.python_version == crate::PythonVersion::Py314
                                 && matches!(self.unit.scope, Scope::Function { .. })
-                                && self.control.loops.contexts.is_empty()
+                                && elided_join_has_forward_continuation
                                 && self.control.exceptions.active_exception_region_exclusions.is_empty()
                                 && self.control.generators.generator_region_start.is_some())
                             // The manager-region join also survives inside a try body.
                             || (matches!(self.unit.scope, Scope::Function { .. })
                                 && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-                                && self.control.loops.contexts.is_empty()
+                                && elided_join_has_forward_continuation
                                 && !self.control.withs.active_with_region_exclusions.is_empty()
                                 && (self.context.python_version == crate::PythonVersion::Py314
                                     || !self.control.exceptions.active_exception_region_exclusions.is_empty())))
@@ -16800,7 +16881,26 @@ impl<'source> Compiler<'source> {
                 || protected_iterator_loop_else
                 // Elided arms share the original loop backedge even inside a
                 // manager. Its threaded false edge gets fresh, ownerless slots.
-                || (statement.elif_else_clauses.len() == 1
+                || ((statement.elif_else_clauses.len() == 1
+                    // Every elided arm of a synchronous iterator's elif chain
+                    // reaches the same backedge, including its final false edge.
+                    || (condition_has_linear_runtime_leaves(&statement.test)
+                        && !expression_suspends_current_scope(&statement.test)
+                        && condition_jump_target_count(&statement.test, true) == 1
+                        && self.control.loops.contexts.last().is_some_and(|context| {
+                            context.iterator_cleanup == IteratorCleanup::Sync
+                        })
+                        && statement.elif_else_clauses.iter().all(|clause| {
+                            clause.test.as_ref().is_none_or(|test| {
+                                condition_has_linear_runtime_leaves(test)
+                                    && !expression_suspends_current_scope(test)
+                                    && condition_jump_target_count(test, true) == 1
+                            }) && !clause.body.is_empty()
+                                && clause.body.iter().all(|statement| matches!(
+                                    self.context.optimized_locations.get(&statement.range()),
+                                    Some(super::optimization::OptimizedLocation::Elided)
+                                ))
+                        })))
                     && (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                         || (self.unit.flags & CO_COROUTINE != 0
                             && condition_has_linear_runtime_leaves(&statement.test)
@@ -39430,6 +39530,57 @@ fn conditional_for_else_cleanup_exit(statement: &ruff_python_ast::StmtIf) -> boo
         && cleanup.orelse.is_empty()
         && suite_has_linear_borrow_fallthrough(&cleanup.body)
         && suite_has_linear_borrow_fallthrough(&cleanup.finalbody)
+}
+
+/// Certifies normal exits from conditional work under a coroutine's synthetic owner.
+fn suite_has_nonsuspending_conditional_work(body: &[Stmt]) -> bool {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| suite_has_nonsuspending_conditional_work(body));
+    }
+    let supports_value = |expression: &Expr| {
+        !expression_suspends_current_scope(expression)
+            && (!expression_contains_inline_branch(expression)
+                || matches!(
+                    expression,
+                    Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)
+                ))
+    };
+    body.iter().all(|statement| match statement {
+        Stmt::If(branch) => {
+            condition_has_linear_runtime_leaves(&branch.test)
+                && !expression_suspends_current_scope(&branch.test)
+                && suite_has_nonsuspending_conditional_work(&branch.body)
+                && branch.elif_else_clauses.iter().all(|clause| {
+                    clause.test.as_ref().is_none_or(|test| {
+                        condition_has_linear_runtime_leaves(test)
+                            && !expression_suspends_current_scope(test)
+                    }) && suite_has_nonsuspending_conditional_work(&clause.body)
+                })
+        }
+        Stmt::Expr(expression) => supports_value(&expression.value),
+        Stmt::Assign(assignment) => {
+            supports_value(&assignment.value)
+                && assignment.targets.iter().all(|target| {
+                    !expression_suspends_current_scope(target)
+                        && !expression_contains_inline_branch(target)
+                })
+        }
+        Stmt::AnnAssign(assignment) => {
+            !expression_suspends_current_scope(&assignment.target)
+                && !expression_contains_inline_branch(&assignment.target)
+                && assignment
+                    .value
+                    .as_ref()
+                    .is_some_and(|value| supports_value(value))
+        }
+        Stmt::AugAssign(assignment) => {
+            !expression_suspends_current_scope(&assignment.target)
+                && !expression_contains_inline_branch(&assignment.target)
+                && supports_value(&assignment.value)
+        }
+        Stmt::Pass(_) => true,
+        _ => false,
+    })
 }
 
 // Only these current-scope statements participate in the all-raising cleanup

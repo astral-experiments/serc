@@ -437,6 +437,52 @@ impl Compiler<'_> {
         self.compile_match_inner(statement, false)
     }
 
+    /// Exposes a terminal case conditional hidden by optimizer-elided statements.
+    fn terminal_match_case_body<'b>(&self, body: &'b [Stmt]) -> &'b [Stmt] {
+        if self.context.python_version < PythonVersion::Py314
+            || !matches!(self.unit.scope, Scope::Function { .. })
+            || self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
+            || self.control.in_loop()
+            || self.control.falls_through_to_loop_backedge()
+            || self.control.active_with_count() != 0
+            || !self.control.withs.active_with_region_exclusions.is_empty()
+            || !self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            || !self
+                .control
+                .comprehensions
+                .active_comprehension_region_exclusions
+                .is_empty()
+            || self.control.in_exception_handler()
+            || !self.control.finally.is_inactive_for_return_unwind()
+        {
+            return body;
+        }
+        let is_elided = |statement: &Stmt| {
+            matches!(
+                self.context.optimized_locations.get(&statement.range()),
+                Some(super::optimization::OptimizedLocation::Elided)
+            )
+        };
+        let Some(last) = body.iter().rposition(|statement| !is_elided(statement)) else {
+            return body;
+        };
+        if matches!(&body[last], Stmt::If(conditional)
+            if conditional.elif_else_clauses.is_empty()
+                && (suite_has_linear_borrow_fallthrough(&conditional.body)
+                    || matches!(conditional.body.as_slice(), [Stmt::Pass(_)])
+                    || (conditional.body.iter().all(is_elided)
+                        && condition_jump_target_count(&conditional.test, true) == 1)))
+        {
+            &body[..=last]
+        } else {
+            body
+        }
+    }
+
     /// Carries a match successor only to its direct case-tail iterator break.
     fn compile_match_case_suite(
         &mut self,
@@ -829,6 +875,7 @@ impl Compiler<'_> {
                 }
                 let body_previous_location = self.assembler.last_instruction_location();
                 let body_start = self.assembler.instruction_count();
+                let terminal_body = self.terminal_match_case_body(&case.body);
                 let tail_if = if !terminal
                     && let Some((Stmt::If(statement), leading)) = case.body.split_last()
                     && statement.elif_else_clauses.is_empty()
@@ -855,10 +902,11 @@ impl Compiler<'_> {
                 };
                 let emitted_fallthrough = if emitted_case_exit {
                     false
-                } else if terminal && matches!(case.body.last(), Some(Stmt::If(_) | Stmt::Match(_)))
+                } else if terminal
+                    && matches!(terminal_body.last(), Some(Stmt::If(_) | Stmt::Match(_)))
                 {
                     let ((), emitted_fallthrough) = self.with_fallthrough_tracking(|compiler| {
-                        compiler.compile_suite_inner(&case.body, true)
+                        compiler.compile_suite_inner(terminal_body, true)
                     })?;
                     emitted_fallthrough
                 } else if !terminal
@@ -1326,10 +1374,11 @@ impl Compiler<'_> {
                 failure_reaches_end = true;
             }
             let body_start = self.assembler.instruction_count();
+            let terminal_body = self.terminal_match_case_body(&case.body);
             let emitted_fallthrough =
-                if terminal && matches!(case.body.last(), Some(Stmt::If(_) | Stmt::Match(_))) {
+                if terminal && matches!(terminal_body.last(), Some(Stmt::If(_) | Stmt::Match(_))) {
                     let ((), emitted_fallthrough) = self.with_fallthrough_tracking(|compiler| {
-                        compiler.compile_suite_inner(&case.body, true)
+                        compiler.compile_suite_inner(terminal_body, true)
                     })?;
                     emitted_fallthrough
                 } else {
