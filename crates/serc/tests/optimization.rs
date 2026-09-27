@@ -22,6 +22,46 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn dotted_import_parser_interning_matches_cpython() {
+    for (case, import) in [
+        "if False:\n    from SercOuter.SercInner import item\n",
+        "if False:\n    from SercOuter.SercInner.Leaf import item\n",
+        "seed = None\nif False:\n    from SercOuter.SercInner.Leaf import *\n",
+        "seed = None\nif False:\n    import SercOuter.SercInner.Leaf\n",
+        "from SercOuter.SercInner import item\n",
+        "if condition:\n    from SercOuter.SercInner import item\n",
+        "if False:\n    from SercOuter import item\n",
+        "if False:\n    from SercOuter.SercInnerExtra.Leaf import item\n",
+        "from SercOuter.SercInner.Leaf import item\nsaved = {'SercOuter.SercInner', 'other'}\n",
+        "if False:\n    from SercOuter.SercInner.Leaf import item\nfirst = ('SercOuter.SercInner', ('SercOuter.SercInner',))\nsecond = ('SercOuter.' + 'SercInner', ('SercOuter.SercInner',))\n",
+        "def select(flag):\n    try:\n        if True:\n            if flag:\n                return 1\n        else:\n            from SercOuter.SercInner.Leaf import item\n    except Exception:\n        return None\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = format!("{import}class SercOuter:\n    class SercInner:\n        pass\n");
+        assert_matches_cpython(&source, &format!("dotted_import_{case}.py"), &LEVELS);
+    }
+    for (case, import) in [
+        "from A.B.C.Leaf import item",
+        "from A.B.C.Leaf import *",
+        "import A.B.C.Leaf",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = format!(
+            "seed = None\nif False:\n    {import}\nclass A:\n    class B:\n        class C:\n            pass\n"
+        );
+        assert_matches_cpython(&source, &format!("deep_dotted_import_{case}.py"), &LEVELS);
+    }
+    let source = "if False:\n    from \u{fb00}.SercInner.Leaf import item\nclass ff:\n    class SercInner:\n        pass\n";
+    assert_matches_cpython(source, "dotted_import_nfkc.py", &LEVELS);
+    let source = "if False:\n    from SercOuter.__SercInner.Leaf import item\nclass SercOuter:\n    class __SercInner:\n        pass\n";
+    assert_matches_cpython(source, "dotted_import_private.py", &LEVELS);
+}
+
+#[test]
 fn discarded_star_imports_match_cpython() {
     for (case, source) in [
         "if False:\n    from package import *\nvalue = 1\n",

@@ -203,6 +203,10 @@ pub(super) struct CompilationContext<'source> {
     pub(super) module_contains_yield: bool,
     finally_bodies: FxHashMap<TextRange, &'source [Stmt]>,
     constant_string_origins: FxHashMap<Cow<'source, str>, Cell<StringConstantOrigin>>,
+    // Dotted imports intern every dot-delimited prefix during parsing. Keep the
+    // complete spellings indexed; materialize only prefixes used as constants.
+    dotted_import_names: Vec<String>,
+    dotted_constant_origins: RefCell<FxHashMap<String, StringConstantOrigin>>,
     // Class qualified-name and synthesized character identity depend on the first cache admission,
     // even when that constant or the defining class is later removed as unreachable.
     constant_origins: Option<RefCell<ConstantOrigins>>,
@@ -297,6 +301,12 @@ impl<'source> CompilationContext<'source> {
         let mut static_attribute_names = FxHashSet::default();
         let mut has_percent_replacement = false;
         let mut finally_bodies = FxHashMap::default();
+        let mut dotted_import_names = std::mem::take(&mut source_analysis.dotted_import_names)
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        dotted_import_names.sort_unstable();
+        dotted_import_names.dedup();
         let (constant_string_origins, requires_empty_bytes_cache_trace) = source_analysis.finish(
             &mut generated_mangled_strings,
             &mut requires_interning_trace,
@@ -334,6 +344,8 @@ impl<'source> CompilationContext<'source> {
             module_contains_yield: false,
             finally_bodies,
             constant_string_origins,
+            dotted_import_names,
+            dotted_constant_origins: RefCell::default(),
             constant_origins,
             interned_metadata_tuples,
             static_attribute_names,
@@ -389,6 +401,14 @@ impl<'source> CompilationContext<'source> {
         // Parsing interns identifiers even when a later optimization removes their
         // expressions. Preserve those raw names, but retain all lowering and cache
         // facts from the optimized tree and do not mark literal objects canonical.
+        self.dotted_import_names.extend(
+            original_source
+                .dotted_import_names
+                .iter()
+                .map(|name| (*name).to_owned()),
+        );
+        self.dotted_import_names.sort_unstable();
+        self.dotted_import_names.dedup();
         original_source.generated_mangled_strings.retain(|name| {
             !original_source
                 .raw_private_identifiers
@@ -495,18 +515,28 @@ impl<'source> CompilationContext<'source> {
         }
     }
 
+    fn dotted_import_interns(&self, value: &str) -> bool {
+        dotted_name_prefix_is_interned(&self.dotted_import_names, value)
+    }
+
     /// Records the first object admitted to the compilation-wide constant cache for an
     /// parser-interned name used as a constant. Later equal constants reuse that object's identity,
     /// even when the first load is removed by control-flow optimization.
     pub(super) fn record_constant_string_origin(&self, value: &str, interned: bool) {
-        if let Some(origin) = self.constant_string_origins.get(value)
-            && origin.get() == StringConstantOrigin::Unrecorded
-        {
-            origin.set(if interned {
-                StringConstantOrigin::Interned
-            } else {
-                StringConstantOrigin::Uninterned
-            });
+        let admitted = if interned {
+            StringConstantOrigin::Interned
+        } else {
+            StringConstantOrigin::Uninterned
+        };
+        if let Some(origin) = self.constant_string_origins.get(value) {
+            if origin.get() == StringConstantOrigin::Unrecorded {
+                origin.set(admitted);
+            }
+        } else if self.dotted_import_interns(value) {
+            self.dotted_constant_origins
+                .borrow_mut()
+                .entry(value.to_owned())
+                .or_insert(admitted);
         }
     }
 
@@ -514,6 +544,8 @@ impl<'source> CompilationContext<'source> {
         self.constant_string_origins
             .get(value)
             .is_some_and(|origin| origin.get() == StringConstantOrigin::Interned)
+            || self.dotted_constant_origins.borrow().get(value)
+                == Some(&StringConstantOrigin::Interned)
     }
 
     pub(super) fn record_identifier_constant_origin(&self, raw: &str, mangled: &str) {
@@ -530,7 +562,7 @@ impl<'source> CompilationContext<'source> {
     }
 
     fn record_interned_constant_string_origins(&self, constant: &Constant, interned: bool) {
-        if self.constant_string_origins.is_empty() {
+        if self.constant_string_origins.is_empty() && self.dotted_import_names.is_empty() {
             return;
         }
         match constant {
@@ -718,7 +750,9 @@ impl<'source> CompilationContext<'source> {
     }
 
     pub(super) fn has_tracked_string_origins(&self) -> bool {
-        !self.constant_string_origins.is_empty() || self.tracks_constant_origins()
+        !self.constant_string_origins.is_empty()
+            || !self.dotted_import_names.is_empty()
+            || self.tracks_constant_origins()
     }
 
     pub(super) fn tracks_constant_origins(&self) -> bool {
@@ -746,11 +780,12 @@ impl<'source> CompilationContext<'source> {
             || origins.interned_qualified_names.contains(value);
         match origins.strings.entry(value.to_string()) {
             std::collections::hash_map::Entry::Vacant(entry) => {
-                // A dotted import interns its complete spelling while parsing. In 3.13,
-                // code construction reuses that object for the qualified-name metadata,
+                // A dotted import interns its spelling while parsing. In Python 3.13
+                // and later, code construction can reuse it for qualified-name metadata,
                 // leaving the class's newly cached scalar constant distinct.
                 let canonical = self.python_version == crate::PythonVersion::Py312
                     || (!self.constant_string_origins.contains_key(value)
+                        && !self.dotted_import_interns(value)
                         && !metadata_already_interned);
                 entry.insert(canonical);
                 Some(canonical)
@@ -809,8 +844,32 @@ impl<'source> CompilationContext<'source> {
                 canonical.insert(value.into_owned());
             }
         }
+        #[expect(
+            clippy::iter_over_hash_type,
+            reason = "Both provenance sets are only queried for membership."
+        )]
+        for (value, origin) in context.dotted_constant_origins.take() {
+            if origin == StringConstantOrigin::Interned {
+                canonical.insert(value.clone());
+            }
+            if has_frozenset_constants {
+                identifiers.insert(value);
+            }
+        }
         (identifiers, canonical)
     }
+}
+
+/// Checks an accumulated dotted-name prefix without constructing or hashing every prefix.
+fn dotted_name_prefix_is_interned(names: &[String], value: &str) -> bool {
+    let index = names.partition_point(|name| match name.strip_prefix(value) {
+        Some(tail) => tail < ".",
+        None => name.as_str() < value,
+    });
+    names.get(index).is_some_and(|name| {
+        name.strip_prefix(value)
+            .is_some_and(|tail| tail.starts_with('.'))
+    })
 }
 
 /// Tests for the ASCII dunder substring without constructing a generic string searcher.
@@ -839,6 +898,7 @@ pub(super) struct SourceAnalysis<'ast> {
     python_version: crate::PythonVersion,
     finally_bodies: FxHashMap<TextRange, &'ast [Stmt]>,
     origins: FxHashMap<Cow<'ast, str>, Cell<StringConstantOrigin>>,
+    dotted_import_names: Vec<&'ast str>,
     // Source-only identifiers still enter `origins` directly, in their original visitation order.
     expression_origin_names: Vec<ExpressionOriginNames>,
     private_name: Option<String>,
@@ -897,6 +957,19 @@ impl<'ast> SourceAnalysis<'ast> {
     fn record_raw_name(&mut self, name: &'ast str) {
         self.origins.entry(Cow::Borrowed(name)).or_default();
         self.record_raw_name_effects(name);
+    }
+
+    fn record_dotted_name(&mut self, name: &'ast str) {
+        // CPython interns each accumulated dotted-name prefix while parsing, before
+        // optimization can discard the import containing it. Index the complete name
+        // rather than hashing every potentially long prefix.
+        if name.contains('.') {
+            self.dotted_import_names.push(name);
+        }
+        self.origins.entry(Cow::Borrowed(name)).or_default();
+        for component in name.split('.') {
+            self.record_raw_name(component);
+        }
     }
 
     #[inline]
@@ -964,9 +1037,7 @@ impl<'ast> SourceAnalysis<'ast> {
             }
             Stmt::ImportFrom(import) => {
                 if let Some(module) = &import.module {
-                    for component in module.as_str().split('.') {
-                        self.record_raw_name(component);
-                    }
+                    self.record_dotted_name(module.as_str());
                 }
             }
             Stmt::Global(declaration) => {
@@ -1134,12 +1205,7 @@ impl<'ast> SourceAnalysis<'ast> {
     }
 
     pub(super) fn observe_alias(&mut self, alias: &'ast ruff_python_ast::Alias) {
-        self.origins
-            .entry(Cow::Borrowed(alias.name.as_str()))
-            .or_default();
-        for component in alias.name.as_str().split('.') {
-            self.record_raw_name(component);
-        }
+        self.record_dotted_name(alias.name.as_str());
         if let Some(name) = &alias.asname {
             self.record_raw_name(name.as_str());
         }
@@ -3007,6 +3073,28 @@ mod tests {
     use std::fmt::Write;
 
     use super::*;
+
+    #[test]
+    fn dotted_name_prefix_index_respects_component_boundaries() {
+        let mut names = ["a.b0", "a.b.c", "a.b!", "a.b", "a.bc.d", "é.x.y", "zz.z"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        for query in [
+            "", "a", "a.b", "a.bc", "a.b!", "a.b0", "a.c", "é", "é.x", "zz.z",
+        ] {
+            let expected = names.iter().any(|name| {
+                name.strip_prefix(query)
+                    .is_some_and(|tail| tail.starts_with('.'))
+            });
+            assert_eq!(
+                dotted_name_prefix_is_interned(&names, query),
+                expected,
+                "{query}"
+            );
+        }
+    }
 
     #[test]
     fn source_aware_atomic_folding_preserves_literal_values_and_surrogates() {

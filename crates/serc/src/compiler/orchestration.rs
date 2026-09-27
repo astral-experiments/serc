@@ -1033,9 +1033,13 @@ impl<'source> Compiler<'source> {
         self.output.qualified_name_is_canonical = self
             .context
             .record_class_qualified_name(&self.unit.qualified_name);
+        // A parser-interned dotted name can leave the class constant distinct from
+        // its interned code metadata; preserve the cache admission recorded above.
         self.context.record_constant_string_origin(
             &self.unit.qualified_name,
-            self.has_deferred_annotations() || self.unit.qualified_name == self.unit.name,
+            (self.has_deferred_annotations()
+                && self.output.qualified_name_is_canonical != Some(false))
+                || self.unit.qualified_name == self.unit.name,
         );
         let qualified_name =
             self.add_constant(Constant::String(self.unit.qualified_name.clone()))?;
