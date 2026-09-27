@@ -23,6 +23,20 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn erased_suffix_preserves_conditional_expression_join() {
+    for condition in ["b", "b is not None"] {
+        for (left, right) in [("x", "y"), ("left(x)", "right(y)")] {
+            for suffix in ["        assert a\n", "        assert a\n        assert b\n"] {
+                let source = format!(
+                    "def f(a, b, x, y):\n    if a:\n        {left} if {condition} else {right}\n{suffix}"
+                );
+                assert_matches_cpython(&source, "conditional_expression_erased_suffix.py", &LEVELS);
+            }
+        }
+    }
+}
+
+#[test]
 fn elided_condition_before_terminal_for_preserves_legacy_footer_location() {
     for first in ["a", "check(a)"] {
         for second in ["b", "check(b)"] {

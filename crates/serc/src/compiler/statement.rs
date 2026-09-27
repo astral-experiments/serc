@@ -1827,6 +1827,12 @@ impl<'source> Compiler<'source> {
         body: &[Stmt],
         final_expression_becomes_return: bool,
     ) -> Result<(), CompileError> {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| {
+                self.compile_suite_inner(body, final_expression_becomes_return)
+            });
+        }
+
         let inherited_statement_has_following = self
             .control
             .statements
@@ -4102,8 +4108,43 @@ impl<'source> Compiler<'source> {
             }
             return Ok(());
         }
+        let conditional_expression_tail = if self.context.python_version
+            >= crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && !self.control.loops.suite_fallthrough_to_loop_backedge
+            && self.control.withs.active_with_exits.is_empty()
+            && !self.has_active_control_flow_region()
+            && !self.control.in_exception_handler()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.finally.is_inactive_for_return_unwind()
+            && !self.control.statements.in_match
+            && statement
+                .body
+                .last()
+                .is_some_and(|part| self.context.is_elided_statement(part))
+            && let Some(last) = statement
+                .body
+                .iter()
+                .rposition(|part| !self.context.is_elided_statement(part))
+            && statement.body[..last].iter().all(|part| {
+                self.context.is_elided_statement(part)
+                    || suite_has_linear_borrow_fallthrough(std::slice::from_ref(part))
+            })
+            && matches!(&statement.body[last], Stmt::Expr(expression)
+                if matches!(expression.value.as_ref(), Expr::If(conditional)
+                    if !expression_contains_inline_branch(&conditional.test)
+                        && !expression_contains_inline_branch(&conditional.body)
+                        && !expression_contains_inline_branch(&conditional.orelse))
+                    && !expression_suspends_current_scope(&expression.value))
+        {
+            Some(&statement.body[last])
+        } else {
+            statement.body.last()
+        };
         if statement.elif_else_clauses.is_empty()
-            && matches!(statement.body.last(), Some(Stmt::Expr(expression))
+            && matches!(conditional_expression_tail, Some(Stmt::Expr(expression))
                 if matches!(expression.value.as_ref(), Expr::If(conditional)
                     if early_condition_truthiness(&conditional.test).is_none()
                         && fold_constant(&conditional.body).is_none()
