@@ -23,6 +23,49 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn legacy_protected_and_coroutine_branches_keep_returns_before_erased_assertions() {
+    for (case, source) in [
+        "def f(a):\n    try:\n        if a:\n            pass\n        assert a\n    except:\n        raise\n",
+        "def f(a):\n    try:\n        if a:\n            action()\n        assert a\n    except ValueError:\n        recover()\n        raise\n",
+        "async def f(a, b):\n    if a:\n        if b:\n            pass\n        assert a\n",
+        "async def f(a, b):\n    if a:\n        if b:\n            action()\n        assert a\n",
+        "async def f(a, b):\n    await action()\n    if a:\n        if b:\n            value = a\n        assert a\n",
+        "async def f(a):\n    try:\n        await action()\n        if a:\n            pass\n        assert a\n    except ValueError:\n        raise\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython_versions(
+            source,
+            &format!("legacy_elided_branch_{case}.py"),
+            &LEVELS,
+            &[PythonVersion::Py313],
+        );
+    }
+}
+
+#[test]
+fn removed_assertions_preserve_constant_loop_break_borrow_boundary() {
+    for (index, body) in [
+        "value = obj.next()\nif value:\n    break\nassert value\n",
+        "value = obj.next()\naction()\nif value in (1, 2):\n    break\nassert value\n",
+        "value = obj.next()\nif value:\n    break\nassert value\nassert obj\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut source = String::from("def f(obj):\n    while True:\n");
+        for line in body.lines() {
+            source.push_str("        ");
+            source.push_str(line);
+            source.push('\n');
+        }
+        source.push_str("    obj.close()\n");
+        assert_matches_cpython(&source, &format!("constant_loop_break_{index}.py"), &LEVELS);
+    }
+}
+
+#[test]
 fn empty_try_before_removed_assertions_preserves_implicit_return() {
     for (case, source) in [
         "def f(flag):\n    try:\n        assert flag\n    except AssertionError:\n        pass\n    assert flag\n",
@@ -38,6 +81,34 @@ fn empty_try_before_removed_assertions_preserves_implicit_return() {
     .enumerate()
     {
         assert_matches_cpython(source, &format!("empty_try_assert_tail_{case}.py"), &LEVELS);
+    }
+}
+
+#[test]
+fn elided_terminal_or_preserves_shared_return_order() {
+    for test in ["a or b", "a == 1 or b == 2", "a or b or c"] {
+        let source = format!("def f(a, b, c):\n    if {test}:\n        assert a\n");
+        assert_matches_cpython(&source, "elided_terminal_or.py", &LEVELS);
+    }
+}
+
+#[test]
+fn elided_try_guards_keep_python313_false_edge_return_locations() {
+    for (index, source) in [
+        "def f(a):\n    try:\n        if a:\n            return\n        assert False\n    except:\n        pass\n",
+        "def f(a):\n    try:\n        if a:\n            action()\n            raise ValueError\n        assert False\n    except ValueError:\n        raise\n",
+        "async def f(a):\n    try:\n        if a:\n            return await action()\n        assert False\n    except ValueError:\n        raise\n",
+        "async def f(a, b):\n    try:\n        if a:\n            return await first()\n        elif b:\n            value = await second()\n            consume(value)\n            return value\n        assert False\n    except ValueError:\n        raise\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython_versions(
+            source,
+            &format!("python313_elided_try_guard_{index}.py"),
+            &LEVELS,
+            &[PythonVersion::Py313],
+        );
     }
 }
 

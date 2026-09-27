@@ -1634,6 +1634,72 @@ impl<'source> Compiler<'source> {
             && self.control.finally.is_inactive_for_return_unwind()
     }
 
+    // In 3.13, erased assertions leave an unlocated exit whose predecessors
+    // receive separate returns before NOP cleanup. Admit only linear branches;
+    // terminating guards retain the ordinary try's separate location policy.
+    fn legacy_terminal_if_before_elided(&self, statement: &Stmt, following: &[Stmt]) -> bool {
+        let Stmt::If(conditional) = statement else {
+            return false;
+        };
+        let is_elided = |statement: &Stmt| {
+            matches!(
+                self.context.optimized_locations.get(&statement.range()),
+                Some(super::optimization::OptimizedLocation::Elided)
+            )
+        };
+        self.context.python_version == crate::PythonVersion::Py313
+            && conditional.elif_else_clauses.is_empty()
+            && condition_has_linear_runtime_leaves(&conditional.test)
+            && !expression_suspends_current_scope(&conditional.test)
+            // Several success edges into an erased body still share an original
+            // empty join; their return donors require separate lowering.
+            && (!conditional.body.iter().all(is_elided)
+                || condition_jump_target_count(&conditional.test, true) == 1)
+            && (matches!(conditional.body.as_slice(), [Stmt::Pass(_)])
+                || conditional.body.iter().all(is_elided)
+                || (suite_has_linear_borrow_fallthrough(&conditional.body)
+                    && conditional.body.iter().all(|statement| match statement {
+                        Stmt::Expr(statement) => !expression_suspends_current_scope(&statement.value),
+                        Stmt::Assign(statement) => {
+                            !expression_suspends_current_scope(&statement.value)
+                                && statement.targets.iter().all(|target| !expression_suspends_current_scope(target))
+                        }
+                        Stmt::AnnAssign(statement) => {
+                            !expression_suspends_current_scope(&statement.target)
+                                && statement.value.as_ref().is_none_or(|value| !expression_suspends_current_scope(value))
+                        }
+                        Stmt::AugAssign(statement) => {
+                            !expression_suspends_current_scope(&statement.target)
+                                && !expression_suspends_current_scope(&statement.value)
+                        }
+                        _ => true,
+                    })))
+            && !following.is_empty()
+            && following.iter().all(is_elided)
+    }
+
+    fn supports_legacy_elided_terminal_if(&self) -> bool {
+        self.context.python_version == crate::PythonVersion::Py313
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && !self.control.loops.suite_fallthrough_to_loop_backedge
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self
+                .control
+                .comprehensions
+                .active_comprehension_region_exclusions
+                .is_empty()
+            && self
+                .control
+                .comprehensions
+                .direct_comprehension_assignment_results
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.is_inactive_for_return_unwind()
+    }
+
     pub(super) fn compile_suite_inner(
         &mut self,
         body: &[Stmt],
@@ -1897,6 +1963,41 @@ impl<'source> Compiler<'source> {
                                     Some(super::optimization::OptimizedLocation::Elided)
                                 ))))
                         && !suite_contains_yield(&conditional.body));
+            let legacy_coroutine_if_before_elided = final_expression_becomes_return
+                && self.supports_legacy_elided_terminal_if()
+                && self.unit.flags & CO_COROUTINE != 0
+                && self.control.statements.in_terminal_if_branch_suite
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && !inherited_statement_has_following
+                && !self
+                    .control
+                    .statements
+                    .context
+                    .propagates_following_to_suites
+                && self.legacy_terminal_if_before_elided(statement, &body[index + 1..]);
+            let legacy_protected_if_before_elided = final_expression_becomes_return
+                && self.supports_legacy_elided_terminal_if()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .len()
+                    == 1
+                && self
+                    .control
+                    .exceptions
+                    .implicit_return_exception_exclusion_depth
+                    == Some(1)
+                && self
+                    .control
+                    .exceptions
+                    .direct_try_body_statements
+                    .contains(&statement.range())
+                && self.legacy_terminal_if_before_elided(statement, &body[index + 1..]);
             let protected_terminal_if_before_elided = final_expression_becomes_return
                 && matches!(statement, Stmt::If(_))
                 && self.supports_protected_terminal_if()
@@ -1914,7 +2015,9 @@ impl<'source> Compiler<'source> {
             let terminal_if_before_elided = terminal_before_elided_assertions
                 || terminal_comprehension_before_elided
                 || terminal_nested_before_elided
-                || protected_terminal_if_before_elided;
+                || protected_terminal_if_before_elided
+                || legacy_coroutine_if_before_elided
+                || legacy_protected_if_before_elided;
             // An assignment with an inlined comprehension becomes terminal when
             // only removed assertions follow it; retain its target's return span.
             let terminal_assignment_before_elided = self.context.python_version
@@ -3655,7 +3758,12 @@ impl<'source> Compiler<'source> {
                 })
                 .collect();
         let has_empty_comparison_arm = !empty_comparison_arms.is_empty();
-        let has_optimized_join = self.context.python_version >= crate::PythonVersion::Py313
+        // 3.12 inserts each copied exit after the original shared footer. Eager
+        // per-arm returns change that order when an OR body is entirely elided.
+        let has_optimized_join = (self.context.python_version >= crate::PythonVersion::Py313
+            || (statement.elif_else_clauses.is_empty()
+                && matches!(statement.test.as_ref(), Expr::BoolOp(boolean)
+                    if boolean.op == BoolOp::Or)))
             && (self.optimized_conditional_join(statement)
                 || (self.context.python_version == crate::PythonVersion::Py313
                     && std::iter::once(statement.body.as_slice())
@@ -14116,6 +14224,68 @@ impl<'source> Compiler<'source> {
         .then_some(statement.test.as_ref())
     }
 
+    /// Finds the sole false-edge donor for a 3.13 try exit after removed assertions.
+    fn legacy_elided_try_guard_return_location(
+        &self,
+        statement: &ruff_python_ast::StmtTry,
+    ) -> Option<SourceLocation> {
+        if self.context.python_version != crate::PythonVersion::Py313
+            || !matches!(self.unit.scope, Scope::Function { .. })
+            || self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
+            || statement.is_star
+            || !statement.orelse.is_empty()
+            || !statement.finalbody.is_empty()
+            || !self.control.loops.contexts.is_empty()
+            || self.control.loops.suite_fallthrough_to_loop_backedge
+            || !self.control.withs.active_with_exits.is_empty()
+            || !self.control.withs.active_with_region_exclusions.is_empty()
+            || !self.control.exceptions.active_exception_handlers.is_empty()
+            || self.control.exceptions.active_exception_group_handlers != 0
+            || !self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            || !self.control.finally.is_inactive_for_return_unwind()
+        {
+            return None;
+        }
+        let is_elided = |statement: &Stmt| {
+            matches!(
+                self.context.optimized_locations.get(&statement.range()),
+                Some(super::optimization::OptimizedLocation::Elided)
+            )
+        };
+        if !statement.body.last().is_some_and(is_elided) {
+            return None;
+        }
+        let Stmt::If(guard) = statement.body.iter().rev().find(|stmt| !is_elided(stmt))? else {
+            return None;
+        };
+        let valid_arm = |test: &Expr, body: &[Stmt]| {
+            condition_has_linear_runtime_leaves(test)
+                && !expression_suspends_current_scope(test)
+                && matches!(body.last(), Some(Stmt::Return(_) | Stmt::Raise(_)))
+                && !suite_contains_nested_exception_cleanup(body)
+                && !suite_contains_yield(body)
+        };
+        if !valid_arm(&guard.test, &guard.body)
+            || !guard.elif_else_clauses.iter().all(|clause| {
+                clause
+                    .test
+                    .as_ref()
+                    .is_some_and(|test| valid_arm(test, &clause.body))
+            })
+        {
+            return None;
+        }
+        let test = terminating_if_fallthrough_test(guard)?;
+        if !original_condition_has_unique_jump_target(test, false) {
+            return None;
+        }
+        unique_condition_jump_target(test, false).map(|test| self.source_location(test.range()))
+    }
+
     pub(super) fn set_branch_end_location(&mut self, body: &[Stmt], body_start: usize) {
         if let Some(range) = suite_match_failure_range(body) {
             // The final pattern's failure falls through to this exit; successful cases
@@ -18444,8 +18614,41 @@ impl<'source> Compiler<'source> {
                     && statement.body.last().is_some_and(|statement| {
                         suite_contains_loop_break(std::slice::from_ref(statement))
                     });
+            let mut borrow_body = statement.body.as_slice();
+            if self.context.python_version == crate::PythonVersion::Py314
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && self.control.loops.contexts.is_empty()
+                && !self.has_active_control_flow_region()
+                && !self.control.in_exception_handler()
+                && self.control.finally.is_inactive_for_return_unwind()
+            {
+                // Removed assertions do not keep a terminal break jump alive. Its
+                // empty original successor still stops 3.14's borrow traversal.
+                while let Some((last, leading)) = borrow_body.split_last()
+                    && matches!(last, Stmt::Global(declaration) if declaration.names.is_empty())
+                    && matches!(
+                        self.context.optimized_locations.get(&last.range()),
+                        Some(super::optimization::OptimizedLocation::Elided)
+                    )
+                {
+                    borrow_body = leading;
+                }
+                if !borrow_body.split_last().is_some_and(|(last, leading)| {
+                    (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
+                        && matches!(last, Stmt::If(branch)
+                        if branch.elif_else_clauses.is_empty()
+                            && branch.body.split_last().is_some_and(|(last, leading)| {
+                                matches!(last, Stmt::Break(_))
+                                    && (leading.is_empty()
+                                        || suite_has_linear_borrow_fallthrough(leading))
+                            }))
+                }) {
+                    borrow_body = &statement.body;
+                }
+            }
             let conditional_break_exit =
-                suite_contains_borrow_reachable_conditional_loop_break(&statement.body);
+                suite_contains_borrow_reachable_conditional_loop_break(borrow_body);
             // Managers entered inside this protected try preserve the break edge through
             // their exit calls. Outer managers can still disconnect an empty finally exit.
             let finally_break_reaches_cleanup = self
@@ -21383,6 +21586,23 @@ impl<'source> Compiler<'source> {
                         .body
                         .last()
                         .is_some_and(terminal_try_distributes_implicit_return)
+                    || (self.supports_legacy_elided_terminal_if()
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len()
+                            == 1
+                        && statement
+                            .body
+                            .iter()
+                            .enumerate()
+                            .any(|(index, body_statement)| {
+                                self.legacy_terminal_if_before_elided(
+                                    body_statement,
+                                    &statement.body[index + 1..],
+                                )
+                            }))
                     || (self.supports_protected_terminal_if()
                         && statement
                             .body
@@ -22177,6 +22397,11 @@ impl<'source> Compiler<'source> {
                 self.assembler.set_location(
                     self.source_location(while_condition_exit_range(&loop_statement.test)),
                 );
+            } else if let Some(location) = self.legacy_elided_try_guard_return_location(statement) {
+                // 3.13 propagates the sole false edge's span into the unlocated
+                // normal exit before RETURN_CONST folding. The terminating arm
+                // cannot donate its physically preceding return or raise span.
+                self.assembler.set_location(location);
             } else if let Some(location) = self.assembler.last_instruction_location() {
                 self.assembler.set_location(location);
             }
