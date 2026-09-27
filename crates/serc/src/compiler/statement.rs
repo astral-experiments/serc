@@ -13012,7 +13012,12 @@ impl<'source> Compiler<'source> {
                             if matches!(nested_if_exit_location(nested, true),
                                 Some(NestedIfExitLocation::Unlocated))
                                 && nested_if_exit_location(nested, false).is_none());
-                    let nested_if_exit = body.last().and_then(|statement| match statement {
+                    // Declarations emit no instructions. Elided assertions are rewritten
+                    // to empty global declarations before this point.
+                    let branch_tail = body.iter().rev().find(|statement| {
+                        !matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_))
+                    });
+                    let nested_if_exit = branch_tail.and_then(|statement| match statement {
                         Stmt::If(statement) => nested_if_exit_location(
                             statement,
                             self.control.statements.context.has_following,

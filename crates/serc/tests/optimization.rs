@@ -5525,3 +5525,78 @@ for target, expected in (
         }
     }
 }
+
+#[test]
+fn instruction_free_branch_tails_preserve_join_locations() {
+    let template = "def f(x, y, value):\n    if x:\n        if y:\n            work()\n        TAIL\n    else:\n        other()\n    after()\n";
+    for tail in [
+        "assert value",
+        "global marker",
+        "pass\n        global marker",
+    ] {
+        let source = template.replace("TAIL", tail);
+        assert_matches_cpython(&source, "branch_tail.py", &LEVELS);
+    }
+    // The same join may require an EXTENDED_ARG for a long jump.
+    let long_jump = template
+        .replace("TAIL", "assert value")
+        .replace("        other()\n", &"        other()\n".repeat(90));
+    assert_matches_cpython(&long_jump, "branch_tail.py", &LEVELS);
+
+    for source in [
+        r"def enclosing():
+    cell = None
+    def f(x, y, value, manager):
+        with manager:
+            if x:
+                if y:
+                    work()
+                nonlocal cell
+                assert value
+            else:
+                other()
+            after()
+    return f
+",
+        r"async def f(x, y, value):
+    try:
+        if x:
+            if y:
+                work()
+            assert value
+        else:
+            other()
+        after()
+    finally:
+        cleanup()
+",
+        r"def f(x, y, items):
+    if x:
+        for item in items:
+            if y:
+                break
+            work()
+        else:
+            other()
+        global marker
+    else:
+        other()
+    after()
+",
+        r"def f(x, y, z):
+    if x:
+        while y:
+            if z:
+                break
+            work()
+        else:
+            other()
+        global marker
+    else:
+        other()
+    after()
+",
+    ] {
+        assert_matches_cpython(source, "branch_tail.py", &LEVELS);
+    }
+}
