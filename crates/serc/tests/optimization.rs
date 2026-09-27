@@ -23,6 +23,20 @@ const LEVELS: [OptimizationLevel; 3] = [
 ];
 
 #[test]
+fn direct_call_and_continue_preserve_legacy_for_footer_location() {
+    for source in [
+        "def f(flag, active, items):\n    if flag is not None:\n        assert flag\n    if active is not None:\n        assert active\n        for item in items:\n            if item is None:\n                continue\n            consume(item)\n",
+        "def f(flag, active, items):\n    if active is not None:\n        assert active\n        for item in items:\n            if item is None:\n                continue\n            consume(item)\n",
+        "def f(flag, active, items):\n    if flag is not None:\n        assert flag\n    if active is not None:\n        assert active\n        for item in items:\n            consume(item)\n",
+        "def f(flag, active, items):\n    if flag is not None:\n        assert flag\n    if active is not None:\n        assert active\n        for item in items:\n            item.consume()\n",
+        "def f(flag, active, items):\n    if flag is not None:\n        assert flag\n    if active is not None:\n        assert active\n        for item in items:\n            if item is None:\n                continue\n            item.consume()\n",
+        "def f(flag, active, items):\n    if flag is not None:\n        consume(flag)\n    if active is not None:\n        assert active\n        for item in items:\n            if item is None:\n                continue\n            consume(item)\n",
+    ] {
+        assert_matches_cpython(source, "continue_call_for.py", &LEVELS);
+    }
+}
+
+#[test]
 fn elided_for_after_completed_prefix_preserves_legacy_footer_location() {
     for source in [
         "def f(items, others):\n    assert items\n    assert others\n    if ready():\n        assert items\n    if active():\n        value = prepare()\n        for item in items:\n            assert item\n            assert value\n        for other in others:\n            assert other\n",
@@ -8696,4 +8710,59 @@ fn erased_loop_arms_keep_distinct_condition_backedges() {
             assert enabled
 ";
     assert_matches_cpython(source, "erased_loop_condition_backedges.py", &LEVELS);
+}
+
+#[test]
+fn erased_branch_assertions_preserve_copied_footer_donors() {
+    for (case, source) in [
+        r"def example(flag, choice, build):
+    if flag:
+        if choice:
+            value = build()
+            assert value
+        else:
+            assert choice
+            value = build() if flag else choice
+        assert flag
+    else:
+        return build()
+",
+        r"def example(flag, choice, build):
+    if flag:
+        if choice:
+            value = build()
+            assert value
+        else:
+            assert choice
+            value = build()
+        assert flag
+    else:
+        return build()
+",
+        r"def example(flag, choice, build):
+    if flag:
+        if choice:
+            value = build()
+        else:
+            value = build() if flag else choice
+        assert flag
+    else:
+        return build()
+",
+        r"def example(flag, choice, build):
+    if flag:
+        if choice:
+            value = build()
+        else:
+            value = build()
+        assert flag
+    else:
+        return build()
+",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython(source, &format!("copied_binary_footer_{case}.py"), &LEVELS);
+    }
 }

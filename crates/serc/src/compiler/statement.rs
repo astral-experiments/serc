@@ -4502,18 +4502,33 @@ impl<'source> Compiler<'source> {
                         && !expression_contains_inline_branch(&iterator.iter)
                         && !expression_suspends_current_scope(&iterator.iter)
                         && (iterator.body.iter().all(|part| self.context.is_elided_statement(part))
-                            || matches!(iterator.body.as_slice(), [Stmt::Expr(expression)]
-                                if matches!(expression.value.as_ref(), Expr::Call(call)
-                                    if !expression_contains_inline_branch(&expression.value)
-                                        && !expression_suspends_current_scope(&expression.value)
-                                        && matches!(call.func.as_ref(), Expr::Attribute(attribute)
-                                            if matches!(attribute.value.as_ref(), Expr::Name(_))))))))
+                            || iterator.body.split_last().is_some_and(|(last, body_prefix)| {
+                                (body_prefix.is_empty()
+                                    || matches!(body_prefix, [Stmt::If(guard)]
+                                        if guard.elif_else_clauses.is_empty()
+                                            && early_condition_truthiness(&guard.test).is_none()
+                                            && condition_has_linear_runtime_leaves(&guard.test)
+                                            && !expression_contains_inline_branch(&guard.test)
+                                            && !expression_suspends_current_scope(&guard.test)
+                                            && condition_jump_target_count(&guard.test, false) == 1
+                                            && condition_jump_target_count(&guard.test, true) == 1
+                                            && matches!(guard.body.as_slice(), [Stmt::Continue(_)])))
+                                    && matches!(last, Stmt::Expr(expression)
+                                        if matches!(expression.value.as_ref(), Expr::Call(call)
+                                            if !expression_contains_inline_branch(&expression.value)
+                                                && !expression_suspends_current_scope(&expression.value)
+                                                && (matches!(call.func.as_ref(), Expr::Name(_))
+                                                    || matches!(call.func.as_ref(), Expr::Attribute(attribute)
+                                                        if matches!(attribute.value.as_ref(), Expr::Name(_))))))
+                            }))))
             {
                 // An earlier erased conditional can count this original footer twice.
                 // A linear call body and two simple AND leaves retain the same exit.
                 // Linear iterator calls, unpacking, and call arguments leave those edges intact.
                 // Completed linear work and erased-body loops before a final erased
                 // Name loop add no edge to the shared footer.
+                // Direct calls and a conditional continue keep their edges inside the
+                // loop, leaving the original scope footer's predecessors unchanged.
                 // Its iterator exhaustion stays unlocated until the native line pass.
                 self.assembler.record_current_original_scope_exit();
             }
@@ -4944,7 +4959,7 @@ impl<'source> Compiler<'source> {
     fn elided_branch_return_location(&self, body: &[Stmt]) -> Option<SourceLocation> {
         match self
             .elided_linear_branch_tail(body, true)
-            .or_else(|| self.elided_linear_elif_tail(body))
+            .or_else(|| self.elided_fallthrough_if_tail(body))
             .or_else(|| self.elided_returning_while_tail(body))?
         {
             // Each original predecessor donates its span when this footer is copied.
@@ -4956,8 +4971,8 @@ impl<'source> Compiler<'source> {
         }
     }
 
-    /// Keeps copied exits of a linear elif chain unlocated after an erased suffix.
-    fn elided_linear_elif_tail<'a>(&self, body: &'a [Stmt]) -> Option<&'a Stmt> {
+    /// Keeps each live branch's copied footer unlocated after an erased suffix.
+    fn elided_fallthrough_if_tail<'a>(&self, body: &'a [Stmt]) -> Option<&'a Stmt> {
         if self.context.python_version < crate::PythonVersion::Py314
             || !self.supports_elided_terminal_if()
             || self.unit.flags & CO_COROUTINE != 0
@@ -4981,6 +4996,34 @@ impl<'source> Compiler<'source> {
                 && !expression_contains_inline_branch(test)
                 && !expression_suspends_current_scope(test)
         };
+        let conditional_assignment = |part: &Stmt| {
+            let Stmt::Assign(assignment) = part else {
+                return false;
+            };
+            let Expr::If(value) = assignment.value.as_ref() else {
+                return false;
+            };
+            matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                && runtime_test(&value.test)
+                && [&value.body, &value.orelse].into_iter().all(|value| {
+                    !expression_contains_inline_branch(value)
+                        && !expression_suspends_current_scope(value)
+                })
+        };
+        let live_arm = |suite: &[Stmt]| {
+            if linear(suite) {
+                return true;
+            }
+            let mut has_runtime_work = false;
+            suite.iter().all(|part| {
+                if self.context.is_elided_statement(part) || matches!(part, Stmt::Pass(_)) {
+                    return true;
+                }
+                let live = linear(std::slice::from_ref(part)) || conditional_assignment(part);
+                has_runtime_work |= live;
+                live
+            }) && has_runtime_work
+        };
         let Stmt::If(statement) = &body[end] else {
             return None;
         };
@@ -4988,14 +5031,14 @@ impl<'source> Compiler<'source> {
         if !body[..end].iter().all(|part| {
             self.context.is_elided_statement(part) || linear(std::slice::from_ref(part))
         }) || !runtime_test(&statement.test)
-            || !linear(&statement.body)
-            || elifs.is_empty()
+            || !live_arm(&statement.body)
             || otherwise.test.is_some()
             || !elifs.iter().all(|clause| {
-                clause.test.as_ref().is_some_and(runtime_test) && linear(&clause.body)
+                clause.test.as_ref().is_some_and(runtime_test) && live_arm(&clause.body)
             })
-            || !(linear(&otherwise.body)
-                || (!otherwise.body.is_empty()
+            || !(live_arm(&otherwise.body)
+                || (!elifs.is_empty()
+                    && !otherwise.body.is_empty()
                     && otherwise
                         .body
                         .iter()
