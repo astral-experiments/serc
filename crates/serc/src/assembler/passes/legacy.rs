@@ -1542,15 +1542,22 @@ impl OptimizationPipeline {
                         tail.next() == Some(POP_TOP)
                             && matches!(tail.next(), Some(CALL | CALL_FUNCTION_EX))
                     });
+                let original_scope_exit = self.graph[block].items().iter().any(|item| {
+                    matches!(item, Item::Label(label)
+                        if self.original_scope_exit_labels.contains(label))
+                });
                 let unprotected_tail = self.exception_regions.is_empty()
                     && self.exception_owner_provenance.setups.is_empty()
                     && (instruction.opcode == JUMP_FORWARD
                         // Native's early fallthrough donation sees the call's
-                        // artificial POP_TOP as unlocated. Located store donors
-                        // and eager all-jump false footers need different proofs.
+                        // artificial POP_TOP as unlocated. A source-certified
+                        // scope footer also admits one ordinary predecessor;
+                        // eager branch-return footers have no such certificate.
                         || (instruction.opcode == RETURN_CONST
-                            && has_call_fallthrough
-                            && counts.is_some_and(|(ordinary, _)| ordinary >= 2)));
+                            && counts.is_some_and(|(ordinary, _)| {
+                                (has_call_fallthrough && ordinary >= 2)
+                                    || (original_scope_exit && ordinary >= 1)
+                            })));
                 if instructions.next().is_none()
                     && (backedge || unprotected_tail)
                     && instruction.location == SourceLocation::NONE

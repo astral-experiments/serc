@@ -1667,6 +1667,8 @@ pub(crate) struct Assembler {
     pub(super) match_join_store_origins: FxHashMap<Label, Vec<Item>>,
     /// Labels preceding an authored NOP omitted during statement lowering.
     pub(super) original_nop_targets: FxHashSet<Label>,
+    /// Source-certified scope exits, separate from eager branch-return footers.
+    pub(super) original_scope_exit_labels: FxHashSet<Label>,
     /// Normal handler cleanup originally emitted without source locations.
     pub(super) original_unlocated_cleanup_targets: FxHashSet<Label>,
     /// Exact source-certified named cleanup spans, used only during statement emission.
@@ -1783,6 +1785,8 @@ pub(super) struct OptimizationPipeline {
     pub(super) match_join_store_origins: FxHashMap<Label, Vec<Item>>,
     /// Labels preceding an authored NOP omitted during statement lowering.
     pub(super) original_nop_targets: FxHashSet<Label>,
+    /// Source-certified scope exits, separate from eager branch-return footers.
+    pub(super) original_scope_exit_labels: FxHashSet<Label>,
     /// Normal handler cleanup originally emitted without source locations.
     pub(super) original_unlocated_cleanup_targets: FxHashSet<Label>,
     /// Unlocated Boolean discards with a fallback whose source instruction folded away.
@@ -1915,6 +1919,7 @@ impl Default for Assembler {
             comprehension_assignment_exits: FxHashMap::default(),
             match_join_store_origins: FxHashMap::default(),
             original_nop_targets: FxHashSet::default(),
+            original_scope_exit_labels: FxHashSet::default(),
             original_unlocated_cleanup_targets: FxHashSet::default(),
             guarded_finally_handler_cleanup_origins: Vec::new(),
             original_unlocated_discard_targets: FxHashSet::default(),

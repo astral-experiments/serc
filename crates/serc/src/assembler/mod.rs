@@ -1434,6 +1434,11 @@ impl Assembler {
         self.location = location;
     }
 
+    /// Certifies an original scope footer without changing its block boundaries.
+    pub(crate) fn record_original_scope_exit(&mut self, label: Label) {
+        self.original_scope_exit_labels.insert(label);
+    }
+
     /// Restores an unlocated Boolean exit while retaining any early-folded location fallback.
     pub(crate) fn prepare_loop_tail_discard(&mut self, preserve_folded_location: bool) {
         let instruction = self.required_last_instruction_mut("preparing a loop-tail discard");

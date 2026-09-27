@@ -574,6 +574,7 @@ impl Assembler {
             comprehension_assignment_exits: self.comprehension_assignment_exits,
             match_join_store_origins: self.match_join_store_origins,
             original_nop_targets: self.original_nop_targets,
+            original_scope_exit_labels: self.original_scope_exit_labels,
             original_unlocated_cleanup_targets: self.original_unlocated_cleanup_targets,
             original_unlocated_discard_targets: self.original_unlocated_discard_targets,
             copied_finally_iterator_break_origins: self.copied_finally_iterator_break_origins,

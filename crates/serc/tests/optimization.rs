@@ -63,6 +63,45 @@ fn legacy_coroutine_conditional_work_keeps_returns_before_erased_assertions() {
     }
 }
 #[test]
+fn terminating_legacy_branches_preserve_the_original_scope_footer() {
+    for (index, tail) in [
+        "raise ValueError",
+        "return obj",
+        "return 1",
+        "return",
+        "value = obj.attr",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source =
+            format!("def f(a, b, obj):\n    if a:\n        assert a\n    if b:\n        {tail}\n");
+        assert_matches_cpython(
+            &source,
+            &format!("original_legacy_scope_footer_{index}.py"),
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn elided_assertions_preserve_legacy_nested_call_footers() {
+    for condition in ["c", "c and a"] {
+        for call in ["obj.action()", "obj.action(*items)"] {
+            let source = format!(
+                "def f(a, b, c, obj, items):\n    if a:\n        assert a\n    if b:\n        if {condition}:\n            {call}\n        assert b\n"
+            );
+            assert_matches_cpython(&source, "legacy_nested_call_footer.py", &LEVELS);
+        }
+    }
+    assert_matches_cpython(
+        "def f(a, b, obj):\n    if a:\n        assert a\n    if b:\n        value = obj.attr\n        obj.before()\n        obj.action()\n",
+        "legacy_linear_call_footer.py",
+        &LEVELS,
+    );
+}
+
+#[test]
 fn empty_conditionals_preserve_legacy_terminal_return_locations() {
     for (case, source) in [
         "def f(a, b, obj):\n    if a:\n        assert a\n    if b:\n        obj.action()\n",
@@ -99,6 +138,27 @@ fn consecutive_elided_conditions_preserve_empty_branch_locations() {
             "def f(a, b, c):\n{prefix}    if b:\n        assert b\n    else:\n        assert c\n{suffix}"
         );
         assert_matches_cpython(&source, "consecutive_elided_conditions.py", &LEVELS);
+    }
+}
+
+#[test]
+fn protected_coroutine_branches_keep_returns_before_erased_assertions() {
+    for (case, source) in [
+        "async def f(a, b):\n    try:\n        if a:\n            assert a\n        assert b\n    except ValueError:\n        pass\n",
+        "async def f(a, b):\n    try:\n        if a:\n            pass\n        assert b\n    except ValueError:\n        pass\n",
+        "async def f(a, b):\n    try:\n        if a:\n            action()\n        assert b\n    except ValueError:\n        pass\n",
+        "async def f(a, b):\n    try:\n        if a:\n            value = b\n        assert b\n    except ValueError:\n        pass\n",
+        "async def f(a):\n    try:\n        value = await action()\n        if a is not None:\n            assert value\n        assert a\n    except ValueError:\n        if a is not None:\n            assert a\n        else:\n            raise\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_matches_cpython_versions(
+            source,
+            &format!("protected_coroutine_elided_branch_{case}.py"),
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
     }
 }
 

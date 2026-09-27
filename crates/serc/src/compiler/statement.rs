@@ -1667,15 +1667,6 @@ impl<'source> Compiler<'source> {
             && self.control.finally.is_inactive_for_return_unwind()
     }
 
-    // In 3.13, erased assertions leave an unlocated exit whose predecessors
-    // receive separate returns before NOP cleanup. Ordinary try bodies admit
-    // only linear branches; a coroutine's outer synthetic owner also permits
-    // nonsuspending conditional work without authored cleanup or abrupt exits.
-    fn legacy_terminal_if_before_elided(&self, statement: &Stmt, following: &[Stmt]) -> bool {
-        self.context.python_version == crate::PythonVersion::Py313
-            && self.terminal_if_before_elided(statement, following)
-    }
-
     /// Certifies target-supported, nonsuspending exits before erased assertions.
     fn terminal_if_before_elided(&self, statement: &Stmt, following: &[Stmt]) -> bool {
         let Stmt::If(conditional) = statement else {
@@ -1721,9 +1712,18 @@ impl<'source> Compiler<'source> {
             && following.iter().all(is_elided)
     }
 
-    fn supports_legacy_elided_terminal_if(&self) -> bool {
-        self.context.python_version == crate::PythonVersion::Py313
+    /// Allows linear return copying from an ordinary terminal try body.
+    fn supports_linear_protected_terminal_if(&self) -> bool {
+        (self.context.python_version == crate::PythonVersion::Py313
+            || (self.context.python_version >= crate::PythonVersion::Py314
+                && self.unit.flags & CO_COROUTINE != 0))
             && self.supports_elided_terminal_if()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .len()
+                == 1
     }
 
     /// Checks the enclosing scope and cleanup state for terminal-exit copying.
@@ -2027,14 +2027,8 @@ impl<'source> Compiler<'source> {
                     .context
                     .propagates_following_to_suites
                 && self.terminal_if_before_elided(statement, &body[index + 1..]);
-            let legacy_protected_if_before_elided = final_expression_becomes_return
-                && self.supports_legacy_elided_terminal_if()
-                && self
-                    .control
-                    .exceptions
-                    .active_exception_region_exclusions
-                    .len()
-                    == 1
+            let linear_protected_if_before_elided = final_expression_becomes_return
+                && self.supports_linear_protected_terminal_if()
                 && self
                     .control
                     .exceptions
@@ -2045,7 +2039,7 @@ impl<'source> Compiler<'source> {
                     .exceptions
                     .direct_try_body_statements
                     .contains(&statement.range())
-                && self.legacy_terminal_if_before_elided(statement, &body[index + 1..]);
+                && self.terminal_if_before_elided(statement, &body[index + 1..]);
             let protected_terminal_if_before_elided = final_expression_becomes_return
                 && matches!(statement, Stmt::If(_))
                 && self.supports_protected_terminal_if()
@@ -2065,7 +2059,7 @@ impl<'source> Compiler<'source> {
                 || terminal_nested_before_elided
                 || protected_terminal_if_before_elided
                 || coroutine_if_before_elided
-                || legacy_protected_if_before_elided;
+                || linear_protected_if_before_elided;
             // An assignment with an inlined comprehension becomes terminal when
             // only removed assertions follow it; retain its target's return span.
             let terminal_assignment_before_elided = self.context.python_version
@@ -3913,7 +3907,8 @@ impl<'source> Compiler<'source> {
         if self.context.python_version == crate::PythonVersion::Py312
             && matches!(self.unit.scope, Scope::Function { .. })
             && statement.elif_else_clauses.is_empty()
-            && matches!(statement.body.as_slice(), [Stmt::Expr(expression)]
+            && suite_has_linear_borrow_fallthrough(&statement.body)
+            && matches!(statement.body.last(), Some(Stmt::Expr(expression))
                 if matches!(expression.value.as_ref(), Expr::Call(_))
                     && !expression_contains_inline_branch(&expression.value)
                     && !expression_suspends_current_scope(&expression.value))
@@ -3947,6 +3942,10 @@ impl<'source> Compiler<'source> {
             self.assembler.set_location(SourceLocation::NONE);
             return self.emit_deferred_implicit_return();
         }
+        let plain_312_scope_exit = self.context.python_version == crate::PythonVersion::Py312
+            && self.supports_elided_terminal_if()
+            && self.unit.flags & CO_COROUTINE == 0
+            && !self.has_active_control_flow_region();
         if self.context.python_version <= crate::PythonVersion::Py313
             && std::iter::once(statement.body.as_slice())
                 .chain(
@@ -3959,6 +3958,13 @@ impl<'source> Compiler<'source> {
                     matches!(body.last(), Some(Stmt::While(_)))
                         || (self.context.python_version == crate::PythonVersion::Py312
                             && (matches!(body.last(), Some(Stmt::Try(_) | Stmt::If(_) | Stmt::Match(_) | Stmt::For(_)))
+                                || (plain_312_scope_exit
+                                    && matches!(body.iter().rev().find(|statement| {
+                                        !matches!(
+                                            self.context.optimized_locations.get(&statement.range()),
+                                            Some(super::optimization::OptimizedLocation::Elided)
+                                        )
+                                    }), Some(Stmt::If(_))))
                                 || matches!(body.last(), Some(Stmt::Expr(expression))
                                     if matches!(expression.value.as_ref(), Expr::Await(_)))
                                 || suite_has_cold_only_terminal_if_continuation(body)
@@ -4114,6 +4120,12 @@ impl<'source> Compiler<'source> {
                         super::legacy_native_labels::NativeRole::IfEnd(statement.range),
                         next,
                     );
+                    if plain_312_scope_exit && suite_terminates(body) {
+                        // No implicit return is distributed into a terminating
+                        // authored arm. This false edge still names the original
+                        // scope footer, even when reachability visits it twice.
+                        self.assembler.record_original_scope_exit(next);
+                    }
                 }
                 let exclude_not_taken = self.control.conditions.exclude_terminal_if_not_taken
                     || (!self.control.withs.active_with_region_exclusions.is_empty()
@@ -21707,19 +21719,13 @@ impl<'source> Compiler<'source> {
                         .body
                         .last()
                         .is_some_and(terminal_try_distributes_implicit_return)
-                    || (self.supports_legacy_elided_terminal_if()
-                        && self
-                            .control
-                            .exceptions
-                            .active_exception_region_exclusions
-                            .len()
-                            == 1
+                    || (self.supports_linear_protected_terminal_if()
                         && statement
                             .body
                             .iter()
                             .enumerate()
                             .any(|(index, body_statement)| {
-                                self.legacy_terminal_if_before_elided(
+                                self.terminal_if_before_elided(
                                     body_statement,
                                     &statement.body[index + 1..],
                                 )
